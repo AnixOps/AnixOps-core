@@ -557,31 +557,47 @@ impl MitmEngine {
 }
 
 /// The first bytes of a relayed body, for capture.
+/// Keeps a body for capture as the pieces it arrived in, joined once when
+/// the exchange is filed, so a growing body is never copied on reallocation
+/// (the iOS extension's peak memory).
 struct Tap {
-    data: Option<Vec<u8>>,
+    pieces: Option<Vec<Vec<u8>>>,
+    kept: usize,
     size: u64,
 }
 
 impl Tap {
     fn new(on: bool) -> Self {
         Self {
-            data: on.then(Vec::new),
+            pieces: on.then(Vec::new),
+            kept: 0,
             size: 0,
         }
     }
 
     fn add(&mut self, chunk: &[u8]) {
-        if let Some(data) = &mut self.data {
+        if let Some(pieces) = &mut self.pieces {
             self.size += chunk.len() as u64;
-            let room = MAX_HTTP_BODY_BYTES.saturating_sub(data.len());
-            data.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            let room = MAX_HTTP_BODY_BYTES.saturating_sub(self.kept);
+            let take = chunk.len().min(room);
+            if take > 0 {
+                pieces.push(chunk[..take].to_vec());
+                self.kept += take;
+            }
         }
     }
 
     fn into_body(self) -> Option<CapturedBody> {
-        self.data.map(|data| CapturedBody {
-            data,
-            size: self.size,
+        let kept = self.kept;
+        self.pieces.map(|pieces| {
+            let mut data = Vec::with_capacity(kept);
+            for piece in pieces {
+                data.extend_from_slice(&piece);
+            }
+            CapturedBody {
+                data,
+                size: self.size,
+            }
         })
     }
 }
