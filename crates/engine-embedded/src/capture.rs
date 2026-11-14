@@ -258,6 +258,18 @@ impl Inner {
     }
 }
 
+/// Makes room in `buf` for `more` bytes, doubling like `Vec` does but never
+/// past `limit`, the most `buf` will ever hold, so a kept piece takes about
+/// the memory the budget counts for it instead of up to twice that.
+pub(crate) fn reserve_capped(buf: &mut Vec<u8>, more: usize, limit: usize) {
+    let needed = buf.len() + more;
+    if needed <= buf.capacity() {
+        return;
+    }
+    let target = (buf.capacity() * 2).clamp(needed, limit.max(needed));
+    buf.reserve_exact(target - buf.len());
+}
+
 /// The capture switch, its budget and what it kept.
 pub struct CaptureStore {
     enabled: AtomicBool,
@@ -385,6 +397,8 @@ impl CaptureStore {
                 .is_some_and(|last| last.direction == direction);
         let added = if merge {
             if let Some(last) = captured.chunks.last_mut() {
+                // `room` is the most this chunk can still grow by.
+                reserve_capped(&mut last.data, take, last.data.len() + room);
                 last.data.extend_from_slice(data);
             }
             take
@@ -1342,5 +1356,16 @@ mod tests {
         // The synthetic client fd00::1 talks to the real IPv6 server.
         let client = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert!(pcap.windows(16).any(|window| window == client));
+    }
+
+    #[test]
+    fn kept_pieces_grow_no_further_than_their_limit() {
+        let mut buf = Vec::new();
+        for _ in 0..44 {
+            reserve_capped(&mut buf, 1460, MAX_DIRECTION_BYTES);
+            buf.extend_from_slice(&[0u8; 1460]);
+        }
+        assert_eq!(buf.len(), 44 * 1460);
+        assert_eq!(buf.capacity(), MAX_DIRECTION_BYTES);
     }
 }

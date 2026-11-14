@@ -99,7 +99,9 @@ impl Tap {
     fn keep(&mut self, bytes: &[u8]) {
         self.size = self.size.saturating_add(bytes.len() as u64);
         let room = self.limit.saturating_sub(self.data.len());
-        self.data.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        let take = bytes.len().min(room);
+        crate::capture::reserve_capped(&mut self.data, take, self.limit);
+        self.data.extend_from_slice(&bytes[..take]);
     }
 }
 

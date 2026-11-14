@@ -196,15 +196,36 @@ def overhead(bench, out, args):
     size = args.mib * MIB
     kinds = ("raw", "http", "https")
     samples = {"off": [], "on": []}
+    speeds = {kind: {"off": [], "on": []} for kind in kinds}
     try:
+        # Throughput: one tunnel process, capture switched at run time before
+        # each download (it applies to new connections), off and on
+        # alternating, so runner speed drifts hit both sides alike.
+        tunnel = Tunnel(bench, out, capture=False, origin=origin)
+        try:
+            for round_index in range(args.throughput_rounds):
+                order = ("off", "on") if round_index % 2 == 0 else ("on", "off")
+                for kind in kinds:
+                    for mode in order:
+                        enabled = "true" if mode == "on" else "false"
+                        tunnel.control(f'{{"cmd":"set_capture","enabled":{enabled}}}')
+                        tunnel.control('{"cmd":"clear_capture"}')
+                        speeds[kind][mode].append(download(tunnel, kind, size))
+            print(f"throughput MiB/s: {json.dumps(speeds)}", flush=True)
+        finally:
+            tunnel.stop()
+
+        # Memory: fresh processes with capture off and on from the start.
         for round_index in range(args.rounds):
             order = ("off", "on") if round_index % 2 == 0 else ("on", "off")
             for mode in order:
                 tunnel = Tunnel(bench, out, capture=mode == "on", origin=origin)
                 try:
                     idle = tunnel.control("sample")
-                    throughput = {kind: download(tunnel, kind, size) for kind in kinds}
+                    for kind in kinds:
+                        download(tunnel, kind, size // 4)
                     peaks = {"download": tunnel.control("sample")["hwm_kb"]}
+                    active = {}
                     failures, errors = 0, []
                     for kind in kinds:
                         # Each phase's peak on its own: VmHWM starts again here.
@@ -214,6 +235,8 @@ def overhead(bench, out, args):
                         failures += failed
                         errors += [f"{kind}: {reason}" for reason in why]
                         peaks[f"short_{kind}"] = tunnel.control("sample")["hwm_kb"]
+                        time.sleep(2)
+                        active[kind] = tunnel.control("sample")["tunnel"].get("tcp_active")
                     end = tunnel.control("sample")
                     time.sleep(5)
                     settled = tunnel.control("sample")
@@ -221,7 +244,7 @@ def overhead(bench, out, args):
                     tunnel.stop()
                 record = {
                     "round": round_index + 1,
-                    "throughput_mib_s": throughput,
+                    "tcp_active_after_phase": active,
                     "request_failures": failures,
                     "request_errors": errors,
                     "idle_rss_kb": idle["rss_kb"],
@@ -243,10 +266,10 @@ def overhead(bench, out, args):
     def median(mode, pick):
         return statistics.median(pick(record) for record in samples[mode])
 
-    result = {"rounds": samples, "throughput": {}, "failures": []}
+    result = {"rounds": samples, "speeds": speeds, "throughput": {}, "failures": []}
     for kind in kinds:
-        off = median("off", lambda r: r["throughput_mib_s"][kind])
-        on = median("on", lambda r: r["throughput_mib_s"][kind])
+        off = statistics.median(speeds[kind]["off"])
+        on = statistics.median(speeds[kind]["on"])
         drop = (off - on) / off * 100
         result["throughput"][kind] = {"off": off, "on": on, "drop_percent": drop}
         if drop > args.max_throughput_drop_percent:
@@ -411,7 +434,9 @@ def summary(result, args):
     overhead_result = result.get("overhead")
     if overhead_result:
         lines += [
-            f"**Capture on vs off** (median of {args.rounds} rounds, {args.mib} MiB per download)",
+            f"**Capture on vs off**: throughput is the median of {args.throughput_rounds} downloads of "
+            f"{args.mib} MiB per side in one tunnel process, capture switched before each; memory "
+            f"is the median of {args.rounds} fresh processes per side",
             "",
             "| Workload | Off MiB/s | On MiB/s | Drop | Gate |",
             "| --- | ---: | ---: | ---: | ---: |",
@@ -508,7 +533,8 @@ def main():
     gates.add_argument("--out", required=True)
     gates.add_argument("--only", choices=["all", "decrypt", "overhead"], default="all")
     gates.add_argument("--rounds", type=int, default=3)
-    gates.add_argument("--mib", type=int, default=256)
+    gates.add_argument("--mib", type=int, default=128)
+    gates.add_argument("--throughput-rounds", type=int, default=6)
     gates.add_argument("--requests", type=int, default=200)
     gates.add_argument("--conns", type=int, default=200)
     gates.add_argument("--request-kib", type=int, default=256)
