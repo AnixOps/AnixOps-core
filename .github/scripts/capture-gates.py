@@ -167,22 +167,28 @@ def download(tunnel, kind, size):
     return size / MIB / seconds
 
 
-def many_requests(tunnel, requests, conns, size):
-    """Short connections: fills the capture budget so eviction runs."""
-    failures = 0
-    for scheme, port in (("https", 443), ("http", 80)):
-        args = ["--max-time", "240", "-Z", "--parallel-max", "16", "-H", "Connection: close",
-                "--resolve", f"{BENCH_HOST}:{port}:{ORIGIN_IP}"]
-        if scheme == "https":
-            args += ["--cacert", tunnel.root]
-        result = curl(*args, f"{scheme}://{BENCH_HOST}/bytes/{size}?i=[1-{requests}]")
-        ok = sum(1 for line in result["lines"] if line["code"] == "200" and line["bytes"] == size)
-        failures += requests - ok
-    result = in_ns("python3", "-I", os.path.abspath(__file__), "raw-client", "--addr", RAW,
-                   "--bytes", str(size), "--count", str(conns), "--parallel", "16",
-                   check=True, timeout=300)
-    failures += json.loads(result.stdout)["failed"]
-    return failures
+def short_requests(tunnel, kind, count, size):
+    """Short connections that fill the capture budget, so eviction runs.
+
+    Returns the failed requests and a sample of what went wrong."""
+    if kind == "raw":
+        result = in_ns("python3", "-I", os.path.abspath(__file__), "raw-client", "--addr", RAW,
+                       "--bytes", str(size), "--count", str(count), "--parallel", "16",
+                       check=True, timeout=300)
+        data = json.loads(result.stdout)
+        return data["failed"], data.get("errors", [])
+    scheme, port = ("https", 443) if kind == "https" else ("http", 80)
+    args = ["--max-time", "240", "-Z", "--parallel-max", "16", "-H", "Connection: close",
+            "--resolve", f"{BENCH_HOST}:{port}:{ORIGIN_IP}"]
+    if scheme == "https":
+        args += ["--cacert", tunnel.root]
+    result = curl(*args, f"{scheme}://{BENCH_HOST}/bytes/{size}?i=[1-{count}]")
+    bad = [line for line in result["lines"] if line["code"] != "200" or line["bytes"] != size]
+    failed = count - (len(result["lines"]) - len(bad))
+    errors = [f"code {line['code']} bytes {line['bytes']}" for line in bad[:5]]
+    if failed and result["error"]:
+        errors.append(result["error"])
+    return failed, errors
 
 
 def overhead(bench, out, args):
@@ -198,7 +204,16 @@ def overhead(bench, out, args):
                 try:
                     idle = tunnel.control("sample")
                     throughput = {kind: download(tunnel, kind, size) for kind in kinds}
-                    failures = many_requests(tunnel, args.requests, args.conns, args.request_kib * 1024)
+                    peaks = {"download": tunnel.control("sample")["hwm_kb"]}
+                    failures, errors = 0, []
+                    for kind in kinds:
+                        # Each phase's peak on its own: VmHWM starts again here.
+                        tunnel.control("reset_peak")
+                        count = args.conns if kind == "raw" else args.requests
+                        failed, why = short_requests(tunnel, kind, count, args.request_kib * 1024)
+                        failures += failed
+                        errors += [f"{kind}: {reason}" for reason in why]
+                        peaks[f"short_{kind}"] = tunnel.control("sample")["hwm_kb"]
                     end = tunnel.control("sample")
                 finally:
                     tunnel.stop()
@@ -206,8 +221,10 @@ def overhead(bench, out, args):
                     "round": round_index + 1,
                     "throughput_mib_s": throughput,
                     "request_failures": failures,
+                    "request_errors": errors,
                     "idle_rss_kb": idle["rss_kb"],
-                    "peak_rss_kb": end["hwm_kb"],
+                    "phase_peak_rss_kb": peaks,
+                    "peak_rss_kb": max(peaks.values()),
                     "end_rss_kb": end["rss_kb"],
                     "cpu_us": end["cpu_us"],
                     "mitm_flows": end["tunnel"].get("mitm_flows"),
@@ -240,6 +257,13 @@ def overhead(bench, out, args):
         "increase_mb": peak_on - peak_off,
         "idle_off_mb": median("off", lambda r: r["idle_rss_kb"]) / 1024,
         "idle_on_mb": median("on", lambda r: r["idle_rss_kb"]) / 1024,
+    }
+    result["memory"]["phases"] = {
+        phase: {
+            "off_mb": median("off", lambda r: r["phase_peak_rss_kb"][phase]) / 1024,
+            "on_mb": median("on", lambda r: r["phase_peak_rss_kb"][phase]) / 1024,
+        }
+        for phase in samples["off"][0]["phase_peak_rss_kb"]
     }
     if peak_on - peak_off > args.max_memory_increase_mb:
         result["failures"].append(
@@ -308,7 +332,7 @@ def decrypt(bench, out, args):
             record["decrypted"] = via
             captured = False
             if via is not None:
-                for _ in range(20):
+                for _ in range(50):
                     entries = tunnel.har_entries()
                     captured = any(
                         urlparse(entry["request"]["url"]).hostname == host
@@ -400,8 +424,18 @@ def summary(result, args):
             f"| Peak RSS (VmHWM) | {memory['peak_off_mb']:.1f} MiB | {memory['peak_on_mb']:.1f} MiB | "
             f"{memory['increase_mb']:.1f} MiB | ≤ {args.max_memory_increase_mb:g} MiB |",
             f"| Idle RSS after start | {memory['idle_off_mb']:.1f} MiB | {memory['idle_on_mb']:.1f} MiB | | |",
-            "",
         ]
+        for phase, row in memory.get("phases", {}).items():
+            lines.append(
+                f"| Peak in phase `{phase}` | {row['off_mb']:.1f} MiB | {row['on_mb']:.1f} MiB | "
+                f"{row['on_mb'] - row['off_mb']:.1f} MiB | |"
+            )
+        lines.append("")
+        errors = [e for mode in overhead_result["rounds"].values() for r in mode for e in r["request_errors"]]
+        if errors:
+            lines += ["Short request failures (first ones):", ""]
+            lines += [f"- {error}" for error in errors[:10]]
+            lines.append("")
     failures = result["failures"]
     lines.append("**Result**: " + ("pass" if not failures else "FAIL"))
     lines += [f"- {failure}" for failure in failures]
@@ -413,6 +447,7 @@ def raw_client(args):
     failed = 0
     lock = threading.Lock()
     timing = {}
+    errors = []
 
     def one():
         nonlocal failed
@@ -427,11 +462,14 @@ def raw_client(args):
                     if n == 0:
                         break
                     got += n
-        except OSError:
-            pass
+        except OSError as err:
+            with lock:
+                errors.append(str(err))
         with lock:
             if got != args.bytes:
                 failed += 1
+                if len(errors) < 5:
+                    errors.append(f"got {got} of {args.bytes} bytes")
             timing.setdefault("bytes", got)
             timing.setdefault("seconds", time.monotonic() - started)
 
@@ -453,7 +491,7 @@ def raw_client(args):
     for thread in workers:
         thread.join()
     print(json.dumps({"bytes": timing.get("bytes", 0), "seconds": timing.get("seconds", 0.0),
-                      "failed": failed}))
+                      "failed": failed, "errors": errors[:5]}))
 
 
 def main():

@@ -21,7 +21,8 @@
 //!   everything else straight to its address. Without `--origin-root` the
 //!   upstream TLS client is the production one (webpki roots), as for real
 //!   sites. Prints `READY <control port>`; each line sent to the control port
-//!   is either `sample` (process memory and CPU, tunnel counters) or a
+//!   is either `sample` (process memory and CPU, tunnel counters),
+//!   `reset_peak` (VmHWM starts again from the current RSS) or a
 //!   runtime control request such as `{"cmd":"export_capture","format":"har"}`,
 //!   answered with one JSON line.
 
@@ -464,6 +465,10 @@ mod linux {
             let line = line.trim();
             let answer = if line == "sample" {
                 sample(&tunnel, &dispatcher)
+            } else if line == "reset_peak" {
+                // Resets VmHWM to the current RSS, so the next sample's
+                // peak covers one phase only.
+                json!({ "reset": std::fs::write("/proc/self/clear_refs", "5").is_ok() })
             } else {
                 match control::handle(&dispatcher, line.as_bytes()) {
                     Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),

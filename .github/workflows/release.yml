@@ -785,6 +785,16 @@ jobs:
           echo "withdrawal_policy=withdrawal-not-overwrite" >> "${GITHUB_OUTPUT}"
           echo "replacement_policy=new-version-tag-required" >> "${GITHUB_OUTPUT}"
 
+  # Debugging-mode gates (I3 / I4): HTTPS decryption success, throughput and
+  # peak memory with capture on. A miss blocks publishing.
+  capture-gates:
+    name: Capture gates
+    needs:
+      - release-policy
+    permissions:
+      contents: read
+    uses: ./.github/workflows/capture-gates.yml
+
   publish-eligibility-gate:
     name: Linux publish eligibility gate
     runs-on: ubuntu-latest
@@ -796,6 +806,7 @@ jobs:
       - package-linux
       - attest-linux
       - post-release-summary
+      - capture-gates
     outputs:
       package_publish_eligibility_status: ${{ steps.eligibility.outputs.package_publish_eligibility_status }}
       package_publish_eligibility_required_gates: ${{ steps.eligibility.outputs.package_publish_eligibility_required_gates }}
