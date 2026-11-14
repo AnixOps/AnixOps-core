@@ -283,7 +283,11 @@ def overhead(bench, out, args):
     for kind in kinds:
         off = statistics.median(speeds[kind]["off"])
         on = statistics.median(speeds[kind]["on"])
-        drop = (off - on) / off * 100
+        # Each off download has its on download right next to it: the median
+        # of the pairs' ratios cancels the runner's speed drifting between
+        # pairs, which single downloads show at +-30%.
+        ratios = [b / a for a, b in zip(speeds[kind]["off"], speeds[kind]["on"])]
+        drop = (1 - statistics.median(ratios)) * 100
         result["throughput"][kind] = {"off": off, "on": on, "drop_percent": drop}
         if drop > args.max_throughput_drop_percent:
             result["failures"].append(
@@ -447,8 +451,9 @@ def summary(result, args):
     overhead_result = result.get("overhead")
     if overhead_result:
         lines += [
-            f"**Capture on vs off**: throughput is the median of {args.throughput_rounds} downloads of "
-            f"{args.mib} MiB per side in one tunnel process, capture switched before each; memory "
+            f"**Capture on vs off**: throughput drop is the median over {args.throughput_rounds} "
+            f"adjacent off/on pairs of {args.mib} MiB downloads in one tunnel process, capture "
+            f"switched before each; Off/On columns are the medians of the single downloads; memory "
             f"is the median of {args.rounds} fresh processes per side",
             "",
             "| Workload | Off MiB/s | On MiB/s | Drop | Gate |",
@@ -546,8 +551,8 @@ def main():
     gates.add_argument("--out", required=True)
     gates.add_argument("--only", choices=["all", "decrypt", "overhead"], default="all")
     gates.add_argument("--rounds", type=int, default=3)
-    gates.add_argument("--mib", type=int, default=128)
-    gates.add_argument("--throughput-rounds", type=int, default=6)
+    gates.add_argument("--mib", type=int, default=256)
+    gates.add_argument("--throughput-rounds", type=int, default=10)
     gates.add_argument("--requests", type=int, default=200)
     gates.add_argument("--conns", type=int, default=200)
     gates.add_argument("--request-kib", type=int, default=256)
