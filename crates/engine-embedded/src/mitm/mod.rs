@@ -66,7 +66,7 @@ use engine_native::{
 };
 #[cfg(feature = "scripts")]
 use engine_native::{NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig};
-use engine_outbound::{BoxFuture, TargetAddr, TcpOutbound};
+use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use mitm_policy::loon_map_local::MAP_LOCAL_REMOTE_DATA_MAX_BYTES;
 use mitm_policy::loon_plugin::{import_loon_plugin_with_resources, merged_plugin_source};
 use mitm_policy::AnixOpsMitmPluginService;
@@ -419,23 +419,12 @@ impl MitmEngine {
         // The origin answers first, so the app is offered the protocol the
         // origin chose and no request is translated between versions.
         let offers_h2 = http2::offers_h2(&crate::sniff::client_hello_alpn(&flow.first));
-        let remote = tokio::time::timeout(connect_timeout, outbound.connect(&target))
-            .await
-            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-        let server_name =
-            ServerName::try_from(host.to_string()).map_err(|_| invalid("invalid server name"))?;
-        let upstream = if offers_h2 {
-            self.upstream_h2.clone()
-        } else {
-            self.upstream.clone()
-        };
-        let origin = tokio::time::timeout(
-            connect_timeout,
-            tokio_rustls::TlsConnector::from(upstream).connect(server_name, remote),
-        )
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-        let h2 = origin.get_ref().1.alpn_protocol() == Some(http2::ALPN_H2);
+        let origin = self
+            .connect_origin(host, &target, offers_h2, outbound, connect_timeout)
+            .await;
+        let h2 = origin
+            .as_ref()
+            .is_ok_and(|origin| origin.get_ref().1.alpn_protocol() == Some(http2::ALPN_H2));
 
         let acceptor = tokio_rustls::TlsAcceptor::from(self.leaf_config(host, h2)?);
         let client = tokio::time::timeout(
@@ -444,6 +433,10 @@ impl MitmEngine {
         )
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        // An unreachable origin still gets the app a decrypted connection
+        // (closed right away), as before origin-first ALPN, so the app sees
+        // the usual leaf instead of a failed handshake.
+        let origin = origin?;
 
         let authority = authority(host, flow.target.port(), HTTPS_PORT);
         if h2 {
@@ -459,6 +452,34 @@ impl MitmEngine {
             idle_timeout,
         )
         .await
+    }
+
+    /// Opens the TLS connection to the origin, offering `h2` only when the
+    /// app offered it.
+    async fn connect_origin(
+        &self,
+        host: &str,
+        target: &TargetAddr,
+        offers_h2: bool,
+        outbound: &dyn TcpOutbound,
+        connect_timeout: Duration,
+    ) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
+        let remote = tokio::time::timeout(connect_timeout, outbound.connect(target))
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        let server_name =
+            ServerName::try_from(host.to_string()).map_err(|_| invalid("invalid server name"))?;
+        let upstream = if offers_h2 {
+            self.upstream_h2.clone()
+        } else {
+            self.upstream.clone()
+        };
+        tokio::time::timeout(
+            connect_timeout,
+            tokio_rustls::TlsConnector::from(upstream).connect(server_name, remote),
+        )
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
     }
 
     /// Relays a plain HTTP flow through the rewrite hook, so `http://`
