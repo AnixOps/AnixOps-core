@@ -196,6 +196,10 @@ def overhead(bench, out, args):
     size = args.mib * MIB
     kinds = ("raw", "http", "https")
     samples = {"off": [], "on": []}
+    if args.diagnose:
+        # Not gated: capture on with the smallest budget, to tell what grows
+        # with the budget from what capture costs whatever the budget.
+        samples["on_min"] = []
     speeds = {kind: {"off": [], "on": []} for kind in kinds}
     try:
         # Throughput: one tunnel process, capture switched at run time before
@@ -218,8 +222,11 @@ def overhead(bench, out, args):
         # Memory: fresh processes with capture off and on from the start.
         for round_index in range(args.rounds):
             order = ("off", "on") if round_index % 2 == 0 else ("on", "off")
+            if args.diagnose:
+                order += ("on_min",)
             for mode in order:
-                tunnel = Tunnel(bench, out, capture=mode == "on", origin=origin)
+                tunnel = Tunnel(bench, out, capture=mode != "off", origin=origin,
+                                capture_bytes=64 * 1024 if mode == "on_min" else None)
                 try:
                     idle = tunnel.control("sample")
                     for kind in kinds:
@@ -542,6 +549,8 @@ def main():
     gates.add_argument("--min-answered", type=int, default=40)
     gates.add_argument("--max-throughput-drop-percent", type=float, default=15)
     gates.add_argument("--max-memory-increase-mb", type=float, default=10)
+    gates.add_argument("--diagnose", action="store_true",
+                       help="also measure capture on with the smallest budget (not gated)")
     gates.add_argument("--max-peak-mb", type=float, default=0, help="0 = report only")
     client = sub.add_parser("raw-client")
     client.add_argument("--addr", required=True)
