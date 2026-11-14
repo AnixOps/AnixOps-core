@@ -16,7 +16,9 @@
 //! larger one, `text/event-stream` responses and protocol upgrades stop
 //! rewriting for the rest of the connection and are relayed as they are.
 //! Requests whose response a rule reads ask for `Accept-Encoding: identity`,
-//! so body rules see plain text. Only HTTP/1.1 is offered to the client.
+//! so body rules see plain text. An app that offers `h2` gets HTTP/2 when
+//! the origin chooses it too; each stream then goes through the same hook
+//! and capture (see [`http2`]).
 //!
 //! Remote `[Map Local]` bodies (and Quantumult X `echo-response` files) are
 //! downloaded by the app and named in `resource_assets`; they are read once
@@ -38,6 +40,7 @@
 //! client's `script_notifications` command.
 
 mod http1;
+mod http2;
 #[cfg(feature = "scripts")]
 mod http_client;
 pub mod inspect;
@@ -63,7 +66,7 @@ use engine_native::{
 };
 #[cfg(feature = "scripts")]
 use engine_native::{NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig};
-use engine_outbound::{BoxFuture, TargetAddr, TcpOutbound};
+use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use mitm_policy::loon_map_local::MAP_LOCAL_REMOTE_DATA_MAX_BYTES;
 use mitm_policy::loon_plugin::{import_loon_plugin_with_resources, merged_plugin_source};
 use mitm_policy::AnixOpsMitmPluginService;
@@ -140,6 +143,8 @@ pub struct MitmEngine {
     script_outbound: Arc<OnceLock<Arc<dyn TcpOutbound>>>,
     issuer: Issuer<'static, KeyPair>,
     upstream: Arc<ClientConfig>,
+    /// `upstream` offering `h2` before `http/1.1`, for apps that offer it.
+    upstream_h2: Arc<ClientConfig>,
     leaves: Mutex<HashMap<String, Arc<ServerConfig>>>,
     decisions: Mutex<HashMap<String, bool>>,
     next_request: AtomicU64,
@@ -232,6 +237,7 @@ impl MitmEngine {
             })
             .map_err(|_| "mitm upstream TLS is unavailable")?,
         );
+        let upstream_h2 = Arc::new(with_h2((*upstream).clone()));
         let script_outbound = Arc::new(OnceLock::new());
         let hook = NativeHttpMitmPluginHook::new(instance.clone(), service.clone());
         let scripts = !config.script_assets.is_empty();
@@ -253,6 +259,7 @@ impl MitmEngine {
             script_outbound,
             issuer,
             upstream,
+            upstream_h2,
             leaves: Mutex::new(HashMap::new()),
             decisions: Mutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
@@ -279,8 +286,16 @@ impl MitmEngine {
 
     /// Replaces the verifying upstream client, e.g. to trust a test origin.
     pub fn with_upstream_config(mut self, config: ClientConfig) -> Self {
+        self.upstream_h2 = Arc::new(with_h2(config.clone()));
         self.upstream = Arc::new(config);
         self
+    }
+
+    /// The id the rewrite hook gets for the next request.
+    fn next_request_id(&self) -> String {
+        self.next_request
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string()
     }
 
     /// Whether TLS to `host` is intercepted.
@@ -307,7 +322,19 @@ impl MitmEngine {
         decision
     }
 
-    fn leaf_config(&self, host: &str) -> io::Result<Arc<ServerConfig>> {
+    /// The leaf for `host`, offering `h2` when the origin chose it and
+    /// `http/1.1` otherwise.
+    fn leaf_config(&self, host: &str, h2: bool) -> io::Result<Arc<ServerConfig>> {
+        let config = self.leaf_config_h1(host)?;
+        if !h2 {
+            return Ok(config);
+        }
+        let mut config = (*config).clone();
+        config.alpn_protocols = vec![http2::ALPN_H2.to_vec()];
+        Ok(Arc::new(config))
+    }
+
+    fn leaf_config_h1(&self, host: &str) -> io::Result<Arc<ServerConfig>> {
         if let Some(config) = self
             .leaves
             .lock()
@@ -350,8 +377,10 @@ impl MitmEngine {
         Ok(config)
     }
 
-    /// Terminates the client's TLS, connects to the origin through `outbound`
-    /// and relays HTTP/1.1 through the rewrite hook until either side closes.
+    /// Connects to the origin through `outbound`, terminates the client's
+    /// TLS and relays HTTP/1.1 or HTTP/2 (whichever the origin chose among
+    /// the client's offers, see [`http2`]) through the rewrite hook until
+    /// either side closes.
     /// A plain HTTP flow is relayed as it is, without TLS on either side.
     /// A keep-alive client that sends nothing for `idle_timeout` is closed.
     ///
@@ -387,24 +416,34 @@ impl MitmEngine {
         }
         let host = flow.host.as_str();
         let target = TargetAddr::Ip(flow.target);
-        let acceptor = tokio_rustls::TlsAcceptor::from(self.leaf_config(host)?);
+        // The origin answers first, so the app is offered the protocol the
+        // origin chose and no request is translated between versions.
+        let offers_h2 = http2::offers_h2(&crate::sniff::client_hello_alpn(&flow.first));
+        let origin = self
+            .connect_origin(host, &target, offers_h2, outbound, connect_timeout)
+            .await;
+        let h2 = origin
+            .as_ref()
+            .is_ok_and(|origin| origin.get_ref().1.alpn_protocol() == Some(http2::ALPN_H2));
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(self.leaf_config(host, h2)?);
         let client = tokio::time::timeout(
             connect_timeout,
             acceptor.accept(Prefixed::new(flow.inbound, flow.first)),
         )
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-
-        let remote = tokio::time::timeout(connect_timeout, outbound.connect(&target))
-            .await
-            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-        let server_name =
-            ServerName::try_from(host.to_string()).map_err(|_| invalid("invalid server name"))?;
-        let origin = tokio_rustls::TlsConnector::from(self.upstream.clone())
-            .connect(server_name, remote)
-            .await?;
+        // An unreachable origin still gets the app a decrypted connection
+        // (closed right away), as before origin-first ALPN, so the app sees
+        // the usual leaf instead of a failed handshake.
+        let origin = origin?;
 
         let authority = authority(host, flow.target.port(), HTTPS_PORT);
+        if h2 {
+            return self
+                .relay_h2(client, origin, host, &authority, idle_timeout)
+                .await;
+        }
         self.relay(
             Conn::new(client, Vec::new()),
             Conn::new(origin, Vec::new()),
@@ -413,6 +452,34 @@ impl MitmEngine {
             idle_timeout,
         )
         .await
+    }
+
+    /// Opens the TLS connection to the origin, offering `h2` only when the
+    /// app offered it.
+    async fn connect_origin(
+        &self,
+        host: &str,
+        target: &TargetAddr,
+        offers_h2: bool,
+        outbound: &dyn TcpOutbound,
+        connect_timeout: Duration,
+    ) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
+        let remote = tokio::time::timeout(connect_timeout, outbound.connect(target))
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        let server_name =
+            ServerName::try_from(host.to_string()).map_err(|_| invalid("invalid server name"))?;
+        let upstream = if offers_h2 {
+            self.upstream_h2.clone()
+        } else {
+            self.upstream.clone()
+        };
+        tokio::time::timeout(
+            connect_timeout,
+            tokio_rustls::TlsConnector::from(upstream).connect(server_name, remote),
+        )
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
     }
 
     /// Relays a plain HTTP flow through the rewrite hook, so `http://`
@@ -492,10 +559,7 @@ impl MitmEngine {
                     }
                 }
             };
-            let request_id = self
-                .next_request
-                .fetch_add(1, Ordering::Relaxed)
-                .to_string();
+            let request_id = self.next_request_id();
             let report = self
                 .plan(NativePlainHttpMessage {
                     request_id: request_id.clone(),
@@ -818,6 +882,12 @@ impl Drop for Recording<'_> {
         let (store, id) = self.capture;
         store.add_exchange(*id, std::mem::take(&mut self.exchange));
     }
+}
+
+/// `config` offering `h2` before `http/1.1`.
+fn with_h2(mut config: ClientConfig) -> ClientConfig {
+    config.alpn_protocols = vec![http2::ALPN_H2.to_vec(), b"http/1.1".to_vec()];
+    config
 }
 
 /// Whether `first` starts a TLS handshake record.
