@@ -40,3 +40,9 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 - I4 吞吐：raw −2.7%、HTTP −0.3%、HTTPS 7.3%（同进程交替测；分进程测时 runner 波动可达 ±15%，不可用）。
 - I4 内存：峰值 87.7 → 93.6 MiB（+5.9 MiB）。最初是 +14.2 MiB，多出的部分是成倍增长的抓包缓冲留下的堆碎片；TCP 抓包改为 ≤16 KiB 分片、body 一次性分配后降到 +5.9 MiB。
 - 抓包关闭时 600 条短连接也会把峰值推到约 88 MiB，见下节 F8。
+
+## 短连接风暴 F8（2026-11-14，GitHub 托管 ubuntu runner）
+
+- 修复前：抓包关 600 条短连接峰值 87.7 MiB，每批 200 条结束 2 s 后仍全部挂着（约 7 s 才归零）。原因是 netstack 的 `poll_shutdown` 要等套接字到 CLOSED：隧道先发 FIN 的连接要等对端 FIN 加 smoltcp 10 s TIME-WAIT，期间整条转发（出站、TLS、缓冲）和套接字的两个窗口都不释放。
+- `poll_shutdown` 改为 FIN 排队即完成、TIME-WAIT 保留 1 s：41.7 MiB，转发 2 s 内全部释放；一批里的套接字大多同时停在 1 s 的 TIME-WAIT 里。
+- TIME-WAIT 保留 100 ms（只等 smoltcp 的延迟 ACK）：抓包关 22.7 MiB、抓包开 25.1 MiB，门槛 32 MiB。
