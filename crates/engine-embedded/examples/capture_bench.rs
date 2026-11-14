@@ -90,7 +90,9 @@ mod linux {
     }
 
     fn arg<'a>(args: &'a Args, key: &str) -> Option<&'a str> {
-        args.get(key).map(String::as_str).filter(|value| !value.is_empty())
+        args.get(key)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
     }
 
     fn port(args: &Args, key: &str) -> io::Result<u16> {
