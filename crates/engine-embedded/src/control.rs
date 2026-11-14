@@ -46,7 +46,9 @@
 //! The desktop local proxy and the packet tunnel runtime also answer
 //! `lan_share`, `start_lan_share` and `stop_lan_share` before this module
 //! sees them (feature `local-proxy`): sharing the engine with phones on the
-//! local network, see [`crate::lan_share`].
+//! local network, see [`crate::lan_share`]; and `replay_proxy`,
+//! `start_replay_proxy` and `stop_replay_proxy`: a `127.0.0.1` listener
+//! for the client's own requests, see [`crate::replay_proxy`].
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
 //! stops; see [`crate::capture`] for what is kept and its memory budget,

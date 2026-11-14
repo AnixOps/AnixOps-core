@@ -25,6 +25,8 @@
 //! - `lan_share` (feature `local-proxy`): the running engine opened to
 //!   phones on the local network that set this computer as their proxy,
 //!   with a setup page for the root certificate.
+//! - `replay_proxy` (feature `local-proxy`): a `127.0.0.1` listener with
+//!   one-time credentials for the client's own requests (replays).
 //! - `wireguard` (feature `wireguard`): with a single `outbound`, an IP-level
 //!   tunnel that bypasses the TCP/IP stack and seals packets straight to one
 //!   peer; in `routing.outbounds`, a node like any other (`outbound-wireguard`).
@@ -65,6 +67,8 @@ pub mod pro;
 pub mod process;
 pub mod profile;
 pub mod protocols;
+#[cfg(feature = "local-proxy")]
+pub mod replay_proxy;
 pub mod routing;
 pub mod rule_sets;
 pub use engine_outbound::protect;
@@ -182,6 +186,8 @@ pub struct EmbeddedRuntime {
     last_stats: TunnelStatsSnapshot,
     #[cfg(feature = "local-proxy")]
     lan_share: lan_share::LanShareSlot,
+    #[cfg(feature = "local-proxy")]
+    replay_proxy: replay_proxy::ReplayProxySlot,
 }
 
 impl EmbeddedRuntime {
@@ -257,6 +263,8 @@ impl EmbeddedRuntime {
             last_stats: TunnelStatsSnapshot::default(),
             #[cfg(feature = "local-proxy")]
             lan_share: lan_share::LanShareSlot::default(),
+            #[cfg(feature = "local-proxy")]
+            replay_proxy: replay_proxy::ReplayProxySlot::default(),
         }
     }
 
@@ -325,7 +333,10 @@ impl EmbeddedRuntime {
     /// Idempotent.
     pub fn stop(&mut self) {
         #[cfg(feature = "local-proxy")]
-        self.lan_share.stop();
+        {
+            self.lan_share.stop();
+            self.replay_proxy.stop();
+        }
         if let Some(mut tunnel) = self.tunnel.take() {
             tunnel.stop();
             self.last_stats = tunnel.stats();
@@ -375,14 +386,39 @@ impl EmbeddedRuntime {
         }
     }
 
-    /// The share commands of [`lan_share`]; a share only runs while the
-    /// tunnel does.
+    /// The commands of [`lan_share`] and [`replay_proxy`]; both listeners
+    /// only run while the tunnel does.
     #[cfg(feature = "local-proxy")]
     fn lan_share_control(
         &self,
         dispatcher: &Arc<Dispatcher>,
         request: &[u8],
     ) -> Option<Result<Vec<u8>, RuntimeError>> {
+        let decrypting =
+            || -> Result<Option<Arc<dyn inbound_mixed::ClientInterceptor>>, RuntimeError> {
+                Ok(match &self.interceptor {
+                    Some(interceptor) => Some(Arc::new(local_proxy::Decrypting::new(
+                        dispatcher.clone(),
+                        interceptor.clone(),
+                        tunnel_settings(&self.config)?,
+                    ))
+                        as Arc<dyn inbound_mixed::ClientInterceptor>),
+                    None => None,
+                })
+            };
+        let replay = self.replay_proxy.control(request, |decrypt| {
+            if self.tunnel.is_none() {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidArgument,
+                    "replay proxy needs a running tunnel",
+                ));
+            }
+            let interceptor = if decrypt { decrypting()? } else { None };
+            replay_proxy::ReplayProxy::start(dispatcher.clone(), interceptor)
+        });
+        if replay.is_some() {
+            return replay;
+        }
         self.lan_share.control(request, |options| {
             if self.tunnel.is_none() {
                 return Err(RuntimeError::new(
@@ -390,18 +426,9 @@ impl EmbeddedRuntime {
                     "lan share needs a running tunnel",
                 ));
             }
-            let decrypting = match &self.interceptor {
-                Some(interceptor) => Some(Arc::new(local_proxy::Decrypting::new(
-                    dispatcher.clone(),
-                    interceptor.clone(),
-                    tunnel_settings(&self.config)?,
-                ))
-                    as Arc<dyn inbound_mixed::ClientInterceptor>),
-                None => None,
-            };
             lan_share::LanShare::start(
                 dispatcher.clone(),
-                decrypting,
+                decrypting()?,
                 self.config.mitm_ca_certificate_der(),
                 options,
             )
