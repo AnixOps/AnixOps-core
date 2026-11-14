@@ -11,6 +11,7 @@
 | I3 HTTPS 解密成功率 | `testdata/capture-sites.txt` 的 60 个真实站点，直连可达的站点里，经隧道解密后状态码类别一致且交换进了抓包（HAR）的 ≥ 95% | `capture_bench` + `.github/scripts/capture-gates.py` | `capture-gates.yml` | 改动 engine-embedded / mitm-policy / netstack 等的 PR、main、手动；`release.yml` 发布前必跑 |
 | I4 抓包吞吐 | 同一隧道进程里抓包开 / 关相邻成对下载 256 MiB 共 10 对（raw TCP、明文 HTTP、HTTPS 解密），每对吞吐比的中位数下降 ≤ 15% | 同上 | 同上 | 同上 |
 | I4 抓包内存 | 抓包关 / 开各 3 个新进程，600 条短连接（16 并发，默认 2 MiB 预算），峰值 RSS（VmHWM）中位数增加 ≤ 10 MiB | 同上 | 同上 | 同上 |
+| F8 短连接风暴 | 抓包关，600 条短连接（raw / HTTP / HTTPS 解密各 200，16 并发）峰值 RSS（3 个进程中位数）≤ 32 MiB；每阶段结束 2 s 后没有仍打开的转发 | 同上 | `capture-gates.yml` | 同 I3/I4 |
 | C4 IPC 模糊测试 | `networkcore_ios_runtime_control` 不 panic、回答必为 JSON 对象、错误码在文档集合内 | `crates/engine-embedded/fuzz` 的 `runtime_control` | `ci.yml` / HTTP/2 MITM fuzz | 每个 Rust PR（30 s）、main（60 s） |
 
 R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR 上 head 超出门槛时，会在同一台 runner 上再测 base；head 不比 base 慢 15% 以上就只告警（runner 偏慢，不是回归），否则失败。
@@ -38,4 +39,10 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 - I3：60/60 站点解密成功（100%）。压测中发现负载下 ClientHello 晚于 100 ms 或被分段时漏解密，已修（80/443 首包等待 1 s 并读完整 TLS 记录）。
 - I4 吞吐：raw −2.7%、HTTP −0.3%、HTTPS 7.3%（同进程交替测；分进程测时 runner 波动可达 ±15%，不可用）。
 - I4 内存：峰值 87.7 → 93.6 MiB（+5.9 MiB）。最初是 +14.2 MiB，多出的部分是成倍增长的抓包缓冲留下的堆碎片；TCP 抓包改为 ≤16 KiB 分片、body 一次性分配后降到 +5.9 MiB。
-- 抓包关闭时 600 条短连接也会把峰值推到约 88 MiB：关闭的连接还会挂 2–5 s（每个隧道连接带收发缓冲），与抓包无关，另行跟进。
+- 抓包关闭时 600 条短连接也会把峰值推到约 88 MiB，见下节 F8。
+
+## 短连接风暴 F8（2026-11-14，GitHub 托管 ubuntu runner）
+
+- 修复前：抓包关 600 条短连接峰值 87.7 MiB，每批 200 条结束 2 s 后仍全部挂着（约 7 s 才归零）。原因是 netstack 的 `poll_shutdown` 要等套接字到 CLOSED：隧道先发 FIN 的连接要等对端 FIN 加 smoltcp 10 s TIME-WAIT，期间整条转发（出站、TLS、缓冲）和套接字的两个窗口都不释放。
+- `poll_shutdown` 改为 FIN 排队即完成、TIME-WAIT 保留 1 s：41.7 MiB，转发 2 s 内全部释放；一批里的套接字大多同时停在 1 s 的 TIME-WAIT 里。
+- TIME-WAIT 保留 100 ms（只等 smoltcp 的延迟 ACK）：抓包关 22.7 MiB、抓包开 25.1 MiB，门槛 32 MiB。

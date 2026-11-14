@@ -20,6 +20,12 @@ Linux runner:
   throughput with capture on is at most --max-throughput-drop-percent below
   off, for every workload; the median peak RSS (VmHWM) with capture on is at
   most --max-memory-increase-mb above off.
+- short-connection storm (F8): the same memory rounds are 600 short
+  connections in a row (16 at a time). With capture off the median peak RSS
+  is at most --max-storm-peak-mb (the iOS Network Extension is killed at
+  about 50 MiB), and 2 s after each phase no relay is left open
+  (--max-active-after-phase): a closed connection must give its buffers
+  back right away, not after a TIME-WAIT.
 
 Subcommand ``raw-client`` is the raw TCP reader run inside the namespace.
 """
@@ -319,6 +325,23 @@ def overhead(bench, out, args):
         result["failures"].append(
             f"peak RSS with capture on is {peak_on:.1f} MiB (limit {args.max_peak_mb:g} MiB)"
         )
+    if peak_off > args.max_storm_peak_mb:
+        result["failures"].append(
+            f"short-connection storm: peak RSS with capture off is {peak_off:.1f} MiB "
+            f"(limit {args.max_storm_peak_mb:g} MiB)"
+        )
+    lingering = max(
+        (count or 0)
+        for mode in ("off", "on")
+        for record in samples[mode]
+        for count in record["tcp_active_after_phase"].values()
+    )
+    result["memory"]["active_after_phase_max"] = lingering
+    if lingering > args.max_active_after_phase:
+        result["failures"].append(
+            f"short-connection storm: {lingering} relays still open 2 s after their phase "
+            f"(limit {args.max_active_after_phase})"
+        )
     failed_requests = sum(r["request_failures"] for mode in samples for r in samples[mode])
     if failed_requests:
         result["failures"].append(f"{failed_requests} short requests failed")
@@ -472,6 +495,10 @@ def summary(result, args):
             f"| Peak RSS (VmHWM) | {memory['peak_off_mb']:.1f} MiB | {memory['peak_on_mb']:.1f} MiB | "
             f"{memory['increase_mb']:.1f} MiB | ≤ {args.max_memory_increase_mb:g} MiB |",
             f"| Idle RSS after start | {memory['idle_off_mb']:.1f} MiB | {memory['idle_on_mb']:.1f} MiB | | |",
+            f"| Short-connection storm peak (F8) | {memory['peak_off_mb']:.1f} MiB | | | "
+            f"Off ≤ {args.max_storm_peak_mb:g} MiB |",
+            f"| Relays open 2 s after a phase (max) | {memory.get('active_after_phase_max', '')} | | | "
+            f"≤ {args.max_active_after_phase} |",
         ]
         for phase, row in memory.get("phases", {}).items():
             lines.append(
@@ -563,6 +590,10 @@ def main():
     gates.add_argument("--diagnose", action="store_true",
                        help="also measure capture on with the smallest budget (not gated)")
     gates.add_argument("--max-peak-mb", type=float, default=0, help="0 = report only")
+    gates.add_argument("--max-storm-peak-mb", type=float, default=32,
+                       help="peak RSS with capture off over the short-connection storm")
+    gates.add_argument("--max-active-after-phase", type=int, default=0,
+                       help="relays still open 2 s after a short-connection phase")
     client = sub.add_parser("raw-client")
     client.add_argument("--addr", required=True)
     client.add_argument("--bytes", type=int, required=True)
