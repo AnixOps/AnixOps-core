@@ -182,7 +182,7 @@ fn term(token: &str, at: usize) -> Result<Term, FilterError> {
         "note" => Test::Note(lower),
         "size" => Test::Size(size(&lower).ok_or_else(|| bad(0))?),
         "header" => match lower.split_once('=') {
-            Some((name, _)) if name.is_empty() => return Err(bad(0)),
+            Some(("", _)) => return Err(bad(0)),
             Some((name, value)) => Test::Header(name.to_string(), Some(value.to_string())),
             None => Test::Header(lower, None),
         },

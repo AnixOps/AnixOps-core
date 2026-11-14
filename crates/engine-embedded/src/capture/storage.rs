@@ -705,7 +705,7 @@ mod tests {
 
         // Another key reads nothing.
         let other = Storage::new(dir.to_str().unwrap(), &[8u8; KEY_LEN], None).unwrap();
-        assert_eq!(other.load(&id).unwrap_err(), StorageError::Unreadable);
+        assert_eq!(other.load(&id).err(), Some(StorageError::Unreadable));
         assert_eq!(other.list(1_000_001)[0]["unreadable"], true);
 
         assert!(storage.delete(&id).unwrap());
@@ -728,8 +728,8 @@ mod tests {
         assert_eq!(storage.list(1_000 + 7 * DAY_MS + 1).len(), 1);
         assert!(dir.join("notes.txt").exists());
         assert_eq!(
-            storage.load("../../etc/passwd").unwrap_err(),
-            StorageError::NoSuchSession
+            storage.load("../../etc/passwd").err(),
+            Some(StorageError::NoSuchSession)
         );
         assert_eq!(
             storage.delete("1-zz").unwrap_err(),

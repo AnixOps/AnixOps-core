@@ -246,7 +246,7 @@ impl MitmEngine {
                     pump(&mut request_body, &mut send, None).await?;
                     let response = response.await.map_err(h2_error)?;
                     return self
-                        .forward_response(respond, response, None, recording.as_mut(), is_head)
+                        .forward_response(respond, response, None, recording.as_mut())
                         .await;
                 }
             }
@@ -399,7 +399,7 @@ impl MitmEngine {
             }
             let response = Response::from_parts(parts, body);
             return self
-                .forward_response(respond, response, None, recording, is_head)
+                .forward_response(respond, response, None, recording)
                 .await;
         }
         let no_body = is_head
@@ -460,7 +460,7 @@ impl MitmEngine {
                 }
                 let response = Response::from_parts(parts, body);
                 return self
-                    .forward_response(respond, response, Some(prefix), recording, is_head)
+                    .forward_response(respond, response, Some(prefix), recording)
                     .await;
             }
         };
@@ -489,7 +489,7 @@ impl MitmEngine {
             http::header::CONTENT_LENGTH,
             HeaderValue::from(report.body.len()),
         );
-        if let Some(recording) = recording.as_deref_mut() {
+        if let Some(recording) = recording {
             recording.exchange.status = Some(status.as_u16());
             recording.exchange.response_headers = header_list(&headers);
             recording.exchange.response_body = CapturedBody::of(&report.body);
@@ -517,7 +517,6 @@ impl MitmEngine {
         response: Response<RecvStream>,
         prefix: Option<Vec<u8>>,
         recording: Option<&mut Recording<'_>>,
-        is_head: bool,
     ) -> io::Result<()> {
         let (parts, mut body) = response.into_parts();
         let mut head = Response::new(());
