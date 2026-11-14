@@ -54,6 +54,8 @@ pub const MAX_CAPTURED_CONNECTIONS: usize = 1024;
 /// Bytes counted for one connection besides its data, so many empty
 /// connections still use the budget.
 const CONNECTION_OVERHEAD: usize = 256;
+/// Largest piece one chunk of a TCP stream is kept in.
+const CHUNK_PIECE_BYTES: usize = 16 * 1024;
 /// Bytes counted for one chunk besides its data.
 const CHUNK_OVERHEAD: usize = 32;
 
@@ -203,6 +205,20 @@ struct Captured {
 }
 
 impl Captured {
+    /// The chunks with the pieces of one TCP run joined again.
+    fn joined_chunks(&self) -> Vec<(Direction, u64, Vec<u8>)> {
+        let mut joined: Vec<(Direction, u64, Vec<u8>)> = Vec::new();
+        for chunk in &self.chunks {
+            match joined.last_mut() {
+                Some(last) if self.network == Network::Tcp && last.0 == chunk.direction => {
+                    last.2.extend_from_slice(&chunk.data);
+                }
+                _ => joined.push((chunk.direction, chunk.at_ms, chunk.data.clone())),
+            }
+        }
+        joined
+    }
+
     fn json(&self, id: u64) -> Value {
         let direction = |index: usize| {
             json!({
@@ -221,13 +237,12 @@ impl Captured {
             "decrypted": self.decrypted,
             "upload": direction(0),
             "download": direction(1),
-            "chunks": self
-                .chunks
-                .iter()
-                .map(|chunk| json!({
-                    "dir": chunk.direction,
-                    "at_ms": chunk.at_ms,
-                    "data_base64": base64_encode(&chunk.data),
+            "chunks": self.joined_chunks()
+                .into_iter()
+                .map(|(direction, at_ms, data)| json!({
+                    "dir": direction,
+                    "at_ms": at_ms,
+                    "data_base64": base64_encode(&data),
                 }))
                 .collect::<Vec<_>>(),
             "http": self.http.iter().map(HttpExchange::json).collect::<Vec<_>>(),
@@ -389,17 +404,17 @@ impl CaptureStore {
         let data = &data[..take];
         let now = unix_millis();
         // A TCP stream is one byte stream per direction: consecutive pieces
-        // the same way join one chunk. Datagrams stay apart.
+        // the same way join one chunk, up to CHUNK_PIECE_BYTES so the
+        // allocator reuses the freed pieces instead of growing the heap with
+        // ever larger buffers (shown joined again, see `Captured::json`).
+        // Datagrams stay apart.
         let merge = captured.network == Network::Tcp
-            && captured
-                .chunks
-                .last()
-                .is_some_and(|last| last.direction == direction);
+            && captured.chunks.last().is_some_and(|last| {
+                last.direction == direction && last.data.len() + take <= CHUNK_PIECE_BYTES
+            });
         let added = if merge {
             if let Some(last) = captured.chunks.last_mut() {
-                // `room` is the most this chunk can still grow by.
-                let limit = last.data.len() + room;
-                reserve_capped(&mut last.data, take, limit);
+                reserve_capped(&mut last.data, take, CHUNK_PIECE_BYTES);
                 last.data.extend_from_slice(data);
             }
             take
@@ -1357,6 +1372,32 @@ mod tests {
         // The synthetic client fd00::1 talks to the real IPv6 server.
         let client = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert!(pcap.windows(16).any(|window| window == client));
+    }
+
+    #[test]
+    fn a_long_tcp_run_is_kept_in_pieces_and_shown_whole() {
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(3, Network::Tcp, None, "192.0.2.1:80", 1);
+        let block = vec![7u8; 1460];
+        for _ in 0..40 {
+            store.record(3, Direction::Down, &block);
+        }
+        {
+            let inner = lock(&store.inner);
+            let captured = &inner.connections[&3];
+            assert!(captured.chunks.len() > 1);
+            assert!(captured
+                .chunks
+                .iter()
+                .all(|chunk| chunk.data.capacity() <= CHUNK_PIECE_BYTES));
+        }
+        let value = store.connection_json(3).unwrap();
+        let chunks = value["chunks"].as_array().unwrap();
+        assert_eq!(chunks.len(), 1);
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(chunks[0]["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(data.len(), 40 * 1460);
     }
 
     #[test]

@@ -89,8 +89,11 @@ pub struct Conn<S> {
     tap: Option<Tap>,
 }
 
+/// Kept as the pieces read and joined once at the end, so a body costs one
+/// allocation of its kept size instead of a chain of ever larger buffers.
 struct Tap {
-    data: Vec<u8>,
+    pieces: Vec<Vec<u8>>,
+    kept: usize,
     size: u64,
     limit: usize,
 }
@@ -98,10 +101,19 @@ struct Tap {
 impl Tap {
     fn keep(&mut self, bytes: &[u8]) {
         self.size = self.size.saturating_add(bytes.len() as u64);
-        let room = self.limit.saturating_sub(self.data.len());
-        let take = bytes.len().min(room);
-        crate::capture::reserve_capped(&mut self.data, take, self.limit);
-        self.data.extend_from_slice(&bytes[..take]);
+        let take = bytes.len().min(self.limit.saturating_sub(self.kept));
+        if take > 0 {
+            self.pieces.push(bytes[..take].to_vec());
+            self.kept += take;
+        }
+    }
+
+    fn into_data(self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(self.kept);
+        for piece in self.pieces {
+            data.extend_from_slice(&piece);
+        }
+        data
     }
 }
 
@@ -118,7 +130,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     /// copies, until [`Conn::take_tap`].
     pub fn start_tap(&mut self, limit: usize) {
         self.tap = Some(Tap {
-            data: Vec::new(),
+            pieces: Vec::new(),
+            kept: 0,
             size: 0,
             limit,
         });
@@ -126,7 +139,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 
     /// The bytes kept since [`Conn::start_tap`] and the body length seen.
     pub fn take_tap(&mut self) -> Option<(Vec<u8>, u64)> {
-        self.tap.take().map(|tap| (tap.data, tap.size))
+        self.tap.take().map(|tap| {
+            let size = tap.size;
+            (tap.into_data(), size)
+        })
     }
 
     /// The stream and any bytes read but not consumed.
