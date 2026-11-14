@@ -34,6 +34,13 @@
 //! | `clear_capture` | | [`crate::capture::CaptureStatus`] |
 //! | `capture_connection` | `id` | `{"capture": {...} \| null}`: kept bytes and decrypted HTTP messages of one connection |
 //! | `export_capture` | `format` (`pcapng` \| `har`), optional `id` | `{"format", "file_name", "content_type", "size", "data_base64"}` |
+//! | `pro_status` | | [`crate::pro::ProStatus`] |
+//! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
+//!
+//! The desktop local proxy and the packet tunnel runtime also answer
+//! `lan_share`, `start_lan_share` and `stop_lan_share` before this module
+//! sees them (feature `local-proxy`): sharing the engine with phones on the
+//! local network, see [`crate::lan_share`].
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
 //! stops; see [`crate::capture`] for what is kept and its memory budget.
@@ -72,6 +79,7 @@ use serde_json::json;
 use crate::capture::{self, ExportFormat};
 use crate::connections::{Dispatcher, Mode};
 use crate::metrics;
+use crate::pro;
 use crate::tunnel::FlowInterceptor;
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -147,6 +155,11 @@ enum ControlRequest {
         format: ExportFormat,
         #[serde(default)]
         id: Option<u64>,
+    },
+    ProStatus,
+    SetProLicense {
+        #[serde(default)]
+        license: Option<String>,
     },
 }
 
@@ -351,6 +364,10 @@ pub fn handle_with_interceptor(
         ControlRequest::ExportCapture { format, id } => {
             // The file goes out as written, without a JSON value in between.
             return Ok(capture::export_answer(tracker.capture(), format, id));
+        }
+        ControlRequest::ProStatus => serde_json::to_value(pro::status()),
+        ControlRequest::SetProLicense { license } => {
+            serde_json::to_value(pro::set_license(license.as_deref()))
         }
         ControlRequest::ReloadRules { rules, dry_run } => {
             let routed = dispatcher
