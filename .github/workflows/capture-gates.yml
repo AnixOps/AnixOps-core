@@ -95,7 +95,7 @@ jobs:
           python3 .github/scripts/capture-gates.py run \
             --bench target/release/examples/capture_bench \
             --sites testdata/capture-sites.txt \
-            --out results --only "${ONLY}" --rounds "${ROUNDS}" --diagnose
+            --out results --only "${ONLY}" --rounds "${ROUNDS}"
 
       - name: Summary
         if: always()
