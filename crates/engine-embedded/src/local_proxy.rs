@@ -12,7 +12,9 @@
 //! [`FlowInterceptor`], and what it does not claim is relayed untouched.
 //!
 //! The `start_lan_share` control request opens the same engine to phones on
-//! the local network; see [`crate::lan_share`].
+//! the local network; see [`crate::lan_share`]. `start_replay_proxy` opens
+//! a `127.0.0.1` listener for the client's own requests; see
+//! [`crate::replay_proxy`].
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -28,6 +30,7 @@ use tokio::sync::oneshot;
 use crate::config::RuntimeConfig;
 use crate::connections::Dispatcher;
 use crate::lan_share::{LanShare, LanShareSlot};
+use crate::replay_proxy::{ReplayProxy, ReplayProxySlot};
 use crate::tunnel::{
     FlowInterceptor, InterceptedFlow, TunnelSettings, TunnelStats, TunnelStatsSnapshot,
 };
@@ -43,6 +46,7 @@ pub struct LocalProxy {
     /// Root certificate of the `mitm` section (DER), for the share's setup page.
     ca_certificate: Option<Vec<u8>>,
     lan_share: LanShareSlot,
+    replay_proxy: ReplayProxySlot,
     shutdown_tx: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -166,6 +170,7 @@ impl LocalProxy {
             stats,
             ca_certificate,
             lan_share: LanShareSlot::default(),
+            replay_proxy: ReplayProxySlot::default(),
             shutdown_tx: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -204,6 +209,19 @@ impl LocalProxy {
 
     /// Answers one [`control`] request, such as the connection list.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        let replay = self.replay_proxy.control(request, |decrypt| {
+            let interceptor = if decrypt {
+                self.decrypting
+                    .clone()
+                    .map(|decrypting| decrypting as Arc<dyn ClientInterceptor>)
+            } else {
+                None
+            };
+            ReplayProxy::start(self.dispatcher.clone(), interceptor)
+        });
+        if let Some(answer) = replay {
+            return answer;
+        }
         let shared = self.lan_share.control(request, |options| {
             LanShare::start(
                 self.dispatcher.clone(),
@@ -233,6 +251,7 @@ impl LocalProxy {
     /// Stops listening and drops every connection. Idempotent.
     pub fn stop(&mut self) {
         self.lan_share.stop();
+        self.replay_proxy.stop();
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
