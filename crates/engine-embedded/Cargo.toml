@@ -17,7 +17,7 @@ hysteria2 = ["dep:outbound-hysteria2"]
 iwan = ["dep:outbound-iwan"]
 # Desktop local proxy (SOCKS5/HTTP listener), URL delay tests and remote rule
 # set downloads (with optional Ed25519 signatures).
-local-proxy = ["dep:inbound-mixed", "dep:ring", "dep:transport-tls"]
+local-proxy = ["dep:inbound-mixed", "dep:transport-tls"]
 mieru = ["dep:outbound-mieru"]
 # HTTPS decryption with the shared mitm-policy rewrite engine (src/mitm).
 # HTTP/2 to apps and origins that offer it (src/mitm/http2.rs) uses `h2`.
@@ -37,7 +37,7 @@ vless = ["dep:outbound-vless", "tls-fingerprints"]
 vmess = ["dep:outbound-vmess"]
 # Whole-device WireGuard tunnel (a single `outbound`) plus the routable
 # WireGuard outbound of `outbound-wireguard` for routed configs.
-wireguard = ["dep:boringtun", "dep:outbound-wireguard", "dep:ring"]
+wireguard = ["dep:boringtun", "dep:outbound-wireguard"]
 
 [dependencies]
 # Capture exports (src/capture.rs), certificates and keys.
@@ -69,7 +69,9 @@ outbound-vless = { path = "../outbound-vless", optional = true }
 outbound-vmess = { path = "../outbound-vmess", optional = true }
 outbound-wireguard = { path = "../outbound-wireguard", optional = true }
 rcgen = { version = "0.14.8", features = ["x509-parser"], optional = true }
-ring = { version = "0.17", optional = true }
+# Always on: saved capture sessions are sealed with ChaCha20-Poly1305
+# (src/capture/storage.rs).
+ring = "0.17"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

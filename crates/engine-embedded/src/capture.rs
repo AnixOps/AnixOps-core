@@ -33,10 +33,17 @@
 //! proxy protocol and decrypted HTTP. The wire bytes of the outbound
 //! protocol (ANX, Shadowsocks, VLESS, ...) never reach this module, so no
 //! capture, export or saved session can show them.
+//!
+//! With `set_capture_storage` the client names a directory and a key it
+//! keeps; `save_capture` then seals what the store holds into an encrypted
+//! session file there, `load_capture` brings one back for viewing and
+//! export, and sessions older than the retention (default 7 days) are
+//! deleted. See [`storage`].
 
 pub mod export;
 pub mod filter;
 pub mod redact;
+pub mod storage;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -241,6 +248,19 @@ struct Captured {
 }
 
 impl Captured {
+    /// What the connection counts against the budget, from its contents.
+    fn memory_estimate(&self) -> usize {
+        CONNECTION_OVERHEAD
+            + self.destination.len()
+            + self.host.as_ref().map_or(0, String::len)
+            + self
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.len() + CHUNK_OVERHEAD)
+                .sum::<usize>()
+            + self.http.iter().map(HttpExchange::memory).sum::<usize>()
+    }
+
     fn json(&self, id: u64) -> Value {
         let direction = |index: usize| {
             json!({
@@ -313,6 +333,8 @@ pub struct CaptureStore {
     /// The `seq` the next filed exchange gets.
     next_seq: AtomicU64,
     inner: Mutex<Inner>,
+    /// Where `save_capture` writes sessions, once the client set it.
+    storage: Mutex<Option<storage::Storage>>,
 }
 
 impl Default for CaptureStore {
@@ -322,6 +344,7 @@ impl Default for CaptureStore {
             max_total_bytes: AtomicUsize::new(DEFAULT_MAX_TOTAL_BYTES),
             next_seq: AtomicU64::new(1),
             inner: Mutex::default(),
+            storage: Mutex::default(),
         }
     }
 }
@@ -559,6 +582,95 @@ impl CaptureStore {
             }
         });
         serde_json::to_vec_pretty(&har).unwrap_or_default()
+    }
+
+    /// Sets where sessions are saved and the key that seals them, and
+    /// deletes sessions past the retention:
+    /// `{"retention_days", "purged"}`.
+    pub fn set_storage(
+        &self,
+        dir: &str,
+        key: &[u8],
+        retention_days: Option<u32>,
+    ) -> Result<Value, storage::StorageError> {
+        let storage = storage::Storage::new(dir, key, retention_days)?;
+        let purged = storage.purge(unix_millis());
+        let answer = json!({
+            "retention_days": storage.retention_days(),
+            "purged": purged,
+        });
+        *lock(&self.storage) = Some(storage);
+        Ok(answer)
+    }
+
+    /// Seals what the store holds into a new session: `{"session": {...}}`.
+    pub fn save_session(&self, name: Option<&str>) -> Result<Value, storage::StorageError> {
+        let storage = lock(&self.storage);
+        let storage = storage
+            .as_ref()
+            .ok_or(storage::StorageError::NotConfigured)?;
+        let now = unix_millis();
+        storage.purge(now);
+        let inner = lock(&self.inner);
+        let session = storage.save(&inner, name, now)?;
+        Ok(json!({ "session": session }))
+    }
+
+    /// The saved sessions, newest first: `{"sessions": [...]}`.
+    pub fn sessions(&self) -> Result<Value, storage::StorageError> {
+        let storage = lock(&self.storage);
+        let storage = storage
+            .as_ref()
+            .ok_or(storage::StorageError::NotConfigured)?;
+        Ok(json!({ "sessions": storage.list(unix_millis()) }))
+    }
+
+    /// Replaces what the store holds with session `id` and turns live
+    /// capture off. Its exchanges get new `seq`s after every earlier one,
+    /// and `dropped_before_seq` covers all earlier rows.
+    pub fn load_session(&self, id: &str) -> Result<CaptureStatus, storage::StorageError> {
+        let loaded = {
+            let storage = lock(&self.storage);
+            storage
+                .as_ref()
+                .ok_or(storage::StorageError::NotConfigured)?
+                .load(id)?
+        };
+        self.enabled.store(false, Ordering::Relaxed);
+        {
+            let mut inner = lock(&self.inner);
+            inner.dropped_seq = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
+            inner.connections.clear();
+            inner.used = 0;
+            let mut connections = loaded
+                .into_iter()
+                .inspect(|(_, captured)| inner.used += captured.memory)
+                .collect::<Vec<_>>();
+            let mut order = connections
+                .iter_mut()
+                .flat_map(|(_, captured)| captured.http.iter_mut())
+                .collect::<Vec<_>>();
+            order.sort_by_key(|exchange| exchange.seq);
+            for exchange in order {
+                exchange.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            }
+            inner.connections.extend(connections);
+            let budget = self.max_total_bytes.load(Ordering::Relaxed);
+            if inner.used > budget {
+                self.max_total_bytes
+                    .store(inner.used.min(MAX_TOTAL_BYTES_LIMIT), Ordering::Relaxed);
+            }
+        }
+        Ok(self.status())
+    }
+
+    /// Deletes session `id`: `{"deleted": bool}`.
+    pub fn delete_session(&self, id: &str) -> Result<Value, storage::StorageError> {
+        let storage = lock(&self.storage);
+        let storage = storage
+            .as_ref()
+            .ok_or(storage::StorageError::NotConfigured)?;
+        Ok(json!({ "deleted": storage.delete(id)? }))
     }
 
     /// Copies of the selected decrypted exchanges, redacted when asked.

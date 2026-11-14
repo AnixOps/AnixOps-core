@@ -34,6 +34,11 @@
 //! | `clear_capture` | | [`crate::capture::CaptureStatus`] |
 //! | `capture_connection` | `id` | `{"capture": {...} \| null}`: kept bytes and decrypted HTTP messages of one connection |
 //! | `export_capture` | `format` (`pcapng` \| `har` \| `curl` \| `code` \| `postman` \| `insomnia`), optional `id`, `exchange` (index in that connection's `http`), `language` (`code`: `python` \| `javascript` \| `swift` \| `kotlin` \| `go`), `redact` (default `true`) | `{"format", "file_name", "content_type", "size", "redacted", "data_base64"}` |
+//! | `set_capture_storage` | `dir`, `key_base64` (32 bytes the client keeps), optional `retention_days` (default 7, 1–365) | `{"retention_days", "purged"}`: where `save_capture` writes; old sessions are deleted |
+//! | `save_capture` | optional `name` | `{"session": {"session", "name", "saved_at_ms", "expires_at_ms", "size", "connections", "requests"}}`: seals what capture holds |
+//! | `capture_sessions` | | `{"sessions": [...]}`, newest first; a session this key cannot open has `"unreadable": true` |
+//! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off |
+//! | `delete_capture` | `session` | `{"deleted": bool}` |
 //! | `capture_requests` | optional `since_seq`, `limit`, `filter` | `{"requests": [...], "last_seq", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange |
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
@@ -157,6 +162,23 @@ enum ControlRequest {
         language: Language,
         #[serde(default = "default_true")]
         redact: bool,
+    },
+    SetCaptureStorage {
+        dir: String,
+        key_base64: String,
+        #[serde(default)]
+        retention_days: Option<u32>,
+    },
+    SaveCapture {
+        #[serde(default)]
+        name: Option<String>,
+    },
+    CaptureSessions,
+    LoadCapture {
+        session: String,
+    },
+    DeleteCapture {
+        session: String,
     },
     CaptureRequests {
         #[serde(default)]
@@ -385,6 +407,34 @@ pub fn handle_with_interceptor(
             // The file goes out as written, without a JSON value in between.
             return Ok(capture::export_answer(tracker.capture(), &request));
         }
+        ControlRequest::SetCaptureStorage {
+            dir,
+            key_base64,
+            retention_days,
+        } => {
+            use base64::Engine as _;
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(key_base64.trim())
+                .map_err(|_| storage_error(capture::storage::StorageError::InvalidKey))?;
+            let set = tracker.capture().set_storage(&dir, &key, retention_days);
+            Ok(set.map_err(storage_error)?)
+        }
+        ControlRequest::SaveCapture { name } => {
+            let saved = tracker.capture().save_session(name.as_deref());
+            Ok(saved.map_err(storage_error)?)
+        }
+        ControlRequest::CaptureSessions => {
+            let sessions = tracker.capture().sessions();
+            Ok(sessions.map_err(storage_error)?)
+        }
+        ControlRequest::LoadCapture { session } => {
+            let status = tracker.capture().load_session(&session);
+            serde_json::to_value(status.map_err(storage_error)?)
+        }
+        ControlRequest::DeleteCapture { session } => {
+            let deleted = tracker.capture().delete_session(&session);
+            Ok(deleted.map_err(storage_error)?)
+        }
         ControlRequest::CaptureRequests {
             since_seq,
             limit,
@@ -428,6 +478,10 @@ fn script(
     interceptor
         .and_then(|interceptor| interceptor.script_control(&request))
         .ok_or_else(|| invalid("this config runs no plugin scripts"))
+}
+
+fn storage_error(error: capture::storage::StorageError) -> RuntimeError {
+    invalid(error.message())
 }
 
 fn default_true() -> bool {
