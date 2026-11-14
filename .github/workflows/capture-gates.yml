@@ -1,0 +1,114 @@
+name: Capture gates
+
+# Debugging-mode quality and overhead gates (decisions I3 / I4, see
+# docs/performance-ci.md): HTTPS decryption success on a fixed set of real
+# sites, and throughput / peak memory of the packet tunnel with capture on
+# against off. crates/engine-embedded/examples/capture_bench.rs provides the
+# processes, .github/scripts/capture-gates.py runs the clients in a network
+# namespace and applies the gates. Release workflows call this one
+# (workflow_call) so a release whose kernel misses a gate does not publish.
+
+on:
+  pull_request:
+    paths:
+      - crates/engine-embedded/**
+      - crates/engine-outbound/**
+      - crates/mitm-policy/**
+      - crates/engine-native/**
+      - crates/netstack-smoltcp/**
+      - crates/transport-tls/**
+      - Cargo.lock
+      - testdata/capture-sites.txt
+      - .github/scripts/capture-gates.py
+      - .github/workflows/capture-gates.yml
+  push:
+    branches: [main]
+    paths:
+      - crates/engine-embedded/**
+      - crates/mitm-policy/**
+      - crates/netstack-smoltcp/**
+      - Cargo.lock
+      - testdata/capture-sites.txt
+      - .github/scripts/capture-gates.py
+      - .github/workflows/capture-gates.yml
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Which gates: all, decrypt or overhead"
+        type: choice
+        options: [all, decrypt, overhead]
+        default: all
+      rounds:
+        description: "Tunnel processes per mode (median is gated)"
+        type: string
+        default: "3"
+  workflow_call:
+    inputs:
+      ref:
+        description: "networkcore_anixops commit to measure (empty = the caller's)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capture-gates-${{ github.ref }}-${{ inputs.ref || '' }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: Capture gates (decryption, throughput, memory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      ONLY: ${{ inputs.only || 'all' }}
+      ROUNDS: ${{ inputs.rounds || '3' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.ref && 'AnixOps/networkcore_anixops' || github.repository }}
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: true
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+
+      - name: Build
+        run: cargo build --locked --release -p engine-embedded --example capture_bench
+
+      - name: Run
+        shell: bash
+        run: |
+          set -euo pipefail
+          nproc
+          curl --version | head -n1
+          python3 .github/scripts/capture-gates.py run \
+            --bench target/release/examples/capture_bench \
+            --sites testdata/capture-sites.txt \
+            --out results --only "${ONLY}" --rounds "${ROUNDS}"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: cat results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-gates
+          path: |
+            results/*.json
+            results/*.md
+          retention-days: 14
+          if-no-files-found: ignore
