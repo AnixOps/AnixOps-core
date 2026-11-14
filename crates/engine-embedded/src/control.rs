@@ -35,6 +35,11 @@
 //! | `capture_connection` | `id` | `{"capture": {...} \| null}`: kept bytes and decrypted HTTP messages of one connection |
 //! | `export_capture` | `format` (`pcapng` \| `har`), optional `id` | `{"format", "file_name", "content_type", "size", "data_base64"}` |
 //!
+//! The desktop local proxy and the packet tunnel runtime also answer
+//! `lan_share`, `start_lan_share` and `stop_lan_share` before this module
+//! sees them (feature `local-proxy`): sharing the engine with phones on the
+//! local network, see [`crate::lan_share`].
+//!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
 //! stops; see [`crate::capture`] for what is kept and its memory budget.
 //!

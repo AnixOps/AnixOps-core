@@ -20,6 +20,9 @@
 //! - `local_proxy` (feature `local-proxy`): the desktop mode, the same
 //!   outbounds behind a SOCKS5/HTTP listener from `inbound-mixed`, and
 //!   `delay`, URL delay tests of a node's outbound.
+//! - `lan_share` (feature `local-proxy`): the running engine opened to
+//!   phones on the local network that set this computer as their proxy,
+//!   with a setup page for the root certificate.
 //! - `wireguard` (feature `wireguard`): with a single `outbound`, an IP-level
 //!   tunnel that bypasses the TCP/IP stack and seals packets straight to one
 //!   peer; in `routing.outbounds`, a node like any other (`outbound-wireguard`).
@@ -47,6 +50,8 @@ pub mod ffi;
 #[cfg(any(feature = "local-proxy", feature = "dns-tls"))]
 pub mod http1;
 pub(crate) mod icmp;
+#[cfg(feature = "local-proxy")]
+pub mod lan_share;
 #[cfg(feature = "local-proxy")]
 pub mod local_proxy;
 pub mod metrics;
@@ -172,6 +177,8 @@ pub struct EmbeddedRuntime {
     state: RuntimeState,
     last_error: Option<RuntimeErrorCode>,
     last_stats: TunnelStatsSnapshot,
+    #[cfg(feature = "local-proxy")]
+    lan_share: lan_share::LanShareSlot,
 }
 
 impl EmbeddedRuntime {
@@ -245,6 +252,8 @@ impl EmbeddedRuntime {
             state: RuntimeState::Initialized,
             last_error: None,
             last_stats: TunnelStatsSnapshot::default(),
+            #[cfg(feature = "local-proxy")]
+            lan_share: lan_share::LanShareSlot::default(),
         }
     }
 
@@ -255,22 +264,9 @@ impl EmbeddedRuntime {
                 "tunnel is already running",
             )));
         }
-        let dns = match DnsPolicy::from_config(&self.config.dns) {
-            Ok(policy) => policy,
-            Err(message) => {
-                return Err(self.fail(RuntimeError::new(RuntimeErrorCode::ConfigRejected, message)))
-            }
-        };
-        let limits = &self.config.limits;
-        let settings = TunnelSettings {
-            mtu: self.config.mtu,
-            tcp_window_bytes: limits.tcp_window_bytes,
-            max_tcp_connections: limits.max_tcp_connections,
-            max_udp_flows: limits.max_udp_flows,
-            max_dns_in_flight: limits.max_dns_in_flight,
-            idle_timeout: Duration::from_secs(limits.idle_timeout_secs),
-            connect_timeout: Duration::from_secs(limits.connect_timeout_secs),
-            dns: Arc::new(dns),
+        let settings = match tunnel_settings(&self.config) {
+            Ok(settings) => settings,
+            Err(err) => return Err(self.fail(err)),
         };
         let started = match &self.engine {
             Engine::Stack(dispatcher) => Tunnel::start_with_dispatcher(
@@ -325,6 +321,8 @@ impl EmbeddedRuntime {
 
     /// Idempotent.
     pub fn stop(&mut self) {
+        #[cfg(feature = "local-proxy")]
+        self.lan_share.stop();
         if let Some(mut tunnel) = self.tunnel.take() {
             tunnel.stop();
             self.last_stats = tunnel.stats();
@@ -361,6 +359,9 @@ impl EmbeddedRuntime {
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
         match &self.engine {
             Engine::Stack(dispatcher) => {
+                if let Some(answer) = self.lan_share_control(dispatcher, request) {
+                    return answer;
+                }
                 control::handle_with_interceptor(dispatcher, self.interceptor.as_deref(), request)
             }
             #[cfg(feature = "wireguard")]
@@ -371,10 +372,69 @@ impl EmbeddedRuntime {
         }
     }
 
+    /// The share commands of [`lan_share`]; a share only runs while the
+    /// tunnel does.
+    #[cfg(feature = "local-proxy")]
+    fn lan_share_control(
+        &self,
+        dispatcher: &Arc<Dispatcher>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, RuntimeError>> {
+        self.lan_share.control(request, |options| {
+            if self.tunnel.is_none() {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidArgument,
+                    "lan share needs a running tunnel",
+                ));
+            }
+            let decrypting = match &self.interceptor {
+                Some(interceptor) => Some(Arc::new(local_proxy::Decrypting::new(
+                    dispatcher.clone(),
+                    interceptor.clone(),
+                    tunnel_settings(&self.config)?,
+                ))
+                    as Arc<dyn inbound_mixed::ClientInterceptor>),
+                None => None,
+            };
+            lan_share::LanShare::start(
+                dispatcher.clone(),
+                decrypting,
+                self.config.mitm_ca_certificate_der(),
+                options,
+            )
+        })
+    }
+
+    #[cfg(not(feature = "local-proxy"))]
+    fn lan_share_control(
+        &self,
+        _dispatcher: &Arc<Dispatcher>,
+        _request: &[u8],
+    ) -> Option<Result<Vec<u8>, RuntimeError>> {
+        None
+    }
+
     fn fail(&mut self, err: RuntimeError) -> RuntimeError {
         self.last_error = Some(err.code);
         err
     }
+}
+
+/// Stack settings of `config`: its MTU, limits and DNS policy.
+pub(crate) fn tunnel_settings(config: &RuntimeConfig) -> Result<TunnelSettings, RuntimeError> {
+    let dns = DnsPolicy::from_config(&config.dns)
+        .map_err(|message| RuntimeError::new(RuntimeErrorCode::ConfigRejected, message))?;
+    let limits = &config.limits;
+    Ok(TunnelSettings {
+        mtu: config.mtu,
+        tcp_window_bytes: limits.tcp_window_bytes,
+        max_tcp_connections: limits.max_tcp_connections,
+        max_udp_flows: limits.max_udp_flows,
+        max_dns_in_flight: limits.max_dns_in_flight,
+        idle_timeout: Duration::from_secs(limits.idle_timeout_secs),
+        connect_timeout: Duration::from_secs(limits.connect_timeout_secs),
+        dns: Arc::new(dns),
+    })
 }
 
 /// The HTTPS decryption interceptor for the config's `mitm` section.

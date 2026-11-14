@@ -15,14 +15,22 @@
 //! HTTP requests, optionally with `Proxy-Authorization: Basic`. SOCKS5 `BIND`
 //! and `UDP ASSOCIATE` are answered with "command not supported".
 //!
-//! The listener is meant for loopback. Errors and logs never contain
-//! credentials or request contents.
+//! The listener is meant for loopback. To serve other devices on the local
+//! network (a phone that sets this computer as its Wi-Fi proxy), bind it to
+//! all interfaces with [`PeerFilter::PrivateNetworks`] so that only clients
+//! from private and link-local addresses are answered, and give it
+//! [`ClientPages`]: plain HTTP requests made to the listener itself (`GET /`
+//! from a browser that has not set the proxy yet) or through it to
+//! [`ClientPages::host`] are answered by those pages instead of being
+//! relayed, for a setup page with the root certificate download.
+//!
+//! Errors and logs never contain credentials or request contents.
 
 mod http;
 mod socks5;
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,8 +65,13 @@ pub struct MixedSettings {
     /// Time allowed for the client's SOCKS5 or HTTP request head.
     pub handshake_timeout: Duration,
     pub connect_timeout: Duration,
-    /// When set, both protocols require these credentials.
+    /// When set, both protocols require these credentials. Pages from
+    /// [`Self::pages`] asked for without the proxy need none.
     pub credentials: Option<Credentials>,
+    /// Which client addresses are answered; others are closed unread.
+    pub peers: PeerFilter,
+    /// Local pages served on this listener; see [`ClientPages`].
+    pub pages: Option<Arc<dyn ClientPages>>,
 }
 
 impl Default for MixedSettings {
@@ -68,8 +81,114 @@ impl Default for MixedSettings {
             handshake_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             credentials: None,
+            peers: PeerFilter::Any,
+            pages: None,
         }
     }
+}
+
+/// The client addresses a listener answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeerFilter {
+    /// Every client; for a loopback listener.
+    #[default]
+    Any,
+    /// Loopback, private (RFC 1918, RFC 6598 shared, IPv6 unique local) and
+    /// link-local addresses only: devices on the same network, never the
+    /// internet when the computer has a public address or a forwarded port.
+    PrivateNetworks,
+}
+
+impl PeerFilter {
+    pub fn allows(self, peer: IpAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::PrivateNetworks => is_private_network(peer),
+        }
+    }
+}
+
+/// Whether `ip` belongs to the local network side of a typical router.
+pub fn is_private_network(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => is_private_v4(ip),
+        IpAddr::V6(ip) => is_private_v6(ip),
+    }
+}
+
+fn is_private_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        // 100.64.0.0/10, carrier-grade NAT and mesh VPNs.
+        || (a == 100 && (64..128).contains(&b))
+}
+
+fn is_private_v6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    ip.is_loopback()
+        // fc00::/7 unique local, fe80::/10 link-local.
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+}
+
+/// A plain HTTP request for a local page, before it is answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageRequest {
+    /// `GET`, `HEAD`, ... as sent.
+    pub method: String,
+    /// Path and query, starting with `/`.
+    pub path: String,
+    /// The `Host` header, when sent.
+    pub host: Option<String>,
+    /// The `User-Agent` header, when sent.
+    pub user_agent: Option<String>,
+    /// Whether the request came through the proxy (absolute form for
+    /// [`ClientPages::host`]) rather than straight to the listener.
+    pub proxied: bool,
+}
+
+/// The answer to a [`PageRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    /// Sent as an attachment with this file name when set.
+    pub file_name: Option<String>,
+}
+
+impl PageResponse {
+    pub fn ok(content_type: &str, body: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            content_type: content_type.to_string(),
+            body,
+            file_name: None,
+        }
+    }
+
+    pub fn not_found() -> Self {
+        Self {
+            status: 404,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            body: b"not found\n".to_vec(),
+            file_name: None,
+        }
+    }
+}
+
+/// Pages a listener serves itself: a request in origin form (`GET / HTTP/1.1`,
+/// a browser that opened `http://<listener address>/`) or one through the
+/// proxy for [`Self::host`] (`GET http://<host>/ HTTP/1.1`). Nothing is
+/// relayed for them; the connection closes after the answer.
+pub trait ClientPages: Send + Sync {
+    /// The made-up host name the pages also answer to through the proxy,
+    /// lower case, such as `cert.anixops`.
+    fn host(&self) -> &str;
+
+    fn respond(&self, client: ClientAddrs, request: &PageRequest) -> PageResponse;
 }
 
 /// Counters only; no addresses.
@@ -82,6 +201,14 @@ pub struct MixedStats {
     pub connect_failed: AtomicU64,
     pub bytes_up: AtomicU64,
     pub bytes_down: AtomicU64,
+    /// Local pages answered ([`ClientPages`]).
+    pub pages: AtomicU64,
+}
+
+/// What a client asked for.
+pub(crate) enum Incoming {
+    Proxy(Request),
+    Page(PageRequest),
 }
 
 /// A parsed proxy request, before the outbound connection exists.
@@ -185,6 +312,11 @@ pub async fn serve_intercepted(
     let settings = Arc::new(settings);
     loop {
         let (stream, peer) = listener.accept().await?;
+        if !settings.peers.allows(peer.ip()) {
+            stats.rejected.fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        }
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             drop(stream);
@@ -227,11 +359,24 @@ async fn handle(
 ) {
     let request = tokio::time::timeout(
         settings.handshake_timeout,
-        read_request(&mut client, settings.credentials.as_ref()),
+        read_request(
+            &mut client,
+            settings.credentials.as_ref(),
+            settings.pages.as_deref(),
+        ),
     )
     .await;
     let request = match request {
-        Ok(Ok(request)) => request,
+        Ok(Ok(Incoming::Proxy(request))) => request,
+        Ok(Ok(Incoming::Page(page))) => {
+            if let Some(pages) = settings.pages.as_deref() {
+                let response = pages.respond(addrs, &page);
+                stats.pages.fetch_add(1, Ordering::Relaxed);
+                let _ = http::send_page(&mut client, &page, &response).await;
+            }
+            close_gracefully(client).await;
+            return;
+        }
         Ok(Err(_)) | Err(_) => {
             stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
             close_gracefully(client).await;
@@ -349,16 +494,19 @@ async fn handle_intercepted(
 async fn read_request(
     client: &mut TcpStream,
     credentials: Option<&Credentials>,
-) -> io::Result<Request> {
+    pages: Option<&dyn ClientPages>,
+) -> io::Result<Incoming> {
     let mut first = [0u8; 1];
     let peeked = client.peek(&mut first).await?;
     if peeked == 0 {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     if first[0] == socks5::VERSION {
-        socks5::read_request(client, credentials).await
+        socks5::read_request(client, credentials)
+            .await
+            .map(Incoming::Proxy)
     } else {
-        http::read_request(client, credentials).await
+        http::read_request(client, credentials, pages).await
     }
 }
 

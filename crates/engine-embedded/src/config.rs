@@ -636,6 +636,17 @@ impl RuntimeConfig {
         Ok(pool)
     }
 
+    /// The root certificate of the `mitm` section as DER, when there is one
+    /// and it decodes; only the certificate, never the key.
+    pub fn mitm_ca_certificate_der(&self) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        let mitm = self.mitm.as_ref()?;
+        base64::engine::general_purpose::STANDARD
+            .decode(mitm.ca_certificate.trim())
+            .ok()
+            .filter(|der| !der.is_empty())
+    }
+
     /// The parsed `redirects` lines.
     pub fn redirect_table(&self) -> Result<RedirectTable, RuntimeError> {
         RedirectTable::parse(&self.redirects).map_err(|error| {
