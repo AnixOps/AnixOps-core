@@ -696,3 +696,113 @@ fn fake_ip_answers_dns_and_sends_the_flow_by_name() {
     );
     tunnel.stop();
 }
+
+/// Server that answers the first bytes of each connection with `pong` and
+/// closes, so the tunnel's side sends its FIN first (and so ends in TIME-WAIT).
+fn start_answer_and_close_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                if stream.read(&mut buf).unwrap_or(0) > 0 {
+                    let _ = stream.write_all(b"pong");
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A short connection the tunnel closes first is released right after the
+/// app's FIN, not after smoltcp's 10 s TIME-WAIT: the relay ends at once
+/// (its outbound and buffers go) and the socket, with its two windows of
+/// buffers, is gone about a second later. Hundreds of such connections in
+/// a burst used to keep ~140 KiB each alive for 10 s (88 MiB peak for 600).
+#[test]
+fn a_short_connection_closed_by_the_tunnel_is_released_promptly() {
+    let server = start_answer_and_close_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
+
+    let client_isn: u32 = 7000;
+    let mut syn = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(40100, 80, client_isn, 65535)
+        .syn()
+        .write(&mut syn, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&syn));
+    let server_isn = wait_for(&rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.syn() && tcp.ack() && tcp.destination_port() == 40100 =>
+        {
+            Some(tcp.sequence_number())
+        }
+        _ => None,
+    });
+
+    let mut request = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(40100, 80, client_isn + 1, 65535)
+        .ack(server_isn.wrapping_add(1))
+        .psh()
+        .write(&mut request, b"ping")
+        .unwrap();
+    assert!(tunnel.input_packet(&request));
+
+    // The answer and the tunnel's FIN, in one segment or several.
+    let mut answer = Vec::new();
+    let fin_end = wait_for(&rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp)) if tcp.destination_port() == 40100 => {
+            answer.extend_from_slice(tcp.payload());
+            tcp.fin().then(|| {
+                tcp.sequence_number()
+                    .wrapping_add(tcp.payload().len() as u32)
+                    .wrapping_add(1)
+            })
+        }
+        _ => None,
+    });
+    assert_eq!(answer, b"pong");
+
+    // The app acknowledges everything and closes its side: the tunnel's
+    // socket goes to TIME-WAIT.
+    let client_fin_seq = client_isn + 1 + 4;
+    let mut fin = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(40100, 80, client_fin_seq, 65535)
+        .ack(fin_end)
+        .fin()
+        .write(&mut fin, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&fin));
+    let closed_at = Instant::now();
+
+    // The relay ends without waiting for TIME-WAIT.
+    while tunnel.stats().tcp_active != 0 {
+        assert!(
+            closed_at.elapsed() < Duration::from_secs(3),
+            "relay still active {:?} after both FINs",
+            closed_at.elapsed()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // After the short TIME-WAIT the socket is gone: a retransmitted FIN no
+    // longer matches a socket and is answered with a RST.
+    thread::sleep(Duration::from_millis(2500));
+    while rx.try_recv().is_ok() {}
+    assert!(tunnel.input_packet(&fin));
+    let reset = wait_for(&rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp)) if tcp.destination_port() == 40100 => Some(tcp.rst()),
+        _ => None,
+    });
+    assert!(
+        reset,
+        "the socket was still in TIME-WAIT 2.5 s after closing"
+    );
+    tunnel.stop();
+}

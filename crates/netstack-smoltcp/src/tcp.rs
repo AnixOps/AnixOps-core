@@ -49,6 +49,21 @@ fn stream_buffer_size(window: u32) -> usize {
 /// Longest park of the socket loop when no socket has anything scheduled.
 const IDLE_PARK: Duration = Duration::from_secs(10);
 
+/// How long a socket stays in TIME-WAIT before it is removed.
+///
+/// smoltcp keeps TIME-WAIT for 10 s, and with it the socket's receive and
+/// send buffers (two windows, 128 KiB at the tunnel's default): every short
+/// connection the tunnel closes first stayed at full size for 10 s, so a
+/// burst of a few hundred short connections pushed the iOS extension
+/// towards its memory limit. The peer is the device's own TCP stack across
+/// the TUN interface, where segments are neither delayed nor duplicated, so
+/// the old-duplicate protection of a full TIME-WAIT buys nothing. This
+/// grace only covers the final ACK, which smoltcp may delay (10 ms by
+/// default), and a FIN the peer retransmits if that ACK is lost (its RTO is
+/// at least 200 ms). A segment arriving later is answered with a RST, which
+/// a peer in LAST-ACK takes as the end of the connection.
+const TIME_WAIT_LINGER: Duration = Duration::from_millis(1000);
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
     Normal,
@@ -74,6 +89,35 @@ struct TcpSocketCreation {
 type SharedNotify = Arc<Notify>;
 type SharedControl = Arc<SpinMutex<TcpSocketControl>>;
 
+/// A socket of the set with its stream's side and, once the socket is in
+/// TIME-WAIT, when it is removed ([`TIME_WAIT_LINGER`]).
+struct SocketEntry {
+    control: SharedControl,
+    time_wait_until: Option<Instant>,
+}
+
+impl SocketEntry {
+    fn new(control: SharedControl) -> Self {
+        Self {
+            control,
+            time_wait_until: None,
+        }
+    }
+}
+
+/// Marks both halves of the stream closed and wakes its reader and writer:
+/// reads return EOF, writes fail with `BrokenPipe`, a shutdown completes.
+fn close_stream(control: &mut TcpSocketControl) {
+    control.send_state = TcpSocketState::Closed;
+    control.recv_state = TcpSocketState::Closed;
+    if let Some(waker) = control.send_waker.take() {
+        waker.wake();
+    }
+    if let Some(waker) = control.recv_waker.take() {
+        waker.wake();
+    }
+}
+
 struct TcpListenerRunner;
 
 impl TcpListenerRunner {
@@ -85,7 +129,7 @@ impl TcpListenerRunner {
         iface_ingress_tx_avail: Arc<AtomicBool>,
         tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
-        sockets: HashMap<SocketHandle, SharedControl>,
+        sockets: HashMap<SocketHandle, SocketEntry>,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
     ) -> Runner {
@@ -211,14 +255,14 @@ impl TcpListenerRunner {
         mut device: VirtualDevice,
         mut iface: Interface,
         iface_ingress_tx_avail: Arc<AtomicBool>,
-        mut sockets: HashMap<SocketHandle, SharedControl>,
+        mut sockets: HashMap<SocketHandle, SocketEntry>,
         mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
         loop {
             while let Ok(TcpSocketCreation { control, socket }) = socket_rx.try_recv() {
                 let handle = socket_set.add(socket);
-                sockets.insert(handle, control);
+                sockets.insert(handle, SocketEntry::new(control));
             }
 
             let before_poll = Instant::now();
@@ -233,27 +277,43 @@ impl TcpListenerRunner {
             // Check all the sockets' status
             let mut sockets_to_remove = Vec::new();
 
-            for (socket_handle, control) in sockets.iter() {
+            // Earliest TIME-WAIT removal still to come, for the park below.
+            let mut next_time_wait: Option<Instant> = None;
+
+            for (socket_handle, entry) in sockets.iter_mut() {
                 let socket_handle = *socket_handle;
                 let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
-                let mut control = control.lock();
+                let mut control = entry.control.lock();
 
                 // Remove the socket only when it is in the closed state.
                 if socket.state() == TcpState::Closed {
                     sockets_to_remove.push(socket_handle);
-
-                    control.send_state = TcpSocketState::Closed;
-                    control.recv_state = TcpSocketState::Closed;
-
-                    if let Some(waker) = control.send_waker.take() {
-                        waker.wake();
-                    }
-                    if let Some(waker) = control.recv_waker.take() {
-                        waker.wake();
-                    }
-
+                    close_stream(&mut control);
                     trace!("closed TCP connection");
                     continue;
+                }
+
+                // Both sides have sent their FIN and had it acknowledged:
+                // keep the socket only for TIME_WAIT_LINGER, not smoltcp's
+                // 10 s, so its buffers go back right away.
+                if socket.state() == TcpState::TimeWait {
+                    let until = *entry
+                        .time_wait_until
+                        .get_or_insert(before_poll + TIME_WAIT_LINGER);
+                    if before_poll < until {
+                        next_time_wait = Some(next_time_wait.map_or(until, |next| next.min(until)));
+                    } else if socket.recv_queue() == 0
+                        || !matches!(control.recv_state, TcpSocketState::Normal)
+                    {
+                        // Removed once every received byte has been handed
+                        // to the stream (or nobody reads any more): bytes
+                        // still in the socket's buffer would be lost. A
+                        // stream that reads notifies the loop.
+                        sockets_to_remove.push(socket_handle);
+                        close_stream(&mut control);
+                        trace!("removed TCP connection in TIME-WAIT");
+                        continue;
+                    }
                 }
 
                 // SHUT_WR — only close once the send_buffer has been fully
@@ -267,6 +327,13 @@ impl TcpListenerRunner {
 
                     socket.close();
                     control.send_state = TcpSocketState::Closing;
+
+                    // The FIN is queued behind every byte written: a pending
+                    // `poll_shutdown` is done, as `shutdown(SHUT_WR)` is on
+                    // an OS socket.
+                    if let Some(waker) = control.send_waker.take() {
+                        waker.wake();
+                    }
                 }
 
                 // Check if readable
@@ -382,9 +449,12 @@ impl TcpListenerRunner {
             if iface_ingress_tx_avail.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             } else {
-                let next_duration = iface
+                let mut next_duration = iface
                     .poll_delay(before_poll, &socket_set)
                     .unwrap_or(IDLE_PARK);
+                if let Some(until) = next_time_wait {
+                    next_duration = next_duration.min(until - before_poll);
+                }
                 if next_duration != Duration::ZERO {
                     let _ = tokio::time::timeout(
                         tokio::time::Duration::from(next_duration),
@@ -585,10 +655,22 @@ impl AsyncWrite for TcpStream {
         Ok(()).into()
     }
 
+    /// Completes once every byte written is in the smoltcp socket and the
+    /// FIN is queued behind it, like `shutdown(SHUT_WR)` on an OS socket.
+    ///
+    /// It used to wait for the socket to reach CLOSED, which for a
+    /// connection the tunnel closes first means the peer's FIN plus all of
+    /// TIME-WAIT: every relay of a short connection (its outbound, TLS state
+    /// and buffers) stayed alive for seconds after both sides were done.
+    /// smoltcp still sends the queued bytes and the FIN after the stream is
+    /// dropped.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut control = self.control.lock();
 
-        if matches!(control.send_state, TcpSocketState::Closed) {
+        if matches!(
+            control.send_state,
+            TcpSocketState::Closing | TcpSocketState::Closed
+        ) {
             return Ok(()).into();
         }
 
