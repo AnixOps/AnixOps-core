@@ -26,6 +26,7 @@
 - [内嵌引擎 DNS：上游、hosts、按域名分流与 fake-ip](architecture/embedded-dns.md)
 - [前置节点（`via`）与入口 → 传输 → 出口模型](architecture/outbound-via.md)
 - [出站多路复用（`multiplex`）与连接复用](architecture/outbound-multiplex.md)
+- [Pro 版开关（`engine-embedded::pro`）](architecture/pro-edition.md)
 - [Public Core Client Reference](architecture/public-core-client-reference.md)
 
 ## 协议规格

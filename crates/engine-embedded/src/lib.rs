@@ -9,6 +9,8 @@
 //! - [`connections`]: the dispatcher every flow goes through, which routes
 //!   it and keeps the connection list and traffic counters that [`control`]
 //!   requests read.
+//! - [`pro`]: the switch for the closed Pro debugging modules of official
+//!   builds; a community build reports no Pro features.
 //! - [`capture`]: opt-in capture of connection bytes and decrypted HTTP
 //!   messages under a memory budget, exported as pcapng or HAR.
 //! - Outbounds implementing [`engine_outbound::TcpOutbound`], looked up by
@@ -53,6 +55,7 @@ pub mod metrics;
 #[cfg(feature = "mitm")]
 pub mod mitm;
 pub mod nodes;
+pub mod pro;
 #[cfg(feature = "local-proxy")]
 pub mod process;
 pub mod profile;
