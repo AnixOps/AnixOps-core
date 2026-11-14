@@ -33,10 +33,13 @@
 //! | `set_capture` | `enabled`, optional `max_total_bytes` | [`crate::capture::CaptureStatus`]: keep the bytes of new connections |
 //! | `clear_capture` | | [`crate::capture::CaptureStatus`] |
 //! | `capture_connection` | `id` | `{"capture": {...} \| null}`: kept bytes and decrypted HTTP messages of one connection |
-//! | `export_capture` | `format` (`pcapng` \| `har`), optional `id` | `{"format", "file_name", "content_type", "size", "data_base64"}` |
+//! | `export_capture` | `format` (`pcapng` \| `har` \| `curl` \| `code` \| `postman` \| `insomnia`), optional `id`, `exchange` (index in that connection's `http`), `language` (`code`: `python` \| `javascript` \| `swift` \| `kotlin` \| `go`), `redact` (default `true`) | `{"format", "file_name", "content_type", "size", "redacted", "data_base64"}` |
+//! | `capture_requests` | optional `since_seq`, `limit`, `filter` | `{"requests": [...], "last_seq", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange |
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
-//! stops; see [`crate::capture`] for what is kept and its memory budget.
+//! stops; see [`crate::capture`] for what is kept and its memory budget,
+//! [`crate::capture::redact`] for what an export masks and
+//! [`crate::capture::filter`] for the `capture_requests` filter syntax.
 //!
 //! `reload_rules` swaps the rule lines of a routing config while the engine
 //! runs ([`crate::routing::RoutedOutbound::reload_rules`]): `rules` is the
@@ -69,7 +72,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::capture::{self, ExportFormat};
+use crate::capture::filter::Filter;
+use crate::capture::{self, ExportFormat, ExportRequest, Language, Selection};
 use crate::connections::{Dispatcher, Mode};
 use crate::metrics;
 use crate::tunnel::FlowInterceptor;
@@ -147,6 +151,20 @@ enum ControlRequest {
         format: ExportFormat,
         #[serde(default)]
         id: Option<u64>,
+        #[serde(default)]
+        exchange: Option<usize>,
+        #[serde(default)]
+        language: Language,
+        #[serde(default = "default_true")]
+        redact: bool,
+    },
+    CaptureRequests {
+        #[serde(default)]
+        since_seq: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        filter: String,
     },
 }
 
@@ -348,10 +366,35 @@ pub fn handle_with_interceptor(
         ControlRequest::CaptureConnection { id } => {
             Ok(json!({ "capture": tracker.capture().connection_json(id) }))
         }
-        ControlRequest::ExportCapture { format, id } => {
+        ControlRequest::ExportCapture {
+            format,
+            id,
+            exchange,
+            language,
+            redact,
+        } => {
+            if exchange.is_some() && id.is_none() {
+                return Err(invalid("exchange needs the connection id"));
+            }
+            let request = ExportRequest {
+                format,
+                selection: Selection { id, exchange },
+                language,
+                redact,
+            };
             // The file goes out as written, without a JSON value in between.
-            return Ok(capture::export_answer(tracker.capture(), format, id));
+            return Ok(capture::export_answer(tracker.capture(), &request));
         }
+        ControlRequest::CaptureRequests {
+            since_seq,
+            limit,
+            filter,
+        } => match Filter::parse(&filter) {
+            Ok(filter) => Ok(tracker.capture().requests_json(since_seq, limit, &filter)),
+            Err(error) => Ok(json!({
+                "error": { "code": "invalid_filter", "at": error.at },
+            })),
+        },
         ControlRequest::ReloadRules { rules, dry_run } => {
             let routed = dispatcher
                 .routed_outbound()

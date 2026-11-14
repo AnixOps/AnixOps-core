@@ -18,13 +18,32 @@
 //! Exports are `pcapng` (each connection as a synthetic TCP or UDP flow over
 //! raw IP that Wireshark reads; a decrypted connection carries its HTTP text,
 //! a domain destination gets an address from 198.18.0.0/15 named in a name
-//! resolution block) and `har` (HAR 1.2 of the decrypted HTTP messages).
+//! resolution block) and `har` (HAR 1.2 of the decrypted HTTP messages),
+//! and for decrypted requests `curl` (a shell script), `code` (Python,
+//! JavaScript, Swift, Kotlin or Go, see [`export::Language`]), `postman`
+//! (a Postman collection v2.1) and `insomnia` (an Insomnia export v4).
+//! Exports are redacted unless the request says `redact: false`: see
+//! [`redact`] for what is masked.
+//!
+//! `capture_requests` lists the decrypted HTTP exchanges one row each, in
+//! the order they were filed (`seq`), filtered by the expression syntax of
+//! [`filter`].
+//!
+//! Only what the app itself sent and got is ever kept: bytes before any
+//! proxy protocol and decrypted HTTP. The wire bytes of the outbound
+//! protocol (ANX, Shadowsocks, VLESS, ...) never reach this module, so no
+//! capture, export or saved session can show them.
 
+pub mod export;
+pub mod filter;
+pub mod redact;
+
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +52,18 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::connections::Network;
+
+pub use self::export::Language;
+use self::filter::Filter;
+
+/// `http_version` of an HTTP/1.x exchange.
+pub const HTTP_1_1: &str = "HTTP/1.1";
+/// `http_version` of an HTTP/2 exchange.
+pub const HTTP_2: &str = "HTTP/2";
+/// Rows `capture_requests` returns when the request names no `limit`.
+pub const DEFAULT_REQUEST_ROWS: usize = 500;
+/// Most rows one `capture_requests` answer holds.
+pub const MAX_REQUEST_ROWS: usize = 2000;
 
 /// Capture budget when `set_capture` names none.
 pub const DEFAULT_MAX_TOTAL_BYTES: usize = 2 * 1024 * 1024;
@@ -113,6 +144,10 @@ impl CapturedBody {
 /// One decrypted HTTP request and its response.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HttpExchange {
+    /// Order in which the store filed it, from 1; 0 until it is filed.
+    pub seq: u64,
+    /// [`HTTP_1_1`] or [`HTTP_2`].
+    pub http_version: &'static str,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub method: String,
@@ -133,6 +168,7 @@ pub struct HttpExchange {
 impl HttpExchange {
     pub fn new(method: &str, url: &str, headers: &[(String, String)]) -> Self {
         Self {
+            http_version: HTTP_1_1,
             started_at_ms: unix_millis(),
             method: method.to_string(),
             url: url.to_string(),
@@ -165,6 +201,8 @@ impl HttpExchange {
                 .collect::<Vec<_>>()
         };
         json!({
+            "seq": self.seq,
+            "http_version": self.http_version,
             "started_at_ms": self.started_at_ms,
             "ended_at_ms": self.ended_at_ms,
             "method": self.method,
@@ -239,9 +277,21 @@ impl Captured {
 struct Inner {
     connections: BTreeMap<u64, Captured>,
     used: usize,
+    /// The highest `seq` of an exchange dropped with its connection.
+    dropped_seq: u64,
 }
 
 impl Inner {
+    /// Forgets connection `id`, freeing its budget.
+    fn remove(&mut self, id: u64) {
+        if let Some(dropped) = self.connections.remove(&id) {
+            self.used = self.used.saturating_sub(dropped.memory);
+            if let Some(last) = dropped.http.iter().map(|exchange| exchange.seq).max() {
+                self.dropped_seq = self.dropped_seq.max(last);
+            }
+        }
+    }
+
     /// Drops the oldest connections other than `keep` until the budget
     /// holds; `false` when `keep` alone is over it.
     fn make_room(&mut self, keep: u64, budget: usize) -> bool {
@@ -250,9 +300,7 @@ impl Inner {
             let Some(oldest) = oldest else {
                 return false;
             };
-            if let Some(dropped) = self.connections.remove(&oldest) {
-                self.used = self.used.saturating_sub(dropped.memory);
-            }
+            self.remove(oldest);
         }
         true
     }
@@ -262,6 +310,8 @@ impl Inner {
 pub struct CaptureStore {
     enabled: AtomicBool,
     max_total_bytes: AtomicUsize,
+    /// The `seq` the next filed exchange gets.
+    next_seq: AtomicU64,
     inner: Mutex<Inner>,
 }
 
@@ -270,6 +320,7 @@ impl Default for CaptureStore {
         Self {
             enabled: AtomicBool::new(false),
             max_total_bytes: AtomicUsize::new(DEFAULT_MAX_TOTAL_BYTES),
+            next_seq: AtomicU64::new(1),
             inner: Mutex::default(),
         }
     }
@@ -306,6 +357,7 @@ impl CaptureStore {
         let mut inner = lock(&self.inner);
         inner.connections.clear();
         inner.used = 0;
+        inner.dropped_seq = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
     }
 
     pub fn status(&self) -> CaptureStatus {
@@ -404,9 +456,7 @@ impl CaptureStore {
         inner.used += added;
         if !inner.make_room(id, budget) {
             // This connection alone is over the budget: drop it.
-            if let Some(dropped) = inner.connections.remove(&id) {
-                inner.used = inner.used.saturating_sub(dropped.memory);
-            }
+            inner.remove(id);
         }
     }
 
@@ -446,13 +496,12 @@ impl CaptureStore {
         if captured.http.len() >= MAX_HTTP_EXCHANGES {
             return;
         }
+        exchange.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         captured.http.push(exchange);
         captured.memory += memory;
         inner.used += memory;
         if !inner.make_room(id, budget) {
-            if let Some(dropped) = inner.connections.remove(&id) {
-                inner.used = inner.used.saturating_sub(dropped.memory);
-            }
+            inner.remove(id);
         }
     }
 
@@ -473,8 +522,9 @@ impl CaptureStore {
             .map(|captured| captured.json(id))
     }
 
-    /// The captured connections (all, or only `id`) as a pcapng file.
-    pub fn export_pcapng(&self, id: Option<u64>) -> Vec<u8> {
+    /// The captured connections (all, or only `id`) as a pcapng file,
+    /// with credentials masked when `redact`.
+    pub fn export_pcapng(&self, id: Option<u64>, redact: bool) -> Vec<u8> {
         let inner = lock(&self.inner);
         let mut file = pcapng::File::new();
         let mut names = Vec::new();
@@ -485,19 +535,20 @@ impl CaptureStore {
                     names.push((flow.server.ip(), host.clone()));
                 }
             }
-            flow.write(&mut file, captured);
+            flow.write(&mut file, captured, redact);
         }
         file.finish(&names)
     }
 
     /// The decrypted HTTP messages (all, or only connection `id`'s) as HAR
-    /// 1.2 JSON.
-    pub fn export_har(&self, id: Option<u64>) -> Vec<u8> {
+    /// 1.2 JSON, with credentials masked when `redact`.
+    pub fn export_har(&self, id: Option<u64>, redact: bool) -> Vec<u8> {
         let inner = lock(&self.inner);
         let mut entries = Vec::new();
         for (&connection, captured) in selected(&inner, id) {
             for exchange in &captured.http {
-                entries.push(har::entry(connection, captured, exchange));
+                let exchange = redacted(exchange, redact);
+                entries.push(har::entry(connection, captured, &exchange));
             }
         }
         let har = json!({
@@ -508,6 +559,94 @@ impl CaptureStore {
             }
         });
         serde_json::to_vec_pretty(&har).unwrap_or_default()
+    }
+
+    /// Copies of the selected decrypted exchanges, redacted when asked.
+    fn exchanges(&self, selection: Selection, redact: bool) -> Vec<HttpExchange> {
+        let inner = lock(&self.inner);
+        selected(&inner, selection.id)
+            .into_iter()
+            .flat_map(|(_, captured)| match selection.exchange {
+                Some(index) => captured.http.get(index..=index).unwrap_or(&[]),
+                None => captured.http.as_slice(),
+            })
+            .map(|exchange| redacted(exchange, redact).into_owned())
+            .collect()
+    }
+
+    /// The `capture_requests` answer: one row per decrypted exchange filed
+    /// after `since_seq`, oldest first, at most `limit`
+    /// (default [`DEFAULT_REQUEST_ROWS`], at most [`MAX_REQUEST_ROWS`]).
+    pub fn requests_json(&self, since_seq: u64, limit: Option<usize>, filter: &Filter) -> Value {
+        let limit = limit
+            .unwrap_or(DEFAULT_REQUEST_ROWS)
+            .clamp(1, MAX_REQUEST_ROWS);
+        let inner = lock(&self.inner);
+        let mut rows = inner
+            .connections
+            .iter()
+            .flat_map(|(&id, captured)| {
+                captured
+                    .http
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, exchange)| exchange.seq > since_seq)
+                    .map(move |(index, exchange)| (id, index, exchange))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|(_, _, exchange)| exchange.seq);
+        let last_seq = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
+        let requests = rows
+            .into_iter()
+            .filter(|(_, _, exchange)| filter.matches(exchange))
+            .take(limit)
+            .map(|(id, index, exchange)| request_row(id, index, exchange))
+            .collect::<Vec<_>>();
+        json!({
+            "requests": requests,
+            "last_seq": last_seq,
+            "dropped_before_seq": inner.dropped_seq,
+        })
+    }
+}
+
+/// One `capture_requests` row.
+fn request_row(id: u64, index: usize, exchange: &HttpExchange) -> Value {
+    let content_type = exchange
+        .response_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    let host = exchange
+        .url
+        .split_once("://")
+        .map_or(exchange.url.as_str(), |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    json!({
+        "seq": exchange.seq,
+        "connection_id": id,
+        "index": index,
+        "method": exchange.method,
+        "url": exchange.url,
+        "host": host,
+        "status": exchange.status,
+        "note": exchange.note,
+        "http_version": exchange.http_version,
+        "started_at_ms": exchange.started_at_ms,
+        "ended_at_ms": exchange.ended_at_ms,
+        "request_size": exchange.request_body.size,
+        "response_size": exchange.response_body.size,
+        "response_content_type": content_type,
+    })
+}
+
+fn redacted(exchange: &HttpExchange, redact: bool) -> Cow<'_, HttpExchange> {
+    if redact {
+        Cow::Owned(redact::exchange(exchange))
+    } else {
+        Cow::Borrowed(exchange)
     }
 }
 
@@ -524,41 +663,110 @@ fn selected(inner: &Inner, id: Option<u64>) -> Vec<(&u64, &Captured)> {
 pub enum ExportFormat {
     Pcapng,
     Har,
+    Curl,
+    Code,
+    Postman,
+    Insomnia,
 }
 
 impl ExportFormat {
     pub fn content_type(self) -> &'static str {
         match self {
             Self::Pcapng => "application/vnd.tcpdump.pcap",
-            Self::Har => "application/json",
+            Self::Har | Self::Postman | Self::Insomnia => "application/json",
+            Self::Curl => "application/x-sh",
+            Self::Code => "text/plain; charset=utf-8",
         }
     }
 
-    pub fn extension(self) -> &'static str {
+    /// The file name suffix, for `code` in `language`.
+    pub fn extension(self, language: Language) -> &'static str {
         match self {
             Self::Pcapng => "pcapng",
             Self::Har => "har",
+            Self::Curl => "sh",
+            Self::Code => language.extension(),
+            Self::Postman => "postman_collection.json",
+            Self::Insomnia => "insomnia.json",
+        }
+    }
+}
+
+/// Which connection and exchange an export covers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Selection {
+    /// One connection, or all.
+    pub id: Option<u64>,
+    /// One exchange of that connection (an index of its `http` list), or all.
+    pub exchange: Option<usize>,
+}
+
+/// What `export_capture` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExportRequest {
+    pub format: ExportFormat,
+    pub selection: Selection,
+    /// The language of a `code` export.
+    pub language: Language,
+    /// Mask credentials (the default).
+    pub redact: bool,
+}
+
+impl ExportRequest {
+    pub fn new(format: ExportFormat) -> Self {
+        Self {
+            format,
+            selection: Selection::default(),
+            language: Language::default(),
+            redact: true,
+        }
+    }
+}
+
+/// The exported file.
+pub fn export_file(store: &CaptureStore, request: &ExportRequest) -> Vec<u8> {
+    let redact = request.redact;
+    let id = request.selection.id;
+    let name = match id {
+        Some(id) => format!("AnixOps capture {id}"),
+        None => "AnixOps capture".to_string(),
+    };
+    match request.format {
+        ExportFormat::Pcapng => store.export_pcapng(id, redact),
+        ExportFormat::Har => store.export_har(id, redact),
+        format => {
+            let exchanges = store.exchanges(request.selection, redact);
+            let exchanges = exchanges.iter().collect::<Vec<_>>();
+            match format {
+                ExportFormat::Curl => export::curl(&exchanges).into_bytes(),
+                ExportFormat::Code => export::code(&exchanges, request.language).into_bytes(),
+                ExportFormat::Postman => {
+                    serde_json::to_vec_pretty(&export::postman(&exchanges, &name))
+                        .unwrap_or_default()
+                }
+                _ => serde_json::to_vec_pretty(&export::insomnia(&exchanges, &name, unix_millis()))
+                    .unwrap_or_default(),
+            }
         }
     }
 }
 
 /// The `export_capture` answer, written straight into one buffer so the
 /// file is not copied again on its way out:
-/// `{"format", "file_name", "content_type", "size", "data_base64"}`.
-pub fn export_answer(store: &CaptureStore, format: ExportFormat, id: Option<u64>) -> Vec<u8> {
-    let file = match format {
-        ExportFormat::Pcapng => store.export_pcapng(id),
-        ExportFormat::Har => store.export_har(id),
-    };
-    let stem = match id {
-        Some(id) => format!("anixops-capture-{id}"),
-        None => format!("anixops-capture-{}", unix_millis() / 1000),
+/// `{"format", "file_name", "content_type", "size", "redacted", "data_base64"}`.
+pub fn export_answer(store: &CaptureStore, request: &ExportRequest) -> Vec<u8> {
+    let file = export_file(store, request);
+    let stem = match (request.selection.id, request.selection.exchange) {
+        (Some(id), Some(exchange)) => format!("anixops-capture-{id}-{exchange}"),
+        (Some(id), None) => format!("anixops-capture-{id}"),
+        _ => format!("anixops-capture-{}", unix_millis() / 1000),
     };
     let head = json!({
-        "format": format,
-        "file_name": format!("{stem}.{}", format.extension()),
-        "content_type": format.content_type(),
+        "format": request.format,
+        "file_name": format!("{stem}.{}", request.format.extension(request.language)),
+        "content_type": request.format.content_type(),
         "size": file.len(),
+        "redacted": request.redact,
     })
     .to_string();
     // `head` is a JSON object: reopen it to append the data field.
@@ -817,7 +1025,7 @@ mod pcapng {
             }
         }
 
-        pub(super) fn write(mut self, file: &mut File, captured: &Captured) {
+        pub(super) fn write(mut self, file: &mut File, captured: &Captured, redact: bool) {
             let comment = format!(
                 "anixops connection {}: {}{}",
                 self.id,
@@ -833,7 +1041,8 @@ mod pcapng {
                     .http
                     .iter()
                     .flat_map(|exchange| {
-                        let (up, down) = http_text(exchange);
+                        let exchange = super::redacted(exchange, redact);
+                        let (up, down) = http_text(&exchange);
                         let ended = exchange.ended_at_ms.unwrap_or(exchange.started_at_ms);
                         [
                             (Direction::Up, exchange.started_at_ms, up),
@@ -846,7 +1055,14 @@ mod pcapng {
                 captured
                     .chunks
                     .iter()
-                    .map(|chunk| (chunk.direction, chunk.at_ms, chunk.data.clone()))
+                    .map(|chunk| {
+                        let data = if redact {
+                            super::redact::http1_text(&chunk.data).into_owned()
+                        } else {
+                            chunk.data.clone()
+                        };
+                        (chunk.direction, chunk.at_ms, data)
+                    })
                     .collect()
             };
             match self.network {
@@ -1063,7 +1279,7 @@ mod har {
         let mut request = json!({
             "method": exchange.method,
             "url": exchange.url,
-            "httpVersion": "HTTP/1.1",
+            "httpVersion": exchange.http_version,
             "cookies": [],
             "headers": headers(&exchange.request_headers),
             "queryString": query(&exchange.url),
@@ -1092,7 +1308,7 @@ mod har {
             "response": {
                 "status": status,
                 "statusText": status_text(status),
-                "httpVersion": "HTTP/1.1",
+                "httpVersion": exchange.http_version,
                 "cookies": [],
                 "headers": headers(&exchange.response_headers),
                 "content": content,
@@ -1308,21 +1524,25 @@ mod tests {
             base64_encode(b"hello")
         );
 
-        let har: Value = serde_json::from_slice(&store.export_har(None)).unwrap();
+        let har: Value = serde_json::from_slice(&store.export_har(None, true)).unwrap();
         let entry = &har["log"]["entries"][0];
         assert_eq!(har["log"]["version"], "1.2");
         assert_eq!(entry["request"]["method"], "GET");
         assert_eq!(entry["request"]["queryString"][0]["name"], "x");
         assert_eq!(entry["response"]["content"]["text"], "hello");
 
-        let pcap = store.export_pcapng(Some(9));
+        let pcap = store.export_pcapng(Some(9), true);
         assert_eq!(&pcap[..4], &[0x0A, 0x0D, 0x0D, 0x0A]);
         assert!(pcap.windows(5).any(|window| window == b"hello"));
         assert!(pcap.windows(16).any(|window| window == b"api.example.test"));
         assert!(pcap.len().is_multiple_of(4));
 
-        let answer: Value =
-            serde_json::from_slice(&export_answer(&store, ExportFormat::Pcapng, Some(9))).unwrap();
+        let answer: Value = serde_json::from_slice(&export_answer(&store, &{
+            let mut request = ExportRequest::new(ExportFormat::Pcapng);
+            request.selection.id = Some(9);
+            request
+        }))
+        .unwrap();
         assert_eq!(answer["file_name"], "anixops-capture-9.pcapng");
         assert_eq!(answer["size"], pcap.len());
         let data = base64::engine::general_purpose::STANDARD
@@ -1337,10 +1557,127 @@ mod tests {
         store.begin(2, Network::Udp, None, "[2001:db8::1]:53", 1);
         store.record(2, Direction::Up, b"query");
         store.record(2, Direction::Down, b"answer");
-        let pcap = store.export_pcapng(None);
+        let pcap = store.export_pcapng(None, true);
         assert!(pcap.windows(6).any(|window| window == b"answer"));
         // The synthetic client fd00::1 talks to the real IPv6 server.
         let client = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert!(pcap.windows(16).any(|window| window == client));
+    }
+
+    fn filed(store: &CaptureStore, id: u64, method: &str, url: &str, status: u16) {
+        let mut exchange = HttpExchange::new(
+            method,
+            url,
+            &[(
+                "Authorization".to_string(),
+                "Bearer secret-value".to_string(),
+            )],
+        );
+        exchange.status = Some(status);
+        store.add_exchange(id, exchange);
+    }
+
+    #[test]
+    fn requests_list_rows_in_order_and_filter() {
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(1, Network::Tcp, Some("a.test"), "a.test:443", 1);
+        store.begin(2, Network::Tcp, Some("b.test"), "b.test:443", 2);
+        store.mark_decrypted(1);
+        store.mark_decrypted(2);
+        filed(&store, 2, "GET", "https://b.test/one", 200);
+        filed(&store, 1, "POST", "https://a.test/two", 500);
+        filed(&store, 2, "GET", "https://b.test/three", 404);
+
+        let all = store.requests_json(0, None, &Filter::default());
+        let rows = all["requests"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["seq"], 1);
+        assert_eq!(rows[0]["connection_id"], 2);
+        assert_eq!(rows[0]["index"], 0);
+        assert_eq!(rows[1]["connection_id"], 1);
+        assert_eq!(rows[2]["index"], 1);
+        assert_eq!(rows[2]["host"], "b.test");
+        assert_eq!(rows[2]["http_version"], HTTP_1_1);
+        assert_eq!(all["last_seq"], 3);
+        assert_eq!(all["dropped_before_seq"], 0);
+
+        let since = store.requests_json(1, Some(1), &Filter::default());
+        assert_eq!(since["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(since["requests"][0]["seq"], 2);
+
+        let errors = store.requests_json(
+            0,
+            None,
+            &Filter::parse("status:>=400 -host:a.test").unwrap(),
+        );
+        assert_eq!(errors["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(errors["requests"][0]["url"], "https://b.test/three");
+
+        store.clear();
+        let cleared = store.requests_json(0, None, &Filter::default());
+        assert!(cleared["requests"].as_array().unwrap().is_empty());
+        assert_eq!(cleared["dropped_before_seq"], 3);
+    }
+
+    #[test]
+    fn exports_are_redacted_unless_asked_not_to() {
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(4, Network::Tcp, Some("a.test"), "a.test:443", 1);
+        store.mark_decrypted(4);
+        filed(&store, 4, "GET", "https://a.test/x?token=tok-value-1", 200);
+        filed(&store, 4, "GET", "https://a.test/y", 200);
+
+        let contains = |file: &[u8], needle: &[u8]| file.windows(needle.len()).any(|w| w == needle);
+        for format in [
+            ExportFormat::Pcapng,
+            ExportFormat::Har,
+            ExportFormat::Curl,
+            ExportFormat::Code,
+            ExportFormat::Postman,
+            ExportFormat::Insomnia,
+        ] {
+            let request = ExportRequest::new(format);
+            let file = export_file(&store, &request);
+            assert!(!contains(&file, b"secret-value"), "{format:?}");
+            assert!(!contains(&file, b"tok-value-1"), "{format:?}");
+            assert!(contains(&file, redact::MASK.as_bytes()), "{format:?}");
+            let raw = ExportRequest {
+                redact: false,
+                ..request
+            };
+            assert!(
+                contains(&export_file(&store, &raw), b"secret-value"),
+                "{format:?}"
+            );
+        }
+
+        let one = ExportRequest {
+            selection: Selection {
+                id: Some(4),
+                exchange: Some(1),
+            },
+            ..ExportRequest::new(ExportFormat::Curl)
+        };
+        let script = String::from_utf8(export_file(&store, &one)).unwrap();
+        assert!(script.contains("https://a.test/y"));
+        assert!(!script.contains("https://a.test/x"));
+        let answer: Value = serde_json::from_slice(&export_answer(&store, &one)).unwrap();
+        assert_eq!(answer["file_name"], "anixops-capture-4-1.sh");
+        assert_eq!(answer["redacted"], true);
+    }
+
+    #[test]
+    fn pcapng_masks_plain_http_heads() {
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(5, Network::Tcp, None, "192.0.2.1:80", 1);
+        store.record(
+            5,
+            Direction::Up,
+            b"GET / HTTP/1.1\r\nCookie: sid=plain-secret\r\n\r\n",
+        );
+        let masked = store.export_pcapng(None, true);
+        assert!(!masked.windows(12).any(|w| w == b"plain-secret"));
+        let raw = store.export_pcapng(None, false);
+        assert!(raw.windows(12).any(|w| w == b"plain-secret"));
     }
 }

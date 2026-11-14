@@ -950,5 +950,39 @@ async fn capture_keeps_decrypted_http_under_the_origin_connection() {
     let export = control_json(&dispatcher, r#"{"cmd":"export_capture","format":"pcapng"}"#);
     let pcap = base64_field(&export["data_base64"]);
     assert!(pcap.windows(13).any(|window| window == b"captured body"));
+
+    // One row per request, filtered by the shared expression syntax.
+    let rows = control_json(
+        &dispatcher,
+        r#"{"cmd":"capture_requests","filter":"method:post status:2xx path:/submit"}"#,
+    );
+    let row = &rows["requests"][0];
+    assert_eq!(row["connection_id"], connection.id, "{rows}");
+    assert_eq!(row["index"], 0);
+    assert_eq!(row["http_version"], "HTTP/1.1");
+    assert_eq!(row["request_size"], 5);
+    let none = control_json(
+        &dispatcher,
+        r#"{"cmd":"capture_requests","filter":"status:5xx"}"#,
+    );
+    assert!(none["requests"].as_array().unwrap().is_empty(), "{none}");
+    let bad = control_json(
+        &dispatcher,
+        r#"{"cmd":"capture_requests","filter":"status:abc"}"#,
+    );
+    assert_eq!(bad["error"]["code"], "invalid_filter");
+    assert_eq!(bad["error"]["at"], 7);
+
+    let curl = control_json(
+        &dispatcher,
+        &format!(
+            r#"{{"cmd":"export_capture","format":"curl","id":{},"exchange":0}}"#,
+            connection.id
+        ),
+    );
+    assert_eq!(curl["redacted"], true);
+    let script = String::from_utf8(base64_field(&curl["data_base64"])).unwrap();
+    assert!(script.contains("curl -X 'POST'"), "{script}");
+    assert!(script.contains("--data-binary 'hello'"), "{script}");
     server.abort();
 }
