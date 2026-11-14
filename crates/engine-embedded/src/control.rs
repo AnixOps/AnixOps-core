@@ -37,6 +37,11 @@
 //! | `pro_status` | | [`crate::pro::ProStatus`] |
 //! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
 //!
+//! The desktop local proxy and the packet tunnel runtime also answer
+//! `lan_share`, `start_lan_share` and `stop_lan_share` before this module
+//! sees them (feature `local-proxy`): sharing the engine with phones on the
+//! local network, see [`crate::lan_share`].
+//!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
 //! stops; see [`crate::capture`] for what is kept and its memory budget.
 //!

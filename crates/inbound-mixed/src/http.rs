@@ -1,5 +1,6 @@
 //! HTTP/1.x proxy requests: `CONNECT host:port` tunnels and absolute-form
-//! plain requests (`GET http://host/path HTTP/1.1`).
+//! plain requests (`GET http://host/path HTTP/1.1`), and requests for the
+//! listener's own [`ClientPages`].
 
 use std::io;
 
@@ -7,7 +8,10 @@ use engine_outbound::TargetAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::{invalid, Credentials, Reply, Request, MAX_HEAD_BYTES};
+use crate::{
+    invalid, ClientPages, Credentials, Incoming, PageRequest, PageResponse, Reply, Request,
+    MAX_HEAD_BYTES,
+};
 
 pub(crate) fn status_response(code: u16, reason: &str) -> String {
     format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -16,7 +20,8 @@ pub(crate) fn status_response(code: u16, reason: &str) -> String {
 pub(crate) async fn read_request(
     client: &mut TcpStream,
     credentials: Option<&Credentials>,
-) -> io::Result<Request> {
+    pages: Option<&dyn ClientPages>,
+) -> io::Result<Incoming> {
     let (head, rest) = read_head(client).await?;
     let text = std::str::from_utf8(&head).map_err(|_| invalid("http head is not utf-8"))?;
     let mut lines = text.split("\r\n");
@@ -33,6 +38,12 @@ pub(crate) async fn read_request(
         return Err(invalid("unsupported http version"));
     }
     let headers: Vec<&str> = lines.take_while(|line| !line.is_empty()).collect();
+
+    // A browser that opened the listener's own address: no proxy involved,
+    // so no proxy credentials either.
+    if pages.is_some() && uri.starts_with('/') {
+        return Ok(Incoming::Page(page_request(method, uri, &headers, false)));
+    }
 
     if let Some(expected) = credentials {
         if !authorized(&headers, expected) {
@@ -52,11 +63,11 @@ Proxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: cl
             return Err(invalid("bad connect authority"));
         };
         // Bytes the client sent after the head belong to the tunnel.
-        return Ok(Request {
+        return Ok(Incoming::Proxy(Request {
             target,
             initial: rest,
             reply: Reply::HttpConnect,
-        });
+        }));
     }
 
     let Some(after_scheme) = uri.strip_prefix("http://") else {
@@ -71,6 +82,11 @@ Proxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: cl
         reject(client, 400, "Bad Request").await?;
         return Err(invalid("bad http authority"));
     };
+    if let Some(pages) = pages {
+        if is_page_target(&target, pages.host()) {
+            return Ok(Incoming::Page(page_request(method, path, &headers, true)));
+        }
+    }
 
     // Forward in origin form, drop hop-by-hop proxy headers, and close after
     // one response so a keep-alive request for another host cannot reuse this
@@ -90,11 +106,80 @@ Proxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: cl
     }
     initial.extend_from_slice(b"Connection: close\r\n\r\n");
     initial.extend_from_slice(&rest);
-    Ok(Request {
+    Ok(Incoming::Proxy(Request {
         target,
         initial,
         reply: Reply::HttpForward,
+    }))
+}
+
+fn page_request(method: &str, path: &str, headers: &[&str], proxied: bool) -> PageRequest {
+    PageRequest {
+        method: method.to_string(),
+        path: path.to_string(),
+        host: header(headers, "host").map(str::to_string),
+        user_agent: header(headers, "user-agent").map(str::to_string),
+        proxied,
+    }
+}
+
+/// Whether a proxied plain request is for the pages' own made-up host.
+fn is_page_target(target: &TargetAddr, host: &str) -> bool {
+    matches!(target, TargetAddr::Domain(name, 80) if !host.is_empty() && name.eq_ignore_ascii_case(host))
+}
+
+/// The value of the first header called `name` (ASCII case-insensitive).
+fn header<'a>(headers: &[&'a str], name: &str) -> Option<&'a str> {
+    headers.iter().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
     })
+}
+
+/// Answers a page request and asks the client to close.
+pub(crate) async fn send_page(
+    client: &mut TcpStream,
+    request: &PageRequest,
+    response: &PageResponse,
+) -> io::Result<()> {
+    let reason = match response.status {
+        200 => "OK",
+        301 => "Moved Permanently",
+        302 => "Found",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "Status",
+    };
+    let mut head = format!(
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+        response.status,
+        sanitize_header(&response.content_type),
+        response.body.len(),
+    );
+    if let Some(file_name) = &response.file_name {
+        head.push_str(&format!(
+            "Content-Disposition: attachment; filename=\"{}\"\r\n",
+            sanitize_header(file_name).replace('"', "")
+        ));
+    }
+    head.push_str("\r\n");
+    client.write_all(head.as_bytes()).await?;
+    if !request.method.eq_ignore_ascii_case("HEAD") {
+        client.write_all(&response.body).await?;
+    }
+    client.flush().await
+}
+
+/// Drops characters that would end or split a header line.
+fn sanitize_header(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Reads up to and including the blank line. Returns the head without the
@@ -230,6 +315,39 @@ mod tests {
         assert_eq!(parse_authority(":80", None), None);
         assert_eq!(parse_authority("example.com:0", None), None);
         assert_eq!(parse_authority("[::1]x", Some(80)), None);
+    }
+
+    #[test]
+    fn page_targets_match_the_made_up_host_on_port_80_only() {
+        let host = "cert.anixops";
+        assert!(is_page_target(
+            &TargetAddr::Domain("CERT.anixops".into(), 80),
+            host
+        ));
+        assert!(!is_page_target(
+            &TargetAddr::Domain("cert.anixops".into(), 8080),
+            host
+        ));
+        assert!(!is_page_target(
+            &TargetAddr::Domain("example.com".into(), 80),
+            host
+        ));
+        assert!(!is_page_target(
+            &TargetAddr::Domain("cert.anixops".into(), 80),
+            ""
+        ));
+    }
+
+    #[test]
+    fn headers_are_found_case_insensitively() {
+        let headers = [
+            "Host: 192.168.1.5:8899",
+            "user-agent:  Mozilla/5.0 (iPhone) ",
+        ];
+        assert_eq!(header(&headers, "HOST"), Some("192.168.1.5:8899"));
+        assert_eq!(header(&headers, "User-Agent"), Some("Mozilla/5.0 (iPhone)"));
+        assert_eq!(header(&headers, "cookie"), None);
+        assert_eq!(sanitize_header("a\r\nb"), "ab");
     }
 
     #[test]

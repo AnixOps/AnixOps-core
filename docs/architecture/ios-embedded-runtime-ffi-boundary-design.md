@@ -101,6 +101,8 @@ struct 必须采用 C-compatible layout，字段必须固定大小、对齐和 o
 `NETWORKCORE_IOS_ERR_INVALID_ARGUMENT`，`out` 保持为空 buffer。handle 创建后、隧道启动前和停止后都可调用。
 桌面 local proxy 通过 `LocalProxy::control_json` 接受同样的请求。命令表以 `crates/engine-embedded/src/control.rs` 为准：
 
+局域网共享（手机连电脑抓包）：`lan_share`、`start_lan_share`、`stop_lan_share` 由桌面 local proxy 和包隧道运行时在进入 `control` 模块之前处理（`local-proxy` feature），命令表、设置页路径与访问限制见 `crates/engine-embedded/src/lan_share.rs`。
+
 | `cmd` | 请求字段 | 应答 |
 | --- | --- | --- |
 | `traffic` | | `upload_total`、`download_total`（字节）、`upload_rate`、`download_rate`（字节/秒，按两次调用间隔采样，间隔不足 500 ms 时沿用上次速率）、`active` |
