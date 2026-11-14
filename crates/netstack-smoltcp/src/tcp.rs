@@ -55,14 +55,17 @@ const IDLE_PARK: Duration = Duration::from_secs(10);
 /// send buffers (two windows, 128 KiB at the tunnel's default): every short
 /// connection the tunnel closes first stayed at full size for 10 s, so a
 /// burst of a few hundred short connections pushed the iOS extension
-/// towards its memory limit. The peer is the device's own TCP stack across
-/// the TUN interface, where segments are neither delayed nor duplicated, so
-/// the old-duplicate protection of a full TIME-WAIT buys nothing. This
-/// grace only covers the final ACK, which smoltcp may delay (10 ms by
-/// default), and a FIN the peer retransmits if that ACK is lost (its RTO is
-/// at least 200 ms). A segment arriving later is answered with a RST, which
-/// a peer in LAST-ACK takes as the end of the connection.
-const TIME_WAIT_LINGER: Duration = Duration::from_millis(1000);
+/// towards its memory limit. Even 1 s kept ~30 MiB alive in a burst of 200
+/// connections at 16 at a time (capture-gates F8).
+///
+/// The peer is the device's own TCP stack across the TUN interface, where
+/// segments are neither delayed nor duplicated, so the old-duplicate
+/// protection of TIME-WAIT buys nothing. The linger only lets smoltcp send
+/// the final ACK, which it may delay by its ACK delay (10 ms). Should that
+/// ACK be lost, the peer's retransmitted FIN is answered with a RST, which a
+/// peer in LAST-ACK takes as the end of the connection: its application
+/// has already closed, so nothing is lost either way.
+const TIME_WAIT_LINGER: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
@@ -293,7 +296,7 @@ impl TcpListenerRunner {
                     continue;
                 }
 
-                // Both sides have sent their FIN and had it acknowledged:
+                // Both sides have sent their FIN and ours is acknowledged:
                 // keep the socket only for TIME_WAIT_LINGER, not smoltcp's
                 // 10 s, so its buffers go back right away.
                 if socket.state() == TcpState::TimeWait {

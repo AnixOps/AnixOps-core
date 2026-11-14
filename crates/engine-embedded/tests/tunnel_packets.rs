@@ -719,7 +719,7 @@ fn start_answer_and_close_server() -> SocketAddr {
 /// A short connection the tunnel closes first is released right after the
 /// app's FIN, not after smoltcp's 10 s TIME-WAIT: the relay ends at once
 /// (its outbound and buffers go) and the socket, with its two windows of
-/// buffers, is gone about a second later. Hundreds of such connections in
+/// buffers, is gone shortly after. Hundreds of such connections in
 /// a burst used to keep ~140 KiB each alive for 10 s (88 MiB peak for 600).
 #[test]
 fn a_short_connection_closed_by_the_tunnel_is_released_promptly() {

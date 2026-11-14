@@ -13,7 +13,7 @@ Changes against 0.2.4 are listed here; measure each one with the
   backstop) instead of re-polling every 5 ms.
 - `tcp.rs`: the staging buffers between a smoltcp socket and its `TcpStream`
   are at most 16 KiB instead of one window each.
-- `tcp.rs`: a socket in TIME-WAIT is removed after 1 s instead of smoltcp's
+- `tcp.rs`: a socket in TIME-WAIT is removed after 100 ms instead of smoltcp's
   10 s, and `TcpStream::poll_shutdown` completes once the FIN is queued (as
   `shutdown(SHUT_WR)` does) instead of when the socket reaches CLOSED. Each
   short connection the tunnel closed first kept its relay and both socket
