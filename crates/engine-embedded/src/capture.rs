@@ -398,7 +398,8 @@ impl CaptureStore {
         let added = if merge {
             if let Some(last) = captured.chunks.last_mut() {
                 // `room` is the most this chunk can still grow by.
-                reserve_capped(&mut last.data, take, last.data.len() + room);
+                let limit = last.data.len() + room;
+                reserve_capped(&mut last.data, take, limit);
                 last.data.extend_from_slice(data);
             }
             take
