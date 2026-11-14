@@ -10,6 +10,9 @@
 //! A config with a `mitm` section gets the same HTTPS decryption as the
 //! packet tunnel: each connection's first bytes are offered to the
 //! [`FlowInterceptor`], and what it does not claim is relayed untouched.
+//!
+//! The `start_lan_share` control request opens the same engine to phones on
+//! the local network; see [`crate::lan_share`].
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -24,7 +27,7 @@ use tokio::sync::oneshot;
 
 use crate::config::RuntimeConfig;
 use crate::connections::Dispatcher;
-use crate::dns_policy::DnsPolicy;
+use crate::lan_share::{LanShare, LanShareSlot};
 use crate::tunnel::{
     FlowInterceptor, InterceptedFlow, TunnelSettings, TunnelStats, TunnelStatsSnapshot,
 };
@@ -37,6 +40,9 @@ pub struct LocalProxy {
     decrypting: Option<Arc<Decrypting>>,
     local_addr: SocketAddr,
     stats: Arc<MixedStats>,
+    /// Root certificate of the `mitm` section (DER), for the share's setup page.
+    ca_certificate: Option<Vec<u8>>,
+    lan_share: LanShareSlot,
     shutdown_tx: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -66,6 +72,7 @@ impl LocalProxy {
         dialer: Arc<dyn Dialer>,
     ) -> Result<Self, RuntimeError> {
         let config = RuntimeConfig::from_json(config)?;
+        let ca_certificate = config.mitm_ca_certificate_der();
         // A routing config keeps its routed outbound to run group health checks.
         let interceptor = crate::build_interceptor(&config)?;
         let plugin_rules = interceptor
@@ -79,25 +86,11 @@ impl LocalProxy {
         let decrypting = match interceptor {
             Some(interceptor) => {
                 interceptor.set_script_outbound(dispatcher.clone());
-                let dns = DnsPolicy::from_config(&config.dns).map_err(|message| {
-                    RuntimeError::new(RuntimeErrorCode::ConfigRejected, message)
-                })?;
-                let limits = &config.limits;
-                Some(Arc::new(Decrypting {
-                    dispatcher: dispatcher.clone(),
+                Some(Arc::new(Decrypting::new(
+                    dispatcher.clone(),
                     interceptor,
-                    settings: TunnelSettings {
-                        mtu: config.mtu,
-                        tcp_window_bytes: limits.tcp_window_bytes,
-                        max_tcp_connections: limits.max_tcp_connections,
-                        max_udp_flows: limits.max_udp_flows,
-                        max_dns_in_flight: limits.max_dns_in_flight,
-                        idle_timeout: Duration::from_secs(limits.idle_timeout_secs),
-                        connect_timeout: Duration::from_secs(limits.connect_timeout_secs),
-                        dns: Arc::new(dns),
-                    },
-                    stats: TunnelStats::default(),
-                }))
+                    crate::tunnel_settings(&config)?,
+                )))
             }
             None => None,
         };
@@ -171,6 +164,8 @@ impl LocalProxy {
             decrypting,
             local_addr,
             stats,
+            ca_certificate,
+            lan_share: LanShareSlot::default(),
             shutdown_tx: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -209,6 +204,19 @@ impl LocalProxy {
 
     /// Answers one [`control`] request, such as the connection list.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        let shared = self.lan_share.control(request, |options| {
+            LanShare::start(
+                self.dispatcher.clone(),
+                self.decrypting
+                    .clone()
+                    .map(|decrypting| decrypting as Arc<dyn ClientInterceptor>),
+                self.ca_certificate.clone(),
+                options,
+            )
+        });
+        if let Some(answer) = shared {
+            return answer;
+        }
         let interceptor = self
             .decrypting
             .as_ref()
@@ -224,6 +232,7 @@ impl LocalProxy {
 
     /// Stops listening and drops every connection. Idempotent.
     pub fn stop(&mut self) {
+        self.lan_share.stop();
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
@@ -279,11 +288,26 @@ impl ClientConnector for ProcessRouting {
 
 /// The config's `mitm` section on the local listener: claimed connections go
 /// to the same [`FlowInterceptor`] the packet tunnel uses.
-struct Decrypting {
+pub(crate) struct Decrypting {
     dispatcher: Arc<Dispatcher>,
     interceptor: Arc<dyn FlowInterceptor>,
     settings: TunnelSettings,
     stats: TunnelStats,
+}
+
+impl Decrypting {
+    pub(crate) fn new(
+        dispatcher: Arc<Dispatcher>,
+        interceptor: Arc<dyn FlowInterceptor>,
+        settings: TunnelSettings,
+    ) -> Self {
+        Self {
+            dispatcher,
+            interceptor,
+            settings,
+            stats: TunnelStats::default(),
+        }
+    }
 }
 
 /// The interceptor judges by the port only; a proxy request for a name has

@@ -40,6 +40,13 @@
 //! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off |
 //! | `delete_capture` | `session` | `{"deleted": bool}` |
 //! | `capture_requests` | optional `since_seq`, `limit`, `filter` | `{"requests": [...], "last_seq", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange |
+//! | `pro_status` | | [`crate::pro::ProStatus`] |
+//! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
+//!
+//! The desktop local proxy and the packet tunnel runtime also answer
+//! `lan_share`, `start_lan_share` and `stop_lan_share` before this module
+//! sees them (feature `local-proxy`): sharing the engine with phones on the
+//! local network, see [`crate::lan_share`].
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
 //! stops; see [`crate::capture`] for what is kept and its memory budget,
@@ -81,6 +88,7 @@ use crate::capture::filter::Filter;
 use crate::capture::{self, ExportFormat, ExportRequest, Language, Selection};
 use crate::connections::{Dispatcher, Mode};
 use crate::metrics;
+use crate::pro;
 use crate::tunnel::FlowInterceptor;
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -187,6 +195,11 @@ enum ControlRequest {
         limit: Option<usize>,
         #[serde(default)]
         filter: String,
+    },
+    ProStatus,
+    SetProLicense {
+        #[serde(default)]
+        license: Option<String>,
     },
 }
 
@@ -445,6 +458,10 @@ pub fn handle_with_interceptor(
                 "error": { "code": "invalid_filter", "at": error.at },
             })),
         },
+        ControlRequest::ProStatus => serde_json::to_value(pro::status()),
+        ControlRequest::SetProLicense { license } => {
+            serde_json::to_value(pro::set_license(license.as_deref()))
+        }
         ControlRequest::ReloadRules { rules, dry_run } => {
             let routed = dispatcher
                 .routed_outbound()
