@@ -8,6 +8,9 @@
 | F2 并发连接 | 5000 条 TCP 同时建立并各回显 1 字节（redirect、ss2022 两种出站） | `tunnel_bench scale` | `perf.yml` / Tunnel scale | 同上 |
 | F3 UDP 会话 | 10 万个 UDP 流同时打开，进程 RSS ≤ 300 MiB | `tunnel_bench udp-sessions` | `perf.yml` / Tunnel scale | 同上 |
 | F7 长稳 | 预热后 RSS 斜率 ≤ 1 MiB/h，连接失败率 ≤ 0.1%，结束无残留流与 fd | `tunnel_bench soak` | `soak.yml` | 每周六 5.5 h（托管 runner）；24 h 手动选自托管 runner；改动 soak 本身的 PR 跑 30 min 冒烟（斜率门槛放宽到 20 MiB/h） |
+| I3 HTTPS 解密成功率 | `testdata/capture-sites.txt` 的 60 个真实站点，直连可达的站点里，经隧道解密后状态码类别一致且交换进了抓包（HAR）的 ≥ 95% | `capture_bench` + `.github/scripts/capture-gates.py` | `capture-gates.yml` | 改动 engine-embedded / mitm-policy / netstack 等的 PR、main、手动；`release.yml` 发布前必跑 |
+| I4 抓包吞吐 | 同一隧道进程里抓包开 / 关相邻成对下载 256 MiB 共 10 对（raw TCP、明文 HTTP、HTTPS 解密），每对吞吐比的中位数下降 ≤ 15% | 同上 | 同上 | 同上 |
+| I4 抓包内存 | 抓包关 / 开各 3 个新进程，600 条短连接（16 并发，默认 2 MiB 预算），峰值 RSS（VmHWM）中位数增加 ≤ 10 MiB | 同上 | 同上 | 同上 |
 | C4 IPC 模糊测试 | `networkcore_ios_runtime_control` 不 panic、回答必为 JSON 对象、错误码在文档集合内 | `crates/engine-embedded/fuzz` 的 `runtime_control` | `ci.yml` / HTTP/2 MITM fuzz | 每个 Rust PR（30 s）、main（60 s） |
 
 R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR 上 head 超出门槛时，会在同一台 runner 上再测 base；head 不比 base 慢 15% 以上就只告警（runner 偏慢，不是回归），否则失败。
@@ -15,6 +18,8 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 `perf.yml` 的隧道基准（base 对 head）仍只做信息展示，不设门槛。
 
 ## 说明
+
+- 抓包门槛（I3/I4）：隧道进程打开 TUN 后，设备被移进 network namespace `capbench`，客户端（curl、raw TCP 读取）在里面跑，隧道自己的出站留在宿主。解密成功率用生产上游 TLS 客户端（webpki 根）；吞吐与内存用本地源站。`--diagnose` 额外跑最小预算和 glibc `mmap_threshold=32768` 对照，用来区分预算内数据和堆碎片，不设门槛。
 
 - 规则决策走 `RoutingModel::decide_indexed`：DOMAIN 与 DOMAIN-SUFFIX 规则用哈希表查找，其余规则按顺序尝试，结果与逐条 `decide` 完全一致（`crates/config-core/tests/rule_index_contracts.rs`）。基准里 10% 的查询不命中任何规则，是最坏情况（走完全部非域名规则、解析一次域名、落到 FINAL）。
 - UDP 流上限由配置 `limits.max_udp_flows` 决定（默认 256，iOS 内存预算不变）；测 10 万流时基准自行调高。
@@ -27,3 +32,10 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 - R2：1 万条规则 p99 约 35 µs（runner 之间约有 2 倍波动）。
 - F2：5000 并发全部回显成功，redirect / ss2022 回显 p99 约 3 ms，隧道进程约 52 KiB/连接。
 - F3：10 万 UDP 流 RSS 222 MiB（约 2.2 KiB/流）。此前每流两个任务加一个 tokio mpsc 通道，是 4.2 KiB/流、417 MiB；现在每流一个任务、按需分配的队列，打开流的 future 用完即释放。
+
+## 抓包门槛首次结果（2026-11-14，GitHub 托管 ubuntu runner）
+
+- I3：60/60 站点解密成功（100%）。压测中发现负载下 ClientHello 晚于 100 ms 或被分段时漏解密，已修（80/443 首包等待 1 s 并读完整 TLS 记录）。
+- I4 吞吐：raw −2.7%、HTTP −0.3%、HTTPS 7.3%（同进程交替测；分进程测时 runner 波动可达 ±15%，不可用）。
+- I4 内存：峰值 87.7 → 93.6 MiB（+5.9 MiB）。最初是 +14.2 MiB，多出的部分是成倍增长的抓包缓冲留下的堆碎片；TCP 抓包改为 ≤16 KiB 分片、body 一次性分配后降到 +5.9 MiB。
+- 抓包关闭时 600 条短连接也会把峰值推到约 88 MiB：关闭的连接还会挂 2–5 s（每个隧道连接带收发缓冲），与抓包无关，另行跟进。

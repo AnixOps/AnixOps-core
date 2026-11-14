@@ -118,6 +118,11 @@ libc = "0.2"
 name = "tunnel_bench"
 required-features = ["shadowsocks"]
 
+# Capture quality and overhead gates (.github/workflows/capture-gates.yml).
+[[example]]
+name = "capture_bench"
+required-features = ["mitm"]
+
 [lib]
 path = "src/lib.rs"
 crate-type = ["lib", "staticlib"]

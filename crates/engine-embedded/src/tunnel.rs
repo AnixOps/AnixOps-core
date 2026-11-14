@@ -131,7 +131,13 @@ const INPUT_QUEUE_PACKETS: usize = 512;
 /// How long a new flow waits for the application's first bytes, so they can
 /// travel inside the proxy request header.
 const FIRST_PAYLOAD_WAIT: Duration = Duration::from_millis(100);
+/// The same for HTTP and HTTPS (client-first protocols): under load the
+/// request or ClientHello can come later than [`FIRST_PAYLOAD_WAIT`], and a
+/// flow without its first bytes misses HTTPS decryption and rewrites.
+const FIRST_PAYLOAD_CLIENT_FIRST_WAIT: Duration = Duration::from_secs(1);
 const FIRST_PAYLOAD_MAX: usize = 4096;
+/// Largest TLS record that is read whole as the first payload.
+const FIRST_TLS_RECORD_MAX: usize = 5 + 16 * 1024;
 const RELAY_BUFFER_BYTES: usize = 8 * 1024;
 const DNS_PORT: u16 = 53;
 /// UDP flows open at once by default ([`TunnelSettings::max_udp_flows`]);
@@ -1022,6 +1028,50 @@ async fn run_udp_flow(
     }
 }
 
+/// The application's first bytes, empty when it sent none in time; `None`
+/// when it closed first. A TLS ClientHello larger than one segment (such as
+/// one with post-quantum key shares) arrives in pieces: reading goes on until
+/// its first record is whole, so the server name can be read from it.
+async fn read_first_payload(inbound: &mut (impl AsyncRead + Unpin), port: u16) -> Option<Vec<u8>> {
+    let wait = match port {
+        80 | 443 => FIRST_PAYLOAD_CLIENT_FIRST_WAIT,
+        _ => FIRST_PAYLOAD_WAIT,
+    };
+    let mut first = vec![0u8; FIRST_PAYLOAD_MAX];
+    let mut len = match tokio::time::timeout(wait, inbound.read(&mut first)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => return None,
+        Ok(Ok(n)) => n,
+        Err(_) => 0,
+    };
+    if let Some(record) = tls_record_len(&first[..len]) {
+        let record = record.min(FIRST_TLS_RECORD_MAX);
+        if record > first.len() {
+            first.resize(record, 0);
+        }
+        while len < record {
+            match tokio::time::timeout(
+                FIRST_PAYLOAD_CLIENT_FIRST_WAIT,
+                inbound.read(&mut first[len..record]),
+            )
+            .await
+            {
+                Ok(Ok(n)) if n > 0 => len += n,
+                _ => break,
+            }
+        }
+    }
+    first.truncate(len);
+    Some(first)
+}
+
+/// Length of the TLS handshake record `bytes` starts with, header included.
+fn tls_record_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 5 || bytes[0] != 0x16 || bytes[1] != 0x03 {
+        return None;
+    }
+    Some(5 + usize::from(u16::from_be_bytes([bytes[3], bytes[4]])))
+}
+
 async fn handle_tcp(
     mut inbound: netstack_smoltcp::TcpStream,
     target: SocketAddr,
@@ -1030,13 +1080,9 @@ async fn handle_tcp(
     stats: &TunnelStats,
     settings: &TunnelSettings,
 ) {
-    let mut first = vec![0u8; FIRST_PAYLOAD_MAX];
-    let first_len = match tokio::time::timeout(FIRST_PAYLOAD_WAIT, inbound.read(&mut first)).await {
-        Ok(Ok(0)) | Ok(Err(_)) => return,
-        Ok(Ok(n)) => n,
-        Err(_) => 0,
+    let Some(first) = read_first_payload(&mut inbound, target.port()).await else {
+        return;
     };
-    first.truncate(first_len);
 
     if let Some(interceptor) = interceptor {
         if let Some(host) = interceptor.claim(&first, target) {
@@ -1170,5 +1216,45 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<'_, S> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_client_hello_in_pieces_is_read_whole() {
+        let mut record = vec![0x16, 0x03, 0x01, 0x17, 0x00];
+        record.extend((0..0x1700).map(|i| i as u8));
+        let (mut app, mut tunnel_side) = tokio::io::duplex(64 * 1024);
+        let sent = record.clone();
+        let writer = tokio::spawn(async move {
+            app.write_all(&sent[..1400]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            app.write_all(&sent[1400..]).await.unwrap();
+            app
+        });
+        let first = read_first_payload(&mut tunnel_side, 443).await.unwrap();
+        assert_eq!(first, record);
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn http_and_https_wait_longer_than_other_ports_for_the_first_bytes() {
+        let (mut app, mut tunnel_side) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            app.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+            app
+        });
+        let first = read_first_payload(&mut tunnel_side, 80).await.unwrap();
+        assert_eq!(first, b"GET / HTTP/1.1\r\n\r\n");
+        drop(writer.await.unwrap());
+
+        let (_app, mut tunnel_side) = tokio::io::duplex(1024);
+        let started = std::time::Instant::now();
+        assert_eq!(read_first_payload(&mut tunnel_side, 22).await.unwrap(), b"");
+        assert!(started.elapsed() < Duration::from_millis(900));
     }
 }

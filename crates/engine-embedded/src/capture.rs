@@ -92,6 +92,8 @@ pub const MAX_CAPTURED_CONNECTIONS: usize = 1024;
 /// Bytes counted for one connection besides its data, so many empty
 /// connections still use the budget.
 const CONNECTION_OVERHEAD: usize = 256;
+/// Largest piece one chunk of a TCP stream is kept in.
+const CHUNK_PIECE_BYTES: usize = 16 * 1024;
 /// Bytes counted for one chunk besides its data.
 const CHUNK_OVERHEAD: usize = 32;
 
@@ -248,6 +250,20 @@ struct Captured {
 }
 
 impl Captured {
+    /// The chunks with the pieces of one TCP run joined again.
+    fn joined_chunks(&self) -> Vec<(Direction, u64, Vec<u8>)> {
+        let mut joined: Vec<(Direction, u64, Vec<u8>)> = Vec::new();
+        for chunk in &self.chunks {
+            match joined.last_mut() {
+                Some(last) if self.network == Network::Tcp && last.0 == chunk.direction => {
+                    last.2.extend_from_slice(&chunk.data);
+                }
+                _ => joined.push((chunk.direction, chunk.at_ms, chunk.data.clone())),
+            }
+        }
+        joined
+    }
+
     /// What the connection counts against the budget, from its contents.
     fn memory_estimate(&self) -> usize {
         CONNECTION_OVERHEAD
@@ -279,13 +295,12 @@ impl Captured {
             "decrypted": self.decrypted,
             "upload": direction(0),
             "download": direction(1),
-            "chunks": self
-                .chunks
-                .iter()
-                .map(|chunk| json!({
-                    "dir": chunk.direction,
-                    "at_ms": chunk.at_ms,
-                    "data_base64": base64_encode(&chunk.data),
+            "chunks": self.joined_chunks()
+                .into_iter()
+                .map(|(direction, at_ms, data)| json!({
+                    "dir": direction,
+                    "at_ms": at_ms,
+                    "data_base64": base64_encode(&data),
                 }))
                 .collect::<Vec<_>>(),
             "http": self.http.iter().map(HttpExchange::json).collect::<Vec<_>>(),
@@ -324,6 +339,18 @@ impl Inner {
         }
         true
     }
+}
+
+/// Makes room in `buf` for `more` bytes, doubling like `Vec` does but never
+/// past `limit`, the most `buf` will ever hold, so a kept piece takes about
+/// the memory the budget counts for it instead of up to twice that.
+pub(crate) fn reserve_capped(buf: &mut Vec<u8>, more: usize, limit: usize) {
+    let needed = buf.len() + more;
+    if needed <= buf.capacity() {
+        return;
+    }
+    let target = (buf.capacity() * 2).clamp(needed, limit.max(needed));
+    buf.reserve_exact(target - buf.len());
 }
 
 /// The capture switch, its budget and what it kept.
@@ -452,14 +479,17 @@ impl CaptureStore {
         let data = &data[..take];
         let now = unix_millis();
         // A TCP stream is one byte stream per direction: consecutive pieces
-        // the same way join one chunk. Datagrams stay apart.
+        // the same way join one chunk, up to CHUNK_PIECE_BYTES so the
+        // allocator reuses the freed pieces instead of growing the heap with
+        // ever larger buffers (shown joined again, see `Captured::json`).
+        // Datagrams stay apart.
         let merge = captured.network == Network::Tcp
-            && captured
-                .chunks
-                .last()
-                .is_some_and(|last| last.direction == direction);
+            && captured.chunks.last().is_some_and(|last| {
+                last.direction == direction && last.data.len() + take <= CHUNK_PIECE_BYTES
+            });
         let added = if merge {
             if let Some(last) = captured.chunks.last_mut() {
+                reserve_capped(&mut last.data, take, CHUNK_PIECE_BYTES);
                 last.data.extend_from_slice(data);
             }
             take
@@ -1164,16 +1194,18 @@ mod pcapng {
                     .filter(|(_, _, data)| !data.is_empty())
                     .collect()
             } else {
+                // Joined so that masking sees each TCP run whole, not the
+                // pieces it is kept in.
                 captured
-                    .chunks
-                    .iter()
-                    .map(|chunk| {
+                    .joined_chunks()
+                    .into_iter()
+                    .map(|(direction, at_ms, data)| {
                         let data = if redact {
-                            super::redact::http1_text(&chunk.data).into_owned()
+                            super::redact::http1_text(&data).into_owned()
                         } else {
-                            chunk.data.clone()
+                            data
                         };
-                        (chunk.direction, chunk.at_ms, data)
+                        (direction, at_ms, data)
                     })
                     .collect()
             };
@@ -1674,6 +1706,43 @@ mod tests {
         // The synthetic client fd00::1 talks to the real IPv6 server.
         let client = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert!(pcap.windows(16).any(|window| window == client));
+    }
+
+    #[test]
+    fn a_long_tcp_run_is_kept_in_pieces_and_shown_whole() {
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(3, Network::Tcp, None, "192.0.2.1:80", 1);
+        let block = vec![7u8; 1460];
+        for _ in 0..40 {
+            store.record(3, Direction::Down, &block);
+        }
+        {
+            let inner = lock(&store.inner);
+            let captured = &inner.connections[&3];
+            assert!(captured.chunks.len() > 1);
+            assert!(captured
+                .chunks
+                .iter()
+                .all(|chunk| chunk.data.capacity() <= CHUNK_PIECE_BYTES));
+        }
+        let value = store.connection_json(3).unwrap();
+        let chunks = value["chunks"].as_array().unwrap();
+        assert_eq!(chunks.len(), 1);
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(chunks[0]["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(data.len(), 40 * 1460);
+    }
+
+    #[test]
+    fn kept_pieces_grow_no_further_than_their_limit() {
+        let mut buf = Vec::new();
+        for _ in 0..44 {
+            reserve_capped(&mut buf, 1460, MAX_DIRECTION_BYTES);
+            buf.extend_from_slice(&[0u8; 1460]);
+        }
+        assert_eq!(buf.len(), 44 * 1460);
+        assert_eq!(buf.capacity(), MAX_DIRECTION_BYTES);
     }
 
     fn filed(store: &CaptureStore, id: u64, method: &str, url: &str, status: u16) {

@@ -1,0 +1,73 @@
+# HTTPS decryption test set for .github/scripts/capture-gates.py (gate I3:
+# at least 95% of the sites that answer directly must also answer, with the
+# same status class, through the tunnel's HTTPS decryption, and the exchange
+# must be in the capture). One host per line; https://HOST/ is fetched once.
+# Sites a mobile developer meets every day, global and mainland China.
+
+# Apple, Google, Microsoft, Amazon
+www.apple.com
+developer.apple.com
+www.icloud.com
+www.google.com
+www.youtube.com
+firebase.google.com
+fonts.googleapis.com
+www.gstatic.com
+www.microsoft.com
+login.microsoftonline.com
+www.amazon.com
+aws.amazon.com
+
+# Developer services and CDNs
+github.com
+api.github.com
+raw.githubusercontent.com
+stackoverflow.com
+registry.npmjs.org
+www.npmjs.com
+pypi.org
+crates.io
+docs.rs
+cdn.jsdelivr.net
+unpkg.com
+www.cloudflare.com
+www.mozilla.org
+www.docker.com
+gitlab.com
+api.stripe.com
+www.stripe.com
+
+# Social, media, productivity
+www.wikipedia.org
+en.wikipedia.org
+www.reddit.com
+x.com
+www.facebook.com
+www.instagram.com
+www.whatsapp.com
+www.linkedin.com
+www.netflix.com
+www.spotify.com
+www.twitch.tv
+discord.com
+slack.com
+www.dropbox.com
+zoom.us
+www.paypal.com
+www.bbc.co.uk
+www.nytimes.com
+www.tiktok.com
+
+# Mainland China
+www.baidu.com
+www.qq.com
+www.taobao.com
+www.jd.com
+www.bilibili.com
+weibo.com
+www.zhihu.com
+www.163.com
+www.sina.com.cn
+www.aliyun.com
+cloud.tencent.com
+www.douyin.com
