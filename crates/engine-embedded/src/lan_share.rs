@@ -270,12 +270,12 @@ impl LanShareSlot {
         }
         let command: LanShareControl = serde_json::from_slice(request).ok()?;
         let status = match command {
-            LanShareControl::LanShare => Ok(self.status()),
-            LanShareControl::StopLanShare => {
+            LanShareControl::Status => Ok(self.status()),
+            LanShareControl::Stop => {
                 self.stop();
                 Ok(LanShareStatus::stopped())
             }
-            LanShareControl::StartLanShare {
+            LanShareControl::Start {
                 port,
                 username,
                 password,
@@ -317,10 +317,12 @@ impl LanShareSlot {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
+#[serde(tag = "cmd")]
 enum LanShareControl {
-    LanShare,
-    StartLanShare {
+    #[serde(rename = "lan_share")]
+    Status,
+    #[serde(rename = "start_lan_share")]
+    Start {
         #[serde(default = "default_port")]
         port: u16,
         #[serde(default)]
@@ -328,7 +330,8 @@ enum LanShareControl {
         #[serde(default)]
         password: Option<String>,
     },
-    StopLanShare,
+    #[serde(rename = "stop_lan_share")]
+    Stop,
 }
 
 fn default_port() -> u16 {
