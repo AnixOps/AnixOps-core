@@ -215,6 +215,8 @@ def overhead(bench, out, args):
                         errors += [f"{kind}: {reason}" for reason in why]
                         peaks[f"short_{kind}"] = tunnel.control("sample")["hwm_kb"]
                     end = tunnel.control("sample")
+                    time.sleep(5)
+                    settled = tunnel.control("sample")
                 finally:
                     tunnel.stop()
                 record = {
@@ -228,6 +230,9 @@ def overhead(bench, out, args):
                     "end_rss_kb": end["rss_kb"],
                     "cpu_us": end["cpu_us"],
                     "mitm_flows": end["tunnel"].get("mitm_flows"),
+                    "tcp_active_end": end["tunnel"].get("tcp_active"),
+                    "tcp_active_settled": settled["tunnel"].get("tcp_active"),
+                    "settled_rss_kb": settled["rss_kb"],
                     "capture": end["capture"],
                 }
                 print(f"round {round_index + 1} capture {mode}: {json.dumps(record)}", flush=True)
