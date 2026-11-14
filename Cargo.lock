@@ -801,6 +801,7 @@ version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "boringtun",
+ "bytes",
  "config-core",
  "control-domain",
  "engine-inbound",
@@ -808,6 +809,8 @@ dependencies = [
  "engine-outbound",
  "etherparse",
  "futures",
+ "h2",
+ "http",
  "inbound-iwan",
  "inbound-mixed",
  "inbound-shadowsocks",

@@ -135,6 +135,46 @@ fn valid_name(name: &str) -> Option<String> {
 /// The SNI host name of a TLS ClientHello, lowercased, when `first` starts
 /// with one. A ClientHello cut short by the first read yields `None`.
 pub fn client_hello_server_name(first: &[u8]) -> Option<String> {
+    let body = client_hello_extension(first, 0)?;
+    let mut list = Reader(body);
+    let list_len = usize::from(list.u16()?);
+    let mut names = Reader(list.take(list_len)?);
+    while let Some(name_type) = names.u8() {
+        let name_len = usize::from(names.u16()?);
+        let name = names.take(name_len)?;
+        if name_type == 0 {
+            return valid_name(std::str::from_utf8(name).ok()?);
+        }
+    }
+    None
+}
+
+/// The ALPN protocols a TLS ClientHello in `first` offers, in its order;
+/// empty when it offers none or `first` holds no whole ClientHello.
+pub fn client_hello_alpn(first: &[u8]) -> Vec<Vec<u8>> {
+    let Some(body) = client_hello_extension(first, 16) else {
+        return Vec::new();
+    };
+    let mut list = Reader(body);
+    let Some(list_len) = list.u16() else {
+        return Vec::new();
+    };
+    let Some(protocols) = list.take(usize::from(list_len)) else {
+        return Vec::new();
+    };
+    let mut protocols = Reader(protocols);
+    let mut out = Vec::new();
+    while let Some(len) = protocols.u8() {
+        match protocols.take(usize::from(len)) {
+            Some(name) => out.push(name.to_vec()),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// The body of extension `kind` of a TLS ClientHello that starts in `first`.
+fn client_hello_extension(first: &[u8], kind: u16) -> Option<&[u8]> {
     // TLS record: content type 22 (handshake), version, length.
     if first.len() < 5 || first[0] != 0x16 || first[1] != 0x03 {
         return None;
@@ -156,23 +196,12 @@ pub fn client_hello_server_name(first: &[u8]) -> Option<String> {
     reader.skip(compression)?;
     let extensions_len = usize::from(reader.u16()?);
     let mut extensions = Reader(reader.take(extensions_len)?);
-    while let Some(kind) = extensions.u16() {
+    while let Some(found) = extensions.u16() {
         let len = usize::from(extensions.u16()?);
         let body = extensions.take(len)?;
-        if kind != 0 {
-            continue;
+        if found == kind {
+            return Some(body);
         }
-        let mut list = Reader(body);
-        let list_len = usize::from(list.u16()?);
-        let mut names = Reader(list.take(list_len)?);
-        while let Some(name_type) = names.u8() {
-            let name_len = usize::from(names.u16()?);
-            let name = names.take(name_len)?;
-            if name_type == 0 {
-                return valid_name(std::str::from_utf8(name).ok()?);
-            }
-        }
-        return None;
     }
     None
 }
@@ -206,10 +235,15 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        client_hello_server_name, host, http_host, http_request_head, http_url, http_user_agent,
+        client_hello_alpn, client_hello_server_name, host, http_host, http_request_head, http_url,
+        http_user_agent,
     };
 
     fn client_hello(server_name: &str) -> Vec<u8> {
+        client_hello_with(server_name, &[])
+    }
+
+    fn client_hello_with(server_name: &str, extra: &[u8]) -> Vec<u8> {
         let name = server_name.as_bytes();
         let mut sni = Vec::new();
         sni.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
@@ -222,6 +256,7 @@ mod tests {
         extensions.extend_from_slice(&[0x00, 0x00]);
         extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
         extensions.extend_from_slice(&sni);
+        extensions.extend_from_slice(extra);
 
         let mut hello = vec![0x03, 0x03];
         hello.extend_from_slice(&[0x11; 32]);
@@ -246,6 +281,26 @@ mod tests {
             client_hello_server_name(&client_hello("API.Example.test.")).as_deref(),
             Some("api.example.test")
         );
+    }
+
+    #[test]
+    fn reads_the_alpn_offer() {
+        // ALPN (16): list of 2 + "h2", 9 + "http/1.1".
+        let alpn = [
+            0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p',
+            b'/', b'1', b'.', b'1',
+        ];
+        let hello = client_hello_with("api.example.test", &alpn);
+        assert_eq!(
+            client_hello_alpn(&hello),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            client_hello_server_name(&hello).as_deref(),
+            Some("api.example.test")
+        );
+        assert!(client_hello_alpn(&client_hello("api.example.test")).is_empty());
+        assert!(client_hello_alpn(b"GET / HTTP/1.1\r\n\r\n").is_empty());
     }
 
     #[test]
