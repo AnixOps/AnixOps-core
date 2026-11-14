@@ -950,5 +950,73 @@ async fn capture_keeps_decrypted_http_under_the_origin_connection() {
     let export = control_json(&dispatcher, r#"{"cmd":"export_capture","format":"pcapng"}"#);
     let pcap = base64_field(&export["data_base64"]);
     assert!(pcap.windows(13).any(|window| window == b"captured body"));
+
+    // One row per request, filtered by the shared expression syntax.
+    let rows = control_json(
+        &dispatcher,
+        r#"{"cmd":"capture_requests","filter":"method:post status:2xx path:/submit"}"#,
+    );
+    let row = &rows["requests"][0];
+    assert_eq!(row["connection_id"], connection.id, "{rows}");
+    assert_eq!(row["index"], 0);
+    assert_eq!(row["http_version"], "HTTP/1.1");
+    assert_eq!(row["request_size"], 5);
+    let none = control_json(
+        &dispatcher,
+        r#"{"cmd":"capture_requests","filter":"status:5xx"}"#,
+    );
+    assert!(none["requests"].as_array().unwrap().is_empty(), "{none}");
+    let bad = control_json(
+        &dispatcher,
+        r#"{"cmd":"capture_requests","filter":"status:abc"}"#,
+    );
+    assert_eq!(bad["error"]["code"], "invalid_filter");
+    assert_eq!(bad["error"]["at"], 7);
+
+    let curl = control_json(
+        &dispatcher,
+        &format!(
+            r#"{{"cmd":"export_capture","format":"curl","id":{},"exchange":0}}"#,
+            connection.id
+        ),
+    );
+    assert_eq!(curl["redacted"], true);
+    let script = String::from_utf8(base64_field(&curl["data_base64"])).unwrap();
+    assert!(script.contains("curl -X 'POST'"), "{script}");
+    assert!(script.contains("--data-binary 'hello'"), "{script}");
+
+    // Saved sessions: sealed on disk, listed, loaded back after a clear.
+    let dir = std::env::temp_dir().join(format!("anixops-sessions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+    let set = control_json(
+        &dispatcher,
+        &serde_json::json!({
+            "cmd": "set_capture_storage",
+            "dir": dir.to_str().unwrap(),
+            "key_base64": key,
+        })
+        .to_string(),
+    );
+    assert_eq!(set["retention_days"], 7, "{set}");
+    let saved = control_json(&dispatcher, r#"{"cmd":"save_capture","name":"plain"}"#);
+    let session = saved["session"]["session"].as_str().unwrap().to_string();
+    assert_eq!(saved["session"]["requests"], 1, "{saved}");
+    let listed = control_json(&dispatcher, r#"{"cmd":"capture_sessions"}"#);
+    assert_eq!(listed["sessions"][0]["session"], session.as_str());
+    control_json(&dispatcher, r#"{"cmd":"clear_capture"}"#);
+    let loaded = control_json(
+        &dispatcher,
+        &format!(r#"{{"cmd":"load_capture","session":"{session}"}}"#),
+    );
+    assert_eq!(loaded["enabled"], false, "{loaded}");
+    let rows = control_json(&dispatcher, r#"{"cmd":"capture_requests"}"#);
+    assert_eq!(rows["requests"][0]["method"], "POST", "{rows}");
+    let deleted = control_json(
+        &dispatcher,
+        &format!(r#"{{"cmd":"delete_capture","session":"{session}"}}"#),
+    );
+    assert_eq!(deleted["deleted"], true);
+    let _ = std::fs::remove_dir_all(&dir);
     server.abort();
 }

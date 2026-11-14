@@ -33,7 +33,13 @@
 //! | `set_capture` | `enabled`, optional `max_total_bytes` | [`crate::capture::CaptureStatus`]: keep the bytes of new connections |
 //! | `clear_capture` | | [`crate::capture::CaptureStatus`] |
 //! | `capture_connection` | `id` | `{"capture": {...} \| null}`: kept bytes and decrypted HTTP messages of one connection |
-//! | `export_capture` | `format` (`pcapng` \| `har`), optional `id` | `{"format", "file_name", "content_type", "size", "data_base64"}` |
+//! | `export_capture` | `format` (`pcapng` \| `har` \| `curl` \| `code` \| `postman` \| `insomnia`), optional `id`, `exchange` (index in that connection's `http`), `language` (`code`: `python` \| `javascript` \| `swift` \| `kotlin` \| `go`), `redact` (default `true`) | `{"format", "file_name", "content_type", "size", "redacted", "data_base64"}` |
+//! | `set_capture_storage` | `dir`, `key_base64` (32 bytes the client keeps), optional `retention_days` (default 7, 1–365) | `{"retention_days", "purged"}`: where `save_capture` writes; old sessions are deleted |
+//! | `save_capture` | optional `name` | `{"session": {"session", "name", "saved_at_ms", "expires_at_ms", "size", "connections", "requests"}}`: seals what capture holds |
+//! | `capture_sessions` | | `{"sessions": [...]}`, newest first; a session this key cannot open has `"unreadable": true` |
+//! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off |
+//! | `delete_capture` | `session` | `{"deleted": bool}` |
+//! | `capture_requests` | optional `since_seq`, `limit`, `filter` | `{"requests": [...], "last_seq", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange |
 //! | `pro_status` | | [`crate::pro::ProStatus`] |
 //! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
 //!
@@ -43,7 +49,9 @@
 //! local network, see [`crate::lan_share`].
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
-//! stops; see [`crate::capture`] for what is kept and its memory budget.
+//! stops; see [`crate::capture`] for what is kept and its memory budget,
+//! [`crate::capture::redact`] for what an export masks and
+//! [`crate::capture::filter`] for the `capture_requests` filter syntax.
 //!
 //! `reload_rules` swaps the rule lines of a routing config while the engine
 //! runs ([`crate::routing::RoutedOutbound::reload_rules`]): `rules` is the
@@ -76,7 +84,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::capture::{self, ExportFormat};
+use crate::capture::filter::Filter;
+use crate::capture::{self, ExportFormat, ExportRequest, Language, Selection};
 use crate::connections::{Dispatcher, Mode};
 use crate::metrics;
 use crate::pro;
@@ -155,6 +164,37 @@ enum ControlRequest {
         format: ExportFormat,
         #[serde(default)]
         id: Option<u64>,
+        #[serde(default)]
+        exchange: Option<usize>,
+        #[serde(default)]
+        language: Language,
+        #[serde(default = "default_true")]
+        redact: bool,
+    },
+    SetCaptureStorage {
+        dir: String,
+        key_base64: String,
+        #[serde(default)]
+        retention_days: Option<u32>,
+    },
+    SaveCapture {
+        #[serde(default)]
+        name: Option<String>,
+    },
+    CaptureSessions,
+    LoadCapture {
+        session: String,
+    },
+    DeleteCapture {
+        session: String,
+    },
+    CaptureRequests {
+        #[serde(default)]
+        since_seq: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        filter: String,
     },
     ProStatus,
     SetProLicense {
@@ -361,10 +401,63 @@ pub fn handle_with_interceptor(
         ControlRequest::CaptureConnection { id } => {
             Ok(json!({ "capture": tracker.capture().connection_json(id) }))
         }
-        ControlRequest::ExportCapture { format, id } => {
+        ControlRequest::ExportCapture {
+            format,
+            id,
+            exchange,
+            language,
+            redact,
+        } => {
+            if exchange.is_some() && id.is_none() {
+                return Err(invalid("exchange needs the connection id"));
+            }
+            let request = ExportRequest {
+                format,
+                selection: Selection { id, exchange },
+                language,
+                redact,
+            };
             // The file goes out as written, without a JSON value in between.
-            return Ok(capture::export_answer(tracker.capture(), format, id));
+            return Ok(capture::export_answer(tracker.capture(), &request));
         }
+        ControlRequest::SetCaptureStorage {
+            dir,
+            key_base64,
+            retention_days,
+        } => {
+            use base64::Engine as _;
+            let key = base64::engine::general_purpose::STANDARD
+                .decode(key_base64.trim())
+                .map_err(|_| storage_error(capture::storage::StorageError::InvalidKey))?;
+            let set = tracker.capture().set_storage(&dir, &key, retention_days);
+            Ok(set.map_err(storage_error)?)
+        }
+        ControlRequest::SaveCapture { name } => {
+            let saved = tracker.capture().save_session(name.as_deref());
+            Ok(saved.map_err(storage_error)?)
+        }
+        ControlRequest::CaptureSessions => {
+            let sessions = tracker.capture().sessions();
+            Ok(sessions.map_err(storage_error)?)
+        }
+        ControlRequest::LoadCapture { session } => {
+            let status = tracker.capture().load_session(&session);
+            serde_json::to_value(status.map_err(storage_error)?)
+        }
+        ControlRequest::DeleteCapture { session } => {
+            let deleted = tracker.capture().delete_session(&session);
+            Ok(deleted.map_err(storage_error)?)
+        }
+        ControlRequest::CaptureRequests {
+            since_seq,
+            limit,
+            filter,
+        } => match Filter::parse(&filter) {
+            Ok(filter) => Ok(tracker.capture().requests_json(since_seq, limit, &filter)),
+            Err(error) => Ok(json!({
+                "error": { "code": "invalid_filter", "at": error.at },
+            })),
+        },
         ControlRequest::ProStatus => serde_json::to_value(pro::status()),
         ControlRequest::SetProLicense { license } => {
             serde_json::to_value(pro::set_license(license.as_deref()))
@@ -402,6 +495,10 @@ fn script(
     interceptor
         .and_then(|interceptor| interceptor.script_control(&request))
         .ok_or_else(|| invalid("this config runs no plugin scripts"))
+}
+
+fn storage_error(error: capture::storage::StorageError) -> RuntimeError {
+    invalid(error.message())
 }
 
 fn default_true() -> bool {
