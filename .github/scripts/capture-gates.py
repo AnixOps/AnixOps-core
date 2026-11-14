@@ -62,8 +62,9 @@ def in_ns(*cmd, check=False, timeout=None):
     return run(["sudo", "ip", "netns", "exec", NS, *cmd], check=check, timeout=timeout)
 
 
-def spawn(cmd):
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+def spawn(cmd, env=None):
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True,
+                            env={**os.environ, **env} if env else None)
     words = (proc.stdout.readline() or "").split()
     if not words or words[0] != "READY":
         proc.kill()
@@ -86,7 +87,7 @@ class Origin:
 class Tunnel:
     serial = 0
 
-    def __init__(self, bench, out, capture, hosts=None, origin=None, capture_bytes=None):
+    def __init__(self, bench, out, capture, hosts=None, origin=None, capture_bytes=None, env=None):
         Tunnel.serial += 1
         self.dev = f"cap{Tunnel.serial}"
         self.root = os.path.join(out, f"device-root-{self.dev}.pem")
@@ -100,7 +101,7 @@ class Tunnel:
                     "--https", str(origin.https), "--origin-root", origin.root]
         if capture_bytes:
             cmd += ["--capture-bytes", str(capture_bytes)]
-        self.proc, (self.port,) = spawn(cmd)
+        self.proc, (self.port,) = spawn(cmd, env)
         # The tunnel holds the device open; from here on its packets belong to
         # the namespace, the tunnel's own sockets stay outside.
         sudo("ip", "link", "set", self.dev, "netns", NS)
@@ -200,6 +201,10 @@ def overhead(bench, out, args):
         # Not gated: capture on with the smallest budget, to tell what grows
         # with the budget from what capture costs whatever the budget.
         samples["on_min"] = []
+        # glibc hands blocks of 32 KiB and more back to the kernel at once:
+        # what remains of the difference is live memory, not fragmentation.
+        samples["off_mmap"] = []
+        samples["on_mmap"] = []
     speeds = {kind: {"off": [], "on": []} for kind in kinds}
     try:
         # Throughput: one tunnel process, capture switched at run time before
@@ -223,10 +228,11 @@ def overhead(bench, out, args):
         for round_index in range(args.rounds):
             order = ("off", "on") if round_index % 2 == 0 else ("on", "off")
             if args.diagnose:
-                order += ("on_min",)
+                order += ("on_min", "off_mmap", "on_mmap")
             for mode in order:
-                tunnel = Tunnel(bench, out, capture=mode != "off", origin=origin,
-                                capture_bytes=64 * 1024 if mode == "on_min" else None)
+                env = {"GLIBC_TUNABLES": "glibc.malloc.mmap_threshold=32768"} if mode.endswith("_mmap") else None
+                tunnel = Tunnel(bench, out, capture=not mode.startswith("off"), origin=origin,
+                                capture_bytes=64 * 1024 if mode == "on_min" else None, env=env)
                 try:
                     idle = tunnel.control("sample")
                     for kind in kinds:
