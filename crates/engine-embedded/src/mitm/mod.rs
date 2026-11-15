@@ -79,6 +79,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use self::http1::{Body, Conn, Framing, Head};
 use crate::capture::stream::SseParser;
+use crate::capture::websocket::{Deflate, WsParser};
+use crate::capture::Direction;
 use crate::capture::{CaptureStore, CapturedBody, HttpExchange};
 use crate::config::MitmConfig;
 use crate::tunnel::{FlowInterceptor, InterceptedFlow, TunnelSettings, TunnelStats};
@@ -671,6 +673,19 @@ impl MitmEngine {
                     }
                 }
                 client.write_all(&response.encode()).await?;
+                if !event_stream {
+                    let websocket = response.has_token("Upgrade", "websocket");
+                    let sink = recording.as_ref().and_then(Recording::sink);
+                    return match sink.filter(|_| websocket) {
+                        Some(sink) => {
+                            let deflate = response
+                                .header("Sec-WebSocket-Extensions")
+                                .and_then(Deflate::from_response);
+                            relay_websocket(client, origin, sink, deflate).await
+                        }
+                        None => passthrough(client, origin).await,
+                    };
+                }
                 let Some(recording) = recording.as_mut().filter(|r| r.reads_events()) else {
                     return passthrough(client, origin).await;
                 };
@@ -950,6 +965,16 @@ impl<'a> Recording<'a> {
         self.publish();
     }
 
+    /// Where the messages of this exchange's stream go, once it is filed.
+    fn sink(&self) -> Option<MessageSink> {
+        let (store, id) = self.capture;
+        self.filed.map(|index| MessageSink {
+            store: store.clone(),
+            id: *id,
+            index,
+        })
+    }
+
     /// Whether [`Recording::response_bytes`] reads the body.
     fn reads_events(&self) -> bool {
         self.events.is_some()
@@ -985,6 +1010,83 @@ impl Drop for Recording<'_> {
         match self.filed {
             Some(index) => store.finish_exchange(*id, index, Some(exchange)),
             None => store.add_exchange(*id, exchange),
+        }
+    }
+}
+
+/// Files stream messages under one captured exchange.
+struct MessageSink {
+    store: Arc<CaptureStore>,
+    id: u64,
+    index: usize,
+}
+
+impl MessageSink {
+    fn push(&self, message: crate::capture::stream::StreamMessage) {
+        self.store.push_message(self.id, self.index, message);
+    }
+}
+
+/// Relays an upgraded WebSocket connection both ways unchanged, like
+/// [`passthrough`], keeping its messages under `sink` as they pass (view
+/// only, see [`crate::capture::websocket`]).
+async fn relay_websocket<C, O>(
+    client: Conn<C>,
+    origin: Conn<O>,
+    sink: MessageSink,
+    deflate: Option<Deflate>,
+) -> io::Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    let (client, client_buffered) = client.into_parts();
+    let (origin, origin_buffered) = origin.into_parts();
+    let (mut client_read, mut client_write) =
+        tokio::io::split(Prefixed::new(client, client_buffered));
+    let (mut origin_read, mut origin_write) =
+        tokio::io::split(Prefixed::new(origin, origin_buffered));
+    let up = relay_messages(
+        &mut client_read,
+        &mut origin_write,
+        WsParser::new(Direction::Up, deflate),
+        &sink,
+    );
+    let down = relay_messages(
+        &mut origin_read,
+        &mut client_write,
+        WsParser::new(Direction::Down, deflate),
+        &sink,
+    );
+    // The first error ends both ways, as `copy_bidirectional` does.
+    tokio::try_join!(up, down).map(|_| ())
+}
+
+/// One way of [`relay_websocket`]: bytes go on as read, then the parser
+/// sees them; the end of `read` shuts `write` down.
+async fn relay_messages<R, W>(
+    read: &mut R,
+    write: &mut W,
+    mut parser: WsParser,
+    sink: &MessageSink,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = read.read(&mut buf).await?;
+        if n == 0 {
+            return write.shutdown().await;
+        }
+        write.write_all(&buf[..n]).await?;
+        write.flush().await?;
+        if !parser.failed() {
+            for message in parser.feed(&buf[..n], crate::capture::unix_millis()) {
+                sink.push(message);
+            }
         }
     }
 }

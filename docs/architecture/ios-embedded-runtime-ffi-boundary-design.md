@@ -119,7 +119,7 @@ struct 必须采用 C-compatible layout，字段必须固定大小、对齐和 o
 | `set_capture` | `enabled`，可选 `max_total_bytes` | 同上；打开后新建的连接开始抓包，关闭后已抓到的保留 |
 | `clear_capture` | | 同上；清空已抓到的内容 |
 | `capture_connection` | `id` | `{"capture": {…} \| null}`：该连接抓到的字节块与 MITM 解密后的 HTTP 请求 / 响应 |
-| `capture_exchange` | `id`、`index`，可选 `since_message` | `{"exchange": {…} \| null}`：一个解密交换（含 `state`、`rules_skipped`）及 `since_message` 之后保留的流内消息（SSE 事件） |
+| `capture_exchange` | `id`、`index`，可选 `since_message` | `{"exchange": {…} \| null}`：一个解密交换（含 `state`、`rules_skipped`）及 `since_message` 之后保留的流内消息（SSE 事件、WebSocket 消息） |
 | `export_capture` | `format`（`pcapng` \| `har`），可选 `id` | `{"format", "file_name", "content_type", "size", "data_base64"}` |
 
 模式：`rule` 按配置的规则与策略组；`global` 全部发往 `routing.global`（策略组 id、节点 id 或 `DIRECT`，缺省为第一个策略组，

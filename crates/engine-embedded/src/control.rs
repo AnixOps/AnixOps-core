@@ -40,7 +40,7 @@
 //! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off |
 //! | `delete_capture` | `session` | `{"deleted": bool}` |
 //! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter` | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`) |
-//! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events) from `since_message` on |
+//! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events, WebSocket messages) from `since_message` on |
 //! | `pro_status` | | [`crate::pro::ProStatus`] |
 //! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
 //!
