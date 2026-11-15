@@ -26,6 +26,7 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_L
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 
+use super::h2frames::{H2Frame, H2Frames, Link, MAX_FRAMES};
 use super::stream::{MessageKind, Messages, StreamMessage};
 use super::{Captured, CapturedBody, Chunk, Direction, HttpExchange, Inner, HTTP_1_1, HTTP_2};
 use crate::connections::Network;
@@ -376,6 +377,8 @@ fn saved_at(id: &str) -> Option<u64> {
 
 /// Extension tag: an exchange's `rules_skipped` and stream messages.
 const EXT_STREAM: u16 = 1;
+/// Extension tag: the connection's HTTP/2 frames.
+const EXT_H2_FRAMES: u16 = 2;
 
 const MESSAGE_KINDS: [MessageKind; 6] = [
     MessageKind::Sse,
@@ -560,10 +563,16 @@ fn encode(inner: &Inner) -> Vec<u8> {
             .enumerate()
             .filter(|(_, exchange)| exchange.rules_skipped || !exchange.messages.is_empty())
             .collect::<Vec<_>>();
-        out.u16(u16::try_from(streams.len()).unwrap_or(u16::MAX));
-        for (index, exchange) in streams.into_iter().take(usize::from(u16::MAX)) {
+        let streams = &streams[..streams.len().min(usize::from(u16::MAX) - 1)];
+        let frames = !captured.h2.is_empty();
+        out.u16(streams.len() as u16 + u16::from(frames));
+        for (index, exchange) in streams {
             out.u16(EXT_STREAM);
-            out.bytes(&stream_extension(index, exchange));
+            out.bytes(&stream_extension(*index, exchange));
+        }
+        if frames {
+            out.u16(EXT_H2_FRAMES);
+            out.bytes(&h2_extension(&captured.h2));
         }
     }
     out.0
@@ -592,6 +601,82 @@ fn stream_extension(index: usize, exchange: &HttpExchange) -> Vec<u8> {
         out.bytes(&message.data);
     }
     out.0
+}
+
+/// Extension [`EXT_H2_FRAMES`]: the counters and the kept frames.
+fn h2_extension(frames: &H2Frames) -> Vec<u8> {
+    let mut out = Writer(Vec::with_capacity(24 + frames.kept.len() * 40));
+    out.u64(frames.seen);
+    out.u64(frames.dropped);
+    out.u64(frames.kept.len() as u64);
+    for frame in &frames.kept {
+        out.u64(frame.index);
+        out.u64(frame.at_ms);
+        out.u8(u8::from(frame.link == Link::Origin));
+        out.u8(u8::from(frame.direction == Direction::Down));
+        out.u8(frame.kind);
+        out.u8(frame.flags);
+        out.u64(u64::from(frame.stream));
+        out.u64(u64::from(frame.length));
+        out.opt_u64(frame.error.map(u64::from));
+        out.opt_u64(frame.value.map(u64::from));
+    }
+    out.0
+}
+
+fn read_h2_extension(data: &[u8]) -> Option<H2Frames> {
+    let mut input = Reader(data);
+    let seen = input.u64()?;
+    let dropped = input.u64()?;
+    let count = input.count(38)?;
+    let mut kept = std::collections::VecDeque::with_capacity(count.min(MAX_FRAMES));
+    let small = |value: u64| u32::try_from(value).ok();
+    for _ in 0..count {
+        let index = input.u64()?;
+        let at_ms = input.u64()?;
+        let link = if input.u8()? == 1 {
+            Link::Origin
+        } else {
+            Link::App
+        };
+        let direction = if input.u8()? == 1 {
+            Direction::Down
+        } else {
+            Direction::Up
+        };
+        let kind = input.u8()?;
+        let flags = input.u8()?;
+        let stream = small(input.u64()?)?;
+        let length = small(input.u64()?)?;
+        let error = match input.opt_u64()? {
+            Some(value) => Some(small(value)?),
+            None => None,
+        };
+        let value = match input.opt_u64()? {
+            Some(value) => Some(small(value)?),
+            None => None,
+        };
+        if kept.len() == MAX_FRAMES {
+            return None;
+        }
+        kept.push_back(H2Frame {
+            index,
+            at_ms,
+            link,
+            direction,
+            kind,
+            flags,
+            stream,
+            length,
+            error,
+            value,
+        });
+    }
+    input.0.is_empty().then_some(H2Frames {
+        kept,
+        seen,
+        dropped,
+    })
 }
 
 /// Reads an [`EXT_STREAM`] extension into `http`.
@@ -712,11 +797,14 @@ fn decode(data: &[u8]) -> Option<Vec<(u64, Captured)>> {
                 ..HttpExchange::default()
             });
         }
+        let mut h2 = H2Frames::default();
         for _ in 0..input.u16()? {
             let tag = input.u16()?;
             let data = input.bytes()?;
-            if tag == EXT_STREAM {
-                read_stream_extension(data, &mut http)?;
+            match tag {
+                EXT_STREAM => read_stream_extension(data, &mut http)?,
+                EXT_H2_FRAMES => h2 = read_h2_extension(data)?,
+                _ => {}
             }
         }
         let mut captured = Captured {
@@ -730,6 +818,7 @@ fn decode(data: &[u8]) -> Option<Vec<(u64, Captured)>> {
             kept,
             seen,
             http,
+            h2,
             memory: 0,
         };
         captured.memory = captured.memory_estimate();
@@ -790,6 +879,16 @@ mod tests {
             );
         }
         store.finish_exchange(2, index, None);
+        let mut scanner = super::super::h2frames::FrameScanner::new(Link::Origin, Direction::Down);
+        // A WINDOW_UPDATE and an RST_STREAM (CANCEL).
+        let frames = scanner.feed(
+            &[
+                0, 0, 4, 8, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8,
+            ],
+            20,
+        );
+        assert_eq!(frames.len(), 2);
+        store.push_h2_frames(2, frames);
         store
     }
 
@@ -834,6 +933,13 @@ mod tests {
         };
         assert_eq!(saved.seen, MESSAGE_KINDS.len() as u64);
         assert_eq!(tcp.http[0].messages, saved);
+        let saved_frames = {
+            let inner = super::super::lock(&store.inner);
+            inner.connections[&2].h2.clone()
+        };
+        assert_eq!(saved_frames.seen, 2);
+        assert_eq!(tcp.h2, saved_frames);
+        assert!(loaded[0].1.h2.is_empty());
         assert_eq!(tcp.memory, tcp.memory_estimate());
         assert_eq!(loaded[0].1.chunks[0].data, b"query");
 

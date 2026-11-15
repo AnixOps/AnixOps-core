@@ -365,6 +365,37 @@ async fn relays_http2_streams_through_rules_and_capture() {
     )
     .unwrap();
     assert_eq!(har["log"]["entries"][0]["request"]["httpVersion"], "HTTP/2");
+
+    // The frame timeline: both links, both ways, the preface skipped.
+    let id = rows[0]["connection_id"].as_u64().unwrap();
+    let timeline = control_json(
+        &dispatcher,
+        &format!(r#"{{"cmd":"capture_h2_frames","id":{id}}}"#),
+    );
+    let frames = timeline["h2_frames"]["frames"].as_array().unwrap();
+    assert!(!frames.is_empty(), "{timeline}");
+    let has = |link: &str, dir: &str, kind: &str| {
+        frames
+            .iter()
+            .any(|frame| frame["link"] == link && frame["dir"] == dir && frame["type"] == kind)
+    };
+    for link in ["app", "origin"] {
+        for dir in ["up", "down"] {
+            assert!(has(link, dir, "SETTINGS"), "{link} {dir}: {timeline}");
+        }
+        assert!(has(link, "up", "HEADERS"), "{link}: {timeline}");
+        assert!(has(link, "down", "HEADERS"), "{link}: {timeline}");
+    }
+    assert!(
+        frames.iter().all(|frame| frame["type"] != "UNKNOWN"),
+        "{timeline}"
+    );
+    assert!(has("app", "up", "DATA"), "the upload: {timeline}");
+    let since = control_json(
+        &dispatcher,
+        &format!(r#"{{"cmd":"capture_h2_frames","id":{id},"since":3}}"#),
+    );
+    assert_eq!(since["h2_frames"]["frames"][0]["index"], 3);
     server.abort();
 }
 

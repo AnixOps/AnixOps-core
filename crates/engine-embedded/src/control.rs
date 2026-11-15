@@ -41,6 +41,7 @@
 //! | `delete_capture` | `session` | `{"deleted": bool}` |
 //! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter` | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`) |
 //! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events, WebSocket messages) from `since_message` on |
+//! | `capture_h2_frames` | `id`, optional `since` | `{"h2_frames": {"seen", "dropped", "frames": [...]} \| null}`: the HTTP/2 frame headers of a decrypted `h2` connection on both links (`link`: `app` \| `origin`, `dir`, `type`, `flags`, `stream`, `length`, `error`, `value`), the last 512 |
 //! | `pro_status` | | [`crate::pro::ProStatus`] |
 //! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
 //!
@@ -168,6 +169,11 @@ enum ControlRequest {
         index: usize,
         #[serde(default)]
         since_message: u64,
+    },
+    CaptureH2Frames {
+        id: u64,
+        #[serde(default)]
+        since: u64,
     },
     ExportCapture {
         format: ExportFormat,
@@ -418,6 +424,9 @@ pub fn handle_with_interceptor(
             since_message,
         } => Ok(json!({
             "exchange": tracker.capture().exchange_json(id, index, since_message),
+        })),
+        ControlRequest::CaptureH2Frames { id, since } => Ok(json!({
+            "h2_frames": tracker.capture().h2_frames_json(id, since),
         })),
         ControlRequest::ExportCapture {
             format,

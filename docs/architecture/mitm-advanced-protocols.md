@@ -33,8 +33,8 @@
 | 1 | MITM 主机的 QUIC 自动回落 TCP | 高：不做则 HTTP/3 流量抓不到 | 低 | #238 |
 | 2 | 内核统一解压 gzip/deflate/br/zstd | 中高：检查器、导出、改写都受益 | 低（压缩炸弹要限） | #239（内核）；客户端另开 |
 | 3 | 流式：进行中请求可见、SSE 事件、流式跳过提示 | 中高：AI/推送类 App | 中（内存） | #241（内核）；客户端另开 |
-| 4 | WebSocket 消息查看 | 中 | 中（内存、permessage-deflate） | 本 PR（内核）；客户端另开 |
-| 5 | HTTP/2 帧视图 | 中：排查流控、RST、GOAWAY | 低 | 待开 |
+| 4 | WebSocket 消息查看 | 中 | 中（内存、permessage-deflate） | #242（内核）；客户端另开 |
+| 5 | HTTP/2 帧视图 | 中：排查流控、RST、GOAWAY | 低 | 本 PR（内核）；客户端另开 |
 | 6 | HTTP/3 真正终结（QUIC MITM） | 低到中 | 高（见 D1） | 不做（D1） |
 
 每项内核一个 PR，Apple 与 Tauri 检查器各一个 PR（anixops-net）。
@@ -133,12 +133,19 @@ HTTP/2 / HTTP/1.1 解密。其余主机的 QUIC 照常放行，不影响非解�
 
 ## 5. HTTP/2 帧视图
 
-在解密后的明文字节流上旁路解析帧头（9 字节），记录每个连接两方向的帧时间线：类型、
-stream、flags、长度，以及 SETTINGS 键值、WINDOW_UPDATE 增量、RST_STREAM 与 GOAWAY
-错误码、PING 载荷。HEADERS/DATA 只记元数据（头部内容已经在请求里，不做第二份 HPACK
-解码）。每个连接最多 1024 帧（环形），新增 `capture_h2_frames {connection}`。
+开抓包时，`h2` 连接的两条 TLS 链路（App ↔ 中继、中继 ↔ 源站）各包一层
+`FrameTap`：字节原样读写，同时在明文上旁路解析帧头（9 字节，客户端一侧先跳过
+24 字节的连接前言，对不上就停止解析）。每帧记链路（`app` / `origin`）、方向
+（`up` 朝源站 / `down` 朝 App）、类型、flags、stream、长度，以及
+RST_STREAM / GOAWAY 错误码、WINDOW_UPDATE 增量、GOAWAY 最后 stream、SETTINGS 条数。
+HEADERS/DATA 只记元数据（头部内容已经在请求里，不做第二份 HPACK 解码），只看载荷
+前 8 字节，不缓冲。每个连接保留最近 512 帧（每帧按 32 字节计入抓包预算），新增
+`capture_h2_frames {id, since}`；会话保存写进连接记录扩展区（tag 2）。未开抓包时
+`FrameTap` 只是直通。
 
-- 测试：用 `h2` 两端互发，断言时间线顺序与字段；畸形帧不影响转发。
+- 测试：帧头任意切分（1/2/7/9/13/4096 字节一块）结果一致、各类型字段、前言不符即
+  停、保留上限；`h2` 端到端（App 与源站两条链路、两个方向的 SETTINGS/HEADERS、
+  上传的 DATA、`since` 增量）；会话往返。
 
 ## 6. HTTP/3 真正终结
 
