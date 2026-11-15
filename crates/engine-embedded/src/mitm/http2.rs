@@ -406,7 +406,7 @@ impl MitmEngine {
             || parts.status == StatusCode::NO_CONTENT
             || parts.status == StatusCode::NOT_MODIFIED
             || body.is_end_stream();
-        let response_headers = header_list(&parts.headers);
+        let mut response_headers = header_list(&parts.headers);
         if stream_response || no_body {
             let report = self
                 .plan(NativePlainHttpMessage {
@@ -453,7 +453,10 @@ impl MitmEngine {
         // A rule reads the body: hold it whole, or relay it unchanged when
         // it is too large.
         let (data, trailers) = match collect(&mut body, MAX_BODY_BYTES).await? {
-            Collected::Complete(data, trailers) => (data, trailers),
+            Collected::Complete(data, trailers) => (
+                super::decoded_for_rules(&mut response_headers, data.to_vec()),
+                trailers,
+            ),
             Collected::TooLarge(prefix) => {
                 if let Some(recording) = recording.as_deref_mut() {
                     recording.exchange.note = Some("too_large");
@@ -472,7 +475,7 @@ impl MitmEngine {
                 phase: HttpMitmPhase::Response,
                 status_code: Some(parts.status.as_u16()),
                 headers: to_metadata(&response_headers),
-                body: data.to_vec(),
+                body: data,
             })
             .await?;
         let status = status(report.final_status_code, parts.status);

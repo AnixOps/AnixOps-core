@@ -30,12 +30,12 @@
 
 | 序 | 条目 | 价值 | 风险 | PR |
 | --- | --- | --- | --- | --- |
-| 1 | MITM 主机的 QUIC 自动回落 TCP | 高：不做则 HTTP/3 流量抓不到 | 低 | 待开 |
-| 2 | 内核统一解压 gzip/deflate/br/zstd | 中高：检查器、导出、改写都受益 | 低（压缩炸弹要限） | 待开 |
+| 1 | MITM 主机的 QUIC 自动回落 TCP | 高：不做则 HTTP/3 流量抓不到 | 低 | #238 |
+| 2 | 内核统一解压 gzip/deflate/br/zstd | 中高：检查器、导出、改写都受益 | 低（压缩炸弹要限） | 本 PR（内核）；客户端另开 |
 | 3 | 流式：进行中请求可见、SSE 事件、流式跳过提示 | 中高：AI/推送类 App | 中（内存） | 待开 |
 | 4 | WebSocket 消息查看 | 中 | 中（内存、permessage-deflate） | 待开 |
 | 5 | HTTP/2 帧视图 | 中：排查流控、RST、GOAWAY | 低 | 待开 |
-| 6 | HTTP/3 真正终结（QUIC MITM） | 低到中 | 高（见 D1） | 视 D1 |
+| 6 | HTTP/3 真正终结（QUIC MITM） | 低到中 | 高（见 D1） | 不做（D1） |
 
 每项内核一个 PR，Apple 与 Tauri 检查器各一个 PR（anixops-net）。
 
@@ -61,13 +61,23 @@ HTTP/2 / HTTP/1.1 解密。其余主机的 QUIC 照常放行，不影响非解�
 （`flate2` 的 `miniz_oxide` 后端、`brotli-decompressor`、`ruzstd`），可叠加编码
 （`Content-Encoding: gzip, br`）逆序解。
 
-- 解压炸弹：输出上限与输入无关，展示用 `MAX_HTTP_BODY_BYTES`、改写用
-  `MAX_BODY_BYTES`，超出即停并标 `truncated`；按块流式解，不先分配。
-- 抓包：存的仍是线上字节；`capture_requests` / `export_capture` 新增解压后的文本
-  视图（HAR `content.text` 用解压后内容，`encoding` 字段照实写）。客户端改为用
-  内核结果，Apple 与 Tauri 各自的解压代码删除，四种编码在所有平台一致。
+- 解压炸弹：输出上限与输入无关，扩展内（导出、改写）用 `MAX_HTTP_BODY_BYTES` /
+  `MAX_BODY_BYTES`，App 进程内（检查器）16 MiB，超出即停并标 `truncated`。
+- 窗口：br 与 zstd 按流头声明的窗口一次性分配，所以先读流头再解：扩展内上限
+  4 MiB（覆盖 brotli 默认 22 位窗口与 zstd 常用级别），App 内 brotli 16 MiB、zstd
+  8 MiB（RFC 9659 对 HTTP 的上限）；超出直接报错，原样显示。zstd 字典帧不支持。
+- deflate 截断：`flate2` 的读取器把未结束的流当成正常结束，改用底层
+  `Decompress` 判断是否读到最终块，完整正文截断即报错。
+- 抓包：存的仍是线上字节。HAR 导出 `content.text` 用解压后内容（`size` 为解压后
+  长度、`compression` 为节省字节），解不开的照旧 base64 并在 `comment` 写原因。
+  检查器在 App 进程里调无状态 FFI `networkcore_ios_decode_body`（桌面直接调 Rust
+  `capture::decode::decode_body`），不在扩展里解，四种编码在所有平台一致。
+- 脱敏：压缩正文先解压再脱敏（原来压缩体里的凭据会原样进导出）；有字段被遮盖时
+  导出的是遮盖后的明文，`Content-Encoding` 改名为
+  `X-AnixOps-Decoded-Content-Encoding`。
 - 改写：规则读响应时仍发 `Accept-Encoding: identity`；源站仍返回压缩体时先解压
-  再交给规则，改写后去掉 `Content-Encoding` 按明文发回。
+  再交给规则，去掉 `Content-Encoding` 按明文发回；解不完整（超 1 MiB、窗口超限、
+  损坏）时保持原样。
 - 测试：四种编码的样本与叠加编码、截断、损坏、1 KiB → 1 GiB 的炸弹（断言内存与
   输出上限）；`cargo fuzz` 目标 `decode_body`。
 
@@ -111,13 +121,9 @@ stream、flags、长度，以及 SETTINGS 键值、WINDOW_UPDATE 增量、RST_ST
 重传缓冲，iOS 上很难守住 50 MB；还需要逐包转发路径改成终结路径。条目 1 已经让解密
 不再漏 HTTP/3 流量，这一项只在需要「看到 App 真的用的是 HTTP/3」时才有价值。见 D1。
 
-## 待用户拍板
+## 用户决定（2026-11-15）
 
-- **D1 HTTP/3**：只做条目 1 的自动回落（推荐），还是之后在桌面端试做真正终结，或全平台
-  都做。
-- **D2 WebSocket 能否改写**：只看不改（推荐），还是允许插件脚本改写文本消息（Loon/Surge
-  没有对应格式，等于新 API）。
-- **D3 流式与正文改写冲突**：SSE 命中正文规则时保持流式、跳过规则并提示（推荐），还是
-  缓冲到流结束再改写，或逐事件交给脚本（新 API）。
-
-决定后在本节记录结果与日期。
+- **D1 HTTP/3**：只做条目 1 的自动回落 TCP，不终结 QUIC；条目 6 不做。
+- **D2 WebSocket**：只看不改，插件不能改写消息。
+- **D3 流式与正文改写冲突**：保持流式，跳过命中的正文规则，检查器提示「改写未生效：
+  流式响应」。

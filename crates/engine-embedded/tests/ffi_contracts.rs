@@ -423,6 +423,7 @@ fn header_declares_every_exported_symbol() {
         "networkcore_ios_runtime_control",
         "networkcore_ios_measure_delay",
         "networkcore_ios_mitm_inspect_plugin",
+        "networkcore_ios_decode_body",
         "networkcore_ios_set_bound_interface",
         "networkcore_ios_runtime_free_buffer",
         "networkcore_ios_runtime_free_handle",
@@ -662,6 +663,76 @@ fn mitm_inspect_plugin_describes_a_plugin_without_a_runtime() {
     unsafe { networkcore_ios_runtime_free_buffer(buffer) };
     let no_out =
         unsafe { networkcore_ios_mitm_inspect_plugin(text.as_ptr(), text.len(), ptr::null_mut()) };
+    assert_eq!(no_out, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+}
+
+#[test]
+fn decode_body_undoes_content_encoding_without_a_runtime() {
+    use std::io::Write;
+
+    let text = "hello inspector ".repeat(200);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(text.as_bytes()).unwrap();
+    let wire = gzip.finish().unwrap();
+    let decode = |data: &[u8], coding: &str, complete: u8| {
+        let mut buffer = NetworkCoreBuffer {
+            ptr: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+        let mut truncated = 9u8;
+        let code = unsafe {
+            networkcore_ios_decode_body(
+                data.as_ptr(),
+                data.len(),
+                coding.as_ptr(),
+                coding.len(),
+                complete,
+                &mut truncated,
+                &mut buffer,
+            )
+        };
+        let bytes = if buffer.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec()
+        };
+        unsafe { networkcore_ios_runtime_free_buffer(buffer) };
+        (code, bytes, truncated)
+    };
+
+    let (code, bytes, truncated) = decode(&wire, "gzip", 1);
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    assert_eq!(bytes, text.as_bytes());
+    assert_eq!(truncated, 0);
+
+    let (code, bytes, truncated) = decode(&wire[..wire.len() / 2], "gzip", 0);
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    assert!(text.as_bytes().starts_with(&bytes));
+    assert_eq!(truncated, 1);
+
+    let (code, bytes, truncated) = decode(&wire, "compress", 1);
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+    assert!(bytes.is_empty());
+    assert_eq!(truncated, 0);
+    assert_eq!(
+        decode(b"not gzip", "gzip", 1).0,
+        NETWORKCORE_IOS_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(decode(&wire, "", 1).0, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+
+    let mut truncated = 0u8;
+    let no_out = unsafe {
+        networkcore_ios_decode_body(
+            wire.as_ptr(),
+            wire.len(),
+            b"gzip".as_ptr(),
+            4,
+            1,
+            &mut truncated,
+            ptr::null_mut(),
+        )
+    };
     assert_eq!(no_out, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
 }
 

@@ -7,6 +7,12 @@
 //! field or form field whose name contains one of [`SENSITIVE_PARTS`]. The
 //! value becomes [`MASK`]; names, order and everything else stay, so the
 //! export still shows what was sent.
+//!
+//! A body with a `Content-Encoding` (gzip, br, zstd, ...) is decoded first
+//! (see [`super::decode`]), so credentials inside it are masked too. When
+//! something was masked, the export carries the masked plain text and the
+//! header becomes [`DECODED_ENCODING_HEADER`], since the original bytes
+//! cannot be re-encoded without them.
 
 use std::borrow::Cow;
 
@@ -16,6 +22,10 @@ use super::{CapturedBody, HttpExchange};
 
 /// What a masked value becomes.
 pub const MASK: &str = "<redacted>";
+
+/// Replaces `Content-Encoding` on a message whose body redaction decoded and
+/// masked: its value is the coding the body had.
+pub const DECODED_ENCODING_HEADER: &str = "X-AnixOps-Decoded-Content-Encoding";
 
 /// Headers masked whatever their value.
 const SENSITIVE_HEADERS: [&str; 4] = [
@@ -49,16 +59,64 @@ pub fn sensitive_name(name: &str) -> bool {
 
 /// `exchange` with its credentials masked.
 pub fn exchange(exchange: &HttpExchange) -> HttpExchange {
-    let request_type = header(&exchange.request_headers, "content-type");
-    let response_type = header(&exchange.response_headers, "content-type");
+    let (request_headers, request_body) =
+        message(&exchange.request_headers, &exchange.request_body);
+    let (response_headers, response_body) =
+        message(&exchange.response_headers, &exchange.response_body);
     HttpExchange {
         url: url(&exchange.url).into_owned(),
-        request_headers: headers(&exchange.request_headers),
-        request_body: body(&exchange.request_body, request_type.as_deref()),
-        response_headers: headers(&exchange.response_headers),
-        response_body: body(&exchange.response_body, response_type.as_deref()),
+        request_headers,
+        request_body,
+        response_headers,
+        response_body,
         ..exchange.clone()
     }
+}
+
+/// The headers and body of one message, masked; an encoded body is masked
+/// in its decoded form.
+fn message(
+    original: &[(String, String)],
+    captured: &CapturedBody,
+) -> (Vec<(String, String)>, CapturedBody) {
+    let content_type = header(original, "content-type");
+    let masked_headers = headers(original);
+    let coding = header(original, "content-encoding")
+        .filter(|coding| !super::decode::codings(coding).is_empty());
+    let Some(coding) = coding else {
+        return (masked_headers, body(captured, content_type.as_deref()));
+    };
+    let Ok(decoded) = super::decode::decode_body(
+        &captured.data,
+        &coding,
+        !captured.truncated(),
+        super::decode::DecodeLimits::EXTENSION,
+    ) else {
+        // Not decodable here: nothing in it can be read either.
+        return (masked_headers, captured.clone());
+    };
+    let cut = decoded.truncated;
+    let plain = CapturedBody {
+        size: decoded.data.len() as u64,
+        data: decoded.data,
+    };
+    let mut masked = body(&plain, content_type.as_deref());
+    if masked.data == plain.data {
+        return (masked_headers, captured.clone());
+    }
+    // A cut body stays marked as cut: `size` past the kept bytes.
+    masked.size = masked.data.len() as u64 + u64::from(cut);
+    let headers = masked_headers
+        .into_iter()
+        .map(|(name, value)| {
+            if name.eq_ignore_ascii_case("content-encoding") {
+                (DECODED_ENCODING_HEADER.to_string(), value)
+            } else {
+                (name, value)
+            }
+        })
+        .collect();
+    (headers, masked)
 }
 
 fn header(headers: &[(String, String)], name: &str) -> Option<String> {
@@ -341,5 +399,53 @@ mod tests {
             b"GET /p?token=<redacted>&a=2 HTTP/1.1\r\nHost: a.test\r\nCookie: <redacted>\r\n\r\nbody"
                 .as_slice()
         );
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn credentials_inside_an_encoded_body_are_masked() {
+        let mut exchange = HttpExchange::new("GET", "https://api.example.test/me", &[]);
+        exchange.status = Some(200);
+        exchange.response_headers = vec![
+            pair("Content-Type", "application/json"),
+            pair("Content-Encoding", "gzip"),
+        ];
+        exchange.response_body =
+            CapturedBody::of(&gzip(br#"{"name":"a","access_token":"secret-value"}"#));
+
+        let masked = super::exchange(&exchange);
+        let body: Value = serde_json::from_slice(&masked.response_body.data).unwrap();
+        assert_eq!(body["name"], "a");
+        assert_eq!(body["access_token"], MASK);
+        assert!(!masked.response_body.truncated());
+        assert_eq!(
+            masked.response_headers[1],
+            pair(DECODED_ENCODING_HEADER, "gzip")
+        );
+        assert!(!masked
+            .response_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding")));
+    }
+
+    #[test]
+    fn an_encoded_body_with_nothing_to_mask_stays_as_captured() {
+        let mut exchange = HttpExchange::new("GET", "https://api.example.test/", &[]);
+        exchange.status = Some(200);
+        exchange.response_headers = vec![
+            pair("Content-Type", "application/json"),
+            pair("Content-Encoding", "gzip"),
+        ];
+        let wire = gzip(br#"{"name":"a"}"#);
+        exchange.response_body = CapturedBody::of(&wire);
+        let masked = super::exchange(&exchange);
+        assert_eq!(masked.response_body.data, wire);
+        assert_eq!(masked.response_headers[1], pair("Content-Encoding", "gzip"));
     }
 }

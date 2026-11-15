@@ -44,11 +44,16 @@ wireguard = ["dep:boringtun", "dep:outbound-wireguard"]
 base64 = "0.22"
 # WireGuard Noise state machine only; the `device` feature (its own TUN and sockets) stays off.
 boringtun = { version = "0.7", default-features = false, optional = true }
+# Content-Encoding br (src/capture/decode.rs); pure Rust, no allocator crate.
+brotli-decompressor = { version = "5", default-features = false, features = ["std"] }
 bytes = { version = "1", optional = true }
 config-core = { path = "../config-core" }
 control-domain = { path = "../control-domain" }
 engine-native = { path = "../engine-native", default-features = false, optional = true }
 engine-outbound = { path = "../engine-outbound" }
+# Content-Encoding gzip and deflate (src/capture/decode.rs), on the pure Rust
+# miniz_oxide backend.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures = "0.3"
 h2 = { version = "0.4", optional = true }
 http = { version = "1", optional = true }
@@ -73,6 +78,8 @@ rcgen = { version = "0.14.8", features = ["x509-parser"], optional = true }
 # (src/capture/storage.rs).
 ring = "0.17"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# Content-Encoding zstd (src/capture/decode.rs); pure Rust decoder.
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", optional = true }

@@ -561,6 +561,81 @@ pub unsafe extern "C" fn networkcore_ios_mitm_inspect_plugin(
     })
 }
 
+/// Undoes a captured body's `Content-Encoding` (`gzip`, `deflate`, `br`,
+/// `zstd`, several in a row) for an inspector, and writes the decoded bytes
+/// to `out` (see [`crate::capture::decode`]). Needs no runtime handle, so
+/// the app decodes in its own process, not in the extension: at most
+/// 16 MiB of output, windows up to brotli's 16 MiB and zstd's 8 MiB.
+/// `complete` is 0 when capture kept only the start of the body; then, or
+/// when the output reaches the limit, `*truncated` is set to 1.
+///
+/// Returns `NETWORKCORE_IOS_ERR_INVALID_ARGUMENT` for a coding it does not
+/// know, a body that is not valid in it, or a window over the limit; the
+/// app then shows the bytes as captured.
+///
+/// # Safety
+///
+/// `data` must point to `data_len` readable bytes (it may be null when
+/// `data_len` is 0), `content_encoding` to `content_encoding_len` readable
+/// bytes, `truncated` to one writable byte and `out` to writable storage for
+/// one `NetworkCoreBuffer`, which must be released with
+/// `networkcore_ios_runtime_free_buffer`.
+#[no_mangle]
+pub unsafe extern "C" fn networkcore_ios_decode_body(
+    data: *const u8,
+    data_len: usize,
+    content_encoding: *const u8,
+    content_encoding_len: usize,
+    complete: u8,
+    truncated: *mut u8,
+    out: *mut NetworkCoreBuffer,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() || truncated.is_null() {
+            return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: checked non-null above.
+        unsafe {
+            out.write(NetworkCoreBuffer::from_vec(Vec::new()));
+            truncated.write(0);
+        }
+        if (data.is_null() && data_len != 0)
+            || content_encoding.is_null()
+            || content_encoding_len == 0
+            || content_encoding_len > 256
+        {
+            return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT;
+        }
+        let data = if data_len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the caller guarantees `data_len` readable bytes.
+            unsafe { std::slice::from_raw_parts(data, data_len) }
+        };
+        // SAFETY: the caller guarantees `content_encoding_len` readable bytes.
+        let coding = unsafe { std::slice::from_raw_parts(content_encoding, content_encoding_len) };
+        let Ok(coding) = std::str::from_utf8(coding) else {
+            return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT;
+        };
+        match crate::capture::decode::decode_body(
+            data,
+            coding,
+            complete != 0,
+            crate::capture::decode::DecodeLimits::APP,
+        ) {
+            Ok(decoded) => {
+                // SAFETY: checked non-null above; the empty placeholder owns no memory.
+                unsafe {
+                    truncated.write(u8::from(decoded.truncated));
+                    out.write(NetworkCoreBuffer::from_vec(decoded.data));
+                }
+                NETWORKCORE_IOS_OK
+            }
+            Err(_) => NETWORKCORE_IOS_ERR_INVALID_ARGUMENT,
+        }
+    })
+}
+
 /// Pins every socket the engine opens (to proxy servers, DNS upstreams and
 /// direct destinations) to a network interface, by interface index, so it
 /// leaves through that interface instead of the tunnel's default route.

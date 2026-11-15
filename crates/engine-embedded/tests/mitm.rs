@@ -295,6 +295,8 @@ async fn decrypts_rewrites_and_relays_https_for_listed_hosts() {
 struct PlainOrigin {
     requests: mpsc::UnboundedSender<String>,
     body: Vec<u8>,
+    /// Header lines added to every response, each ending in CRLF.
+    extra_headers: &'static str,
 }
 
 impl TcpOutbound for PlainOrigin {
@@ -307,6 +309,7 @@ impl TcpOutbound for PlainOrigin {
             let (near, mut far) = tokio::io::duplex(64 * 1024);
             let requests = self.requests.clone();
             let body = self.body.clone();
+            let extra_headers = self.extra_headers;
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -321,7 +324,7 @@ impl TcpOutbound for PlainOrigin {
                         buf.drain(..end + 4);
                         requests.send(head).unwrap();
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{extra_headers}Content-Length: {}\r\n\r\n",
                             body.len()
                         );
                         far.write_all(response.as_bytes()).await.unwrap();
@@ -346,6 +349,7 @@ async fn rewrites_plain_http_without_a_mitm_hostname() {
     let origin = Arc::new(PlainOrigin {
         requests: requests_tx,
         body: b"plain origin".to_vec(),
+        extra_headers: "",
     });
     let target: SocketAddr = "192.0.2.20:80".parse().unwrap();
 
@@ -413,6 +417,67 @@ async fn rewrites_plain_http_without_a_mitm_hostname() {
 }
 
 #[tokio::test]
+async fn a_body_rule_reads_a_body_the_origin_compressed_anyway() {
+    use std::io::Write;
+
+    let device_root = root("NetworkCore Test Device Root");
+    let mut config = mitm_config(&device_root);
+    config.plugins.push(
+        "#!name = Body\n[Body Rewrite]\nhttp-response ^http://plain\\.example\\.test/ origin edited\n"
+            .to_string(),
+    );
+    let engine = Arc::new(MitmEngine::new(&config).unwrap());
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(b"hello from the origin").unwrap();
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    // The origin answers gzip although asked for identity.
+    let origin = Arc::new(PlainOrigin {
+        requests: requests_tx,
+        body: gzip.finish().unwrap(),
+        extra_headers: "Content-Encoding: gzip\r\n",
+    });
+    let target: SocketAddr = "192.0.2.21:80".parse().unwrap();
+    let first =
+        b"GET /page HTTP/1.1\r\nHost: plain.example.test\r\nAccept-Encoding: gzip\r\n\r\n".to_vec();
+    let host = engine.claim(&first, target).unwrap();
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let origin = origin.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    origin.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    let (head, body) = tokio::time::timeout(Duration::from_secs(10), read_response(&mut app))
+        .await
+        .expect("answered in time");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // The rule saw the text and the app gets it plain.
+    assert_eq!(body, "hello from the edited");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-encoding"),
+        "{head}"
+    );
+    let request = requests.recv().await.unwrap();
+    assert!(request.contains("Accept-Encoding: identity"), "{request}");
+    server.abort();
+}
+
+#[tokio::test]
 async fn bodies_no_rule_reads_stream_past_the_body_limit_and_keep_the_connection() {
     let device_root = root("NetworkCore Test Device Root");
     let mut config = mitm_config(&device_root);
@@ -426,6 +491,7 @@ async fn bodies_no_rule_reads_stream_past_the_body_limit_and_keep_the_connection
     let origin = Arc::new(PlainOrigin {
         requests: requests_tx,
         body: large.clone(),
+        extra_headers: "",
     });
     let target: SocketAddr = "192.0.2.20:80".parse().unwrap();
     let first = b"GET /video.bin HTTP/1.1\r\nHost: plain.example.test\r\n\r\n".to_vec();
@@ -863,6 +929,7 @@ async fn capture_keeps_decrypted_http_under_the_origin_connection() {
     let dispatcher = Arc::new(Dispatcher::single(Arc::new(PlainOrigin {
         requests: requests_tx,
         body: b"captured body".to_vec(),
+        extra_headers: "",
     })));
     let status = control_json(&dispatcher, r#"{"cmd":"set_capture","enabled":true}"#);
     assert_eq!(status["enabled"], true);
