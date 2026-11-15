@@ -19,6 +19,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use transport_tls::{TlsConnector, TlsSettings};
 
+/// A loopback address nothing listens on. The socket stays bound (not
+/// listening) until the caller drops it, so no other test can take the port:
+/// a dropped listener's port can be handed out again at once, and on Windows a
+/// parallel test's listener got it, so the "closed" target answered.
+fn refused_addr() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 const SYN: u8 = 1;
@@ -335,9 +346,7 @@ async fn version_one_clients_get_no_synack_and_other_schemes_are_updated() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreachable_targets_get_a_synack_with_the_error() {
     let server = start(None).await;
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target = closed.local_addr().unwrap();
-    drop(closed);
+    let (_reserved, target) = refused_addr();
     let mut client = Client::v2(server.addr, "alice-secret").await;
     client.open_stream(1, &TargetAddr::Ip(target), b"x").await;
     let mut synack = None;

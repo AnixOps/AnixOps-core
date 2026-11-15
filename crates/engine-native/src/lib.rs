@@ -8302,7 +8302,9 @@ mod controlled_tls_session_tests {
             Some(&http_mitm_hook),
         );
 
-        assert!(exchange_completed);
+        // Failed once on Windows (CI run 43629103710) with the request body
+        // not rewritten by the node script; print what the session reported.
+        assert!(exchange_completed, "diagnostics: {diagnostics:#?}");
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_SESSION_DECRYPTION_READY_CODE
         }));
