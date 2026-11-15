@@ -830,45 +830,6 @@ pub fn offers_h2(alpn: &[Vec<u8>]) -> bool {
     alpn.iter().any(|protocol| protocol == ALPN_H2)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn header_maps_drop_connection_headers_and_lower_names() {
-        let mut map = header_map(&[
-            ("Host".to_string(), "a.test".to_string()),
-            ("Connection".to_string(), "keep-alive".to_string()),
-            ("X-Test".to_string(), "1".to_string()),
-            ("TE".to_string(), "gzip".to_string()),
-            ("bad name".to_string(), "x".to_string()),
-        ]);
-        strip_connection_headers(&mut map);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.get("x-test").unwrap(), "1");
-    }
-
-    #[test]
-    fn same_host_reads_authority_or_host() {
-        let uri: Uri = "https://a.test/x".parse().unwrap();
-        assert!(same_host(&uri, &HeaderMap::new(), "A.test"));
-        assert!(!same_host(&uri, &HeaderMap::new(), "b.test"));
-        let path: Uri = "/x".parse().unwrap();
-        assert!(same_host(&path, &HeaderMap::new(), "a.test"));
-    }
-
-    #[tokio::test]
-    async fn taps_keep_the_first_bytes() {
-        let mut tap = Tap::new(true);
-        tap.add(&vec![1; MAX_HTTP_BODY_BYTES]);
-        tap.add(&[2; 10]);
-        let body = tap.into_body().unwrap();
-        assert_eq!(body.data.len(), MAX_HTTP_BODY_BYTES);
-        assert_eq!(body.size, MAX_HTTP_BODY_BYTES as u64 + 10);
-        assert!(Tap::new(false).into_body().is_none());
-    }
-}
-
 /// One TLS link of a decrypted HTTP/2 connection, passing its bytes through
 /// unchanged and, with capture on, keeping the header of every frame that
 /// goes either way (see [`crate::capture::h2frames`]).
@@ -947,5 +908,44 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FrameTap<S> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_maps_drop_connection_headers_and_lower_names() {
+        let mut map = header_map(&[
+            ("Host".to_string(), "a.test".to_string()),
+            ("Connection".to_string(), "keep-alive".to_string()),
+            ("X-Test".to_string(), "1".to_string()),
+            ("TE".to_string(), "gzip".to_string()),
+            ("bad name".to_string(), "x".to_string()),
+        ]);
+        strip_connection_headers(&mut map);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("x-test").unwrap(), "1");
+    }
+
+    #[test]
+    fn same_host_reads_authority_or_host() {
+        let uri: Uri = "https://a.test/x".parse().unwrap();
+        assert!(same_host(&uri, &HeaderMap::new(), "A.test"));
+        assert!(!same_host(&uri, &HeaderMap::new(), "b.test"));
+        let path: Uri = "/x".parse().unwrap();
+        assert!(same_host(&path, &HeaderMap::new(), "a.test"));
+    }
+
+    #[tokio::test]
+    async fn taps_keep_the_first_bytes() {
+        let mut tap = Tap::new(true);
+        tap.add(&vec![1; MAX_HTTP_BODY_BYTES]);
+        tap.add(&[2; 10]);
+        let body = tap.into_body().unwrap();
+        assert_eq!(body.data.len(), MAX_HTTP_BODY_BYTES);
+        assert_eq!(body.size, MAX_HTTP_BODY_BYTES as u64 + 10);
+        assert!(Tap::new(false).into_body().is_none());
     }
 }
