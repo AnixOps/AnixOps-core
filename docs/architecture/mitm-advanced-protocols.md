@@ -32,8 +32,8 @@
 | --- | --- | --- | --- | --- |
 | 1 | MITM 主机的 QUIC 自动回落 TCP | 高：不做则 HTTP/3 流量抓不到 | 低 | #238 |
 | 2 | 内核统一解压 gzip/deflate/br/zstd | 中高：检查器、导出、改写都受益 | 低（压缩炸弹要限） | #239（内核）；客户端另开 |
-| 3 | 流式：进行中请求可见、SSE 事件、流式跳过提示 | 中高：AI/推送类 App | 中（内存） | 本 PR（内核）；客户端另开 |
-| 4 | WebSocket 消息查看 | 中 | 中（内存、permessage-deflate） | 待开 |
+| 3 | 流式：进行中请求可见、SSE 事件、流式跳过提示 | 中高：AI/推送类 App | 中（内存） | #241（内核）；客户端另开 |
+| 4 | WebSocket 消息查看 | 中 | 中（内存、permessage-deflate） | 本 PR（内核）；客户端另开 |
 | 5 | HTTP/2 帧视图 | 中：排查流控、RST、GOAWAY | 低 | 待开 |
 | 6 | HTTP/3 真正终结（QUIC MITM） | 低到中 | 高（见 D1） | 不做（D1） |
 
@@ -110,15 +110,26 @@ HTTP/2 / HTTP/1.1 解密。其余主机的 QUIC 照常放行，不影响非解�
 
 ## 4. WebSocket
 
-- HTTP/1.1 `101 Switching Protocols` 之后按 RFC 6455 解帧（两方向、去掩码、分片
-  重组、控制帧），permessage-deflate（RFC 7692）在内核解压后记录；原字节照旧转发，
-  不重新编码（除非 D2 选了可改写）。
-- 每条消息记方向、类型（text/binary/ping/pong/close）、长度、时间戳与前 4 KiB；
-  每个交换最多保留最近 512 条、数据合计 64 KiB（与 SSE 共用同一模型 `capture/stream.rs`），超出丢最旧的并计数。close 记码与原因。
-- 帧解析失败时停止解析、继续原样转发，不断连。
+- 开抓包时，HTTP/1.1 `101 Switching Protocols`（`Upgrade: websocket`）之后不再用
+  `copy_bidirectional` 透传，而是两方向各自读、原样写出并 flush，再交给
+  `capture/websocket.rs` 按 RFC 6455 解帧（去掩码、分片重组、控制帧可插在分片之间）。
+  只读不改（D2），原字节不重新编码；未开抓包仍走原透传。
+- permessage-deflate（RFC 7692）：按 `101` 响应的 `Sec-WebSocket-Extensions`
+  取协商结果，解压后记录；默认跨消息共享窗口，`server_no_context_takeover` /
+  `client_no_context_takeover` 分别让下行 / 上行每条消息后重置。每个方向只在出现
+  压缩消息时才建一个 inflate 状态（32 KiB 窗口）。一条消息解压超过 1 MiB 或解压出错
+  时，该方向停止解压（窗口已失），之后的压缩消息原样记录并标 `permessage-deflate`。
+- 每条消息记方向、类型（text/binary/ping/pong/close）、原长、时间与前 4 KiB；数据帧
+  只复制要保留的前 4 KiB，超出部分只计长度。close 记码（`code`）与原因（`label`）。
+  与 SSE 共用 `capture/stream.rs` 的有界模型：每个交换最多 512 条、数据合计 64 KiB，
+  超出丢最旧的并计数；`capture_exchange` 增量取，会话保存同一扩展区。
+- 帧解析失败（未知 opcode、RSV 位、控制帧过长或分片、无消息的续帧等）时停止解析、
+  继续原样转发，不断连。
 - HTTP/2 扩展 CONNECT（RFC 8441）仍不宣告；以后需要再开。
-- 测试：RFC 6455 示例帧、分片、超长帧、掩码、deflate 上下文接管与不接管；与
-  `tokio-tungstenite` 端到端互通；内存上限测试。
+- 测试：RFC 6455 §5.7 全部示例（任意切分、7 字节一块）、close 码与原因、RFC 7692
+  §7.2.3 示例（共享窗口、分片、stored 块）、不接管上下文时的重置、压缩炸弹只停解压
+  不停解析、协议错误；端到端用手写帧（RFC 示例字节）走完整 MITM 中继，验证 App
+  收到的字节不变、事件被记录、关闭后交换结束。
 
 ## 5. HTTP/2 帧视图
 

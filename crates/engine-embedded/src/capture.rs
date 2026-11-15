@@ -46,6 +46,7 @@ pub mod filter;
 pub mod redact;
 pub mod storage;
 pub mod stream;
+pub mod websocket;
 
 use std::borrow::Cow;
 use std::cell::RefCell;

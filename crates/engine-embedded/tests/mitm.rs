@@ -1249,3 +1249,126 @@ async fn event_streams_relay_live_and_capture_their_events() {
     assert_eq!(rows["requests"][0]["state"], "done");
     server.abort();
 }
+
+/// A plain HTTP origin that accepts a WebSocket upgrade with
+/// `permessage-deflate`, reads one message and answers a compressed "Hello"
+/// (RFC 7692 §7.2.3.1) and a close.
+struct WebSocketOrigin;
+
+impl TcpOutbound for WebSocketOrigin {
+    fn protocol(&self) -> &'static str {
+        "test-websocket-origin"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move {
+            let (near, mut far) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                read_until(&mut far, &mut seen, b"\r\n\r\n").await;
+                far.write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                      Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+                      Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                let mut frame = [0u8; 11];
+                far.read_exact(&mut frame).await.unwrap();
+                far.write_all(&[
+                    0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x88, 0x02, 0x03, 0xe8,
+                ])
+                .await
+                .unwrap();
+                let mut rest = [0u8; 64];
+                while far.read(&mut rest).await.unwrap_or(0) > 0 {}
+            });
+            Ok(Box::new(near) as BoxStream)
+        })
+    }
+}
+
+#[tokio::test]
+async fn websocket_messages_are_captured_as_they_pass_unchanged() {
+    let device_root = root("NetworkCore Test Device Root");
+    let engine = Arc::new(MitmEngine::new(&mitm_config(&device_root)).unwrap());
+    let dispatcher = Arc::new(Dispatcher::single(Arc::new(WebSocketOrigin)));
+    control_json(&dispatcher, r#"{"cmd":"set_capture","enabled":true}"#);
+
+    let target: SocketAddr = "192.0.2.23:80".parse().unwrap();
+    let first = b"GET /chat HTTP/1.1\r\nHost: plain.example.test\r\nUpgrade: websocket\r\n\
+        Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+        Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+        .to_vec();
+    let host = engine.claim(&first, target).unwrap();
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let dispatcher = dispatcher.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    dispatcher.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    let mut seen = Vec::new();
+    read_until(&mut app, &mut seen, b"\r\n\r\n").await;
+    assert!(
+        seen.starts_with(b"HTTP/1.1 101"),
+        "{:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    // RFC 6455 §5.7: a masked "Hello" from the app.
+    app.write_all(&[
+        0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58,
+    ])
+    .await
+    .unwrap();
+    // The origin's frames reach the app as they were sent.
+    let head_end = seen.len();
+    read_until(&mut app, &mut seen, &[0x88, 0x02, 0x03, 0xe8]).await;
+    assert_eq!(
+        &seen[head_end..],
+        &[0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x88, 0x02, 0x03, 0xe8]
+    );
+
+    let row = wait_for_row(&dispatcher, |row| row["message_count"] == 3).await;
+    assert_eq!(row["status"], 101, "{row}");
+    assert_eq!(row["note"], "streaming");
+    assert_eq!(row["state"], "in_progress");
+    let (id, index) = (row["connection_id"].clone(), row["index"].clone());
+    let detail = control_json(
+        &dispatcher,
+        &format!(r#"{{"cmd":"capture_exchange","id":{id},"index":{index}}}"#),
+    );
+    let kept = detail["exchange"]["messages"]["kept"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(kept.len(), 3, "{detail}");
+    assert_eq!(kept[0]["dir"], "up");
+    assert_eq!(kept[0]["kind"], "text");
+    assert_eq!(kept[0]["text"], "Hello");
+    assert_eq!(kept[1]["dir"], "down");
+    assert_eq!(kept[1]["text"], "Hello", "inflated for the view");
+    assert_eq!(kept[2]["kind"], "close");
+    assert_eq!(kept[2]["code"], 1000);
+
+    // Closing the app ends the relay and the exchange.
+    drop(app);
+    let row = wait_for_row(&dispatcher, |row| row["state"] == "done").await;
+    assert_eq!(row["message_count"], 3, "{row}");
+    server.abort();
+}
