@@ -217,6 +217,46 @@ pub fn read_current_user_system_proxy() -> DomainResult<WindowsProxySettings> {
     native::read_current_user_system_proxy()
 }
 
+/// Writes only the current user's WinINet proxy settings and returns what
+/// they were before. Unlike `apply_system_proxy` this leaves the machine-wide
+/// WinHTTP proxy alone, so a process without administrator rights can call it:
+/// a client whose window is not elevated sets the user's proxy here and leaves
+/// WinHTTP to its service (`apply_winhttp_proxy`).
+pub fn apply_current_user_system_proxy(
+    settings: &WindowsProxySettings,
+) -> DomainResult<WindowsProxySettings> {
+    settings.validate()?;
+    native::apply_current_user_system_proxy(settings)
+}
+
+/// Puts the current user's WinINet proxy settings back to `previous`, the
+/// value `apply_current_user_system_proxy` returned.
+pub fn restore_current_user_system_proxy(previous: &WindowsProxySettings) -> DomainResult<()> {
+    native::restore_current_user_system_proxy(previous)
+}
+
+/// The machine-wide WinHTTP proxy as `apply_winhttp_proxy` found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsWinHttpProxy {
+    pub access_type: u32,
+    pub server: String,
+    pub bypass: String,
+}
+
+/// Writes only the machine-wide WinHTTP proxy, which services use, and returns
+/// what it was before. Needs administrator rights; the current user's WinINet
+/// settings are not touched.
+pub fn apply_winhttp_proxy(settings: &WindowsProxySettings) -> DomainResult<WindowsWinHttpProxy> {
+    settings.validate()?;
+    native::apply_winhttp_proxy(settings)
+}
+
+/// Puts the machine-wide WinHTTP proxy back to `previous`, the value
+/// `apply_winhttp_proxy` returned.
+pub fn restore_winhttp_proxy(previous: &WindowsWinHttpProxy) -> DomainResult<()> {
+    native::restore_winhttp_proxy(previous)
+}
+
 /// Probes the explicit loopback endpoint configured for the managed desktop
 /// proxy. This is an observation only; it never changes proxy settings.
 pub fn managed_proxy_listener_ready(
@@ -438,6 +478,26 @@ mod native {
     pub fn apply_system_proxy(
         _settings: &WindowsProxySettings,
     ) -> DomainResult<WindowsProxySnapshot> {
+        Err(unsupported())
+    }
+
+    pub fn apply_current_user_system_proxy(
+        _settings: &WindowsProxySettings,
+    ) -> DomainResult<WindowsProxySettings> {
+        Err(unsupported())
+    }
+
+    pub fn restore_current_user_system_proxy(_previous: &WindowsProxySettings) -> DomainResult<()> {
+        Err(unsupported())
+    }
+
+    pub fn apply_winhttp_proxy(
+        _settings: &WindowsProxySettings,
+    ) -> DomainResult<WindowsWinHttpProxy> {
+        Err(unsupported())
+    }
+
+    pub fn restore_winhttp_proxy(_previous: &WindowsWinHttpProxy) -> DomainResult<()> {
         Err(unsupported())
     }
 
@@ -979,6 +1039,67 @@ mod native {
             &snapshot.winhttp_bypass,
         )?;
         notify_proxy_change()
+    }
+
+    fn write_current_user_system_proxy(settings: &WindowsProxySettings) -> DomainResult<()> {
+        let key = open_internet_settings_key()?;
+        write_registry_dword(&key, "ProxyEnable", u32::from(settings.enabled))?;
+        write_registry_string(&key, "ProxyServer", &settings.server)?;
+        write_registry_string(&key, "ProxyOverride", &settings.bypass)?;
+        notify_proxy_change()
+    }
+
+    pub fn apply_current_user_system_proxy(
+        settings: &WindowsProxySettings,
+    ) -> DomainResult<WindowsProxySettings> {
+        let previous = read_current_user_system_proxy()?;
+        if let Err(error) = write_current_user_system_proxy(settings) {
+            return match write_current_user_system_proxy(&previous) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(proxy_error(&format!(
+                    "system proxy could not be applied: {}; rollback failed: {}",
+                    error.message, rollback.message
+                ))),
+            };
+        }
+        Ok(previous)
+    }
+
+    pub fn restore_current_user_system_proxy(previous: &WindowsProxySettings) -> DomainResult<()> {
+        write_current_user_system_proxy(previous)
+    }
+
+    fn read_winhttp_proxy() -> DomainResult<WindowsWinHttpProxy> {
+        let mut snapshot = WindowsProxySnapshot {
+            enabled: false,
+            server: String::new(),
+            bypass: String::new(),
+            winhttp_access_type: WINHTTP_ACCESS_TYPE_NO_PROXY,
+            winhttp_server: String::new(),
+            winhttp_bypass: String::new(),
+        };
+        read_winhttp_snapshot(&mut snapshot)?;
+        Ok(WindowsWinHttpProxy {
+            access_type: snapshot.winhttp_access_type,
+            server: snapshot.winhttp_server,
+            bypass: snapshot.winhttp_bypass,
+        })
+    }
+
+    pub fn apply_winhttp_proxy(
+        settings: &WindowsProxySettings,
+    ) -> DomainResult<WindowsWinHttpProxy> {
+        let previous = read_winhttp_proxy()?;
+        set_winhttp_proxy(settings.enabled, &settings.server, &settings.bypass)?;
+        Ok(previous)
+    }
+
+    pub fn restore_winhttp_proxy(previous: &WindowsWinHttpProxy) -> DomainResult<()> {
+        set_winhttp_proxy(
+            previous.access_type == WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+            &previous.server,
+            &previous.bypass,
+        )
     }
 
     pub fn install_root_certificate(certificate: &Path) -> DomainResult<String> {
@@ -1667,6 +1788,23 @@ mod native {
                     r"\\?\C:\Program Files\AnixOps\NetworkCore\networkcore-windows-gui.exe"
                 )),
                 r#""C:\Program Files\AnixOps\NetworkCore\networkcore-windows-gui.exe" --start-after-login"#,
+            );
+        }
+
+        /// Writes back the settings that are already there, so the test leaves
+        /// the machine as it found it and needs no administrator rights.
+        #[test]
+        fn current_user_proxy_is_written_without_touching_winhttp() {
+            let current =
+                read_current_user_system_proxy().expect("the user's proxy should be readable");
+            let previous = apply_current_user_system_proxy(&current)
+                .expect("the user's proxy should be writable without elevation");
+            assert_eq!(previous, current);
+            restore_current_user_system_proxy(&previous)
+                .expect("the user's proxy should be restorable");
+            assert_eq!(
+                read_current_user_system_proxy().expect("the user's proxy should be readable"),
+                current
             );
         }
 
