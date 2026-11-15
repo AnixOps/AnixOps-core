@@ -239,8 +239,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
     where
         W: AsyncRead + AsyncWrite + Unpin,
     {
+        self.copy_body_with(framing, dst, |_| {}, false).await
+    }
+
+    /// [`Conn::copy_body`] for a stream (server-sent events): each piece of
+    /// the body is flushed to `dst` as it arrives and then handed to
+    /// `observe` (without chunk framing).
+    pub async fn copy_body_observed<W, F>(
+        &mut self,
+        framing: Framing,
+        dst: &mut Conn<W>,
+        observe: F,
+    ) -> io::Result<()>
+    where
+        W: AsyncRead + AsyncWrite + Unpin,
+        F: FnMut(&[u8]),
+    {
+        self.copy_body_with(framing, dst, observe, true).await
+    }
+
+    async fn copy_body_with<W, F>(
+        &mut self,
+        framing: Framing,
+        dst: &mut Conn<W>,
+        mut observe: F,
+        flush: bool,
+    ) -> io::Result<()>
+    where
+        W: AsyncRead + AsyncWrite + Unpin,
+        F: FnMut(&[u8]),
+    {
+        let observe = &mut observe;
         match framing {
-            Framing::Length(length) => self.copy_exact(length, dst, true).await?,
+            Framing::Length(length) => self.copy_exact(length, dst, Some(observe), flush).await?,
             Framing::Chunked => loop {
                 let mut line = Vec::new();
                 let size_text = self.read_line(&mut line).await?;
@@ -259,15 +290,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
                     }
                     break;
                 }
-                self.copy_exact(size, dst, true).await?;
-                self.copy_exact(2, dst, false).await?;
+                self.copy_exact(size, dst, Some(&mut *observe), false)
+                    .await?;
+                self.copy_exact::<W, F>(2, dst, None, flush).await?;
             },
             Framing::UntilClose => loop {
                 if !self.buf.is_empty() {
                     dst.io.write_all(&self.buf).await?;
+                    if flush {
+                        dst.io.flush().await?;
+                    }
                     if let Some(tap) = &mut self.tap {
                         tap.keep(&self.buf);
                     }
+                    observe(&self.buf);
                     self.buf.clear();
                 }
                 if self.fill().await? == 0 {
@@ -278,14 +314,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         dst.io.flush().await
     }
 
-    async fn copy_exact<W>(
+    /// Copies `remaining` bytes; body bytes (those with an `observe`) are
+    /// also tapped and observed.
+    async fn copy_exact<W, F>(
         &mut self,
         mut remaining: usize,
         dst: &mut Conn<W>,
-        tap: bool,
+        mut observe: Option<&mut F>,
+        flush: bool,
     ) -> io::Result<()>
     where
         W: AsyncRead + AsyncWrite + Unpin,
+        F: FnMut(&[u8]),
     {
         while remaining > 0 {
             if self.buf.is_empty() && self.fill().await? == 0 {
@@ -293,8 +333,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
             }
             let take = remaining.min(self.buf.len());
             dst.io.write_all(&self.buf[..take]).await?;
-            if let (true, Some(kept)) = (tap, &mut self.tap) {
-                kept.keep(&self.buf[..take]);
+            if let Some(observe) = observe.as_deref_mut() {
+                if let Some(kept) = &mut self.tap {
+                    kept.keep(&self.buf[..take]);
+                }
+                observe(&self.buf[..take]);
+            }
+            if flush {
+                dst.io.flush().await?;
             }
             self.buf.drain(..take);
             remaining -= take;

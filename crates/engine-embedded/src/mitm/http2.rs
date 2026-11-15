@@ -216,6 +216,7 @@ impl MitmEngine {
         let mut recording = capture.map(|capture| {
             let mut recording = Recording::new(capture, &method, &url, &request_headers[1..]);
             recording.exchange.http_version = HTTP_2;
+            recording.publish();
             recording
         });
         let stream_request = !self.needs_body(&url, HttpMitmPhase::Request);
@@ -235,6 +236,7 @@ impl MitmEngine {
                             size: prefix.len() as u64,
                         };
                         recording.exchange.note = Some("too_large");
+                        recording.exchange.rules_skipped = true;
                     }
                     let headers = upstream_headers(&parts.headers);
                     let upstream_request = build_request(&parts.method, authority, &path, headers)?;
@@ -395,7 +397,7 @@ impl MitmEngine {
             .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
         if event_stream {
             if let Some(recording) = recording.as_deref_mut() {
-                recording.exchange.note = Some("streaming");
+                recording.stream(!stream_response);
             }
             let response = Response::from_parts(parts, body);
             return self
@@ -460,6 +462,7 @@ impl MitmEngine {
             Collected::TooLarge(prefix) => {
                 if let Some(recording) = recording.as_deref_mut() {
                     recording.exchange.note = Some("too_large");
+                    recording.exchange.rules_skipped = true;
                 }
                 let response = Response::from_parts(parts, body);
                 return self
@@ -537,12 +540,19 @@ impl MitmEngine {
         if let Some(recording) = recording {
             recording.exchange.status = Some(status);
             recording.exchange.response_headers = headers;
+            if streaming {
+                recording.start_events();
+            }
             if !end {
                 if let Some(prefix) = prefix {
                     tap.add(&prefix);
                     send_bytes(&mut send, Bytes::from(prefix)).await?;
                 }
-                pump(&mut body, &mut send, Some(&mut tap)).await?;
+                if streaming {
+                    pump_events(&mut body, &mut send, recording).await?;
+                } else {
+                    pump(&mut body, &mut send, Some(&mut tap)).await?;
+                }
             }
             if let Some(body) = tap.into_body() {
                 recording.exchange.response_body = body;
@@ -641,6 +651,24 @@ async fn pump(
         }
         send_bytes(send, chunk).await?;
         // Released only once the other side took it: backpressure.
+        let _ = body.flow_control().release_capacity(len);
+    }
+    let trailers = body.trailers().await.map_err(h2_error)?;
+    finish(send, trailers)
+}
+
+/// [`pump`] for an event stream: each piece goes to `recording` once sent,
+/// which keeps its events.
+async fn pump_events(
+    body: &mut RecvStream,
+    send: &mut SendStream<Bytes>,
+    recording: &mut Recording<'_>,
+) -> io::Result<()> {
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(h2_error)?;
+        let len = chunk.len();
+        send_bytes(send, chunk.clone()).await?;
+        recording.response_bytes(&chunk);
         let _ = body.flow_control().release_capacity(len);
     }
     let trailers = body.trailers().await.map_err(h2_error)?;

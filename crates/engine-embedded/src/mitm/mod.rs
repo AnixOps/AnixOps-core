@@ -78,6 +78,7 @@ use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use self::http1::{Body, Conn, Framing, Head};
+use crate::capture::stream::SseParser;
 use crate::capture::{CaptureStore, CapturedBody, HttpExchange};
 use crate::config::MitmConfig;
 use crate::tunnel::{FlowInterceptor, InterceptedFlow, TunnelSettings, TunnelStats};
@@ -532,9 +533,11 @@ impl MitmEngine {
             let request_framing = request.framing()?;
             let url = format!("{scheme}://{authority}{path}");
             // Filed when this iteration ends, whichever way it ends.
-            let mut recording = capture
-                .as_ref()
-                .map(|capture| Recording::new(capture, &method, &url, &request.headers));
+            let mut recording = capture.as_ref().map(|capture| {
+                let mut recording = Recording::new(capture, &method, &url, &request.headers);
+                recording.publish();
+                recording
+            });
             // A body no rule reads is forwarded as it arrives, not held whole.
             let stream_request = !self.needs_body(&url, HttpMitmPhase::Request);
             let stream_response = !self.needs_body(&url, HttpMitmPhase::Response);
@@ -552,6 +555,7 @@ impl MitmEngine {
                         if let Some(recording) = &mut recording {
                             recording.exchange.request_body = CapturedBody::of(&raw);
                             recording.exchange.note = Some("too_large");
+                            recording.exchange.rules_skipped = true;
                         }
                         origin.write_all(&request.encode()).await?;
                         origin.write_all(&raw).await?;
@@ -656,11 +660,43 @@ impl MitmEngine {
                     value.to_ascii_lowercase().starts_with("text/event-stream")
                 });
             if streaming {
+                let event_stream = status != 101;
                 if let Some(recording) = &mut recording {
-                    recording.response(&response, &[], Some("streaming"));
+                    recording.response(&response, &[], None);
+                    recording.stream(!stream_response);
+                    if event_stream {
+                        recording.start_events();
+                    } else {
+                        recording.publish();
+                    }
                 }
                 client.write_all(&response.encode()).await?;
-                return passthrough(client, origin).await;
+                let Some(recording) = recording.as_mut().filter(|r| r.reads_events()) else {
+                    return passthrough(client, origin).await;
+                };
+                // The events are read as the body is relayed in its framing.
+                let framing =
+                    if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
+                        Framing::Length(0)
+                    } else if response.header("Transfer-Encoding").is_none()
+                        && response.header("Content-Length").is_none()
+                    {
+                        Framing::UntilClose
+                    } else {
+                        response.framing()?
+                    };
+                origin
+                    .copy_body_observed(framing, &mut client, |bytes| {
+                        recording.response_bytes(bytes)
+                    })
+                    .await?;
+                if client_close
+                    || framing == Framing::UntilClose
+                    || response.has_token("Connection", "close")
+                {
+                    return Ok(());
+                }
+                continue;
             }
             let no_body = method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304;
             let framing = if no_body {
@@ -730,6 +766,7 @@ impl MitmEngine {
                 Body::TooLarge(raw) => {
                     if let Some(recording) = &mut recording {
                         recording.response(&response, &raw, Some("too_large"));
+                        recording.exchange.rules_skipped = true;
                     }
                     client.write_all(&response.encode()).await?;
                     client.write_all(&raw).await?;
@@ -853,11 +890,17 @@ impl FlowInterceptor for MitmEngine {
     }
 }
 
-/// One decrypted exchange being captured, filed under its connection when
-/// dropped, so every way out of the relay loop keeps what was seen.
+/// One decrypted exchange being captured: filed under its connection as
+/// soon as its request head is read (in progress), refreshed when its
+/// response starts streaming and finished when dropped, so every way out of
+/// the relay loop keeps what was seen.
 struct Recording<'a> {
     capture: &'a (Arc<CaptureStore>, u64),
     exchange: HttpExchange,
+    /// Its index under the connection once filed.
+    filed: Option<usize>,
+    /// Splits an event-stream response into events as it is relayed.
+    events: Option<SseParser>,
 }
 
 impl<'a> Recording<'a> {
@@ -870,6 +913,56 @@ impl<'a> Recording<'a> {
         Self {
             capture,
             exchange: HttpExchange::new(method, url, headers),
+            filed: None,
+            events: None,
+        }
+    }
+
+    /// Files the exchange as it stands, still in progress, or refreshes
+    /// what the store holds of it.
+    fn publish(&mut self) {
+        let (store, id) = self.capture;
+        match self.filed {
+            Some(index) => store.update_exchange(*id, index, &self.exchange),
+            None => self.filed = store.open_exchange(*id, self.exchange.clone()),
+        }
+    }
+
+    /// The response streams from here on (an event stream or an upgrade)
+    /// and is relayed as it arrives; `rules_skipped` when a body rule
+    /// matched it and so did not run.
+    fn stream(&mut self, rules_skipped: bool) {
+        self.exchange.note = Some("streaming");
+        self.exchange.rules_skipped |= rules_skipped;
+    }
+
+    /// The streaming response is an event stream whose head is recorded:
+    /// its events are kept from here on, unless a content coding hides
+    /// them. Publishes the exchange either way.
+    fn start_events(&mut self) {
+        let coded = self.exchange.response_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                && !value.trim().eq_ignore_ascii_case("identity")
+        });
+        if !coded {
+            self.events = Some(SseParser::default());
+        }
+        self.publish();
+    }
+
+    /// Whether [`Recording::response_bytes`] reads the body.
+    fn reads_events(&self) -> bool {
+        self.events.is_some()
+    }
+
+    /// Body bytes of a streaming response as relayed to the app.
+    fn response_bytes(&mut self, bytes: &[u8]) {
+        let (Some(parser), Some(index)) = (&mut self.events, self.filed) else {
+            return;
+        };
+        let (store, id) = self.capture;
+        for event in parser.feed(bytes, crate::capture::unix_millis()) {
+            store.push_message(*id, index, event);
         }
     }
 
@@ -888,7 +981,11 @@ impl<'a> Recording<'a> {
 impl Drop for Recording<'_> {
     fn drop(&mut self) {
         let (store, id) = self.capture;
-        store.add_exchange(*id, std::mem::take(&mut self.exchange));
+        let exchange = std::mem::take(&mut self.exchange);
+        match self.filed {
+            Some(index) => store.finish_exchange(*id, index, Some(exchange)),
+            None => store.add_exchange(*id, exchange),
+        }
     }
 }
 

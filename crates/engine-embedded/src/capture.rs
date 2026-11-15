@@ -45,6 +45,7 @@ pub mod export;
 pub mod filter;
 pub mod redact;
 pub mod storage;
+pub mod stream;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -173,6 +174,15 @@ pub struct HttpExchange {
     /// upgrade or event stream, body not kept) or `too_large` (relayed
     /// without decryption from there on).
     pub note: Option<&'static str>,
+    /// A body rule matched but did not run: the body streamed (`streaming`)
+    /// or was too large to hold (`too_large`).
+    pub rules_skipped: bool,
+    /// The kept tail of the messages inside a stream (server-sent events).
+    pub messages: stream::Messages,
+    /// When the store last changed it, in the store's order of changes:
+    /// `capture_requests` with `since_rev` lists exchanges still in
+    /// progress and each change to them.
+    pub rev: u64,
 }
 
 impl HttpExchange {
@@ -200,7 +210,28 @@ impl HttpExchange {
             + headers(&self.response_headers)
             + self.request_body.data.len()
             + self.response_body.data.len()
+            + self.messages.memory()
             + CHUNK_OVERHEAD
+    }
+
+    /// `in_progress` until the exchange ended (its response, or stream,
+    /// is still coming), then `done`.
+    fn state(&self) -> &'static str {
+        if self.ended_at_ms.is_some() {
+            "done"
+        } else {
+            "in_progress"
+        }
+    }
+
+    /// The messages from index `since` on, as `capture_exchange` and
+    /// `capture_connection` show them.
+    fn messages_json(&self, since: u64) -> Value {
+        json!({
+            "seen": self.messages.seen,
+            "dropped": self.messages.dropped,
+            "kept": self.messages.json_since(since),
+        })
     }
 
     fn json(&self) -> Value {
@@ -219,6 +250,10 @@ impl HttpExchange {
             "url": self.url,
             "status": self.status,
             "note": self.note,
+            "state": self.state(),
+            "rev": self.rev,
+            "rules_skipped": self.rules_skipped,
+            "messages": self.messages_json(0),
             "request": {
                 "headers": headers(&self.request_headers),
                 "body": self.request_body.json(),
@@ -315,9 +350,16 @@ struct Inner {
     used: usize,
     /// The highest `seq` of an exchange dropped with its connection.
     dropped_seq: u64,
+    /// The last `rev` given to an exchange.
+    rev: u64,
 }
 
 impl Inner {
+    fn next_rev(&mut self) -> u64 {
+        self.rev += 1;
+        self.rev
+    }
+
     /// Forgets connection `id`, freeing its budget.
     fn remove(&mut self, id: u64) {
         if let Some(dropped) = self.connections.remove(&id) {
@@ -532,29 +574,115 @@ impl CaptureStore {
         inner.used = inner.used.saturating_sub(freed);
     }
 
-    /// Adds one decrypted HTTP exchange to connection `id`.
+    /// Adds one decrypted HTTP exchange to connection `id`, ended.
     #[cfg_attr(not(feature = "mitm"), allow(dead_code))]
-    pub(crate) fn add_exchange(&self, id: u64, mut exchange: HttpExchange) {
+    pub(crate) fn add_exchange(&self, id: u64, exchange: HttpExchange) {
+        if let Some(index) = self.open_exchange(id, exchange) {
+            self.finish_exchange(id, index, None);
+        }
+    }
+
+    /// Files an exchange of connection `id` that is still in progress (its
+    /// `ended_at_ms` is left as given). Its `seq` comes when it is finished,
+    /// so `capture_requests` by `since_seq` lists it once, done; by
+    /// `since_rev` it is listed now and again after each change. Returns
+    /// its index in the connection's `http`, or `None` when capture is off,
+    /// the connection is not kept or holds [`MAX_HTTP_EXCHANGES`] already.
+    #[cfg_attr(not(feature = "mitm"), allow(dead_code))]
+    pub(crate) fn open_exchange(&self, id: u64, mut exchange: HttpExchange) -> Option<usize> {
         if !self.enabled() {
-            return;
+            return None;
         }
-        if exchange.ended_at_ms.is_none() {
-            exchange.ended_at_ms = Some(unix_millis());
-        }
+        exchange.seq = 0;
         let budget = self.max_total_bytes.load(Ordering::Relaxed);
         let memory = exchange.memory();
         let mut inner = lock(&self.inner);
-        let Some(captured) = inner.connections.get_mut(&id) else {
-            return;
-        };
+        exchange.rev = inner.next_rev();
+        let captured = inner.connections.get_mut(&id)?;
         if captured.http.len() >= MAX_HTTP_EXCHANGES {
-            return;
+            return None;
         }
-        exchange.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let index = captured.http.len();
         captured.http.push(exchange);
         captured.memory += memory;
         inner.used += memory;
         if !inner.make_room(id, budget) {
+            inner.remove(id);
+            return None;
+        }
+        Some(index)
+    }
+
+    /// Replaces what exchange `index` of connection `id` holds with
+    /// `exchange`, keeping its `seq` and messages.
+    #[cfg_attr(not(feature = "mitm"), allow(dead_code))]
+    pub(crate) fn update_exchange(&self, id: u64, index: usize, exchange: &HttpExchange) {
+        self.change(id, index, |kept| {
+            let seq = kept.seq;
+            let messages = std::mem::take(&mut kept.messages);
+            *kept = HttpExchange {
+                seq,
+                messages,
+                ..exchange.clone()
+            };
+        });
+    }
+
+    /// Ends exchange `index` of connection `id`, first replacing what it
+    /// holds with `exchange` when given (see [`CaptureStore::update_exchange`]).
+    #[cfg_attr(not(feature = "mitm"), allow(dead_code))]
+    pub(crate) fn finish_exchange(&self, id: u64, index: usize, exchange: Option<HttpExchange>) {
+        let seq = &self.next_seq;
+        self.change(id, index, |kept| {
+            if let Some(exchange) = exchange {
+                let messages = std::mem::take(&mut kept.messages);
+                *kept = HttpExchange {
+                    messages,
+                    ..exchange
+                };
+            }
+            if kept.ended_at_ms.is_none() {
+                kept.ended_at_ms = Some(unix_millis());
+            }
+            if kept.seq == 0 {
+                kept.seq = seq.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Adds one message of the stream inside exchange `index` of
+    /// connection `id`, dropping its oldest past the limits of
+    /// [`stream`].
+    #[cfg_attr(not(feature = "mitm"), allow(dead_code))]
+    pub(crate) fn push_message(&self, id: u64, index: usize, message: stream::StreamMessage) {
+        if !self.enabled() {
+            return;
+        }
+        self.change(id, index, |kept| {
+            kept.messages.push(message);
+        });
+    }
+
+    /// Applies `edit` to exchange `index` of connection `id`, giving it a
+    /// new `rev` and accounting the change in memory against the budget.
+    #[cfg_attr(not(feature = "mitm"), allow(dead_code))]
+    fn change(&self, id: u64, index: usize, edit: impl FnOnce(&mut HttpExchange)) {
+        let budget = self.max_total_bytes.load(Ordering::Relaxed);
+        let mut inner = lock(&self.inner);
+        let rev = inner.next_rev();
+        let Some(captured) = inner.connections.get_mut(&id) else {
+            return;
+        };
+        let Some(kept) = captured.http.get_mut(index) else {
+            return;
+        };
+        let before = kept.memory();
+        edit(kept);
+        kept.rev = rev;
+        let after = kept.memory();
+        captured.memory = (captured.memory + after).saturating_sub(before);
+        inner.used = (inner.used + after).saturating_sub(before);
+        if after > before && !inner.make_room(id, budget) {
             inner.remove(id);
         }
     }
@@ -684,6 +812,7 @@ impl CaptureStore {
             order.sort_by_key(|exchange| exchange.seq);
             for exchange in order {
                 exchange.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+                exchange.rev = inner.next_rev();
             }
             inner.connections.extend(connections);
             let budget = self.max_total_bytes.load(Ordering::Relaxed);
@@ -717,10 +846,20 @@ impl CaptureStore {
             .collect()
     }
 
-    /// The `capture_requests` answer: one row per decrypted exchange filed
-    /// after `since_seq`, oldest first, at most `limit`
+    /// The `capture_requests` answer: one row per decrypted exchange
+    /// finished after `since_seq`, oldest first, at most `limit`
     /// (default [`DEFAULT_REQUEST_ROWS`], at most [`MAX_REQUEST_ROWS`]).
-    pub fn requests_json(&self, since_seq: u64, limit: Option<usize>, filter: &Filter) -> Value {
+    /// With `since_rev`, instead one row per exchange that changed after
+    /// that `rev`, in the order of their last change, those still in
+    /// progress included; a client that keeps the `last_rev` it was given
+    /// sees each exchange open, change and end.
+    pub fn requests_json(
+        &self,
+        since_seq: u64,
+        since_rev: Option<u64>,
+        limit: Option<usize>,
+        filter: &Filter,
+    ) -> Value {
         let limit = limit
             .unwrap_or(DEFAULT_REQUEST_ROWS)
             .clamp(1, MAX_REQUEST_ROWS);
@@ -733,11 +872,18 @@ impl CaptureStore {
                     .http
                     .iter()
                     .enumerate()
-                    .filter(|(_, exchange)| exchange.seq > since_seq)
+                    .filter(|(_, exchange)| match since_rev {
+                        Some(since_rev) => exchange.rev > since_rev,
+                        None => exchange.seq > since_seq,
+                    })
                     .map(move |(index, exchange)| (id, index, exchange))
             })
             .collect::<Vec<_>>();
-        rows.sort_unstable_by_key(|(_, _, exchange)| exchange.seq);
+        if since_rev.is_some() {
+            rows.sort_unstable_by_key(|(_, _, exchange)| exchange.rev);
+        } else {
+            rows.sort_unstable_by_key(|(_, _, exchange)| exchange.seq);
+        }
         let last_seq = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
         let requests = rows
             .into_iter()
@@ -748,8 +894,28 @@ impl CaptureStore {
         json!({
             "requests": requests,
             "last_seq": last_seq,
+            "last_rev": inner.rev,
             "dropped_before_seq": inner.dropped_seq,
         })
+    }
+
+    /// The `capture_exchange` answer: exchange `index` of connection `id`
+    /// with its stream messages from index `since_message` on; `null` when
+    /// it is not kept.
+    pub fn exchange_json(&self, id: u64, index: usize, since_message: u64) -> Value {
+        let inner = lock(&self.inner);
+        let Some(exchange) = inner
+            .connections
+            .get(&id)
+            .and_then(|captured| captured.http.get(index))
+        else {
+            return Value::Null;
+        };
+        let mut value = exchange.json();
+        value["connection_id"] = json!(id);
+        value["index"] = json!(index);
+        value["messages"] = exchange.messages_json(since_message);
+        value
     }
 }
 
@@ -782,6 +948,10 @@ fn request_row(id: u64, index: usize, exchange: &HttpExchange) -> Value {
         "request_size": exchange.request_body.size,
         "response_size": exchange.response_body.size,
         "response_content_type": content_type,
+        "state": exchange.state(),
+        "rev": exchange.rev,
+        "rules_skipped": exchange.rules_skipped,
+        "message_count": exchange.messages.seen,
     })
 }
 
@@ -1858,7 +2028,7 @@ mod tests {
         filed(&store, 1, "POST", "https://a.test/two", 500);
         filed(&store, 2, "GET", "https://b.test/three", 404);
 
-        let all = store.requests_json(0, None, &Filter::default());
+        let all = store.requests_json(0, None, None, &Filter::default());
         let rows = all["requests"].as_array().unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["seq"], 1);
@@ -1871,12 +2041,13 @@ mod tests {
         assert_eq!(all["last_seq"], 3);
         assert_eq!(all["dropped_before_seq"], 0);
 
-        let since = store.requests_json(1, Some(1), &Filter::default());
+        let since = store.requests_json(1, None, Some(1), &Filter::default());
         assert_eq!(since["requests"].as_array().unwrap().len(), 1);
         assert_eq!(since["requests"][0]["seq"], 2);
 
         let errors = store.requests_json(
             0,
+            None,
             None,
             &Filter::parse("status:>=400 -host:a.test").unwrap(),
         );
@@ -1884,9 +2055,125 @@ mod tests {
         assert_eq!(errors["requests"][0]["url"], "https://b.test/three");
 
         store.clear();
-        let cleared = store.requests_json(0, None, &Filter::default());
+        let cleared = store.requests_json(0, None, None, &Filter::default());
         assert!(cleared["requests"].as_array().unwrap().is_empty());
         assert_eq!(cleared["dropped_before_seq"], 3);
+    }
+
+    #[test]
+    fn exchanges_in_progress_are_listed_by_rev_and_keep_their_messages() {
+        use stream::{MessageKind, StreamMessage};
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(7, Network::Tcp, Some("a.test"), "a.test:443", 1);
+        store.mark_decrypted(7);
+        let used = store.status().used_bytes;
+        let mut exchange = HttpExchange::new("GET", "https://a.test/events", &[]);
+        let index = store.open_exchange(7, exchange.clone()).unwrap();
+
+        // Not finished: only `since_rev` lists it.
+        let by_seq = store.requests_json(0, None, None, &Filter::default());
+        assert!(by_seq["requests"].as_array().unwrap().is_empty());
+        let by_rev = store.requests_json(0, Some(0), None, &Filter::default());
+        assert_eq!(by_rev["requests"][0]["state"], "in_progress");
+        assert_eq!(by_rev["requests"][0]["seq"], 0);
+        let last_rev = by_rev["last_rev"].as_u64().unwrap();
+
+        exchange.status = Some(200);
+        exchange.note = Some("streaming");
+        exchange.rules_skipped = true;
+        store.update_exchange(7, index, &exchange);
+        for i in 0..3u8 {
+            store.push_message(
+                7,
+                index,
+                StreamMessage {
+                    index: 0,
+                    at_ms: 5,
+                    direction: Direction::Down,
+                    kind: MessageKind::Sse,
+                    label: Some("tick".into()),
+                    id: None,
+                    code: None,
+                    data: vec![b'0' + i],
+                    size: 1,
+                },
+            );
+        }
+        let changed = store.requests_json(0, Some(last_rev), None, &Filter::default());
+        let rows = changed["requests"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], 200);
+        assert_eq!(rows[0]["message_count"], 3);
+        assert_eq!(rows[0]["rules_skipped"], true);
+        let last_rev = changed["last_rev"].as_u64().unwrap();
+        let unchanged = store.requests_json(0, Some(last_rev), None, &Filter::default());
+        assert!(unchanged["requests"].as_array().unwrap().is_empty());
+
+        let detail = store.exchange_json(7, index, 1);
+        assert_eq!(detail["messages"]["seen"], 3);
+        let kept = detail["messages"]["kept"].as_array().unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0]["index"], 1);
+        assert_eq!(kept[0]["label"], "tick");
+        assert_eq!(kept[1]["text"], "2");
+
+        // Finishing keeps the messages and files it by `seq`.
+        store.finish_exchange(7, index, Some(exchange.clone()));
+        let done = store.requests_json(0, None, None, &Filter::default());
+        assert_eq!(done["requests"][0]["state"], "done");
+        assert_eq!(done["requests"][0]["seq"], 1);
+        assert_eq!(store.exchange_json(7, index, 0)["messages"]["seen"], 3);
+        assert_eq!(store.exchange_json(7, 9, 0), Value::Null);
+
+        // The memory the exchange holds is what the budget counts.
+        let expected = {
+            let inner = lock(&store.inner);
+            inner.connections[&7].http[index].memory()
+        };
+        assert_eq!(store.status().used_bytes, used + expected);
+        // One lock at a time: a second `lock` in the same statement would
+        // wait for the first guard forever.
+        let inner = lock(&store.inner);
+        let captured = &inner.connections[&7];
+        assert_eq!(captured.memory, captured.memory_estimate());
+    }
+
+    #[test]
+    fn a_stream_of_many_messages_stays_within_its_budget() {
+        use stream::{MessageKind, StreamMessage, MAX_MESSAGES, MAX_MESSAGE_BYTES_TOTAL};
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(8, Network::Tcp, Some("a.test"), "a.test:443", 1);
+        store.mark_decrypted(8);
+        let index = store
+            .open_exchange(8, HttpExchange::new("GET", "https://a.test/s", &[]))
+            .unwrap();
+        for i in 0..20_000u64 {
+            store.push_message(
+                8,
+                index,
+                StreamMessage {
+                    index: 0,
+                    at_ms: i,
+                    direction: Direction::Down,
+                    kind: MessageKind::Sse,
+                    label: None,
+                    id: None,
+                    code: None,
+                    data: vec![b'x'; 700],
+                    size: 700,
+                },
+            );
+        }
+        let inner = lock(&store.inner);
+        let exchange = &inner.connections[&8].http[index];
+        assert_eq!(exchange.messages.seen, 20_000);
+        assert!(exchange.messages.kept.len() <= MAX_MESSAGES);
+        assert!(exchange.messages.memory() <= MAX_MESSAGE_BYTES_TOTAL + MAX_MESSAGES * 64);
+        assert_eq!(inner.used, inner.connections[&8].memory);
+        assert_eq!(
+            inner.connections[&8].memory,
+            inner.connections[&8].memory_estimate()
+        );
     }
 
     #[test]
