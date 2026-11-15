@@ -417,7 +417,11 @@ fn zstd(
         }
         let mut reader = rest;
         let room = limits.output - out.len();
-        let decoder = match ruzstd::decoding::StreamingDecoder::new(&mut reader) {
+        // The decoder checks the window again against the same limit.
+        let decoder = match ruzstd::decoding::StreamingDecoder::new_with_max_window_size(
+            &mut reader,
+            window_limit,
+        ) {
             Ok(decoder) => decoder,
             Err(_) if !complete => return Ok((out, true)),
             Err(_) => return Err(DecodeError::Corrupt(NAME)),
