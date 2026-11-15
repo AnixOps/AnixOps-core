@@ -22,7 +22,9 @@
 //! per stream and [`SEND_BUFFER`] of queued data per stream on each side.
 
 use std::io;
-use std::pin::pin;
+use std::pin::{pin, Pin};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -34,10 +36,11 @@ use h2::server::SendResponse;
 use h2::{Reason, RecvStream, SendStream};
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{from_metadata, to_metadata, MitmEngine, Recording, MAX_BODY_BYTES};
-use crate::capture::{CapturedBody, HTTP_2, MAX_HTTP_BODY_BYTES};
+use crate::capture::h2frames::{FrameScanner, Link};
+use crate::capture::{CaptureStore, CapturedBody, Direction, HTTP_2, MAX_HTTP_BODY_BYTES};
 
 /// The ALPN id of HTTP/2.
 pub const ALPN_H2: &[u8] = b"h2";
@@ -89,6 +92,9 @@ impl MitmEngine {
         O: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let capture = crate::capture::current_flow();
+        // With capture on, every frame header on both links is kept.
+        let origin = FrameTap::new(origin, Link::Origin, capture.as_ref());
+        let client = FrameTap::new(client, Link::App, capture.as_ref());
         let (send_request, upstream) = tokio::time::timeout(
             idle_timeout,
             h2::client::Builder::new()
@@ -822,6 +828,87 @@ fn header_map(headers: &[(String, String)]) -> HeaderMap {
 /// Whether `alpn` (the protocols a ClientHello offers) includes `h2`.
 pub fn offers_h2(alpn: &[Vec<u8>]) -> bool {
     alpn.iter().any(|protocol| protocol == ALPN_H2)
+}
+
+/// One TLS link of a decrypted HTTP/2 connection, passing its bytes through
+/// unchanged and, with capture on, keeping the header of every frame that
+/// goes either way (see [`crate::capture::h2frames`]).
+struct FrameTap<S> {
+    inner: S,
+    taps: Option<Taps>,
+}
+
+struct Taps {
+    store: Arc<CaptureStore>,
+    id: u64,
+    read: FrameScanner,
+    write: FrameScanner,
+}
+
+impl<S> FrameTap<S> {
+    fn new(inner: S, link: Link, capture: Option<&(Arc<CaptureStore>, u64)>) -> Self {
+        // The relay is the server on the app's link and the client on the
+        // origin's: what it reads from the app and writes to the origin goes
+        // up.
+        let (read, write) = match link {
+            Link::App => (Direction::Up, Direction::Down),
+            Link::Origin => (Direction::Down, Direction::Up),
+        };
+        Self {
+            inner,
+            taps: capture.map(|(store, id)| Taps {
+                store: store.clone(),
+                id: *id,
+                read: FrameScanner::new(link, read),
+                write: FrameScanner::new(link, write),
+            }),
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for FrameTap<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let (Poll::Ready(Ok(())), Some(taps)) = (&polled, &mut this.taps) {
+            let frames = taps
+                .read
+                .feed(&buf.filled()[before..], crate::capture::unix_millis());
+            taps.store.push_h2_frames(taps.id, frames);
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for FrameTap<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let (Poll::Ready(Ok(written)), Some(taps)) = (&polled, &mut this.taps) {
+            let frames = taps
+                .write
+                .feed(&buf[..*written], crate::capture::unix_millis());
+            taps.store.push_h2_frames(taps.id, frames);
+        }
+        polled
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]

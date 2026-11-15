@@ -43,6 +43,7 @@
 pub mod decode;
 pub mod export;
 pub mod filter;
+pub mod h2frames;
 pub mod redact;
 pub mod storage;
 pub mod stream;
@@ -282,6 +283,8 @@ struct Captured {
     /// Bytes seen while capturing, by direction.
     seen: [u64; 2],
     http: Vec<HttpExchange>,
+    /// The HTTP/2 frame timeline of a decrypted `h2` connection.
+    h2: h2frames::H2Frames,
     /// What this connection counts against the budget.
     memory: usize,
 }
@@ -312,6 +315,7 @@ impl Captured {
                 .map(|chunk| chunk.data.len() + CHUNK_OVERHEAD)
                 .sum::<usize>()
             + self.http.iter().map(HttpExchange::memory).sum::<usize>()
+            + self.h2.memory()
     }
 
     fn json(&self, id: u64) -> Value {
@@ -341,6 +345,10 @@ impl Captured {
                 }))
                 .collect::<Vec<_>>(),
             "http": self.http.iter().map(HttpExchange::json).collect::<Vec<_>>(),
+            "h2_frames": {
+                "seen": self.h2.seen,
+                "dropped": self.h2.dropped,
+            },
         })
     }
 }
@@ -493,6 +501,7 @@ impl CaptureStore {
                 kept: [0, 0],
                 seen: [0, 0],
                 http: Vec::new(),
+                h2: h2frames::H2Frames::default(),
                 memory,
             },
         );
@@ -686,6 +695,39 @@ impl CaptureStore {
         if after > before && !inner.make_room(id, budget) {
             inner.remove(id);
         }
+    }
+
+    /// Adds HTTP/2 frames seen on decrypted connection `id`.
+    #[cfg_attr(not(feature = "mitm"), allow(dead_code))]
+    pub(crate) fn push_h2_frames(&self, id: u64, frames: Vec<h2frames::H2Frame>) {
+        if frames.is_empty() || !self.enabled() {
+            return;
+        }
+        let budget = self.max_total_bytes.load(Ordering::Relaxed);
+        let mut inner = lock(&self.inner);
+        let Some(captured) = inner.connections.get_mut(&id) else {
+            return;
+        };
+        let delta = captured.h2.push(frames);
+        captured.memory = captured.memory.saturating_add_signed(delta);
+        inner.used = inner.used.saturating_add_signed(delta);
+        if delta > 0 && !inner.make_room(id, budget) {
+            inner.remove(id);
+        }
+    }
+
+    /// The `capture_h2_frames` answer: the kept HTTP/2 frames of connection
+    /// `id` from index `since` on; `null` when the connection is not kept.
+    pub fn h2_frames_json(&self, id: u64, since: u64) -> Value {
+        let inner = lock(&self.inner);
+        let Some(captured) = inner.connections.get(&id) else {
+            return Value::Null;
+        };
+        json!({
+            "seen": captured.h2.seen,
+            "dropped": captured.h2.dropped,
+            "frames": captured.h2.json_since(since),
+        })
     }
 
     /// Notes that connection `id` closed.
