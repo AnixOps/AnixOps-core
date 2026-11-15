@@ -10,7 +10,8 @@
  *     networkcore_ios_runtime_free_buffer.
  *   - The runtime handle is released with networkcore_ios_runtime_free_handle.
  *   - networkcore_ios_measure_delay is also linked into the containing app, which tests
- *     nodes with it without starting a tunnel; so is networkcore_ios_mitm_inspect_plugin.
+ *     nodes with it without starting a tunnel; so are networkcore_ios_mitm_inspect_plugin and
+ *     networkcore_ios_decode_body.
  *   - The packet writer runs on the tunnel thread until stop_tunnel returns and must
  *     not call back into the library.
  */
@@ -95,6 +96,15 @@ int32_t networkcore_ios_measure_delay(const uint8_t *config, size_t config_len, 
  * "map_local_data" resources and pass them as mitm.resource_assets; scripts need the user's
  * consent first. Needs no runtime handle. */
 int32_t networkcore_ios_mitm_inspect_plugin(const uint8_t *text, size_t text_len, NetworkCoreBuffer *out);
+/* Decodes a captured body's Content-Encoding (gzip, x-gzip, deflate, br, zstd, several in a row)
+ * for the inspector, in the app's own process: at most 16 MiB out, windows up to brotli's 16 MiB
+ * and zstd's 8 MiB (RFC 9659). complete = 0 when capture kept only the start of the body; then,
+ * or when the output reaches the limit, *truncated is set to 1. An unknown coding, an invalid body
+ * or a window over the limit returns NETWORKCORE_IOS_ERR_INVALID_ARGUMENT; show the bytes as
+ * captured then. Needs no runtime handle. */
+int32_t networkcore_ios_decode_body(const uint8_t *data, size_t data_len, const uint8_t *content_encoding,
+                                    size_t content_encoding_len, uint8_t complete, uint8_t *truncated,
+                                    NetworkCoreBuffer *out);
 /* Bound interface (macOS packet tunnel): pins every socket the engine opens to the interface with
  * this index (if_nametoindex), so it leaves through the physical network instead of looping into
  * the tunnel's default route. 0 leaves that family unpinned; both 0 removes the pin. Process-wide,

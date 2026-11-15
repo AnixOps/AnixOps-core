@@ -724,8 +724,9 @@ impl MitmEngine {
                 continue;
             }
 
+            let mut response_headers = response.headers.clone();
             let response_body = match origin.read_body(framing, MAX_BODY_BYTES).await? {
-                Body::Complete(body) => body,
+                Body::Complete(body) => decoded_for_rules(&mut response_headers, body),
                 Body::TooLarge(raw) => {
                     if let Some(recording) = &mut recording {
                         recording.response(&response, &raw, Some("too_large"));
@@ -742,7 +743,7 @@ impl MitmEngine {
                     method: Some(method.clone()),
                     phase: HttpMitmPhase::Response,
                     status_code: Some(status),
-                    headers: to_metadata(&response.headers),
+                    headers: to_metadata(&response_headers),
                     body: response_body,
                 })
                 .await?;
@@ -1003,6 +1004,36 @@ fn reason(status: u16) -> &'static str {
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         _ => "Status",
+    }
+}
+
+/// A response body a rule reads, decoded when the origin sent it with a
+/// `Content-Encoding` although the request asked for `identity`, so rules
+/// and scripts see the text; the header goes and the body is sent on
+/// decoded (the caller sets its length). A body that does not decode whole
+/// within [`MAX_BODY_BYTES`] and the extension's window limit is left as it
+/// came, with its header.
+fn decoded_for_rules(headers: &mut Vec<(String, String)>, body: Vec<u8>) -> Vec<u8> {
+    use crate::capture::decode::{codings, decode_body, DecodeLimits};
+
+    let Some(coding) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, value)| value.clone())
+        .filter(|value| !codings(value).is_empty())
+    else {
+        return body;
+    };
+    let limits = DecodeLimits {
+        output: MAX_BODY_BYTES,
+        ..DecodeLimits::EXTENSION
+    };
+    match decode_body(&body, &coding, true, limits) {
+        Ok(decoded) if !decoded.truncated => {
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-encoding"));
+            decoded.data
+        }
+        _ => body,
     }
 }
 

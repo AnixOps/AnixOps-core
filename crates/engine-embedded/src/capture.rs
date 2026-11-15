@@ -40,6 +40,7 @@
 //! export, and sessions older than the retention (default 7 days) are
 //! deleted. See [`storage`].
 
+pub mod decode;
 pub mod export;
 pub mod filter;
 pub mod redact;
@@ -1403,7 +1404,7 @@ mod har {
 
     use serde_json::{json, Value};
 
-    use super::{base64_encode, Captured, CapturedBody, HttpExchange, MAX_HTTP_BODY_BYTES};
+    use super::{base64_encode, decode, Captured, CapturedBody, HttpExchange, MAX_HTTP_BODY_BYTES};
 
     pub(super) fn entry(id: u64, captured: &Captured, exchange: &HttpExchange) -> Value {
         let ended = exchange.ended_at_ms.unwrap_or(exchange.started_at_ms);
@@ -1430,16 +1431,23 @@ mod har {
             "headersSize": -1,
             "bodySize": exchange.request_body.size,
         });
+        let mut comment = Vec::new();
         if exchange.request_body.size > 0 {
             let mime = header("Content-Type", &exchange.request_headers).unwrap_or_default();
             let mut post = json!({ "mimeType": mime });
-            text(&mut post, &exchange.request_body);
+            let encoding = header("Content-Encoding", &exchange.request_headers);
+            comment.extend(text(&mut post, &exchange.request_body, encoding.as_deref()));
             request["postData"] = post;
         }
         let status = exchange.status.unwrap_or(0);
         let mime = header("Content-Type", &exchange.response_headers).unwrap_or_default();
         let mut content = json!({ "size": exchange.response_body.size, "mimeType": mime });
-        text(&mut content, &exchange.response_body);
+        let encoding = header("Content-Encoding", &exchange.response_headers);
+        comment.extend(text(
+            &mut content,
+            &exchange.response_body,
+            encoding.as_deref(),
+        ));
         let body_size = if exchange.status.is_some() {
             exchange.response_body.size as i64
         } else {
@@ -1467,9 +1475,8 @@ mod har {
         if let Ok(address) = captured.destination.parse::<SocketAddr>() {
             entry["serverIPAddress"] = json!(address.ip().to_string());
         }
-        let mut comment = Vec::new();
         if let Some(note) = exchange.note {
-            comment.push(note.to_string());
+            comment.insert(0, note.to_string());
         }
         if exchange.request_body.truncated() || exchange.response_body.truncated() {
             comment.push(format!("bodies truncated to {MAX_HTTP_BODY_BYTES} bytes"));
@@ -1480,18 +1487,52 @@ mod har {
         entry
     }
 
-    /// `text` (UTF-8) or `text` + `encoding: base64`.
-    fn text(target: &mut Value, body: &CapturedBody) {
+    /// `text` (UTF-8) or `text` + `encoding: base64`, with `Content-Encoding`
+    /// undone first as HAR asks (`size` then counts the decoded bytes and
+    /// `compression` the bytes saved). Returns a comment when the body could
+    /// not be decoded, or only in part.
+    fn text(
+        target: &mut Value,
+        body: &CapturedBody,
+        content_encoding: Option<&str>,
+    ) -> Option<String> {
         if body.data.is_empty() {
-            return;
+            return None;
         }
-        match std::str::from_utf8(&body.data) {
+        let mut comment = None;
+        let mut data = std::borrow::Cow::Borrowed(body.data.as_slice());
+        if let Some(coding) = content_encoding.filter(|coding| !decode::codings(coding).is_empty())
+        {
+            match decode::decode_body(
+                &body.data,
+                coding,
+                !body.truncated(),
+                decode::DecodeLimits::EXTENSION,
+            ) {
+                Ok(decoded) => {
+                    if decoded.truncated {
+                        comment = Some(format!(
+                            "{coding} body decoded only in part ({} bytes)",
+                            decoded.data.len()
+                        ));
+                    } else {
+                        let size = decoded.data.len() as u64;
+                        target["size"] = json!(size);
+                        target["compression"] = json!(size.saturating_sub(body.size));
+                    }
+                    data = std::borrow::Cow::Owned(decoded.data);
+                }
+                Err(error) => comment = Some(format!("{coding} body left encoded: {error}")),
+            }
+        }
+        match std::str::from_utf8(&data) {
             Ok(text) => target["text"] = json!(text),
             Err(_) => {
-                target["text"] = json!(base64_encode(&body.data));
+                target["text"] = json!(base64_encode(&data));
                 target["encoding"] = json!("base64");
             }
         }
+        comment
     }
 
     fn query(url: &str) -> Vec<Value> {
@@ -1693,6 +1734,54 @@ mod tests {
             .decode(answer["data_base64"].as_str().unwrap())
             .unwrap();
         assert_eq!(data.len(), pcap.len());
+    }
+
+    #[test]
+    fn har_carries_encoded_bodies_decoded() {
+        use std::io::Write;
+
+        let store = Arc::new(store(MAX_TOTAL_BYTES_LIMIT));
+        store.begin(
+            4,
+            Network::Tcp,
+            Some("cdn.example.test"),
+            "192.0.2.4:443",
+            1,
+        );
+        store.mark_decrypted(4);
+        let text = "hello ".repeat(500);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(text.as_bytes()).unwrap();
+        let wire = gzip.finish().unwrap();
+        let header = |name: &str, value: &str| (name.to_string(), value.to_string());
+        let mut exchange = HttpExchange::new("GET", "https://cdn.example.test/a", &[]);
+        exchange.status = Some(200);
+        exchange.response_headers = vec![
+            header("Content-Type", "text/plain"),
+            header("Content-Encoding", "gzip"),
+        ];
+        exchange.response_body = CapturedBody::of(&wire);
+        store.add_exchange(4, exchange.clone());
+        // An encoding nobody decodes stays as captured, with a comment.
+        exchange.response_headers[1].1 = "compress".to_string();
+        exchange.response_body = CapturedBody::of(b"\x1f\x9d\x90");
+        store.add_exchange(4, exchange);
+
+        let har: Value = serde_json::from_slice(&store.export_har(Some(4), true)).unwrap();
+        let decoded = &har["log"]["entries"][0]["response"];
+        assert_eq!(decoded["content"]["text"], text.as_str());
+        assert_eq!(decoded["content"]["size"], text.len());
+        assert_eq!(decoded["content"]["compression"], text.len() - wire.len());
+        assert_eq!(decoded["bodySize"], wire.len());
+        // The headers stay as sent.
+        assert_eq!(decoded["headers"][1]["value"], "gzip");
+
+        let left = &har["log"]["entries"][1];
+        assert_eq!(left["response"]["content"]["encoding"], "base64");
+        assert!(left["comment"]
+            .as_str()
+            .unwrap()
+            .contains("compress body left encoded"));
     }
 
     #[test]
