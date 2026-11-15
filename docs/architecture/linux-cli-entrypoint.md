@@ -47,7 +47,7 @@ CLI 作为应用入口层存在，当前首个源码边界是 `apps/linux-cli`�
 | `networkcore-linux version` | 输出 CLI、workspace、commit 或构建元数据 | 元数据必须由 GitHub Actions 注入或从 crate 版本读取 |
 | `networkcore-linux capabilities` | 输出 Linux platform adapter 的能力状态和诊断 | 只读探测，不修改系统状态 |
 | `networkcore-linux prepare-config --config <path>` | 读取配置并调用 `prepare_config`，输出标准化结果或诊断 | 不写回配置文件，不迁移落盘 |
-| `networkcore-linux start --config <path>` | 前台启动 runtime，用当前进程持有生命周期；native engine 注入内置 `networkcore.adblock` MITM hook | 不默认 daemonize，不安装服务，不后台运行；默认只在 SOCKS5 CONNECT 层应用插件 `Reject` 为 CONNECT failure。只有显式 `--enable-https-mitm --mitm-ca-cert <path> --mitm-ca-key <path> --confirm` 才启用受控 HTTP/1.1 TLS termination/rewrite，且不支持 HTTP/2、HTTP/3/QUIC 或 pinning bypass |
+| `networkcore-linux start --config <path>` | 前台启动 runtime，用当前进程持有生命周期；`--mitm-plugin <path>` 时 native engine 注入用户自己的 MITM 插件（不内置插件） | 不默认 daemonize，不安装服务，不后台运行；默认只在 SOCKS5 CONNECT 层应用插件 `Reject` 为 CONNECT failure。只有显式 `--enable-https-mitm --mitm-ca-cert <path> --mitm-ca-key <path> --confirm` 才启用受控 HTTP/1.1 TLS termination/rewrite，且不支持 HTTP/2、HTTP/3/QUIC 或 pinning bypass |
 | `networkcore-linux stop` | 无参数时描述当前停止能力边界；带显式 Unix `--managed-control-socket <absolute-path> --confirm` 时请求当前 managed foreground session stop | 不发现默认路径、不使用 PID fallback；不提供 reload、status 或 rollback |
 | `networkcore-linux status` | 输出当前进程可见的平台、配置或 runtime 状态 | 没有 daemon/control socket 前不得假装能读取后台状态 |
 | `networkcore-linux diagnostics` | 输出聚合诊断，便于 CI 日志、用户排错和后续 UI 消费 | 不读取敏感配置值，不输出密钥 |

@@ -2,7 +2,7 @@
 
 use engine_embedded::profile::{
     envelope_for_mode, groups, selected_node, set_group_default, switch_group_for_node,
-    RoutingMode, RuleList, PROXY_OUTBOUND,
+    RoutingMode, PROXY_OUTBOUND,
 };
 use serde_json::{json, Value};
 
@@ -36,84 +36,42 @@ fn routed() -> Value {
     })
 }
 
-fn lists(list: RuleList) -> Result<Vec<String>, String> {
-    Ok(match list {
-        RuleList::ChinaDomains => vec!["cn".to_string(), "baidu.com".to_string()],
-        RuleList::ChinaIps => vec!["1.0.1.0/24".to_string()],
-        RuleList::GfwDomains => vec!["google.com".to_string()],
-    })
-}
-
 fn render(profile: &Value, mode: RoutingMode) -> Value {
-    serde_json::from_str(&envelope_for_mode(&profile.to_string(), mode, lists).unwrap()).unwrap()
+    serde_json::from_str(&envelope_for_mode(&profile.to_string(), mode).unwrap()).unwrap()
 }
 
 #[test]
-fn modes_name_themselves_and_their_lists() {
-    for mode in [
-        RoutingMode::BypassChina,
-        RoutingMode::GfwList,
-        RoutingMode::ReturnChina,
-        RoutingMode::Direct,
-        RoutingMode::Rule,
-    ] {
+fn only_rule_and_direct_modes_exist() {
+    for mode in [RoutingMode::Direct, RoutingMode::Rule] {
         assert_eq!(RoutingMode::parse(mode.as_str()), Some(mode));
         assert_eq!(
             serde_json::to_value(mode).unwrap(),
             Value::String(mode.as_str().to_string())
         );
     }
-    assert_eq!(RoutingMode::parse("global"), None);
+    // No preset list modes (docs/no-presets.md).
+    for removed in ["bypass_china", "gfw_list", "return_china", "global"] {
+        assert_eq!(RoutingMode::parse(removed), None, "{removed}");
+    }
     assert_eq!(RoutingMode::default(), RoutingMode::Rule);
-    assert_eq!(
-        RoutingMode::BypassChina.rule_lists(),
-        [RuleList::ChinaDomains, RuleList::ChinaIps]
-    );
-    assert!(RoutingMode::Rule.rule_lists().is_empty());
-
-    let text = "# comment\nexample.cn\n\nnot-a-domain\n1.0.1.0/24 extra\n";
-    assert_eq!(RuleList::ChinaDomains.parse(text), ["example.cn"]);
-    assert_eq!(RuleList::ChinaIps.parse(text), ["1.0.1.0/24"]);
 }
 
 #[test]
-fn rule_mode_keeps_the_profile_and_list_modes_replace_its_rules() {
+fn rule_mode_keeps_the_profile_and_direct_mode_replaces_its_rules() {
     let profile = routed();
     assert_eq!(render(&profile, RoutingMode::Rule), profile);
 
-    let bypass = render(&profile, RoutingMode::BypassChina);
-    assert_eq!(
-        bypass["routing"]["rules"],
-        json!(["RULE-SET,china,DIRECT", "FINAL,Proxy"])
-    );
-    assert_eq!(
-        bypass["routing"]["rule_sets"]["china"]["ip_cidr"],
-        json!(["1.0.1.0/24"])
-    );
-    // The groups stay, so the proxied part still follows them.
-    assert_eq!(bypass["routing"]["groups"], profile["routing"]["groups"]);
-
-    let back = render(&profile, RoutingMode::ReturnChina);
-    assert_eq!(
-        back["routing"]["rules"],
-        json!(["RULE-SET,china,Proxy", "FINAL,DIRECT"])
-    );
-
-    let gfw = render(&single(), RoutingMode::GfwList);
-    assert!(gfw.get("outbound").is_none());
-    assert_eq!(
-        gfw["routing"]["rules"],
-        json!([format!("RULE-SET,gfw,{PROXY_OUTBOUND}"), "FINAL,DIRECT"])
-    );
-    assert!(gfw["routing"]["outbounds"][PROXY_OUTBOUND].is_object());
-
-    let direct = render(&single(), RoutingMode::Direct);
+    let direct = render(&profile, RoutingMode::Direct);
     assert_eq!(direct["routing"]["rules"], json!(["FINAL,DIRECT"]));
+    assert_eq!(direct["routing"]["rule_sets"], json!({}));
+    assert_eq!(direct["routing"]["groups"], profile["routing"]["groups"]);
 
-    let failing = envelope_for_mode(&profile.to_string(), RoutingMode::GfwList, |_| {
-        Err("offline".to_string())
-    });
-    assert_eq!(failing, Err("offline".to_string()));
+    let single_direct = render(&single(), RoutingMode::Direct);
+    assert!(single_direct.get("outbound").is_none());
+    assert_eq!(single_direct["routing"]["rules"], json!(["FINAL,DIRECT"]));
+    assert!(single_direct["routing"]["outbounds"][PROXY_OUTBOUND].is_object());
+
+    assert!(envelope_for_mode("[]", RoutingMode::Direct).is_err());
 }
 
 #[test]

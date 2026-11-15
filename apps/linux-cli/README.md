@@ -32,8 +32,9 @@ file, one Ubuntu-style CA trust file, and operator-selected certificate/PAC/poli
 
 ## Foreground runtime
 
-`start` wires `engine-native::NativeProxyEngineService` through `RuntimeOrchestrator` with the built-in
-`networkcore.adblock` MITM plugin hook. It is foreground-only: Unix `SIGINT`/`SIGTERM` and injected lifecycle
+`start` wires `engine-native::NativeProxyEngineService` through `RuntimeOrchestrator`. No MITM plugin is built in
+([docs/no-presets.md](../../docs/no-presets.md)): `--mitm-plugin <path>` loads the user's own plugin as the HTTP MITM
+hook, and HTTPS MITM and the script runtime need one. It is foreground-only: Unix `SIGINT`/`SIGTERM` and injected lifecycle
 interruption map to `cli.linux.start.lifecycle_interrupted` with exit code 130, after which the in-process runtime is
 stopped and native release diagnostics such as `engine.native.runtime.accept_loop_stopped` and
 `engine.native.runtime.released` are aggregated.
@@ -135,9 +136,9 @@ process or controls a runtime.
 
 ## MITM
 
-The `mitm` commands implement the partial `MITM_CLI_COMMAND_GATE` surface: they load the built-in `networkcore.adblock`
-policy through `mitm-policy`, emit `mitm_status` JSON, and report `mitm-cli-command-gate-status=partial-active`.
-`start` loads the same plugin into `engine-native`: a plugin `Reject` becomes a SOCKS5 general failure at the explicit
+The `mitm` commands implement the partial `MITM_CLI_COMMAND_GATE` surface: they report the `mitm-policy` engine with no
+plugin loaded (`plugin_loaded=false`; NetworkCore ships none), emit `mitm_status` JSON, and report `mitm-cli-command-gate-status=partial-active`.
+`mitm http-rewrite preview` and `start` load the user's plugin from `--mitm-plugin <path>`; in `engine-native` a plugin `Reject` becomes a SOCKS5 general failure at the explicit
 CONNECT layer before outbound selection, and CONNECT hook diagnostics
 (`engine.native.runtime.http_mitm_connect_browser_proof_observed`) emit the default browser proof token.
 

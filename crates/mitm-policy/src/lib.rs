@@ -1,9 +1,9 @@
 //! Safe `mitm_anixops` policy adapter for NetworkCore.
 //!
 //! This crate owns the first domain-facing MITM policy boundary. It can load
-//! plugin text through the pinned C ABI, expose stable diagnostics, and provide
-//! an alpha built-in ad-block plugin package. It does not apply live
-//! request/response mutations yet.
+//! plugin text through the pinned C ABI and expose stable diagnostics. It ships
+//! no plugin of its own: every policy is text the user brought
+//! ([`user_plugin_package`]). It does not apply live request/response mutations.
 
 pub mod loon_cron;
 pub mod loon_header_block;
@@ -30,8 +30,9 @@ use std::ptr::NonNull;
 
 pub const SOURCE_MITM_POLICY: &str = "mitm.policy";
 
-pub const MITM_POLICY_AD_BLOCK_PLUGIN_ID: &str = "networkcore.adblock";
-pub const MITM_POLICY_BILIBILI_WEB_AD_BLOCK_PLUGIN_ID: &str = "networkcore.bilibili-web-adblock";
+/// The id a plugin the user brought loads under. NetworkCore ships no plugin of its own
+/// (no ad blocking, no site rules): every policy comes from the user.
+pub const MITM_POLICY_USER_PLUGIN_ID: &str = "user";
 pub const MITM_POLICY_ENGINE_ALLOC_FAILED_CODE: &str = "mitm.policy.engine.alloc_failed";
 pub const MITM_POLICY_INPUT_NUL_BYTE_CODE: &str = "mitm.policy.input.nul_byte";
 pub const MITM_POLICY_CONFIG_LOADED_CODE: &str = "mitm.policy.config.loaded";
@@ -60,43 +61,6 @@ pub const MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_MESSAGE: &str = concat!(
 pub const MITM_POLICY_HTTP_EVENT_MUTATION_DEFERRED_MESSAGE: &str = concat!(
     "mitm_anixops policy loaded, but request/response mutation is deferred until ",
     "NetworkCore HTTP/TLS data plane can apply the mutation plan",
-);
-
-pub const BUILTIN_AD_BLOCK_PLUGIN_SOURCE: &str = concat!(
-    "[Plugin]\n",
-    "name = NetworkCore Builtin Ad Block\n",
-    "desc = Alpha ad blocking policy pack\n",
-    "\n",
-    "[URL Rewrite]\n",
-    "^https?://.*doubleclick\\.net/ reject\n",
-    "^https?://.*googlesyndication\\.com/ reject\n",
-    "^https?://.*google-analytics\\.com/ reject\n",
-    "^https?://.*adservice\\.google\\.com/ reject\n",
-    "^https?://.*adsystem\\.com/ reject\n",
-    "\n",
-    "[MITM]\n",
-    "enable = true\n",
-    "hostname = %APPEND% *.doubleclick.net, *.googlesyndication.com, ",
-    "*.google-analytics.com, *.adservice.google.com, *.adsystem.com\n",
-);
-
-/// A deliberately narrow, first-party Bilibili web trial.  It only rejects
-/// self-contained promotional requests and does not execute scripts or modify
-/// response bodies.
-pub const BUILTIN_BILIBILI_WEB_AD_BLOCK_PLUGIN_SOURCE: &str = concat!(
-    "[Plugin]\n",
-    "name = NetworkCore Bilibili Web Ad Block Trial\n",
-    "desc = Request-only Bilibili promotional endpoint blocker\n",
-    "\n",
-    "[URL Rewrite]\n",
-    "^https?://api\\.vc\\.bilibili\\.com/search_svr/v[0-9]+/Search/recommend_words(?:\\?.*)?$ reject\n",
-    "^https?://api\\.vc\\.bilibili\\.com/topic_svr/v1/topic_svr(?:\\?.*)?$ reject\n",
-    "^https?://api\\.vc\\.bilibili\\.com/dynamic_svr/v1/dynamic_svr/mix_uplist(?:\\?.*)?$ reject\n",
-    "^https?://api\\.live\\.bilibili\\.com/xlive/e-commerce-interface/v1/ecommerce-user/get_shopping_info(?:\\?.*)?$ reject\n",
-    "\n",
-    "[MITM]\n",
-    "enable = true\n",
-    "hostname = api.vc.bilibili.com, api.live.bilibili.com\n",
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1150,11 +1114,17 @@ impl MitmPluginService for AnixOpsMitmPluginService {
     }
 }
 
-pub fn builtin_ad_block_plugin_package() -> PluginPackage {
+/// The linked `mitm_anixops` core's version.
+pub fn engine_version() -> &'static str {
+    sys::version()
+}
+
+/// The user's own plugin text as a package that may read and change requests and responses.
+pub fn user_plugin_package(source: impl Into<String>) -> PluginPackage {
     PluginPackage {
         manifest: PluginManifest {
-            id: MITM_POLICY_AD_BLOCK_PLUGIN_ID.to_string(),
-            version: "0.1.0-alpha".to_string(),
+            id: MITM_POLICY_USER_PLUGIN_ID.to_string(),
+            version: "user".to_string(),
             permissions: vec![
                 PluginPermission::ReadRequest,
                 PluginPermission::ModifyRequest,
@@ -1163,22 +1133,7 @@ pub fn builtin_ad_block_plugin_package() -> PluginPackage {
             ],
             hooks: vec![HookPoint::Request, HookPoint::Response],
         },
-        source: BUILTIN_AD_BLOCK_PLUGIN_SOURCE.to_string(),
-    }
-}
-
-pub fn builtin_bilibili_web_ad_block_plugin_package() -> PluginPackage {
-    PluginPackage {
-        manifest: PluginManifest {
-            id: MITM_POLICY_BILIBILI_WEB_AD_BLOCK_PLUGIN_ID.to_string(),
-            version: "0.1.0-alpha".to_string(),
-            permissions: vec![
-                PluginPermission::ReadRequest,
-                PluginPermission::ModifyRequest,
-            ],
-            hooks: vec![HookPoint::Request],
-        },
-        source: BUILTIN_BILIBILI_WEB_AD_BLOCK_PLUGIN_SOURCE.to_string(),
+        source: source.into(),
     }
 }
 

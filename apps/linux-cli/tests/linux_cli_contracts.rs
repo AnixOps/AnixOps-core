@@ -41,9 +41,9 @@ use networkcore_linux::{
     handle_restart_unavailable, handle_start, handle_status, handle_stop,
     handle_subscription_command, handle_subscription_command_with_fetcher,
     handle_systemd_service_control, handle_uninstall_service_apply_at,
-    native_proxy_engine_service_with_builtin_mitm_plugin,
-    native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files,
-    native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files, parse_args,
+    native_proxy_engine_service_with_mitm_plugin,
+    native_proxy_engine_service_with_mitm_plugin_and_runtime_files,
+    native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files, parse_args,
     registered_core_engine_descriptors, render_response, BrowserCaptureEndpointProbe,
     BrowserCapturePacFileStore, BrowserCaptureProcessRunner, BrowserCaptureTrafficProofProbe,
     CommandBrowserCaptureEndpointProbe, CommandBrowserCaptureTrafficProofProbe,
@@ -99,11 +99,13 @@ use networkcore_linux::{
     CLI_MITM_CERTIFICATE_TRUST_CONFIG_MISSING_CODE, CLI_MITM_CLI_GATE_PARTIAL_CODE,
     CLI_MITM_DATA_PLANE_GATE_DEFERRED_CODE, CLI_MITM_HTTP_REWRITE_APPLY_READY_CODE,
     CLI_MITM_HTTP_REWRITE_AUTHORIZATION_REQUIRED_CODE, CLI_MITM_HTTP_REWRITE_PLAN_READY_CODE,
-    CLI_MITM_HTTP_REWRITE_TLS_BLOCKED_CODE, CLI_MITM_POLICY_READY_CODE, CLI_RUNTIME_UNWIRED_CODE,
+    CLI_MITM_HTTP_REWRITE_PLUGIN_MISSING_CODE, CLI_MITM_HTTP_REWRITE_TLS_BLOCKED_CODE,
+    CLI_MITM_PLUGIN_READ_FAILED_CODE, CLI_MITM_POLICY_READY_CODE, CLI_RUNTIME_UNWIRED_CODE,
     CLI_RUN_URL_REMOTE_FETCH_FAILED_CODE, CLI_START_FOREGROUND_ONLY_CODE,
     CLI_START_LIFECYCLE_FAILED_CODE, CLI_START_LIFECYCLE_HOST_MISSING_CODE,
-    CLI_START_LIFECYCLE_INTERRUPTED_CODE, CLI_START_PLATFORM_DENIED_CODE,
-    CLI_START_RUNTIME_STOP_FAILED_CODE, CLI_START_SCRIPT_RUNTIME_AUTHORIZATION_REQUIRED_CODE,
+    CLI_START_LIFECYCLE_INTERRUPTED_CODE, CLI_START_MITM_PLUGIN_REQUIRED_CODE,
+    CLI_START_PLATFORM_DENIED_CODE, CLI_START_RUNTIME_STOP_FAILED_CODE,
+    CLI_START_SCRIPT_RUNTIME_AUTHORIZATION_REQUIRED_CODE,
     CLI_START_SCRIPT_RUNTIME_CONFIG_INVALID_CODE, CLI_START_SCRIPT_RUNTIME_CONFIG_REQUIRED_CODE,
     CLI_START_TLS_MITM_AUTHORIZATION_REQUIRED_CODE, CLI_START_TLS_MITM_MATERIAL_REQUIRED_CODE,
     CLI_STATUS_NO_RUNTIME_CONTEXT_CODE, CLI_STATUS_PLATFORM_ONLY_CODE,
@@ -166,6 +168,37 @@ use platform_linux::{
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+
+/// A MITM plugin as a user would bring it; NetworkCore ships none (docs/no-presets.md).
+const TEST_MITM_PLUGIN: &str = concat!(
+    "[Plugin]\n",
+    "name = Test Reject Policy\n",
+    "\n",
+    "[URL Rewrite]\n",
+    "^https?://.*doubleclick\\.net/ reject\n",
+    "^https?://.*googlesyndication\\.com/ reject\n",
+    "^https?://.*google-analytics\\.com/ reject\n",
+    "^https?://.*adservice\\.google\\.com/ reject\n",
+    "^https?://.*adsystem\\.com/ reject\n",
+    "\n",
+    "[MITM]\n",
+    "enable = true\n",
+    "hostname = %APPEND% *.doubleclick.net, *.googlesyndication.com, ",
+    "*.google-analytics.com, *.adservice.google.com, *.adsystem.com\n",
+);
+
+/// [`TEST_MITM_PLUGIN`] written to a file once per test process.
+fn test_mitm_plugin_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!(
+            "networkcore-test-mitm-plugin-{}.plugin",
+            std::process::id()
+        ));
+        std::fs::write(&path, TEST_MITM_PLUGIN).expect("test MITM plugin should be written");
+        path.to_string_lossy().into_owned()
+    })
+}
 
 #[test]
 fn parses_prepare_config_with_explicit_path_and_json_format() {
@@ -2463,31 +2496,59 @@ fn subscription_catalog_remove_persists_snapshot_and_redacts_location() {
 }
 
 #[test]
-fn native_engine_factory_enables_builtin_mitm_plugin_hook_for_start_path() {
-    let service = native_proxy_engine_service_with_builtin_mitm_plugin()
-        .expect("built-in MITM plugin hook should load for native start path");
-
+fn native_engine_factory_hooks_only_the_users_own_mitm_plugin() {
+    let service = native_proxy_engine_service_with_mitm_plugin(&mitm_policy::user_plugin_package(
+        TEST_MITM_PLUGIN,
+    ))
+    .expect("the user's MITM plugin should load for the native start path");
     assert!(service.http_mitm_hook_enabled());
     assert!(!service.tls_mitm_ca_material_enabled());
+
+    // No plugin is built in: a start without --mitm-plugin has no MITM hook.
+    let plain = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        None, None, None, false, false,
+    )
+    .expect("a start without MITM should configure the native engine");
+    assert!(!plain.http_mitm_hook_enabled());
+
+    let from_file = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        Some(test_mitm_plugin_path()),
+        None,
+        None,
+        false,
+        false,
+    )
+    .expect("--mitm-plugin should load the user's plugin file");
+    assert!(from_file.http_mitm_hook_enabled());
+
+    let missing = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        Some("/nonexistent/networkcore-user.plugin"),
+        None,
+        None,
+        false,
+        false,
+    )
+    .expect_err("an unreadable plugin file must be refused");
+    assert_eq!(missing.code, CLI_MITM_PLUGIN_READ_FAILED_CODE);
 }
 
 #[test]
 fn native_engine_factory_requires_explicit_authorization_before_loading_tls_mitm_material() {
-    let missing_confirmation =
-        native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files(
-            Some("/tmp/networkcore-mitm-ca.crt"),
-            Some("/tmp/networkcore-mitm-ca.key"),
-            true,
-            false,
-        )
-        .expect_err("TLS MITM material must require explicit confirmation");
+    let missing_confirmation = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        None,
+        Some("/tmp/networkcore-mitm-ca.crt"),
+        Some("/tmp/networkcore-mitm-ca.key"),
+        true,
+        false,
+    )
+    .expect_err("TLS MITM material must require explicit confirmation");
     assert_eq!(
         missing_confirmation.code,
         CLI_START_TLS_MITM_AUTHORIZATION_REQUIRED_CODE
     );
 
-    let missing_material = native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files(
-        None, None, true, true,
+    let missing_material = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        None, None, None, true, true,
     )
     .expect_err("TLS MITM enablement must require both material paths");
     assert_eq!(
@@ -2495,7 +2556,8 @@ fn native_engine_factory_requires_explicit_authorization_before_loading_tls_mitm
         CLI_START_TLS_MITM_MATERIAL_REQUIRED_CODE
     );
 
-    let unapproved_paths = native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files(
+    let unapproved_paths = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        None,
         Some("/tmp/networkcore-mitm-ca.crt"),
         Some("/tmp/networkcore-mitm-ca.key"),
         false,
@@ -2529,7 +2591,8 @@ fn native_engine_factory_rejects_tls_mitm_private_key_without_owner_only_mode() 
     )
     .expect("private key fixture mode should be changed");
 
-    let error = native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files(
+    let error = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        None,
         certificate_path.to_str(),
         private_key_path.to_str(),
         true,
@@ -2562,7 +2625,8 @@ fn native_engine_factory_rejects_tls_mitm_private_key_symlink() {
     std::os::unix::fs::symlink(&private_key_target_path, &private_key_path)
         .expect("private key symlink fixture should be created");
 
-    let error = native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files(
+    let error = native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+        None,
         certificate_path.to_str(),
         private_key_path.to_str(),
         true,
@@ -2595,6 +2659,7 @@ fn parses_start_with_explicit_tls_mitm_authorization_and_material_paths() {
         command,
         LinuxCliCommand::Start {
             config_path: Some("/tmp/networkcore.toml".to_string()),
+            mitm_plugin_path: None,
             mitm_ca_certificate_path: Some("/tmp/networkcore-mitm-ca.crt".to_string()),
             mitm_ca_private_key_path: Some("/tmp/networkcore-mitm-ca.key".to_string()),
             enable_https_mitm: true,
@@ -2612,28 +2677,29 @@ fn parses_start_with_explicit_tls_mitm_authorization_and_material_paths() {
 
 #[test]
 fn native_engine_factory_requires_explicit_script_runtime_authorization_and_config() {
-    let missing_confirmation =
-        native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
-            LinuxNativeMitmRuntimeFileConfig {
-                certificate_path: None,
-                private_key_path: None,
-                enable_https_mitm: false,
-                enable_script_runtime: true,
-                script_runner_path: Some("/tmp/networkcore-script-runner.js"),
-                node_binary: None,
-                script_maps: &["https://scripts.networkcore.test/a.js=/tmp/a.js".to_string()],
-                script_store_path: None,
-                confirm: false,
-            },
-        )
-        .expect_err("script runtime must require explicit confirmation");
+    let missing_confirmation = native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
+        LinuxNativeMitmRuntimeFileConfig {
+            plugin_path: None,
+            certificate_path: None,
+            private_key_path: None,
+            enable_https_mitm: false,
+            enable_script_runtime: true,
+            script_runner_path: Some("/tmp/networkcore-script-runner.js"),
+            node_binary: None,
+            script_maps: &["https://scripts.networkcore.test/a.js=/tmp/a.js".to_string()],
+            script_store_path: None,
+            confirm: false,
+        },
+    )
+    .expect_err("script runtime must require explicit confirmation");
     assert_eq!(
         missing_confirmation.code,
         CLI_START_SCRIPT_RUNTIME_AUTHORIZATION_REQUIRED_CODE
     );
 
-    let missing_runner = native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+    let missing_runner = native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
         LinuxNativeMitmRuntimeFileConfig {
+            plugin_path: None,
             certificate_path: None,
             private_key_path: None,
             enable_https_mitm: false,
@@ -2659,8 +2725,9 @@ fn native_engine_factory_requires_explicit_script_runtime_authorization_and_conf
         "{}/../../third_party/mitm_anixops/mitm_anixops/tests/fixtures/runner_replay_script.js",
         env!("CARGO_MANIFEST_DIR")
     );
-    let configured = native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+    let configured = native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
         LinuxNativeMitmRuntimeFileConfig {
+            plugin_path: Some(test_mitm_plugin_path()),
             certificate_path: None,
             private_key_path: None,
             enable_https_mitm: false,
@@ -2683,8 +2750,9 @@ fn native_engine_factory_requires_explicit_script_runtime_authorization_and_conf
     );
     assert_eq!(configured.http_mitm_script_engine(), Some("node"));
 
-    let quickjs = native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+    let quickjs = native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
         LinuxNativeMitmRuntimeFileConfig {
+            plugin_path: Some(test_mitm_plugin_path()),
             certificate_path: None,
             private_key_path: None,
             enable_https_mitm: false,
@@ -2703,9 +2771,30 @@ fn native_engine_factory_requires_explicit_script_runtime_authorization_and_conf
     assert_eq!(quickjs.http_mitm_script_engine(), Some("quickjs-ng"));
     assert_eq!(quickjs.http_mitm_script_sandbox(), None);
 
+    // Scripts only run on a plugin's rules, and none is built in.
+    let without_plugin = native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
+        LinuxNativeMitmRuntimeFileConfig {
+            plugin_path: None,
+            certificate_path: None,
+            private_key_path: None,
+            enable_https_mitm: false,
+            enable_script_runtime: true,
+            script_runner_path: None,
+            node_binary: None,
+            script_maps: &[format!(
+                "https://scripts.networkcore.test/replay.js={script_path}"
+            )],
+            script_store_path: None,
+            confirm: true,
+        },
+    )
+    .expect_err("the script runtime must need the user's own MITM plugin");
+    assert_eq!(without_plugin.code, CLI_START_MITM_PLUGIN_REQUIRED_CODE);
+
     let node_binary_without_runner =
-        native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+        native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
             LinuxNativeMitmRuntimeFileConfig {
+                plugin_path: None,
                 certificate_path: None,
                 private_key_path: None,
                 enable_https_mitm: false,
@@ -2725,8 +2814,9 @@ fn native_engine_factory_requires_explicit_script_runtime_authorization_and_conf
         CLI_START_SCRIPT_RUNTIME_CONFIG_INVALID_CODE
     );
 
-    let rejected_store = native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+    let rejected_store = native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
         LinuxNativeMitmRuntimeFileConfig {
+            plugin_path: None,
             certificate_path: None,
             private_key_path: None,
             enable_https_mitm: false,
@@ -2768,6 +2858,7 @@ fn parses_start_with_explicit_script_runtime_mapping() {
         command,
         LinuxCliCommand::Start {
             config_path: Some("/tmp/networkcore.toml".to_string()),
+            mitm_plugin_path: None,
             mitm_ca_certificate_path: None,
             mitm_ca_private_key_path: None,
             enable_https_mitm: false,
@@ -2995,6 +3086,8 @@ fn parses_mitm_status_and_diagnostics_commands() {
         "mitm",
         "http-rewrite",
         "preview",
+        "--mitm-plugin",
+        "/tmp/my.plugin",
         "--url",
         "https://pubads.g.doubleclick.net/pagead/id",
         "--method",
@@ -3228,6 +3321,7 @@ fn parses_mitm_status_and_diagnostics_commands() {
     assert_eq!(
         http_rewrite_preview,
         LinuxCliCommand::MitmHttpRewritePreview {
+            mitm_plugin_path: Some("/tmp/my.plugin".to_string()),
             url: Some("https://pubads.g.doubleclick.net/pagead/id".to_string()),
             method: "GET".to_string(),
             phase: "request".to_string(),
@@ -4069,7 +4163,7 @@ fn status_with_service_unit_reads_managed_systemd_state() {
 }
 
 #[test]
-fn mitm_status_loads_builtin_policy_and_reports_deferred_gates() {
+fn mitm_status_loads_no_built_in_policy_and_reports_deferred_gates() {
     let platform = StaticLinuxPlatformCapabilityService::new(LinuxPlatformSnapshot {
         mitm_certificate: LinuxCertificateProbe::new(CertificateTrustState::NotInstalled),
         ..LinuxPlatformSnapshot::available_for_tests()
@@ -4166,13 +4260,12 @@ fn mitm_status_loads_builtin_policy_and_reports_deferred_gates() {
         .blocked_operations
         .iter()
         .any(|operation| operation == "install-browser-policy"));
-    assert_eq!(
-        mitm.policy.plugin_id,
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
-    assert!(mitm.policy.plugin_loaded);
-    assert!(mitm.policy.rewrite_rule_count >= 5);
-    assert!(mitm.policy.mitm_pattern_count >= 5);
+    // NetworkCore ships no MITM plugin (docs/no-presets.md).
+    assert_eq!(mitm.policy.plugin_id, "");
+    assert!(!mitm.policy.plugin_loaded);
+    assert!(!mitm.policy.engine_version.is_empty());
+    assert_eq!(mitm.policy.rewrite_rule_count, 0);
+    assert_eq!(mitm.policy.mitm_pattern_count, 0);
     assert_gate(
         &mitm.gates,
         MITM_CLI_COMMAND_GATE,
@@ -4321,6 +4414,7 @@ fn mitm_http_rewrite_preview_requires_authorization_before_applying_outcome() {
 
     let response = handle_mitm_http_rewrite_preview(
         &platform,
+        Some(test_mitm_plugin_path()),
         Some("https://pubads.g.doubleclick.net/pagead/id"),
         "GET",
         "request",
@@ -4352,6 +4446,51 @@ fn mitm_http_rewrite_preview_requires_authorization_before_applying_outcome() {
 }
 
 #[test]
+fn mitm_http_rewrite_preview_needs_the_users_own_plugin() {
+    let platform =
+        StaticLinuxPlatformCapabilityService::new(LinuxPlatformSnapshot::available_for_tests());
+
+    let response = handle_mitm_http_rewrite_preview(
+        &platform,
+        None,
+        Some("https://pubads.g.doubleclick.net/pagead/id"),
+        "GET",
+        "request",
+        None,
+        &[],
+        None,
+        true,
+    );
+
+    assert!(!response.ok);
+    assert_eq!(response.exit_code, LinuxCliExitCode::ArgumentOrConfig);
+    assert_diagnostic(
+        &response.diagnostics,
+        CLI_MITM_HTTP_REWRITE_PLUGIN_MISSING_CODE,
+    );
+    let mitm = response
+        .mitm_status
+        .as_ref()
+        .expect("preview should report MITM status");
+    assert!(!mitm.policy.plugin_loaded);
+
+    let unreadable = handle_mitm_http_rewrite_preview(
+        &platform,
+        Some("/nonexistent/networkcore-user.plugin"),
+        Some("https://pubads.g.doubleclick.net/pagead/id"),
+        "GET",
+        "request",
+        None,
+        &[],
+        None,
+        true,
+    );
+    assert!(!unreadable.ok);
+    assert_eq!(unreadable.exit_code, LinuxCliExitCode::ArgumentOrConfig);
+    assert_diagnostic(&unreadable.diagnostics, CLI_MITM_PLUGIN_READ_FAILED_CODE);
+}
+
+#[test]
 fn mitm_http_rewrite_preview_reports_https_request_preview_without_live_tls_or_script() {
     let platform = StaticLinuxPlatformCapabilityService::new(LinuxPlatformSnapshot {
         mitm_certificate: LinuxCertificateProbe::new(CertificateTrustState::InstalledUntrusted),
@@ -4361,6 +4500,7 @@ fn mitm_http_rewrite_preview_reports_https_request_preview_without_live_tls_or_s
 
     let response = handle_mitm_http_rewrite_preview(
         &platform,
+        Some(test_mitm_plugin_path()),
         Some("https://pubads.g.doubleclick.net/pagead/id"),
         "GET",
         "request",
@@ -5180,10 +5320,7 @@ fn mitm_browser_capture_launch_plan_outputs_manual_browser_commands_without_muta
         capture.plan.manual_launch.proxy_url,
         "http://127.0.0.1:7890"
     );
-    assert_eq!(
-        capture.plan.manual_launch.plugin_id,
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(capture.plan.manual_launch.plugin_id, "");
     assert!(capture
         .plan
         .manual_launch
@@ -5317,10 +5454,7 @@ fn mitm_browser_capture_session_plan_links_proxy_browser_and_plugin_without_muta
             .as_deref(),
         Some("https://example.com/capture")
     );
-    assert_eq!(
-        session.plugin_id,
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(session.plugin_id, "");
     assert!(session
         .required_steps
         .iter()
@@ -5517,10 +5651,7 @@ fn mitm_browser_capture_launch_uses_injected_runner_with_dedicated_profile() {
             .proof_token,
         "browser-proof-123"
     );
-    assert_eq!(
-        launch.plugin_id,
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(launch.plugin_id, "");
 
     let rendered = render_response(&response, OutputFormat::Text);
     assert!(rendered.contains("browser capture launch: started launched=true pid=4242"));
@@ -5611,10 +5742,7 @@ fn mitm_browser_capture_verify_requires_confirmation_before_probe() {
     assert_eq!(verify.status, "authorization_required");
     assert!(!verify.verified);
     assert_eq!(verify.request.proxy_url, "http://127.0.0.1:7890");
-    assert_eq!(
-        verify.plugin_id,
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(verify.plugin_id, "");
 }
 
 #[test]
@@ -5825,7 +5953,7 @@ fn mitm_browser_capture_traffic_proof_uses_injected_probe_for_observed_token() {
     assert!(proof.request.target_url.is_none());
     assert!(proof.request.proof_target_url.is_none());
     assert_eq!(proof.request.probe, "proof-log-token");
-    assert_eq!(proof.plugin_id, mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID);
+    assert_eq!(proof.plugin_id, "");
 
     let rendered = render_response(&response, OutputFormat::Text);
     assert!(rendered.contains(
@@ -6870,6 +6998,7 @@ fn entrypoint_keeps_runtime_mutation_commands_unwired() {
     let response = handle_entrypoint(
         LinuxCliCommand::Start {
             config_path: Some("config.toml".to_string()),
+            mitm_plugin_path: None,
             mitm_ca_certificate_path: None,
             mitm_ca_private_key_path: None,
             enable_https_mitm: false,
@@ -6910,6 +7039,7 @@ profile = "default"
     let response = handle_entrypoint_with_runtime(
         LinuxCliCommand::Start {
             config_path: Some("networkcore.toml".to_string()),
+            mitm_plugin_path: None,
             mitm_ca_certificate_path: None,
             mitm_ca_private_key_path: None,
             enable_https_mitm: false,
@@ -6969,6 +7099,7 @@ route_node = "node-1"
     let response = handle_entrypoint_with_runtime_and_lifecycle(
         LinuxCliCommand::Start {
             config_path: Some("networkcore.toml".to_string()),
+            mitm_plugin_path: None,
             mitm_ca_certificate_path: None,
             mitm_ca_private_key_path: None,
             enable_https_mitm: false,
@@ -7415,6 +7546,7 @@ route_node = "node-1"
     let response = handle_entrypoint_with_runtime_and_lifecycle(
         LinuxCliCommand::Start {
             config_path: Some("networkcore.toml".to_string()),
+            mitm_plugin_path: None,
             mitm_ca_certificate_path: None,
             mitm_ca_private_key_path: None,
             enable_https_mitm: false,
@@ -7495,6 +7627,7 @@ route_node = "node-1"
     let response = handle_entrypoint_with_runtime_and_lifecycle(
         LinuxCliCommand::Start {
             config_path: Some("networkcore.toml".to_string()),
+            mitm_plugin_path: None,
             mitm_ca_certificate_path: None,
             mitm_ca_private_key_path: None,
             enable_https_mitm: false,
@@ -7768,10 +7901,7 @@ fn mitm_status_json_output_contains_machine_fields() {
         .expect("browser blocked operations should be an array")
         .iter()
         .any(|operation| operation.as_str() == Some("install-browser-policy")));
-    assert_eq!(
-        json["mitm_status"]["policy"]["plugin_id"],
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(json["mitm_status"]["policy"]["plugin_id"], "");
     assert_eq!(
         json["mitm_status"]["gates"][0]["gate"],
         MITM_CLI_COMMAND_GATE
@@ -7805,6 +7935,7 @@ fn http_rewrite_json_output_contains_live_plain_http_gate_fields() {
     let headers = vec!["Accept: */*".to_string()];
     let response = handle_mitm_http_rewrite_preview(
         &platform,
+        Some(test_mitm_plugin_path()),
         Some("https://pubads.g.doubleclick.net/pagead/id"),
         "GET",
         "request",
@@ -8036,7 +8167,7 @@ fn browser_capture_json_output_contains_machine_report_fields() {
     );
     assert_eq!(
         json["browser_capture"]["plan"]["manual_launch"]["plugin_id"],
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
+        ""
     );
     assert!(
         json["browser_capture"]["plan"]["manual_launch"]["browser_commands"]
@@ -8214,10 +8345,7 @@ fn browser_capture_launch_json_output_contains_process_report_fields() {
             .any(|arg| arg.as_str()
                 == Some("https://example.com/capture?networkcore_proof_token=browser-proof-123"))
     );
-    assert_eq!(
-        json["browser_capture"]["launch_report"]["plugin_id"],
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(json["browser_capture"]["launch_report"]["plugin_id"], "");
 }
 
 #[test]
@@ -8271,10 +8399,7 @@ fn browser_capture_verify_json_output_contains_endpoint_probe_fields() {
         json["browser_capture"]["verify_report"]["request"]["target_url"],
         "https://example.com/capture"
     );
-    assert_eq!(
-        json["browser_capture"]["verify_report"]["plugin_id"],
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(json["browser_capture"]["verify_report"]["plugin_id"], "");
 }
 
 #[test]
@@ -8348,7 +8473,7 @@ fn browser_capture_traffic_proof_json_output_contains_proof_fields() {
     );
     assert_eq!(
         json["browser_capture"]["traffic_proof_report"]["plugin_id"],
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
+        ""
     );
 }
 
@@ -8471,10 +8596,7 @@ fn browser_capture_session_plan_json_output_contains_session_fields() {
         json["browser_capture"]["session_plan"]["browser_command"]["executable"],
         "chromium"
     );
-    assert_eq!(
-        json["browser_capture"]["session_plan"]["plugin_id"],
-        mitm_policy::MITM_POLICY_AD_BLOCK_PLUGIN_ID
-    );
+    assert_eq!(json["browser_capture"]["session_plan"]["plugin_id"], "");
     assert!(json["browser_capture"]["session_plan"]["required_steps"]
         .as_array()
         .expect("required steps should be an array")
