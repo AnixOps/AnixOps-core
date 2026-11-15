@@ -31,6 +31,12 @@
 //!
 //! UDP datagrams use 1 and 3.
 //!
+//! A route may list `fallbacks`: more relays, tried in order when the ones
+//! before fail to connect (for example Japan, then the US, then Germany).
+//! A relay that failed is skipped for [`EXIT_DOWN`], so later connections do
+//! not wait on it; after that it is tried again and taken back once it
+//! connects. UDP flows take the first relay that is not skipped.
+//!
 //! The router also applies the panel's block rules ([`RulesConfig`], `PUT
 //! /v1/rules`): a connection whose domain matches a blocked domain, or whose
 //! first bytes show a blocked protocol, is refused instead of connected.
@@ -51,7 +57,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{ready, Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use engine_inbound::udp::{UdpOutbound, UdpSession};
 use engine_outbound::{
@@ -75,6 +81,11 @@ pub const RELAY_PROTOCOL_VLESS: &str = "vless";
 /// before it is routed by address (server-first protocols send nothing).
 pub const SNIFF_WAIT: Duration = Duration::from_millis(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long connecting to one relay of a route may take before the next is
+/// tried.
+const EXIT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a relay that failed to connect is skipped.
+pub const EXIT_DOWN: Duration = Duration::from_secs(30);
 const MAX_ROUTES: usize = 256;
 const MAX_DOMAINS: usize = 10_000;
 /// Blocked address ranges a node takes at once.
@@ -102,6 +113,9 @@ pub struct EgressRoute {
     pub domains: Vec<String>,
     /// The exit node's relay.
     pub server: EgressServer,
+    /// Backup relays, tried in order when the ones before fail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<EgressServer>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -210,7 +224,66 @@ impl DomainMatcher {
 struct CompiledRoute {
     id: u64,
     matchers: Vec<DomainMatcher>,
+    /// The server, then the fallbacks.
+    exits: Vec<RouteExit>,
+}
+
+/// One relay of a route.
+struct RouteExit {
     outbound: Arc<dyn TcpOutbound>,
+    /// Until when the relay is skipped after it failed to connect.
+    down_until: Mutex<Option<Instant>>,
+}
+
+impl RouteExit {
+    fn new(outbound: Arc<dyn TcpOutbound>) -> Self {
+        Self {
+            outbound,
+            down_until: Mutex::new(None),
+        }
+    }
+
+    fn is_down(&self, now: Instant) -> bool {
+        self.down_until
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|until| now < until)
+    }
+
+    fn mark(&self, connected: bool) {
+        *self.down_until.lock().unwrap_or_else(|p| p.into_inner()) =
+            (!connected).then(|| Instant::now() + EXIT_DOWN);
+    }
+}
+
+impl CompiledRoute {
+    /// The relays in the order they are tried: those not skipped, then the
+    /// skipped ones, each in the route's order.
+    fn exits(&self) -> impl Iterator<Item = &RouteExit> {
+        let now = Instant::now();
+        let up = self.exits.iter().filter(move |exit| !exit.is_down(now));
+        up.chain(self.exits.iter().filter(move |exit| exit.is_down(now)))
+    }
+
+    async fn connect(&self, target: &TargetAddr) -> io::Result<BoxStream> {
+        let mut last: io::Error = io::ErrorKind::NotConnected.into();
+        for exit in self.exits() {
+            let result = tokio::time::timeout(EXIT_CONNECT_TIMEOUT, exit.outbound.connect(target))
+                .await
+                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
+            exit.mark(result.is_ok());
+            match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
+    /// The relay UDP flows take.
+    fn udp_outbound(&self) -> &Arc<dyn TcpOutbound> {
+        &self.exits().next().expect("a route has a server").outbound
+    }
 }
 
 /// The routes in id order; the first that matches a host wins.
@@ -253,16 +326,18 @@ pub(crate) fn compile(config: &EgressConfig) -> Result<RouteTable, String> {
             .map(|entry| DomainMatcher::parse(entry))
             .collect::<Result<Vec<_>, _>>()
             .map_err(fail)?;
-        let server = &route.server;
-        check_protocol(&server.protocol).map_err(fail)?;
-        if server.host.trim().is_empty() || server.port == 0 {
-            return Err(fail("the server needs a host and a port".into()));
+        let mut exits = Vec::with_capacity(1 + route.fallbacks.len());
+        for server in std::iter::once(&route.server).chain(&route.fallbacks) {
+            check_protocol(&server.protocol).map_err(fail)?;
+            if server.host.trim().is_empty() || server.port == 0 {
+                return Err(fail("the server needs a host and a port".into()));
+            }
+            exits.push(RouteExit::new(route_outbound(server).map_err(fail)?));
         }
-        let outbound = route_outbound(server).map_err(fail)?;
         routes.push(CompiledRoute {
             id: route.id,
             matchers,
-            outbound,
+            exits,
         });
     }
     routes.sort_by_key(|route| route.id);
@@ -530,7 +605,7 @@ impl Router {
         }
         let table = self.egress.table();
         match host.and_then(|host| table.find(host)) {
-            Some(route) => route.outbound.connect(target).await,
+            Some(route) => route.connect(target).await,
             None => self.base.connect(target).await,
         }
     }
@@ -800,7 +875,7 @@ impl UdpSession for RoutedUdp {
             }
             match host.as_deref().and_then(|host| table.find(host)) {
                 Some(route) => {
-                    let send = self.flow(&route.outbound, target).await?;
+                    let send = self.flow(route.udp_outbound(), target).await?;
                     let mut send = send.lock().await;
                     send.send(payload).await
                 }

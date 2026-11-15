@@ -162,6 +162,43 @@ async fn routes_domains_through_the_exit_relay() {
         .is_err());
 }
 
+/// A route with fallbacks: its first relay is down, so the connection goes
+/// through the next one, and later ones skip the dead relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fails_over_to_the_next_relay() {
+    let target = echo_server().await;
+    let (exit, source) = (start_api().await, start_api().await);
+    // Bound but not listening, so no parallel test takes the port.
+    let dead = tokio::net::TcpSocket::new_v4().unwrap();
+    dead.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (dead_port, relay_port) = (dead.local_addr().unwrap().port(), free_port());
+    let relay = json!({"id": 3, "port": relay_port, "method": "2022-blake3-aes-128-gcm", "password": RELAY_KEY});
+    let (status, body) = call(exit, "PUT", "/v1/egress", Some(json!({"relays": [relay]}))).await;
+    assert_eq!(status, 200, "{body}");
+
+    let server = |port: u16| {
+        json!({"host": "127.0.0.1", "port": port,
+        "method": "2022-blake3-aes-128-gcm", "password": RELAY_KEY})
+    };
+    let route = json!({"routes": [{"id": 3, "domains": ["localhost"],
+        "server": server(dead_port), "fallbacks": [server(relay_port)]}]});
+    let (status, body) = call(source, "PUT", "/v1/egress", Some(route)).await;
+    assert_eq!(status, 200, "{body}");
+    let inbound = json!({
+        "tag": "ss", "type": "shadowsocks", "listen": "127.0.0.1", "listen_port": 0,
+        "method": "2022-blake3-aes-128-gcm", "password": SERVER_KEY,
+        "users": [{"name": "1001", "password": USER_KEY}]
+    });
+    let (status, body) = call(source, "POST", "/v1/inbounds", Some(inbound)).await;
+    assert_eq!(status, 201, "{body}");
+    let inbound: SocketAddr = body["listen"].as_str().unwrap().parse().unwrap();
+
+    let named = TargetAddr::Domain("localhost".into(), target.port());
+    round_trip(inbound, named.clone(), b"first").await;
+    round_trip(inbound, named, b"second").await;
+    assert_eq!(relay_accepted(exit).await, 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relay_on_a_taken_port_fails_alone() {
     let api = start_api().await;
