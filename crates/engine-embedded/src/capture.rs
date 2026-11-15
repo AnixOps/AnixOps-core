@@ -2131,10 +2131,11 @@ mod tests {
             inner.connections[&7].http[index].memory()
         };
         assert_eq!(store.status().used_bytes, used + expected);
-        assert_eq!(
-            lock(&store.inner).connections[&7].memory,
-            lock(&store.inner).connections[&7].memory_estimate()
-        );
+        // One lock at a time: a second `lock` in the same statement would
+        // wait for the first guard forever.
+        let inner = lock(&store.inner);
+        let captured = &inner.connections[&7];
+        assert_eq!(captured.memory, captured.memory_estimate());
     }
 
     #[test]
