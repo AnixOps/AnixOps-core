@@ -980,10 +980,8 @@ async fn capture_keeps_decrypted_http_under_the_origin_connection() {
     let mut capture = serde_json::Value::Null;
     for _ in 0..100 {
         capture = control_json(&dispatcher, &request)["capture"].clone();
-        if capture["http"]
-            .as_array()
-            .is_some_and(|http| !http.is_empty())
-        {
+        // Filed as the request arrives, finished once answered.
+        if capture["http"][0]["state"] == "done" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1085,5 +1083,169 @@ async fn capture_keeps_decrypted_http_under_the_origin_connection() {
     );
     assert_eq!(deleted["deleted"], true);
     let _ = std::fs::remove_dir_all(&dir);
+    server.abort();
+}
+
+/// A plain HTTP origin that answers with a chunked event stream: two events
+/// at once (the first split across chunks), a third and the end once
+/// `release` is notified.
+struct EventOrigin {
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl TcpOutbound for EventOrigin {
+    fn protocol(&self) -> &'static str {
+        "test-event-origin"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move {
+            let (near, mut far) = tokio::io::duplex(64 * 1024);
+            let release = self.release.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = far.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let chunked = |data: &str| format!("{:x}\r\n{data}\r\n", data.len());
+                let mut first = String::from(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                );
+                first.push_str(&chunked(": hello\n\nevent: tick\ndata: origin o"));
+                first.push_str(&chunked("ne\n\nid: 7\r\ndata: origin two\r\n\r\n"));
+                far.write_all(first.as_bytes()).await.unwrap();
+                release.notified().await;
+                let rest = format!("{}0\r\n\r\n", chunked("data: origin three\n\n"));
+                far.write_all(rest.as_bytes()).await.unwrap();
+                // Hold the connection until the engine lets go.
+                let _ = far.read(&mut chunk).await;
+            });
+            Ok(Box::new(near) as BoxStream)
+        })
+    }
+}
+
+/// Reads from `stream` until what came holds `needle`.
+async fn read_until(stream: &mut (impl AsyncReadExt + Unpin), seen: &mut Vec<u8>, needle: &[u8]) {
+    let mut chunk = [0u8; 4096];
+    while !seen.windows(needle.len()).any(|w| w == needle) {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
+            .await
+            .expect("read in time")
+            .unwrap();
+        assert!(n > 0, "closed before {:?}", String::from_utf8_lossy(needle));
+        seen.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Polls `capture_requests` by `since_rev` until `done` accepts a row.
+async fn wait_for_row(
+    dispatcher: &Dispatcher,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let mut rows = serde_json::Value::Null;
+    for _ in 0..200 {
+        rows = control_json(dispatcher, r#"{"cmd":"capture_requests","since_rev":0}"#);
+        if let Some(row) = rows["requests"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| done(row)))
+        {
+            return row.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no matching row: {rows}");
+}
+
+#[tokio::test]
+async fn event_streams_relay_live_and_capture_their_events() {
+    let device_root = root("NetworkCore Test Device Root");
+    let mut config = mitm_config(&device_root);
+    // A body rule matches the stream, but a stream is not held to rewrite.
+    config.plugins.push(
+        "#!name = Body\n[Body Rewrite]\nhttp-response ^http://plain\\.example\\.test/ origin edited\n"
+            .to_string(),
+    );
+    let engine = Arc::new(MitmEngine::new(&config).unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::single(Arc::new(EventOrigin {
+        release: release.clone(),
+    })));
+    control_json(&dispatcher, r#"{"cmd":"set_capture","enabled":true}"#);
+
+    let target: SocketAddr = "192.0.2.22:80".parse().unwrap();
+    let first = b"GET /events HTTP/1.1\r\nHost: plain.example.test\r\n\r\n".to_vec();
+    let host = engine.claim(&first, target).unwrap();
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let dispatcher = dispatcher.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    dispatcher.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    // The first events reach the app while the stream is still open.
+    let mut seen = Vec::new();
+    read_until(&mut app, &mut seen, b"origin two\r\n\r\n").await;
+    let text = String::from_utf8_lossy(&seen).into_owned();
+    assert!(text.contains("text/event-stream"), "{text}");
+    assert!(!text.contains("edited"), "not rewritten: {text}");
+
+    let row = wait_for_row(&dispatcher, |row| row["message_count"] == 2).await;
+    assert_eq!(row["state"], "in_progress", "{row}");
+    assert_eq!(row["seq"], 0);
+    assert_eq!(row["status"], 200);
+    assert_eq!(row["note"], "streaming");
+    assert_eq!(row["rules_skipped"], true);
+    let (id, index) = (row["connection_id"].clone(), row["index"].clone());
+
+    let detail = control_json(
+        &dispatcher,
+        &format!(r#"{{"cmd":"capture_exchange","id":{id},"index":{index},"since_message":1}}"#),
+    );
+    let exchange = &detail["exchange"];
+    assert_eq!(exchange["messages"]["seen"], 2, "{detail}");
+    let kept = exchange["messages"]["kept"].as_array().unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0]["index"], 1);
+    assert_eq!(kept[0]["kind"], "sse");
+    assert_eq!(kept[0]["id"], "7");
+    assert_eq!(kept[0]["text"], "origin two");
+    let all = control_json(
+        &dispatcher,
+        &format!(r#"{{"cmd":"capture_exchange","id":{id},"index":{index}}}"#),
+    );
+    let first_event = &all["exchange"]["messages"]["kept"][0];
+    assert_eq!(first_event["label"], "tick", "{all}");
+    assert_eq!(first_event["text"], "origin one");
+
+    release.notify_one();
+    read_until(&mut app, &mut seen, b"0\r\n\r\n").await;
+    let row = wait_for_row(&dispatcher, |row| row["state"] == "done").await;
+    assert_eq!(row["message_count"], 3, "{row}");
+    assert!(row["seq"].as_u64().unwrap() > 0);
+    // Listed once by `since_seq`, finished.
+    let rows = control_json(&dispatcher, r#"{"cmd":"capture_requests"}"#);
+    assert_eq!(rows["requests"].as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows["requests"][0]["state"], "done");
     server.abort();
 }

@@ -26,6 +26,7 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_L
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 
+use super::stream::{MessageKind, Messages, StreamMessage};
 use super::{Captured, CapturedBody, Chunk, Direction, HttpExchange, Inner, HTTP_1_1, HTTP_2};
 use crate::connections::Network;
 
@@ -369,6 +370,21 @@ fn saved_at(id: &str) -> Option<u64> {
 
 // Binary layout of the connections part: integers big-endian, strings and
 // byte strings as a u32 length and the bytes, options as a 0/1 byte first.
+// Each connection ends with its extensions: a u16 count, then per
+// extension a u16 tag and its bytes; a reader skips tags it does not know.
+// Tag 1 is the stream state of one exchange (see `stream_extension`).
+
+/// Extension tag: an exchange's `rules_skipped` and stream messages.
+const EXT_STREAM: u16 = 1;
+
+const MESSAGE_KINDS: [MessageKind; 6] = [
+    MessageKind::Sse,
+    MessageKind::Text,
+    MessageKind::Binary,
+    MessageKind::Ping,
+    MessageKind::Pong,
+    MessageKind::Close,
+];
 
 struct Writer(Vec<u8>);
 
@@ -538,9 +554,91 @@ fn encode(inner: &Inner) -> Vec<u8> {
             out.body(&exchange.response_body);
             out.opt_str(exchange.note);
         }
-        out.u16(0);
+        let streams = captured
+            .http
+            .iter()
+            .enumerate()
+            .filter(|(_, exchange)| exchange.rules_skipped || !exchange.messages.is_empty())
+            .collect::<Vec<_>>();
+        out.u16(u16::try_from(streams.len()).unwrap_or(u16::MAX));
+        for (index, exchange) in streams.into_iter().take(usize::from(u16::MAX)) {
+            out.u16(EXT_STREAM);
+            out.bytes(&stream_extension(index, exchange));
+        }
     }
     out.0
+}
+
+/// Extension [`EXT_STREAM`]: the exchange's index, `rules_skipped`, the
+/// message counters and the kept messages.
+fn stream_extension(index: usize, exchange: &HttpExchange) -> Vec<u8> {
+    let messages = &exchange.messages;
+    let mut out = Writer(Vec::with_capacity(32 + messages.memory()));
+    out.u64(index as u64);
+    out.u8(u8::from(exchange.rules_skipped));
+    out.u64(messages.seen);
+    out.u64(messages.dropped);
+    out.u64(messages.kept.len() as u64);
+    for message in &messages.kept {
+        out.u64(message.index);
+        out.u64(message.at_ms);
+        out.u8(u8::from(message.direction == Direction::Down));
+        let kind = MESSAGE_KINDS.iter().position(|kind| *kind == message.kind);
+        out.u8(kind.unwrap_or(0) as u8);
+        out.opt_str(message.label.as_deref());
+        out.opt_str(message.id.as_deref());
+        out.opt_u64(message.code.map(u64::from));
+        out.u64(message.size);
+        out.bytes(&message.data);
+    }
+    out.0
+}
+
+/// Reads an [`EXT_STREAM`] extension into `http`.
+fn read_stream_extension(data: &[u8], http: &mut [HttpExchange]) -> Option<()> {
+    let mut input = Reader(data);
+    let index = usize::try_from(input.u64()?).ok()?;
+    let rules_skipped = input.u8()? != 0;
+    let seen = input.u64()?;
+    let dropped = input.u64()?;
+    let count = input.count(33)?;
+    let mut kept = std::collections::VecDeque::with_capacity(count);
+    for _ in 0..count {
+        let index = input.u64()?;
+        let at_ms = input.u64()?;
+        let direction = if input.u8()? == 1 {
+            Direction::Down
+        } else {
+            Direction::Up
+        };
+        let kind = *MESSAGE_KINDS.get(usize::from(input.u8()?))?;
+        let label = input.opt_string()?;
+        let id = input.opt_string()?;
+        let code = match input.opt_u64()? {
+            Some(code) => Some(u16::try_from(code).ok()?),
+            None => None,
+        };
+        let size = input.u64()?;
+        let data = input.bytes()?.to_vec();
+        kept.push_back(StreamMessage {
+            index,
+            at_ms,
+            direction,
+            kind,
+            label,
+            id,
+            code,
+            data,
+            size,
+        });
+    }
+    if !input.0.is_empty() {
+        return None;
+    }
+    let exchange = http.get_mut(index)?;
+    exchange.rules_skipped = rules_skipped;
+    exchange.messages = Messages::restore(kept, seen, dropped);
+    Some(())
 }
 
 fn decode(data: &[u8]) -> Option<Vec<(u64, Captured)>> {
@@ -611,10 +709,15 @@ fn decode(data: &[u8]) -> Option<Vec<(u64, Captured)>> {
                 response_headers,
                 response_body,
                 note,
+                ..HttpExchange::default()
             });
         }
-        if input.u16()? != 0 {
-            return None;
+        for _ in 0..input.u16()? {
+            let tag = input.u16()?;
+            let data = input.bytes()?;
+            if tag == EXT_STREAM {
+                read_stream_extension(data, &mut http)?;
+            }
         }
         let mut captured = Captured {
             network,
@@ -663,7 +766,30 @@ mod tests {
         exchange.status = Some(200);
         exchange.response_body = CapturedBody::of(b"secret payload");
         exchange.note = Some("streaming");
-        store.add_exchange(2, exchange);
+        exchange.rules_skipped = true;
+        let index = store.open_exchange(2, exchange).unwrap();
+        for (i, kind) in MESSAGE_KINDS.into_iter().enumerate() {
+            store.push_message(
+                2,
+                index,
+                StreamMessage {
+                    index: 0,
+                    at_ms: 10 + i as u64,
+                    direction: if i % 2 == 0 {
+                        Direction::Down
+                    } else {
+                        Direction::Up
+                    },
+                    kind,
+                    label: (i == 0).then(|| "update".to_string()),
+                    id: (i == 0).then(|| "42".to_string()),
+                    code: (kind == MessageKind::Close).then_some(1000),
+                    data: format!("message {i}").into_bytes(),
+                    size: 9 + i as u64,
+                },
+            );
+        }
+        store.finish_exchange(2, index, None);
         store
     }
 
@@ -701,6 +827,14 @@ mod tests {
         assert_eq!(tcp.http[0].http_version, HTTP_2);
         assert_eq!(tcp.http[0].note, Some("streaming"));
         assert_eq!(tcp.http[0].response_body.data, b"secret payload");
+        assert!(tcp.http[0].rules_skipped);
+        let saved = {
+            let inner = super::super::lock(&store.inner);
+            inner.connections[&2].http[0].messages.clone()
+        };
+        assert_eq!(saved.seen, MESSAGE_KINDS.len() as u64);
+        assert_eq!(tcp.http[0].messages, saved);
+        assert_eq!(tcp.memory, tcp.memory_estimate());
         assert_eq!(loaded[0].1.chunks[0].data, b"query");
 
         // Another key reads nothing.

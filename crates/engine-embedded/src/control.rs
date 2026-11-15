@@ -39,7 +39,8 @@
 //! | `capture_sessions` | | `{"sessions": [...]}`, newest first; a session this key cannot open has `"unreadable": true` |
 //! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off |
 //! | `delete_capture` | `session` | `{"deleted": bool}` |
-//! | `capture_requests` | optional `since_seq`, `limit`, `filter` | `{"requests": [...], "last_seq", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange |
+//! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter` | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`) |
+//! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events) from `since_message` on |
 //! | `pro_status` | | [`crate::pro::ProStatus`] |
 //! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
 //!
@@ -162,6 +163,12 @@ enum ControlRequest {
     CaptureConnection {
         id: u64,
     },
+    CaptureExchange {
+        id: u64,
+        index: usize,
+        #[serde(default)]
+        since_message: u64,
+    },
     ExportCapture {
         format: ExportFormat,
         #[serde(default)]
@@ -193,6 +200,8 @@ enum ControlRequest {
     CaptureRequests {
         #[serde(default)]
         since_seq: u64,
+        #[serde(default)]
+        since_rev: Option<u64>,
         #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
@@ -403,6 +412,13 @@ pub fn handle_with_interceptor(
         ControlRequest::CaptureConnection { id } => {
             Ok(json!({ "capture": tracker.capture().connection_json(id) }))
         }
+        ControlRequest::CaptureExchange {
+            id,
+            index,
+            since_message,
+        } => Ok(json!({
+            "exchange": tracker.capture().exchange_json(id, index, since_message),
+        })),
         ControlRequest::ExportCapture {
             format,
             id,
@@ -452,10 +468,13 @@ pub fn handle_with_interceptor(
         }
         ControlRequest::CaptureRequests {
             since_seq,
+            since_rev,
             limit,
             filter,
         } => match Filter::parse(&filter) {
-            Ok(filter) => Ok(tracker.capture().requests_json(since_seq, limit, &filter)),
+            Ok(filter) => Ok(tracker
+                .capture()
+                .requests_json(since_seq, since_rev, limit, &filter)),
             Err(error) => Ok(json!({
                 "error": { "code": "invalid_filter", "at": error.at },
             })),
