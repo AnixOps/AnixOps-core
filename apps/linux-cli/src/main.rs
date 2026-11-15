@@ -9,6 +9,7 @@ fn main() {
             let reader = networkcore_linux::FsConfigReader;
             let lifecycle_host = networkcore_linux::CurrentProcessForegroundLifecycleHost::new();
             let response = if let networkcore_linux::LinuxCliCommand::Start {
+                mitm_plugin_path,
                 mitm_ca_certificate_path,
                 mitm_ca_private_key_path,
                 enable_https_mitm,
@@ -21,8 +22,9 @@ fn main() {
                 ..
             } = &command
             {
-                match networkcore_linux::native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+                match networkcore_linux::native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
                     networkcore_linux::LinuxNativeMitmRuntimeFileConfig {
+                        plugin_path: mitm_plugin_path.as_deref(),
                         certificate_path: mitm_ca_certificate_path.as_deref(),
                         private_key_path: mitm_ca_private_key_path.as_deref(),
                         enable_https_mitm: *enable_https_mitm,

@@ -16,7 +16,8 @@ version `0.45.10`.
   retained in `PluginInstance`, and `mitm_anixops` URL reject/redirect, header
   mutation, body mutation, and script dispatch results map to
   `control-domain` `HttpMitmOutcome` plans.
-- A built-in alpha ad-block plugin package, `networkcore.adblock`.
+- `user_plugin_package`, which wraps plugin text the user brought. No plugin is
+  built in ([docs/no-presets.md](../../docs/no-presets.md)).
 - `ManagedSdwanMitmPolicyGate`, a pure fail-closed admission boundary for an
   opaque immutable verifier-produced Plan B client delivery envelope. It
   snapshots only the linked C core, validates the released V1 capability query,

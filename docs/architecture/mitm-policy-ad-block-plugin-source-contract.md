@@ -1,5 +1,7 @@
 # MITM Policy Ad Block Plugin Source Contract
 
+> 已废止（2026-11-15）：公开版不再内置任何 MITM 插件，`networkcore.adblock` 和相关函数已删除，`networkcore-linux` 改为用 `--mitm-plugin <path>` 加载用户自己的插件。见 [公开版不带预设规则和插件](../no-presets.md)。下文仅作历史记录。
+
 ## Purpose
 
 This contract fixes the first NetworkCore-owned MITM policy plugin over the

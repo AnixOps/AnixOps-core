@@ -13,7 +13,7 @@ use engine_native::{
     NativeHttpMitmPluginHook,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response};
-use mitm_policy::{builtin_ad_block_plugin_package, AnixOpsMitmPluginService};
+use mitm_policy::{user_plugin_package, AnixOpsMitmPluginService};
 use std::future::Future;
 use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
@@ -207,10 +207,24 @@ fn connect_request() -> engine_native::NativeExplicitHttpProxyRequest {
         .expect("fuzz CONNECT request should parse")
 }
 
+/// A user-style plugin for the fuzz targets; NetworkCore ships none of its own.
+const FUZZ_PLUGIN: &str = concat!(
+    "[Plugin]\n",
+    "name = Fuzz Reject Policy\n",
+    "\n",
+    "[URL Rewrite]\n",
+    "^https?://.*doubleclick\\.net/ reject\n",
+    "^https?://.*googlesyndication\\.com/ reject\n",
+    "\n",
+    "[MITM]\n",
+    "enable = true\n",
+    "hostname = %APPEND% *.doubleclick.net, *.googlesyndication.com\n",
+);
+
 fn policy_hook() -> NativeHttpMitmPluginHook {
     static HOOK: OnceLock<NativeHttpMitmPluginHook> = OnceLock::new();
     HOOK.get_or_init(|| {
-        let package = builtin_ad_block_plugin_package();
+        let package = user_plugin_package(FUZZ_PLUGIN);
         let service = AnixOpsMitmPluginService::new();
         let instance = service
             .load(
@@ -219,7 +233,7 @@ fn policy_hook() -> NativeHttpMitmPluginHook {
                     permissions: package.manifest.permissions.clone(),
                 },
             )
-            .expect("built-in ad block plugin should load");
+            .expect("the fuzz plugin should load");
         NativeHttpMitmPluginHook::new(instance, Arc::new(service))
     })
     .clone()

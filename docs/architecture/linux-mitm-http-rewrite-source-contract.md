@@ -179,8 +179,8 @@ GitHub Actions 完整 E2E/security 验证前仍保持 `tls-decryption-blocked`�
 - `read_https_connect_http_request`
 - `NativeProxyEngineService::with_tls_mitm_ca_material`
 - `NativeHttpMitmPluginHook::with_node_script_executor`
-- `native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files`
-- `native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files`
+- `native_proxy_engine_service_with_mitm_plugin_and_runtime_files`
+- `native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files`
 - `plan_and_apply_https_request_rewrite_preview`
 - `plan_and_apply_https_response_rewrite_preview`
 - `write_http_connect_established_response`
