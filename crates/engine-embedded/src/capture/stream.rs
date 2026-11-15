@@ -163,8 +163,9 @@ impl Messages {
 #[derive(Debug, Default)]
 pub struct SseParser {
     line: Vec<u8>,
-    /// The current line ran past [`MAX_SSE_LINE`]; the rest is skipped.
-    line_cut: bool,
+    /// Bytes of the current line past [`MAX_SSE_LINE`], skipped but
+    /// counted in the event's size.
+    line_skipped: u64,
     /// The last byte was CR, so an LF right after it ends nothing more.
     after_cr: bool,
     /// Whether the stream's first bytes (a BOM) were looked at.
@@ -200,7 +201,7 @@ impl SseParser {
                     if self.line.len() < MAX_SSE_LINE {
                         self.line.push(byte);
                     } else {
-                        self.line_cut = true;
+                        self.line_skipped += 1;
                     }
                 }
             }
@@ -210,7 +211,7 @@ impl SseParser {
 
     fn end_line(&mut self, at_ms: u64) -> Option<StreamMessage> {
         let line = std::mem::take(&mut self.line);
-        let cut = std::mem::take(&mut self.line_cut);
+        let skipped = std::mem::take(&mut self.line_skipped);
         if line.is_empty() {
             return self.dispatch(at_ms);
         }
@@ -230,7 +231,7 @@ impl SseParser {
                     self.append_data(b"\n", 1);
                 }
                 self.has_data = true;
-                let size = value.len() as u64 + if cut { 1 } else { 0 };
+                let size = value.len() as u64 + skipped;
                 self.append_data(value, size);
             }
             b"event" => self.event = Some(String::from_utf8_lossy(value).into_owned()),
@@ -337,7 +338,8 @@ mod tests {
         }
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data.len(), MAX_MESSAGE_BYTES);
-        assert!(events[0].size > 1024 * 1024);
+        // The whole first line, the joining LF and "tail".
+        assert_eq!(events[0].size, 1024 * 1024 + 1 + 4);
         assert!(parser.line.capacity() <= MAX_SSE_LINE * 2);
     }
 
