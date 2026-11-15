@@ -54,6 +54,7 @@
 ## MITM 与插件
 
 - [mitm_anixops Adapter Design](architecture/mitm-anixops-adapter.md)
+- [MITM 高级协议：HTTP/3、解压、流式、WebSocket、HTTP/2 帧](architecture/mitm-advanced-protocols.md)：现状、排期、门槛与待拍板项
 - [MITM Policy Ad Block Plugin Source Contract](architecture/mitm-policy-ad-block-plugin-source-contract.md)
 - [Managed SD-WAN MITM Policy Gate Source Contract](architecture/managed-sdwan-mitm-policy-gate-source-contract.md)
 - [Third-Party Plugin Onboarding Process](architecture/third-party-plugin-onboarding-process.md)
