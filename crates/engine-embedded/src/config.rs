@@ -1033,6 +1033,14 @@ fn build_single_outbound(
             "this protocol opens its own sockets and cannot run through a via",
         ));
     }
+    if outbound.via.is_some()
+        && outbound.kind == crate::direct::PROTOCOL
+        && outbound.settings.contains_key("interface")
+    {
+        return Err(rejected(
+            "a direct outbound bound to an interface cannot run through a via",
+        ));
+    }
     let built = registry
         .build(&outbound.kind, &outbound.settings, dialer)
         .map_err(rejected)?;

@@ -140,4 +140,8 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 
 防重试风暴：同一主机（域名，没有域名时为地址）30 秒内被普通 `REJECT` 拒绝超过 10 次，之后的拒绝按 `REJECT-DROP` 应答，直到该主机最近 30 秒内的拒绝不超过 10 次；被升级的拒绝本身也计数，持续猛打的客户端会一直被静默。`REJECT-NO-DROP` 永不升级。计数只针对用户流量（包隧道、本地代理、解密连接的路由），DNS 服务器路由和状态查询不计。最多跟踪 1024 个主机，满时先清掉 30 秒内没有被拒的主机，再清最早被拒的。连接列表的 `outbound`/`chain` 显示实际应答（风暴中为 `REJECT-DROP`），`error` 仍为 `rejected`。
 
+## 绑定网卡的直连
+
+直连出站可以写 `{"type":"direct","interface":"<名称>"}`（对齐 Surge `direct, interface=...`），把公司 VPN 或某块网卡专用的流量钉在那块网卡上，例如 `DOMAIN-SUFFIX,corp.example,CorpVPN`，`CorpVPN` 为绑定 `utun4` 的直连节点。名称在 Linux/Android 是网卡名（`wg0`，最长 15 字节，`SO_BINDTODEVICE`），macOS/iOS 是 BSD 名（`utun4`、`en0`，`IP_BOUND_IF`/`IPV6_BOUND_IF`），Windows 是“网络连接”里的适配器名（`IP_UNICAST_IF`/`IPV6_UNICAST_IF`）。网卡在每个连接时查找：VPN 后起也能立刻用上；网卡不存在时连接失败（`NotFound`，本地代理回 502 / SOCKS5 一般失败），绝不改走默认网卡。域名用系统解析器解析后逐个地址尝试。这类出站不经过进程级的 socket 保护（绑定的网卡取代了它），也不能再套 `via`。
+
 后续工作：Windows MITM 导入路径接入路由；engine-embedded 的 FakeIP、UDP/QUIC 嗅探与桌面进程名查询。

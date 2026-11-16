@@ -313,3 +313,42 @@ fn src_ip_and_in_port_rules_apply_to_local_proxy_connections() {
     let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
     assert_eq!(reply, 0x00, "another listener port passes");
 }
+
+#[test]
+fn a_direct_outbound_bound_to_an_interface_uses_only_that_interface() {
+    let echo = echo_server();
+    let start = |interface: &str| {
+        let config = format!(
+            r#"{{"schema_version":1,"profile_id":"bound","routing":{{"outbounds":{{"corp":{{"type":"direct","interface":"{interface}"}}}},"rules":["FINAL,corp"]}}}}"#
+        );
+        LocalProxy::start(config.as_bytes(), loopback(), MixedSettings::default())
+    };
+
+    // An interface that does not exist: the flow fails instead of leaving
+    // through the default route.
+    let proxy = start("anixops-none0").unwrap();
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x01);
+
+    // A name that cannot be an interface is refused with the config.
+    let error = start("bad\\nname").err().expect("config must be refused");
+    assert_eq!(error.code, RuntimeErrorCode::ConfigRejected);
+
+    // Loopback exists, so a flow to a loopback server goes through it.
+    let loopback_interface = if cfg!(target_os = "linux") {
+        Some("lo")
+    } else if cfg!(target_os = "macos") {
+        Some("lo0")
+    } else {
+        None
+    };
+    if let Some(name) = loopback_interface {
+        let proxy = start(name).unwrap();
+        let (mut stream, reply) = socks_connect(proxy.local_addr(), echo);
+        assert_eq!(reply, 0x00);
+        stream.write_all(b"bound").unwrap();
+        let mut echoed = [0u8; 5];
+        stream.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"bound");
+    }
+}

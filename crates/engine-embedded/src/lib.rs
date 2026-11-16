@@ -51,6 +51,7 @@ pub mod fake_ip;
 #[cfg(feature = "local-proxy")]
 pub mod fetch;
 pub mod ffi;
+pub mod interface;
 #[cfg(any(feature = "local-proxy", feature = "dns-tls"))]
 pub mod http1;
 pub(crate) mod icmp;

@@ -6,6 +6,7 @@
 
 ### Added
 
+- 绑定网卡的直连（对齐 Surge `direct, interface=...`，公司 VPN 场景）：`{"type":"direct","interface":"<名称>"}` 让该直连出站的每个连接只从指定网卡出去（Linux/Android `SO_BINDTODEVICE`，macOS/iOS `IP_BOUND_IF`/`IPV6_BOUND_IF`，Windows 按适配器别名 `IP_UNICAST_IF`/`IPV6_UNICAST_IF`）。网卡每次连接时查找，VPN 后起也能用上；网卡不存在时连接失败（`NotFound`），绝不改走其他网卡。域名用系统解析器解析。此类出站不能再套 `via`。新增 `engine_embedded::interface`。
 - `SRC-IP`（别名 `SRC-IP-CIDR`）与 `IN-PORT` 分流规则：`SRC-IP` 按发起连接的客户端/应用地址（地址或网段）匹配，`IN-PORT` 按客户端连上的本地监听端口匹配（包隧道不命中）；也可用在逻辑规则、`redirects` 与订阅导入里。`RouteQuery` 新增 `source`、`in_port`；`Dispatcher` 新增 `connect_origin_flow`、`open_origin_udp_flow`、`with_origin_request` 与 `FlowOrigin`，`RoutedOutbound::route_network_flow` 多一个 `FlowSource` 参数。
 - REJECT 系列分流策略（对齐 Surge）：规则目标新增 `REJECT-NO-DROP`、`REJECT-DROP`、`REJECT-TINYGIF`（Loon `REJECT-IMG` 同义），订阅与插件导入不再把它们并成 `REJECT`。`REJECT-DROP` 不回应（包隧道 TCP 保持到应用关闭或 60 秒，同时最多占 `max_tcp_connections` 的 1/8；UDP 不回 ICMP；本地代理不回复），`REJECT-TINYGIF` 对明文 HTTP 请求和 HTTPS 解密后的请求回 1x1 GIF。防重试风暴：同一主机 30 秒内被 `REJECT` 拒绝超过 10 次后按 `REJECT-DROP` 应答，`REJECT-NO-DROP` 不升级。`config_core::routing::PolicyTarget::Reject` 与 `RouteOutcome::Reject` 改为带 `RejectKind`；`RouteInfo` 新增不序列化的 `reject` 字段；新增 `engine_outbound::reject`（`rejected`/`rejection`/`hold`/`tiny_gif_response`）与 `engine_embedded::reject`。
 - 分流（`egress`）故障转移：`PUT /v1/egress` 的路由新增可选的 `fallbacks`（与 `server` 同结构的中转出口列表）。连接按 `server`、`fallbacks` 顺序尝试，每个出口连接限时 3 秒，失败即换下一个；失败的出口跳过 30 秒（`EXIT_DOWN`），到期后重新尝试、连上即恢复。全部被跳过时仍按顺序逐个尝试。UDP 流走第一个未被跳过的出口。没有 `fallbacks` 的路由行为不变（只多了 3 秒的出口连接限时）。
