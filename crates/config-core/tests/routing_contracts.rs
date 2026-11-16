@@ -239,7 +239,7 @@ fn parses_rule_lines() {
         ("DOMAIN,example.com", ROUTING_RULE_LINE_INVALID_CODE),
         ("FINAL", ROUTING_RULE_LINE_INVALID_CODE),
         ("FINAL,Proxy,extra", ROUTING_RULE_LINE_INVALID_CODE),
-        ("IN-PORT,6152,DIRECT", ROUTING_RULE_TYPE_UNSUPPORTED_CODE),
+        ("SUBNET,SSID:Home,DIRECT", ROUTING_RULE_TYPE_UNSUPPORTED_CODE),
         (
             "DOMAIN,exa mple.com,DIRECT",
             ROUTING_RULE_VALUE_INVALID_CODE,
@@ -754,7 +754,7 @@ fn malformed_logical_and_port_rules_are_rejected() {
         "AND,((DOMAIN,a.com)(DOMAIN,b.com)),DIRECT",
         "AND,((DOMAIN,a.com,DIRECT)),DIRECT",
         "AND,((DOMAIN)),DIRECT",
-        "AND,((IN-PORT,6152)),DIRECT",
+        "AND,((SUBNET,SSID:Home)),DIRECT",
         "DST-PORT,99999,DIRECT",
         "DST-PORT,500-400,DIRECT",
         "GEOSITE,bad category,DIRECT",
