@@ -239,7 +239,10 @@ fn parses_rule_lines() {
         ("DOMAIN,example.com", ROUTING_RULE_LINE_INVALID_CODE),
         ("FINAL", ROUTING_RULE_LINE_INVALID_CODE),
         ("FINAL,Proxy,extra", ROUTING_RULE_LINE_INVALID_CODE),
-        ("SUBNET,SSID:Home,DIRECT", ROUTING_RULE_TYPE_UNSUPPORTED_CODE),
+        (
+            "SUBNET,SSID:Home,DIRECT",
+            ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
+        ),
         (
             "DOMAIN,exa mple.com,DIRECT",
             ROUTING_RULE_VALUE_INVALID_CODE,
