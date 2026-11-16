@@ -867,6 +867,7 @@ dependencies = [
  "ring",
  "rustls",
  "ruzstd",
+ "script-runtime",
  "serde",
  "serde_json",
  "time",

@@ -149,12 +149,13 @@ pub fn parse_redirect_line(line: &str) -> DomainResult<RedirectRule> {
 
 fn check_matcher(matcher: &RuleMatcher) -> DomainResult<()> {
     match matcher {
-        RuleMatcher::GeoIp(_) | RuleMatcher::GeoSite(_) | RuleMatcher::RuleSet(_) => {
-            Err(DomainError::new(
-                REDIRECT_MATCHER_UNSUPPORTED_CODE,
-                "GEOIP, GEOSITE and RULE-SET cannot select a redirect",
-            ))
-        }
+        RuleMatcher::GeoIp(_)
+        | RuleMatcher::GeoSite(_)
+        | RuleMatcher::RuleSet(_)
+        | RuleMatcher::Script(_) => Err(DomainError::new(
+            REDIRECT_MATCHER_UNSUPPORTED_CODE,
+            "GEOIP, GEOSITE, RULE-SET and SCRIPT cannot select a redirect",
+        )),
         RuleMatcher::And(rules) | RuleMatcher::Or(rules) => {
             rules.iter().try_for_each(check_matcher)
         }

@@ -99,6 +99,7 @@ fn resolution_snapshot(resolution: &RouteResolution) -> Value {
         "matched": match resolution.matched {
             RouteMatch::Rule(index) => format!("rule:{index}"),
             RouteMatch::ResolveFailed(index) => format!("resolve_failed:{index}"),
+            RouteMatch::ScriptPending(index) => format!("script_pending:{index}"),
             RouteMatch::Final => "final".to_string(),
         },
         "target": resolution.target.name(),
@@ -1104,6 +1105,104 @@ fn src_ip_and_in_port_rules_match_where_a_flow_came_from() {
     assert_eq!(
         model_error(&spec(
             &["IN-PORT,7890,DIRECT,no-resolve", "FINAL,DIRECT"],
+            vec![]
+        )),
+        ROUTING_RULE_OPTION_UNSUPPORTED_CODE
+    );
+}
+
+/// Script verdicts by name; a name not in the map has not run yet.
+struct ScriptVerdicts(BTreeMap<&'static str, bool>);
+
+impl RoutingEnvironment for ScriptVerdicts {
+    fn script_matches(&self, name: &str) -> Option<bool> {
+        self.0.get(name).copied()
+    }
+
+    fn resolve(&self, _domain: &str) -> Option<IpAddr> {
+        Some("192.0.2.9".parse().unwrap())
+    }
+}
+
+#[test]
+fn script_rules_stop_for_a_verdict_and_follow_it() {
+    let model = RoutingModel::from_spec(
+        &spec(
+            &[
+                "DOMAIN,direct.example,DIRECT",
+                "IP-CIDR,203.0.113.0/24,REJECT",
+                "SCRIPT,corp-vpn,hk-1",
+                "SCRIPT,ads,REJECT-DROP",
+                "FINAL,jp-1",
+            ],
+            vec![],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+    assert_eq!(
+        model.rules[2].matcher,
+        RuleMatcher::Script("corp-vpn".into())
+    );
+    assert_eq!(model.rules[2].matcher.to_string(), "SCRIPT,corp-vpn");
+
+    let query = RouteQuery::domain("git.corp.example").with_port(443);
+    let ip_query = RouteQuery::ip("198.51.100.1".parse().unwrap()).with_port(443);
+    let verdicts =
+        |entries: &[(&'static str, bool)]| ScriptVerdicts(entries.iter().copied().collect());
+
+    // An earlier rule decides without running any script.
+    let resolution = model.decide(&RouteQuery::domain("direct.example"), &verdicts(&[]));
+    assert_eq!(resolution.matched, RouteMatch::Rule(0));
+
+    // No verdict yet: the decision stops at the script and rejects...
+    let pending = model.decide(&ip_query, &verdicts(&[]));
+    assert_eq!(pending.matched, RouteMatch::ScriptPending(2));
+    assert_eq!(pending.outcome, RouteOutcome::Reject(RejectKind::Reject));
+    assert_eq!(pending.resolved_ip, None);
+    // ...carrying the address resolved for an earlier IP rule.
+    let pending = model.decide(&query, &verdicts(&[]));
+    assert_eq!(pending.matched, RouteMatch::ScriptPending(2));
+    assert_eq!(pending.resolved_ip, Some("192.0.2.9".parse().unwrap()));
+
+    let resolution = model.decide(&ip_query, &verdicts(&[("corp-vpn", true)]));
+    assert_eq!(resolution.matched, RouteMatch::Rule(2));
+    assert_eq!(resolution.outcome, RouteOutcome::Node("hk-1".to_string()));
+    let resolution = model.decide(&ip_query, &verdicts(&[("corp-vpn", false)]));
+    assert_eq!(resolution.matched, RouteMatch::ScriptPending(3));
+    let resolution = model.decide(&ip_query, &verdicts(&[("corp-vpn", false), ("ads", true)]));
+    assert_eq!(resolution.outcome, RouteOutcome::Reject(RejectKind::Drop));
+    let resolution = model.decide(&ip_query, &verdicts(&[("corp-vpn", false), ("ads", false)]));
+    assert_eq!(resolution.matched, RouteMatch::Final);
+    // The indexed decision agrees.
+    let index = config_core::routing::RuleIndex::new(&model);
+    let resolution = model.decide_indexed(&index, &ip_query, &verdicts(&[]));
+    assert_eq!(resolution.matched, RouteMatch::ScriptPending(2));
+
+    // An environment without scripts treats every SCRIPT rule as no match.
+    let resolution = model.decide(&ip_query, &StaticRoutingEnvironment);
+    assert_eq!(resolution.matched, RouteMatch::Final);
+
+    for bad in ["SCRIPT,bad name,DIRECT", "SCRIPT,a/b,DIRECT"] {
+        assert_eq!(
+            model_error(&spec(&[bad, "FINAL,DIRECT"], vec![])),
+            ROUTING_RULE_VALUE_INVALID_CODE,
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        model_error(&spec(
+            &[
+                "AND,((SCRIPT,corp-vpn),(DST-PORT,443)),DIRECT",
+                "FINAL,DIRECT"
+            ],
+            vec![]
+        )),
+        ROUTING_RULE_TYPE_UNSUPPORTED_CODE
+    );
+    assert_eq!(
+        model_error(&spec(
+            &["SCRIPT,corp-vpn,DIRECT,no-resolve", "FINAL,DIRECT"],
             vec![]
         )),
         ROUTING_RULE_OPTION_UNSUPPORTED_CODE

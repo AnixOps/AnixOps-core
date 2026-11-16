@@ -4,7 +4,7 @@
 
 ## 范围
 
-- 规则：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`（可带 `no-resolve`）、`GEOIP`、`GEOSITE`、`DST-PORT`（别名 `DEST-PORT`，单个端口或 `起-止`）、`SRC-IP`（别名 `SRC-IP-CIDR`，地址或网段，IPv6 可加方括号）、`IN-PORT`（入站监听端口，单个或 `起-止`）、`PROCESS-NAME`、`RULE-SET`、逻辑规则 `AND`/`OR`/`NOT`、`FINAL`。
+- 规则：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`（可带 `no-resolve`）、`GEOIP`、`GEOSITE`、`DST-PORT`（别名 `DEST-PORT`，单个端口或 `起-止`）、`SRC-IP`（别名 `SRC-IP-CIDR`，地址或网段，IPv6 可加方括号）、`IN-PORT`（入站监听端口，单个或 `起-止`）、`PROCESS-NAME`、`RULE-SET`、`SCRIPT`（规则脚本，不能放在逻辑规则里）、逻辑规则 `AND`/`OR`/`NOT`、`FINAL`。
 - 逻辑规则采用 Surge 写法：`AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443)),Proxy`、`NOT,((DOMAIN-KEYWORD,ads)),DIRECT`；子规则不带目标，可以嵌套（最多 8 层），`NOT` 只能有一个子规则。含 IP 子规则的逻辑规则按 IP 规则处理，可带 `no-resolve`。
 - 策略组：`select`、`url-test`、`fallback`、`load-balance`（按目的主机一致性哈希）、`round-robin`（轮询）。
 - 目标：`DIRECT`、`REJECT` 系列（`REJECT`、`REJECT-NO-DROP`、`REJECT-DROP`、`REJECT-TINYGIF`，Loon `REJECT-IMG` 等同 `REJECT-TINYGIF`）、策略组 id、节点 id（保留名大小写不敏感）。
@@ -139,6 +139,15 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 | `REJECT-TINYGIF` | 明文 HTTP 请求回 `200`、`image/gif` 的 1x1 GIF 并关闭；其他按 `REJECT` | 同 `REJECT` | 明文 HTTP 代理请求回 GIF；CONNECT/SOCKS5 按 `REJECT` | 解密后第一个请求回 GIF 并关闭 |
 
 防重试风暴：同一主机（域名，没有域名时为地址）30 秒内被普通 `REJECT` 拒绝超过 10 次，之后的拒绝按 `REJECT-DROP` 应答，直到该主机最近 30 秒内的拒绝不超过 10 次；被升级的拒绝本身也计数，持续猛打的客户端会一直被静默。`REJECT-NO-DROP` 永不升级。计数只针对用户流量（包隧道、本地代理、解密连接的路由），DNS 服务器路由和状态查询不计。最多跟踪 1024 个主机，满时先清掉 30 秒内没有被拒的主机，再清最早被拒的。连接列表的 `outbound`/`chain` 显示实际应答（风暴中为 `REJECT-DROP`），`error` 仍为 `rejected`。
+
+## SCRIPT 规则（规则脚本）
+
+对齐 Surge 规则脚本：`SCRIPT,<名称>,<策略>`，脚本在 `routing.scripts` 里按名称配置，例如 `"scripts": {"corp": {"path": "/…/corp.js", "argument": "443", "timeout_secs": 1}}`。`path` 是客户端保存脚本的本地文件（启动时读一次，最大 1 MiB），`argument` 为 `$argument`，`timeout_secs` 为 1–3 秒（默认 1）；最多 32 个脚本，规则（含热重载的规则）引用未配置的脚本时整个配置被拒绝（热重载返回 `unknown_script`）。需要 `scripts` feature（默认构建都包含，iOS 同样用 QuickJS）。公开版不带任何预设脚本，脚本只来自用户。
+
+- 决策按顺序进行：前面的规则先判，走到 `SCRIPT` 规则且本连接还没有该脚本的结论时，config-core 返回 `RouteMatch::ScriptPending`，engine-embedded 在阻塞线程池里运行脚本，再带着结论重新决策；IP 规则需要的解析结果沿用，不重复解析。同一连接每个脚本最多运行一次。
+- 脚本看到的 `$request`：`hostname`（小写域名）、`destIP`（目的地址或之前 IP 规则解析出的地址）、`destPort`、`sourceIP`、`inPort`、`processName`、`protocol`（`TCP`/`UDP`）、`userAgent`、`url`，未知时为 `null`；`$script.type` 为 `rule`。只有 `$done({matched: true})` 算命中；抛异常、超时、不调用 `$done`、或等待空闲槽位超过超时都按不命中继续往下判。
+- 规则脚本没有网络（`$httpClient` 失败），`$persistentStore` 只在内存里、引擎重启即清空；同时最多运行 2 个，每个 QuickJS 堆上限 4 MiB。
+- 没有具体连接的决策（DNS 服务器分流、状态查询）不运行脚本，`SCRIPT` 规则一律不命中。重定向（`redirects`）和插件规则不接受 `SCRIPT`。
 
 ## 绑定网卡的直连
 

@@ -352,3 +352,58 @@ fn a_direct_outbound_bound_to_an_interface_uses_only_that_interface() {
         assert_eq!(&echoed, b"bound");
     }
 }
+
+#[test]
+fn script_rules_run_the_script_the_routing_section_names() {
+    let echo = echo_server();
+    let path = std::env::temp_dir().join(format!(
+        "anixops-rule-script-{}-{}.js",
+        std::process::id(),
+        echo.port()
+    ));
+    std::fs::write(
+        &path,
+        "$done({matched: $request.destPort === Number($argument) \
+         && $request.sourceIP === '127.0.0.1' && $request.inPort !== null})",
+    )
+    .unwrap();
+    let start = |script_path: &str, rule: &str| {
+        let config = format!(
+            r#"{{"schema_version":1,"profile_id":"scripted","routing":{{"outbounds":{{"node":{{"type":"direct"}}}},"scripts":{{"block":{{"path":{script_path:?},"argument":"{port}","timeout_secs":2}}}},"rules":["{rule}","FINAL,DIRECT"]}}}}"#,
+            port = echo.port(),
+        );
+        LocalProxy::start(config.as_bytes(), loopback(), MixedSettings::default())
+    };
+    let script_path = path.to_str().unwrap();
+
+    // A missing file, or a rule naming an unknown script, refuses the config.
+    for (script_path, rule) in [
+        ("/nonexistent/anixops-rule.js", "SCRIPT,block,REJECT"),
+        (script_path, "SCRIPT,other,REJECT"),
+    ] {
+        let error = start(script_path, rule)
+            .err()
+            .expect("config must be refused");
+        assert_eq!(error.code, RuntimeErrorCode::ConfigRejected, "{rule}");
+    }
+
+    let proxy = start(script_path, "SCRIPT,block,REJECT");
+    if cfg!(feature = "scripts") {
+        // The script matches the echo server's port: the flow is rejected.
+        let proxy = proxy.unwrap();
+        let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+        assert_eq!(reply, 0x01);
+        // Another port does not match and goes DIRECT.
+        let other = echo_server();
+        let (mut stream, reply) = socks_connect(proxy.local_addr(), other);
+        assert_eq!(reply, 0x00);
+        stream.write_all(b"script").unwrap();
+        let mut echoed = [0u8; 6];
+        stream.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"script");
+    } else {
+        let error = proxy.err().expect("this build cannot run scripts");
+        assert_eq!(error.code, RuntimeErrorCode::ConfigRejected);
+    }
+    let _ = std::fs::remove_file(&path);
+}

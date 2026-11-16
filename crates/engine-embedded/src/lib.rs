@@ -51,10 +51,10 @@ pub mod fake_ip;
 #[cfg(feature = "local-proxy")]
 pub mod fetch;
 pub mod ffi;
-pub mod interface;
 #[cfg(any(feature = "local-proxy", feature = "dns-tls"))]
 pub mod http1;
 pub(crate) mod icmp;
+pub mod interface;
 #[cfg(feature = "local-proxy")]
 pub mod lan_share;
 #[cfg(feature = "local-proxy")]
@@ -72,6 +72,7 @@ pub mod reject;
 #[cfg(feature = "local-proxy")]
 pub mod replay_proxy;
 pub mod routing;
+pub mod rule_scripts;
 pub mod rule_sets;
 pub use engine_outbound::protect;
 pub use engine_outbound::sniff;
