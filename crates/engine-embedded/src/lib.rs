@@ -397,7 +397,7 @@ impl EmbeddedRuntime {
     }
 
     /// The commands of [`lan_share`], [`replay_proxy`] and [`system_proxy`];
-    /// the listeners only run while the tunnel does.
+    /// the listeners stop with the runtime.
     #[cfg(feature = "local-proxy")]
     fn lan_share_control(
         &self,
@@ -429,13 +429,11 @@ impl EmbeddedRuntime {
         if replay.is_some() {
             return replay;
         }
+        // Unlike the other listeners it may start before the tunnel: the
+        // provider registers its port with the interface settings, which it
+        // applies before the tunnel reads packets. Stopping or dropping the
+        // runtime stops it either way.
         let system = self.system_proxy.control(request, |port| {
-            if self.tunnel.is_none() {
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::InvalidArgument,
-                    "system proxy needs a running tunnel",
-                ));
-            }
             system_proxy::SystemProxy::start(
                 dispatcher.clone(),
                 decrypting()?,

@@ -1,5 +1,5 @@
 //! The packet tunnel's `127.0.0.1` listener for the system proxy setting:
-//! its control requests, relaying through the tunnel's dispatcher, and
+//! its control requests and lifetime, relaying through the tunnel's dispatcher, and
 //! `URL-REGEX` / `USER-AGENT` rules on plain HTTP requests sent through it.
 
 #![cfg(feature = "local-proxy")]
@@ -113,14 +113,43 @@ fn proxied_get(
 }
 
 #[test]
-fn the_listener_needs_a_running_tunnel() {
-    let runtime = EmbeddedRuntime::from_json(DIRECT).unwrap();
+fn the_listener_starts_before_the_tunnel_and_stops_with_the_runtime() {
+    let mut runtime = EmbeddedRuntime::from_json(DIRECT).unwrap();
     let stopped = control(&runtime, r#"{"cmd":"system_proxy"}"#);
     assert_eq!(stopped["running"], false);
     assert!(stopped["port"].is_null());
-    assert!(runtime
-        .control_json(br#"{"cmd":"start_system_proxy","port":0}"#)
-        .is_err());
+
+    // The provider learns the port before it applies the interface settings
+    // and starts the tunnel.
+    let proxy = proxy_addr(&control(
+        &runtime,
+        r#"{"cmd":"start_system_proxy","port":0}"#,
+    ));
+    let echo = echo_server();
+    let mut stream = TcpStream::connect(proxy).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    write!(stream, "CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\n").unwrap();
+    let mut established = [0u8; 39];
+    stream.read_exact(&mut established).unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection established\r\n\r\n");
+    drop(stream);
+
+    runtime.start(Discard).unwrap();
+    assert_eq!(
+        control(&runtime, r#"{"cmd":"system_proxy"}"#)["running"],
+        true
+    );
+    runtime.stop();
+    assert!(TcpStream::connect(proxy).is_err());
+
+    // Dropping a runtime that never started stops it too.
+    let unstarted = EmbeddedRuntime::from_json(DIRECT).unwrap();
+    let proxy = proxy_addr(&control(
+        &unstarted,
+        r#"{"cmd":"start_system_proxy","port":0}"#,
+    ));
+    drop(unstarted);
+    assert!(TcpStream::connect(proxy).is_err());
 }
 
 #[test]

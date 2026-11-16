@@ -19,6 +19,11 @@
 //! when the config has `PROCESS-NAME` rules ([`crate::process`]); iOS gives
 //! no names.
 //!
+//! It may start before the tunnel does, so the provider can learn the port
+//! and register it with the interface settings it applies before the tunnel
+//! reads packets; stopping or dropping the runtime stops it. A whole-device
+//! WireGuard tunnel has no dispatcher and refuses it.
+//!
 //! Control requests (answered by the packet tunnel runtime, ahead of
 //! [`crate::control`]):
 //!
