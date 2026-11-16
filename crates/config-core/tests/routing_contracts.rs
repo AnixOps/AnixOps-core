@@ -1040,10 +1040,10 @@ fn subnet_groups_validate_rules_and_default() {
         &node_ids(),
     )
     .unwrap();
-    let group = model.group("ByNetwork").unwrap();
-    assert_eq!(group.kind, PolicyGroupKind::Subnet);
+    let by_network = model.group("ByNetwork").unwrap();
+    assert_eq!(by_network.kind, PolicyGroupKind::Subnet);
     assert_eq!(
-        group.members,
+        by_network.members,
         vec![
             PolicyTarget::Group("Auto".to_string()),
             PolicyTarget::Direct,

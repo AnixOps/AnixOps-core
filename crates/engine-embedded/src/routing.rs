@@ -183,6 +183,9 @@ pub struct RoutingTable {
     /// Whether a rule matches the local process, so callers that can look
     /// it up should.
     pub uses_process: bool,
+    /// Whether a rule matches the URL or `User-Agent` of a request, so a
+    /// decrypted connection routes each request on its own.
+    pub uses_request: bool,
     /// 0 for the table the engine started with, then one more per reload.
     pub generation: u64,
 }
@@ -474,6 +477,12 @@ impl RoutedOutbound {
     /// Whether a `PROCESS-NAME` rule exists, alone or inside a logical rule.
     pub fn uses_process(&self) -> bool {
         self.table().uses_process
+    }
+
+    /// Whether a `URL-REGEX` or `USER-AGENT` rule exists (plugin rules
+    /// included), alone or inside a logical rule.
+    pub fn uses_request(&self) -> bool {
+        self.table().uses_request
     }
 
     /// Puts MITM plugin rules ahead of the user's rules. A plugin names a
@@ -1384,6 +1393,10 @@ fn compile_table(
         .rules
         .iter()
         .any(|rule| matches_process(&rule.matcher));
+    let uses_request = model
+        .rules
+        .iter()
+        .any(|rule| matches_request(&rule.matcher));
     let global = match global_name {
         Some(name) => global_target(&model, name, node_ids)?,
         None => match model.groups.first() {
@@ -1399,6 +1412,7 @@ fn compile_table(
         index: RuleIndex::default(),
         global,
         uses_process,
+        uses_request,
         generation,
     };
     add_plugin_rules(&mut table, plugin_rules, node_ids, rule_sets);
@@ -1442,6 +1456,7 @@ fn add_plugin_rules(
                 .unwrap_or_else(|| table.global.clone()),
         };
         table.uses_process |= matches_process(&rule.matcher);
+        table.uses_request |= matches_request(&rule.matcher);
         added.push(RoutingRule {
             matcher: rule.matcher.clone(),
             target,
@@ -1519,6 +1534,15 @@ fn matches_process(matcher: &RuleMatcher) -> bool {
         RuleMatcher::ProcessName(_) => true,
         RuleMatcher::And(rules) | RuleMatcher::Or(rules) => rules.iter().any(matches_process),
         RuleMatcher::Not(rule) => matches_process(rule),
+        _ => false,
+    }
+}
+
+fn matches_request(matcher: &RuleMatcher) -> bool {
+    match matcher {
+        RuleMatcher::UserAgent(_) | RuleMatcher::UrlRegex(_) => true,
+        RuleMatcher::And(rules) | RuleMatcher::Or(rules) => rules.iter().any(matches_request),
+        RuleMatcher::Not(rule) => matches_request(rule),
         _ => false,
     }
 }

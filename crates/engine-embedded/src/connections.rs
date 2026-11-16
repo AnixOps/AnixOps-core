@@ -25,7 +25,8 @@ use config_core::redirect::{RedirectHost, RedirectTable, RedirectTo};
 use config_core::routing::{RouteNetwork, RouteQuery};
 use engine_outbound::sniff::HttpRequestHead;
 use engine_outbound::{
-    BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpDialer, TcpOutbound, UdpFlow,
+    BoxFuture, BoxStream, DatagramRecv, DatagramSend, RequestRouter, TargetAddr, TcpDialer,
+    TcpOutbound, UdpFlow,
 };
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
@@ -937,6 +938,41 @@ impl Dispatcher {
         }
     }
 
+    /// The outbound name (node id, `DIRECT` or `REJECT`) a request to
+    /// `target` would get, the way [`Self::connect_http_flow`] routes it
+    /// (Fake-IP names and redirects included), without connecting or
+    /// listing anything. `None` unless the rule mode runs a rule that looks
+    /// at requests (`URL-REGEX`, `USER-AGENT`): then every request of a
+    /// connection goes where the connection went.
+    pub async fn request_route(
+        &self,
+        target: &TargetAddr,
+        host: Option<&str>,
+        http: Option<&HttpRequestHead>,
+    ) -> Option<String> {
+        if self.mode() != Mode::Rule {
+            return None;
+        }
+        let routed = self
+            .routed
+            .as_ref()
+            .filter(|routed| routed.uses_request())?;
+        let unfaked = self.unfake(target, host).ok()?;
+        let (target, host) = match &unfaked {
+            Some(named) => (named, None),
+            None => (target, host),
+        };
+        let redirected = self.redirect(target, host, None, RouteNetwork::Tcp, http);
+        let (target, host) = match &redirected {
+            Some((new, _)) => (new, None),
+            None => (target, host),
+        };
+        let (route, _) = routed
+            .route_network_flow(target, host, None, RouteNetwork::Tcp, http)
+            .await;
+        Some(route.outbound)
+    }
+
     /// Opens a TCP connection to `target`. For an address target, `host` is
     /// the name sniffed from the flow, used for domain rules and the list.
     pub async fn connect_flow(
@@ -1154,6 +1190,10 @@ impl TcpOutbound for HostedDispatcher<'_> {
         self.dispatcher.protocol()
     }
 
+    fn request_router(&self) -> Option<&dyn RequestRouter> {
+        Some(self)
+    }
+
     fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
         Box::pin(
             self.dispatcher
@@ -1163,6 +1203,33 @@ impl TcpOutbound for HostedDispatcher<'_> {
 
     fn open_udp<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
         Box::pin(self.dispatcher.open_udp_flow(target, Some(self.host)))
+    }
+}
+
+/// A decrypted connection's requests are routed with the claimed host and,
+/// without a request of their own, the first plain HTTP request the flow
+/// was opened with.
+impl RequestRouter for HostedDispatcher<'_> {
+    fn request_route<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        request: Option<&'a HttpRequestHead>,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(
+            self.dispatcher
+                .request_route(target, Some(self.host), request.or(self.http)),
+        )
+    }
+
+    fn connect_request<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        request: &'a HttpRequestHead,
+    ) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(
+            self.dispatcher
+                .connect_http_flow(target, Some(self.host), Some(request)),
+        )
     }
 }
 
