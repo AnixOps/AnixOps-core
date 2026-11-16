@@ -97,6 +97,11 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# Desktop tunnels run on several worker threads (src/tunnel.rs,
+# `limits.worker_threads`); iOS and Android keep one thread for memory.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

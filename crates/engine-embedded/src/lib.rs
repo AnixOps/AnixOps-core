@@ -465,6 +465,10 @@ pub(crate) fn tunnel_settings(config: &RuntimeConfig) -> Result<TunnelSettings, 
         idle_timeout: Duration::from_secs(limits.idle_timeout_secs),
         connect_timeout: Duration::from_secs(limits.connect_timeout_secs),
         dns: Arc::new(dns),
+        worker_threads: match limits.worker_threads {
+            0 => tunnel::default_worker_threads(),
+            n => n,
+        },
     })
 }
 

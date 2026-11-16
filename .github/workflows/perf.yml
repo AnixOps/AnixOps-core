@@ -298,17 +298,41 @@ jobs:
             done
           done
 
+      # The head on one tunnel thread and on the desktop default (one worker
+      # per CPU, at most 4), same runner: what the multi-thread runtime buys
+      # (8 flows) and costs (CPU per GiB, memory, idle wakeups).
+      - name: Multi-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cores
+          for round in $(seq 1 "${ROUNDS}"); do
+            for workers in 1 4; do
+              for outbound in redirect ss2022; do
+                echo "::group::${workers} threads ${outbound} round ${round}"
+                head/target/release/examples/tunnel_bench run --tun ncb0 \
+                  --outbound "${outbound}" --window-kib "${WINDOW_KIB}" --workers "${workers}" \
+                  --json "cores/w${workers}-${outbound}-${round}.json"
+                echo "::endgroup::"
+              done
+            done
+          done
+
       - name: Summary
         if: always()
         shell: bash
-        run: python3 head/.github/scripts/perf-summary.py results >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          python3 head/.github/scripts/perf-summary.py results >> "$GITHUB_STEP_SUMMARY"
+          python3 head/.github/scripts/perf-summary.py --cores cores >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tunnel-perf
-          path: results
+          path: |
+            results
+            cores
           if-no-files-found: ignore
 
   # CPU profile of the tunnel process (head only), on demand: where the

@@ -21,7 +21,9 @@
 //!
 //! Options of `run`: `--tun NAME`, `--outbound redirect|ss2022`, `--seconds N`
 //! (per throughput test), `--window-kib N`, `--max-conns N`, `--conns N`
-//! (memory test), `--connects N` (latency test), `--json PATH`.
+//! (memory test), `--connects N` (latency test), `--workers N` (tunnel
+//! worker threads; 0 or absent is the platform default, as in the product),
+//! `--json PATH`. `run`, `scale` and `soak` pass `--workers` to the tunnel.
 //!
 //! Two scale tests have their own commands and fail (exit 1) when a target is
 //! missed:
@@ -73,7 +75,7 @@ mod linux {
     use base64::Engine as _;
     use engine_embedded::dns_policy::DnsPolicy;
     use engine_embedded::shadowsocks::{Method, Ss2022Outbound};
-    use engine_embedded::tunnel::{PacketSink, Tunnel, TunnelSettings};
+    use engine_embedded::tunnel::{default_worker_threads, PacketSink, Tunnel, TunnelSettings};
     use engine_inbound::server::{serve, InboundStats, ServeSettings};
     use engine_outbound::{
         BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpDialer, TcpOutbound,
@@ -124,6 +126,15 @@ mod linux {
                 .map_err(|_| io::Error::other(format!("--{key} is not a number"))),
             None => Ok(default),
         }
+    }
+
+    /// `--workers N`: tunnel worker threads; 0 or absent is the runtime's
+    /// default for this platform ([`default_worker_threads`]).
+    fn workers(args: &Args) -> io::Result<usize> {
+        Ok(match num(args, "workers", 0)? as usize {
+            0 => default_worker_threads(),
+            n => n,
+        })
     }
 
     fn fnum(args: &Args, key: &str, default: f64) -> io::Result<f64> {
@@ -262,6 +273,7 @@ mod linux {
                 SocketAddr::from(([127, 0, 0, 1], 53)),
                 Duration::from_secs(5),
             )),
+            worker_threads: workers(args)?,
         };
         let sink: PacketSink = Box::new(move |packet: &[u8]| {
             // SAFETY: `fd` stays open for the life of the process.
@@ -446,7 +458,7 @@ mod linux {
             "--outbound",
             outbound.as_str(),
         ];
-        let forwarded: Vec<(String, String)> = ["tun", "window-kib", "max-conns", "mtu"]
+        let forwarded: Vec<(String, String)> = ["tun", "window-kib", "max-conns", "mtu", "workers"]
             .iter()
             .filter_map(|key| {
                 args.get(*key)
@@ -498,6 +510,7 @@ mod linux {
             "start_ms": start_us / 1000.0,
             "rss_after_start_kb": get(&started, "rss_kb"),
             "threads": get(&started, "threads"),
+            "workers": workers(args)?,
         });
 
         report["idle"] = idle(&children, Duration::from_secs(10), &[])?;
@@ -878,6 +891,7 @@ mod linux {
                 SocketAddr::from(([127, 0, 0, 1], 53)),
                 Duration::from_secs(5),
             )),
+            worker_threads: workers(args)?,
         };
         let rss_before = rss_kb();
         let sink: PacketSink = Box::new(|_packet: &[u8]| {});

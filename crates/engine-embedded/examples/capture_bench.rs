@@ -426,6 +426,9 @@ mod linux {
                 SocketAddr::from(([127, 0, 0, 1], 53)),
                 Duration::from_secs(5),
             )),
+            // One thread, so capture cost is compared on the same footing
+            // as earlier runs.
+            worker_threads: 1,
         };
         let sink: PacketSink = Box::new(move |packet: &[u8]| {
             // SAFETY: `fd` stays open for the life of the process.

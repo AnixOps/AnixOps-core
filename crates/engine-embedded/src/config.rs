@@ -547,6 +547,11 @@ pub struct Limits {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// Threads the tunnel runs on, 1 to 16; 0 (the default) picks for the
+    /// platform: 1 on iOS and Android, the CPUs available (at most 4) on
+    /// desktop. iOS and Android always use 1.
+    #[serde(default)]
+    pub worker_threads: usize,
 }
 
 impl Default for Limits {
@@ -558,6 +563,7 @@ impl Default for Limits {
             tcp_window_bytes: default_tcp_window_bytes(),
             idle_timeout_secs: default_idle_timeout_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
+            worker_threads: 0,
         }
     }
 }
@@ -742,6 +748,7 @@ impl RuntimeConfig {
             || limits.tcp_window_bytes > 1024 * 1024
             || limits.idle_timeout_secs == 0
             || limits.connect_timeout_secs == 0
+            || limits.worker_threads > crate::tunnel::MAX_WORKER_THREADS
             || self.dns.timeout_ms == 0
         {
             return Err(rejected("resource limits are out of range"));

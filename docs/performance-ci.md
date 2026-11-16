@@ -16,7 +16,7 @@
 
 R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR 上 head 超出门槛时，会在同一台 runner 上再测 base；head 不比 base 慢 15% 以上就只告警（runner 偏慢，不是回归），否则失败。
 
-`perf.yml` 的隧道基准（base 对 head）仍只做信息展示，不设门槛。
+`perf.yml` 的隧道基准（base 对 head）仍只做信息展示，不设门槛。同一 job 的 Multi-core 步骤在同一台 runner 上对 head 跑 1 线程与 4 线程（`tunnel_bench run --workers`），summary 里的 “Tunnel threads” 表给出多核收益（8 流下载）与代价（每 GiB CPU、内存、空闲唤醒）。
 
 ## 说明
 
@@ -24,6 +24,7 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 
 - 规则决策走 `RoutingModel::decide_indexed`：DOMAIN 与 DOMAIN-SUFFIX 规则用哈希表查找，其余规则按顺序尝试，结果与逐条 `decide` 完全一致（`crates/config-core/tests/rule_index_contracts.rs`）。基准里 10% 的查询不命中任何规则，是最坏情况（走完全部非域名规则、解析一次域名、落到 FINAL）。
 - UDP 流上限由配置 `limits.max_udp_flows` 决定（默认 256，iOS 内存预算不变）；测 10 万流时基准自行调高。
+- 隧道线程：配置 `limits.worker_threads`（0 = 按平台默认）。iOS、Android 恒为 1 个线程（current-thread runtime，iOS 网络扩展有硬内存上限；这两个平台的构建不含 tokio 多线程调度器）；macOS、Windows、Linux 默认每个 CPU 一个工作线程，最多 4 个，上限 16。用户态 TCP/IP 栈仍是一个任务，多线程分摊的是各条流的转发、加解密和出站 I/O。`tunnel_bench` 的 `run`、`scale`、`soak` 默认跟产品一样按平台取值，所以 F2、F3、F7 门槛测的是桌面默认的多线程运行时；`capture_bench`（I3/I4/F8）固定 1 线程，与此前结果可比。
 - 长稳的 RSS 斜率是去掉前 15% 采样后的最小二乘斜率，每 60 s 采样一次；完整曲线在 job summary 和 artifact `tunnel-soak` 里。
 - 24 h 长稳需要自托管 runner，准备步骤见 [manual-intervention.md](manual-intervention.md)。
 - 手动调整门槛：`perf.yml` 的 `max_rule_p99_us`、`concurrent`、`udp_flows`、`max_udp_rss_mb` 输入；`soak.yml` 的 `hours`、`max_slope_mb_per_h` 输入。

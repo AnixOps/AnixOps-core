@@ -171,6 +171,45 @@ pub struct TunnelSettings {
     pub connect_timeout: Duration,
     /// Hosts, per-domain servers and upstreams for UDP/53.
     pub dns: Arc<DnsPolicy>,
+    /// Threads the tunnel's runtime runs on. 1 runs everything on the tunnel
+    /// thread; more spreads flows (relay, encryption, outbound I/O) over a
+    /// multi-thread runtime while the userspace TCP/IP stack stays one task.
+    /// iOS and Android always use 1. See [`default_worker_threads`].
+    pub worker_threads: usize,
+}
+
+/// Most worker threads a tunnel runs on.
+pub const MAX_WORKER_THREADS: usize = 16;
+/// Worker threads a desktop tunnel uses by default, at most this many.
+const DEFAULT_DESKTOP_WORKERS: usize = 4;
+
+/// Worker threads when the config does not say: 1 on iOS and Android (the
+/// iOS Network Extension has a hard memory limit, and phones gain little),
+/// otherwise the CPUs available, at most 4.
+pub fn default_worker_threads() -> usize {
+    if cfg!(any(target_os = "ios", target_os = "android")) {
+        return 1;
+    }
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(DEFAULT_DESKTOP_WORKERS)
+}
+
+/// The tunnel runtime: one thread, or `workers` threads on desktop.
+fn tunnel_runtime(workers: usize) -> io::Result<tokio::runtime::Runtime> {
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    if workers > 1 {
+        return tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers.min(MAX_WORKER_THREADS))
+            .thread_name("networkcore-tunnel-worker")
+            .enable_all()
+            .build();
+    }
+    let _ = workers;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
 }
 
 /// Live counters. Snapshots are safe to expose: no addresses, no payloads.
@@ -322,7 +361,8 @@ impl Tunnel {
         let interceptor_background = interceptor
             .clone()
             .and_then(|interceptor| interceptor.background());
-        Self::launch(move |packet_rx, stats| {
+        let workers = settings.worker_threads;
+        Self::launch(workers, move |packet_rx, stats| {
             spawn_tasks(settings, dispatcher, interceptor, sink, packet_rx, stats)?;
             for background in [background, interceptor_background].into_iter().flatten() {
                 tokio::spawn(background);
@@ -339,20 +379,19 @@ impl Tunnel {
         sink: impl PacketWriter,
     ) -> io::Result<Self> {
         let sink: PacketSink = Box::new(move |packet: &[u8]| sink.write(packet));
-        Self::launch(move |packet_rx, stats| {
+        Self::launch(1, move |packet_rx, stats| {
             wireguard::spawn_tasks(settings, sink, packet_rx, stats)
         })
     }
 
-    /// Runs `setup` on a new tunnel thread inside its tokio runtime and waits
-    /// for it to report whether the tasks started.
-    fn launch<F>(setup: F) -> io::Result<Self>
+    /// Runs `setup` on a new tunnel thread inside its tokio runtime (one
+    /// thread, or `workers` worker threads) and waits for it to report
+    /// whether the tasks started.
+    fn launch<F>(workers: usize, setup: F) -> io::Result<Self>
     where
         F: FnOnce(mpsc::Receiver<Vec<u8>>, Arc<TunnelStats>) -> io::Result<()> + Send + 'static,
     {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        let runtime = tunnel_runtime(workers)?;
         let stats = Arc::new(TunnelStats::default());
         let (packet_tx, packet_rx) = mpsc::channel(INPUT_QUEUE_PACKETS);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

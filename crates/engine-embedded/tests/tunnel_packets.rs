@@ -114,6 +114,7 @@ fn settings() -> TunnelSettings {
             SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
             Duration::from_secs(5),
         )),
+        worker_threads: 1,
     }
 }
 
@@ -1076,5 +1077,100 @@ fn https_waits_for_the_app_even_when_it_is_silent() {
     assert!(started.elapsed() >= Duration::from_millis(900));
     assert_eq!(greeting(&tunnel, &rx, 43001, 443), b"220 ready\r\n");
     assert_eq!(tunnel.stats().tcp_first_wait_skipped, 0);
+    tunnel.stop();
+}
+
+#[test]
+fn flows_on_a_multi_thread_tunnel_are_relayed_in_order() {
+    let echo = start_echo_server();
+    let (sink, rx) = capture();
+    let settings = TunnelSettings {
+        worker_threads: 4,
+        max_tcp_connections: 32,
+        ..settings()
+    };
+    let mut tunnel = Tunnel::start(settings, Arc::new(Redirect(echo)), sink).unwrap();
+
+    // Open every flow first, then send on all of them, so their relays run
+    // at the same time on the worker threads.
+    let ports: Vec<u16> = (44000..44016).collect();
+    let mut opened = Vec::new();
+    for &port in &ports {
+        let mut syn = Vec::new();
+        PacketBuilder::ipv4(APP, REMOTE, 64)
+            .tcp(port, 80, 1000, 65535)
+            .syn()
+            .write(&mut syn, &[])
+            .unwrap();
+        assert!(tunnel.input_packet(&syn));
+        let server_isn = wait_for(&rx, |sliced| match &sliced.transport {
+            Some(TransportSlice::Tcp(tcp))
+                if tcp.syn() && tcp.ack() && tcp.destination_port() == port =>
+            {
+                Some(tcp.sequence_number())
+            }
+            _ => None,
+        });
+        opened.push((port, server_isn));
+    }
+    for &(port, server_isn) in &opened {
+        let mut data = Vec::new();
+        PacketBuilder::ipv4(APP, REMOTE, 64)
+            .tcp(port, 80, 1001, 65535)
+            .ack(server_isn.wrapping_add(1))
+            .psh()
+            .write(
+                &mut data,
+                format!("GET /{port} HTTP/1.1\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+        assert!(tunnel.input_packet(&data));
+    }
+    let mut echoed: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+    let deadline = Instant::now() + WAIT;
+    while echoed.len() < ports.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let packet = rx.recv_timeout(left).expect("every flow is echoed");
+        let Ok(sliced) = SlicedPacket::from_ip(&packet) else {
+            continue;
+        };
+        if let Some(TransportSlice::Tcp(tcp)) = &sliced.transport {
+            let port = tcp.destination_port();
+            if ports.contains(&port) && !tcp.payload().is_empty() {
+                // The echo is one small segment; a retransmit repeats it.
+                echoed.entry(port).or_insert_with(|| tcp.payload().to_vec());
+            }
+        }
+    }
+    for port in ports {
+        // Each flow got its own bytes back, whatever thread relayed it.
+        let want = format!("GET /{port} HTTP/1.1\r\n\r\n");
+        assert_eq!(echoed[&port], want.as_bytes(), "port {port}");
+    }
+    let stats = tunnel.stats();
+    assert_eq!(stats.tcp_total, 16);
+    assert_eq!(stats.tcp_connect_failed, 0);
+    tunnel.stop();
+}
+
+#[test]
+fn dns_is_answered_on_a_multi_thread_tunnel() {
+    let config = DnsConfig {
+        hosts: BTreeMap::from([(
+            "example.com".to_string(),
+            vec!["192.0.2.7".parse().unwrap()],
+        )]),
+        ..DnsConfig::default()
+    };
+    let settings = TunnelSettings {
+        dns: Arc::new(DnsPolicy::from_config(&config).unwrap()),
+        worker_threads: 4,
+        ..settings()
+    };
+    let (sink, rx) = capture();
+    let mut tunnel =
+        Tunnel::start(settings, Arc::new(Redirect(start_closing_server())), sink).unwrap();
+    let response = ask(&tunnel, &rx, &dns_query());
+    assert!(response.ends_with(&[192, 0, 2, 7]));
     tunnel.stop();
 }
