@@ -46,7 +46,9 @@ use crate::loon_map_local::{
 };
 use crate::loon_syntax::{attributes, quote, tokens};
 use crate::{AnixOpsMitmPolicyEngine, MitmPolicyRuleDiagnosticStatus};
-use config_core::routing::{parse_rule_line, PolicyTarget, RoutingModel, RoutingRule, RuleLine};
+use config_core::routing::{
+    parse_rule_line, PolicyTarget, RejectKind, RoutingModel, RoutingRule, RuleLine,
+};
 use control_domain::{
     DomainError, DomainResult, HookPoint, PluginManifest, PluginPackage, PluginPermission,
 };
@@ -1111,7 +1113,11 @@ impl Parser<'_> {
                 no_resolve,
             }) => {
                 let (policy, reason) = if is_reject_policy(&target) {
-                    (PolicyTarget::Reject, "rule.routing")
+                    // REJECT-DROP, REJECT-NO-DROP and REJECT-TINYGIF (Loon
+                    // REJECT-IMG) keep their kind; the variants that answer
+                    // only decrypted requests close like REJECT.
+                    let kind = RejectKind::parse(&target).unwrap_or_default();
+                    (PolicyTarget::Reject(kind), "rule.routing")
                 } else if target.eq_ignore_ascii_case("DIRECT") {
                     (PolicyTarget::Direct, "rule.routing")
                 } else {

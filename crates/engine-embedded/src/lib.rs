@@ -70,6 +70,7 @@ pub mod pro;
 pub mod process;
 pub mod profile;
 pub mod protocols;
+pub mod reject;
 #[cfg(feature = "local-proxy")]
 pub mod replay_proxy;
 pub mod routing;
