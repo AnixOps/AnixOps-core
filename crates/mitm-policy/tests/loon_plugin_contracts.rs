@@ -1,5 +1,5 @@
 use config_core::routing::{
-    PolicyGroupSpec, PolicyTarget, RouteOutcome, RouteQuery, RoutingModel, RoutingSpec,
+    PolicyGroupSpec, PolicyTarget, RejectKind, RouteOutcome, RouteQuery, RoutingModel, RoutingSpec,
     RuleMatcher, StaticRoutingEnvironment,
 };
 use control_domain::{
@@ -63,14 +63,14 @@ fn full_p0_plugin_imports_metadata_hostnames_rules_and_rewrites() {
         rules[0].matcher,
         RuleMatcher::Domain("ads.example.com".to_string())
     );
-    assert_eq!(rules[0].target, PolicyTarget::Reject);
+    assert_eq!(rules[0].target, PolicyTarget::Reject(RejectKind::Reject));
     assert_eq!(
         rules[1].matcher,
         RuleMatcher::DomainSuffix("tracker.example.net".to_string())
     );
-    assert_eq!(rules[1].target, PolicyTarget::Reject);
+    assert_eq!(rules[1].target, PolicyTarget::Reject(RejectKind::Reject));
     assert!(matches!(rules[2].matcher, RuleMatcher::IpCidr(_)));
-    assert_eq!(rules[2].target, PolicyTarget::Reject);
+    assert_eq!(rules[2].target, PolicyTarget::Reject(RejectKind::Reject));
     assert!(rules[2].no_resolve);
     assert_eq!(rules[3].target, PolicyTarget::Direct);
 }
@@ -185,14 +185,14 @@ fn plugin_rules_run_before_user_rules_in_the_routing_model() {
 
     let environment = StaticRoutingEnvironment;
     let blocked = merged.decide(&RouteQuery::domain("ads.example.com"), &environment);
-    assert_eq!(blocked.outcome, RouteOutcome::Reject);
+    assert_eq!(blocked.outcome, RouteOutcome::Reject(RejectKind::Reject));
     let user = merged.decide(&RouteQuery::domain("www.example.com"), &environment);
     assert_eq!(user.outcome, RouteOutcome::Node("node-a".to_string()));
     let blocked_ip = merged.decide(
         &RouteQuery::ip("203.0.113.9".parse().expect("test address should parse")),
         &environment,
     );
-    assert_eq!(blocked_ip.outcome, RouteOutcome::Reject);
+    assert_eq!(blocked_ip.outcome, RouteOutcome::Reject(RejectKind::Reject));
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn mixed_plugin_reports_partial_deferred_and_unsupported_lines() {
         rules[0].matcher,
         RuleMatcher::DomainKeyword("adtrack".to_string())
     );
-    assert_eq!(rules[0].target, PolicyTarget::Reject);
+    assert_eq!(rules[0].target, PolicyTarget::Reject(RejectKind::Reject));
     // PROXY names the user's proxy; it resolves when joining the model.
     assert_eq!(rules[1].target, PolicyTarget::Group("PROXY".to_string()));
 
@@ -798,7 +798,7 @@ fn surge_module_arguments_substitute_and_surge_rule_options_are_read() {
     assert_eq!(rules.len(), 6, "{rules:?}");
     assert_eq!(rules[0].target, PolicyTarget::Direct);
     assert_eq!(rules[1].matcher, RuleMatcher::DstPort(4480, 4480));
-    assert_eq!(rules[1].target, PolicyTarget::Reject);
+    assert_eq!(rules[1].target, PolicyTarget::Reject(RejectKind::NoDrop));
     assert_eq!(
         plugin.mitm_hostnames.include,
         vec!["api.example.com", "cdn.example.com"]
@@ -941,7 +941,7 @@ fn policyless_rules_and_misfiled_lines_are_read() {
     );
     let rules = plugin.routing_rules();
     assert_eq!(rules[0].target, PolicyTarget::Group("PROXY".to_string()));
-    assert_eq!(rules[1].target, PolicyTarget::Reject);
+    assert_eq!(rules[1].target, PolicyTarget::Reject(RejectKind::Reject));
     let merged = merged_plugin_source("Misfiled", &[&plugin]);
     assert!(
         merged.contains("http-response ^https?://a\\.example\\.com/feed"),

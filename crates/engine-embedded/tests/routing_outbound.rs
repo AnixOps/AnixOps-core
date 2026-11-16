@@ -5,9 +5,11 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use config_core::routing::{PolicyGroupSpec, RouteOutcome, RoutingSpec};
+use config_core::routing::{PolicyGroupSpec, RejectKind, RouteOutcome, RoutingSpec};
 use config_core::rule_set::RuleSet;
+use engine_embedded::reject::STORM_LIMIT;
 use engine_embedded::routing::{DomainResolver, RoutedOutbound};
+use engine_outbound::reject::{self, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 
 /// Records the target and fails, so tests see which outbound was chosen.
@@ -84,7 +86,7 @@ fn routes_targets_by_rules_and_groups() {
     assert_eq!(outbound.route(&ip("10.1.2.3:443")), RouteOutcome::Direct);
     assert_eq!(
         outbound.route(&ip("198.51.100.7:443")),
-        RouteOutcome::Reject
+        RouteOutcome::Reject(RejectKind::Reject)
     );
     assert_eq!(
         outbound.route(&ip("[2001:db8::1]:443")),
@@ -101,7 +103,7 @@ fn routes_targets_by_rules_and_groups() {
     // A domain that reaches an IP rule is not resolved, so it is rejected.
     assert_eq!(
         outbound.route(&TargetAddr::Domain("other.example".to_string(), 443)),
-        RouteOutcome::Reject
+        RouteOutcome::Reject(RejectKind::Reject)
     );
 }
 
@@ -154,7 +156,7 @@ fn domains_are_resolved_only_when_an_ip_rule_needs_them() {
         // A failed lookup rejects the connection, as in sing-box.
         assert_eq!(
             outbound.route_resolving(&domain("missing.example")).await,
-            RouteOutcome::Reject
+            RouteOutcome::Reject(RejectKind::Reject)
         );
         // IP targets never trigger a lookup.
         assert_eq!(
@@ -260,4 +262,93 @@ fn url_test_groups_follow_recorded_latencies() {
     // A failed check removes the member from the choice.
     outbound.record_latency("Auto", "jp-1", None);
     assert_eq!(outbound.route(&v6), RouteOutcome::Node("hk-1".to_string()));
+}
+
+fn rejecting() -> RoutedOutbound {
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let direct: Arc<dyn TcpOutbound> = Arc::new(Recording {
+        name: "direct",
+        hits,
+    });
+    let spec = RoutingSpec {
+        rules: vec![
+            "DOMAIN,plain.example,REJECT".to_string(),
+            "DOMAIN,nodrop.example,REJECT-NO-DROP".to_string(),
+            "DOMAIN,drop.example,REJECT-DROP".to_string(),
+            "DOMAIN,gif.example,REJECT-TINYGIF".to_string(),
+            "FINAL,DIRECT".to_string(),
+        ],
+        groups: Vec::new(),
+    };
+    RoutedOutbound::new(&spec, direct, BTreeMap::new()).expect("spec should validate")
+}
+
+fn named(domain: &str) -> TargetAddr {
+    TargetAddr::Domain(domain.to_string(), 443)
+}
+
+#[tokio::test]
+async fn reject_variants_reach_the_inbound_as_their_action() {
+    let outbound = rejecting();
+    for (domain, action, shown) in [
+        ("plain.example", RejectAction::Close, "REJECT"),
+        ("nodrop.example", RejectAction::Close, "REJECT-NO-DROP"),
+        ("drop.example", RejectAction::Drop, "REJECT-DROP"),
+        ("gif.example", RejectAction::TinyGif, "REJECT-TINYGIF"),
+    ] {
+        let error = match outbound.connect(&named(domain)).await {
+            Ok(_) => panic!("{domain} must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{domain}");
+        assert_eq!(reject::rejection(&error), Some(action), "{domain}");
+
+        let (route, picked) = outbound.route_flow(&named(domain), None, None).await;
+        assert!(picked.is_none(), "{domain}");
+        assert_eq!(route.outbound, shown);
+        assert_eq!(route.chain, vec![shown.to_string()]);
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_host_that_keeps_retrying_is_dropped() {
+    let outbound = rejecting();
+    // Ten rejections in a row are answered as REJECT ...
+    for attempt in 0..STORM_LIMIT {
+        let (route, _) = outbound
+            .route_flow(&named("plain.example"), None, None)
+            .await;
+        assert_eq!(route.outbound, "REJECT", "attempt {attempt}");
+        assert_eq!(route.reject, Some(RejectKind::Reject));
+    }
+    // ... and the next ones within the window like REJECT-DROP.
+    let (route, _) = outbound
+        .route_flow(&named("plain.example"), None, None)
+        .await;
+    assert_eq!(route.outbound, "REJECT-DROP");
+    assert_eq!(route.reject, Some(RejectKind::Drop));
+    let error = match outbound.connect(&named("plain.example")).await {
+        Ok(_) => panic!("must stay rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(reject::rejection(&error), Some(RejectAction::Drop));
+
+    // Hosts are counted apart, and REJECT-NO-DROP never upgrades.
+    let (route, _) = outbound
+        .route_flow(&ip("192.0.2.9:443"), Some("other.example"), None)
+        .await;
+    assert_eq!(route.outbound, "DIRECT");
+    for _ in 0..3 * STORM_LIMIT {
+        let (route, _) = outbound
+            .route_flow(&named("nodrop.example"), None, None)
+            .await;
+        assert_eq!(route.outbound, "REJECT-NO-DROP");
+    }
+    // Synchronous lookups (DNS servers, status) do not count.
+    for _ in 0..3 * STORM_LIMIT {
+        assert_eq!(
+            outbound.route(&named("gif.example")),
+            RouteOutcome::Reject(RejectKind::TinyGif)
+        );
+    }
 }

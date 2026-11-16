@@ -10,7 +10,7 @@
 //! validation (for example no FINAL rule or a group cycle), no routing is
 //! returned and the caller keeps its single-node behavior.
 
-use crate::routing::{parse_rule_line, PolicyGroupSpec, RoutingModel, RoutingSpec};
+use crate::routing::{parse_rule_line, PolicyGroupSpec, RejectKind, RoutingModel, RoutingSpec};
 use control_domain::{Diagnostic, DiagnosticSeverity, NodeDescriptor};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1133,7 +1133,7 @@ fn provider_rule_set(
         .proxy
         .as_deref()
         .and_then(|proxy| resolve_rule_target(importer, group_ids, proxy))
-        .filter(|target| target != "REJECT");
+        .filter(|target| !is_reject_policy(target));
     Ok(ImportedRuleSet {
         id: String::new(),
         url: url.to_string(),
@@ -1168,7 +1168,16 @@ fn resolve_rule_target(
     if target.eq_ignore_ascii_case("DIRECT") {
         Some("DIRECT".to_string())
     } else if is_reject_policy(target) {
-        Some("REJECT".to_string())
+        // REJECT, REJECT-NO-DROP, REJECT-DROP and REJECT-TINYGIF (Loon
+        // REJECT-IMG) keep their kind; Loon's REJECT-200, REJECT-DICT,
+        // REJECT-ARRAY and REJECT-VIDEO answer requests only after
+        // decryption, so as a routing policy they close like REJECT.
+        Some(
+            RejectKind::parse(target)
+                .unwrap_or_default()
+                .name()
+                .to_string(),
+        )
     } else if group_ids.contains(target) {
         Some(target.to_string())
     } else {

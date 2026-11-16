@@ -26,6 +26,7 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
+use engine_outbound::reject::{rejection, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use futures::{FutureExt, SinkExt, StreamExt};
 use netstack_smoltcp::udp::UdpMsg;
@@ -495,6 +496,10 @@ fn spawn_tasks(
 
     // TCP flows.
     let tcp_permits = Arc::new(Semaphore::new(settings.max_tcp_connections));
+    // REJECT-DROP flows held open, each still on its TCP permit (its stack
+    // buffers stay allocated): an eighth of them at most, so a retry storm
+    // never starves real flows; past that a dropped flow just closes.
+    let drop_holds = Arc::new(Semaphore::new((settings.max_tcp_connections / 8).max(1)));
     let tcp_dispatcher = dispatcher.clone();
     let tcp_stats = stats.clone();
     let tcp_settings = settings.clone();
@@ -510,6 +515,7 @@ fn spawn_tasks(
             let stats = tcp_stats.clone();
             let settings = tcp_settings.clone();
             let interceptor = interceptor.clone();
+            let drop_holds = drop_holds.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 stats.tcp_active.fetch_add(1, Ordering::Relaxed);
@@ -520,6 +526,7 @@ fn spawn_tasks(
                     interceptor.as_deref(),
                     &stats,
                     &settings,
+                    &drop_holds,
                 )
                 .await;
                 stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
@@ -1010,7 +1017,7 @@ async fn run_udp_flow(
             dispatcher.refuse_quic_for_decryption(destination, &host);
             bump(&stats.udp_failed);
             bump(&stats.quic_mitm_fallback);
-            refuse_udp_flow(packets, held, app, destination, &stats, raw.as_ref()).await;
+            refuse_udp_flow(packets, held, app, destination, &stats, Some(raw.as_ref())).await;
             return;
         }
     }
@@ -1022,10 +1029,21 @@ async fn run_udp_flow(
         tokio::time::timeout(connect_timeout, open).await
     };
     drop(dispatcher);
-    let Ok(Ok(UdpFlow { mut send, recv })) = opened else {
-        bump(&stats.udp_failed);
-        refuse_udp_flow(packets, held, app, destination, &stats, raw.as_ref()).await;
-        return;
+    let opened = match opened {
+        Ok(Ok(flow)) => Ok(flow),
+        Ok(Err(error)) => Err(rejection(&error)),
+        Err(_) => Err(None),
+    };
+    let UdpFlow { mut send, recv } = match opened {
+        Ok(flow) => flow,
+        Err(rejected) => {
+            bump(&stats.udp_failed);
+            // REJECT-DROP answers nothing, not even ICMP.
+            let silent = rejected == Some(RejectAction::Drop);
+            let raw = (!silent).then_some(raw.as_ref());
+            refuse_udp_flow(packets, held, app, destination, &stats, raw).await;
+            return;
+        }
     };
     drop(raw);
     bump(&stats.udp_flows);
@@ -1096,19 +1114,21 @@ async fn sniff_quic_name(packets: &mut FlowReceiver, held: &mut Vec<Vec<u8>>) ->
 
 /// Drops a flow that could not be opened (or was refused), staying mapped
 /// until it goes quiet so an outbound without UDP is not asked again for
-/// every packet. QUIC is refused with ICMP port unreachable, so it falls
-/// back to TCP instead of waiting for its handshake to time out.
+/// every packet. QUIC is refused with ICMP port unreachable through `raw`,
+/// so it falls back to TCP instead of waiting for its handshake to time
+/// out; without `raw` (REJECT-DROP) nothing is answered.
 async fn refuse_udp_flow(
     mut packets: FlowReceiver,
     held: Vec<Vec<u8>>,
     app: SocketAddr,
     destination: SocketAddr,
     stats: &TunnelStats,
-    raw: &dyn PacketWriter,
+    raw: Option<&dyn PacketWriter>,
 ) {
     let mut refused = 0;
     let mut refuse = |datagram: &[u8]| {
         bump(&stats.udp_dropped);
+        let Some(raw) = raw else { return };
         if destination.port() == QUIC_PORT && refused < MAX_ICMP_PER_FLOW {
             if let Some(packet) = crate::icmp::port_unreachable(app, destination, datagram.len()) {
                 refused += 1;
@@ -1161,6 +1181,33 @@ async fn read_first_payload(inbound: &mut (impl AsyncRead + Unpin), port: u16) -
     Some(first)
 }
 
+/// Answers a TCP flow a routing rule rejected, once its first bytes are
+/// read: `REJECT-TINYGIF` answers a plain HTTP request with a 1x1 GIF,
+/// `REJECT-DROP` keeps the flow open without a word (while a hold slot is
+/// free), and everything else closes.
+async fn answer_rejected(
+    mut inbound: netstack_smoltcp::TcpStream,
+    action: RejectAction,
+    plain_http: bool,
+    drop_holds: &Semaphore,
+) {
+    match action {
+        RejectAction::TinyGif if plain_http => {
+            let response = engine_outbound::reject::tiny_gif_response();
+            if inbound.write_all(&response).await.is_ok() {
+                let _ = inbound.shutdown().await;
+            }
+        }
+        RejectAction::Drop => {
+            if let Ok(_slot) = drop_holds.try_acquire() {
+                engine_outbound::reject::hold(&mut inbound, engine_outbound::reject::DROP_HOLD)
+                    .await;
+            }
+        }
+        RejectAction::TinyGif | RejectAction::Close => {}
+    }
+}
+
 /// Length of the TLS handshake record `bytes` starts with, header included.
 fn tls_record_len(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 5 || bytes[0] != 0x16 || bytes[1] != 0x03 {
@@ -1176,6 +1223,7 @@ async fn handle_tcp(
     interceptor: Option<&dyn FlowInterceptor>,
     stats: &TunnelStats,
     settings: &TunnelSettings,
+    drop_holds: &Semaphore,
 ) {
     let Some(first) = read_first_payload(&mut inbound, target.port()).await else {
         return;
@@ -1206,6 +1254,9 @@ async fn handle_tcp(
         Ok(Err(err)) => {
             bump(&stats.tcp_connect_failed);
             record(&stats.tcp_last_failure, OutboundFailure::connect(&err));
+            if let Some(action) = rejection(&err) {
+                answer_rejected(inbound, action, http.is_some(), drop_holds).await;
+            }
             return;
         }
         Err(_) => {

@@ -16,7 +16,7 @@ serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["net", "io-util", "rt", "macros", "time"] }
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "rt", "macros", "time", "test-util"] }
 
 [lib]
 path = "src/lib.rs"

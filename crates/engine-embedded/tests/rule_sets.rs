@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use config_core::routing::RouteOutcome;
+use config_core::routing::{RejectKind, RouteOutcome};
 use engine_embedded::config::RuntimeConfig;
 use engine_embedded::protocols::default_registry;
 use engine_embedded::routing::RoutedOutbound;
@@ -39,7 +39,10 @@ fn geosite_and_geoip_rules_match_their_sets() {
     assert_eq!(routed.route(&domain("mail.google.com", 443)), hk);
     assert_eq!(routed.route(&domain("g.co", 443)), hk);
     assert_eq!(routed.route(&ip("1.0.1.7:443")), RouteOutcome::Direct);
-    assert_eq!(routed.route(&ip("1.0.2.7:22")), RouteOutcome::Reject);
+    assert_eq!(
+        routed.route(&ip("1.0.2.7:22")),
+        RouteOutcome::Reject(RejectKind::Reject)
+    );
     assert_eq!(routed.route(&ip("1.0.2.7:443")), hk);
 
     let status = routed.rule_sets().status();
@@ -142,11 +145,11 @@ mod remote {
         assert_eq!(status.last_error, None);
         assert_eq!(
             routed.route(&domain("x.ads.test", 443)),
-            RouteOutcome::Reject
+            RouteOutcome::Reject(RejectKind::Reject)
         );
         assert_eq!(
             routed.route(&domain("a.track.test", 443)),
-            RouteOutcome::Reject
+            RouteOutcome::Reject(RejectKind::Reject)
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
@@ -187,7 +190,7 @@ mod remote {
         assert_eq!(status.updated_at_ms, None);
         assert_eq!(
             routed.route(&domain("www.cached.test", 443)),
-            RouteOutcome::Reject
+            RouteOutcome::Reject(RejectKind::Reject)
         );
         runtime.shutdown_background();
     }
@@ -256,7 +259,10 @@ mod remote {
         assert!(good.rule_sets().status()[0].signed);
         let runtime = run_once(&good);
         wait_until(|| good.rule_sets().status()[0].updated_at_ms.is_some());
-        assert_eq!(good.route(&domain("x.ads.test", 443)), RouteOutcome::Reject);
+        assert_eq!(
+            good.route(&domain("x.ads.test", 443)),
+            RouteOutcome::Reject(RejectKind::Reject)
+        );
         runtime.shutdown_background();
 
         // A signature over other bytes: the cached copy stays.
@@ -277,7 +283,7 @@ mod remote {
         );
         assert_eq!(
             bad.route(&domain("www.cached.test", 443)),
-            RouteOutcome::Reject
+            RouteOutcome::Reject(RejectKind::Reject)
         );
         runtime.shutdown_background();
     }
