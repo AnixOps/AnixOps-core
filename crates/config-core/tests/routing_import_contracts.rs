@@ -544,3 +544,112 @@ https://rules.example/loon/Off.list, policy=Proxy, tag=Off, enabled=false
         .iter()
         .any(|diagnostic| diagnostic.message.contains("rule set SYSTEM is not a URL")));
 }
+
+const NETWORK_PROFILE: &str = r#"
+[Proxy]
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503
+JP = ss, 82.47.34.100, 11112, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141504
+
+[Proxy Group]
+Auto = url-test, HK, JP, evaluate-before-use=true
+ByNetwork = subnet, default = Auto, "SSID:My Home" = DIRECT, "ROUTER:192.168.1.1" = DIRECT, "TYPE:CELLULAR" = JP, "WIFI:Cafe" = HK, "SSID:Lab" = Missing
+Legacy = ssid, default = HK, cellular = JP, "Office" = DIRECT
+Orphan = subnet, default = Missing, "SSID:My Home" = DIRECT
+
+[Rule]
+DOMAIN-SUFFIX,legacy.example,Legacy
+FINAL,ByNetwork
+"#;
+
+#[test]
+fn surge_subnet_and_ssid_groups_import_with_their_rules() {
+    use config_core::routing::{NetworkCondition, NetworkContext, NetworkKind, RoutingEnvironment};
+
+    let nodes = parse_nodes(NETWORK_PROFILE);
+    let imported = import_subscription_routing(NETWORK_PROFILE, &nodes);
+    let model = imported
+        .routing
+        .clone()
+        .expect("network profile should import");
+
+    assert!(model.group("Auto").unwrap().evaluate_before_use);
+    let by_network = model.group("ByNetwork").unwrap();
+    assert_eq!(by_network.kind, PolicyGroupKind::Subnet);
+    assert_eq!(
+        by_network.default,
+        Some(PolicyTarget::Group("Auto".to_string()))
+    );
+    assert_eq!(
+        by_network
+            .network_rules
+            .iter()
+            .map(|rule| (rule.when.clone(), rule.target.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                NetworkCondition::Ssid("My Home".to_string()),
+                PolicyTarget::Direct
+            ),
+            (
+                NetworkCondition::Router("192.168.1.1".parse().unwrap()),
+                PolicyTarget::Direct
+            ),
+            (
+                NetworkCondition::Kind(NetworkKind::Cellular),
+                PolicyTarget::Node(node_id(&nodes, "JP"))
+            ),
+        ]
+    );
+    let legacy = model.group("Legacy").unwrap();
+    assert_eq!(
+        legacy
+            .network_rules
+            .iter()
+            .map(|rule| rule.when.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            NetworkCondition::Kind(NetworkKind::Cellular),
+            NetworkCondition::Ssid("Office".to_string()),
+        ]
+    );
+    // A subnet group without an importable default is dropped.
+    assert!(model.group("Orphan").is_none());
+
+    struct OnWifi(NetworkContext);
+    impl RoutingEnvironment for OnWifi {
+        fn network(&self) -> Option<&NetworkContext> {
+            Some(&self.0)
+        }
+    }
+    let home = OnWifi(NetworkContext {
+        kind: Some(NetworkKind::Wifi),
+        ssid: Some("My Home".to_string()),
+        ..NetworkContext::default()
+    });
+    assert_eq!(
+        model
+            .decide(&RouteQuery::domain("www.example.com"), &home)
+            .outcome,
+        RouteOutcome::Direct
+    );
+
+    let messages = imported
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(messages.contains("ByNetwork network rule WIFI:Cafe was skipped"));
+    assert!(messages.contains("ByNetwork network rule SSID:Lab was skipped"));
+    assert!(diagnostic_codes(&imported).contains(&ROUTING_IMPORT_GROUP_SKIPPED_CODE));
+
+    // The spec the embedded engine takes keeps the rules as text.
+    let spec = imported.spec.expect("spec should be kept");
+    let group = spec
+        .groups
+        .iter()
+        .find(|group| group.id == "ByNetwork")
+        .unwrap();
+    assert!(group.members.is_empty());
+    assert_eq!(group.network_rules[0].when, "SSID:My Home");
+}

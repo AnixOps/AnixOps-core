@@ -17,7 +17,7 @@ use config_core::redirect::{
     RedirectTable, REDIRECT_MATCHER_UNSUPPORTED_CODE, REDIRECT_TARGET_INVALID_CODE,
     REDIRECT_TOO_MANY_CODE,
 };
-use config_core::routing::{PolicyGroupSpec, RoutingRule, RoutingSpec};
+use config_core::routing::{NetworkRuleSpec, PolicyGroupSpec, RoutingRule, RoutingSpec};
 use config_core::rule_set::{BareDomain, RuleSet, RuleSetEntries, MAX_RULE_SET_ENTRIES};
 use engine_outbound::mux::{MuxConfig, MuxOutbound};
 use engine_outbound::registry::{OutboundRegistry, Settings};
@@ -340,6 +340,9 @@ pub struct PolicyGroupConfig {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
+    /// Absent for a `subnet` group, whose members are its network rule
+    /// targets and its default.
+    #[serde(default)]
     pub members: Vec<String>,
     #[serde(default)]
     pub default: Option<String>,
@@ -349,6 +352,28 @@ pub struct PolicyGroupConfig {
     pub interval_secs: Option<u32>,
     #[serde(default)]
     pub tolerance_ms: Option<u16>,
+    /// Health-checked groups: a connection waits for a check while the
+    /// group has no result (first use, after the network changed) instead
+    /// of taking the first member.
+    #[serde(default)]
+    pub evaluate_before_use: bool,
+    /// `subnet` groups: the first rule whose `when` matches the network the
+    /// client reported with the `set_network` control command picks the
+    /// target, else `default`.
+    #[serde(default)]
+    pub network_rules: Vec<NetworkRuleConfig>,
+}
+
+/// Most network rules one `subnet` group may have.
+pub const MAX_NETWORK_RULES: usize = 64;
+
+/// One rule of a `subnet` group; see
+/// [`config_core::routing::NetworkRuleSpec`] for `when`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkRuleConfig {
+    pub when: String,
+    pub target: String,
 }
 
 /// The `dns` section; see [`crate::dns_policy`].
@@ -683,6 +708,10 @@ impl RuntimeConfig {
                     || routing.outbounds.len() > MAX_ROUTED_OUTBOUNDS
                     || routing.rules.len() > MAX_ROUTING_RULES
                     || routing.groups.len() > MAX_POLICY_GROUPS
+                    || routing
+                        .groups
+                        .iter()
+                        .any(|group| group.network_rules.len() > MAX_NETWORK_RULES)
                     || routing.rule_sets.len() > MAX_RULE_SETS
                     || rule_set_entries > MAX_RULE_SET_ENTRIES
                 {
@@ -829,6 +858,15 @@ impl RuntimeConfig {
                     url: group.url.clone(),
                     interval_secs: group.interval_secs,
                     tolerance_ms: group.tolerance_ms,
+                    evaluate_before_use: group.evaluate_before_use,
+                    network_rules: group
+                        .network_rules
+                        .iter()
+                        .map(|rule| NetworkRuleSpec {
+                            when: rule.when.clone(),
+                            target: rule.target.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         };

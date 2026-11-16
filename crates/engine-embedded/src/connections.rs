@@ -890,7 +890,8 @@ impl Dispatcher {
         }
     }
 
-    /// Picks the outbound for one flow and records the decision.
+    /// Picks the outbound for one flow and records the decision. Returns
+    /// the route too, so a failed connect can ask its groups to retest.
     async fn route(
         &self,
         target: &TargetAddr,
@@ -899,10 +900,10 @@ impl Dispatcher {
         network: RouteNetwork,
         http: Option<&HttpRequestHead>,
         guard: &ConnectionGuard,
-    ) -> io::Result<Arc<dyn TcpOutbound>> {
+    ) -> io::Result<(Arc<dyn TcpOutbound>, RouteInfo)> {
         let (route, outbound) = match (self.mode(), &self.routed) {
             (Mode::Direct, _) => (direct_route(), Some(self.direct.clone())),
-            (Mode::Global, Some(routed)) => routed.route_global(),
+            (Mode::Global, Some(routed)) => routed.route_global_flow().await,
             (Mode::Rule, Some(routed)) => {
                 routed
                     .route_network_flow(target, host, process, network, http)
@@ -910,14 +911,30 @@ impl Dispatcher {
             }
             (_, None) => (single_route(&*self.outbound), Some(self.outbound.clone())),
         };
-        guard.set_route(route);
-        outbound.ok_or_else(|| {
-            guard.fail("rejected");
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "connection rejected by routing rule",
-            )
-        })
+        guard.set_route(route.clone());
+        match outbound {
+            Some(outbound) => Ok((outbound, route)),
+            None => {
+                guard.fail("rejected");
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "connection rejected by routing rule",
+                ))
+            }
+        }
+    }
+
+    /// A TCP connection routed as `route` failed to open: the health-checked
+    /// groups it went through probe its member at once (see
+    /// [`RoutedOutbound::report_failure`]).
+    fn report_connect_failure(&self, route: &RouteInfo, error: &io::Error) {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            // Refused by a rule or policy inside the outbound, not a dead node.
+            return;
+        }
+        if let Some(routed) = &self.routed {
+            routed.report_failure(route);
+        }
     }
 
     /// Opens a TCP connection to `target`. For an address target, `host` is
@@ -980,7 +997,7 @@ impl Dispatcher {
             }
             None => (target, host),
         };
-        let outbound = self
+        let (outbound, route) = self
             .route(target, host, process, RouteNetwork::Tcp, http, &guard)
             .await?;
         let resolved = if unfaked.is_some() {
@@ -989,7 +1006,13 @@ impl Dispatcher {
             None
         };
         let named = resolved.or_else(|| proxied_name(target, host, &*outbound));
-        let stream = outbound.connect(named.as_ref().unwrap_or(target)).await?;
+        let stream = match outbound.connect(named.as_ref().unwrap_or(target)).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.report_connect_failure(&route, &error);
+                return Err(error);
+            }
+        };
         guard.connected();
         Ok(Box::new(TrackedStream {
             inner: stream,
@@ -1054,7 +1077,9 @@ impl Dispatcher {
             }
             None => (target, host),
         };
-        let outbound = self
+        // UDP failures do not retest: a node without UDP relay still passes
+        // the (TCP) health check, so a retest would only cost a dial.
+        let (outbound, _) = self
             .route(target, host, None, RouteNetwork::Udp, None, &guard)
             .await?;
         let resolved = if unfaked.is_some() {

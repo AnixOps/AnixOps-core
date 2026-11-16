@@ -31,6 +31,36 @@
 //! url-test group every few minutes; each dial through a node keeps that
 //! node's session (and the radio) awake for minutes after it.
 //!
+//! ## Self-healing groups
+//!
+//! - **A failed connection retests its member.** When a connection through
+//!   a health-checked group fails to open
+//!   ([`RoutedOutbound::report_failure`]), the member it used is probed at
+//!   once instead of at the next interval (at most once per
+//!   [`FAILURE_RETEST_COOLDOWN`] per member). A member that fails the probe
+//!   loses its result, so the next connection takes another member; one
+//!   that passes keeps it, so a site that refuses connections does not
+//!   push the group off a good node. Only that member is probed, never the
+//!   whole group, so a dead site cannot make the phone dial every node.
+//! - **A network change forgets every result**
+//!   ([`RoutedOutbound::forget_health`], sent with `reset_network`):
+//!   latencies measured on the old network say nothing about the new one.
+//!   A group without a result is checked as soon as a connection goes
+//!   through it, and a check that started on the old network records
+//!   nothing.
+//! - **Evaluate before use.** A group with `evaluate_before_use` holds a
+//!   connection while it has no result (first use, or after a network
+//!   change) until its check finishes, at most [`EVALUATE_WAIT`], instead of
+//!   sending it through the first member, which may be dead.
+//! - **Url-test tolerance.** A url-test group keeps its member until another
+//!   is faster by more than the group's `tolerance_ms`, so near-equal
+//!   members do not trade places (and drop pooled sessions) on every check.
+//! - **Subnet groups** pick a target from the network the client reports
+//!   with [`RoutedOutbound::set_network`]: Wi-Fi name, access point, router,
+//!   an address range of the device or the interface type, else their
+//!   default. A connection decides once; `reset_network` closes the old
+//!   ones so they reconnect through the new pick.
+//!
 //! ## Hot reload
 //!
 //! The compiled rules live in a [`RoutingTable`] behind one pointer: every
@@ -48,13 +78,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use config_core::routing::{
-    parse_rule_line, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RouteMatch, RouteNetwork,
-    RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment, RoutingModel, RoutingRule,
-    RoutingSpec, RuleIndex, RuleLine, RuleMatcher,
+    parse_rule_line, NetworkContext, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RouteMatch,
+    RouteNetwork, RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment, RoutingModel,
+    RoutingRule, RoutingSpec, RuleIndex, RuleLine, RuleMatcher,
 };
 use config_core::rule_set::RuleSet;
 use engine_outbound::sniff::HttpRequestHead;
@@ -87,6 +118,56 @@ pub struct RoutedOutbound {
     /// Groups a flow went through since the last health check round, by id
     /// (see [`RoutedOutbound::run_health_checks`]).
     used_groups: Mutex<BTreeSet<String>>,
+    /// The member each url-test group uses now, kept until another member
+    /// is faster by more than the tolerance.
+    url_test_now: RwLock<BTreeMap<String, String>>,
+    /// The network the client reported, for subnet groups.
+    network: RwLock<Option<NetworkContext>>,
+    health: Mutex<HealthState>,
+    /// Wakes the check loop for a check asked for out of turn.
+    health_wake: tokio::sync::Notify,
+    /// Signalled after every check round.
+    health_done: tokio::sync::Notify,
+    /// Whether [`RoutedOutbound::run_health_checks`] runs, so a connection
+    /// never waits for a check nobody will make.
+    checks_running: AtomicBool,
+}
+
+/// Probing one member gives up after this long.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest a connection waits for the check of an `evaluate_before_use`
+/// group: one probe and a little slack.
+pub const EVALUATE_WAIT: Duration = Duration::from_secs(6);
+
+/// A member whose connection failed is probed again at most this often.
+pub const FAILURE_RETEST_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// What the check loop knows besides the latencies.
+#[derive(Default)]
+struct HealthState {
+    /// Groups whose check finished since the start or the last
+    /// [`RoutedOutbound::forget_health`].
+    checked: BTreeSet<String>,
+    /// Groups being checked now.
+    in_flight: BTreeSet<String>,
+    /// Groups to check at once, ahead of the interval.
+    pending_groups: BTreeSet<String>,
+    /// `(group, member)` to probe at once: a connection through it failed.
+    pending_members: BTreeSet<(String, String)>,
+    /// When a failed connection last asked to probe a member, by node or
+    /// DIRECT name.
+    failure_retests: BTreeMap<String, Instant>,
+    /// Grows on every [`RoutedOutbound::forget_health`]; a probe that
+    /// started before records nothing.
+    epoch: u64,
+}
+
+impl HealthState {
+    #[cfg(feature = "local-proxy")]
+    fn has_pending(&self) -> bool {
+        !self.pending_groups.is_empty() || !self.pending_members.is_empty()
+    }
 }
 
 /// One compiled rule list: the model, where the global mode goes, and
@@ -185,6 +266,8 @@ struct QueryEnvironment<'a> {
     rule_sets: &'a BTreeMap<String, Arc<RuleSet>>,
     latencies: &'a Latencies,
     selected: &'a BTreeMap<String, String>,
+    url_test_now: &'a BTreeMap<String, String>,
+    network: Option<&'a NetworkContext>,
     resolved: Option<IpAddr>,
     round_robin: &'a AtomicUsize,
 }
@@ -219,6 +302,14 @@ impl RoutingEnvironment for QueryEnvironment<'_> {
 
     fn round_robin(&self, _group_id: &str) -> usize {
         self.round_robin.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn url_test_current(&self, group_id: &str) -> Option<String> {
+        self.url_test_now.get(group_id).cloned()
+    }
+
+    fn network(&self) -> Option<&NetworkContext> {
+        self.network
     }
 }
 
@@ -304,6 +395,12 @@ impl RoutedOutbound {
             selected: RwLock::default(),
             round_robin: AtomicUsize::new(0),
             used_groups: Mutex::default(),
+            url_test_now: RwLock::default(),
+            network: RwLock::default(),
+            health: Mutex::default(),
+            health_wake: tokio::sync::Notify::new(),
+            health_done: tokio::sync::Notify::new(),
+            checks_running: AtomicBool::new(false),
         })
     }
 
@@ -598,10 +695,20 @@ impl RoutedOutbound {
             .selected
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let url_test_now = self
+            .url_test_now
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let network = self
+            .network
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         body(&QueryEnvironment {
             rule_sets: &rule_sets,
             latencies: &latencies,
             selected: &selected,
+            url_test_now: &url_test_now,
+            network: network.as_ref(),
             resolved,
             round_robin: &self.round_robin,
         })
@@ -680,11 +787,35 @@ impl RoutedOutbound {
     /// target, through its groups.
     pub fn route_global(&self) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
         let table = self.table();
-        let resolution = self.with_environment(None, |environment| {
+        let resolution = self.global_resolution(&table);
+        self.note_used(&table, &resolution);
+        self.global_route(&table, &resolution)
+    }
+
+    /// [`Self::route_global`] for a user flow, which waits for the check of
+    /// an `evaluate_before_use` group without a result.
+    pub async fn route_global_flow(&self) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
+        let table = self.table();
+        let mut resolution = self.global_resolution(&table);
+        if self.evaluate_before_use(&table, &resolution).await {
+            resolution = self.global_resolution(&table);
+        }
+        self.note_used(&table, &resolution);
+        self.global_route(&table, &resolution)
+    }
+
+    fn global_resolution(&self, table: &RoutingTable) -> RouteResolution {
+        self.with_environment(None, |environment| {
             table.model.route_to(&table.global, environment)
-        });
-        self.note_used(&resolution);
-        let mut route = describe(&table, &resolution);
+        })
+    }
+
+    fn global_route(
+        &self,
+        table: &RoutingTable,
+        resolution: &RouteResolution,
+    ) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
+        let mut route = describe(table, resolution);
         route.rule = "MODE,global".to_string();
         (route, self.outbound_of(&resolution.outcome))
     }
@@ -700,6 +831,11 @@ impl RoutedOutbound {
     /// Records a health check result for a group member; `None` marks it
     /// failed.
     pub fn record_latency(&self, group_id: &str, member: &str, latency_ms: Option<u32>) {
+        self.store_latency(group_id, member, latency_ms);
+        self.settle_url_test(group_id);
+    }
+
+    fn store_latency(&self, group_id: &str, member: &str, latency_ms: Option<u32>) {
         let mut latencies = self
             .latencies
             .write()
@@ -709,6 +845,65 @@ impl RoutedOutbound {
             Some(latency) => group.insert(member.to_string(), latency),
             None => group.remove(member),
         };
+    }
+
+    /// Moves a url-test group to the member it picks with the latest
+    /// results, keeping the current one within the tolerance.
+    fn settle_url_test(&self, group_id: &str) {
+        let table = self.table();
+        if table
+            .model
+            .group(group_id)
+            .is_none_or(|group| group.kind != PolicyGroupKind::UrlTest)
+        {
+            return;
+        }
+        let pick = self.with_environment(None, |environment| {
+            table.model.group_member(group_id, environment)
+        });
+        let mut now = self
+            .url_test_now
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match pick {
+            Some(member) => now.insert(group_id.to_string(), member.name().to_string()),
+            None => now.remove(group_id),
+        };
+    }
+
+    /// Records the results of one check round that started in `epoch`,
+    /// unless the network changed since; marks `groups` checked and wakes
+    /// the connections waiting for them.
+    #[cfg(feature = "local-proxy")]
+    fn finish_round(
+        &self,
+        epoch: u64,
+        groups: &[String],
+        results: Vec<(String, String, Option<u32>)>,
+    ) {
+        let current = self.lock_health().epoch == epoch;
+        if current {
+            let mut touched = BTreeSet::new();
+            for (group_id, member, latency) in results {
+                self.store_latency(&group_id, &member, latency);
+                touched.insert(group_id);
+            }
+            // Once per group, with the whole round in: the url-test pick
+            // never passes through a half-measured state.
+            for group_id in touched {
+                self.settle_url_test(&group_id);
+            }
+        }
+        {
+            let mut health = self.lock_health();
+            for group in groups {
+                health.in_flight.remove(group);
+                if current {
+                    health.checked.insert(group.clone());
+                }
+            }
+        }
+        self.health_done.notify_waiters();
     }
 
     /// Where a connection to `target` goes, resolving its domain only when an
@@ -755,27 +950,214 @@ impl RoutedOutbound {
         }
         query.process = process.map(str::to_string);
         let table = self.table();
-        let resolution = self.resolve_query(&table, &query).await;
-        self.note_used(&resolution);
+        let mut resolution = self.resolve_query(&table, &query).await;
+        if self.evaluate_before_use(&table, &resolution).await {
+            resolution = self.resolve_query(&table, &query).await;
+        }
+        self.note_used(&table, &resolution);
         let outbound = self.outbound_of(&resolution.outcome);
         (describe(&table, &resolution), outbound)
     }
 
     /// Remembers the groups a user flow went through, for lazy health
-    /// checks. Takes the lock only when the path has groups.
-    fn note_used(&self, resolution: &RouteResolution) {
+    /// checks, and asks for a check of a health-checked group on the path
+    /// that has no result yet (after a network change). Takes the locks only
+    /// when the path has groups.
+    fn note_used(&self, table: &RoutingTable, resolution: &RouteResolution) {
         if resolution.group_path.is_empty() {
             return;
         }
-        let mut used = self
-            .used_groups
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for group in &resolution.group_path {
-            if !used.contains(group) {
-                used.insert(group.clone());
+        {
+            let mut used = self
+                .used_groups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for group in &resolution.group_path {
+                if !used.contains(group) {
+                    used.insert(group.clone());
+                }
             }
         }
+        let unchecked = self.unchecked_groups(table, resolution, |_| true);
+        self.request_group_checks(unchecked);
+    }
+
+    /// Health-checked groups on the path of `resolution`, picked by
+    /// `filter`, with no finished check since the last network change.
+    fn unchecked_groups(
+        &self,
+        table: &RoutingTable,
+        resolution: &RouteResolution,
+        filter: impl Fn(&config_core::routing::PolicyGroup) -> bool,
+    ) -> Vec<String> {
+        let health = self.lock_health();
+        resolution
+            .group_path
+            .iter()
+            .filter(|id| !health.checked.contains(*id))
+            .filter(|id| {
+                table
+                    .model
+                    .group(id)
+                    .is_some_and(|group| group.kind.is_health_checked() && filter(group))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Holds a connection whose path has an `evaluate_before_use` group
+    /// without a result until that group's check finishes, at most
+    /// [`EVALUATE_WAIT`]. Returns whether it waited, so the caller routes
+    /// again with the new results.
+    async fn evaluate_before_use(
+        &self,
+        table: &RoutingTable,
+        resolution: &RouteResolution,
+    ) -> bool {
+        if !self.checks_running.load(Ordering::Acquire) {
+            return false;
+        }
+        let waiting = self.unchecked_groups(table, resolution, |group| group.evaluate_before_use);
+        if waiting.is_empty() {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + EVALUATE_WAIT;
+        loop {
+            // Again on every wake: a round that started on the previous
+            // network finished without a result.
+            self.request_group_checks(waiting.clone());
+            let done = self.health_done.notified();
+            tokio::pin!(done);
+            // Registered before the check below, so a round that ends in
+            // between still wakes this flow.
+            done.as_mut().enable();
+            {
+                let health = self.lock_health();
+                if waiting.iter().all(|id| health.checked.contains(id)) {
+                    return true;
+                }
+            }
+            if tokio::time::timeout_at(deadline, done).await.is_err() {
+                return true;
+            }
+        }
+    }
+
+    fn lock_health(&self) -> std::sync::MutexGuard<'_, HealthState> {
+        self.health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Asks the check loop to check `groups` now, unless a check of them
+    /// is already due or running.
+    fn request_group_checks(&self, groups: Vec<String>) {
+        if groups.is_empty() {
+            return;
+        }
+        let mut asked = false;
+        {
+            let mut health = self.lock_health();
+            for group in groups {
+                if !health.in_flight.contains(&group) && !health.pending_groups.contains(&group) {
+                    health.pending_groups.insert(group);
+                    asked = true;
+                }
+            }
+        }
+        if asked {
+            self.health_wake.notify_one();
+        }
+    }
+
+    /// A connection routed as `route` (its [`RouteInfo::chain`]) failed to
+    /// open through its outbound: probe that outbound in each health-checked
+    /// group on the path at once (see the module docs). Rate limited per
+    /// outbound by [`FAILURE_RETEST_COOLDOWN`]. Returns whether a probe was
+    /// asked for.
+    pub fn report_failure(&self, route: &RouteInfo) -> bool {
+        let Some((member, groups)) = route.chain.split_last() else {
+            return false;
+        };
+        if groups.is_empty() || member == "REJECT" {
+            return false;
+        }
+        let table = self.table();
+        let checked_groups: Vec<&String> = groups
+            .iter()
+            .filter(|id| {
+                table
+                    .model
+                    .group(id)
+                    .is_some_and(|group| group.kind.is_health_checked())
+            })
+            .collect();
+        if checked_groups.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        {
+            let mut health = self.lock_health();
+            if health
+                .failure_retests
+                .get(member)
+                .is_some_and(|last| now.duration_since(*last) < FAILURE_RETEST_COOLDOWN)
+            {
+                return false;
+            }
+            health.failure_retests.insert(member.clone(), now);
+            for group in checked_groups {
+                health
+                    .pending_members
+                    .insert((group.clone(), member.clone()));
+            }
+        }
+        self.health_wake.notify_one();
+        true
+    }
+
+    /// Forgets every health check result, url-test pick and failure
+    /// cooldown: the network under the engine changed (see the module
+    /// docs). Probes still running record nothing. Returns how many groups
+    /// had results.
+    pub fn forget_health(&self) -> usize {
+        let forgotten = {
+            let mut health = self.lock_health();
+            health.epoch += 1;
+            health.failure_retests.clear();
+            health.pending_members.clear();
+            std::mem::take(&mut health.checked).len()
+        };
+        self.latencies
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.url_test_now
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        forgotten
+    }
+
+    /// Sets the network the device is on, for subnet groups; `None` when
+    /// the client does not know. Returns whether it changed. Connections
+    /// already open keep their route.
+    pub fn set_network(&self, network: Option<NetworkContext>) -> bool {
+        let mut current = self
+            .network
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current == network {
+            return false;
+        }
+        *current = network;
+        true
+    }
+
+    /// Whether a check of `group_id` finished since the start or the last
+    /// [`Self::forget_health`].
+    pub fn group_checked(&self, group_id: &str) -> bool {
+        self.lock_health().checked.contains(group_id)
     }
 
     /// The groups used since the last call, and forgets them.
@@ -804,21 +1186,20 @@ impl RoutedOutbound {
     /// Measures every member of the health-checked groups through its
     /// outbound, then again after the shortest group interval, forever, but
     /// only the groups a flow went through since the previous round (lazy;
-    /// a round with none measures nothing). Group members that are groups
-    /// themselves or REJECT are not measured. Never returns when no group
-    /// needs checks.
+    /// a round with none measures nothing). Between rounds it checks at once
+    /// what routing asks for: a group without a result that a flow went
+    /// through, and a member whose connection failed (see the module docs).
+    /// Group members that are groups themselves or REJECT are not measured.
+    /// Never returns when no group needs checks.
     #[cfg(feature = "local-proxy")]
     pub async fn run_health_checks(self: Arc<Self>) {
-        use std::time::Duration;
-
-        const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
         // Groups never change on a reload, so the first table's are the ones.
         let table = self.table();
         let checked: Vec<_> = table
             .model
             .groups
             .iter()
-            .filter(|group| group.kind != PolicyGroupKind::Select)
+            .filter(|group| group.kind.is_health_checked())
             .filter_map(|group| Some((group, group.health_check.clone()?)))
             .collect();
         let Some(interval) = checked
@@ -828,39 +1209,100 @@ impl RoutedOutbound {
         else {
             return std::future::pending().await;
         };
+        let interval = Duration::from_secs(u64::from(interval));
+        self.checks_running.store(true, Ordering::Release);
         let mut first = true;
+        let mut next_round = tokio::time::Instant::now();
         loop {
-            let due = due_groups(&checked, first, &self.take_used_groups());
+            if !first && !self.lock_health().has_pending() {
+                tokio::select! {
+                    () = tokio::time::sleep_until(next_round) => {}
+                    () = self.health_wake.notified() => {}
+                }
+            }
+            let scheduled = first || tokio::time::Instant::now() >= next_round;
+            let used = if scheduled {
+                self.take_used_groups()
+            } else {
+                BTreeSet::new()
+            };
+            let (epoch, groups, members) = {
+                let mut health = self.lock_health();
+                let mut groups: Vec<(&config_core::routing::PolicyGroup, String)> = Vec::new();
+                if scheduled {
+                    for (group, check) in due_groups(&checked, first, &used) {
+                        groups.push((group, check.url.clone()));
+                    }
+                }
+                let pending = std::mem::take(&mut health.pending_groups);
+                for (group, check) in &checked {
+                    if pending.contains(&group.id)
+                        && !groups.iter().any(|(due, _)| due.id == group.id)
+                    {
+                        groups.push((*group, check.url.clone()));
+                    }
+                }
+                for (group, _) in &groups {
+                    health.in_flight.insert(group.id.clone());
+                }
+                let members: Vec<(String, String, String)> =
+                    std::mem::take(&mut health.pending_members)
+                        .into_iter()
+                        .filter(|(group_id, _)| !groups.iter().any(|(due, _)| &due.id == group_id))
+                        .filter_map(|(group_id, member)| {
+                            let (_, check) =
+                                checked.iter().find(|(group, _)| group.id == group_id)?;
+                            Some((group_id, member, check.url.clone()))
+                        })
+                        .collect();
+                (health.epoch, groups, members)
+            };
+            if scheduled {
+                next_round = tokio::time::Instant::now() + interval;
+            }
             first = false;
-            let mut probes = tokio::task::JoinSet::new();
-            for (group, check) in due {
+
+            let mut jobs: Vec<(String, PolicyTarget, String)> = Vec::new();
+            for (group, url) in &groups {
                 for member in &group.members {
-                    let outbound = match member {
-                        PolicyTarget::Node(id) => self.nodes.get(id).cloned(),
-                        PolicyTarget::Direct => Some(self.direct.clone()),
-                        PolicyTarget::Reject | PolicyTarget::Group(_) => None,
-                    };
-                    let Some(outbound) = outbound else { continue };
-                    let (group_id, name, url) = (
-                        group.id.clone(),
-                        member.name().to_string(),
-                        check.url.clone(),
-                    );
-                    probes.spawn(async move {
-                        let latency = crate::delay::probe(&*outbound, &url, PROBE_TIMEOUT)
-                            .await
-                            .ok()
-                            .map(|elapsed| u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
-                        (group_id, name, latency)
-                    });
+                    jobs.push((group.id.clone(), member.clone(), url.clone()));
                 }
             }
+            for (group_id, member, url) in members {
+                let target = table
+                    .model
+                    .group(&group_id)
+                    .and_then(|group| group.members.iter().find(|m| m.name() == member))
+                    .cloned();
+                if let Some(target) = target {
+                    jobs.push((group_id, target, url));
+                }
+            }
+            let mut probes = tokio::task::JoinSet::new();
+            for (group_id, member, url) in jobs {
+                let outbound = match &member {
+                    PolicyTarget::Node(id) => self.nodes.get(id).cloned(),
+                    PolicyTarget::Direct => Some(self.direct.clone()),
+                    PolicyTarget::Reject | PolicyTarget::Group(_) => None,
+                };
+                let Some(outbound) = outbound else { continue };
+                let name = member.name().to_string();
+                probes.spawn(async move {
+                    let latency = crate::delay::probe(&*outbound, &url, PROBE_TIMEOUT)
+                        .await
+                        .ok()
+                        .map(|elapsed| u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
+                    (group_id, name, latency)
+                });
+            }
+            let mut results = Vec::new();
             while let Some(result) = probes.join_next().await {
-                if let Ok((group_id, member, latency)) = result {
-                    self.record_latency(&group_id, &member, latency);
+                if let Ok(result) = result {
+                    results.push(result);
                 }
             }
-            tokio::time::sleep(Duration::from_secs(u64::from(interval))).await;
+            let group_ids: Vec<String> = groups.iter().map(|(group, _)| group.id.clone()).collect();
+            self.finish_round(epoch, &group_ids, results);
         }
     }
 }
@@ -1155,6 +1597,7 @@ mod lazy_health_tests {
             url: None,
             interval_secs: None,
             tolerance_ms: None,
+            ..PolicyGroupSpec::default()
         }
     }
 

@@ -740,6 +740,7 @@ fn plugin_policy_names_resolve_to_a_user_group_or_the_proxy_fallback() {
         url: None,
         interval_secs: None,
         tolerance_ms: None,
+        ..PolicyGroupSpec::default()
     };
     let nodes = BTreeSet::from(["node-a".to_string()]);
     let environment = StaticRoutingEnvironment;

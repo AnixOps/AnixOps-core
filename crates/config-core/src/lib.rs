@@ -46,7 +46,7 @@ use control_domain::{
     NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY, NODE_METADATA_WIREGUARD_PRE_SHARED_KEY,
     NODE_METADATA_WIREGUARD_PRIVATE_KEY, NODE_METADATA_WIREGUARD_RESERVED,
 };
-use routing::{PolicyGroupSpec, RoutingModel, RoutingSpec};
+use routing::{NetworkRuleSpec, PolicyGroupSpec, RoutingModel, RoutingSpec};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -163,11 +163,23 @@ struct RawPolicyGroup {
     id: String,
     #[serde(rename = "type")]
     kind: String,
+    /// Absent for a subnet group.
+    #[serde(default)]
     members: Vec<String>,
     default: Option<String>,
     url: Option<String>,
     interval_secs: Option<u32>,
     tolerance_ms: Option<u16>,
+    evaluate_before_use: Option<bool>,
+    network_rules: Option<Vec<RawNetworkRule>>,
+}
+
+/// One subnet group rule: `{"when": "SSID:Home", "target": "DIRECT"}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNetworkRule {
+    when: String,
+    target: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,6 +583,16 @@ fn collect_routing(
                 url: group.url,
                 interval_secs: group.interval_secs,
                 tolerance_ms: group.tolerance_ms,
+                evaluate_before_use: group.evaluate_before_use.unwrap_or(false),
+                network_rules: group
+                    .network_rules
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|rule| NetworkRuleSpec {
+                        when: rule.when,
+                        target: rule.target,
+                    })
+                    .collect(),
             })
             .collect(),
     };

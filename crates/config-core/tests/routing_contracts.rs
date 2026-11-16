@@ -1,15 +1,16 @@
 use config_core::parse_config_document;
 use config_core::routing::{
-    parse_rule_line, IpCidr, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RouteMatch,
-    RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment, RoutingModel, RoutingSpec,
-    RuleLine, RuleMatcher, StaticRoutingEnvironment, ROUTING_FINAL_MISSING_CODE,
-    ROUTING_FINAL_NOT_LAST_CODE, ROUTING_GROUP_CYCLE_CODE, ROUTING_GROUP_DEFAULT_INVALID_CODE,
+    parse_rule_line, IpCidr, NetworkCondition, NetworkContext, NetworkKind, NetworkRuleSpec,
+    PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RouteMatch, RouteOutcome, RouteQuery,
+    RouteResolution, RoutingEnvironment, RoutingModel, RoutingSpec, RuleLine, RuleMatcher,
+    StaticRoutingEnvironment, ROUTING_FINAL_MISSING_CODE, ROUTING_FINAL_NOT_LAST_CODE,
+    ROUTING_GROUP_CYCLE_CODE, ROUTING_GROUP_DEFAULT_INVALID_CODE,
     ROUTING_GROUP_HEALTH_CHECK_INVALID_CODE, ROUTING_GROUP_ID_CONFLICT_CODE,
     ROUTING_GROUP_ID_INVALID_CODE, ROUTING_GROUP_MEMBERS_EMPTY_CODE,
-    ROUTING_GROUP_MEMBER_UNSUPPORTED_CODE, ROUTING_GROUP_TYPE_UNSUPPORTED_CODE,
-    ROUTING_RULE_LINE_INVALID_CODE, ROUTING_RULE_OPTION_UNSUPPORTED_CODE,
-    ROUTING_RULE_TYPE_UNSUPPORTED_CODE, ROUTING_RULE_VALUE_INVALID_CODE,
-    ROUTING_TARGET_UNKNOWN_CODE,
+    ROUTING_GROUP_MEMBER_UNSUPPORTED_CODE, ROUTING_GROUP_NETWORK_RULE_INVALID_CODE,
+    ROUTING_GROUP_TYPE_UNSUPPORTED_CODE, ROUTING_RULE_LINE_INVALID_CODE,
+    ROUTING_RULE_OPTION_UNSUPPORTED_CODE, ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
+    ROUTING_RULE_VALUE_INVALID_CODE, ROUTING_TARGET_UNKNOWN_CODE,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,6 +296,7 @@ fn group(id: &str, kind: &str, members: &[&str]) -> PolicyGroupSpec {
         url: None,
         interval_secs: None,
         tolerance_ms: None,
+        ..PolicyGroupSpec::default()
     }
 }
 
@@ -929,4 +931,253 @@ fn url_regex_rules_match_plain_http_urls_inside_logical_rules() {
             .code,
         ROUTING_RULE_TYPE_UNSUPPORTED_CODE
     );
+}
+
+fn network_rule(when: &str, target: &str) -> NetworkRuleSpec {
+    NetworkRuleSpec {
+        when: when.to_string(),
+        target: target.to_string(),
+    }
+}
+
+fn subnet(default: Option<&str>, rules: Vec<NetworkRuleSpec>) -> PolicyGroupSpec {
+    PolicyGroupSpec {
+        id: "ByNetwork".to_string(),
+        kind: "subnet".to_string(),
+        default: default.map(str::to_string),
+        network_rules: rules,
+        ..PolicyGroupSpec::default()
+    }
+}
+
+#[test]
+fn network_conditions_parse_surge_subnet_keys() {
+    let parse = NetworkCondition::parse;
+    assert_eq!(
+        parse("SSID:My Home"),
+        Some(NetworkCondition::Ssid("My Home".to_string()))
+    );
+    assert_eq!(
+        parse("bssid:AA-BB-CC-DD-EE-0F"),
+        Some(NetworkCondition::Bssid("aa:bb:cc:dd:ee:0f".to_string()))
+    );
+    assert_eq!(
+        parse("ROUTER:192.168.1.1"),
+        Some(NetworkCondition::Router("192.168.1.1".parse().unwrap()))
+    );
+    assert_eq!(
+        parse("SUBNET:10.0.0.0/8"),
+        Some(NetworkCondition::Subnet(
+            IpCidr::parse("10.0.0.0/8").unwrap()
+        ))
+    );
+    assert_eq!(
+        parse("TYPE:WIRED"),
+        Some(NetworkCondition::Kind(NetworkKind::Wired))
+    );
+    assert_eq!(
+        parse("cellular"),
+        Some(NetworkCondition::Kind(NetworkKind::Cellular))
+    );
+    for bad in [
+        "SSID:",
+        "BSSID:aa:bb",
+        "ROUTER:gateway",
+        "SUBNET:10.0.0.0/40",
+        "TYPE:satellite",
+        "Home",
+        "WIFI:Home",
+    ] {
+        assert_eq!(parse(bad), None, "{bad}");
+    }
+
+    let network = NetworkContext {
+        kind: Some(NetworkKind::Wifi),
+        ssid: Some("My Home".to_string()),
+        bssid: Some("aa:bb:cc:dd:ee:0f".to_string()),
+        router: Some("192.168.1.1".parse().unwrap()),
+        addresses: vec!["192.168.1.20".parse().unwrap()],
+    };
+    for when in [
+        "SSID:My Home",
+        "BSSID:AA:BB:CC:DD:EE:0F",
+        "ROUTER:192.168.1.1",
+        "SUBNET:192.168.1.0/24",
+        "TYPE:WIFI",
+    ] {
+        assert!(parse(when).unwrap().matches(&network), "{when}");
+    }
+    for when in [
+        "SSID:my home",
+        "ROUTER:192.168.1.254",
+        "SUBNET:10.0.0.0/8",
+        "CELLULAR",
+    ] {
+        assert!(!parse(when).unwrap().matches(&network), "{when}");
+    }
+    // An unknown network matches nothing.
+    assert!(!parse("TYPE:WIFI")
+        .unwrap()
+        .matches(&NetworkContext::default()));
+}
+
+#[test]
+fn subnet_groups_validate_rules_and_default() {
+    let model = RoutingModel::from_spec(
+        &spec(
+            &["FINAL,ByNetwork"],
+            vec![
+                subnet(
+                    Some("Auto"),
+                    vec![
+                        network_rule("SSID:Home", "DIRECT"),
+                        network_rule("TYPE:CELLULAR", "hk-1"),
+                    ],
+                ),
+                group("Auto", "url-test", &["hk-1", "jp-1"]),
+            ],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+    let group = model.group("ByNetwork").unwrap();
+    assert_eq!(group.kind, PolicyGroupKind::Subnet);
+    assert_eq!(
+        group.members,
+        vec![
+            PolicyTarget::Group("Auto".to_string()),
+            PolicyTarget::Direct,
+            PolicyTarget::Node("hk-1".to_string()),
+        ]
+    );
+    // Without a network the default is used.
+    assert_eq!(
+        model.group_member("ByNetwork", &StaticRoutingEnvironment),
+        Some(PolicyTarget::Group("Auto".to_string()))
+    );
+
+    let cases = [
+        (
+            subnet(None, vec![network_rule("SSID:Home", "DIRECT")]),
+            ROUTING_GROUP_DEFAULT_INVALID_CODE,
+        ),
+        (
+            subnet(Some("hk-1"), vec![network_rule("Home", "DIRECT")]),
+            ROUTING_GROUP_NETWORK_RULE_INVALID_CODE,
+        ),
+        (
+            subnet(Some("hk-1"), vec![network_rule("SSID:Home", "REJECT")]),
+            ROUTING_GROUP_MEMBER_UNSUPPORTED_CODE,
+        ),
+        (
+            subnet(Some("hk-1"), vec![network_rule("SSID:Home", "nowhere")]),
+            ROUTING_TARGET_UNKNOWN_CODE,
+        ),
+        (
+            PolicyGroupSpec {
+                members: vec!["hk-1".to_string()],
+                ..subnet(Some("hk-1"), Vec::new())
+            },
+            ROUTING_GROUP_NETWORK_RULE_INVALID_CODE,
+        ),
+        (
+            PolicyGroupSpec {
+                interval_secs: Some(60),
+                ..subnet(Some("hk-1"), Vec::new())
+            },
+            ROUTING_GROUP_HEALTH_CHECK_INVALID_CODE,
+        ),
+    ];
+    for (group, code) in cases {
+        assert_eq!(model_error(&spec(&["FINAL,ByNetwork"], vec![group])), code);
+    }
+
+    // A subnet group that reaches itself through a select group is a cycle.
+    let cyclic = spec(
+        &["FINAL,ByNetwork"],
+        vec![
+            subnet(Some("Proxy"), Vec::new()),
+            group("Proxy", "select", &["ByNetwork", "hk-1"]),
+        ],
+    );
+    assert_eq!(model_error(&cyclic), ROUTING_GROUP_CYCLE_CODE);
+}
+
+#[test]
+fn only_health_checked_groups_evaluate_before_use_and_only_subnet_groups_have_network_rules() {
+    let evaluated = |kind: &str| PolicyGroupSpec {
+        evaluate_before_use: true,
+        ..group("Auto", kind, &["hk-1", "jp-1"])
+    };
+    for kind in ["url-test", "fallback", "load-balance", "round-robin"] {
+        let model =
+            RoutingModel::from_spec(&spec(&["FINAL,Auto"], vec![evaluated(kind)]), &node_ids())
+                .unwrap();
+        assert!(model.group("Auto").unwrap().evaluate_before_use, "{kind}");
+    }
+    assert_eq!(
+        model_error(&spec(&["FINAL,Auto"], vec![evaluated("select")])),
+        ROUTING_GROUP_HEALTH_CHECK_INVALID_CODE
+    );
+    let with_rules = PolicyGroupSpec {
+        network_rules: vec![network_rule("SSID:Home", "DIRECT")],
+        ..group("Auto", "url-test", &["hk-1", "jp-1"])
+    };
+    assert_eq!(
+        model_error(&spec(&["FINAL,Auto"], vec![with_rules])),
+        ROUTING_GROUP_NETWORK_RULE_INVALID_CODE
+    );
+}
+
+/// Latencies plus the url-test member in use, for the tolerance.
+struct Measured {
+    latencies: BTreeMap<&'static str, u32>,
+    current: Option<&'static str>,
+}
+
+impl RoutingEnvironment for Measured {
+    fn member_latency_ms(&self, _group_id: &str, member: &PolicyTarget) -> Option<u32> {
+        self.latencies.get(member.name()).copied()
+    }
+
+    fn url_test_current(&self, _group_id: &str) -> Option<String> {
+        self.current.map(str::to_string)
+    }
+}
+
+#[test]
+fn url_test_switches_only_beyond_the_tolerance() {
+    let auto = PolicyGroupSpec {
+        tolerance_ms: Some(50),
+        ..group("Auto", "url-test", &["hk-1", "jp-1"])
+    };
+    let model = RoutingModel::from_spec(&spec(&["FINAL,Auto"], vec![auto]), &node_ids()).unwrap();
+    let pick = |hk: u32, jp: u32, current: Option<&'static str>| {
+        model
+            .group_member(
+                "Auto",
+                &Measured {
+                    latencies: BTreeMap::from([("hk-1", hk), ("jp-1", jp)]),
+                    current,
+                },
+            )
+            .unwrap()
+            .name()
+            .to_string()
+    };
+    assert_eq!(pick(100, 60, None), "jp-1");
+    assert_eq!(pick(100, 60, Some("hk-1")), "hk-1");
+    assert_eq!(pick(100, 50, Some("hk-1")), "hk-1");
+    assert_eq!(pick(100, 49, Some("hk-1")), "jp-1");
+    // A current member without a result is not kept.
+    let model_pick = model
+        .group_member(
+            "Auto",
+            &Measured {
+                latencies: BTreeMap::from([("jp-1", 300)]),
+                current: Some("hk-1"),
+            },
+        )
+        .unwrap();
+    assert_eq!(model_pick.name(), "jp-1");
 }
