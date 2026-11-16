@@ -4,7 +4,7 @@
 
 ## 范围
 
-- 规则：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`（可带 `no-resolve`）、`GEOIP`、`GEOSITE`、`DST-PORT`（别名 `DEST-PORT`，单个端口或 `起-止`）、`PROCESS-NAME`、`RULE-SET`、逻辑规则 `AND`/`OR`/`NOT`、`FINAL`。
+- 规则：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`（可带 `no-resolve`）、`GEOIP`、`GEOSITE`、`DST-PORT`（别名 `DEST-PORT`，单个端口或 `起-止`）、`SRC-IP`（别名 `SRC-IP-CIDR`，地址或网段，IPv6 可加方括号）、`IN-PORT`（入站监听端口，单个或 `起-止`）、`PROCESS-NAME`、`RULE-SET`、逻辑规则 `AND`/`OR`/`NOT`、`FINAL`。
 - 逻辑规则采用 Surge 写法：`AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443)),Proxy`、`NOT,((DOMAIN-KEYWORD,ads)),DIRECT`；子规则不带目标，可以嵌套（最多 8 层），`NOT` 只能有一个子规则。含 IP 子规则的逻辑规则按 IP 规则处理，可带 `no-resolve`。
 - 策略组：`select`、`url-test`、`fallback`、`load-balance`（按目的主机一致性哈希）、`round-robin`（轮询）。
 - 目标：`DIRECT`、`REJECT` 系列（`REJECT`、`REJECT-NO-DROP`、`REJECT-DROP`、`REJECT-TINYGIF`，Loon `REJECT-IMG` 等同 `REJECT-TINYGIF`）、策略组 id、节点 id（保留名大小写不敏感）。
@@ -122,7 +122,7 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 - 运行时配置新增 `routing` 段（与 `outbound` 二选一）：`outbounds` 以节点 id 为键，`rules` 与 `groups` 字段同 `RoutingSpec`/`PolicyGroupSpec`。路由节点必须是 TCP 出站（Shadowsocks-2022、direct）；WireGuard 是包级隧道，只能作为单一 `outbound` 使用。
 - `engine_embedded::routing::RoutedOutbound` 对每个连接调用 `decide`，`DIRECT` 走直连出站，`REJECT` 系列直接失败（按下文「REJECT 系列」应答），节点走对应出站。select 组先用运行时 `select` 控制命令的选择，再用 `default` 或第一个成员；url-test/fallback/load-balance/round-robin 使用 `run_health_checks` 的测速结果，round-robin 的计数在 `RoutedOutbound` 内。
 - 隧道从 TCP 首包嗅探 TLS SNI 或 HTTP `Host`：域名规则按嗅探到的名字匹配，IP 规则仍匹配目的地址，连接仍发往原地址。UDP（含 QUIC）尚不嗅探，FakeIP 未接入。
-- 每个连接都带目的端口，`DST-PORT` 规则在隧道和本地代理里都生效。`PROCESS-NAME` 规则在桌面 local proxy 中生效：配置含该规则时，每条连接先由 `engine-embedded::process` 按连接两端地址查出发起进程（Linux `/proc`、Windows `GetExtendedTcpTable`、macOS `proc_pidfdinfo`），名称为可执行文件名，连接列表的 `process` 字段显示它。查不到（其他用户的进程、无权限）时该连接不命中 `PROCESS-NAME`。iOS 隧道没有进程信息，规则不命中。
+- 每个连接都带目的端口，`DST-PORT` 规则在隧道和本地代理里都生效。`SRC-IP` 匹配发起连接的一方：本地代理、局域网共享和回放代理里是客户端地址（双栈监听上的 IPv4 映射地址按 IPv4 比较），包隧道里是应用的源地址（隧道作网关时即局域网设备的地址）。`IN-PORT` 匹配客户端连上的本地监听端口（本地代理、局域网共享各自的端口），包隧道没有监听端口，不命中。HTTPS 解密后的连接沿用原连接的来源。`PROCESS-NAME` 规则在桌面 local proxy 中生效：配置含该规则时，每条连接先由 `engine-embedded::process` 按连接两端地址查出发起进程（Linux `/proc`、Windows `GetExtendedTcpTable`、macOS `proc_pidfdinfo`），名称为可执行文件名，连接列表的 `process` 字段显示它。查不到（其他用户的进程、无权限）时该连接不命中 `PROCESS-NAME`。iOS 隧道没有进程信息，规则不命中。
 - 规则集（`routing.rule_sets`，最多 32 个，合计 50 万条）：每个集可含 `domain`、`domain_suffix`、`domain_keyword`、`ip_cidr`。`RULE-SET,<name>` 匹配同名集；`GEOSITE,<category>` 匹配名为 `geosite-<category>` 的集（未配置时整个配置被拒绝）；`GEOIP,<CC>` 匹配 `geoip-<cc>`（小写，未配置时与以前一样不命中）。客户端以普通列表提供 GeoSite/GeoIP 数据，例如 MetaCubeX `meta-rules-dat` 的文本规则集。
 - 远程规则集：规则集带 `url` 时由内核自己下载（需要 `local-proxy` feature，iOS 与桌面构建都包含），可选 `format`（`suffix`：裸域名匹配自身与子域名，默认；`domain`：裸域名只匹配自身，即 Clash `behavior: domain`）、`interval_secs`（至少 600，默认 86400）和 `via`（经哪个策略组、节点或 `DIRECT` 下载，默认 `DIRECT`）。内联条目作为初始内容（客户端缓存的副本）；初始为空时启动即下载，之后按间隔刷新，失败保留旧内容并在 5 分钟内重试。下载为 HTTP/1.1 GET（不跟随跳转、不压缩，最大 32 MiB，60 秒超时），列表可以是 Surge/Loon/Clash classical 行、Clash `payload:` YAML 或每行一个域名/网段。可选签名校验：`public_key`（Ed25519 公钥 32 字节，base64）要求每次下载都附带分离签名，签名默认取 `<url>.sig`（可用 `signature_url` 指定），文件内容是对列表原始字节的 64 字节签名（标准或 URL-safe base64，可带 `#` / `untrusted comment:` 注释行，最大 1 KiB）；签名缺失记 `signature_missing`、格式不对记 `signature_malformed`、校验失败记 `signature_invalid`，都按下载失败处理，保留旧内容。运行时控制 `rule_sets` 返回每个集的来源、条目数、最近成功时间、最近错误（不含 URL）和是否要求签名（`signed`），`update_rule_sets` 立即刷新全部远程集。
 - 运行时控制（见 FFI 边界文档 “Runtime Control”）提供连接列表、模式切换（`rule`/`global`/`direct`，全局目标为 `routing.global`）、策略组列表与 select 切换。

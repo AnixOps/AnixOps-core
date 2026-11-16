@@ -1017,3 +1017,95 @@ fn url_regex_rules_match_plain_http_urls_inside_logical_rules() {
         ROUTING_RULE_TYPE_UNSUPPORTED_CODE
     );
 }
+
+#[test]
+fn src_ip_and_in_port_rules_match_where_a_flow_came_from() {
+    let model = RoutingModel::from_spec(
+        &spec(
+            &[
+                "SRC-IP,192.168.1.20,hk-1",
+                "SRC-IP-CIDR,10.8.0.0/16,jp-1,no-resolve",
+                "SRC-IP,[2001:db8::7],DIRECT",
+                "IN-PORT,7891,REJECT",
+                "IN-PORT,8000-8010,jp-1",
+                "FINAL,DIRECT",
+            ],
+            vec![],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+    assert_eq!(model.rules[0].matcher.to_string(), "SRC-IP,192.168.1.20/32");
+    assert_eq!(model.rules[1].matcher.to_string(), "SRC-IP,10.8.0.0/16");
+    assert!(!model.rules[1].no_resolve);
+    assert_eq!(model.rules[2].matcher.to_string(), "SRC-IP,2001:db8::7/128");
+    assert_eq!(model.rules[3].matcher.to_string(), "IN-PORT,7891");
+    assert_eq!(model.rules[4].matcher, RuleMatcher::InPort(8000, 8010));
+    assert_eq!(model.rules[4].matcher.to_string(), "IN-PORT,8000-8010");
+
+    let from = |source: &str, in_port: Option<u16>| {
+        RouteQuery::domain("example.com")
+            .with_port(443)
+            .with_source(Some(source.parse().unwrap()), in_port)
+    };
+    for (query, expected) in [
+        (from("192.168.1.20", None), RouteMatch::Rule(0)),
+        // An IPv4 client seen on a dual-stack listener.
+        (from("::ffff:192.168.1.20", Some(7890)), RouteMatch::Rule(0)),
+        (from("10.8.3.4", Some(7891)), RouteMatch::Rule(1)),
+        (from("2001:db8::7", None), RouteMatch::Rule(2)),
+        (from("192.168.1.21", Some(7891)), RouteMatch::Rule(3)),
+        (from("192.168.1.21", Some(8005)), RouteMatch::Rule(4)),
+        (from("192.168.1.21", Some(7890)), RouteMatch::Final),
+        // The packet tunnel knows no listener port and, without a source,
+        // nothing matches either rule.
+        (RouteQuery::domain("example.com"), RouteMatch::Final),
+    ] {
+        let resolution = model.decide(&query, &StaticRoutingEnvironment);
+        assert_eq!(resolution.matched, expected, "{query:?}");
+    }
+
+    // Inside logical rules too.
+    let logical = RoutingModel::from_spec(
+        &spec(
+            &[
+                "AND,((SRC-IP,192.168.1.0/24),(DOMAIN-SUFFIX,corp.example)),hk-1",
+                "FINAL,DIRECT",
+            ],
+            vec![],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+    let corp = RouteQuery::domain("git.corp.example");
+    let resolution = logical.decide(
+        &corp
+            .clone()
+            .with_source(Some("192.168.1.9".parse().unwrap()), None),
+        &StaticRoutingEnvironment,
+    );
+    assert_eq!(resolution.outcome, RouteOutcome::Node("hk-1".to_string()));
+    let resolution = logical.decide(&corp, &StaticRoutingEnvironment);
+    assert_eq!(resolution.matched, RouteMatch::Final);
+
+    for bad in [
+        "SRC-IP,example.com,DIRECT",
+        "SRC-IP,10.0.0.0/33,DIRECT",
+        "IN-PORT,0x50,DIRECT",
+        "IN-PORT,9000-8000,DIRECT",
+    ] {
+        assert_eq!(
+            model_error(&spec(&[bad, "FINAL,DIRECT"], vec![])),
+            ROUTING_RULE_VALUE_INVALID_CODE,
+            "{bad}"
+        );
+    }
+    // IN-PORT takes no no-resolve.
+    assert_eq!(
+        model_error(&spec(
+            &["IN-PORT,7890,DIRECT,no-resolve", "FINAL,DIRECT"],
+            vec![]
+        )),
+        ROUTING_RULE_OPTION_UNSUPPORTED_CODE
+    );
+}

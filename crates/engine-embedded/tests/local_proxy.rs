@@ -265,3 +265,51 @@ fn process_name_rules_apply_to_local_proxy_connections() {
     let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
     assert_eq!(reply, 0x00);
 }
+
+#[test]
+fn src_ip_and_in_port_rules_apply_to_local_proxy_connections() {
+    let echo = echo_server();
+    let start = |rules: &str, listen: SocketAddr| {
+        let config = format!(
+            r#"{{"schema_version":1,"profile_id":"routed","routing":{{"outbounds":{{"node":{{"type":"direct"}}}},"rules":[{rules},"FINAL,node"]}}}}"#
+        );
+        LocalProxy::start(config.as_bytes(), listen, MixedSettings::default()).unwrap()
+    };
+    let port = echo.port();
+
+    // The client is on loopback.
+    let proxy = start(
+        &format!(r#""AND,((SRC-IP,127.0.0.1),(DST-PORT,{port})),REJECT""#),
+        loopback(),
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x01, "rejected by the SRC-IP rule");
+    let proxy = start(
+        &format!(r#""AND,((SRC-IP,10.9.9.0/24),(DST-PORT,{port})),REJECT""#),
+        loopback(),
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x00, "another source passes");
+
+    // IN-PORT matches the port of the listener the client reached.
+    let free = TcpListener::bind(loopback()).unwrap().local_addr().unwrap();
+    let proxy = start(
+        &format!(
+            r#""AND,((IN-PORT,{}),(DST-PORT,{port})),REJECT""#,
+            free.port()
+        ),
+        free,
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x01, "rejected by the IN-PORT rule");
+    let other = TcpListener::bind(loopback()).unwrap().local_addr().unwrap();
+    let proxy = start(
+        &format!(
+            r#""AND,((IN-PORT,{}),(DST-PORT,{port})),REJECT""#,
+            free.port()
+        ),
+        other,
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x00, "another listener port passes");
+}

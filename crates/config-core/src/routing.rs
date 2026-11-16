@@ -2,7 +2,7 @@
 //!
 //! This module owns the platform-neutral routing model: ordered
 //! DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD/IP-CIDR/GEOIP/GEOSITE/DST-PORT/
-//! PROCESS-NAME/RULE-SET rules and AND/OR/NOT combinations of them, a
+//! SRC-IP/IN-PORT/PROCESS-NAME/RULE-SET rules and AND/OR/NOT combinations of them, a
 //! mandatory FINAL target, and
 //! select/url-test/fallback policy groups. In-process engines call
 //! [`RoutingModel::decide`] directly, and snapshot tests pin its results. The module performs no DNS, GeoIP database, health check,
@@ -295,6 +295,13 @@ pub enum RuleMatcher {
     /// Lower-case name of the local process that opened the connection,
     /// when the platform can tell.
     ProcessName(String),
+    /// Address of the device or app that opened the connection, as Surge
+    /// `SRC-IP` (an address or a CIDR; Clash `SRC-IP-CIDR`).
+    SrcIp(IpCidr),
+    /// Local port of the inbound listener the connection came in on, within
+    /// an inclusive range, as Surge `IN-PORT`. The packet tunnel has no
+    /// listener port, so it never matches there.
+    InPort(u16, u16),
     /// Transport of the connection, as Surge `PROTOCOL`.
     Protocol(RuleProtocol),
     /// Lower-case glob over the `User-Agent` of a plain HTTP request, as
@@ -337,6 +344,8 @@ impl RuleMatcher {
             domain: domain.as_deref(),
             ip: query.ip,
             port: query.port,
+            source: query.source,
+            in_port: query.in_port,
             process: process.as_deref(),
             network: query.network,
             user_agent: user_agent.as_deref(),
@@ -363,6 +372,9 @@ impl fmt::Display for RuleMatcher {
             Self::DstPort(start, end) if start == end => write!(formatter, "DST-PORT,{start}"),
             Self::DstPort(start, end) => write!(formatter, "DST-PORT,{start}-{end}"),
             Self::ProcessName(name) => write!(formatter, "PROCESS-NAME,{name}"),
+            Self::SrcIp(cidr) => write!(formatter, "SRC-IP,{cidr}"),
+            Self::InPort(start, end) if start == end => write!(formatter, "IN-PORT,{start}"),
+            Self::InPort(start, end) => write!(formatter, "IN-PORT,{start}-{end}"),
             Self::Protocol(protocol) => write!(formatter, "PROTOCOL,{}", protocol.name()),
             Self::UserAgent(pattern) => write!(formatter, "USER-AGENT,{pattern}"),
             Self::UrlRegex(pattern) => write!(formatter, "URL-REGEX,{}", pattern.as_str()),
@@ -541,6 +553,11 @@ fn parse_options(options: &[&str], matcher: &RuleMatcher) -> DomainResult<bool> 
     for option in options {
         if option.eq_ignore_ascii_case("no-resolve") && matcher.matches_ip() {
             no_resolve = true;
+        } else if option.eq_ignore_ascii_case("no-resolve")
+            && matches!(matcher, RuleMatcher::SrcIp(_))
+        {
+            // Clash writes it on SRC-IP-CIDR; a source address never needs
+            // a lookup.
         } else if option.eq_ignore_ascii_case("pre-matching")
             || option.eq_ignore_ascii_case("extended-matching")
         {
@@ -683,6 +700,16 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             let (start, end) = parse_port_range(value)?;
             RuleMatcher::DstPort(start, end)
         }
+        "IN-PORT" => {
+            let (start, end) = parse_port_range(value).map_err(|_| {
+                routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "IN-PORT rule value must be a port or a start-end range",
+                )
+            })?;
+            RuleMatcher::InPort(start, end)
+        }
+        "SRC-IP" | "SRC-IP-CIDR" => RuleMatcher::SrcIp(parse_source(value)?),
         "PROCESS-NAME" => RuleMatcher::ProcessName(value.trim().to_lowercase()),
         "USER-AGENT" => {
             let pattern = value.trim().trim_matches('"').to_lowercase();
@@ -710,8 +737,33 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
         }),
         _ => return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, RULE-SET, AND, OR, NOT, or FINAL (URL-REGEX inside AND, OR, NOT)",
+            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, SRC-IP, IN-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, RULE-SET, AND, OR, NOT, or FINAL (URL-REGEX inside AND, OR, NOT)",
         )),
+    })
+}
+
+/// A `SRC-IP` value: an address (one host) or a CIDR; IPv6 may be written
+/// in brackets.
+fn parse_source(value: &str) -> DomainResult<IpCidr> {
+    let value = value.trim();
+    let unbracketed = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(address, rest)| format!("{address}{rest}"));
+    let value = unbracketed.as_deref().unwrap_or(value);
+    let parsed = if value.contains('/') {
+        IpCidr::parse(value)
+    } else {
+        value.parse::<IpAddr>().ok().and_then(|address| {
+            let prefix = if address.is_ipv4() { 32 } else { 128 };
+            IpCidr::parse(&format!("{address}/{prefix}"))
+        })
+    };
+    parsed.ok_or_else(|| {
+        routing_error(
+            ROUTING_RULE_VALUE_INVALID_CODE,
+            "SRC-IP rule value must be an address or an address with a prefix length",
+        )
     })
 }
 
@@ -908,6 +960,8 @@ impl RoutingModel {
                 domain: domain.as_deref(),
                 ip,
                 port: query.port,
+                source: query.source,
+                in_port: query.in_port,
                 process: process.as_deref(),
                 network: query.network,
                 user_agent: user_agent.as_deref(),
@@ -1112,6 +1166,12 @@ pub struct RouteQuery {
     pub user_agent: Option<String>,
     /// URL of a plain HTTP request, for URL-REGEX rules.
     pub url: Option<String>,
+    /// Address of the device or app that opened the connection, for SRC-IP
+    /// rules.
+    pub source: Option<IpAddr>,
+    /// Local port of the inbound listener the connection came in on, for
+    /// IN-PORT rules.
+    pub in_port: Option<u16>,
 }
 
 impl RouteQuery {
@@ -1136,6 +1196,13 @@ impl RouteQuery {
 
     pub fn with_network(mut self, network: RouteNetwork) -> Self {
         self.network = Some(network);
+        self
+    }
+
+    /// Sets the source address and inbound port, for SRC-IP and IN-PORT.
+    pub fn with_source(mut self, source: Option<IpAddr>, in_port: Option<u16>) -> Self {
+        self.source = source;
+        self.in_port = in_port;
         self
     }
 }
@@ -1233,6 +1300,8 @@ struct MatchInput<'a> {
     domain: Option<&'a str>,
     ip: Option<IpAddr>,
     port: Option<u16>,
+    source: Option<IpAddr>,
+    in_port: Option<u16>,
     process: Option<&'a str>,
     network: Option<RouteNetwork>,
     user_agent: Option<&'a str>,
@@ -1269,6 +1338,12 @@ fn rule_matches(
             .port
             .is_some_and(|port| (*start..=*end).contains(&port)),
         RuleMatcher::ProcessName(name) => input.process == Some(name.as_str()),
+        RuleMatcher::SrcIp(cidr) => input
+            .source
+            .is_some_and(|source| cidr.contains(source.to_canonical())),
+        RuleMatcher::InPort(start, end) => input
+            .in_port
+            .is_some_and(|port| (*start..=*end).contains(&port)),
         RuleMatcher::Protocol(protocol) => {
             let port = input.port;
             match (protocol, input.network) {

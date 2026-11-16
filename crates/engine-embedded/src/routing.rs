@@ -173,6 +173,15 @@ impl DomainResolver for SystemResolver {
     }
 }
 
+/// Where a flow came from, for `SRC-IP` and `IN-PORT` rules: the address
+/// of the app or device that opened it and the local port of the listener
+/// it came in on (none for the packet tunnel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlowSource {
+    pub address: Option<IpAddr>,
+    pub in_port: Option<u16>,
+}
+
 /// Why a flow went where it did: the matched rule (`FINAL` when none did),
 /// the policy groups passed through and the outbound picked, ending with it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -741,13 +750,21 @@ impl RoutedOutbound {
         sniffed: Option<&str>,
         process: Option<&str>,
     ) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
-        self.route_network_flow(target, sniffed, process, RouteNetwork::Tcp, None)
-            .await
+        self.route_network_flow(
+            target,
+            sniffed,
+            process,
+            RouteNetwork::Tcp,
+            None,
+            FlowSource::default(),
+        )
+        .await
     }
 
     /// [`Self::route_flow`] for a flow of the given transport, which
-    /// `PROTOCOL` rules match, and the head sniffed from a plain HTTP
-    /// request, which `USER-AGENT` and `URL-REGEX` rules match.
+    /// `PROTOCOL` rules match, the head sniffed from a plain HTTP request,
+    /// which `USER-AGENT` and `URL-REGEX` rules match, and where the flow
+    /// came from, which `SRC-IP` and `IN-PORT` rules match.
     pub async fn route_network_flow(
         &self,
         target: &TargetAddr,
@@ -755,8 +772,11 @@ impl RoutedOutbound {
         process: Option<&str>,
         network: RouteNetwork,
         http: Option<&HttpRequestHead>,
+        source: FlowSource,
     ) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
-        let mut query = query(target).with_network(network);
+        let mut query = query(target)
+            .with_network(network)
+            .with_source(source.address, source.in_port);
         if let Some(http) = http {
             query.user_agent.clone_from(&http.user_agent);
             query.url.clone_from(&http.url);
