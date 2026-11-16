@@ -18,8 +18,9 @@ use serde_json::Value;
 const WAIT: Duration = Duration::from_secs(10);
 const DIRECT: &[u8] = br#"{"schema_version":1,"profile_id":"ios","outbound":{"type":"direct"}}"#;
 /// Plain HTTP to `blocked.test/ad` and from the `BadAgent` user agent is
-/// refused; everything else goes direct.
-const ROUTED: &[u8] = br#"{"schema_version":1,"profile_id":"ios","routing":{"outbounds":{"node":{"type":"direct"}},"rules":["URL-REGEX,^http://blocked\\.test/ad,REJECT","USER-AGENT,BadAgent*,REJECT","FINAL,node"]}}"#;
+/// refused (`URL-REGEX` only goes inside `AND` / `OR` / `NOT`); everything
+/// else goes direct.
+const ROUTED: &[u8] = br#"{"schema_version":1,"profile_id":"ios","routing":{"outbounds":{"node":{"type":"direct"}},"rules":["OR,((URL-REGEX,\"^http://blocked\\.test/ad\"),(USER-AGENT,BadAgent*)),REJECT","FINAL,node"]}}"#;
 
 /// The tunnel's packets go nowhere: these tests only use the listener.
 struct Discard;
