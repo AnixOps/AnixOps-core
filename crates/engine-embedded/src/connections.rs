@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use config_core::redirect::{RedirectHost, RedirectTable, RedirectTo};
-use config_core::routing::{RouteNetwork, RouteQuery};
+use config_core::routing::{RejectKind, RouteNetwork, RouteQuery};
 use engine_outbound::sniff::HttpRequestHead;
 use engine_outbound::{
     BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpDialer, TcpOutbound, UdpFlow,
@@ -910,13 +910,11 @@ impl Dispatcher {
             }
             (_, None) => (single_route(&*self.outbound), Some(self.outbound.clone())),
         };
+        let reject = route.reject.unwrap_or_default();
         guard.set_route(route);
         outbound.ok_or_else(|| {
             guard.fail("rejected");
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "connection rejected by routing rule",
-            )
+            engine_outbound::reject::rejected(crate::reject::action(reject))
         })
     }
 
@@ -1030,6 +1028,7 @@ impl Dispatcher {
             rule: MITM_QUIC_RULE.to_string(),
             chain: vec!["REJECT".to_string()],
             outbound: "REJECT".to_string(),
+            reject: Some(RejectKind::Reject),
         });
         guard.fail("quic_mitm_fallback");
     }
@@ -1178,6 +1177,7 @@ fn single_route(outbound: &dyn TcpOutbound) -> RouteInfo {
         rule: "DEFAULT".to_string(),
         chain: vec![name.clone()],
         outbound: name,
+        reject: None,
     }
 }
 
@@ -1219,6 +1219,7 @@ fn block_quic_route() -> RouteInfo {
         rule: BLOCK_QUIC_RULE.to_string(),
         chain: vec!["REJECT".to_string()],
         outbound: "REJECT".to_string(),
+        reject: Some(RejectKind::Reject),
     }
 }
 
@@ -1227,6 +1228,7 @@ fn direct_route() -> RouteInfo {
         rule: "MODE,direct".to_string(),
         chain: vec!["DIRECT".to_string()],
         outbound: "DIRECT".to_string(),
+        reject: None,
     }
 }
 

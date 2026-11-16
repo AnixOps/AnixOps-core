@@ -1,8 +1,8 @@
 use config_core::parse_config_document;
 use config_core::routing::{
-    parse_rule_line, IpCidr, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RouteMatch,
-    RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment, RoutingModel, RoutingSpec,
-    RuleLine, RuleMatcher, StaticRoutingEnvironment, ROUTING_FINAL_MISSING_CODE,
+    parse_rule_line, IpCidr, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RejectKind,
+    RouteMatch, RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment, RoutingModel,
+    RoutingSpec, RuleLine, RuleMatcher, StaticRoutingEnvironment, ROUTING_FINAL_MISSING_CODE,
     ROUTING_FINAL_NOT_LAST_CODE, ROUTING_GROUP_CYCLE_CODE, ROUTING_GROUP_DEFAULT_INVALID_CODE,
     ROUTING_GROUP_HEALTH_CHECK_INVALID_CODE, ROUTING_GROUP_ID_CONFLICT_CODE,
     ROUTING_GROUP_ID_INVALID_CODE, ROUTING_GROUP_MEMBERS_EMPTY_CODE,
@@ -105,7 +105,7 @@ fn resolution_snapshot(resolution: &RouteResolution) -> Value {
         "group_path": resolution.group_path,
         "outcome": match &resolution.outcome {
             RouteOutcome::Direct => "direct".to_string(),
-            RouteOutcome::Reject => "reject".to_string(),
+            RouteOutcome::Reject(kind) => kind.name().to_ascii_lowercase(),
             RouteOutcome::Node(id) => format!("node:{id}"),
         },
         "resolved_ip": resolution.resolved_ip.map(|ip| ip.to_string()),
@@ -348,10 +348,97 @@ fn final_reject_and_reserved_names_are_case_insensitive() {
     .unwrap();
 
     assert_eq!(model.rules[0].target, PolicyTarget::Direct);
-    assert_eq!(model.final_target, PolicyTarget::Reject);
+    assert_eq!(model.final_target, PolicyTarget::Reject(RejectKind::Reject));
     let resolution = model.decide(&RouteQuery::domain("other.test"), &StaticRoutingEnvironment);
     assert_eq!(resolution.matched, RouteMatch::Final);
-    assert_eq!(resolution.outcome, RouteOutcome::Reject);
+    assert_eq!(resolution.outcome, RouteOutcome::Reject(RejectKind::Reject));
+}
+
+#[test]
+fn reject_variants_are_policies_of_their_own() {
+    let model = RoutingModel::from_spec(
+        &spec(
+            &[
+                "DOMAIN,a.test,REJECT",
+                "DOMAIN,b.test,reject-no-drop",
+                "DOMAIN,c.test,REJECT-DROP",
+                "DOMAIN,d.test,REJECT-TINYGIF",
+                // Loon's name for the same 1x1 image.
+                "DOMAIN,e.test,REJECT-IMG",
+                "FINAL,REJECT-DROP",
+            ],
+            vec![],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+    let kinds = model
+        .rules
+        .iter()
+        .map(|rule| rule.target.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            PolicyTarget::Reject(RejectKind::Reject),
+            PolicyTarget::Reject(RejectKind::NoDrop),
+            PolicyTarget::Reject(RejectKind::Drop),
+            PolicyTarget::Reject(RejectKind::TinyGif),
+            PolicyTarget::Reject(RejectKind::TinyGif),
+        ]
+    );
+    assert_eq!(model.final_target, PolicyTarget::Reject(RejectKind::Drop));
+    for (domain, kind) in [
+        ("a.test", RejectKind::Reject),
+        ("b.test", RejectKind::NoDrop),
+        ("c.test", RejectKind::Drop),
+        ("d.test", RejectKind::TinyGif),
+        ("other.test", RejectKind::Drop),
+    ] {
+        let resolution = model.decide(&RouteQuery::domain(domain), &StaticRoutingEnvironment);
+        assert_eq!(resolution.outcome, RouteOutcome::Reject(kind), "{domain}");
+    }
+    // Rules print their canonical policy name.
+    assert_eq!(model.rules[4].target.name(), "REJECT-TINYGIF");
+    for kind in RejectKind::ALL {
+        assert_eq!(RejectKind::parse(kind.name()), Some(kind));
+        assert_eq!(RejectKind::parse(&kind.name().to_lowercase()), Some(kind));
+    }
+    assert_eq!(RejectKind::parse("REJECT-IMG"), Some(RejectKind::TinyGif));
+    assert_eq!(RejectKind::default(), RejectKind::Reject);
+
+    // Answers that only exist after decryption are not routing policies.
+    for unknown in ["REJECT-DICT", "REJECT-200", "REJECT-VIDEO", "REJECT-"] {
+        assert_eq!(RejectKind::parse(unknown), None, "{unknown}");
+        assert_eq!(
+            model_error(&spec(&[&format!("FINAL,{unknown}")], vec![])),
+            ROUTING_TARGET_UNKNOWN_CODE,
+            "{unknown}"
+        );
+    }
+    // A group never holds a REJECT policy, and none is a group id.
+    assert_eq!(
+        model_error(&spec(
+            &["FINAL,Proxy"],
+            vec![group("Proxy", "select", &["hk-1", "REJECT-DROP"])]
+        )),
+        ROUTING_GROUP_MEMBER_UNSUPPORTED_CODE
+    );
+    for reserved in [
+        "REJECT-DROP",
+        "reject-tinygif",
+        "REJECT-IMG",
+        "REJECT-NO-DROP",
+    ] {
+        assert_eq!(
+            model_error(&spec(
+                &["FINAL,DIRECT"],
+                vec![group(reserved, "select", &["hk-1"])]
+            )),
+            ROUTING_GROUP_ID_INVALID_CODE,
+            "{reserved}"
+        );
+    }
 }
 
 #[test]
@@ -540,7 +627,7 @@ fn ip_rules_resolve_once_and_no_resolve_rules_skip_domains() {
         &StaticRoutingEnvironment,
     );
     assert_eq!(direct_ip.matched, RouteMatch::Rule(0));
-    assert_eq!(direct_ip.outcome, RouteOutcome::Reject);
+    assert_eq!(direct_ip.outcome, RouteOutcome::Reject(RejectKind::Reject));
 }
 
 #[test]
@@ -602,7 +689,7 @@ fn port_process_geosite_and_logical_rules_route() {
     assert_eq!(plain.matched, RouteMatch::Final);
     assert_eq!(
         route(RouteQuery::domain("ads.test").with_port(80)).outcome,
-        RouteOutcome::Reject
+        RouteOutcome::Reject(RejectKind::Reject)
     );
     assert_eq!(
         route(RouteQuery::domain("other.test").with_port(8443)).matched,

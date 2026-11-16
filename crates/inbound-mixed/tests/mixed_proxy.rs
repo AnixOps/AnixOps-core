@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use engine_outbound::reject::{self, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use inbound_mixed::{
     serve, serve_intercepted, ClientAddrs, ClientConnector, ClientInterceptor, Credentials,
@@ -281,6 +282,95 @@ async fn malformed_http_gets_400_and_connect_failure_gets_502() {
     let mut client = TcpStream::connect(proxy).await.unwrap();
     let request = format!("CONNECT {target} HTTP/1.1\r\n\r\n");
     client.write_all(request.as_bytes()).await.unwrap();
+    assert!(read_to_end(&mut client).await.starts_with("HTTP/1.1 502 "));
+}
+
+/// Refuses every connect the way a routing rule does, with `action`.
+struct Rejects(RejectAction);
+
+impl TcpOutbound for Rejects {
+    fn protocol(&self) -> &'static str {
+        "test-reject"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        let action = self.0;
+        Box::pin(async move { Err(reject::rejected(action)) })
+    }
+}
+
+async fn rejecting_proxy(action: RejectAction) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Rejects(action)),
+        MixedSettings::default(),
+        Arc::new(MixedStats::default()),
+    ));
+    addr
+}
+
+const PLAIN_GET: &[u8] = b"GET http://ads.example/pixel.gif HTTP/1.1\r\nHost: ads.example\r\n\r\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reject_tinygif_answers_plain_http_with_a_gif() {
+    let proxy = rejecting_proxy(RejectAction::TinyGif).await;
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client.write_all(PLAIN_GET).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(WAIT, client.read_to_end(&mut response))
+        .await
+        .expect("read timed out")
+        .unwrap();
+    assert_eq!(response, reject::tiny_gif_response());
+
+    // A tunnel has no request to answer: it fails as with REJECT.
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(b"CONNECT ads.example:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(read_to_end(&mut client).await.starts_with("HTTP/1.1 502 "));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reject_drop_answers_nothing_and_keeps_the_connection_open() {
+    let proxy = rejecting_proxy(RejectAction::Drop).await;
+    for request in [
+        PLAIN_GET.to_vec(),
+        b"CONNECT ads.example:443 HTTP/1.1\r\n\r\n".to_vec(),
+    ] {
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(&request).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(500), client.read(&mut byte)).await;
+        assert!(
+            read.is_err(),
+            "a dropped request must get no answer or close"
+        );
+        // The client can still give up on its own.
+        drop(client);
+    }
+
+    // SOCKS5 gets the method reply (before routing) and then nothing.
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    assert_eq!(read_n(&mut client, 2).await, [0x05, 0x00]);
+    client
+        .write_all(&socks_connect_ipv4("192.0.2.1:443".parse().unwrap()))
+        .await
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_millis(500), client.read(&mut byte)).await;
+    assert!(read.is_err(), "a dropped SOCKS5 connect must get no reply");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reject_close_gets_the_usual_failure_reply() {
+    let proxy = rejecting_proxy(RejectAction::Close).await;
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client.write_all(PLAIN_GET).await.unwrap();
     assert!(read_to_end(&mut client).await.starts_with("HTTP/1.1 502 "));
 }
 

@@ -24,6 +24,12 @@
 //! [`ClientPages::host`] are answered by those pages instead of being
 //! relayed, for a setup page with the root certificate download.
 //!
+//! A connect the outbound refuses with a routing rejection
+//! ([`engine_outbound::reject`]) is answered as the rule asks: `REJECT-DROP`
+//! gets no answer at all (the connection is held open until the client
+//! gives up), `REJECT-TINYGIF` answers a plain HTTP request with a 1x1 GIF,
+//! and the rest get the usual failure reply.
+//!
 //! Errors and logs never contain credentials or request contents.
 
 mod http;
@@ -35,6 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use engine_outbound::reject::{self, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -420,10 +427,14 @@ async fn handle(
     .await;
     let mut remote = match connected {
         Ok(Ok(remote)) => remote,
-        Ok(Err(_)) | Err(_) => {
+        Ok(Err(error)) => {
             stats.connect_failed.fetch_add(1, Ordering::Relaxed);
-            let _ = send_failure(&mut client, request.reply).await;
-            close_gracefully(client).await;
+            answer_failure(client, request.reply, reject::rejection(&error), false).await;
+            return;
+        }
+        Err(_) => {
+            stats.connect_failed.fetch_add(1, Ordering::Relaxed);
+            answer_failure(client, request.reply, None, false).await;
             return;
         }
     };
@@ -486,13 +497,15 @@ async fn handle_intercepted(
     .await;
     let mut remote = match connected {
         Ok(Ok(remote)) => remote,
-        Ok(Err(_)) | Err(_) => {
+        Ok(Err(error)) => {
             stats.connect_failed.fetch_add(1, Ordering::Relaxed);
             // A tunnel was already answered; all that is left is to close it.
-            if !tunnel {
-                let _ = send_failure(&mut client, request.reply).await;
-            }
-            close_gracefully(client).await;
+            answer_failure(client, request.reply, reject::rejection(&error), tunnel).await;
+            return;
+        }
+        Err(_) => {
+            stats.connect_failed.fetch_add(1, Ordering::Relaxed);
+            answer_failure(client, request.reply, None, tunnel).await;
             return;
         }
     };
@@ -555,6 +568,37 @@ async fn send_failure<S: AsyncWrite + Unpin>(client: &mut S, reply: Reply) -> io
                 .await
         }
     }
+}
+
+/// Answers a request whose outbound connect failed, then closes: with the
+/// failure reply (unless the request was `answered` already), a 1x1 GIF for
+/// a plain HTTP request a `REJECT-TINYGIF` rule refused, or nothing at all
+/// for `REJECT-DROP` while the connection is held (see
+/// [`reject::hold`]); when no hold slot is free a drop gets the failure
+/// reply after all.
+async fn answer_failure(
+    mut client: TcpStream,
+    reply: Reply,
+    rejection: Option<RejectAction>,
+    answered: bool,
+) {
+    match rejection {
+        Some(RejectAction::Drop) => {
+            if reject::hold(&mut client, reject::DROP_HOLD).await {
+                return;
+            }
+        }
+        Some(RejectAction::TinyGif) if reply == Reply::HttpForward && !answered => {
+            let _ = client.write_all(&reject::tiny_gif_response()).await;
+            close_gracefully(client).await;
+            return;
+        }
+        _ => {}
+    }
+    if !answered {
+        let _ = send_failure(&mut client, reply).await;
+    }
+    close_gracefully(client).await;
 }
 
 /// Sends FIN after an error reply and drains what the client still sends for
