@@ -411,8 +411,7 @@ fn script_rules_must_name_a_configured_script() {
             ],
             true,
         )
-        .err()
-        .expect("a reload naming an unknown script is rejected");
+        .expect_err("a reload naming an unknown script is rejected");
     assert_eq!(rejection.line, Some(0));
     assert_eq!(rejection.code, reject_code::UNKNOWN_SCRIPT);
     assert!(outbound
