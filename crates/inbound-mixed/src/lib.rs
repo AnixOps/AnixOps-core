@@ -245,6 +245,22 @@ pub trait ClientConnector: Send + Sync {
         client: ClientAddrs,
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, io::Result<BoxStream>>;
+
+    /// [`Self::connect_client`] with the bytes the client sends first, known
+    /// before the connection opens: the origin-form head of a plain HTTP
+    /// request, or the start of a tunnel's payload (empty when the client
+    /// waits for the server or the listener did not read ahead). Connectors
+    /// that route by a plain HTTP request's head (`USER-AGENT`, `URL-REGEX`)
+    /// override it; the default ignores `first`.
+    fn connect_client_with_first<'a>(
+        &'a self,
+        client: ClientAddrs,
+        target: &'a TargetAddr,
+        first: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<BoxStream>> {
+        let _ = first;
+        self.connect_client(client, target)
+    }
 }
 
 /// Takes tunnels over before they are relayed, judged from the first bytes
@@ -399,7 +415,7 @@ async fn handle(
 
     let connected = tokio::time::timeout(
         settings.connect_timeout,
-        connector.connect_client(addrs, &request.target),
+        connector.connect_client_with_first(addrs, &request.target, &request.initial),
     )
     .await;
     let mut remote = match connected {
@@ -465,7 +481,7 @@ async fn handle_intercepted(
 
     let connected = tokio::time::timeout(
         settings.connect_timeout,
-        connector.connect_client(addrs, &request.target),
+        connector.connect_client_with_first(addrs, &request.target, &first),
     )
     .await;
     let mut remote = match connected {
