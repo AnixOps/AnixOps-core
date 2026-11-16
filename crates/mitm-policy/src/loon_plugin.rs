@@ -1045,7 +1045,8 @@ impl Parser<'_> {
 
         match kind.as_str() {
             // Request URLs are only visible after decryption, so the policy
-            // core enforces URL-REGEX rejects on MITM hosts.
+            // core enforces URL-REGEX rejects on MITM hosts; a URL-REGEX
+            // with a node or group goes to the routing model.
             "URL-REGEX" => self.url_regex_rule_line(line, section, text),
             "FINAL" => self.push(
                 line,
@@ -1073,13 +1074,9 @@ impl Parser<'_> {
     fn url_regex_rule_line(&mut self, line: usize, section: &str, text: &str) {
         let target = text.rsplit(',').next().unwrap_or_default().trim();
         if !is_reject_policy(target) {
-            self.push(
-                line,
-                section,
-                LoonLineStatus::Unsupported,
-                LoonLineHandler::None,
-                "rule.policy_unsupported",
-            );
+            // A node or group: the routing model picks it for each request
+            // (decrypted ones request by request).
+            self.routing_rule_line(line, section, text);
             return;
         }
         // Without a connection to drop after decryption, the drop variants

@@ -931,6 +931,21 @@ fn url_regex_rules_match_plain_http_urls_inside_logical_rules() {
             .code,
         ROUTING_RULE_TYPE_UNSUPPORTED_CODE
     );
+    assert_eq!(
+        parse_rule_line("URL-REGEX,^http://a/,reject-tinygif")
+            .unwrap_err()
+            .code,
+        ROUTING_RULE_TYPE_UNSUPPORTED_CODE
+    );
+    // With a node or group it is a routing rule of its own.
+    let RuleLine::Rule {
+        matcher, target, ..
+    } = parse_rule_line(r"URL-REGEX,^http://a\.test/video/,Proxy").unwrap()
+    else {
+        panic!("URL-REGEX with a policy is a rule");
+    };
+    assert_eq!(target, "Proxy");
+    assert_eq!(matcher.to_string(), r"URL-REGEX,^http://a\.test/video/");
 }
 
 fn network_rule(when: &str, target: &str) -> NetworkRuleSpec {

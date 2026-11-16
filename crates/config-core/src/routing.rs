@@ -42,6 +42,12 @@ const RESERVED_DIRECT: &str = "DIRECT";
 const RESERVED_REJECT: &str = "REJECT";
 const RESERVED_NAMES: [&str; 3] = [RESERVED_DIRECT, RESERVED_REJECT, "FINAL"];
 
+/// `REJECT` and Surge's `REJECT-*` variants.
+fn is_reject_target(target: &str) -> bool {
+    let target = target.trim().to_ascii_uppercase();
+    target == RESERVED_REJECT || target.starts_with("REJECT-")
+}
+
 /// Unvalidated routing input: Loon-style rule lines and policy group specs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutingSpec {
@@ -276,7 +282,8 @@ pub enum RuleMatcher {
     /// Surge `USER-AGENT` (`*` and `?`). Other flows never match.
     UserAgent(String),
     /// Regex over the URL of a plain HTTP request (`http://host/path`), as
-    /// Surge `URL-REGEX` inside a logical rule. Other flows never match.
+    /// Surge `URL-REGEX`, alone with a node or group target or inside a
+    /// logical rule. Other flows never match.
     UrlRegex(UrlPattern),
     /// Every rule matches.
     And(Vec<RuleMatcher>),
@@ -610,13 +617,14 @@ pub fn parse_rule_line(line: &str) -> DomainResult<RuleLine> {
             "routing rule must have a type, a value, and a target",
         ));
     }
-    if kind == "URL-REGEX" {
-        // A standalone URL-REGEX is the MITM core's (its rejects run on the
-        // full URL of every intercepted request); only logical rules bring
-        // one here.
+    if kind == "URL-REGEX" && is_reject_target(parts[2]) {
+        // A standalone URL-REGEX that rejects is the MITM core's (its rejects
+        // run on the full URL of every intercepted request). One that picks
+        // a node or group routes each request: plain HTTP flows by their
+        // first request, decrypted ones request by request.
         return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "URL-REGEX is a routing rule only inside AND, OR, or NOT",
+            "URL-REGEX with REJECT belongs to HTTPS decryption; as a routing rule it needs a node or group, or AND, OR, NOT",
         ));
     }
     let matcher = parse_matcher(&kind, parts[1])?;
@@ -802,7 +810,7 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
         }),
         _ => return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, RULE-SET, AND, OR, NOT, or FINAL (URL-REGEX inside AND, OR, NOT)",
+            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, URL-REGEX, RULE-SET, AND, OR, NOT, or FINAL",
         )),
     })
 }

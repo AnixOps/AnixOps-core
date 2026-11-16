@@ -140,7 +140,7 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
   - `reset_network` 同时调用 `forget_health`：清空全部延迟、url-test 当前成员与失败冷却；切网前开始的测速结果作废。之后有连接经过某个还没有结果的测速组时立即测它（不等间隔）。
   - `evaluate_before_use`：组没有结果时（首次使用、切网后）连接等待该组测完（最多 6 秒）再选成员，而不是先走可能已失效的第一个成员；测速循环没有运行（无 `local-proxy`）时不等待。
   - `subnet` 组的网络来自控制命令 `set_network`（`type`、`ssid`、`bssid`、`router`、`addresses`），客户端在网络变化时先发 `set_network` 再发 `reset_network`。Wi-Fi 名与 BSSID 只留在内核内存里，不进日志、列表和导出。
-- 按请求路由：`USER-AGENT`、`URL-REGEX` 在明文 HTTP 流上按首个请求生效；被 MITM 解密的连接（HTTPS 与经改写钩子的明文 HTTP）里每个请求都重新分流（`mitm::request_route`）：同出站复用源站连接，`REJECT` 本地回 403，其他出站时 HTTP/1.1 换源站连接、HTTP/2 为该出站另开源站连接（每个 App 连接最多 4 条）。规则表没有这两类规则时（`RoutingTable::uses_request`）完全不做按请求路由。
+- 按请求路由：`USER-AGENT`、`URL-REGEX` 在明文 HTTP 流上按首个请求生效；被 MITM 解密的连接（HTTPS 与经改写钩子的明文 HTTP）里每个请求都重新分流（`mitm::request_route`）：同出站复用源站连接，`REJECT` 本地回 403，其他出站时 HTTP/1.1 换源站连接、HTTP/2 为该出站另开源站连接（每个 App 连接最多 4 条）。规则表没有这两类规则时（`RoutingTable::uses_request`）完全不做按请求路由。`URL-REGEX` 可以单独成行指向节点或策略组（也可在 AND/OR/NOT 里）；指向 `REJECT`/`REJECT-*` 的单独 `URL-REGEX` 仍由 HTTPS 解密的拦截处理，不是分流规则。
 - 隧道从 TCP 首包嗅探 TLS SNI 或 HTTP `Host`：域名规则按嗅探到的名字匹配，IP 规则仍匹配目的地址，连接仍发往原地址。UDP（含 QUIC）尚不嗅探，FakeIP 未接入。
 - 每个连接都带目的端口，`DST-PORT` 规则在隧道和本地代理里都生效。`PROCESS-NAME` 规则在桌面 local proxy 中生效：配置含该规则时，每条连接先由 `engine-embedded::process` 按连接两端地址查出发起进程（Linux `/proc`、Windows `GetExtendedTcpTable`、macOS `proc_pidfdinfo`），名称为可执行文件名，连接列表的 `process` 字段显示它。查不到（其他用户的进程、无权限）时该连接不命中 `PROCESS-NAME`。iOS 隧道没有进程信息，规则不命中。
 - 规则集（`routing.rule_sets`，最多 32 个，合计 50 万条）：每个集可含 `domain`、`domain_suffix`、`domain_keyword`、`ip_cidr`。`RULE-SET,<name>` 匹配同名集；`GEOSITE,<category>` 匹配名为 `geosite-<category>` 的集（未配置时整个配置被拒绝）；`GEOIP,<CC>` 匹配 `geoip-<cc>`（小写，未配置时与以前一样不命中）。客户端以普通列表提供 GeoSite/GeoIP 数据，例如 MetaCubeX `meta-rules-dat` 的文本规则集。

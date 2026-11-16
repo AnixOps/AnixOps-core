@@ -894,7 +894,10 @@ fn import_rules(
             import_logical_rule(importer, group_ids, rule_sets, &kind, line)
         } else if kind == "RULE-SET" || kind == "DOMAIN-SET" {
             import_rule_set_rule(importer, group_ids, rule_sets, &kind, &parts)
-        } else if SUPPORTED_RULE_TYPES.contains(&kind.as_str()) {
+        } else if SUPPORTED_RULE_TYPES.contains(&kind.as_str())
+            || (kind == "URL-REGEX" && parts.len() >= 3 && !is_reject_policy(parts[2]))
+        {
+            // A rejecting URL-REGEX is HTTPS decryption's, not routing's.
             import_plain_rule(importer, group_ids, &kind, &parts)
         } else {
             *skipped.entry(kind).or_default() += 1;

@@ -322,7 +322,8 @@ impl TcpOutbound for PlainOrigin {
                     while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&buf[..end]).into_owned();
                         buf.drain(..end + 4);
-                        requests.send(head).unwrap();
+                        // Tests that do not read the heads drop the receiver.
+                        let _ = requests.send(head);
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{extra_headers}Content-Length: {}\r\n\r\n",
                             body.len()

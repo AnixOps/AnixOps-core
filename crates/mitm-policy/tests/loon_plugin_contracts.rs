@@ -1155,3 +1155,30 @@ fn header_url_rewrites_become_redirects() {
         .expect("rewrite should evaluate");
     assert_eq!(surge.action, MitmPolicyRewriteAction::Redirect);
 }
+
+#[test]
+fn plugin_url_regex_with_a_policy_routes_and_a_rejecting_one_stays_with_the_core() {
+    let source = "#!name = URL routes\n\n[Rule]\nURL-REGEX,^https?://v\\.example\\.com/live/,PROXY\nURL-REGEX,^https?://api\\.example\\.com/ad,REJECT\n\n[MITM]\nhostname = v.example.com, api.example.com\n";
+    let plugin = import_loon_plugin(source).expect("plugin imports");
+    let reasons = plugin
+        .report
+        .lines
+        .iter()
+        .map(|line| (line.reason.as_str(), line.status))
+        .collect::<Vec<_>>();
+    assert!(
+        reasons.contains(&("rule.routing_policy", LoonLineStatus::Supported)),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.contains(&("rule.url_regex_reject", LoonLineStatus::Supported)),
+        "{reasons:?}"
+    );
+    let rules = plugin.routing_rules();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(
+        rules[0].matcher.to_string(),
+        r"URL-REGEX,^https?://v\.example\.com/live/"
+    );
+    assert_eq!(rules[0].target, PolicyTarget::Group("PROXY".to_string()));
+}

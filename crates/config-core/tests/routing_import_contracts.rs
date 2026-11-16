@@ -653,3 +653,39 @@ fn surge_subnet_and_ssid_groups_import_with_their_rules() {
     assert!(group.members.is_empty());
     assert_eq!(group.network_rules[0].when, "SSID:My Home");
 }
+
+#[test]
+fn surge_url_regex_with_a_policy_imports_and_rejecting_ones_stay_with_decryption() {
+    let profile = r#"
+[Proxy]
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503
+
+[Proxy Group]
+Video = select, HK, DIRECT
+
+[Rule]
+URL-REGEX,^https?://v\.example\.com/live/,Video
+URL-REGEX,^https?://example\.com/ad,REJECT
+URL-REGEX,^https?://example\.com/pixel,REJECT-TINYGIF
+FINAL,DIRECT
+"#;
+    let nodes = parse_nodes(profile);
+    let imported = import_subscription_routing(profile, &nodes);
+    let model = imported.routing.clone().expect("routing imports");
+    assert_eq!(model.rules.len(), 1, "{:?}", model.rules);
+    assert_eq!(
+        model.rules[0].matcher.to_string(),
+        r"URL-REGEX,^https?://v\.example\.com/live/"
+    );
+    assert_eq!(
+        model.rules[0].target,
+        PolicyTarget::Group("Video".to_string())
+    );
+    let messages = imported
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(messages.contains("URL-REGEX x2"), "{messages}");
+}
