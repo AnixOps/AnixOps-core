@@ -720,8 +720,11 @@ async fn system_resolver_answer(
     if !matches!(question.qtype, TYPE_A | TYPE_AAAA) {
         return Ok(error_answer(query, &question, RCODE_SERVFAIL));
     }
-    let lookup = tokio::net::lookup_host((question.name.as_str(), 0));
-    match tokio::time::timeout_at(deadline, lookup).await {
+    // The lookup owns its name: the match below borrows `question` while the
+    // finished lookup's iterator is still alive.
+    let lookup = tokio::net::lookup_host((question.name.clone(), 0));
+    let looked_up = tokio::time::timeout_at(deadline, lookup).await;
+    match looked_up {
         Ok(Ok(addresses)) => {
             let mut found: Vec<IpAddr> = Vec::new();
             for address in addresses {
