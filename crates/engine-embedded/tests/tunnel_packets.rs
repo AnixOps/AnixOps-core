@@ -15,6 +15,7 @@ use engine_embedded::connections::Dispatcher;
 use engine_embedded::dns_policy::DnsPolicy;
 use engine_embedded::fake_ip::FakeIpPool;
 use engine_embedded::tunnel::{PacketSink, Tunnel, TunnelSettings};
+use engine_outbound::reject::{self, RejectAction};
 use engine_outbound::{
     BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpOutbound, UdpFlow,
 };
@@ -969,5 +970,157 @@ fn a_hello_that_never_completes_passes_after_a_short_wait() {
     echoed(&rx, 40014, &one);
     assert!(sent.elapsed() < Duration::from_secs(2));
     assert_eq!(tunnel.stats().quic_mitm_fallback, 0);
+    tunnel.stop();
+}
+
+/// Test outbound that refuses every flow the way a routing rule does.
+struct Rejects(RejectAction);
+
+impl TcpOutbound for Rejects {
+    fn protocol(&self) -> &'static str {
+        "test-reject"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        let action = self.0;
+        Box::pin(async move { Err(reject::rejected(action)) })
+    }
+
+    fn open_udp<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
+        let action = self.0;
+        Box::pin(async move { Err(reject::rejected(action)) })
+    }
+}
+
+/// Opens a TCP flow from the app to `REMOTE:port` and sends `payload`;
+/// returns the sequence number the app sends next and the tunnel's ISN.
+fn open_tcp(tunnel: &Tunnel, rx: &Receiver<Vec<u8>>, port: u16, payload: &[u8]) -> (u32, u32) {
+    let client_isn: u32 = 7000;
+    let mut syn = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(40100, port, client_isn, 65535)
+        .syn()
+        .write(&mut syn, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&syn));
+    let server_isn = wait_for(rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.syn() && tcp.ack() && tcp.destination_port() == 40100 =>
+        {
+            Some(tcp.sequence_number())
+        }
+        _ => None,
+    });
+    let mut data = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(40100, port, client_isn + 1, 65535)
+        .ack(server_isn.wrapping_add(1))
+        .psh()
+        .write(&mut data, payload)
+        .unwrap();
+    assert!(tunnel.input_packet(&data));
+    (client_isn + 1 + payload.len() as u32, server_isn)
+}
+
+/// Payload bytes the tunnel sends the app until it closes (FIN or RST).
+fn read_until_closed(rx: &Receiver<Vec<u8>>) -> Vec<u8> {
+    let mut received = Vec::new();
+    loop {
+        let closed = wait_for(rx, |sliced| match &sliced.transport {
+            Some(TransportSlice::Tcp(tcp)) if tcp.destination_port() == 40100 => {
+                Some((tcp.payload().to_vec(), tcp.fin() || tcp.rst()))
+            }
+            _ => None,
+        });
+        received.extend_from_slice(&closed.0);
+        if closed.1 {
+            return received;
+        }
+    }
+}
+
+/// Whether the tunnel sends the app anything but bare ACKs within `quiet`.
+fn answers_within(rx: &Receiver<Vec<u8>>, quiet: Duration) -> bool {
+    let deadline = Instant::now() + quiet;
+    while let Ok(packet) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        let Ok(sliced) = SlicedPacket::from_ip(&packet) else {
+            continue;
+        };
+        match &sliced.transport {
+            Some(TransportSlice::Tcp(tcp)) if tcp.destination_port() == 40100 => {
+                if !tcp.payload().is_empty() || tcp.fin() || tcp.rst() {
+                    return true;
+                }
+            }
+            Some(TransportSlice::Icmpv4(_)) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+#[test]
+fn reject_tinygif_answers_plain_http_in_the_tunnel() {
+    let (sink, rx) = capture();
+    let mut tunnel =
+        Tunnel::start(settings(), Arc::new(Rejects(RejectAction::TinyGif)), sink).unwrap();
+    open_tcp(
+        &tunnel,
+        &rx,
+        80,
+        b"GET /ad.gif HTTP/1.1\r\nHost: ads.example\r\n\r\n",
+    );
+    assert_eq!(read_until_closed(&rx), reject::tiny_gif_response());
+    tunnel.stop();
+}
+
+#[test]
+fn reject_close_closes_the_flow_without_an_answer() {
+    let (sink, rx) = capture();
+    let mut tunnel =
+        Tunnel::start(settings(), Arc::new(Rejects(RejectAction::Close)), sink).unwrap();
+    open_tcp(
+        &tunnel,
+        &rx,
+        80,
+        b"GET /ad.gif HTTP/1.1\r\nHost: ads.example\r\n\r\n",
+    );
+    assert!(read_until_closed(&rx).is_empty());
+    tunnel.stop();
+}
+
+#[test]
+fn reject_drop_keeps_the_flow_silent() {
+    let (sink, rx) = capture();
+    let mut tunnel =
+        Tunnel::start(settings(), Arc::new(Rejects(RejectAction::Drop)), sink).unwrap();
+    open_tcp(
+        &tunnel,
+        &rx,
+        80,
+        b"GET /ad.gif HTTP/1.1\r\nHost: ads.example\r\n\r\n",
+    );
+    assert!(
+        !answers_within(&rx, Duration::from_millis(800)),
+        "a dropped flow gets neither data nor a close"
+    );
+    assert_eq!(tunnel.stats().tcp_active, 1, "the flow is held open");
+
+    // QUIC gets no ICMP either, so the app waits instead of retrying.
+    assert!(tunnel.input_packet(&udp_to_remote(40200, &[0xc0; 1200])));
+    assert!(
+        !answers_within(&rx, Duration::from_millis(800)),
+        "a dropped QUIC flow gets no ICMP"
+    );
+    tunnel.stop();
+}
+
+#[test]
+fn reject_close_refuses_quic_with_icmp() {
+    let (sink, rx) = capture();
+    let mut tunnel =
+        Tunnel::start(settings(), Arc::new(Rejects(RejectAction::Close)), sink).unwrap();
+    assert!(tunnel.input_packet(&udp_to_remote(40201, &[0xc0; 1200])));
+    icmp_port_unreachable(&rx, 40201);
     tunnel.stop();
 }

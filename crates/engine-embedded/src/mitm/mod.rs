@@ -66,6 +66,7 @@ use engine_native::{
 };
 #[cfg(feature = "scripts")]
 use engine_native::{NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig};
+use engine_outbound::reject::{rejection, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use mitm_policy::loon_map_local::MAP_LOCAL_REMOTE_DATA_MAX_BYTES;
 use mitm_policy::loon_plugin::{import_loon_plugin_with_resources, merged_plugin_source};
@@ -438,8 +439,15 @@ impl MitmEngine {
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
         // An unreachable origin still gets the app a decrypted connection
         // (closed right away), as before origin-first ALPN, so the app sees
-        // the usual leaf instead of a failed handshake.
-        let origin = origin?;
+        // the usual leaf instead of a failed handshake. A REJECT-TINYGIF
+        // rule answers its request with the GIF instead.
+        let origin = match origin {
+            Ok(origin) => origin,
+            Err(error) if rejection(&error) == Some(RejectAction::TinyGif) => {
+                return answer_tiny_gif(Conn::new(client, Vec::new()), idle_timeout).await;
+            }
+            Err(error) => return Err(error),
+        };
 
         let authority = authority(host, flow.target.port(), HTTPS_PORT);
         if h2 {
@@ -495,9 +503,16 @@ impl MitmEngine {
         idle_timeout: Duration,
     ) -> io::Result<()> {
         let target = TargetAddr::Ip(flow.target);
-        let origin = tokio::time::timeout(connect_timeout, outbound.connect(&target))
+        let origin = match tokio::time::timeout(connect_timeout, outbound.connect(&target))
             .await
-            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        {
+            Ok(origin) => origin,
+            Err(error) if rejection(&error) == Some(RejectAction::TinyGif) => {
+                return answer_tiny_gif(Conn::new(flow.inbound, flow.first), idle_timeout).await;
+            }
+            Err(error) => return Err(error),
+        };
         let authority = authority(&flow.host, flow.target.port(), HTTP_PORT);
         self.relay(
             Conn::new(flow.inbound, flow.first),
@@ -903,6 +918,28 @@ impl FlowInterceptor for MitmEngine {
             }
         })
     }
+}
+
+/// Answers the first request of a decrypted flow a `REJECT-TINYGIF` rule
+/// refused with a 1x1 GIF, then closes it (the response says so).
+async fn answer_tiny_gif<C: AsyncRead + AsyncWrite + Unpin>(
+    mut client: Conn<C>,
+    idle_timeout: Duration,
+) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let Ok(head) = tokio::time::timeout(idle_timeout, client.read_head()).await else {
+        return Ok(());
+    };
+    if head?.is_none() {
+        return Ok(());
+    }
+    client
+        .write_all(&engine_outbound::reject::tiny_gif_response())
+        .await?;
+    let (mut io, _) = client.into_parts();
+    let _ = io.shutdown().await;
+    Ok(())
 }
 
 /// One decrypted exchange being captured: filed under its connection as
