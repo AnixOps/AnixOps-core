@@ -971,3 +971,110 @@ fn a_hello_that_never_completes_passes_after_a_short_wait() {
     assert_eq!(tunnel.stats().quic_mitm_fallback, 0);
     tunnel.stop();
 }
+
+/// A server that greets first, like SMTP or MySQL, and then echoes.
+fn start_greeting_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            thread::spawn(move || {
+                if stream.write_all(b"220 ready\r\n").is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Opens a TCP flow from `app_port` to `REMOTE:port` and waits for the
+/// server's first bytes without sending any.
+fn greeting(tunnel: &Tunnel, rx: &Receiver<Vec<u8>>, app_port: u16, port: u16) -> Vec<u8> {
+    let client_isn: u32 = 7000;
+    let mut syn = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(app_port, port, client_isn, 65535)
+        .syn()
+        .write(&mut syn, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&syn));
+    let server_isn = wait_for(rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.syn() && tcp.ack() && tcp.destination_port() == app_port =>
+        {
+            Some(tcp.sequence_number())
+        }
+        _ => None,
+    });
+    let mut ack = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(app_port, port, client_isn + 1, 65535)
+        .ack(server_isn.wrapping_add(1))
+        .write(&mut ack, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&ack));
+    wait_for(rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.destination_port() == app_port && !tcp.payload().is_empty() =>
+        {
+            Some(tcp.payload().to_vec())
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn server_first_ports_connect_without_waiting_for_the_app() {
+    let server = start_greeting_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
+
+    for (app_port, port) in [(41000, 25), (41001, 3306), (41002, 21)] {
+        assert_eq!(greeting(&tunnel, &rx, app_port, port), b"220 ready\r\n");
+    }
+    let stats = tunnel.stats();
+    assert_eq!(stats.tcp_total, 3);
+    assert_eq!(stats.tcp_first_wait_skipped, 3);
+    tunnel.stop();
+}
+
+#[test]
+fn a_destination_that_stayed_silent_is_connected_at_once_next_time() {
+    let server = start_greeting_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
+
+    // Unknown port: the first flow waits for the app, then learns.
+    assert_eq!(greeting(&tunnel, &rx, 42000, 2525), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 0);
+    // The next flow to the same destination does not wait.
+    assert_eq!(greeting(&tunnel, &rx, 42001, 2525), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 1);
+    // Another port on the same address is still sniffed.
+    assert_eq!(greeting(&tunnel, &rx, 42002, 2526), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 1);
+    tunnel.stop();
+}
+
+#[test]
+fn https_waits_for_the_app_even_when_it_is_silent() {
+    let server = start_greeting_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
+
+    let started = Instant::now();
+    assert_eq!(greeting(&tunnel, &rx, 43000, 443), b"220 ready\r\n");
+    // Held for the whole client-first wait (1 s) because nothing came.
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(greeting(&tunnel, &rx, 43001, 443), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 0);
+    tunnel.stop();
+}

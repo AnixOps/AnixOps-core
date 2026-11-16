@@ -41,6 +41,7 @@ use crate::dns::{self, OutboundFailure};
 use crate::dns_cache::{CacheKey, DnsCache, Lookup, UpstreamPool, Waiter};
 use crate::dns_policy::{DnsPolicy, Plan};
 use crate::fake_ip::FakeAnswer;
+use crate::first_payload::{ServerFirst, Wait};
 use crate::sniff;
 #[cfg(feature = "wireguard")]
 use crate::wireguard::{self, WireGuardSettings};
@@ -197,6 +198,7 @@ pub struct TunnelStats {
     pub(crate) mitm_flows: AtomicU64,
     pub(crate) mitm_failed: AtomicU64,
     pub(crate) quic_mitm_fallback: AtomicU64,
+    pub(crate) tcp_first_wait_skipped: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -230,6 +232,10 @@ pub struct TunnelStatsSnapshot {
     /// QUIC flows to a decrypted host refused so the app falls back to TCP
     /// (see [`FlowInterceptor::refuses_quic`]); counted in `udp_failed` too.
     pub quic_mitm_fallback: u64,
+    /// TCP flows that connected without waiting for the application's first
+    /// bytes: a server-first port, or a destination that stayed silent
+    /// before (see [`crate::first_payload`]); counted in `tcp_total` too.
+    pub tcp_first_wait_skipped: u64,
 }
 
 impl TunnelStats {
@@ -257,6 +263,7 @@ impl TunnelStats {
             mitm_flows: get(&self.mitm_flows),
             mitm_failed: get(&self.mitm_failed),
             quic_mitm_fallback: get(&self.quic_mitm_fallback),
+            tcp_first_wait_skipped: get(&self.tcp_first_wait_skipped),
         }
     }
 }
@@ -498,6 +505,7 @@ fn spawn_tasks(
     let tcp_dispatcher = dispatcher.clone();
     let tcp_stats = stats.clone();
     let tcp_settings = settings.clone();
+    let server_first = Arc::new(ServerFirst::default());
     tokio::spawn(async move {
         while let Some((stream, _local, remote)) = tcp_listener.next().await {
             let Ok(permit) = tcp_permits.clone().try_acquire_owned() else {
@@ -510,6 +518,7 @@ fn spawn_tasks(
             let stats = tcp_stats.clone();
             let settings = tcp_settings.clone();
             let interceptor = interceptor.clone();
+            let server_first = server_first.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 stats.tcp_active.fetch_add(1, Ordering::Relaxed);
@@ -520,6 +529,7 @@ fn spawn_tasks(
                     interceptor.as_deref(),
                     &stats,
                     &settings,
+                    &server_first,
                 )
                 .await;
                 stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
@@ -1129,10 +1139,12 @@ async fn refuse_udp_flow(
 /// when it closed first. A TLS ClientHello larger than one segment (such as
 /// one with post-quantum key shares) arrives in pieces: reading goes on until
 /// its first record is whole, so the server name can be read from it.
-async fn read_first_payload(inbound: &mut (impl AsyncRead + Unpin), port: u16) -> Option<Vec<u8>> {
-    let wait = match port {
-        80 | 443 => FIRST_PAYLOAD_CLIENT_FIRST_WAIT,
-        _ => FIRST_PAYLOAD_WAIT,
+/// With [`Wait::Skip`] nothing is read and the payload is empty at once.
+async fn read_first_payload(inbound: &mut (impl AsyncRead + Unpin), wait: Wait) -> Option<Vec<u8>> {
+    let wait = match wait {
+        Wait::Skip => return Some(Vec::new()),
+        Wait::ClientFirst => FIRST_PAYLOAD_CLIENT_FIRST_WAIT,
+        Wait::Sniff => FIRST_PAYLOAD_WAIT,
     };
     let mut first = vec![0u8; FIRST_PAYLOAD_MAX];
     let mut len = match tokio::time::timeout(wait, inbound.read(&mut first)).await {
@@ -1176,10 +1188,19 @@ async fn handle_tcp(
     interceptor: Option<&dyn FlowInterceptor>,
     stats: &TunnelStats,
     settings: &TunnelSettings,
+    server_first: &ServerFirst,
 ) {
-    let Some(first) = read_first_payload(&mut inbound, target.port()).await else {
+    let wait = server_first.wait(target);
+    if wait == Wait::Skip {
+        bump(&stats.tcp_first_wait_skipped);
+    }
+    let Some(first) = read_first_payload(&mut inbound, wait).await else {
         return;
     };
+    if first.is_empty() && wait == Wait::Sniff {
+        // Silent for the whole wait: a server-first protocol, most likely.
+        server_first.learn(target);
+    }
 
     if let Some(interceptor) = interceptor {
         if let Some(host) = interceptor.claim(&first, target) {
@@ -1332,7 +1353,9 @@ mod tests {
             app.write_all(&sent[1400..]).await.unwrap();
             app
         });
-        let first = read_first_payload(&mut tunnel_side, 443).await.unwrap();
+        let first = read_first_payload(&mut tunnel_side, Wait::ClientFirst)
+            .await
+            .unwrap();
         assert_eq!(first, record);
         drop(writer.await.unwrap());
     }
@@ -1345,13 +1368,20 @@ mod tests {
             app.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
             app
         });
-        let first = read_first_payload(&mut tunnel_side, 80).await.unwrap();
+        let first = read_first_payload(&mut tunnel_side, Wait::ClientFirst)
+            .await
+            .unwrap();
         assert_eq!(first, b"GET / HTTP/1.1\r\n\r\n");
         drop(writer.await.unwrap());
 
         let (_app, mut tunnel_side) = tokio::io::duplex(1024);
         let started = std::time::Instant::now();
-        assert_eq!(read_first_payload(&mut tunnel_side, 22).await.unwrap(), b"");
+        assert_eq!(
+            read_first_payload(&mut tunnel_side, Wait::Sniff)
+                .await
+                .unwrap(),
+            b""
+        );
         assert!(started.elapsed() < Duration::from_millis(900));
     }
 }
