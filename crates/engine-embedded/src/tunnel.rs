@@ -1,9 +1,11 @@
 //! Packet tunnel: IP packets in, IP packets out, connections through an outbound.
 //!
-//! The tunnel owns one current-thread tokio runtime on a dedicated thread. IP
-//! packets from the TUN side enter through [`Tunnel::input_packet`]; packets
-//! produced by the userspace TCP/IP stack leave through the [`PacketWriter`]
-//! on the tunnel thread, a burst at a time. TCP flows are relayed through the
+//! The tunnel owns one tokio runtime on a dedicated thread: a current-thread
+//! runtime, or on desktop a multi-thread one with
+//! [`TunnelSettings::worker_threads`] workers. IP packets from the TUN side
+//! enter through [`Tunnel::input_packet`]; packets produced by the userspace
+//! TCP/IP stack leave through the [`PacketWriter`] on a tunnel thread, a
+//! burst at a time and one call at a time. TCP flows are relayed through the
 //! [`Dispatcher`], which routes and tracks them; the host name sniffed from a
 //! flow's first bytes (TLS SNI or HTTP `Host`) goes along for domain rules.
 //! UDP/53 is answered from the DNS hosts, from the Fake-IP table when it is on
@@ -46,10 +48,12 @@ use crate::sniff;
 #[cfg(feature = "wireguard")]
 use crate::wireguard::{self, WireGuardSettings};
 
-/// Receives every IP packet the stack emits. Called on the tunnel thread.
+/// Receives every IP packet the stack emits. Called on a tunnel thread, one
+/// call at a time.
 pub type PacketSink = Box<dyn Fn(&[u8]) + Send + Sync + 'static>;
 
-/// Where the tunnel writes the IP packets it emits, on the tunnel thread.
+/// Where the tunnel writes the IP packets it emits, on a tunnel thread. Calls
+/// never overlap, even when the tunnel runs on several worker threads.
 ///
 /// Packets that are ready together arrive in one [`PacketWriter::write_batch`]
 /// call, so a host whose packet write is expensive (one
@@ -63,6 +67,25 @@ pub trait PacketWriter: Send + Sync + 'static {
         for packet in packets {
             self.write(packet);
         }
+    }
+}
+
+/// Keeps a multi-thread tunnel's writes one at a time: the stack's output
+/// and ICMP replies from the UDP path run as different tasks.
+struct OneAtATime<W> {
+    lock: std::sync::Mutex<()>,
+    inner: W,
+}
+
+impl<W: PacketWriter> PacketWriter for OneAtATime<W> {
+    fn write(&self, packet: &[u8]) {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.write(packet);
+    }
+
+    fn write_batch(&self, packets: &[Vec<u8>]) {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.write_batch(packets);
     }
 }
 
@@ -196,12 +219,22 @@ pub fn default_worker_threads() -> usize {
         .min(DEFAULT_DESKTOP_WORKERS)
 }
 
+/// The worker threads a tunnel really uses: 1 on iOS and Android, otherwise
+/// `requested` within 1..=[`MAX_WORKER_THREADS`].
+fn effective_workers(requested: usize) -> usize {
+    if cfg!(any(target_os = "ios", target_os = "android")) {
+        1
+    } else {
+        requested.clamp(1, MAX_WORKER_THREADS)
+    }
+}
+
 /// The tunnel runtime: one thread, or `workers` threads on desktop.
 fn tunnel_runtime(workers: usize) -> io::Result<tokio::runtime::Runtime> {
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     if workers > 1 {
         return tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers.min(MAX_WORKER_THREADS))
+            .worker_threads(workers)
             .thread_name("networkcore-tunnel-worker")
             .enable_all()
             .build();
@@ -357,11 +390,18 @@ impl Tunnel {
         background: Option<BoxFuture<'static, ()>>,
         sink: impl PacketWriter,
     ) -> io::Result<Self> {
-        let sink: Arc<dyn PacketWriter> = Arc::new(sink);
+        let workers = effective_workers(settings.worker_threads);
+        let sink: Arc<dyn PacketWriter> = if workers > 1 {
+            Arc::new(OneAtATime {
+                lock: std::sync::Mutex::new(()),
+                inner: sink,
+            })
+        } else {
+            Arc::new(sink)
+        };
         let interceptor_background = interceptor
             .clone()
             .and_then(|interceptor| interceptor.background());
-        let workers = settings.worker_threads;
         Self::launch(workers, move |packet_rx, stats| {
             spawn_tasks(settings, dispatcher, interceptor, sink, packet_rx, stats)?;
             for background in [background, interceptor_background].into_iter().flatten() {
@@ -503,7 +543,8 @@ fn spawn_tasks(
     let (mut stack_sink, mut stack_stream) = stack.split();
 
     // Stack -> TUN. The UDP path also writes ICMP errors straight to the
-    // sink (see [`crate::icmp`]); everything runs on the tunnel thread.
+    // sink (see [`crate::icmp`]); on a multi-thread tunnel the sink is
+    // wrapped so those writes never overlap.
     // Packets that are already waiting go out with the first one, in one
     // batch of at most MAX_WRITE_BATCH.
     let raw_sink = sink.clone();
