@@ -169,7 +169,6 @@ fn managed_configuration_accepts_native_https_mitm_with_explicit_socks_upstream(
                 r"C:\ProgramData\AnixOps\NetworkCore\mitm\root-ca-key.pem",
             ),
             log_path: PathBuf::from(r"C:\ProgramData\AnixOps\NetworkCore\logs\native-mitm.log"),
-            bilibili_web_ad_block_enabled: false,
             script_runtime: Some(WindowsManagedNativeMitmScriptRuntimeConfig {
                 policy_source_path: PathBuf::from(
                     r"C:\ProgramData\AnixOps\NetworkCore\scripts\policy.conf",
@@ -195,7 +194,10 @@ fn managed_configuration_accepts_native_https_mitm_with_explicit_socks_upstream(
     let mut json = serde_json::to_value(&config).expect("native MITM config serializes");
     assert_eq!(json["native_mitm"]["listen_port"], 7890);
     assert_eq!(json["native_mitm"]["upstream_socks_port"], 7891);
-    assert_eq!(json["native_mitm"]["bilibili_web_ad_block_enabled"], false);
+    // The built-in Bilibili trial is gone (docs/no-presets.md).
+    assert!(json["native_mitm"]
+        .get("bilibili_web_ad_block_enabled")
+        .is_none());
     assert_eq!(
         json["native_mitm"]["script_runtime"]["policy_source_path"],
         r"C:\ProgramData\AnixOps\NetworkCore\scripts\policy.conf"
@@ -203,15 +205,10 @@ fn managed_configuration_accepts_native_https_mitm_with_explicit_socks_upstream(
     json["native_mitm"]
         .as_object_mut()
         .expect("native MITM config serializes as an object")
-        .remove("bilibili_web_ad_block_enabled");
-    let legacy: WindowsManagedConfig =
-        serde_json::from_value(json).expect("pre-snapshot native MITM config remains readable");
-    assert!(
-        !legacy
-            .native_mitm
-            .expect("legacy native MITM configuration remains present")
-            .bilibili_web_ad_block_enabled
-    );
+        .insert("bilibili_web_ad_block_enabled".to_string(), true.into());
+    let legacy: WindowsManagedConfig = serde_json::from_value(json)
+        .expect("a config saved with the removed Bilibili switch remains readable");
+    assert!(legacy.native_mitm.is_some());
 }
 
 #[test]

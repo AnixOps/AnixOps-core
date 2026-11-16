@@ -5,24 +5,40 @@ use control_domain::{
     PluginPackage, PluginPermission,
 };
 use mitm_policy::{
-    builtin_ad_block_plugin_package, builtin_bilibili_web_ad_block_plugin_package,
-    AnixOpsMitmPluginService, AnixOpsMitmPolicyEngine, MitmPolicyHeaderField,
+    user_plugin_package, AnixOpsMitmPluginService, AnixOpsMitmPolicyEngine, MitmPolicyHeaderField,
     MitmPolicyHeaderOperation, MitmPolicyMitmDecisionType, MitmPolicyPhase,
-    MitmPolicyRewriteAction, MitmPolicyScriptKind, MITM_POLICY_AD_BLOCK_PLUGIN_ID,
-    MITM_POLICY_BILIBILI_WEB_AD_BLOCK_PLUGIN_ID, MITM_POLICY_CONFIG_LOADED_CODE,
+    MitmPolicyRewriteAction, MitmPolicyScriptKind, MITM_POLICY_CONFIG_LOADED_CODE,
     MITM_POLICY_CONFIG_PARSE_FAILED_CODE, MITM_POLICY_HTTP_EVENT_MUTATION_DEFERRED_CODE,
     MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_CODE, MITM_POLICY_HTTP_EVENT_SOURCE_MISSING_CODE,
-    MITM_POLICY_MANIFEST_HOOK_MISSING_CODE,
+    MITM_POLICY_MANIFEST_HOOK_MISSING_CODE, MITM_POLICY_USER_PLUGIN_ID,
 };
 
+/// A plugin as a user would import it. NetworkCore ships none (docs/no-presets.md).
+const TEST_PLUGIN: &str = concat!(
+    "[Plugin]\n",
+    "name = Test Reject Policy\n",
+    "\n",
+    "[URL Rewrite]\n",
+    "^https?://.*doubleclick\\.net/ reject\n",
+    "^https?://.*googlesyndication\\.com/ reject\n",
+    "^https?://.*google-analytics\\.com/ reject\n",
+    "^https?://.*adservice\\.google\\.com/ reject\n",
+    "^https?://.*adsystem\\.com/ reject\n",
+    "\n",
+    "[MITM]\n",
+    "enable = true\n",
+    "hostname = %APPEND% *.doubleclick.net, *.googlesyndication.com, ",
+    "*.google-analytics.com, *.adservice.google.com, *.adsystem.com\n",
+);
+
 #[test]
-fn builtin_ad_block_plugin_package_loads_through_mitm_anixops_core() {
-    let package = builtin_ad_block_plugin_package();
+fn a_user_plugin_package_loads_through_mitm_anixops_core() {
+    let package = user_plugin_package(TEST_PLUGIN);
     let mut engine = AnixOpsMitmPolicyEngine::new().expect("policy engine should allocate");
 
     let report = engine
         .load_config(&package.source)
-        .expect("built-in ad block policy should load");
+        .expect("the user plugin should load");
 
     assert_eq!(report.version, "0.45.10");
     assert!(report.rewrite_rule_count >= 5);
@@ -50,46 +66,6 @@ fn builtin_ad_block_plugin_package_loads_through_mitm_anixops_core() {
         .evaluate_mitm("stats.doubleclick.net", false)
         .expect("MITM host decision should evaluate");
     assert_eq!(decision.decision, MitmPolicyMitmDecisionType::Intercept);
-}
-
-#[test]
-fn builtin_bilibili_web_trial_is_request_only_and_rejects_only_promotional_endpoints() {
-    let package = builtin_bilibili_web_ad_block_plugin_package();
-    let mut engine = AnixOpsMitmPolicyEngine::new().expect("policy engine should allocate");
-
-    let report = engine
-        .load_config(&package.source)
-        .expect("Bilibili web trial policy should load");
-    assert_eq!(
-        package.manifest.id,
-        MITM_POLICY_BILIBILI_WEB_AD_BLOCK_PLUGIN_ID
-    );
-    assert_eq!(package.manifest.hooks, vec![HookPoint::Request]);
-    assert_eq!(
-        package.manifest.permissions,
-        vec![
-            PluginPermission::ReadRequest,
-            PluginPermission::ModifyRequest
-        ]
-    );
-    assert_eq!(report.script_rule_count, 0);
-    assert_eq!(report.rewrite_rule_count, 4);
-
-    let promotional = engine
-        .evaluate_url_rewrite(
-            "https://api.vc.bilibili.com/search_svr/v1/Search/recommend_words?from=web",
-            MitmPolicyPhase::Request,
-        )
-        .expect("promotional request should evaluate");
-    assert_eq!(promotional.action, MitmPolicyRewriteAction::Reject);
-
-    let unrelated = engine
-        .evaluate_url_rewrite(
-            "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd",
-            MitmPolicyPhase::Request,
-        )
-        .expect("unrelated request should evaluate");
-    assert_eq!(unrelated.action, MitmPolicyRewriteAction::None);
 }
 
 #[test]
@@ -264,8 +240,8 @@ fn v04510_policy_wrapper_applies_bounded_header_list_contract() {
 }
 
 #[test]
-fn adapter_loads_builtin_ad_block_plugin_and_reports_deferred_mutation() {
-    let package = builtin_ad_block_plugin_package();
+fn adapter_loads_a_user_plugin_and_reports_deferred_mutation() {
+    let package = user_plugin_package(TEST_PLUGIN);
     let service = AnixOpsMitmPluginService::new();
     let instance = service
         .load(
@@ -274,7 +250,7 @@ fn adapter_loads_builtin_ad_block_plugin_and_reports_deferred_mutation() {
                 permissions: package.manifest.permissions.clone(),
             },
         )
-        .expect("built-in ad block plugin should load");
+        .expect("the user plugin should load");
 
     let result = service
         .handle_http_event(
@@ -290,7 +266,7 @@ fn adapter_loads_builtin_ad_block_plugin_and_reports_deferred_mutation() {
         )
         .expect("adapter should return audit and diagnostics");
 
-    assert_eq!(instance.manifest.id, MITM_POLICY_AD_BLOCK_PLUGIN_ID);
+    assert_eq!(instance.manifest.id, MITM_POLICY_USER_PLUGIN_ID);
     assert_eq!(service.audit(&result).len(), 1);
     assert_diagnostic(
         &result.diagnostics,
@@ -300,7 +276,7 @@ fn adapter_loads_builtin_ad_block_plugin_and_reports_deferred_mutation() {
 
 #[test]
 fn adapter_rejects_quic_only_for_mitm_hostnames() {
-    let package = builtin_ad_block_plugin_package();
+    let package = user_plugin_package(TEST_PLUGIN);
     let service = AnixOpsMitmPluginService::new();
     let instance = service
         .load(
@@ -309,7 +285,7 @@ fn adapter_rejects_quic_only_for_mitm_hostnames() {
                 permissions: package.manifest.permissions.clone(),
             },
         )
-        .expect("built-in ad block plugin should load");
+        .expect("the user plugin should load");
 
     let decide = |hostname: &str, is_quic: bool| {
         service
@@ -340,8 +316,8 @@ fn adapter_rejects_quic_only_for_mitm_hostnames() {
 }
 
 #[test]
-fn adapter_plans_builtin_ad_block_reject_for_rich_http_mitm_event() {
-    let package = builtin_ad_block_plugin_package();
+fn adapter_plans_a_user_plugin_reject_for_rich_http_mitm_event() {
+    let package = user_plugin_package(TEST_PLUGIN);
     let service = AnixOpsMitmPluginService::new();
     let instance = service
         .load(
@@ -350,7 +326,7 @@ fn adapter_plans_builtin_ad_block_reject_for_rich_http_mitm_event() {
                 permissions: package.manifest.permissions.clone(),
             },
         )
-        .expect("built-in ad block plugin should load");
+        .expect("the user plugin should load");
 
     let outcome = service
         .handle_http_mitm_event(

@@ -13,16 +13,13 @@ use control_domain::{
     CertificateTrustState, ConfigurationService, Diagnostic, DiagnosticSeverity, DomainError,
     DomainResult, GrantedPermissions, HttpMitmAction, HttpMitmPhase, MetadataEntry,
     MitmPluginService, OperatingSystem, PlatformCapabilityService, PlatformCapabilityStatus,
-    PlatformFeatureState, ProxyEngineConfig, ProxyEngineDescriptor, ProxyEngineEvent,
-    ProxyEngineHealthReport, ProxyEngineLifecycleState, ProxyEngineRollbackRequest,
-    ProxyEngineService, ProxyEngineStatus, RawSubscription, SubscriptionService,
-    SubscriptionSource,
+    PlatformFeatureState, PluginPackage, ProxyEngineConfig, ProxyEngineDescriptor,
+    ProxyEngineEvent, ProxyEngineHealthReport, ProxyEngineLifecycleState,
+    ProxyEngineRollbackRequest, ProxyEngineService, ProxyEngineStatus, RawSubscription,
+    SubscriptionService, SubscriptionSource,
 };
 use control_runtime::{RuntimeConfigRequest, RuntimeOperationResult, RuntimeOrchestrator};
-use mitm_policy::{
-    builtin_ad_block_plugin_package, AnixOpsMitmPluginService, AnixOpsMitmPolicyEngine,
-    MITM_POLICY_AD_BLOCK_PLUGIN_ID,
-};
+use mitm_policy::{user_plugin_package, AnixOpsMitmPluginService, AnixOpsMitmPolicyEngine};
 use platform_linux::proxy::{
     apply_environment_proxy, rollback_environment_proxy, status_environment_proxy,
     LinuxEnvironmentProxyApplyRequest, LinuxEnvironmentProxyRollbackRequest,
@@ -136,6 +133,8 @@ pub const CLI_START_TLS_MITM_MATERIAL_READ_FAILED_CODE: &str =
     "cli.linux.start.tls_mitm_material_read_failed";
 pub const CLI_START_TLS_MITM_PRIVATE_KEY_PROTECTION_FAILED_CODE: &str =
     "cli.linux.start.tls_mitm_private_key_protection_failed";
+pub const CLI_START_MITM_PLUGIN_REQUIRED_CODE: &str = "cli.linux.start.mitm_plugin_required";
+pub const CLI_MITM_PLUGIN_READ_FAILED_CODE: &str = "cli.linux.mitm.plugin_read_failed";
 pub const CLI_START_SCRIPT_RUNTIME_AUTHORIZATION_REQUIRED_CODE: &str =
     "cli.linux.start.script_runtime_authorization_required";
 pub const CLI_START_SCRIPT_RUNTIME_CONFIG_REQUIRED_CODE: &str =
@@ -353,6 +352,8 @@ pub const CLI_MITM_HTTP_REWRITE_PLAN_READY_CODE: &str = "cli.linux.mitm.http_rew
 pub const CLI_MITM_HTTP_REWRITE_APPLY_READY_CODE: &str = "cli.linux.mitm.http_rewrite.apply.ready";
 pub const CLI_MITM_HTTP_REWRITE_CONFIG_MISSING_CODE: &str =
     "cli.linux.mitm.http_rewrite.config_missing";
+pub const CLI_MITM_HTTP_REWRITE_PLUGIN_MISSING_CODE: &str =
+    "cli.linux.mitm.http_rewrite.plugin_missing";
 pub const CLI_MITM_HTTP_REWRITE_TLS_BLOCKED_CODE: &str = "cli.linux.mitm.http_rewrite.tls_blocked";
 pub const CLI_MITM_BROWSER_HIJACK_DEFERRED_CODE: &str = "cli.linux.mitm.browser_hijack.deferred";
 
@@ -505,6 +506,8 @@ pub enum LinuxCliCommand {
     },
     Start {
         config_path: Option<String>,
+        /// The user's own MITM plugin; NetworkCore ships none.
+        mitm_plugin_path: Option<String>,
         mitm_ca_certificate_path: Option<String>,
         mitm_ca_private_key_path: Option<String>,
         enable_https_mitm: bool,
@@ -824,6 +827,7 @@ pub enum LinuxCliCommand {
         format: OutputFormat,
     },
     MitmHttpRewritePreview {
+        mitm_plugin_path: Option<String>,
         url: Option<String>,
         method: String,
         phase: String,
@@ -1827,6 +1831,8 @@ pub struct LinuxMitmGateStatus {
 
 #[derive(Debug, Clone, Copy)]
 pub struct LinuxNativeMitmRuntimeFileConfig<'a> {
+    /// The user's own MITM plugin file; NetworkCore ships none.
+    pub plugin_path: Option<&'a str>,
     pub certificate_path: Option<&'a str>,
     pub private_key_path: Option<&'a str>,
     pub enable_https_mitm: bool,
@@ -1838,25 +1844,34 @@ pub struct LinuxNativeMitmRuntimeFileConfig<'a> {
     pub confirm: bool,
 }
 
-pub fn native_proxy_engine_service_with_builtin_mitm_plugin(
+/// The native engine with the user's own MITM plugin as its HTTP MITM hook.
+pub fn native_proxy_engine_service_with_mitm_plugin(
+    package: &PluginPackage,
 ) -> DomainResult<engine_native::NativeProxyEngineService> {
-    native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_ca_material(None)
+    native_proxy_engine_service_with_mitm_plugin_and_runtime(Some(package), None, None)
 }
 
-pub fn native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_ca_material(
-    tls_mitm_ca_material: Option<engine_native::NativeTlsMitmCaMaterial>,
-) -> DomainResult<engine_native::NativeProxyEngineService> {
-    native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime(tls_mitm_ca_material, None)
-}
-
-pub fn native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime(
+/// The native engine with an optional user MITM plugin. NetworkCore ships no
+/// plugin (docs/no-presets.md): without one the engine has no HTTP MITM hook,
+/// and HTTPS MITM or the script runtime, which only act on a plugin's rules,
+/// are refused.
+pub fn native_proxy_engine_service_with_mitm_plugin_and_runtime(
+    package: Option<&PluginPackage>,
     tls_mitm_ca_material: Option<engine_native::NativeTlsMitmCaMaterial>,
     script_executor: Option<engine_native::NativeHttpScriptExecutor>,
 ) -> DomainResult<engine_native::NativeProxyEngineService> {
-    let package = builtin_ad_block_plugin_package();
+    let Some(package) = package else {
+        if tls_mitm_ca_material.is_some() || script_executor.is_some() {
+            return Err(DomainError::new(
+                CLI_START_MITM_PLUGIN_REQUIRED_CODE,
+                "HTTPS MITM and the script runtime need your own MITM plugin: pass --mitm-plugin <path>; NetworkCore ships none",
+            ));
+        }
+        return Ok(engine_native::NativeProxyEngineService::new());
+    };
     let service = AnixOpsMitmPluginService::new();
     let instance = service.load(
-        &package,
+        package,
         &GrantedPermissions {
             permissions: package.manifest.permissions.clone(),
         },
@@ -1879,14 +1894,27 @@ pub fn native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime(
     })
 }
 
-pub fn native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files(
+/// The user's MITM plugin file as a package.
+pub fn read_user_mitm_plugin(path: &str) -> DomainResult<PluginPackage> {
+    let source = std::fs::read_to_string(path).map_err(|error| {
+        DomainError::new(
+            CLI_MITM_PLUGIN_READ_FAILED_CODE,
+            format!("MITM plugin {path} could not be read: {error}"),
+        )
+    })?;
+    Ok(user_plugin_package(source))
+}
+
+pub fn native_proxy_engine_service_with_mitm_plugin_and_tls_mitm_files(
+    plugin_path: Option<&str>,
     certificate_path: Option<&str>,
     private_key_path: Option<&str>,
     enable_https_mitm: bool,
     confirm: bool,
 ) -> DomainResult<engine_native::NativeProxyEngineService> {
-    native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+    native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
         LinuxNativeMitmRuntimeFileConfig {
+            plugin_path,
             certificate_path,
             private_key_path,
             enable_https_mitm,
@@ -1900,10 +1928,11 @@ pub fn native_proxy_engine_service_with_builtin_mitm_plugin_and_tls_mitm_files(
     )
 }
 
-pub fn native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
+pub fn native_proxy_engine_service_with_mitm_plugin_and_runtime_files(
     runtime_config: LinuxNativeMitmRuntimeFileConfig<'_>,
 ) -> DomainResult<engine_native::NativeProxyEngineService> {
     let LinuxNativeMitmRuntimeFileConfig {
+        plugin_path,
         certificate_path,
         private_key_path,
         enable_https_mitm,
@@ -1964,7 +1993,9 @@ pub fn native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime_files(
         confirm,
     )?;
 
-    native_proxy_engine_service_with_builtin_mitm_plugin_and_runtime(
+    let package = plugin_path.map(read_user_mitm_plugin).transpose()?;
+    native_proxy_engine_service_with_mitm_plugin_and_runtime(
+        package.as_ref(),
         tls_mitm_ca_material,
         script_executor,
     )
@@ -6298,6 +6329,7 @@ struct ParsedOptions {
     cert_file_path: Option<String>,
     key_file_path: Option<String>,
     trust_file_path: Option<String>,
+    mitm_plugin_path: Option<String>,
     mitm_ca_certificate_path: Option<String>,
     mitm_ca_private_key_path: Option<String>,
     script_runner_path: Option<String>,
@@ -6425,6 +6457,7 @@ where
             };
             Ok(LinuxCliCommand::Start {
                 config_path: options.config_path,
+                mitm_plugin_path: options.mitm_plugin_path,
                 mitm_ca_certificate_path: options.mitm_ca_certificate_path,
                 mitm_ca_private_key_path: options.mitm_ca_private_key_path,
                 enable_https_mitm: options.enable_https_mitm,
@@ -7100,6 +7133,7 @@ where
         ),
         LinuxCliCommand::MitmHttpRewritePlan { .. } => handle_mitm_http_rewrite_plan(platform),
         LinuxCliCommand::MitmHttpRewritePreview {
+            mitm_plugin_path,
             url,
             method,
             phase,
@@ -7110,6 +7144,7 @@ where
             ..
         } => handle_mitm_http_rewrite_preview(
             platform,
+            mitm_plugin_path.as_deref(),
             url.as_deref(),
             &method,
             &phase,
@@ -11430,6 +11465,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn handle_mitm_http_rewrite_preview<P>(
     platform: &P,
+    plugin_path: Option<&str>,
     url: Option<&str>,
     method: &str,
     phase: &str,
@@ -11453,18 +11489,30 @@ where
             );
         }
     };
-
-    let (mitm_status, mut diagnostics) = match build_linux_mitm_status(&platform_status) {
-        Ok(status) => status,
+    let plugin = match plugin_path.map(read_user_mitm_plugin).transpose() {
+        Ok(plugin) => plugin,
         Err(error) => {
             return domain_error_response(
                 command,
-                LinuxCliExitCode::GeneralFailure,
+                LinuxCliExitCode::ArgumentOrConfig,
                 error,
                 SOURCE_CLI_MITM,
             );
         }
     };
+
+    let (mitm_status, mut diagnostics) =
+        match build_linux_mitm_status_with_plugin(&platform_status, plugin.as_ref()) {
+            Ok(status) => status,
+            Err(error) => {
+                return domain_error_response(
+                    command,
+                    LinuxCliExitCode::GeneralFailure,
+                    error,
+                    SOURCE_CLI_MITM,
+                );
+            }
+        };
 
     let authorization = LinuxMitmHttpRewriteAuthorization {
         confirmed: confirm,
@@ -11552,7 +11600,24 @@ where
         };
     };
 
-    let package = builtin_ad_block_plugin_package();
+    let Some(package) = plugin else {
+        diagnostics.push(cli_diagnostic(
+            DiagnosticSeverity::Error,
+            CLI_MITM_HTTP_REWRITE_PLUGIN_MISSING_CODE,
+            "plain HTTP rewrite preview requires --mitm-plugin <path>: NetworkCore ships no MITM plugin of its own",
+            SOURCE_CLI_MITM,
+        ));
+        let report = build_linux_mitm_http_rewrite_report("preview", Some(request), None);
+        return LinuxCliResponse {
+            ok: false,
+            exit_code: LinuxCliExitCode::ArgumentOrConfig,
+            ..LinuxCliResponse::success(command)
+                .with_platform(platform_status)
+                .with_mitm_status(mitm_status)
+                .with_http_rewrite(report)
+                .with_diagnostics(diagnostics)
+        };
+    };
     let service = AnixOpsMitmPluginService::new();
     let instance = match service.load(
         &package,
@@ -11988,28 +12053,69 @@ where
     response
 }
 
+/// MITM status for the commands that take no plugin: the policy engine with
+/// nothing loaded, since NetworkCore ships no plugin (docs/no-presets.md).
 fn build_linux_mitm_status(
     platform_status: &PlatformCapabilityStatus,
 ) -> DomainResult<(LinuxMitmStatus, Vec<Diagnostic>)> {
-    let package = builtin_ad_block_plugin_package();
-    let mut engine = AnixOpsMitmPolicyEngine::new()?;
-    let report = engine.load_config(&package.source)?;
-    let service = AnixOpsMitmPluginService::new();
-    let instance = service.load(
-        &package,
-        &GrantedPermissions {
-            permissions: package.manifest.permissions.clone(),
-        },
-    )?;
+    build_linux_mitm_status_with_plugin(platform_status, None)
+}
 
+fn build_linux_mitm_status_with_plugin(
+    platform_status: &PlatformCapabilityStatus,
+    plugin: Option<&PluginPackage>,
+) -> DomainResult<(LinuxMitmStatus, Vec<Diagnostic>)> {
     let mut diagnostics = platform_diagnostics(platform_status);
-    diagnostics.extend(report.diagnostics.clone());
-    diagnostics.push(cli_diagnostic(
-        DiagnosticSeverity::Info,
-        CLI_MITM_POLICY_READY_CODE,
-        "mitm policy engine loaded built-in networkcore.adblock plugin",
-        SOURCE_CLI_MITM,
-    ));
+    let policy = match plugin {
+        Some(package) => {
+            let mut engine = AnixOpsMitmPolicyEngine::new()?;
+            let report = engine.load_config(&package.source)?;
+            let service = AnixOpsMitmPluginService::new();
+            let instance = service.load(
+                package,
+                &GrantedPermissions {
+                    permissions: package.manifest.permissions.clone(),
+                },
+            )?;
+            diagnostics.extend(report.diagnostics.clone());
+            diagnostics.push(cli_diagnostic(
+                DiagnosticSeverity::Info,
+                CLI_MITM_POLICY_READY_CODE,
+                "mitm policy engine loaded your MITM plugin",
+                SOURCE_CLI_MITM,
+            ));
+            LinuxMitmPolicyStatus {
+                engine: "mitm_anixops".to_string(),
+                engine_version: report.version,
+                plugin_id: instance.manifest.id,
+                plugin_version: instance.manifest.version,
+                plugin_loaded: true,
+                mitm_pattern_count: report.mitm_pattern_count,
+                rewrite_rule_count: report.rewrite_rule_count,
+                script_rule_count: report.script_rule_count,
+                argument_count: report.argument_count,
+            }
+        }
+        None => {
+            diagnostics.push(cli_diagnostic(
+                DiagnosticSeverity::Info,
+                CLI_MITM_POLICY_READY_CODE,
+                "mitm policy engine is ready with no plugin loaded: NetworkCore ships none; load your own with --mitm-plugin <path>",
+                SOURCE_CLI_MITM,
+            ));
+            LinuxMitmPolicyStatus {
+                engine: "mitm_anixops".to_string(),
+                engine_version: mitm_policy::engine_version().to_string(),
+                plugin_id: String::new(),
+                plugin_version: String::new(),
+                plugin_loaded: false,
+                mitm_pattern_count: 0,
+                rewrite_rule_count: 0,
+                script_rule_count: 0,
+                argument_count: 0,
+            }
+        }
+    };
     diagnostics.push(cli_diagnostic(
         DiagnosticSeverity::Info,
         CLI_MITM_CLI_GATE_PARTIAL_CODE,
@@ -12068,17 +12174,7 @@ fn build_linux_mitm_status(
             .to_string(),
         certificate_plan: build_linux_mitm_certificate_plan(platform_status),
         browser_plan: build_linux_mitm_browser_plan(platform_status),
-        policy: LinuxMitmPolicyStatus {
-            engine: "mitm_anixops".to_string(),
-            engine_version: report.version,
-            plugin_id: instance.manifest.id,
-            plugin_version: instance.manifest.version,
-            plugin_loaded: true,
-            mitm_pattern_count: report.mitm_pattern_count,
-            rewrite_rule_count: report.rewrite_rule_count,
-            script_rule_count: report.script_rule_count,
-            argument_count: report.argument_count,
-        },
+        policy,
         gates: vec![
             LinuxMitmGateStatus {
                 gate: MITM_CLI_COMMAND_GATE.to_string(),
@@ -12103,8 +12199,6 @@ fn build_linux_mitm_status(
         ],
     };
 
-    debug_assert_eq!(status.policy.plugin_id, MITM_POLICY_AD_BLOCK_PLUGIN_ID);
-
     Ok((status, diagnostics))
 }
 
@@ -12124,7 +12218,7 @@ fn build_linux_mitm_browser_plan(
             LinuxMitmBrowserPlanStep {
                 id: "load-mitm-policy".to_string(),
                 status: "active".to_string(),
-                reason: "built-in networkcore.adblock policy can be loaded".to_string(),
+                reason: "your own MITM plugin can be loaded with --mitm-plugin; none is built in".to_string(),
             },
             LinuxMitmBrowserPlanStep {
                 id: "verify-certificate-trust".to_string(),
@@ -13710,6 +13804,16 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions, LinuxCliParseError> {
                 };
                 options.trust_file_path = Some(value.clone());
             }
+            "--mitm-plugin" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(parse_error(
+                        CLI_ARGUMENT_VALUE_MISSING_CODE,
+                        "--mitm-plugin requires the path of your own MITM plugin",
+                    ));
+                };
+                options.mitm_plugin_path = Some(value.clone());
+            }
             "--mitm-ca-cert" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -15203,6 +15307,7 @@ fn parse_mitm_http_rewrite_command(args: &[String]) -> Result<LinuxCliCommand, L
         "preview" | "apply" | "dry-run" => {
             let options = parse_options(&args[1..])?;
             Ok(LinuxCliCommand::MitmHttpRewritePreview {
+                mitm_plugin_path: options.mitm_plugin_path,
                 url: options.url,
                 method: options
                     .method
@@ -15354,7 +15459,7 @@ pub const fn cli_help_text() -> &'static str {
         "  networkcore-linux subscription refresh schedule status --unit-name <base-name> --snapshot <path> [--format text|json]\n",
         "  networkcore-linux subscription refresh schedule stop --unit-name <base-name> --snapshot <path> --confirm [--format text|json]\n",
         "  networkcore-linux subscription refresh schedule uninstall --unit-name <base-name> --snapshot <path> --confirm [--format text|json]\n",
-        "  networkcore-linux start --config <path> [--managed-status <path> --managed-snapshot <path> --managed-events <dir> [--managed-control-socket <absolute-path>]] [--enable-https-mitm --mitm-ca-cert <path> --mitm-ca-key <path>] [--enable-script-runtime [--script-runner <path>] --script-map <url=file> ... [--script-store <path>]] --confirm [--format text|json]\n",
+        "  networkcore-linux start --config <path> [--managed-status <path> --managed-snapshot <path> --managed-events <dir> [--managed-control-socket <absolute-path>]] [--mitm-plugin <path>] [--enable-https-mitm --mitm-ca-cert <path> --mitm-ca-key <path>] [--enable-script-runtime [--script-runner <path>] --script-map <url=file> ... [--script-store <path>]] --confirm [--format text|json]\n",
         "  networkcore-linux connect --config <path> [same explicit foreground options as start]\n",
         "  networkcore-linux stop [--managed-control-socket <absolute-path> --confirm] [--format text|json]\n",
         "  networkcore-linux reload --managed-control-socket <absolute-path> --confirm [--format text|json]\n",
@@ -15377,7 +15482,7 @@ pub const fn cli_help_text() -> &'static str {
         "  networkcore-linux mitm certificate trust-apply --cert-file <path> --trust-file <path> --snapshot <path> --confirm\n",
         "  networkcore-linux mitm certificate trust-rollback --trust-file <path> --snapshot <path> --confirm\n",
         "  networkcore-linux mitm browser-capture [plan|launch-plan|session-plan|launch|apply|rollback|verify|traffic-proof] [<ss://url>] [--browser <executable>] [--profile-dir <dir>] [--target-url <url>] [--proxy-scheme http|socks5] [--listen-host <host>] [--listen-port <port>] [--pac-file <path>] [--policy-file <path>] [--profile-prefs-file <path>] [--proof-token <token>] [--proof-log <path>] [--confirm] [--snapshot <path>] [--format text|json]\n",
-        "  networkcore-linux mitm http-rewrite [plan|preview] [--url <url>] [--method <method>] [--phase request|response] [--status-code <code>] [--header <name:value>] [--body <text>] [--confirm] [--format text|json]\n",
+        "  networkcore-linux mitm http-rewrite [plan|preview] [--mitm-plugin <path>] [--url <url>] [--method <method>] [--phase request|response] [--status-code <code>] [--header <name:value>] [--body <text>] [--confirm] [--format text|json]\n",
         "  networkcore-linux install-service --service-executable <absolute-path> [--service-unit <name>] [--service-description <text>] [--service-arg <arg>] [--service-user <user>] [--service-group <group>] [--service-state-dir <absolute-path>] --confirm [--format text|json]\n",
         "  networkcore-linux service <start|stop|restart|reload> [--service-unit <name>] --confirm [--format text|json]\n",
         "  networkcore-linux service status [--service-unit <name>] [--format text|json]\n",
@@ -15431,6 +15536,7 @@ pub const fn cli_help_text() -> &'static str {
         "Options:\n",
         "  --config <path>       Config file for prepare-config and start.\n",
         "  --enable-https-mitm   Explicitly enable the controlled HTTPS MITM engine path for start; requires --confirm and both CA paths.\n",
+        "  --mitm-plugin <path>  Your own MITM plugin for start and mitm http-rewrite preview; none is built in. HTTPS MITM and the script runtime need one.\n",
         "  --mitm-ca-cert <path> CA certificate PEM path for explicitly enabled HTTPS MITM start.\n",
         "  --mitm-ca-key <path>  CA private key PEM path for explicitly enabled HTTPS MITM start.\n",
         "  --enable-script-runtime Explicitly enable mapped local [Script] execution in in-process QuickJS; requires --confirm and maps.\n",

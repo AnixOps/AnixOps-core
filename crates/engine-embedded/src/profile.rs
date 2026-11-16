@@ -1,8 +1,9 @@
 //! Desktop routing over an imported profile: the envelope an import produced
 //! (one outbound, or every node with the subscription's rules and policy
 //! groups) turned into the envelope for a routing mode, and the policy group
-//! choices a client shows and switches. Pure JSON work, no files or network:
-//! clients download and cache the public rule lists themselves.
+//! choices a client shows and switches. Pure JSON work, no files or network.
+//! There are no preset list modes (绕过大陆, GFW 列表, 回国): the rules are the
+//! subscription's and the user's own (docs/no-presets.md).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,12 +17,6 @@ pub const PROXY_OUTBOUND: &str = "proxy";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
-    /// Mainland China sites direct, everything else through the proxy.
-    BypassChina,
-    /// Only sites on the GFW list through the proxy.
-    GfwList,
-    /// Mainland China sites through the proxy, everything else direct.
-    ReturnChina,
     /// Everything direct.
     Direct,
     /// The subscription's own rules and policy groups; a single-node profile
@@ -33,102 +28,21 @@ pub enum RoutingMode {
 impl RoutingMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            RoutingMode::BypassChina => "bypass_china",
-            RoutingMode::GfwList => "gfw_list",
-            RoutingMode::ReturnChina => "return_china",
             RoutingMode::Direct => "direct",
             RoutingMode::Rule => "rule",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        [
-            RoutingMode::BypassChina,
-            RoutingMode::GfwList,
-            RoutingMode::ReturnChina,
-            RoutingMode::Direct,
-            RoutingMode::Rule,
-        ]
-        .into_iter()
-        .find(|mode| mode.as_str() == value)
-    }
-
-    /// The public lists this mode's rules are built from.
-    pub fn rule_lists(self) -> &'static [RuleList] {
-        match self {
-            RoutingMode::BypassChina | RoutingMode::ReturnChina => {
-                &[RuleList::ChinaDomains, RuleList::ChinaIps]
-            }
-            RoutingMode::GfwList => &[RuleList::GfwDomains],
-            RoutingMode::Direct | RoutingMode::Rule => &[],
-        }
+        [RoutingMode::Direct, RoutingMode::Rule]
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
     }
 }
 
-/// A public domain or network list the routing modes use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuleList {
-    ChinaDomains,
-    ChinaIps,
-    GfwDomains,
-}
-
-impl RuleList {
-    pub fn url(self) -> &'static str {
-        match self {
-            RuleList::ChinaDomains => {
-                "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt"
-            }
-            RuleList::ChinaIps => {
-                "https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt"
-            }
-            RuleList::GfwDomains => {
-                "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"
-            }
-        }
-    }
-
-    /// The cache file name a client keeps the parsed entries under.
-    pub fn file_name(self) -> &'static str {
-        match self {
-            RuleList::ChinaDomains => "china-domains.txt",
-            RuleList::ChinaIps => "china-ips.txt",
-            RuleList::GfwDomains => "gfw-domains.txt",
-        }
-    }
-
-    pub fn is_networks(self) -> bool {
-        self == RuleList::ChinaIps
-    }
-
-    /// The entries of a downloaded list: one domain suffix or network per
-    /// line, comments and anything else skipped.
-    pub fn parse(self, content: &str) -> Vec<String> {
-        content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| line.split_whitespace().next())
-            .filter(|entry| {
-                if self.is_networks() {
-                    entry.parse::<std::net::IpAddr>().is_ok() || entry.contains('/')
-                } else {
-                    entry.contains('.') && !entry.contains('/')
-                }
-            })
-            .map(str::to_string)
-            .collect()
-    }
-}
-
-/// The envelope `profile` runs with in `mode`. The rule modes replace the
-/// profile's rules with the lists' (`list` returns a list's entries) and send
-/// the proxied part to the profile's FINAL target, or to its one outbound.
-pub fn envelope_for_mode(
-    profile: &str,
-    mode: RoutingMode,
-    list: impl Fn(RuleList) -> Result<Vec<String>, String>,
-) -> Result<String, String> {
+/// The envelope `profile` runs with in `mode`: rule mode keeps the profile,
+/// direct mode replaces its rules with `FINAL,DIRECT`.
+pub fn envelope_for_mode(profile: &str, mode: RoutingMode) -> Result<String, String> {
     if mode == RoutingMode::Rule {
         validate(profile)?;
         return Ok(profile.to_string());
@@ -137,44 +51,16 @@ pub fn envelope_for_mode(
     let object = envelope
         .as_object_mut()
         .ok_or("the profile must be a JSON object")?;
-    let (mut routing, proxy) = match (object.remove("outbound"), object.remove("routing")) {
-        (Some(outbound), None) => (
-            json!({ "outbounds": { PROXY_OUTBOUND: outbound } }),
-            PROXY_OUTBOUND.to_string(),
-        ),
-        (None, Some(routing)) => {
-            let proxy = final_target(&routing).ok_or("the profile's rules must end with FINAL")?;
-            (routing, proxy)
-        }
+    let mut routing = match (object.remove("outbound"), object.remove("routing")) {
+        (Some(outbound), None) => json!({ "outbounds": { PROXY_OUTBOUND: outbound } }),
+        (None, Some(routing)) => routing,
         _ => return Err("the profile must carry one outbound or routing".to_string()),
-    };
-    let (rules, rule_sets) = match mode {
-        RoutingMode::BypassChina | RoutingMode::ReturnChina => {
-            let (china, rest) = if mode == RoutingMode::BypassChina {
-                ("DIRECT".to_string(), proxy)
-            } else {
-                (proxy, "DIRECT".to_string())
-            };
-            (
-                vec![format!("RULE-SET,china,{china}"), format!("FINAL,{rest}")],
-                json!({ "china": {
-                    "domain_suffix": list(RuleList::ChinaDomains)?,
-                    "ip_cidr": list(RuleList::ChinaIps)?,
-                } }),
-            )
-        }
-        RoutingMode::GfwList => (
-            vec![format!("RULE-SET,gfw,{proxy}"), "FINAL,DIRECT".to_string()],
-            json!({ "gfw": { "domain_suffix": list(RuleList::GfwDomains)?, "ip_cidr": [] } }),
-        ),
-        RoutingMode::Direct => (vec!["FINAL,DIRECT".to_string()], json!({})),
-        RoutingMode::Rule => unreachable!("rule mode returns the profile above"),
     };
     let routing_object = routing
         .as_object_mut()
         .ok_or("the profile's routing must be a JSON object")?;
-    routing_object.insert("rules".to_string(), json!(rules));
-    routing_object.insert("rule_sets".to_string(), rule_sets);
+    routing_object.insert("rules".to_string(), json!(["FINAL,DIRECT"]));
+    routing_object.insert("rule_sets".to_string(), json!({}));
     object.insert("routing".to_string(), routing);
     let rendered = envelope.to_string();
     validate(&rendered)?;

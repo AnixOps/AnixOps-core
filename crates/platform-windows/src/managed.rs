@@ -134,10 +134,6 @@ pub struct WindowsManagedNativeMitmConfig {
     pub ca_certificate_path: PathBuf,
     pub ca_private_key_path: PathBuf,
     pub log_path: PathBuf,
-    /// Enables the first-party, request-only Bilibili web advertising trial.
-    /// This never loads third-party script bundles or response body rewrites.
-    #[serde(default)]
-    pub bilibili_web_ad_block_enabled: bool,
     /// Explicit local Node runner and script URL mappings for native MITM.
     #[serde(default)]
     pub script_runtime: Option<WindowsManagedNativeMitmScriptRuntimeConfig>,

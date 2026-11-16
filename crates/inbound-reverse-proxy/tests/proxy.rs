@@ -13,6 +13,17 @@ use inbound_reverse_proxy::ReverseProxyInboundFactory;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// A loopback address nothing listens on. The socket stays bound (not
+/// listening) until the caller drops it, so no other test can take the port:
+/// a dropped listener's port can be handed out again at once, and on Windows a
+/// parallel test's listener got it, so the "closed" target answered.
+fn refused_addr() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Direct;
@@ -256,10 +267,7 @@ async fn relays_upgrades() {
 
 #[tokio::test]
 async fn answers_502_when_upstreams_are_down() {
-    let closed = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
-    };
+    let (_reserved, closed) = refused_addr();
     let proxy = start_proxy(format!(
         r#"{{"sites":[{{"hosts":["*"],"routes":[{{"upstreams":[{{"server":"127.0.0.1","server_port":{}}}],"health":{{"disabled":true}}}}]}}]}}"#,
         closed.port()

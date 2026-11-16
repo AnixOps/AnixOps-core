@@ -11,6 +11,7 @@
 - [Release Strategy](release-strategy.md)：tag 发布门禁、产物矩阵与回滚
 - [Alpha Release Feature Matrix](alpha-release-feature-matrix.md)：每个 alpha/beta/rc/stable 版本的能力边界
 - [Manual Intervention List](manual-intervention.md)：需要人工处理的事项
+- [公开版不带预设规则和插件](no-presets.md)：去掉的预设模式、内置插件，保留项与 CI 防回归
 - [P0 维护手册](MAINTENANCE_P0.md)、[交付证据](P4_EXECUTION_STATUS.md)、[维护事件 schema](contracts/maintenance-event.schema.json) 与 [fixture](contracts/maintenance-event.fixture.json)
 - [归档](archive/README.md)：已完成的历史计划与设计
 
