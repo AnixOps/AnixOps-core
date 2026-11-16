@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use crate::config::DnsVia;
 use crate::connections::{Dispatcher, Mode};
 use crate::dns::{self, OutboundFailure};
-use crate::dns_cache::{CacheKey, DnsCache, Lookup, UpstreamPool, Waiter};
+use crate::dns_cache::{CacheKey, DnsCache, DnsPools, Lookup, Waiter};
 use crate::dns_policy::{DnsPolicy, Plan};
 use crate::fake_ip::FakeAnswer;
 use crate::sniff;
@@ -539,7 +539,7 @@ fn spawn_tasks(
     });
     let dns_permits = Arc::new(Semaphore::new(settings.max_dns_in_flight));
     let dns_state = Arc::new(std::sync::Mutex::new(DnsCache::default()));
-    let upstream_pool = Arc::new(std::sync::Mutex::new(UpstreamPool::default()));
+    let upstream_pool = Arc::new(DnsPools::default());
     let mut flows = UdpFlows::default();
     tokio::spawn(async move {
         while let Some((payload, src, dst)) = udp_rx.next().await {
@@ -583,8 +583,12 @@ fn spawn_tasks(
                 continue;
             }
             bump(&stats.dns_queries);
-            let proxied = matches!(policy_via(&settings, server), DnsVia::Proxy)
-                && dispatcher.mode() != Mode::Direct;
+            let proxied = dispatcher.mode() != Mode::Direct
+                && settings
+                    .dns
+                    .target(server)
+                    .iter()
+                    .any(|&index| settings.dns.servers()[index].via == DnsVia::Proxy);
             let question = dns::question(&payload);
             let key = question.as_ref().map(|question| CacheKey {
                 name: question.name.clone(),
@@ -683,10 +687,6 @@ fn spawn_tasks(
     Ok(())
 }
 
-fn policy_via(settings: &TunnelSettings, server: usize) -> DnsVia {
-    settings.dns.servers()[server].via
-}
-
 /// One query to send upstream and who gets the answer.
 struct DnsExchange {
     payload: Vec<u8>,
@@ -696,7 +696,10 @@ struct DnsExchange {
     resolver: SocketAddr,
     /// The cache entry and in-flight slot, `None` when the question did not parse.
     key: Option<CacheKey>,
+    /// The target of the policy: the servers asked together.
     server: usize,
+    /// Whether the servers are reached as configured (`false` in the direct
+    /// mode, where every server is direct).
     proxied: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
     dispatcher: Arc<Dispatcher>,
@@ -704,19 +707,10 @@ struct DnsExchange {
     stats: Arc<TunnelStats>,
     reply_tx: mpsc::Sender<UdpMsg>,
     state: Arc<std::sync::Mutex<DnsCache>>,
-    pool: Arc<std::sync::Mutex<UpstreamPool>>,
+    pool: Arc<DnsPools>,
 }
 
 fn spawn_dns_exchange(job: DnsExchange) {
-    // DNS queries are the tunnel's own traffic, not listed connections.
-    let via = if job.proxied {
-        DnsVia::Proxy
-    } else {
-        DnsVia::Direct
-    };
-    let outbound = job
-        .dispatcher
-        .dns_outbound(via, job.policy.servers()[job.server].upstream.target());
     tokio::spawn(async move {
         let DnsExchange {
             payload,
@@ -724,31 +718,29 @@ fn spawn_dns_exchange(job: DnsExchange) {
             resolver,
             key,
             server,
+            proxied,
             permit: _permit,
+            dispatcher,
             policy,
             stats,
             reply_tx,
             state,
             pool,
-            ..
         } = job;
-        let upstream = &policy.servers()[server].upstream;
-        let result = match outbound {
-            Some(outbound) => {
-                // Kept connections belong to one server through one outbound.
-                let pool_key = (server, Arc::as_ptr(&outbound) as *const () as usize);
-                dns::exchange(
-                    upstream,
-                    outbound.as_ref(),
-                    &payload,
-                    policy.timeout(),
-                    Some((&pool, pool_key)),
-                )
-                .await
+        // DNS queries are the tunnel's own traffic, not listed connections.
+        // Routing that rejects the proxy gives no outbound: no query rather
+        // than one in the clear.
+        let outbound_for = |index: usize| -> Option<Arc<dyn TcpOutbound>> {
+            let server = &policy.servers()[index];
+            match server.upstream.target() {
+                Some(target) if proxied => dispatcher.dns_outbound(server.via, target),
+                Some(target) => dispatcher.dns_outbound(DnsVia::Direct, target),
+                // `system`: always direct.
+                None => Some(dispatcher.direct().clone()),
             }
-            // Routing rejects the proxy: no query rather than one in the clear.
-            None => Err(OutboundFailure::ConnectRefused),
         };
+        let result =
+            crate::dns_client::resolve(&policy, server, &payload, &outbound_for, &pool).await;
         let waiters = match &key {
             Some(key) => {
                 let mut state = state.lock().unwrap_or_else(|e| e.into_inner());

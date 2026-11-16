@@ -6,6 +6,15 @@
 
 ### Added
 
+- 嵌入式 DNS 追平 Surge（engine-embedded，见 `docs/architecture/embedded-dns.md`）：
+  - 新上游 `udp://host[:53]`（随机 id、1 秒重发至多 3 次、丢弃 id / 问题不符的数据报、截断或出站不支持 UDP 时改走 TCP）与 `quic://host[:853]`（DNS over QUIC，RFC 9250，ALPN `doq`，证书始终校验；握手跑在出站的 UDP 流上，可直连也可经节点，连接按上游与出站复用、多查询并发、无 keep-alive）。新 cargo feature `dns-quic`（默认开启，含 `dns-tls`），engine-embedded 新增对 `transport-quic` 的依赖（`Cargo.lock` 没有新包）。`transport-quic` 新增 `flow::FlowSocket`（quinn 跑在 `UdpFlow` 上）、`QuicConnector::connect_over` 与 `without_keep_alive`。
+  - 多上游竞速：`default` 与 `rules[].server` 可以写 2–4 个上游的列表，同时发出，第一个 NOERROR 立即采用；NXDOMAIN 等其他上游都结束才采用，所以公网与公司解析器放在一起也能解析公司域名。
+  - 回退：新字段 `fallback`（一个上游或列表），选中的上游全部失败或只回 SERVFAIL / REFUSED 时再问；NXDOMAIN 不回退。
+  - 设备解析器：`url` 写 `system` 的上游始终直连，问 `system_servers`（客户端填入的物理网络解析器地址，最多 8 个，竞速）或在没有地址时用系统解析器（只答 A / AAAA）。用于公司 VPN 的分流 DNS 与回退。
+  - Fake-IP IPv6：`dns.fake_ip.range6`（如 `fc00::/18`，`/8`–`/96`）配了之后 `AAAA` 也回假地址（同一槽位、TTL 1 秒），`Dispatcher` 同样还原；不配时与之前一样回空应答。`FakeIpPool` 新增 `assign6`、`has_ipv6`。
+  - 新模块 `dns_client`（竞速与回退，隧道与 `PolicyResolver` 共用）、`dns_quic`；`dns::exchange` 的连接池参数改为 `dns_cache::DnsPools`，`Upstream::target` 改为返回 `Option`，`DnsServerView` 新增 `fallback`，`DnsRuleConfig.server` / `DnsConfig.default` 改为 `DnsServerRef`（单个名字的旧配置不变）。
+  - CI：engine-embedded 的单 feature 矩阵新增 `dns-quic`。
+
 - 重放用本机代理（engine-embedded 新模块 `replay_proxy`，`local-proxy` feature）：桌面本地代理与包隧道运行时新增控制命令 `replay_proxy`、`start_replay_proxy`（可选 `decrypt`，缺省 `true`：`mitm` 主机表内的 HTTPS 也解密，客户端需信任 `mitm` 根证书）与 `stop_replay_proxy`，都回答 `ReplayProxyStatus`（`running`、`host`、`port`、`username`、`password`、`https_decryption`、计数）。监听只绑 `127.0.0.1`、端口由系统选、凭据每次启动随机生成且必须带（SOCKS5 或 HTTP Basic），其他 App 借不到；连接走同一个 `Dispatcher`，以进程名 `Replay` 出现在连接列表与抓包里。用于 Android 等客户端自身流量不经隧道的平台重放抓到的请求；停止运行时同时停止该监听。
 - 抓包会话加密落盘（engine-embedded `capture::storage`）：新控制命令 `set_capture_storage`（`dir`、`key_base64` 为客户端保存在 Keychain / 系统密钥库里的 32 字节密钥，内核不落盘；可选 `retention_days`，缺省 7，1–365）、`save_capture`（可选 `name`）、`capture_sessions`、`load_capture`（`session`，用该会话替换内存中的抓包并关闭实时抓包，交换重新编号，`dropped_before_seq` 覆盖之前的行）与 `delete_capture`。会话文件 `<保存时刻毫秒>-<随机>.anxcap`，元数据（名称、时间、连接数、请求数）与连接内容分两段各自用 ChaCha20-Poly1305 封装，列表只解元数据；换了密钥打不开的会话标 `unreadable`。超过保留期的文件按文件名里的时间在设置存储、每次保存与每次列出时删除，打不开的也照删。会话 id 只能是数字、`-` 与十六进制，不能指向别的路径。`ring` 改为 engine-embedded 常驻依赖（`Cargo.lock` 不变）。
 - 嵌入式 MITM 支持 HTTP/2（engine-embedded `mitm::http2`，iOS / macOS / Windows / Linux / Android 共用）：App 的 ClientHello 提供 `h2` 时，先以 `h2`、`http/1.1` 连源站，再按源站选中的协议给 App 证书握手，所以请求不在两个版本之间转换；`h2` 两侧都用已有的 `h2` crate，每个流与 HTTP/1.1 消息走同一套改写钩子与抓包（`http_version` 为 `HTTP/2`）：没有规则读取的 body 按流控逐帧转发（含 trailers，gRPC 双向流照常），规则读取的 body 整块持有至 1 MiB，更大的不改写原样转发（`too_large`），`text/event-stream` 边到边转（`streaming`）；请求其他 authority 回 `421`，`CONNECT` 回 `405`。为守住 Network Extension 内存，每条连接最多 16 个并发流、每流接收窗口 128 KiB、连接窗口 1 MiB、每流发送缓冲 128 KiB，所有流在本连接的任务里运行不另起任务。`engine_outbound::sniff` 新增 `client_hello_alpn`。engine-embedded 的 `mitm` feature 新增依赖 `h2`、`http`、`bytes`（均已在 `Cargo.lock` 中）。

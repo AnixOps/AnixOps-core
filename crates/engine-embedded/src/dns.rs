@@ -1,19 +1,23 @@
 //! DNS forwarding for the tunnel.
 //!
 //! UDP/53 queries captured from the TUN interface are answered from the
-//! configured hosts or re-sent to an upstream over TCP, TLS or HTTPS through
-//! an outbound, so DNS needs no UDP relay; [`crate::dns_policy`] picks the
-//! upstream for each name.
+//! configured hosts or re-sent to an upstream over TCP, UDP, TLS, HTTPS or
+//! QUIC through an outbound, or to the device's own resolvers;
+//! [`crate::dns_policy`] picks the upstreams for each name and
+//! [`crate::dns_client`] races them.
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use engine_outbound::{BoxStream, TargetAddr, TcpOutbound};
+use engine_outbound::{BoxStream, TargetAddr, TcpOutbound, UdpFlow};
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 
-use crate::dns_cache::{PoolKey, UpstreamPool};
+use crate::dns_cache::{DnsPools, PoolKey, UpstreamPool};
 
 /// Smallest valid DNS message: the fixed header.
 const DNS_HEADER_LEN: usize = 12;
@@ -98,12 +102,17 @@ impl OutboundFailure {
     }
 }
 
-/// Where a query goes: DNS over TCP, over TLS (RFC 7858) or over HTTPS
-/// (RFC 8484, HTTP/1.1 POST) through an outbound; connections are kept for
-/// later queries (see [`crate::dns_cache::UpstreamPool`]).
+/// Where a query goes: DNS over TCP, over UDP, over TLS (RFC 7858), over
+/// HTTPS (RFC 8484, HTTP/1.1 POST) or over QUIC (RFC 9250) through an
+/// outbound, or the device's own resolvers. TCP, TLS and HTTPS connections
+/// and QUIC connections are kept for later queries (see
+/// [`crate::dns_cache::DnsPools`]).
 #[derive(Clone)]
 pub enum Upstream {
     Tcp(TargetAddr),
+    /// Plain UDP, retried over TCP when the answer is truncated or the
+    /// outbound does not relay UDP.
+    Udp(TargetAddr),
     #[cfg(feature = "dns-tls")]
     Tls {
         target: TargetAddr,
@@ -117,29 +126,45 @@ pub enum Upstream {
         host: String,
         path: String,
     },
+    #[cfg(feature = "dns-quic")]
+    Quic {
+        target: TargetAddr,
+        connector: Arc<transport_quic::QuicConnector>,
+    },
+    /// The device's resolvers: these addresses over UDP through the direct
+    /// outbound, raced, or the system resolver (`getaddrinfo`, A and AAAA
+    /// only) when there are none. Always direct.
+    System(Arc<[SocketAddr]>),
 }
 
 /// Why an upstream URL was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpstreamError {
     Invalid,
-    /// `tls://` and `https://` need the `dns-tls` feature.
+    /// `tls://` and `https://` need the `dns-tls` feature, `quic://` the
+    /// `dns-quic` feature.
     Unsupported,
 }
 
 impl Upstream {
     /// Parses `1.1.1.1`, `1.1.1.1:53`, `tcp://host[:port]`,
-    /// `tls://host[:port]` or `https://host[:port][/path]`. `server_name`
-    /// overrides the TLS name, for servers given by IP address.
+    /// `udp://host[:port]`, `tls://host[:port]`, `https://host[:port][/path]`,
+    /// `quic://host[:port]` or `system`. `server_name` overrides the TLS
+    /// name, for servers given by IP address. `system` comes back without
+    /// addresses; [`crate::dns_policy::DnsPolicy`] fills in the configured
+    /// ones.
     pub fn parse(url: &str, server_name: Option<&str>) -> Result<Self, UpstreamError> {
+        if url.eq_ignore_ascii_case("system") {
+            return Ok(Self::System(Arc::from(Vec::new())));
+        }
         let (scheme, rest) = url.split_once("://").unwrap_or(("tcp", url));
         let (authority, path) = match rest.find('/') {
             Some(slash) => (&rest[..slash], &rest[slash..]),
             None => (rest, ""),
         };
         let default_port = match scheme {
-            "tcp" => 53,
-            "tls" => 853,
+            "tcp" | "udp" => 53,
+            "tls" | "quic" => 853,
             "https" => 443,
             _ => return Err(UpstreamError::Invalid),
         };
@@ -155,6 +180,30 @@ impl Upstream {
         };
         match scheme {
             "tcp" => Ok(Self::Tcp(target)),
+            "udp" => Ok(Self::Udp(target)),
+            #[cfg(feature = "dns-quic")]
+            "quic" => {
+                let name = server_name.unwrap_or(&host).to_string();
+                let connector = transport_quic::QuicConnector::new(
+                    host.clone(),
+                    port,
+                    &transport_tls::TlsSettings {
+                        server_name: name,
+                        alpn: vec!["doq".to_string()],
+                        insecure: false,
+                    },
+                    &["doq"],
+                    transport_quic::Congestion::Cubic,
+                )
+                .and_then(transport_quic::QuicConnector::without_keep_alive)
+                .map_err(|_| UpstreamError::Invalid)?;
+                Ok(Self::Quic {
+                    target,
+                    connector: Arc::new(connector),
+                })
+            }
+            #[cfg(not(feature = "dns-quic"))]
+            "quic" => Err(UpstreamError::Unsupported),
             #[cfg(feature = "dns-tls")]
             _ => {
                 let name = server_name.unwrap_or(&host).to_string();
@@ -194,23 +243,31 @@ impl Upstream {
         }
     }
 
-    /// `tcp`, `tls` or `https`, for status.
+    /// `tcp`, `udp`, `tls`, `https`, `quic` or `system`, for status.
     pub fn scheme(&self) -> &'static str {
         match self {
             Self::Tcp(_) => "tcp",
+            Self::Udp(_) => "udp",
             #[cfg(feature = "dns-tls")]
             Self::Tls { .. } => "tls",
             #[cfg(feature = "dns-tls")]
             Self::Https { .. } => "https",
+            #[cfg(feature = "dns-quic")]
+            Self::Quic { .. } => "quic",
+            Self::System(_) => "system",
         }
     }
 
-    /// The server's address or name and port.
-    pub fn target(&self) -> &TargetAddr {
+    /// The server's address or name and port; `None` for `system`, which
+    /// has several or none.
+    pub fn target(&self) -> Option<&TargetAddr> {
         match self {
-            Self::Tcp(target) => target,
+            Self::Tcp(target) | Self::Udp(target) => Some(target),
             #[cfg(feature = "dns-tls")]
-            Self::Tls { target, .. } | Self::Https { target, .. } => target,
+            Self::Tls { target, .. } | Self::Https { target, .. } => Some(target),
+            #[cfg(feature = "dns-quic")]
+            Self::Quic { target, .. } => Some(target),
+            Self::System(_) => None,
         }
     }
 }
@@ -258,22 +315,56 @@ fn bracketed(host: &str) -> String {
     }
 }
 
-/// Sends one query to `upstream` through `outbound` and returns the reply,
-/// whose id must match the query's. With a `pool`, an idle connection kept
+/// Sends one query to `upstream` through `outbound` (the direct outbound for
+/// `system`) and returns the reply, whose id must match the query's. With
+/// `pools`, connections kept there for `key` are reused (see
+/// [`stream_exchange`] and [`crate::dns_quic`]) and new ones kept.
+pub async fn exchange(
+    upstream: &Upstream,
+    outbound: &dyn TcpOutbound,
+    query: &[u8],
+    timeout: Duration,
+    pools: Option<(&DnsPools, PoolKey)>,
+) -> Result<Vec<u8>, OutboundFailure> {
+    if query.len() < DNS_HEADER_LEN || query.len() > MAX_QUERY_LEN {
+        return Err(OutboundFailure::QueryInvalid);
+    }
+    let deadline = Instant::now() + timeout;
+    let tcp_pool = pools.map(|(pools, key)| (&pools.tcp, key));
+    match upstream {
+        Upstream::Udp(target) => udp_exchange(target, outbound, query, deadline, tcp_pool).await,
+        #[cfg(feature = "dns-quic")]
+        Upstream::Quic { target, connector } => {
+            crate::dns_quic::exchange(
+                connector,
+                target,
+                outbound,
+                query,
+                deadline,
+                pools.map(|(pools, key)| (&pools.quic, key)),
+            )
+            .await
+        }
+        Upstream::System(servers) => system_exchange(servers, outbound, query, deadline).await,
+        _ => stream_exchange(upstream, outbound, query, timeout, tcp_pool).await,
+    }
+}
+
+/// One query over TCP, TLS or HTTPS. With a `pool`, an idle connection kept
 /// there for `key` is tried first (for at most half of `timeout`, falling
 /// back to a new connection), and the connection is kept there afterwards
 /// when it can carry another query.
-pub async fn exchange(
+pub async fn stream_exchange(
     upstream: &Upstream,
     outbound: &dyn TcpOutbound,
     query: &[u8],
     timeout: Duration,
     pool: Option<(&Mutex<UpstreamPool>, PoolKey)>,
 ) -> Result<Vec<u8>, OutboundFailure> {
-    if query.len() < DNS_HEADER_LEN || query.len() > MAX_QUERY_LEN {
+    let Some(target) = upstream.target() else {
         return Err(OutboundFailure::QueryInvalid);
-    }
-    let started = tokio::time::Instant::now();
+    };
+    let started = Instant::now();
     let deadline = started + timeout;
     let take = |pool: &Mutex<UpstreamPool>, key| {
         pool.lock()
@@ -303,7 +394,7 @@ pub async fn exchange(
         }
     }
     let connect = async {
-        let stream = match outbound.connect(upstream.target()).await {
+        let stream = match outbound.connect(target).await {
             Ok(stream) => stream,
             Err(err) => return Err(OutboundFailure::connect(&err)),
         };
@@ -470,6 +561,256 @@ fn keeps_alive(raw: &[u8]) -> bool {
     length.is_some_and(|length| raw.len() == head_end + 4 + length)
 }
 
+/// Datagrams sent for one UDP query: the first, then again after
+/// [`UDP_RETRY`] each while no answer came.
+const UDP_SENDS: u32 = 3;
+const UDP_RETRY: Duration = Duration::from_millis(1000);
+
+/// DNS over UDP to `target` through `outbound`, with a random id of its own
+/// (the app's comes back in the answer). Datagrams that are not the answer
+/// to this question are ignored. A truncated answer, or an outbound without
+/// UDP, makes the query go over TCP to the same server.
+async fn udp_exchange(
+    target: &TargetAddr,
+    outbound: &dyn TcpOutbound,
+    query: &[u8],
+    deadline: Instant,
+    tcp_pool: Option<(&Mutex<UpstreamPool>, PoolKey)>,
+) -> Result<Vec<u8>, OutboundFailure> {
+    let flow = match tokio::time::timeout_at(deadline, outbound.open_udp(target)).await {
+        Ok(Ok(flow)) => flow,
+        Ok(Err(err)) if err.kind() == io::ErrorKind::Unsupported => {
+            return over_tcp(target, outbound, query, deadline, tcp_pool).await;
+        }
+        Ok(Err(err)) => return Err(OutboundFailure::connect(&err)),
+        Err(_) => return Err(OutboundFailure::ConnectTimeout),
+    };
+    let mut sent = query.to_vec();
+    sent[..2].copy_from_slice(&random_id().to_be_bytes());
+    let mut response = udp_ask(flow, &sent, deadline).await?;
+    if response[2] & FLAG_TC != 0 {
+        return over_tcp(target, outbound, query, deadline, tcp_pool).await;
+    }
+    response[..2].copy_from_slice(&query[..2]);
+    Ok(response)
+}
+
+/// The UDP server's query over TCP, in the time left.
+async fn over_tcp(
+    target: &TargetAddr,
+    outbound: &dyn TcpOutbound,
+    query: &[u8],
+    deadline: Instant,
+    tcp_pool: Option<(&Mutex<UpstreamPool>, PoolKey)>,
+) -> Result<Vec<u8>, OutboundFailure> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(OutboundFailure::ReplyTimeout);
+    }
+    let upstream = Upstream::Tcp(target.clone());
+    stream_exchange(&upstream, outbound, query, left, tcp_pool).await
+}
+
+/// Sends `query` on `flow` until its answer arrives or `deadline` passes.
+async fn udp_ask(
+    flow: UdpFlow,
+    query: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, OutboundFailure> {
+    let UdpFlow { mut send, mut recv } = flow;
+    let mut sends = 0;
+    let mut next_send = Instant::now();
+    loop {
+        if sends < UDP_SENDS && Instant::now() >= next_send {
+            send.send(query)
+                .await
+                .map_err(|err| OutboundFailure::reply(&err))?;
+            sends += 1;
+            next_send = Instant::now() + UDP_RETRY;
+        }
+        let wait = if sends < UDP_SENDS {
+            next_send.min(deadline)
+        } else {
+            deadline
+        };
+        match tokio::time::timeout_at(wait, recv.recv()).await {
+            Ok(Ok(datagram)) if answers(query, &datagram) => return Ok(datagram),
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => return Err(OutboundFailure::reply(&err)),
+            Err(_) if Instant::now() >= deadline => return Err(OutboundFailure::ReplyTimeout),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Whether `response` answers `query`: same id, a response, and the same
+/// question (names compared without case).
+pub fn answers(query: &[u8], response: &[u8]) -> bool {
+    if response.len() < DNS_HEADER_LEN
+        || response[..2] != query[..2]
+        || response[2] & 0x80 == 0
+        || response[4..6] != query[4..6]
+    {
+        return false;
+    }
+    match question(query) {
+        Some(question) => response
+            .get(DNS_HEADER_LEN..question.end)
+            .is_some_and(|asked| asked.eq_ignore_ascii_case(&query[DNS_HEADER_LEN..question.end])),
+        None => true,
+    }
+}
+
+/// TC: the answer did not fit in the datagram.
+const FLAG_TC: u8 = 0x02;
+
+pub const RCODE_NOERROR: u8 = 0;
+pub const RCODE_SERVFAIL: u8 = 2;
+pub const RCODE_NXDOMAIN: u8 = 3;
+
+/// The response code of a response.
+pub fn rcode(response: &[u8]) -> u8 {
+    response.get(3).map_or(RCODE_SERVFAIL, |flags| flags & 0x0F)
+}
+
+fn random_id() -> u16 {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut id = [0u8; 2];
+    if SystemRandom::new().fill(&mut id).is_err() {
+        // Only the spoofing margin of direct UDP rests on it.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        return nanos as u16;
+    }
+    u16::from_be_bytes(id)
+}
+
+/// The device's resolvers: `servers` over UDP through `direct`, raced, or
+/// the system resolver when there are none.
+async fn system_exchange(
+    servers: &[SocketAddr],
+    direct: &dyn TcpOutbound,
+    query: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, OutboundFailure> {
+    if servers.is_empty() {
+        return system_resolver_answer(query, deadline).await;
+    }
+    let targets: Vec<TargetAddr> = servers
+        .iter()
+        .map(|server| TargetAddr::Ip(*server))
+        .collect();
+    race(
+        targets
+            .iter()
+            .map(|target| udp_exchange(target, direct, query, deadline, None)),
+    )
+    .await
+    .into_result()
+}
+
+/// An answer to an A or AAAA query from the system resolver (TTL 60 s), or
+/// SERVFAIL when it fails or for other types, which it cannot look up.
+async fn system_resolver_answer(
+    query: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>, OutboundFailure> {
+    let question = question(query).ok_or(OutboundFailure::QueryInvalid)?;
+    if !matches!(question.qtype, TYPE_A | TYPE_AAAA) {
+        return Ok(error_answer(query, &question, RCODE_SERVFAIL));
+    }
+    let lookup = tokio::net::lookup_host((question.name.as_str(), 0));
+    match tokio::time::timeout_at(deadline, lookup).await {
+        Ok(Ok(addresses)) => {
+            let mut found: Vec<IpAddr> = Vec::new();
+            for address in addresses {
+                if !found.contains(&address.ip()) {
+                    found.push(address.ip());
+                }
+            }
+            Ok(local_answer(query, &question, &found))
+        }
+        Ok(Err(_)) => Ok(error_answer(query, &question, RCODE_SERVFAIL)),
+        Err(_) => Err(OutboundFailure::ReplyTimeout),
+    }
+}
+
+/// The outcome of [`race`]: the best response, and why the others failed.
+#[derive(Debug, Default)]
+pub struct Raced {
+    /// The best response by [`rank`], with its rank.
+    pub best: Option<(u8, Vec<u8>)>,
+    /// The last failure, when an exchange failed.
+    pub failure: Option<OutboundFailure>,
+}
+
+impl Raced {
+    /// Whether the best response is an answer (NOERROR or NXDOMAIN), not an
+    /// error or nothing.
+    pub fn answered(&self) -> bool {
+        self.best.as_ref().is_some_and(|(rank, _)| *rank <= 1)
+    }
+
+    /// Keeps the better of two outcomes.
+    pub fn merge(mut self, other: Raced) -> Raced {
+        if let Some((rank, response)) = other.best {
+            if self.best.as_ref().is_none_or(|(best, _)| rank < *best) {
+                self.best = Some((rank, response));
+            }
+        }
+        self.failure = other.failure.or(self.failure);
+        self
+    }
+
+    /// The best response, or the failure when no exchange got one.
+    pub fn into_result(self) -> Result<Vec<u8>, OutboundFailure> {
+        match self.best {
+            Some((_, response)) => Ok(response),
+            None => Err(self.failure.unwrap_or(OutboundFailure::ReplyFailed)),
+        }
+    }
+}
+
+/// How good a response is: 0 for NOERROR, 1 for NXDOMAIN, 2 for any error.
+pub fn rank(response: &[u8]) -> u8 {
+    match rcode(response) {
+        RCODE_NOERROR => 0,
+        RCODE_NXDOMAIN => 1,
+        _ => 2,
+    }
+}
+
+/// Runs `exchanges` at once. The first NOERROR response wins and the others
+/// are dropped; otherwise, once all have finished, the best response by
+/// [`rank`] (the first of equals) is kept, so a server that knows a name
+/// beats one that answers NXDOMAIN faster.
+pub async fn race<F>(exchanges: impl IntoIterator<Item = F>) -> Raced
+where
+    F: Future<Output = Result<Vec<u8>, OutboundFailure>>,
+{
+    let mut pending: FuturesUnordered<F> = exchanges.into_iter().collect();
+    let mut raced = Raced::default();
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(response) => {
+                let rank = rank(&response);
+                if rank == 0 {
+                    return Raced {
+                        best: Some((0, response)),
+                        failure: None,
+                    };
+                }
+                if raced.best.as_ref().is_none_or(|(best, _)| rank < *best) {
+                    raced.best = Some((rank, response));
+                }
+            }
+            Err(failure) => raced.failure = Some(failure),
+        }
+    }
+    raced
+}
+
 /// The first question of a query: the name in lower case without the final
 /// dot, its type, and where the question ends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -591,6 +932,20 @@ pub fn local_answer(query: &[u8], question: &Question, addresses: &[IpAddr]) -> 
     response
 }
 
+/// A reply to `query` with no records and response code `rcode` (e.g.
+/// SERVFAIL).
+pub fn error_answer(query: &[u8], question: &Question, rcode: u8) -> Vec<u8> {
+    let flags = u16::from_be_bytes([query[2], query[3]]);
+    // QR, the opcode and RD copied, RA set.
+    let flags = 0x8000 | (flags & 0x7900) | 0x0080 | u16::from(rcode & 0x0F);
+    let mut response = Vec::with_capacity(question.end);
+    response.extend_from_slice(&query[..2]);
+    response.extend_from_slice(&flags.to_be_bytes());
+    response.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+    response.extend_from_slice(&query[DNS_HEADER_LEN..question.end]);
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,7 +1030,7 @@ mod tests {
     fn tcp_target(url: &str) -> TargetAddr {
         let upstream = Upstream::parse(url, None).unwrap();
         assert_eq!(upstream.scheme(), "tcp", "{url}");
-        upstream.target().clone()
+        upstream.target().unwrap().clone()
     }
 
     #[test]
@@ -694,7 +1049,8 @@ mod tests {
         );
         for url in [
             "",
-            "udp://1.1.1.1",
+            "ftp://1.1.1.1",
+            "udp://1.1.1.1/x",
             "tcp://1.1.1.1/x",
             "tcp://:53",
             "tcp://a b",
@@ -728,7 +1084,7 @@ mod tests {
         assert_eq!(upstream.scheme(), "tls");
         assert_eq!(
             upstream.target(),
-            &TargetAddr::Domain("dns.alidns.com".into(), 853)
+            Some(&TargetAddr::Domain("dns.alidns.com".into(), 853))
         );
     }
 

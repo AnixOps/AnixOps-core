@@ -3,22 +3,25 @@
 //!
 //! A query is answered locally when its name is in `hosts` (exact, or a
 //! subdomain of a `*.` entry). Otherwise the first rule whose domains, suffixes,
-//! keywords or rule set match picks the server, and names no rule picks go to
-//! the default server. Each server is reached through the proxy (the config's
-//! outbound, or the node a rule picks and else the global target, never DIRECT
-//! by a rule; the direct outbound in the direct mode) or directly.
-//! A config without `servers` keeps the single `upstream` over TCP through the
-//! proxy.
+//! keywords or rule set match picks the servers, and names no rule picks go to
+//! the default servers. Several servers named together are raced (see
+//! [`crate::dns_client`]), and the `fallback` servers are asked when they
+//! fail. Each server is reached through the proxy (the config's outbound, or
+//! the node a rule picks and else the global target, never DIRECT by a rule;
+//! the direct outbound in the direct mode) or directly; `system` servers are
+//! always direct. A config without `servers` keeps the single `upstream` over
+//! TCP through the proxy.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use engine_outbound::TargetAddr;
 use serde::Serialize;
 
-use crate::config::{DnsConfig, DnsRuleConfig, DnsVia};
+use crate::config::{DnsConfig, DnsRuleConfig, DnsServerRef, DnsVia};
 use crate::dns::{self, Upstream, UpstreamError};
 use crate::rule_sets::RuleSetStore;
 
@@ -28,6 +31,10 @@ pub const MAX_DNS_RULES: usize = 64;
 pub const MAX_DNS_RULE_DOMAINS: usize = 4096;
 pub const MAX_HOSTS: usize = 1024;
 pub const MAX_HOST_ADDRESSES: usize = 8;
+/// Servers raced for one name.
+pub const MAX_RACE: usize = 4;
+/// Addresses in `system_servers`.
+pub const MAX_SYSTEM_SERVERS: usize = 8;
 
 /// One configured upstream.
 #[derive(Clone)]
@@ -42,7 +49,7 @@ pub struct DnsServer {
 pub enum Plan {
     /// Reply with this message without asking anyone.
     Local(Vec<u8>),
-    /// Forward to the server at this index of [`DnsPolicy::servers`].
+    /// Forward to the servers of this target ([`DnsPolicy::target`]).
     Forward(usize),
 }
 
@@ -50,11 +57,14 @@ pub enum Plan {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DnsServerView {
     pub name: String,
-    /// `tcp`, `tls` or `https`.
+    /// `tcp`, `udp`, `tls`, `https`, `quic` or `system`.
     pub scheme: &'static str,
     /// `proxy` or `direct`.
     pub via: &'static str,
+    /// Among the servers for names no rule picks.
     pub default: bool,
+    /// Among the fallback servers.
+    pub fallback: bool,
 }
 
 struct DnsRule {
@@ -62,7 +72,7 @@ struct DnsRule {
     suffixes: Vec<String>,
     keywords: Vec<String>,
     rule_set: Option<String>,
-    server: usize,
+    target: usize,
 }
 
 impl DnsRule {
@@ -86,7 +96,10 @@ impl DnsRule {
 
 pub struct DnsPolicy {
     servers: Vec<DnsServer>,
+    /// Sets of servers asked together, each sorted and distinct.
+    targets: Vec<Vec<usize>>,
     default: usize,
+    fallback: Option<usize>,
     hosts: HashMap<String, Vec<IpAddr>>,
     /// `*.suffix` hosts, by suffix.
     wildcard_hosts: Vec<(String, Vec<IpAddr>)>,
@@ -113,7 +126,9 @@ impl DnsPolicy {
                 upstream: Upstream::Tcp(TargetAddr::Ip(upstream)),
                 via: DnsVia::Proxy,
             }],
+            targets: vec![vec![0]],
             default: 0,
+            fallback: None,
             hosts: HashMap::new(),
             wildcard_hosts: Vec::new(),
             rules: Vec::new(),
@@ -125,9 +140,10 @@ impl DnsPolicy {
     /// without names or URLs).
     pub fn from_config(config: &DnsConfig) -> Result<Self, &'static str> {
         let timeout = Duration::from_millis(config.timeout_ms);
+        let system = system_servers(&config.system_servers)?;
         let mut policy = if config.servers.is_empty() {
-            if config.default.is_some() || !config.rules.is_empty() {
-                return Err("dns rules and default need servers");
+            if config.default.is_some() || config.fallback.is_some() || !config.rules.is_empty() {
+                return Err("dns rules, default and fallback need servers");
             }
             Self::tcp(config.upstream, timeout)
         } else {
@@ -142,24 +158,34 @@ impl DnsPolicy {
                 if servers.iter().any(|known| known.name == server.name) {
                     return Err("dns server names must be unique");
                 }
-                let upstream = Upstream::parse(&server.url, server.server_name.as_deref())
+                let mut upstream = Upstream::parse(&server.url, server.server_name.as_deref())
                     .map_err(|error| match error {
                         UpstreamError::Invalid => "dns server url is invalid",
                         UpstreamError::Unsupported => {
-                            "dns over tls and https need the dns-tls feature"
+                            "dns over tls, https and quic need the dns-tls / dns-quic features"
                         }
                     })?;
+                let mut via = server.via;
+                if let Upstream::System(_) = upstream {
+                    upstream = Upstream::System(system.clone());
+                    via = DnsVia::Direct;
+                }
                 servers.push(DnsServer {
                     name: server.name.clone(),
                     upstream,
-                    via: server.via,
+                    via,
                 });
             }
-            let index_of = |name: &str| servers.iter().position(|server| server.name == name);
+            let mut targets = Targets::new(&servers);
             let default = match &config.default {
-                Some(name) => index_of(name).ok_or("dns default names no server")?,
-                None => 0,
+                Some(reference) => targets.of(reference, "dns default names no server")?,
+                None => targets.of(&DnsServerRef::One(servers[0].name.clone()), "")?,
             };
+            let fallback = config
+                .fallback
+                .as_ref()
+                .map(|reference| targets.of(reference, "dns fallback names no server"))
+                .transpose()?;
             if config.rules.len() > MAX_DNS_RULES {
                 return Err("dns has too many rules");
             }
@@ -169,7 +195,7 @@ impl DnsPolicy {
             }
             let mut rules = Vec::with_capacity(config.rules.len());
             for rule in &config.rules {
-                let server = index_of(&rule.server).ok_or("dns rule names no server")?;
+                let target = targets.of(&rule.server, "dns rule names no server")?;
                 if rule.entry_count() == 0 && rule.rule_set.is_none() {
                     return Err("dns rule matches nothing");
                 }
@@ -183,12 +209,15 @@ impl DnsPolicy {
                         .filter(|keyword| !keyword.is_empty())
                         .collect(),
                     rule_set: rule.rule_set.clone(),
-                    server,
+                    target,
                 });
             }
+            let sets = targets.sets;
             Self {
                 servers,
+                targets: sets,
                 default,
+                fallback,
                 hosts: HashMap::new(),
                 wildcard_hosts: Vec::new(),
                 rules,
@@ -227,6 +256,17 @@ impl DnsPolicy {
         self.timeout
     }
 
+    /// The indexes in [`DnsPolicy::servers`] of the servers asked together
+    /// for `target`.
+    pub fn target(&self, target: usize) -> &[usize] {
+        &self.targets[target]
+    }
+
+    /// The target asked when the chosen one fails.
+    pub fn fallback(&self) -> Option<usize> {
+        self.fallback
+    }
+
     /// The servers without their URLs, for status.
     pub fn view(&self) -> Vec<DnsServerView> {
         self.servers
@@ -236,7 +276,10 @@ impl DnsPolicy {
                 name: server.name.clone(),
                 scheme: server.upstream.scheme(),
                 via: server.via.as_str(),
-                default: index == self.default,
+                default: self.targets[self.default].contains(&index),
+                fallback: self
+                    .fallback
+                    .is_some_and(|fallback| self.targets[fallback].contains(&index)),
             })
             .collect()
     }
@@ -253,12 +296,12 @@ impl DnsPolicy {
         Plan::Forward(self.server_for(&question.name, rule_sets))
     }
 
-    /// The index of the server for `name`.
+    /// The target (servers asked together) for `name`.
     pub fn server_for(&self, name: &str, rule_sets: Option<&RuleSetStore>) -> usize {
         self.rules
             .iter()
             .find(|rule| rule.matches(name, rule_sets))
-            .map_or(self.default, |rule| rule.server)
+            .map_or(self.default, |rule| rule.target)
     }
 
     fn host(&self, name: &str) -> Option<&[IpAddr]> {
@@ -270,6 +313,81 @@ impl DnsPolicy {
             .find(|(suffix, _)| name.len() > suffix.len() && is_within(name, suffix))
             .map(|(_, addresses)| addresses.as_slice())
     }
+}
+
+/// The distinct server sets the default, the rules and the fallback name.
+struct Targets<'a> {
+    servers: &'a [DnsServer],
+    sets: Vec<Vec<usize>>,
+}
+
+impl<'a> Targets<'a> {
+    fn new(servers: &'a [DnsServer]) -> Self {
+        Self {
+            servers,
+            sets: Vec::new(),
+        }
+    }
+
+    /// The target of `reference`, added when new; `unknown` is the error for
+    /// a name that is not a server.
+    fn of(
+        &mut self,
+        reference: &DnsServerRef,
+        unknown: &'static str,
+    ) -> Result<usize, &'static str> {
+        let names = reference.names();
+        if names.is_empty() || names.len() > MAX_RACE {
+            return Err("dns server lists race 1-4 servers");
+        }
+        let mut set = Vec::with_capacity(names.len());
+        for name in names {
+            let index = self
+                .servers
+                .iter()
+                .position(|server| server.name == *name)
+                .ok_or(unknown)?;
+            if set.contains(&index) {
+                return Err("dns server lists must not repeat a server");
+            }
+            set.push(index);
+        }
+        set.sort_unstable();
+        Ok(match self.sets.iter().position(|known| *known == set) {
+            Some(target) => target,
+            None => {
+                self.sets.push(set);
+                self.sets.len() - 1
+            }
+        })
+    }
+}
+
+/// The `system_servers` addresses: `ip` or `ip:port` / `[ipv6]:port`, port
+/// 53 by default.
+fn system_servers(list: &[String]) -> Result<Arc<[SocketAddr]>, &'static str> {
+    if list.len() > MAX_SYSTEM_SERVERS {
+        return Err("dns has too many system servers");
+    }
+    let mut servers: Vec<SocketAddr> = Vec::with_capacity(list.len());
+    for entry in list {
+        let entry = entry.trim();
+        let address = match entry.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, 53),
+            Err(_) => entry
+                .parse::<SocketAddr>()
+                .ok()
+                .filter(|address| address.port() != 0)
+                .ok_or("dns system server is not an address")?,
+        };
+        if address.ip().is_unspecified() || address.ip().is_multicast() {
+            return Err("dns system server is not an address");
+        }
+        if !servers.contains(&address) {
+            servers.push(address);
+        }
+    }
+    Ok(Arc::from(servers))
 }
 
 /// Whether `name` is `suffix` or one of its subdomains.
@@ -427,7 +545,7 @@ mod tests {
         let mut duplicate = config();
         duplicate.servers[1].name = "remote".into();
         let mut bad_url = config();
-        bad_url.servers[0].url = "udp://8.8.8.8".into();
+        bad_url.servers[0].url = "ftp://8.8.8.8".into();
         let mut empty_rule = config();
         empty_rule.rules.push(DnsRuleConfig {
             server: "local".into(),
