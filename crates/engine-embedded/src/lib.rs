@@ -27,6 +27,9 @@
 //!   with a setup page for the root certificate.
 //! - `replay_proxy` (feature `local-proxy`): a `127.0.0.1` listener with
 //!   one-time credentials for the client's own requests (replays).
+//! - `system_proxy` (feature `local-proxy`): the packet tunnel's HTTP/SOCKS5
+//!   listener on `127.0.0.1` that iOS and macOS register as the system
+//!   proxy, next to the tunnel or (macOS) instead of it.
 //! - `wireguard` (feature `wireguard`): with a single `outbound`, an IP-level
 //!   tunnel that bypasses the TCP/IP stack and seals packets straight to one
 //!   peer; in `routing.outbounds`, a node like any other (`outbound-wireguard`).
@@ -74,6 +77,8 @@ pub mod replay_proxy;
 pub mod routing;
 pub mod rule_scripts;
 pub mod rule_sets;
+#[cfg(feature = "local-proxy")]
+pub mod system_proxy;
 pub use engine_outbound::protect;
 pub use engine_outbound::sniff;
 pub mod tunnel;
@@ -191,6 +196,8 @@ pub struct EmbeddedRuntime {
     lan_share: lan_share::LanShareSlot,
     #[cfg(feature = "local-proxy")]
     replay_proxy: replay_proxy::ReplayProxySlot,
+    #[cfg(feature = "local-proxy")]
+    system_proxy: system_proxy::SystemProxySlot,
 }
 
 impl EmbeddedRuntime {
@@ -268,6 +275,8 @@ impl EmbeddedRuntime {
             lan_share: lan_share::LanShareSlot::default(),
             #[cfg(feature = "local-proxy")]
             replay_proxy: replay_proxy::ReplayProxySlot::default(),
+            #[cfg(feature = "local-proxy")]
+            system_proxy: system_proxy::SystemProxySlot::default(),
         }
     }
 
@@ -337,6 +346,7 @@ impl EmbeddedRuntime {
     pub fn stop(&mut self) {
         #[cfg(feature = "local-proxy")]
         {
+            self.system_proxy.stop();
             self.lan_share.stop();
             self.replay_proxy.stop();
         }
@@ -389,8 +399,8 @@ impl EmbeddedRuntime {
         }
     }
 
-    /// The commands of [`lan_share`] and [`replay_proxy`]; both listeners
-    /// only run while the tunnel does.
+    /// The commands of [`lan_share`], [`replay_proxy`] and [`system_proxy`];
+    /// the listeners stop with the runtime.
     #[cfg(feature = "local-proxy")]
     fn lan_share_control(
         &self,
@@ -421,6 +431,23 @@ impl EmbeddedRuntime {
         });
         if replay.is_some() {
             return replay;
+        }
+        // Unlike the other listeners it may start before the tunnel: the
+        // provider registers its port with the interface settings, which it
+        // applies before the tunnel reads packets. Stopping or dropping the
+        // runtime stops it either way.
+        let system = self.system_proxy.control(request, |port| {
+            system_proxy::SystemProxy::start(
+                dispatcher.clone(),
+                decrypting()?,
+                system_proxy::SystemProxyOptions {
+                    port,
+                    max_connections: self.config.limits.max_tcp_connections,
+                },
+            )
+        });
+        if system.is_some() {
+            return system;
         }
         self.lan_share.control(request, |options| {
             if self.tunnel.is_none() {

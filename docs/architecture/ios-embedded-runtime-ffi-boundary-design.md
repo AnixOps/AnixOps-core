@@ -103,6 +103,8 @@ struct 必须采用 C-compatible layout，字段必须固定大小、对齐和 o
 
 局域网共享（手机连电脑抓包）：`lan_share`、`start_lan_share`、`stop_lan_share` 由桌面 local proxy 和包隧道运行时在进入 `control` 模块之前处理（`local-proxy` feature），命令表、设置页路径与访问限制见 `crates/engine-embedded/src/lan_share.rs`。
 
+系统代理监听：`system_proxy`、`start_system_proxy`、`stop_system_proxy` 只由包隧道运行时处理（`local-proxy` feature，可在隧道启动前打开，运行时停止或释放时关闭）。监听只绑 `127.0.0.1`，iOS / macOS 的隧道把它注册为系统 HTTP 代理（`NEProxySettings`），连接走隧道同一个分发器；命令表与端口规则见 `crates/engine-embedded/src/system_proxy.rs`。
+
 | `cmd` | 请求字段 | 应答 |
 | --- | --- | --- |
 | `traffic` | | `upload_total`、`download_total`（字节）、`upload_rate`、`download_rate`（字节/秒，按两次调用间隔采样，间隔不足 500 ms 时沿用上次速率）、`active` |

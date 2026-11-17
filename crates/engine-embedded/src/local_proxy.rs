@@ -279,8 +279,38 @@ impl Drop for LocalProxy {
 }
 
 /// Routes each client's connections, naming its local process when a
-/// `PROCESS-NAME` rule needs it.
-struct ProcessRouting(Arc<Dispatcher>);
+/// `PROCESS-NAME` rule needs it and passing the head of a plain HTTP request
+/// to `USER-AGENT` and `URL-REGEX` rules. The desktop local proxy and the
+/// packet tunnel's system proxy listener ([`crate::system_proxy`]) use it.
+pub(crate) struct ProcessRouting(pub(crate) Arc<Dispatcher>);
+
+impl ProcessRouting {
+    async fn connect(
+        &self,
+        client: ClientAddrs,
+        target: &TargetAddr,
+        first: &[u8],
+    ) -> io::Result<BoxStream> {
+        let process = if self.0.wants_process() {
+            tokio::task::spawn_blocking(move || {
+                crate::process::process_name(client.peer, client.local)
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let http = sniff::http_request_head(first);
+        let origin = FlowOrigin {
+            process: process.as_deref(),
+            source: client_source(client),
+        };
+        self.0
+            .connect_origin_flow(target, None, origin, http.as_ref())
+            .await
+    }
+}
 
 impl ClientConnector for ProcessRouting {
     fn connect_client<'a>(
@@ -288,23 +318,16 @@ impl ClientConnector for ProcessRouting {
         client: ClientAddrs,
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, io::Result<BoxStream>> {
-        Box::pin(async move {
-            let process = if self.0.wants_process() {
-                tokio::task::spawn_blocking(move || {
-                    crate::process::process_name(client.peer, client.local)
-                })
-                .await
-                .ok()
-                .flatten()
-            } else {
-                None
-            };
-            let origin = FlowOrigin {
-                process: process.as_deref(),
-                source: client_source(client),
-            };
-            self.0.connect_origin_flow(target, None, origin, None).await
-        })
+        Box::pin(self.connect(client, target, &[]))
+    }
+
+    fn connect_client_with_first<'a>(
+        &'a self,
+        client: ClientAddrs,
+        target: &'a TargetAddr,
+        first: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(self.connect(client, target, first))
     }
 }
 
