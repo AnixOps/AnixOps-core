@@ -939,6 +939,18 @@ impl Dispatcher {
         self.connect_tcp(target, host, process, None).await
     }
 
+    /// Opens a TCP connection for a proxy listener's client: `process` is
+    /// the local process that asked, for `PROCESS-NAME` rules, and `http` the
+    /// head of its plain HTTP request, for `USER-AGENT` and `URL-REGEX` rules.
+    pub async fn connect_client_flow(
+        &self,
+        target: &TargetAddr,
+        process: Option<&str>,
+        http: Option<&HttpRequestHead>,
+    ) -> io::Result<BoxStream> {
+        self.connect_tcp(target, None, process, http).await
+    }
+
     /// [`Self::connect_flow`] with the head of a plain HTTP request sniffed
     /// from the flow's first bytes, for `USER-AGENT` and `URL-REGEX` rules.
     pub async fn connect_http_flow(
