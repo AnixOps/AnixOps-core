@@ -11,9 +11,11 @@
 //! Tunnels it leaves alone are relayed as usual, the first bytes included.
 //!
 //! Supported: SOCKS5 without authentication and with username/password
-//! (RFC 1929), `CONNECT` only; HTTP `CONNECT` tunnels and absolute-form plain
-//! HTTP requests, optionally with `Proxy-Authorization: Basic`. SOCKS5 `BIND`
-//! and `UDP ASSOCIATE` are answered with "command not supported".
+//! (RFC 1929), `CONNECT`, and `UDP ASSOCIATE` when [`MixedSettings::udp`] is
+//! set (see [`ClientConnector::open_client_udp`]); HTTP `CONNECT` tunnels and
+//! absolute-form plain HTTP requests, optionally with
+//! `Proxy-Authorization: Basic`. SOCKS5 `BIND`, and `UDP ASSOCIATE` on a
+//! listener without UDP, are answered with "command not supported".
 //!
 //! The listener is meant for loopback. To serve other devices on the local
 //! network (a phone that sets this computer as its Wi-Fi proxy), bind it to
@@ -34,6 +36,7 @@
 
 mod http;
 mod socks5;
+mod udp;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -42,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_outbound::reject::{self, RejectAction};
-use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
+use engine_outbound::{udp_unsupported, BoxFuture, BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -79,6 +82,10 @@ pub struct MixedSettings {
     pub peers: PeerFilter,
     /// Local pages served on this listener; see [`ClientPages`].
     pub pages: Option<Arc<dyn ClientPages>>,
+    /// Answers SOCKS5 `UDP ASSOCIATE` with a relay socket on the listener's
+    /// address. Off by default: a listener shared with other devices should
+    /// not relay UDP unless its owner chose to.
+    pub udp: bool,
 }
 
 impl Default for MixedSettings {
@@ -90,6 +97,7 @@ impl Default for MixedSettings {
             credentials: None,
             peers: PeerFilter::Any,
             pages: None,
+            udp: false,
         }
     }
 }
@@ -210,6 +218,8 @@ pub struct MixedStats {
     pub bytes_down: AtomicU64,
     /// Local pages answered ([`ClientPages`]).
     pub pages: AtomicU64,
+    /// SOCKS5 UDP associations opened.
+    pub udp_associations: AtomicU64,
 }
 
 /// What a client asked for.
@@ -230,6 +240,8 @@ pub(crate) struct Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reply {
     Socks5,
+    /// SOCKS5 `UDP ASSOCIATE`; answered by the UDP relay, not a tunnel.
+    Socks5Associate,
     HttpConnect,
     /// Plain HTTP: the target's own response is the answer.
     HttpForward,
@@ -268,6 +280,18 @@ pub trait ClientConnector: Send + Sync {
         let _ = first;
         self.connect_client(client, target)
     }
+
+    /// Opens a UDP flow to `target` for a SOCKS5 `UDP ASSOCIATE`. The default
+    /// fails with [`udp_unsupported`]; a datagram for such a destination is
+    /// dropped.
+    fn open_client_udp<'a>(
+        &'a self,
+        client: ClientAddrs,
+        target: &'a TargetAddr,
+    ) -> BoxFuture<'a, io::Result<UdpFlow>> {
+        let _ = (client, target);
+        Box::pin(async { Err(udp_unsupported()) })
+    }
 }
 
 /// Takes tunnels over before they are relayed, judged from the first bytes
@@ -300,6 +324,14 @@ impl ClientConnector for AnyClient {
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, io::Result<BoxStream>> {
         self.0.connect(target)
+    }
+
+    fn open_client_udp<'a>(
+        &'a self,
+        _client: ClientAddrs,
+        target: &'a TargetAddr,
+    ) -> BoxFuture<'a, io::Result<UdpFlow>> {
+        self.0.open_udp(target)
     }
 }
 
@@ -361,7 +393,7 @@ pub async fn serve_intercepted(
             handle(
                 stream,
                 client,
-                connector.as_ref(),
+                &connector,
                 interceptor.as_deref(),
                 &settings,
                 &stats,
@@ -375,10 +407,10 @@ pub async fn serve_intercepted(
 async fn handle(
     mut client: TcpStream,
     addrs: ClientAddrs,
-    connector: &dyn ClientConnector,
+    connector: &Arc<dyn ClientConnector>,
     interceptor: Option<&dyn ClientInterceptor>,
     settings: &MixedSettings,
-    stats: &MixedStats,
+    stats: &Arc<MixedStats>,
 ) {
     let request = tokio::time::timeout(
         settings.handshake_timeout,
@@ -386,6 +418,7 @@ async fn handle(
             &mut client,
             settings.credentials.as_ref(),
             settings.pages.as_deref(),
+            settings.udp,
         ),
     )
     .await;
@@ -406,12 +439,23 @@ async fn handle(
             return;
         }
     };
+    if request.reply == Reply::Socks5Associate {
+        udp::associate(
+            client,
+            addrs,
+            connector.clone(),
+            settings.connect_timeout,
+            stats.clone(),
+        )
+        .await;
+        return;
+    }
     if let Some(interceptor) = interceptor {
         handle_intercepted(
             client,
             addrs,
             request,
-            connector,
+            connector.as_ref(),
             interceptor,
             settings,
             stats,
@@ -524,6 +568,7 @@ async fn read_request(
     client: &mut TcpStream,
     credentials: Option<&Credentials>,
     pages: Option<&dyn ClientPages>,
+    udp: bool,
 ) -> io::Result<Incoming> {
     let mut first = [0u8; 1];
     let peeked = client.peek(&mut first).await?;
@@ -531,7 +576,7 @@ async fn read_request(
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     if first[0] == socks5::VERSION {
-        socks5::read_request(client, credentials)
+        socks5::read_request(client, credentials, udp)
             .await
             .map(Incoming::Proxy)
     } else {
@@ -541,7 +586,7 @@ async fn read_request(
 
 async fn send_success<S: AsyncWrite + Unpin>(client: &mut S, reply: Reply) -> io::Result<()> {
     match reply {
-        Reply::Socks5 => {
+        Reply::Socks5 | Reply::Socks5Associate => {
             client
                 .write_all(&socks5::reply(socks5::REP_SUCCEEDED))
                 .await
@@ -557,7 +602,7 @@ async fn send_success<S: AsyncWrite + Unpin>(client: &mut S, reply: Reply) -> io
 
 async fn send_failure<S: AsyncWrite + Unpin>(client: &mut S, reply: Reply) -> io::Result<()> {
     match reply {
-        Reply::Socks5 => {
+        Reply::Socks5 | Reply::Socks5Associate => {
             client
                 .write_all(&socks5::reply(socks5::REP_GENERAL_FAILURE))
                 .await

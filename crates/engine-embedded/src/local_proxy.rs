@@ -23,7 +23,7 @@ use std::thread;
 use std::time::Duration;
 
 use engine_outbound::registry::OutboundRegistry;
-use engine_outbound::{BoxFuture, BoxStream, Dialer, TargetAddr, TcpDialer, TcpOutbound};
+use engine_outbound::{BoxFuture, BoxStream, Dialer, TargetAddr, TcpDialer, TcpOutbound, UdpFlow};
 use inbound_mixed::{ClientAddrs, ClientConnector, ClientInterceptor, MixedSettings, MixedStats};
 use tokio::sync::oneshot;
 
@@ -323,6 +323,17 @@ impl ClientConnector for ProcessRouting {
         first: &'a [u8],
     ) -> BoxFuture<'a, io::Result<BoxStream>> {
         Box::pin(self.connect(client, target, first))
+    }
+
+    /// SOCKS5 `UDP ASSOCIATE` flows go through the same rules as the packet
+    /// tunnel's UDP (routing, `block_quic`, the connection list); the
+    /// listener answers it only with [`MixedSettings::udp`] set.
+    fn open_client_udp<'a>(
+        &'a self,
+        _client: ClientAddrs,
+        target: &'a TargetAddr,
+    ) -> BoxFuture<'a, io::Result<UdpFlow>> {
+        Box::pin(self.0.open_udp_flow(target, None))
     }
 }
 

@@ -6,6 +6,7 @@
 
 ### Added
 
+- 本地混合入站支持 SOCKS5 `UDP ASSOCIATE`（`inbound-mixed`）：`MixedSettings::udp`（默认关闭）打开后，在监听地址上开一个中继 UDP 套接字，按目标经新的 `ClientConnector::open_client_udp` 建 `UdpFlow`（每个关联最多 64 个目标），只接受客户端 IP 与首个源端口的数据报，回包带客户端请求的目标地址（域名保持域名），丢弃分片，TCP 控制连接断开即结束。`engine-embedded` 的本地代理把它交给 `Dispatcher::open_udp_flow`，与隧道 UDP 同样走分流规则、`block_quic` 和连接列表。统计新增 `udp_associations`。用途：测速端经 anx-proxy 做 HTTP/3（QUIC）延迟探测。
 - 嵌入式 DNS 追平 Surge（engine-embedded，见 `docs/architecture/embedded-dns.md`）：
   - 新上游 `udp://host[:53]`（随机 id、1 秒重发至多 3 次、丢弃 id / 问题不符的数据报、截断或出站不支持 UDP 时改走 TCP）与 `quic://host[:853]`（DNS over QUIC，RFC 9250，ALPN `doq`，证书始终校验；握手跑在出站的 UDP 流上，可直连也可经节点，连接按上游与出站复用、多查询并发、无 keep-alive）。新 cargo feature `dns-quic`（默认开启，含 `dns-tls`），engine-embedded 新增对 `transport-quic` 的依赖（`Cargo.lock` 没有新包）。`transport-quic` 新增 `flow::FlowSocket`（quinn 跑在 `UdpFlow` 上）、`QuicConnector::connect_over` 与 `without_keep_alive`。
   - 多上游竞速：`default` 与 `rules[].server` 可以写 2–4 个上游的列表，同时发出，第一个 NOERROR 立即采用；NXDOMAIN 等其他上游都结束才采用，所以公网与公司解析器放在一起也能解析公司域名。
