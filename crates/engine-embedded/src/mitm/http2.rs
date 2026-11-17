@@ -38,7 +38,8 @@ use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{from_metadata, to_metadata, MitmEngine, Recording, MAX_BODY_BYTES};
+use super::request_route::{request_head, Decision, MAX_EXTRA_ORIGINS};
+use super::{from_metadata, to_metadata, MitmEngine, Recording, Reroute, MAX_BODY_BYTES};
 use crate::capture::h2frames::{FrameScanner, Link};
 use crate::capture::{CaptureStore, CapturedBody, Direction, HTTP_2, MAX_HTTP_BODY_BYTES};
 
@@ -86,12 +87,14 @@ impl MitmEngine {
         host: &str,
         authority: &str,
         idle_timeout: Duration,
+        reroute: Reroute<'_>,
     ) -> io::Result<()>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
         O: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let capture = crate::capture::current_flow();
+
         // With capture on, every frame header on both links is kept.
         let origin = FrameTap::new(origin, Link::Origin, capture.as_ref());
         let client = FrameTap::new(client, Link::App, capture.as_ref());
@@ -122,6 +125,16 @@ impl MitmEngine {
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
         .map_err(h2_error)?;
 
+        // Origin connections through other outbounds, for streams whose
+        // request routes elsewhere; driven in this task like the rest.
+        let (driver_tx, mut driver_rx) = tokio::sync::mpsc::unbounded_channel();
+        let origins = Origins {
+            primary: send_request,
+            reroute: &reroute,
+            extra: tokio::sync::Mutex::new(Vec::new()),
+            drivers: driver_tx,
+        };
+        let mut drivers = FuturesUnordered::new();
         let mut upstream = pin!(upstream);
         let mut streams = FuturesUnordered::new();
         let idle = tokio::time::sleep(idle_timeout);
@@ -134,7 +147,7 @@ impl MitmEngine {
                         streams.push(self.h2_stream(
                             request,
                             respond,
-                            send_request.clone(),
+                            &origins,
                             host,
                             authority,
                             capture.as_ref(),
@@ -147,6 +160,8 @@ impl MitmEngine {
                 Some(()) = streams.next(), if !streams.is_empty() => {
                     idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                 }
+                Some(driver) = driver_rx.recv() => drivers.push(driver),
+                Some(()) = drivers.next(), if !drivers.is_empty() => {}
                 _ = &mut upstream => break,
                 _ = &mut idle, if streams.is_empty() => {
                     if closing {
@@ -166,13 +181,13 @@ impl MitmEngine {
         &self,
         request: Request<RecvStream>,
         mut respond: SendResponse<Bytes>,
-        upstream: SendRequest<Bytes>,
+        origins: &Origins<'_>,
         host: &str,
         authority: &str,
         capture: Option<&(std::sync::Arc<crate::capture::CaptureStore>, u64)>,
     ) {
         let relayed = self
-            .relay_h2_stream(request, &mut respond, upstream, host, authority, capture)
+            .relay_h2_stream(request, &mut respond, origins, host, authority, capture)
             .await;
         if relayed.is_err() {
             respond.send_reset(Reason::INTERNAL_ERROR);
@@ -183,7 +198,7 @@ impl MitmEngine {
         &self,
         request: Request<RecvStream>,
         respond: &mut SendResponse<Bytes>,
-        upstream: SendRequest<Bytes>,
+        origins: &Origins<'_>,
         host: &str,
         authority: &str,
         capture: Option<&(std::sync::Arc<crate::capture::CaptureStore>, u64)>,
@@ -225,6 +240,21 @@ impl MitmEngine {
             recording.publish();
             recording
         });
+        let refused = match origins.pick(self, &url, &parts.headers).await {
+            Pick::Send(upstream) => Ok(upstream),
+            Pick::Reject => Err((StatusCode::FORBIDDEN, "rejected")),
+            Pick::Failed => Err((StatusCode::BAD_GATEWAY, "connect_failed")),
+        };
+        let upstream = match refused {
+            Ok(upstream) => upstream,
+            Err((status, note)) => {
+                if let Some(recording) = &mut recording {
+                    recording.exchange.status = Some(status.as_u16());
+                    recording.exchange.note = Some(note);
+                }
+                return answer(respond, status, HeaderMap::new(), Bytes::new(), is_head);
+            }
+        };
         let stream_request = !self.needs_body(&url, HttpMitmPhase::Request);
         let stream_response = !self.needs_body(&url, HttpMitmPhase::Response);
         let request_ends = request_body.is_end_stream();
@@ -705,6 +735,89 @@ fn finish(send: &mut SendStream<Bytes>, trailers: Option<HeaderMap>) -> io::Resu
         None => send.send_data(Bytes::new(), true),
     }
     .map_err(h2_error)
+}
+
+/// Where a stream's request goes when requests are routed one by one (see
+/// [`super::request_route`]).
+enum Pick {
+    Send(SendRequest<Bytes>),
+    Reject,
+    Failed,
+}
+
+/// The origin connections of one HTTP/2 app connection through outbounds
+/// other than its own, opened as streams route to them, at most
+/// [`MAX_EXTRA_ORIGINS`].
+struct Origins<'r> {
+    /// The app connection's own origin.
+    primary: SendRequest<Bytes>,
+    reroute: &'r Reroute<'r>,
+    extra: tokio::sync::Mutex<Vec<(String, SendRequest<Bytes>)>>,
+    /// Hands each new connection's driver to the relay loop.
+    drivers: tokio::sync::mpsc::UnboundedSender<engine_outbound::BoxFuture<'static, ()>>,
+}
+
+impl Origins<'_> {
+    /// Routes the request for `url` and returns where to send it: the
+    /// connection's own origin when it routes there or
+    /// requests are not routed, else an origin connection through the
+    /// outbound it routes to, opened now if there is none that still works.
+    async fn pick(&self, engine: &MitmEngine, url: &str, headers: &HeaderMap) -> Pick {
+        let Some(routes) = &self.reroute.routes else {
+            return Pick::Send(self.primary.clone());
+        };
+        let user_agent = headers
+            .get(http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok());
+        let head = request_head(url, user_agent);
+        let name = match routes.decide(&routes.connection, &head).await {
+            Decision::Keep => return Pick::Send(self.primary.clone()),
+            Decision::Reject => return Pick::Reject,
+            Decision::Switch(name) => name,
+        };
+        let mut extra = self.extra.lock().await;
+        if let Some(index) = extra.iter().position(|(open, _)| *open == name) {
+            // A connection the origin closed fails `ready`; open another.
+            match extra[index].1.clone().ready().await {
+                Ok(send) => return Pick::Send(send),
+                Err(_) => {
+                    extra.remove(index);
+                }
+            }
+        }
+        if extra.len() >= MAX_EXTRA_ORIGINS {
+            return Pick::Failed;
+        }
+        let Ok(stream) = engine
+            .connect_routed(self.reroute, routes, &head, true)
+            .await
+        else {
+            return Pick::Failed;
+        };
+        let handshake = h2::client::Builder::new()
+            .enable_push(false)
+            .initial_window_size(STREAM_WINDOW)
+            .initial_connection_window_size(CONNECTION_WINDOW)
+            .max_send_buffer_size(SEND_BUFFER)
+            .max_header_list_size(MAX_HEADER_LIST)
+            .handshake::<_, Bytes>(stream);
+        let Ok(Ok((send, connection))) =
+            tokio::time::timeout(self.reroute.connect_timeout, handshake).await
+        else {
+            return Pick::Failed;
+        };
+        if self
+            .drivers
+            .send(Box::pin(async move {
+                let _ = connection.await;
+            }))
+            .is_err()
+        {
+            return Pick::Failed;
+        }
+        extra.push((name, send.clone()));
+        Pick::Send(send)
+    }
 }
 
 /// A complete response the relay makes itself.

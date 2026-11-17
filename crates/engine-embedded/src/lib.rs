@@ -57,6 +57,7 @@ pub mod fake_ip;
 #[cfg(feature = "local-proxy")]
 pub mod fetch;
 pub mod ffi;
+pub mod first_payload;
 #[cfg(any(feature = "local-proxy", feature = "dns-tls"))]
 pub mod http1;
 pub(crate) mod icmp;
@@ -497,6 +498,10 @@ pub(crate) fn tunnel_settings(config: &RuntimeConfig) -> Result<TunnelSettings, 
         idle_timeout: Duration::from_secs(limits.idle_timeout_secs),
         connect_timeout: Duration::from_secs(limits.connect_timeout_secs),
         dns: Arc::new(dns),
+        worker_threads: match limits.worker_threads {
+            0 => tunnel::default_worker_threads(),
+            n => n,
+        },
     })
 }
 

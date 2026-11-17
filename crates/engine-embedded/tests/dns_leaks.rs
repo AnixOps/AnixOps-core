@@ -160,6 +160,7 @@ fn gfw_list(outbounds: &Outbounds) -> RoutedOutbound {
             url: None,
             interval_secs: None,
             tolerance_ms: None,
+            ..PolicyGroupSpec::default()
         }],
     };
     RoutedOutbound::new(&spec, outbounds.make("direct"), nodes).expect("spec should validate")

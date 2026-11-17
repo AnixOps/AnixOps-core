@@ -186,6 +186,7 @@ fn model(lines: Vec<String>) -> RoutingModel {
             url: None,
             interval_secs: None,
             tolerance_ms: None,
+            ..PolicyGroupSpec::default()
         }],
     };
     RoutingModel::from_spec(&spec, &nodes).expect("benchmark rules are valid")

@@ -59,6 +59,7 @@ fn routed(hits: &Arc<Mutex<Vec<&'static str>>>) -> RoutedOutbound {
                 url: None,
                 interval_secs: None,
                 tolerance_ms: None,
+                ..PolicyGroupSpec::default()
             },
             PolicyGroupSpec {
                 id: "Auto".to_string(),
@@ -68,6 +69,7 @@ fn routed(hits: &Arc<Mutex<Vec<&'static str>>>) -> RoutedOutbound {
                 url: None,
                 interval_secs: None,
                 tolerance_ms: None,
+                ..PolicyGroupSpec::default()
             },
         ],
     };

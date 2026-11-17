@@ -25,7 +25,8 @@ use config_core::redirect::{RedirectHost, RedirectTable, RedirectTo};
 use config_core::routing::{RejectKind, RouteNetwork, RouteQuery};
 use engine_outbound::sniff::HttpRequestHead;
 use engine_outbound::{
-    BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpDialer, TcpOutbound, UdpFlow,
+    BoxFuture, BoxStream, DatagramRecv, DatagramSend, RequestRouter, TargetAddr, TcpDialer,
+    TcpOutbound, UdpFlow,
 };
 use futures::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
@@ -891,7 +892,8 @@ impl Dispatcher {
         }
     }
 
-    /// Picks the outbound for one flow and records the decision.
+    /// Picks the outbound for one flow and records the decision. Returns
+    /// the route too, so a failed connect can ask its groups to retest.
     async fn route(
         &self,
         target: &TargetAddr,
@@ -900,10 +902,10 @@ impl Dispatcher {
         network: RouteNetwork,
         http: Option<&HttpRequestHead>,
         guard: &ConnectionGuard,
-    ) -> io::Result<Arc<dyn TcpOutbound>> {
+    ) -> io::Result<(Arc<dyn TcpOutbound>, RouteInfo)> {
         let (route, outbound) = match (self.mode(), &self.routed) {
             (Mode::Direct, _) => (direct_route(), Some(self.direct.clone())),
-            (Mode::Global, Some(routed)) => routed.route_global(),
+            (Mode::Global, Some(routed)) => routed.route_global_flow().await,
             (Mode::Rule, Some(routed)) => {
                 routed
                     .route_network_flow(target, host, origin.process, network, http, origin.source)
@@ -912,10 +914,76 @@ impl Dispatcher {
             (_, None) => (single_route(&*self.outbound), Some(self.outbound.clone())),
         };
         let reject = route.reject.unwrap_or_default();
-        guard.set_route(route);
-        outbound.ok_or_else(|| {
-            guard.fail("rejected");
-            engine_outbound::reject::rejected(crate::reject::action(reject))
+        guard.set_route(route.clone());
+        match outbound {
+            Some(outbound) => Ok((outbound, route)),
+            None => {
+                guard.fail("rejected");
+                Err(engine_outbound::reject::rejected(crate::reject::action(
+                    reject,
+                )))
+            }
+        }
+    }
+
+    /// A TCP connection routed as `route` failed to open: the health-checked
+    /// groups it went through probe its member at once (see
+    /// [`RoutedOutbound::report_failure`]).
+    fn report_connect_failure(&self, route: &RouteInfo, error: &io::Error) {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            // Refused by a rule or policy inside the outbound, not a dead node.
+            return;
+        }
+        if let Some(routed) = &self.routed {
+            routed.report_failure(route);
+        }
+    }
+
+    /// The outbound name (node id, `DIRECT` or `REJECT`) a request to
+    /// `target` would get, the way [`Self::connect_http_flow`] routes it
+    /// (Fake-IP names and redirects included), without connecting or
+    /// listing anything. `None` unless the rule mode runs a rule that looks
+    /// at requests (`URL-REGEX`, `USER-AGENT`): then every request of a
+    /// connection goes where the connection went.
+    pub async fn request_route(
+        &self,
+        target: &TargetAddr,
+        host: Option<&str>,
+        origin: FlowOrigin<'_>,
+        http: Option<&HttpRequestHead>,
+    ) -> Option<String> {
+        if self.mode() != Mode::Rule {
+            return None;
+        }
+        let routed = self
+            .routed
+            .as_ref()
+            .filter(|routed| routed.uses_request())?;
+        let unfaked = self.unfake(target, host).ok()?;
+        let (target, host) = match &unfaked {
+            Some(named) => (named, None),
+            None => (target, host),
+        };
+        let redirected = self.redirect(target, host, origin, RouteNetwork::Tcp, http);
+        let (target, host) = match &redirected {
+            Some((new, _)) => (new, None),
+            None => (target, host),
+        };
+        let (route, _) = routed
+            .route_network_flow(
+                target,
+                host,
+                origin.process,
+                RouteNetwork::Tcp,
+                http,
+                origin.source,
+            )
+            .await;
+        // Every REJECT variant refuses the request the same way.
+        Some(if route.reject.is_some() {
+            "REJECT".to_string()
+        } else {
+            route.outbound
         })
     }
 
@@ -1015,7 +1083,7 @@ impl Dispatcher {
             }
             None => (target, host),
         };
-        let outbound = self
+        let (outbound, route) = self
             .route(target, host, origin, RouteNetwork::Tcp, http, &guard)
             .await?;
         let resolved = if unfaked.is_some() {
@@ -1024,7 +1092,13 @@ impl Dispatcher {
             None
         };
         let named = resolved.or_else(|| proxied_name(target, host, &*outbound));
-        let stream = outbound.connect(named.as_ref().unwrap_or(target)).await?;
+        let stream = match outbound.connect(named.as_ref().unwrap_or(target)).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.report_connect_failure(&route, &error);
+                return Err(error);
+            }
+        };
         guard.connected();
         Ok(Box::new(TrackedStream {
             inner: stream,
@@ -1102,7 +1176,9 @@ impl Dispatcher {
             }
             None => (target, host),
         };
-        let outbound = self
+        // UDP failures do not retest: a node without UDP relay still passes
+        // the (TCP) health check, so a retest would only cost a dial.
+        let (outbound, _) = self
             .route(target, host, origin, RouteNetwork::Udp, None, &guard)
             .await?;
         let resolved = if unfaked.is_some() {
@@ -1193,9 +1269,22 @@ pub struct HostedDispatcher<'a> {
     source: FlowSource,
 }
 
+impl HostedDispatcher<'_> {
+    fn origin(&self) -> FlowOrigin<'static> {
+        FlowOrigin {
+            process: None,
+            source: self.source,
+        }
+    }
+}
+
 impl TcpOutbound for HostedDispatcher<'_> {
     fn protocol(&self) -> &'static str {
         self.dispatcher.protocol()
+    }
+
+    fn request_router(&self) -> Option<&dyn RequestRouter> {
+        Some(self)
     }
 
     fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
@@ -1218,6 +1307,37 @@ impl TcpOutbound for HostedDispatcher<'_> {
             self.dispatcher
                 .open_origin_udp_flow(target, Some(self.host), origin),
         )
+    }
+}
+
+/// A decrypted connection's requests are routed with the claimed host and,
+/// without a request of their own, the first plain HTTP request the flow
+/// was opened with.
+impl RequestRouter for HostedDispatcher<'_> {
+    fn request_route<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        request: Option<&'a HttpRequestHead>,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(self.dispatcher.request_route(
+            target,
+            Some(self.host),
+            self.origin(),
+            request.or(self.http),
+        ))
+    }
+
+    fn connect_request<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        request: &'a HttpRequestHead,
+    ) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(self.dispatcher.connect_origin_flow(
+            target,
+            Some(self.host),
+            self.origin(),
+            Some(request),
+        ))
     }
 }
 

@@ -10,7 +10,10 @@
 //! validation (for example no FINAL rule or a group cycle), no routing is
 //! returned and the caller keeps its single-node behavior.
 
-use crate::routing::{parse_rule_line, PolicyGroupSpec, RejectKind, RoutingModel, RoutingSpec};
+use crate::routing::{
+    parse_rule_line, NetworkCondition, NetworkRuleSpec, PolicyGroupSpec, RejectKind, RoutingModel,
+    RoutingSpec,
+};
 use control_domain::{Diagnostic, DiagnosticSeverity, NodeDescriptor};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,7 +48,7 @@ pub const MAX_IMPORTED_RULE_SETS: usize = 32;
 const MIN_RULE_SET_INTERVAL_SECS: u32 = 600;
 const MAX_RULE_SET_URL_LEN: usize = 2048;
 const MAX_RULE_SET_ID_LEN: usize = 64;
-const HEALTH_CHECK_OPTIONS: [&str; 3] = ["url", "interval", "tolerance"];
+const HEALTH_CHECK_OPTIONS: [&str; 4] = ["url", "interval", "tolerance", "evaluate-before-use"];
 /// How a load-balance group spreads connections: Clash `strategy`, Loon
 /// `algorithm`.
 const BALANCE_OPTIONS: [&str; 2] = ["strategy", "algorithm"];
@@ -130,8 +133,15 @@ struct RuleProvider {
 struct SourceGroup {
     name: String,
     kind: String,
+    /// For a subnet group, its default and rule targets, so a group whose
+    /// targets are all gone is dropped like any other.
     members: Vec<String>,
     options: BTreeMap<String, String>,
+    /// Surge `subnet` / `ssid` groups: `default = <policy>`.
+    default: Option<String>,
+    /// Surge `subnet` / `ssid` groups: `(when, target)` in order, `when` as
+    /// [`crate::routing::NetworkRuleSpec::when`] takes it.
+    network_rules: Vec<(String, String)>,
 }
 
 fn has_ini_routing_sections(content: &str) -> bool {
@@ -199,15 +209,38 @@ fn parse_remote_rule_line(line: &str) -> Option<String> {
     Some(format!("RULE-SET,{url},{}", policy?))
 }
 
-/// Parses `Name = type, member, member, key=value`.
+/// Parses `Name = type, member, member, key=value`. A Surge `subnet` group
+/// (`default = A, "SSID:Home" = DIRECT, "TYPE:CELLULAR" = B`) or legacy
+/// `ssid` group (`default = A, cellular = B, "Home" = DIRECT`) keeps its
+/// keys in order with their case, since a Wi-Fi name is case-sensitive.
 fn parse_ini_group_line(line: &str) -> Option<SourceGroup> {
     let (name, definition) = line.split_once('=')?;
     let mut parts = definition.split(',').map(str::trim);
     let kind = parts.next()?.to_string();
+    let lowered_kind = kind.to_ascii_lowercase();
+    let network_kind = matches!(lowered_kind.as_str(), "subnet" | "ssid");
     let mut members = Vec::new();
     let mut options = BTreeMap::new();
+    let mut default = None;
+    let mut network_rules = Vec::new();
     for part in parts.filter(|part| !part.is_empty()) {
         match part.split_once('=') {
+            Some((key, value)) if network_kind => {
+                let key = strip_quotes(key.trim());
+                let value = strip_quotes(value.trim()).to_string();
+                if key.eq_ignore_ascii_case("default") {
+                    default = Some(value.clone());
+                } else if key.eq_ignore_ascii_case("cellular") {
+                    network_rules.push(("CELLULAR".to_string(), value.clone()));
+                } else if lowered_kind == "ssid" {
+                    network_rules.push((format!("SSID:{key}"), value.clone()));
+                } else {
+                    network_rules.push((key.to_string(), value.clone()));
+                }
+                if !members.contains(&value) {
+                    members.push(value);
+                }
+            }
             Some((key, value)) => {
                 options.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
             }
@@ -219,6 +252,8 @@ fn parse_ini_group_line(line: &str) -> Option<SourceGroup> {
         kind,
         members,
         options,
+        default,
+        network_rules,
     })
 }
 
@@ -329,6 +364,8 @@ fn parse_clash_routing(content: &str) -> Option<RoutingSource> {
                     .map(RawScalar::into_text)
                     .collect(),
                 options,
+                default: None,
+                network_rules: Vec::new(),
             })
         })
         .collect();
@@ -366,6 +403,7 @@ enum GroupKind {
     Fallback,
     LoadBalance,
     RoundRobin,
+    Subnet,
 }
 
 impl GroupKind {
@@ -376,13 +414,14 @@ impl GroupKind {
             Self::Fallback => "fallback",
             Self::LoadBalance => "load-balance",
             Self::RoundRobin => "round-robin",
+            Self::Subnet => "subnet",
         }
     }
 
     /// Whether `key` is an option this kind of group uses.
     fn uses_option(self, key: &str) -> bool {
         match self {
-            Self::Select => false,
+            Self::Select | Self::Subnet => false,
             Self::UrlTest | Self::Fallback => HEALTH_CHECK_OPTIONS.contains(&key),
             Self::LoadBalance | Self::RoundRobin => {
                 HEALTH_CHECK_OPTIONS.contains(&key) || BALANCE_OPTIONS.contains(&key)
@@ -400,6 +439,7 @@ fn group_kind(group: &SourceGroup) -> Option<GroupKind> {
         "select" => Some(GroupKind::Select),
         "url-test" => Some(GroupKind::UrlTest),
         "fallback" => Some(GroupKind::Fallback),
+        "subnet" | "ssid" => Some(GroupKind::Subnet),
         "load-balance" => {
             let strategy = BALANCE_OPTIONS
                 .iter()
@@ -639,11 +679,16 @@ fn import_groups(importer: &mut Importer, groups: Vec<SourceGroup>) -> Vec<Polic
         let emptied = candidates
             .iter()
             .filter(|(group, kind)| {
-                kept.contains_key(&group.name) && {
-                    !group.members.iter().any(|member| {
-                        resolve_member(&importer.nodes_by_name, &kept, *kind, member).is_ok()
-                    })
-                }
+                let resolves = |member: &str| {
+                    resolve_member(&importer.nodes_by_name, &kept, *kind, member).is_ok()
+                };
+                kept.contains_key(&group.name)
+                    && if *kind == GroupKind::Subnet {
+                        // A subnet group stands or falls with its default.
+                        !group.default.as_deref().is_some_and(resolves)
+                    } else {
+                        !group.members.iter().any(|member| resolves(member))
+                    }
             })
             .map(|(group, _)| group.name.clone())
             .collect::<Vec<_>>();
@@ -662,6 +707,12 @@ fn import_groups(importer: &mut Importer, groups: Vec<SourceGroup>) -> Vec<Polic
     let mut specs = Vec::new();
     for (group, kind) in candidates {
         if !kept.contains_key(&group.name) {
+            continue;
+        }
+        if kind == GroupKind::Subnet {
+            if let Some(spec) = import_subnet_group(importer, &kept, &group) {
+                specs.push(spec);
+            }
             continue;
         }
         let mut members = Vec::new();
@@ -711,9 +762,73 @@ fn import_groups(importer: &mut Importer, groups: Vec<SourceGroup>) -> Vec<Polic
                 .get("tolerance")
                 .filter(|_| kind == GroupKind::UrlTest)
                 .and_then(|value| value.parse().ok()),
+            evaluate_before_use: health_check
+                && group
+                    .options
+                    .get("evaluate-before-use")
+                    .is_some_and(|value| is_truthy(value)),
+            network_rules: Vec::new(),
         });
     }
     specs
+}
+
+/// A Surge `subnet` or `ssid` group: its default and the network rules
+/// whose key and target can be imported. Without an importable default the
+/// group is skipped, as Surge requires one.
+fn import_subnet_group(
+    importer: &mut Importer,
+    kept: &BTreeMap<String, GroupKind>,
+    group: &SourceGroup,
+) -> Option<PolicyGroupSpec> {
+    let default = group.default.as_deref().and_then(|default| {
+        resolve_member(&importer.nodes_by_name, kept, GroupKind::Subnet, default).ok()
+    });
+    // The default resolved when the group was kept (see import_groups).
+    let default = default?;
+    let mut network_rules = Vec::new();
+    for (when, target) in &group.network_rules {
+        if NetworkCondition::parse(when).is_none() {
+            importer.warn(
+                ROUTING_IMPORT_OPTION_IGNORED_CODE,
+                format!(
+                    "policy group {} network rule {when} was skipped: only SSID, BSSID, ROUTER, SUBNET, TYPE and cellular are supported",
+                    group.name
+                ),
+            );
+            continue;
+        }
+        match resolve_member(&importer.nodes_by_name, kept, GroupKind::Subnet, target) {
+            Ok(target) => network_rules.push(NetworkRuleSpec {
+                when: when.clone(),
+                target,
+            }),
+            Err(reason) => importer.warn(
+                ROUTING_IMPORT_MEMBER_SKIPPED_CODE,
+                format!(
+                    "policy group {} network rule {when} was skipped: {reason}",
+                    group.name
+                ),
+            ),
+        }
+    }
+    if !group.options.is_empty() {
+        importer.warn(
+            ROUTING_IMPORT_OPTION_IGNORED_CODE,
+            format!(
+                "policy group {} options were ignored: {}",
+                group.name,
+                group.options.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    Some(PolicyGroupSpec {
+        id: group.name.clone(),
+        kind: GroupKind::Subnet.as_str().to_string(),
+        default: Some(default),
+        network_rules,
+        ..PolicyGroupSpec::default()
+    })
 }
 
 fn resolve_member(
@@ -730,10 +845,10 @@ fn resolve_member(
         return Err("policy groups cannot contain REJECT");
     }
     if groups.contains_key(member) {
-        return if kind == GroupKind::Select {
+        return if matches!(kind, GroupKind::Select | GroupKind::Subnet) {
             Ok(member.to_string())
         } else {
-            Err("only select groups can contain other groups")
+            Err("only select and subnet groups can contain other groups")
         };
     }
     nodes_by_name
@@ -783,7 +898,10 @@ fn import_rules(
             import_logical_rule(importer, group_ids, rule_sets, &kind, line)
         } else if kind == "RULE-SET" || kind == "DOMAIN-SET" {
             import_rule_set_rule(importer, group_ids, rule_sets, &kind, &parts)
-        } else if SUPPORTED_RULE_TYPES.contains(&kind.as_str()) {
+        } else if SUPPORTED_RULE_TYPES.contains(&kind.as_str())
+            || (kind == "URL-REGEX" && parts.len() >= 3 && !is_reject_policy(parts[2]))
+        {
+            // A rejecting URL-REGEX is HTTPS decryption's, not routing's.
             import_plain_rule(importer, group_ids, &kind, &parts)
         } else {
             *skipped.entry(kind).or_default() += 1;

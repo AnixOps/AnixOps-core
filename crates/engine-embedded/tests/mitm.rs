@@ -322,7 +322,8 @@ impl TcpOutbound for PlainOrigin {
                     while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&buf[..end]).into_owned();
                         buf.drain(..end + 4);
-                        requests.send(head).unwrap();
+                        // Tests that do not read the heads drop the receiver.
+                        let _ = requests.send(head);
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{extra_headers}Content-Length: {}\r\n\r\n",
                             body.len()
@@ -1370,5 +1371,187 @@ async fn websocket_messages_are_captured_as_they_pass_unchanged() {
     drop(app);
     let row = wait_for_row(&dispatcher, |row| row["state"] == "done").await;
     assert_eq!(row["message_count"], 3, "{row}");
+    server.abort();
+}
+
+/// Counts the connections opened through an outbound.
+struct Counting {
+    inner: Arc<dyn TcpOutbound>,
+    opened: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TcpOutbound for Counting {
+    fn protocol(&self) -> &'static str {
+        "test-counting"
+    }
+
+    fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.connect(target)
+    }
+}
+
+/// Two nodes that answer with their own name, and rules that send some
+/// requests of one decrypted connection to the other node or reject them.
+fn request_routed(rules: &[&str]) -> (Arc<Dispatcher>, [Arc<std::sync::atomic::AtomicUsize>; 2]) {
+    use config_core::routing::RoutingSpec;
+    use engine_embedded::routing::RoutedOutbound;
+
+    let counters = [Arc::default(), Arc::default()];
+    let node = |name: &'static str, opened: &Arc<std::sync::atomic::AtomicUsize>| {
+        let (requests, _) = mpsc::unbounded_channel();
+        Arc::new(Counting {
+            inner: Arc::new(PlainOrigin {
+                requests,
+                body: name.as_bytes().to_vec(),
+                extra_headers: "",
+            }),
+            opened: opened.clone(),
+        }) as Arc<dyn TcpOutbound>
+    };
+    let nodes = std::collections::BTreeMap::from([
+        ("node-a".to_string(), node("node-a", &counters[0])),
+        ("node-b".to_string(), node("node-b", &counters[1])),
+    ]);
+    let spec = RoutingSpec {
+        rules: rules.iter().map(|rule| rule.to_string()).collect(),
+        groups: Vec::new(),
+    };
+    let direct = node("direct", &Arc::default());
+    let routed = RoutedOutbound::new(&spec, direct, nodes).unwrap();
+    (Arc::new(Dispatcher::routed(Arc::new(routed))), counters)
+}
+
+async fn get(app: &mut tokio::io::DuplexStream, path: &str, agent: &str) -> (String, String) {
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: plain.example.test\r\nUser-Agent: {agent}\r\n\r\n");
+    app.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), read_response(app))
+        .await
+        .expect("answered in time")
+}
+
+#[tokio::test]
+async fn each_decrypted_http1_request_is_routed_on_its_own() {
+    let device_root = root("NetworkCore Test Device Root");
+    let engine = Arc::new(MitmEngine::new(&mitm_config(&device_root)).unwrap());
+    let (dispatcher, [a, b]) = request_routed(&[
+        r"URL-REGEX,^http://plain\.example\.test/video/,node-b",
+        "USER-AGENT,Special*,node-b",
+        r#"AND,((URL-REGEX,"^http://plain\.example\.test/ads/"),(DST-PORT,80)),REJECT"#,
+        "FINAL,node-a",
+    ]);
+    let target: SocketAddr = "192.0.2.20:80".parse().unwrap();
+    let first =
+        b"GET /index.html HTTP/1.1\r\nHost: plain.example.test\r\nUser-Agent: App\r\n\r\n".to_vec();
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let dispatcher = dispatcher.clone();
+        async move {
+            let http = engine_outbound::sniff::http_request_head(&first);
+            let outbound = dispatcher.with_request("plain.example.test", http.as_ref());
+            let flow = InterceptedFlow {
+                inbound: Box::new(tunnel_side),
+                first,
+                host: "plain.example.test".to_string(),
+                target,
+            };
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    &outbound,
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    // The first request was sent with the flow.
+    let (head, body) = tokio::time::timeout(Duration::from_secs(10), read_response(&mut app))
+        .await
+        .unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "node-a");
+    // URL-REGEX and USER-AGENT see every request, not only the first.
+    assert_eq!(get(&mut app, "/video/1.ts", "App").await.1, "node-b");
+    assert_eq!(get(&mut app, "/video/2.ts", "App").await.1, "node-b");
+    assert_eq!(get(&mut app, "/feed", "SpecialPlayer/2").await.1, "node-b");
+    assert_eq!(get(&mut app, "/feed", "App").await.1, "node-a");
+    // REJECT answers here and keeps the connection.
+    let (head, _) = get(&mut app, "/ads/banner.js", "App").await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert_eq!(get(&mut app, "/index.html", "App").await.1, "node-a");
+    // One origin connection per switch, none for repeats on the same node.
+    let opened = |count: &Arc<std::sync::atomic::AtomicUsize>| {
+        count.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    assert_eq!(opened(&a), 2);
+    assert_eq!(opened(&b), 1);
+    // Each origin connection is listed with the rule of the request that
+    // opened it: the USER-AGENT request reused the node-b connection the
+    // URL-REGEX request opened, so it opened none.
+    let list = control_json(&dispatcher, r#"{"cmd":"connections"}"#);
+    let mut rules: Vec<String> = list["active"]
+        .as_array()
+        .into_iter()
+        .chain(list["closed"].as_array())
+        .flatten()
+        .map(|connection| connection["rule"].as_str().unwrap_or_default().to_string())
+        .collect();
+    rules.sort();
+    assert_eq!(
+        rules,
+        [
+            "FINAL",
+            "FINAL",
+            r"URL-REGEX,^http://plain\.example\.test/video/",
+        ],
+        "{rules:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rules_that_ignore_requests_keep_one_origin_connection() {
+    let device_root = root("NetworkCore Test Device Root");
+    let engine = Arc::new(MitmEngine::new(&mitm_config(&device_root)).unwrap());
+    let (dispatcher, [a, b]) =
+        request_routed(&["DOMAIN-SUFFIX,video.example.test,node-b", "FINAL,node-a"]);
+    let target: SocketAddr = "192.0.2.20:80".parse().unwrap();
+    let first = b"GET / HTTP/1.1\r\nHost: plain.example.test\r\n\r\n".to_vec();
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let dispatcher = dispatcher.clone();
+        async move {
+            let outbound = dispatcher.with_host("plain.example.test");
+            let flow = InterceptedFlow {
+                inbound: Box::new(tunnel_side),
+                first,
+                host: "plain.example.test".to_string(),
+                target,
+            };
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    &outbound,
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+    let (_, body) = tokio::time::timeout(Duration::from_secs(10), read_response(&mut app))
+        .await
+        .unwrap();
+    assert_eq!(body, "node-a");
+    for _ in 0..3 {
+        assert_eq!(get(&mut app, "/video/1.ts", "App").await.1, "node-a");
+    }
+    assert_eq!(a.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(b.load(std::sync::atomic::Ordering::SeqCst), 0);
     server.abort();
 }
