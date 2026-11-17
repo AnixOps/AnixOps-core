@@ -1439,7 +1439,7 @@ async fn each_decrypted_http1_request_is_routed_on_its_own() {
     let (dispatcher, [a, b]) = request_routed(&[
         r"URL-REGEX,^http://plain\.example\.test/video/,node-b",
         "USER-AGENT,Special*,node-b",
-        r"URL-REGEX,^http://plain\.example\.test/ads/,REJECT",
+        r#"AND,((URL-REGEX,"^http://plain\.example\.test/ads/"),(DST-PORT,80)),REJECT"#,
         "FINAL,node-a",
     ]);
     let target: SocketAddr = "192.0.2.20:80".parse().unwrap();

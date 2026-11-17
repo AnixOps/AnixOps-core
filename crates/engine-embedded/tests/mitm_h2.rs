@@ -500,7 +500,8 @@ async fn each_http2_stream_is_routed_on_its_own() {
     let spec = RoutingSpec {
         rules: vec![
             r"URL-REGEX,^https://api\.example\.test/video/,node-b".to_string(),
-            r"URL-REGEX,^https://api\.example\.test/ads/,REJECT".to_string(),
+            r#"AND,((URL-REGEX,"^https://api\.example\.test/ads/"),(DST-PORT,443)),REJECT"#
+                .to_string(),
             "FINAL,node-a".to_string(),
         ],
         groups: Vec::new(),
