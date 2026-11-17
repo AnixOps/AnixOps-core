@@ -37,11 +37,12 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::config::DnsVia;
-use crate::connections::{Dispatcher, Mode};
+use crate::connections::{Dispatcher, FlowOrigin, Mode};
 use crate::dns::{self, OutboundFailure};
 use crate::dns_cache::{CacheKey, DnsCache, DnsPools, Lookup, Waiter};
 use crate::dns_policy::{DnsPolicy, Plan};
 use crate::fake_ip::FakeAnswer;
+use crate::routing::FlowSource;
 use crate::sniff;
 #[cfg(feature = "wireguard")]
 use crate::wireguard::{self, WireGuardSettings};
@@ -1016,7 +1017,14 @@ async fn run_udp_flow(
     let opened = {
         let open: BoxFuture<'_, io::Result<UdpFlow>> = Box::pin(async {
             let target = TargetAddr::Ip(destination);
-            dispatcher.open_udp_flow(&target, None).await
+            let origin = FlowOrigin {
+                process: None,
+                source: FlowSource {
+                    address: Some(app.ip().to_canonical()),
+                    in_port: None,
+                },
+            };
+            dispatcher.open_origin_udp_flow(&target, None, origin).await
         });
         tokio::time::timeout(connect_timeout, open).await
     };
@@ -1217,6 +1225,12 @@ async fn handle_tcp(
     settings: &TunnelSettings,
     drop_holds: &Semaphore,
 ) {
+    // The app (or, with the tunnel as a gateway, the device) that opened
+    // the flow, for SRC-IP rules; the tunnel has no listener port.
+    let source = FlowSource {
+        address: Some(inbound.local_addr().ip().to_canonical()),
+        in_port: None,
+    };
     let Some(first) = read_first_payload(&mut inbound, target.port()).await else {
         return;
     };
@@ -1225,7 +1239,7 @@ async fn handle_tcp(
         if let Some(host) = interceptor.claim(&first, target) {
             bump(&stats.mitm_flows);
             let http = sniff::http_request_head(&first);
-            let outbound = dispatcher.with_request(&host, http.as_ref());
+            let outbound = dispatcher.with_origin_request(&host, http.as_ref(), source);
             let flow = InterceptedFlow {
                 inbound: Box::new(inbound),
                 first,
@@ -1240,7 +1254,11 @@ async fn handle_tcp(
     let host = sniff::host(&first);
     let http = sniff::http_request_head(&first);
     let target = TargetAddr::Ip(target);
-    let connect = dispatcher.connect_http_flow(&target, host.as_deref(), http.as_ref());
+    let origin = FlowOrigin {
+        process: None,
+        source,
+    };
+    let connect = dispatcher.connect_origin_flow(&target, host.as_deref(), origin, http.as_ref());
     let mut remote = match tokio::time::timeout(settings.connect_timeout, connect).await {
         Ok(Ok(remote)) => remote,
         Ok(Err(err)) => {

@@ -2,7 +2,7 @@
 //!
 //! This module owns the platform-neutral routing model: ordered
 //! DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD/IP-CIDR/GEOIP/GEOSITE/DST-PORT/
-//! PROCESS-NAME/RULE-SET rules and AND/OR/NOT combinations of them, a
+//! SRC-IP/IN-PORT/PROCESS-NAME/RULE-SET/SCRIPT rules and AND/OR/NOT combinations of them, a
 //! mandatory FINAL target, and
 //! select/url-test/fallback policy groups. In-process engines call
 //! [`RoutingModel::decide`] directly, and snapshot tests pin its results. The module performs no DNS, GeoIP database, health check,
@@ -295,6 +295,13 @@ pub enum RuleMatcher {
     /// Lower-case name of the local process that opened the connection,
     /// when the platform can tell.
     ProcessName(String),
+    /// Address of the device or app that opened the connection, as Surge
+    /// `SRC-IP` (an address or a CIDR; Clash `SRC-IP-CIDR`).
+    SrcIp(IpCidr),
+    /// Local port of the inbound listener the connection came in on, within
+    /// an inclusive range, as Surge `IN-PORT`. The packet tunnel has no
+    /// listener port, so it never matches there.
+    InPort(u16, u16),
     /// Transport of the connection, as Surge `PROTOCOL`.
     Protocol(RuleProtocol),
     /// Lower-case glob over the `User-Agent` of a plain HTTP request, as
@@ -303,6 +310,11 @@ pub enum RuleMatcher {
     /// Regex over the URL of a plain HTTP request (`http://host/path`), as
     /// Surge `URL-REGEX` inside a logical rule. Other flows never match.
     UrlRegex(UrlPattern),
+    /// Name of a rule script that decides, as Surge `SCRIPT`. The verdict
+    /// comes from [`RoutingEnvironment::script_matches`]; a script that has
+    /// not run yet stops [`RoutingModel::decide`] at this rule with
+    /// [`RouteMatch::ScriptPending`]. Not accepted inside a logical rule.
+    Script(String),
     /// Every rule matches.
     And(Vec<RuleMatcher>),
     /// Any rule matches.
@@ -337,6 +349,8 @@ impl RuleMatcher {
             domain: domain.as_deref(),
             ip: query.ip,
             port: query.port,
+            source: query.source,
+            in_port: query.in_port,
             process: process.as_deref(),
             network: query.network,
             user_agent: user_agent.as_deref(),
@@ -363,9 +377,13 @@ impl fmt::Display for RuleMatcher {
             Self::DstPort(start, end) if start == end => write!(formatter, "DST-PORT,{start}"),
             Self::DstPort(start, end) => write!(formatter, "DST-PORT,{start}-{end}"),
             Self::ProcessName(name) => write!(formatter, "PROCESS-NAME,{name}"),
+            Self::SrcIp(cidr) => write!(formatter, "SRC-IP,{cidr}"),
+            Self::InPort(start, end) if start == end => write!(formatter, "IN-PORT,{start}"),
+            Self::InPort(start, end) => write!(formatter, "IN-PORT,{start}-{end}"),
             Self::Protocol(protocol) => write!(formatter, "PROTOCOL,{}", protocol.name()),
             Self::UserAgent(pattern) => write!(formatter, "USER-AGENT,{pattern}"),
             Self::UrlRegex(pattern) => write!(formatter, "URL-REGEX,{}", pattern.as_str()),
+            Self::Script(name) => write!(formatter, "SCRIPT,{name}"),
             Self::And(rules) => write_logical(formatter, "AND", rules),
             Self::Or(rules) => write_logical(formatter, "OR", rules),
             Self::Not(rule) => write_logical(formatter, "NOT", std::slice::from_ref(rule)),
@@ -541,6 +559,11 @@ fn parse_options(options: &[&str], matcher: &RuleMatcher) -> DomainResult<bool> 
     for option in options {
         if option.eq_ignore_ascii_case("no-resolve") && matcher.matches_ip() {
             no_resolve = true;
+        } else if option.eq_ignore_ascii_case("no-resolve")
+            && matches!(matcher, RuleMatcher::SrcIp(_))
+        {
+            // Clash writes it on SRC-IP-CIDR; a source address never needs
+            // a lookup.
         } else if option.eq_ignore_ascii_case("pre-matching")
             || option.eq_ignore_ascii_case("extended-matching")
         {
@@ -648,6 +671,12 @@ fn parse_sub_rule(text: &str, depth: usize) -> DomainResult<RuleMatcher> {
         }
         return parse_logical(&kind, inner, depth + 1);
     }
+    if kind == "SCRIPT" {
+        return Err(routing_error(
+            ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
+            "SCRIPT rules cannot be used inside AND, OR, or NOT",
+        ));
+    }
     let mut parts = value.split(',').map(str::trim);
     let value = parts.next().unwrap_or_default();
     // `no-resolve` is accepted for compatibility; a logical rule resolves as
@@ -683,6 +712,16 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             let (start, end) = parse_port_range(value)?;
             RuleMatcher::DstPort(start, end)
         }
+        "IN-PORT" => {
+            let (start, end) = parse_port_range(value).map_err(|_| {
+                routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "IN-PORT rule value must be a port or a start-end range",
+                )
+            })?;
+            RuleMatcher::InPort(start, end)
+        }
+        "SRC-IP" | "SRC-IP-CIDR" => RuleMatcher::SrcIp(parse_source(value)?),
         "PROCESS-NAME" => RuleMatcher::ProcessName(value.trim().to_lowercase()),
         "USER-AGENT" => {
             let pattern = value.trim().trim_matches('"').to_lowercase();
@@ -695,6 +734,21 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             RuleMatcher::UserAgent(pattern)
         }
         "URL-REGEX" => RuleMatcher::UrlRegex(UrlPattern::new(value.trim().trim_matches('"'))?),
+        "SCRIPT" => {
+            let name = value.trim();
+            let valid = !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+            if !valid {
+                return Err(routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "SCRIPT rule value must be a script name of 1-128 characters of [A-Za-z0-9._-]",
+                ));
+            }
+            RuleMatcher::Script(name.to_string())
+        }
         "PROTOCOL" => RuleMatcher::Protocol(match value.trim().to_ascii_uppercase().as_str() {
             "TCP" => RuleProtocol::Tcp,
             "UDP" => RuleProtocol::Udp,
@@ -710,8 +764,33 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
         }),
         _ => return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, RULE-SET, AND, OR, NOT, or FINAL (URL-REGEX inside AND, OR, NOT)",
+            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, SRC-IP, IN-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, RULE-SET, SCRIPT, AND, OR, NOT, or FINAL (URL-REGEX inside AND, OR, NOT)",
         )),
+    })
+}
+
+/// A `SRC-IP` value: an address (one host) or a CIDR; IPv6 may be written
+/// in brackets.
+fn parse_source(value: &str) -> DomainResult<IpCidr> {
+    let value = value.trim();
+    let unbracketed = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(address, rest)| format!("{address}{rest}"));
+    let value = unbracketed.as_deref().unwrap_or(value);
+    let parsed = if value.contains('/') {
+        IpCidr::parse(value)
+    } else {
+        value.parse::<IpAddr>().ok().and_then(|address| {
+            let prefix = if address.is_ipv4() { 32 } else { 128 };
+            IpCidr::parse(&format!("{address}/{prefix}"))
+        })
+    };
+    parsed.ok_or_else(|| {
+        routing_error(
+            ROUTING_RULE_VALUE_INVALID_CODE,
+            "SRC-IP rule value must be an address or an address with a prefix length",
+        )
     })
 }
 
@@ -904,10 +983,35 @@ impl RoutingModel {
                     ip = resolved_ip;
                 }
             }
+            if let RuleMatcher::Script(name) = &rule.matcher {
+                match environment.script_matches(name) {
+                    Some(true) => {
+                        return self.resolution(
+                            RouteMatch::Rule(index),
+                            &rule.target,
+                            resolved_ip,
+                            balance_key.as_deref(),
+                            environment,
+                        )
+                    }
+                    Some(false) => continue,
+                    None => {
+                        return RouteResolution {
+                            matched: RouteMatch::ScriptPending(index),
+                            target: PolicyTarget::Reject(RejectKind::Reject),
+                            group_path: Vec::new(),
+                            outcome: RouteOutcome::Reject(RejectKind::Reject),
+                            resolved_ip,
+                        }
+                    }
+                }
+            }
             let input = MatchInput {
                 domain: domain.as_deref(),
                 ip,
                 port: query.port,
+                source: query.source,
+                in_port: query.in_port,
                 process: process.as_deref(),
                 network: query.network,
                 user_agent: user_agent.as_deref(),
@@ -1112,6 +1216,12 @@ pub struct RouteQuery {
     pub user_agent: Option<String>,
     /// URL of a plain HTTP request, for URL-REGEX rules.
     pub url: Option<String>,
+    /// Address of the device or app that opened the connection, for SRC-IP
+    /// rules.
+    pub source: Option<IpAddr>,
+    /// Local port of the inbound listener the connection came in on, for
+    /// IN-PORT rules.
+    pub in_port: Option<u16>,
 }
 
 impl RouteQuery {
@@ -1136,6 +1246,13 @@ impl RouteQuery {
 
     pub fn with_network(mut self, network: RouteNetwork) -> Self {
         self.network = Some(network);
+        self
+    }
+
+    /// Sets the source address and inbound port, for SRC-IP and IN-PORT.
+    pub fn with_source(mut self, source: Option<IpAddr>, in_port: Option<u16>) -> Self {
+        self.source = source;
+        self.in_port = in_port;
         self
     }
 }
@@ -1186,6 +1303,16 @@ pub trait RoutingEnvironment {
         0
     }
 
+    /// Verdict of the rule script `name` (a `SCRIPT` rule) for the
+    /// connection being routed. `None` means it has not run yet:
+    /// [`RoutingModel::decide`] then stops at that rule with
+    /// [`RouteMatch::ScriptPending`] so the caller can run the script, which
+    /// may take a while, outside the decision and decide again. By default
+    /// no script matches.
+    fn script_matches(&self, _name: &str) -> Option<bool> {
+        Some(false)
+    }
+
     /// Whether the named rule set holds the destination; an unknown set
     /// matches nothing.
     fn rule_set_matches(&self, _name: &str, _domain: Option<&str>, _ip: Option<IpAddr>) -> bool {
@@ -1206,6 +1333,11 @@ pub enum RouteMatch {
     Rule(usize),
     /// Resolving the domain for the IP rule at this index failed.
     ResolveFailed(usize),
+    /// The SCRIPT rule at this index has no verdict yet
+    /// ([`RoutingEnvironment::script_matches`] returned `None`): the caller
+    /// runs the script and decides again with its verdict. The resolution
+    /// rejects and carries the address resolved so far.
+    ScriptPending(usize),
     Final,
 }
 
@@ -1233,6 +1365,8 @@ struct MatchInput<'a> {
     domain: Option<&'a str>,
     ip: Option<IpAddr>,
     port: Option<u16>,
+    source: Option<IpAddr>,
+    in_port: Option<u16>,
     process: Option<&'a str>,
     network: Option<RouteNetwork>,
     user_agent: Option<&'a str>,
@@ -1269,6 +1403,12 @@ fn rule_matches(
             .port
             .is_some_and(|port| (*start..=*end).contains(&port)),
         RuleMatcher::ProcessName(name) => input.process == Some(name.as_str()),
+        RuleMatcher::SrcIp(cidr) => input
+            .source
+            .is_some_and(|source| cidr.contains(source.to_canonical())),
+        RuleMatcher::InPort(start, end) => input
+            .in_port
+            .is_some_and(|port| (*start..=*end).contains(&port)),
         RuleMatcher::Protocol(protocol) => {
             let port = input.port;
             match (protocol, input.network) {
@@ -1284,6 +1424,7 @@ fn rule_matches(
             .user_agent
             .is_some_and(|agent| wildcard_matches(pattern.as_bytes(), agent.as_bytes())),
         RuleMatcher::UrlRegex(pattern) => input.url.is_some_and(|url| pattern.is_match(url)),
+        RuleMatcher::Script(name) => environment.script_matches(name) == Some(true),
         RuleMatcher::And(rules) => rules
             .iter()
             .all(|rule| rule_matches(rule, input, environment)),

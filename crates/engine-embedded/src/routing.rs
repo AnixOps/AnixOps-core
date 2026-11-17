@@ -62,6 +62,7 @@ use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use serde::Serialize;
 
 use crate::reject::RejectStorm;
+use crate::rule_scripts::RuleScripts;
 use crate::rule_sets::RuleSetStore;
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -91,6 +92,8 @@ pub struct RoutedOutbound {
     /// Recent plain-REJECT flows per host, to drop retry storms (see
     /// [`crate::reject`]).
     reject_storm: RejectStorm,
+    /// Scripts that `SCRIPT` rules name (see [`crate::rule_scripts`]).
+    scripts: Arc<RuleScripts>,
 }
 
 /// One compiled rule list: the model, where the global mode goes, and
@@ -138,6 +141,7 @@ pub mod reject_code {
     pub const SYNTAX: &str = "syntax";
     pub const UNKNOWN_TARGET: &str = "unknown_target";
     pub const UNKNOWN_RULE_SET: &str = "unknown_rule_set";
+    pub const UNKNOWN_SCRIPT: &str = "unknown_script";
     pub const FINAL_NOT_LAST: &str = "final_not_last";
     pub const FINAL_MISSING: &str = "final_missing";
     pub const INVALID: &str = "invalid";
@@ -173,6 +177,15 @@ impl DomainResolver for SystemResolver {
     }
 }
 
+/// Where a flow came from, for `SRC-IP` and `IN-PORT` rules: the address
+/// of the app or device that opened it and the local port of the listener
+/// it came in on (none for the packet tunnel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlowSource {
+    pub address: Option<IpAddr>,
+    pub in_port: Option<u16>,
+}
+
 /// Why a flow went where it did: the matched rule (`FINAL` when none did),
 /// the policy groups passed through and the outbound picked, ending with it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -196,6 +209,9 @@ struct QueryEnvironment<'a> {
     selected: &'a BTreeMap<String, String>,
     resolved: Option<IpAddr>,
     round_robin: &'a AtomicUsize,
+    /// Verdicts of the rule scripts run for this connection so far; `None`
+    /// when deciding without a connection, where no script matches.
+    scripts: Option<&'a BTreeMap<String, bool>>,
 }
 
 impl RoutingEnvironment for QueryEnvironment<'_> {
@@ -216,6 +232,13 @@ impl RoutingEnvironment for QueryEnvironment<'_> {
 
     fn resolve(&self, _domain: &str) -> Option<IpAddr> {
         self.resolved
+    }
+
+    fn script_matches(&self, name: &str) -> Option<bool> {
+        match self.scripts {
+            Some(verdicts) => verdicts.get(name).copied(),
+            None => Some(false),
+        }
     }
 
     fn member_latency_ms(&self, group_id: &str, member: &PolicyTarget) -> Option<u32> {
@@ -314,6 +337,7 @@ impl RoutedOutbound {
             round_robin: AtomicUsize::new(0),
             used_groups: Mutex::default(),
             reject_storm: RejectStorm::default(),
+            scripts: Arc::default(),
         })
     }
 
@@ -342,7 +366,13 @@ impl RoutedOutbound {
     ) -> Result<RulesReload, RulesRejection> {
         let node_ids = self.node_ids();
         let current = self.table();
-        check_rule_lines(rules, &node_ids, &current.model, &self.rule_sets)?;
+        check_rule_lines(
+            rules,
+            &node_ids,
+            &current.model,
+            &self.rule_sets,
+            &self.scripts,
+        )?;
         let spec = RoutingSpec {
             rules: rules.to_vec(),
             groups: self.group_specs.clone(),
@@ -404,6 +434,27 @@ impl RoutedOutbound {
         );
         add_plugin_rules(table, rules, &node_ids, &self.rule_sets);
         self
+    }
+
+    /// Gives `SCRIPT` rules their scripts. Every `SCRIPT` rule must name
+    /// one of them, now and in every reload. Without this call no script is
+    /// known and a `SCRIPT` rule never matches.
+    pub fn with_rule_scripts(mut self, scripts: RuleScripts) -> Result<Self, RuntimeError> {
+        let unknown = self
+            .table()
+            .model
+            .rules
+            .iter()
+            .filter_map(|rule| script_name(&rule.matcher))
+            .any(|name| !scripts.contains(name));
+        if unknown {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::ConfigRejected,
+                "a SCRIPT rule names a script that is not configured",
+            ));
+        }
+        self.scripts = Arc::new(scripts);
+        Ok(self)
     }
 
     /// Sets where the global mode sends connections: a policy group, a node
@@ -580,7 +631,8 @@ impl RoutedOutbound {
     /// Where a connection to `target` goes without resolving its domain: a
     /// domain that reaches an IP rule without `no-resolve` is rejected.
     pub fn route(&self, target: &TargetAddr) -> RouteOutcome {
-        self.decide(&self.table(), &query(target), None).outcome
+        self.decide(&self.table(), &query(target), None, None)
+            .outcome
     }
 
     fn decide(
@@ -588,8 +640,9 @@ impl RoutedOutbound {
         table: &RoutingTable,
         query: &RouteQuery,
         resolved: Option<IpAddr>,
+        scripts: Option<&BTreeMap<String, bool>>,
     ) -> RouteResolution {
-        self.with_environment(resolved, |environment| {
+        self.with_scripts(resolved, scripts, |environment| {
             table.model.decide_indexed(&table.index, query, environment)
         })
     }
@@ -597,6 +650,15 @@ impl RoutedOutbound {
     fn with_environment<T>(
         &self,
         resolved: Option<IpAddr>,
+        body: impl FnOnce(&QueryEnvironment<'_>) -> T,
+    ) -> T {
+        self.with_scripts(resolved, None, body)
+    }
+
+    fn with_scripts<T>(
+        &self,
+        resolved: Option<IpAddr>,
+        scripts: Option<&BTreeMap<String, bool>>,
         body: impl FnOnce(&QueryEnvironment<'_>) -> T,
     ) -> T {
         let latencies = self
@@ -614,6 +676,7 @@ impl RoutedOutbound {
             selected: &selected,
             resolved,
             round_robin: &self.round_robin,
+            scripts,
         })
     }
 
@@ -741,13 +804,21 @@ impl RoutedOutbound {
         sniffed: Option<&str>,
         process: Option<&str>,
     ) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
-        self.route_network_flow(target, sniffed, process, RouteNetwork::Tcp, None)
-            .await
+        self.route_network_flow(
+            target,
+            sniffed,
+            process,
+            RouteNetwork::Tcp,
+            None,
+            FlowSource::default(),
+        )
+        .await
     }
 
     /// [`Self::route_flow`] for a flow of the given transport, which
-    /// `PROTOCOL` rules match, and the head sniffed from a plain HTTP
-    /// request, which `USER-AGENT` and `URL-REGEX` rules match.
+    /// `PROTOCOL` rules match, the head sniffed from a plain HTTP request,
+    /// which `USER-AGENT` and `URL-REGEX` rules match, and where the flow
+    /// came from, which `SRC-IP` and `IN-PORT` rules match.
     pub async fn route_network_flow(
         &self,
         target: &TargetAddr,
@@ -755,8 +826,11 @@ impl RoutedOutbound {
         process: Option<&str>,
         network: RouteNetwork,
         http: Option<&HttpRequestHead>,
+        source: FlowSource,
     ) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
-        let mut query = query(target).with_network(network);
+        let mut query = query(target)
+            .with_network(network)
+            .with_source(source.address, source.in_port);
         if let Some(http) = http {
             query.user_agent.clone_from(&http.user_agent);
             query.url.clone_from(&http.url);
@@ -817,16 +891,41 @@ impl RoutedOutbound {
         resolution
     }
 
+    /// Decides `query`, resolving its domain once when an IP rule needs an
+    /// address and running each `SCRIPT` rule the decision reaches, then
+    /// deciding again with the address or the verdict. Every pass adds one
+    /// of them, so this ends after at most one pass more than the scripts.
     async fn decide_resolving(&self, table: &RoutingTable, query: &RouteQuery) -> RouteResolution {
-        let first = self.decide(table, query, None);
-        let (Some(domain), RouteMatch::ResolveFailed(_)) = (query.domain.as_deref(), first.matched)
-        else {
-            return first;
-        };
-        let Ok(resolved) = self.resolver.resolve(domain).await else {
-            return first;
-        };
-        self.decide(table, query, Some(resolved))
+        let mut resolved = None;
+        let mut verdicts = BTreeMap::new();
+        loop {
+            let resolution = self.decide(table, query, resolved, Some(&verdicts));
+            match resolution.matched {
+                RouteMatch::ResolveFailed(_) if resolved.is_none() => {
+                    let Some(domain) = query.domain.as_deref() else {
+                        return resolution;
+                    };
+                    let Ok(address) = self.resolver.resolve(domain).await else {
+                        return resolution;
+                    };
+                    resolved = Some(address);
+                }
+                RouteMatch::ScriptPending(index) => {
+                    let Some(name) = script_name(&table.model.rules[index].matcher) else {
+                        return resolution;
+                    };
+                    if verdicts.contains_key(name) {
+                        return resolution;
+                    }
+                    let matched = self
+                        .scripts
+                        .matches(name, query, resolution.resolved_ip)
+                        .await;
+                    verdicts.insert(name.to_string(), matched);
+                }
+                _ => return resolution,
+            }
+        }
     }
 
     /// Measures every member of the health-checked groups through its
@@ -921,6 +1020,9 @@ fn describe(table: &RoutingTable, resolution: &RouteResolution) -> RouteInfo {
         RouteMatch::Rule(index) => table.model.rules[index].matcher.to_string(),
         RouteMatch::ResolveFailed(index) => {
             format!("{} (resolve failed)", table.model.rules[index].matcher)
+        }
+        RouteMatch::ScriptPending(index) => {
+            format!("{} (script pending)", table.model.rules[index].matcher)
         }
         RouteMatch::Final => "FINAL".to_string(),
     };
@@ -1018,7 +1120,10 @@ fn add_plugin_rules(
     for rule in rules {
         let mut named = Vec::new();
         named_sets(&rule.matcher, &mut named);
-        if named.iter().any(|name| !rule_sets.contains(name)) {
+        // A plugin cannot bring rule scripts.
+        if named.iter().any(|name| !rule_sets.contains(name))
+            || script_name(&rule.matcher).is_some()
+        {
             continue;
         }
         let target = match &rule.target {
@@ -1047,6 +1152,7 @@ fn check_rule_lines(
     node_ids: &BTreeSet<String>,
     model: &RoutingModel,
     rule_sets: &RuleSetStore,
+    scripts: &RuleScripts,
 ) -> Result<(), RulesRejection> {
     let reject = |line: Option<usize>, code| Err(RulesRejection { line, code });
     if rules.len() > node_import::MAX_ROUTING_RULES {
@@ -1078,6 +1184,9 @@ fn check_rule_lines(
                 if named.iter().any(|name| !rule_sets.contains(name)) {
                     return reject(Some(index), reject_code::UNKNOWN_RULE_SET);
                 }
+                if script_name(&matcher).is_some_and(|name| !scripts.contains(name)) {
+                    return reject(Some(index), reject_code::UNKNOWN_SCRIPT);
+                }
             }
             RuleLine::Final { target } => {
                 if !known_target(&target) {
@@ -1099,6 +1208,14 @@ fn query(target: &TargetAddr) -> RouteQuery {
         TargetAddr::Domain(domain, _) => RouteQuery::domain(domain.clone()),
     }
     .with_port(target.port())
+}
+
+/// The script a `SCRIPT` rule names (never inside a logical rule).
+fn script_name(matcher: &RuleMatcher) -> Option<&str> {
+    match matcher {
+        RuleMatcher::Script(name) => Some(name),
+        _ => None,
+    }
 }
 
 fn matches_process(matcher: &RuleMatcher) -> bool {

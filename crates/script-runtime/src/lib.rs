@@ -53,6 +53,10 @@ pub enum ScriptPhase {
     Event,
     /// Script the user runs by hand (Loon/Surge `generic`).
     Generic,
+    /// Surge rule script (`SCRIPT,<name>,<policy>`): `$request` describes
+    /// the connection ([`ScriptInvocation::rule`]) and the script answers
+    /// with `$done({matched: true})`.
+    Rule,
 }
 
 impl ScriptPhase {
@@ -63,6 +67,7 @@ impl ScriptPhase {
             Self::Cron => "cron",
             Self::Event => "event",
             Self::Generic => "generic",
+            Self::Rule => "rule",
         }
     }
 
@@ -90,6 +95,27 @@ pub struct ScriptResponse {
     pub body: Option<String>,
 }
 
+/// The connection a rule script decides on, visible as `$request`:
+/// `hostname`, `destIP`, `destPort`, `sourceIP`, `inPort`, `processName`,
+/// `protocol`, `userAgent` and `url`, each `null` when unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScriptRuleRequest {
+    /// Destination domain, lower case.
+    pub hostname: Option<String>,
+    /// Destination address: the connection's, or the one resolved for an
+    /// earlier IP rule.
+    pub dest_ip: Option<std::net::IpAddr>,
+    pub dest_port: Option<u16>,
+    pub source_ip: Option<std::net::IpAddr>,
+    /// Port of the local listener the connection came in on.
+    pub in_port: Option<u16>,
+    pub process_name: Option<String>,
+    /// `TCP` or `UDP`.
+    pub protocol: Option<String>,
+    pub user_agent: Option<String>,
+    pub url: Option<String>,
+}
+
 /// One script dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptInvocation {
@@ -109,6 +135,8 @@ pub struct ScriptInvocation {
     /// Event name for [`ScriptPhase::Event`] (`$event.name`), such as
     /// `network-changed`.
     pub event: Option<String>,
+    /// The connection a [`ScriptPhase::Rule`] script decides on.
+    pub rule: Option<ScriptRuleRequest>,
 }
 
 impl ScriptInvocation {
@@ -128,6 +156,7 @@ impl ScriptInvocation {
             response: None,
             binary_body: false,
             event,
+            rule: None,
         }
     }
 
@@ -201,6 +230,9 @@ pub struct ScriptMutation {
     pub body: Option<String>,
     /// Response returned without contacting the origin (request phase).
     pub response: Option<ScriptResponse>,
+    /// Whether the connection matches (rule phase): `true` only when the
+    /// script passed `matched: true`.
+    pub matched: Option<bool>,
 }
 
 impl ScriptMutation {
@@ -210,6 +242,7 @@ impl ScriptMutation {
             && self.headers.is_none()
             && self.body.is_none()
             && self.response.is_none()
+            && self.matched.is_none()
     }
 }
 

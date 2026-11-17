@@ -1,0 +1,11 @@
+{
+  "invocation": {
+    "phase": "rule",
+    "scriptName": "loose",
+    "rule": { "hostname": "example.com", "destPort": 80, "protocol": "UDP" }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "matched": false }
+  }
+}

@@ -6,6 +6,9 @@
 
 ### Added
 
+- `SCRIPT` 分流规则（对齐 Surge 规则脚本）：`routing.scripts` 按名称配置本地脚本文件（`path`、`argument`、`timeout_secs` 1–3 秒），`SCRIPT,<名称>,<策略>` 在走到该规则时运行脚本，`$request` 给出 `hostname`、`destIP`、`destPort`、`sourceIP`、`inPort`、`processName`、`protocol`、`userAgent`、`url`，`$done({matched: true})` 即命中，失败或超时按不命中。脚本在阻塞线程池运行（同时最多 2 个，堆 4 MiB，无网络）。`config_core::routing` 新增 `RuleMatcher::Script`、`RouteMatch::ScriptPending` 与 `RoutingEnvironment::script_matches`；script-runtime 新增 `ScriptPhase::Rule`、`ScriptRuleRequest`、`ScriptInvocation::rule` 与 `ScriptMutation::matched`；engine-embedded 新增 `rule_scripts`、`RoutedOutbound::with_rule_scripts` 与热重载拒绝码 `unknown_script`。
+- 绑定网卡的直连（对齐 Surge `direct, interface=...`，公司 VPN 场景）：`{"type":"direct","interface":"<名称>"}` 让该直连出站的每个连接只从指定网卡出去（Linux/Android `SO_BINDTODEVICE`，macOS/iOS `IP_BOUND_IF`/`IPV6_BOUND_IF`，Windows 按适配器别名 `IP_UNICAST_IF`/`IPV6_UNICAST_IF`）。网卡每次连接时查找，VPN 后起也能用上；网卡不存在时连接失败（`NotFound`），绝不改走其他网卡。域名用系统解析器解析。此类出站不能再套 `via`。新增 `engine_embedded::interface`。
+- `SRC-IP`（别名 `SRC-IP-CIDR`）与 `IN-PORT` 分流规则：`SRC-IP` 按发起连接的客户端/应用地址（地址或网段）匹配，`IN-PORT` 按客户端连上的本地监听端口匹配（包隧道不命中）；也可用在逻辑规则、`redirects` 与订阅导入里。`RouteQuery` 新增 `source`、`in_port`；`Dispatcher` 新增 `connect_origin_flow`、`open_origin_udp_flow`、`with_origin_request` 与 `FlowOrigin`，`RoutedOutbound::route_network_flow` 多一个 `FlowSource` 参数。
 - 嵌入式 DNS 追平 Surge（engine-embedded，见 `docs/architecture/embedded-dns.md`）：
   - 新上游 `udp://host[:53]`（随机 id、1 秒重发至多 3 次、丢弃 id / 问题不符的数据报、截断或出站不支持 UDP 时改走 TCP）与 `quic://host[:853]`（DNS over QUIC，RFC 9250，ALPN `doq`，证书始终校验；握手跑在出站的 UDP 流上，可直连也可经节点，连接按上游与出站复用、多查询并发、无 keep-alive）。新 cargo feature `dns-quic`（默认开启，含 `dns-tls`），engine-embedded 新增对 `transport-quic` 的依赖（`Cargo.lock` 没有新包）。`transport-quic` 新增 `flow::FlowSocket`（quinn 跑在 `UdpFlow` 上）、`QuicConnector::connect_over` 与 `without_keep_alive`。
   - 多上游竞速：`default` 与 `rules[].server` 可以写 2–4 个上游的列表，同时发出，第一个 NOERROR 立即采用；NXDOMAIN 等其他上游都结束才采用，所以公网与公司解析器放在一起也能解析公司域名。

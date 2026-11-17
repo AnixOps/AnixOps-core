@@ -60,6 +60,7 @@ pub mod ffi;
 #[cfg(any(feature = "local-proxy", feature = "dns-tls"))]
 pub mod http1;
 pub(crate) mod icmp;
+pub mod interface;
 #[cfg(feature = "local-proxy")]
 pub mod lan_share;
 #[cfg(feature = "local-proxy")]
@@ -77,6 +78,7 @@ pub mod reject;
 #[cfg(feature = "local-proxy")]
 pub mod replay_proxy;
 pub mod routing;
+pub mod rule_scripts;
 pub mod rule_sets;
 #[cfg(feature = "local-proxy")]
 pub mod system_proxy;

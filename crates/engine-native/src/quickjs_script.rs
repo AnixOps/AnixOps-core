@@ -292,6 +292,7 @@ impl NativeQuickJsScriptExecutor {
             response,
             binary_body: dispatch.binary_body_mode,
             event: None,
+            rule: None,
         };
         let timeout_ms = bounded_script_timeout(dispatch.timeout_ms, self.config.max_timeout_ms);
         let limits = ScriptLimits {

@@ -269,6 +269,22 @@ fn context_json(invocation: &ScriptInvocation) -> String {
     // whether `$request` exists, so a scheduled run must not have one.
     if invocation.phase.is_http() {
         context.insert("request".into(), Value::Object(request));
+    } else if invocation.phase == ScriptPhase::Rule {
+        let rule = invocation.rule.clone().unwrap_or_default();
+        context.insert(
+            "request".into(),
+            json!({
+                "hostname": rule.hostname,
+                "destIP": rule.dest_ip.map(|ip| ip.to_string()),
+                "destPort": rule.dest_port,
+                "sourceIP": rule.source_ip.map(|ip| ip.to_string()),
+                "inPort": rule.in_port,
+                "processName": rule.process_name,
+                "protocol": rule.protocol,
+                "userAgent": rule.user_agent,
+                "url": rule.url,
+            }),
+        );
     }
     if let Some(response) = &invocation.response {
         let mut object = Map::new();
@@ -311,6 +327,14 @@ fn parse_done(
 ) -> Result<ScriptMutation, String> {
     let value = serde_json::from_str::<Value>(payload)
         .map_err(|_| "$done argument is not JSON-serializable".to_string())?;
+    if phase == ScriptPhase::Rule {
+        // `$done({matched: true})`; anything else is no match.
+        let matched = value.get("matched").and_then(Value::as_bool) == Some(true);
+        return Ok(ScriptMutation {
+            matched: Some(matched),
+            ..ScriptMutation::default()
+        });
+    }
     if !phase.is_http() {
         // Scheduled and event scripts end with `$done()` or `$done({})`;
         // whatever they pass has nothing to change.
@@ -354,7 +378,7 @@ fn parse_done(
                 mutation.status = Some(parse_status(status)?);
             }
         }
-        ScriptPhase::Cron | ScriptPhase::Event | ScriptPhase::Generic => {}
+        ScriptPhase::Cron | ScriptPhase::Event | ScriptPhase::Generic | ScriptPhase::Rule => {}
     }
     Ok(mutation)
 }
