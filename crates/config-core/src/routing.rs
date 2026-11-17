@@ -92,7 +92,7 @@ impl RejectKind {
 /// `REJECT` and Surge's `REJECT-*` variants.
 fn is_reject_target(target: &str) -> bool {
     let target = target.trim().to_ascii_uppercase();
-    target == RESERVED_REJECT || target.starts_with("REJECT-")
+    target == "REJECT" || target.starts_with("REJECT-")
 }
 
 /// Unvalidated routing input: Loon-style rule lines and policy group specs.
