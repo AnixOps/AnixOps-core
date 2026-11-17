@@ -166,12 +166,14 @@ fn failures_outside_health_checked_groups_ask_for_nothing() {
         rule: "FINAL".to_string(),
         chain: vec!["DIRECT".to_string()],
         outbound: "DIRECT".to_string(),
+        ..RouteInfo::default()
     };
     assert!(!routed.report_failure(&direct));
     let rejected = RouteInfo {
         rule: "FINAL".to_string(),
         chain: vec!["Auto".to_string(), "REJECT".to_string()],
         outbound: "REJECT".to_string(),
+        reject: Some(config_core::routing::RejectKind::Reject),
     };
     assert!(!routed.report_failure(&rejected));
 }

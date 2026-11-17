@@ -83,15 +83,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use config_core::routing::{
-    parse_rule_line, NetworkContext, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RouteMatch,
-    RouteNetwork, RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment, RoutingModel,
-    RoutingRule, RoutingSpec, RuleIndex, RuleLine, RuleMatcher,
+    parse_rule_line, NetworkContext, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RejectKind,
+    RouteMatch, RouteNetwork, RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment,
+    RoutingModel, RoutingRule, RoutingSpec, RuleIndex, RuleLine, RuleMatcher,
 };
 use config_core::rule_set::RuleSet;
 use engine_outbound::sniff::HttpRequestHead;
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use serde::Serialize;
 
+use crate::reject::RejectStorm;
 use crate::rule_sets::RuleSetStore;
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -131,6 +132,9 @@ pub struct RoutedOutbound {
     /// Whether [`RoutedOutbound::run_health_checks`] runs, so a connection
     /// never waits for a check nobody will make.
     checks_running: AtomicBool,
+    /// Recent plain-REJECT flows per host, to drop retry storms (see
+    /// [`crate::reject`]).
+    reject_storm: RejectStorm,
 }
 
 /// Probing one member gives up after this long.
@@ -259,8 +263,13 @@ impl DomainResolver for SystemResolver {
 pub struct RouteInfo {
     pub rule: String,
     pub chain: Vec<String>,
-    /// A node id, `DIRECT` or `REJECT`.
+    /// A node id, `DIRECT`, or a REJECT policy (`REJECT`, `REJECT-NO-DROP`,
+    /// `REJECT-DROP`, `REJECT-TINYGIF`); a `REJECT` retry storm shows as
+    /// `REJECT-DROP`.
     pub outbound: String,
+    /// How the flow is rejected, when it is.
+    #[serde(skip)]
+    pub reject: Option<RejectKind>,
 }
 
 /// What the model sees while routing one connection: the rule sets, the
@@ -404,6 +413,7 @@ impl RoutedOutbound {
             health_wake: tokio::sync::Notify::new(),
             health_done: tokio::sync::Notify::new(),
             checks_running: AtomicBool::new(false),
+            reject_storm: RejectStorm::default(),
         })
     }
 
@@ -831,7 +841,7 @@ impl RoutedOutbound {
 
     fn outbound_of(&self, outcome: &RouteOutcome) -> Option<Arc<dyn TcpOutbound>> {
         match outcome {
-            RouteOutcome::Reject => None,
+            RouteOutcome::Reject(_) => None,
             RouteOutcome::Direct => Some(self.direct.clone()),
             RouteOutcome::Node(id) => self.nodes.get(id).cloned(),
         }
@@ -916,7 +926,8 @@ impl RoutedOutbound {
     }
 
     /// Where a connection to `target` goes, resolving its domain only when an
-    /// IP rule asks for an address before another rule matches.
+    /// IP rule asks for an address before another rule matches. A plain
+    /// `REJECT` of a host in a retry storm comes back as `REJECT-DROP`.
     pub async fn route_resolving(&self, target: &TargetAddr) -> RouteOutcome {
         self.resolve_query(&self.table(), &query(target))
             .await
@@ -1088,7 +1099,7 @@ impl RoutedOutbound {
         let Some((member, groups)) = route.chain.split_last() else {
             return false;
         };
-        if groups.is_empty() || member == "REJECT" {
+        if groups.is_empty() || route.reject.is_some() || member.starts_with("REJECT") {
             return false;
         }
         let table = self.table();
@@ -1180,7 +1191,24 @@ impl RoutedOutbound {
         )
     }
 
+    /// Decides a user flow, resolving a domain when an IP rule needs it,
+    /// and drops a host's plain `REJECT` while it storms.
     async fn resolve_query(&self, table: &RoutingTable, query: &RouteQuery) -> RouteResolution {
+        let mut resolution = self.decide_resolving(table, query).await;
+        if resolution.outcome == RouteOutcome::Reject(RejectKind::Reject) {
+            let host = query
+                .domain
+                .clone()
+                .or_else(|| query.ip.map(|ip| ip.to_string()));
+            if let Some(host) = host {
+                let kind = self.reject_storm.settle(&host, std::time::Instant::now());
+                resolution.outcome = RouteOutcome::Reject(kind);
+            }
+        }
+        resolution
+    }
+
+    async fn decide_resolving(&self, table: &RoutingTable, query: &RouteQuery) -> RouteResolution {
         let first = self.decide(table, query, None);
         let (Some(domain), RouteMatch::ResolveFailed(_)) = (query.domain.as_deref(), first.matched)
         else {
@@ -1292,7 +1320,7 @@ impl RoutedOutbound {
                 let outbound = match &member {
                     PolicyTarget::Node(id) => self.nodes.get(id).cloned(),
                     PolicyTarget::Direct => Some(self.direct.clone()),
-                    PolicyTarget::Reject | PolicyTarget::Group(_) => None,
+                    PolicyTarget::Reject(_) | PolicyTarget::Group(_) => None,
                 };
                 let Some(outbound) = outbound else { continue };
                 let name = member.name().to_string();
@@ -1347,10 +1375,10 @@ fn describe(table: &RoutingTable, resolution: &RouteResolution) -> RouteInfo {
         }
         RouteMatch::Final => "FINAL".to_string(),
     };
-    let outbound = match &resolution.outcome {
-        RouteOutcome::Direct => "DIRECT".to_string(),
-        RouteOutcome::Reject => "REJECT".to_string(),
-        RouteOutcome::Node(id) => id.clone(),
+    let (outbound, reject) = match &resolution.outcome {
+        RouteOutcome::Direct => ("DIRECT".to_string(), None),
+        RouteOutcome::Reject(kind) => (kind.name().to_string(), Some(*kind)),
+        RouteOutcome::Node(id) => (id.clone(), None),
     };
     let mut chain = resolution.group_path.clone();
     chain.push(outbound.clone());
@@ -1358,6 +1386,7 @@ fn describe(table: &RoutingTable, resolution: &RouteResolution) -> RouteInfo {
         rule,
         chain,
         outbound,
+        reject,
     }
 }
 
@@ -1425,7 +1454,7 @@ fn global_target(
     node_ids: &BTreeSet<String>,
 ) -> Result<PolicyTarget, RuntimeError> {
     match model.target_named(name, node_ids) {
-        Some(PolicyTarget::Reject) | None => Err(RuntimeError::new(
+        Some(PolicyTarget::Reject(_)) | None => Err(RuntimeError::new(
             RuntimeErrorCode::ConfigRejected,
             "the global target must be a policy group, a node or DIRECT",
         )),
@@ -1449,7 +1478,7 @@ fn add_plugin_rules(
             continue;
         }
         let target = match &rule.target {
-            PolicyTarget::Direct | PolicyTarget::Reject => rule.target.clone(),
+            PolicyTarget::Direct | PolicyTarget::Reject(_) => rule.target.clone(),
             PolicyTarget::Group(name) | PolicyTarget::Node(name) => table
                 .model
                 .target_named(name, node_ids)
@@ -1584,9 +1613,8 @@ impl TcpOutbound for RoutedOutbound {
 impl RoutedOutbound {
     async fn outbound_for(&self, target: &TargetAddr) -> io::Result<&Arc<dyn TcpOutbound>> {
         match self.route_resolving(target).await {
-            RouteOutcome::Reject => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "connection rejected by routing rule",
+            RouteOutcome::Reject(kind) => Err(engine_outbound::reject::rejected(
+                crate::reject::action(kind),
             )),
             RouteOutcome::Direct => Ok(&self.direct),
             RouteOutcome::Node(id) => self.nodes.get(&id).ok_or_else(|| {

@@ -51,7 +51,10 @@
 //! sees them (feature `local-proxy`): sharing the engine with phones on the
 //! local network, see [`crate::lan_share`]; and `replay_proxy`,
 //! `start_replay_proxy` and `stop_replay_proxy`: a `127.0.0.1` listener
-//! for the client's own requests, see [`crate::replay_proxy`].
+//! for the client's own requests, see [`crate::replay_proxy`]. The packet
+//! tunnel runtime alone answers `system_proxy`, `start_system_proxy` and
+//! `stop_system_proxy`: the `127.0.0.1` listener that iOS and macOS register
+//! as the system proxy, see [`crate::system_proxy`].
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
 //! stops; see [`crate::capture`] for what is kept and its memory budget,

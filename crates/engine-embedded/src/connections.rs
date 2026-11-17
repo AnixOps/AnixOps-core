@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use config_core::redirect::{RedirectHost, RedirectTable, RedirectTo};
-use config_core::routing::{RouteNetwork, RouteQuery};
+use config_core::routing::{RejectKind, RouteNetwork, RouteQuery};
 use engine_outbound::sniff::HttpRequestHead;
 use engine_outbound::{
     BoxFuture, BoxStream, DatagramRecv, DatagramSend, RequestRouter, TargetAddr, TcpDialer,
@@ -912,15 +912,15 @@ impl Dispatcher {
             }
             (_, None) => (single_route(&*self.outbound), Some(self.outbound.clone())),
         };
+        let reject = route.reject.unwrap_or_default();
         guard.set_route(route.clone());
         match outbound {
             Some(outbound) => Ok((outbound, route)),
             None => {
                 guard.fail("rejected");
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "connection rejected by routing rule",
-                ))
+                Err(engine_outbound::reject::rejected(crate::reject::action(
+                    reject,
+                )))
             }
         }
     }
@@ -970,7 +970,12 @@ impl Dispatcher {
         let (route, _) = routed
             .route_network_flow(target, host, None, RouteNetwork::Tcp, http)
             .await;
-        Some(route.outbound)
+        // Every REJECT variant refuses the request the same way.
+        Some(if route.reject.is_some() {
+            "REJECT".to_string()
+        } else {
+            route.outbound
+        })
     }
 
     /// Opens a TCP connection to `target`. For an address target, `host` is
@@ -992,6 +997,18 @@ impl Dispatcher {
         process: Option<&str>,
     ) -> io::Result<BoxStream> {
         self.connect_tcp(target, host, process, None).await
+    }
+
+    /// Opens a TCP connection for a proxy listener's client: `process` is
+    /// the local process that asked, for `PROCESS-NAME` rules, and `http` the
+    /// head of its plain HTTP request, for `USER-AGENT` and `URL-REGEX` rules.
+    pub async fn connect_client_flow(
+        &self,
+        target: &TargetAddr,
+        process: Option<&str>,
+        http: Option<&HttpRequestHead>,
+    ) -> io::Result<BoxStream> {
+        self.connect_tcp(target, None, process, http).await
     }
 
     /// [`Self::connect_flow`] with the head of a plain HTTP request sniffed
@@ -1077,6 +1094,7 @@ impl Dispatcher {
             rule: MITM_QUIC_RULE.to_string(),
             chain: vec!["REJECT".to_string()],
             outbound: "REJECT".to_string(),
+            reject: Some(RejectKind::Reject),
         });
         guard.fail("quic_mitm_fallback");
     }
@@ -1258,6 +1276,7 @@ fn single_route(outbound: &dyn TcpOutbound) -> RouteInfo {
         rule: "DEFAULT".to_string(),
         chain: vec![name.clone()],
         outbound: name,
+        reject: None,
     }
 }
 
@@ -1299,6 +1318,7 @@ fn block_quic_route() -> RouteInfo {
         rule: BLOCK_QUIC_RULE.to_string(),
         chain: vec!["REJECT".to_string()],
         outbound: "REJECT".to_string(),
+        reject: Some(RejectKind::Reject),
     }
 }
 
@@ -1307,6 +1327,7 @@ fn direct_route() -> RouteInfo {
         rule: "MODE,direct".to_string(),
         chain: vec!["DIRECT".to_string()],
         outbound: "DIRECT".to_string(),
+        reject: None,
     }
 }
 

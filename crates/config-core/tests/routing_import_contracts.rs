@@ -1,5 +1,6 @@
 use config_core::routing::{
-    PolicyGroupKind, PolicyTarget, RouteOutcome, RouteQuery, RuleMatcher, StaticRoutingEnvironment,
+    PolicyGroupKind, PolicyTarget, RejectKind, RouteOutcome, RouteQuery, RuleMatcher,
+    StaticRoutingEnvironment,
 };
 use config_core::routing_import::{
     import_subscription_routing, ImportedRouting, ImportedRuleSet,
@@ -122,7 +123,7 @@ fn surge_profile_imports_supported_rules_and_groups() {
         vec![
             (
                 RuleMatcher::Domain("ads.example.com".to_string()),
-                PolicyTarget::Reject,
+                PolicyTarget::Reject(RejectKind::TinyGif),
                 false
             ),
             (
@@ -132,7 +133,7 @@ fn surge_profile_imports_supported_rules_and_groups() {
             ),
             (
                 RuleMatcher::DomainKeyword("tracker".to_string()),
-                PolicyTarget::Reject,
+                PolicyTarget::Reject(RejectKind::Reject),
                 false
             ),
             (
@@ -221,6 +222,48 @@ fn surge_profile_imports_supported_rules_and_groups() {
     assert!(messages.contains("Backup member Auto was skipped"));
     assert!(messages.contains("URL-REGEX x1"));
     assert!(!messages.contains("f43c0eee"));
+}
+
+#[test]
+fn imported_reject_variants_keep_their_kind() {
+    let profile = SURGE_PROFILE.replace(
+        "DOMAIN-KEYWORD,tracker,REJECT\n",
+        "DOMAIN-KEYWORD,tracker,REJECT-DROP\nDOMAIN,nodrop.example,REJECT-NO-DROP\n\
+         DOMAIN,img.example,REJECT-IMG\nDOMAIN,dict.example,REJECT-DICT\n",
+    );
+    let nodes = parse_nodes(&profile);
+    let model = import_subscription_routing(&profile, &nodes)
+        .routing
+        .expect("routing should import");
+    let target = |domain: &str| {
+        model
+            .rules
+            .iter()
+            .find(|rule| match &rule.matcher {
+                RuleMatcher::Domain(name) | RuleMatcher::DomainKeyword(name) => name == domain,
+                _ => false,
+            })
+            .map(|rule| rule.target.clone())
+            .unwrap_or_else(|| panic!("rule for {domain}"))
+    };
+    assert_eq!(target("tracker"), PolicyTarget::Reject(RejectKind::Drop));
+    assert_eq!(
+        target("nodrop.example"),
+        PolicyTarget::Reject(RejectKind::NoDrop)
+    );
+    assert_eq!(
+        target("img.example"),
+        PolicyTarget::Reject(RejectKind::TinyGif)
+    );
+    assert_eq!(
+        target("ads.example.com"),
+        PolicyTarget::Reject(RejectKind::TinyGif)
+    );
+    // Loon's REJECT-DICT answers only decrypted requests: a plain REJECT.
+    assert_eq!(
+        target("dict.example"),
+        PolicyTarget::Reject(RejectKind::Reject)
+    );
 }
 
 #[test]

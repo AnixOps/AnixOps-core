@@ -39,8 +39,55 @@ pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u32 = 300;
 pub const DEFAULT_URL_TEST_TOLERANCE_MS: u16 = 50;
 
 const RESERVED_DIRECT: &str = "DIRECT";
-const RESERVED_REJECT: &str = "REJECT";
-const RESERVED_NAMES: [&str; 3] = [RESERVED_DIRECT, RESERVED_REJECT, "FINAL"];
+const RESERVED_NAMES: [&str; 2] = [RESERVED_DIRECT, "FINAL"];
+
+/// How a REJECT policy answers, as Surge's REJECT family.
+///
+/// A plain [`RejectKind::Reject`] closes the connection; when one host is
+/// rejected more than ten times in thirty seconds the engine answers it
+/// like [`RejectKind::Drop`] until the retries calm down, so an app that
+/// retries at once does not spin. [`RejectKind::NoDrop`] never does that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum RejectKind {
+    /// `REJECT`: close the connection.
+    #[default]
+    Reject,
+    /// `REJECT-NO-DROP`: close the connection, never upgraded to a drop.
+    NoDrop,
+    /// `REJECT-DROP`: answer nothing, so the client waits for its own
+    /// timeout instead of retrying at once.
+    Drop,
+    /// `REJECT-TINYGIF` (Loon `REJECT-IMG`): answer a plain HTTP request
+    /// with a 1x1 GIF; any other flow is closed as with `REJECT`.
+    TinyGif,
+}
+
+impl RejectKind {
+    pub const ALL: [Self; 4] = [Self::Reject, Self::NoDrop, Self::Drop, Self::TinyGif];
+
+    /// The policy name: `REJECT`, `REJECT-NO-DROP`, `REJECT-DROP` or
+    /// `REJECT-TINYGIF`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Reject => "REJECT",
+            Self::NoDrop => "REJECT-NO-DROP",
+            Self::Drop => "REJECT-DROP",
+            Self::TinyGif => "REJECT-TINYGIF",
+        }
+    }
+
+    /// The kind a policy name stands for, ignoring case; Loon's
+    /// `REJECT-IMG` is `REJECT-TINYGIF`. Other `REJECT-` names are `None`.
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("REJECT-IMG") {
+            return Some(Self::TinyGif);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.name().eq_ignore_ascii_case(name))
+    }
+}
 
 /// `REJECT` and Surge's `REJECT-*` variants.
 fn is_reject_target(target: &str) -> bool {
@@ -91,7 +138,7 @@ pub struct NetworkRuleSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PolicyTarget {
     Direct,
-    Reject,
+    Reject(RejectKind),
     Node(String),
     Group(String),
 }
@@ -101,7 +148,7 @@ impl PolicyTarget {
     pub fn name(&self) -> &str {
         match self {
             Self::Direct => RESERVED_DIRECT,
-            Self::Reject => RESERVED_REJECT,
+            Self::Reject(kind) => kind.name(),
             Self::Node(id) | Self::Group(id) => id,
         }
     }
@@ -995,9 +1042,9 @@ impl RoutingModel {
                     if resolved_ip.is_none() {
                         return RouteResolution {
                             matched: RouteMatch::ResolveFailed(index),
-                            target: PolicyTarget::Reject,
+                            target: PolicyTarget::Reject(RejectKind::Reject),
                             group_path: Vec::new(),
-                            outcome: RouteOutcome::Reject,
+                            outcome: RouteOutcome::Reject(RejectKind::Reject),
                             resolved_ip: None,
                         };
                     }
@@ -1066,13 +1113,13 @@ impl RoutingModel {
     }
 
     /// Looks up a configuration name the way rule targets are resolved:
-    /// DIRECT, REJECT, a policy group id or a node id.
+    /// DIRECT, a REJECT policy, a policy group id or a node id.
     pub fn target_named(&self, name: &str, node_ids: &BTreeSet<String>) -> Option<PolicyTarget> {
         let name = name.trim();
         if name.eq_ignore_ascii_case(RESERVED_DIRECT) {
             Some(PolicyTarget::Direct)
-        } else if name.eq_ignore_ascii_case(RESERVED_REJECT) {
-            Some(PolicyTarget::Reject)
+        } else if let Some(kind) = RejectKind::parse(name) {
+            Some(PolicyTarget::Reject(kind))
         } else if self.group(name).is_some() {
             Some(PolicyTarget::Group(name.to_string()))
         } else if node_ids.contains(name) {
@@ -1105,7 +1152,7 @@ impl RoutingModel {
 
         let outcome = match current {
             PolicyTarget::Direct | PolicyTarget::Group(_) => RouteOutcome::Direct,
-            PolicyTarget::Reject => RouteOutcome::Reject,
+            PolicyTarget::Reject(kind) => RouteOutcome::Reject(kind),
             PolicyTarget::Node(id) => RouteOutcome::Node(id),
         };
         RouteResolution {
@@ -1326,7 +1373,7 @@ pub enum RouteMatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteOutcome {
     Direct,
-    Reject,
+    Reject(RejectKind),
     Node(String),
 }
 
@@ -1527,7 +1574,7 @@ impl<'a> TargetNames<'a> {
             if id.is_empty() || id.contains(',') || is_reserved_name(id) {
                 return Err(routing_error(
                     ROUTING_GROUP_ID_INVALID_CODE,
-                    "policy group id must be non-empty, comma-free, and not DIRECT, REJECT, or FINAL",
+                    "policy group id must be non-empty, comma-free, and not DIRECT, FINAL, or a REJECT policy",
                 ));
             }
             if node_ids.contains(id) || !names.insert(id) {
@@ -1547,8 +1594,8 @@ impl<'a> TargetNames<'a> {
         let name = name.trim();
         if name.eq_ignore_ascii_case(RESERVED_DIRECT) {
             Ok(PolicyTarget::Direct)
-        } else if name.eq_ignore_ascii_case(RESERVED_REJECT) {
-            Ok(PolicyTarget::Reject)
+        } else if let Some(kind) = RejectKind::parse(name) {
+            Ok(PolicyTarget::Reject(kind))
         } else if self.groups.contains(name) {
             Ok(PolicyTarget::Group(name.to_string()))
         } else if self.node_ids.contains(name) {
@@ -1556,7 +1603,7 @@ impl<'a> TargetNames<'a> {
         } else {
             Err(routing_error(
                 ROUTING_TARGET_UNKNOWN_CODE,
-                format!("routing target {name} is not DIRECT, REJECT, a policy group, or a node"),
+                format!("routing target {name} is not DIRECT, REJECT, REJECT-NO-DROP, REJECT-DROP, REJECT-TINYGIF, a policy group, or a node"),
             ))
         }
     }
@@ -1709,7 +1756,7 @@ fn check_member_supported(
     member: &PolicyTarget,
 ) -> DomainResult<()> {
     let supported = match (member, kind) {
-        (PolicyTarget::Reject, _) => false,
+        (PolicyTarget::Reject(_), _) => false,
         (PolicyTarget::Group(_), PolicyGroupKind::Select | PolicyGroupKind::Subnet) => true,
         (PolicyTarget::Group(_), _) => false,
         (PolicyTarget::Direct | PolicyTarget::Node(_), _) => true,
@@ -1919,10 +1966,12 @@ fn normalize_country_code(value: &str) -> DomainResult<String> {
     }
 }
 
+/// DIRECT, FINAL and every REJECT policy name, `REJECT-IMG` included.
 fn is_reserved_name(name: &str) -> bool {
     RESERVED_NAMES
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        || RejectKind::parse(name).is_some()
 }
 
 fn with_rule_index(error: DomainError, index: usize) -> DomainError {

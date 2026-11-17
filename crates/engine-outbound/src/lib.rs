@@ -19,6 +19,7 @@ pub mod mux;
 pub mod protect;
 pub mod quic_sniff;
 pub mod registry;
+pub mod reject;
 pub mod sniff;
 
 use std::fmt;
