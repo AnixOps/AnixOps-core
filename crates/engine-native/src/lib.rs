@@ -8105,6 +8105,15 @@ mod controlled_tls_session_tests {
     use std::thread;
     use std::time::Duration;
 
+    // Each exchange runs a request and a response script in a fresh node
+    // process. Shared Windows runners have taken over 5 s to start node while
+    // the rest of the suite runs in parallel, so the script budget here is
+    // sized for that; the timeout path itself is covered by the 10 ms test.
+    // Socket timeouts stay above one script budget so a slow script is
+    // reported as a script timeout, not as a dropped connection.
+    const CONTROLLED_TLS_SCRIPT_TEST_TIMEOUT_MS: usize = 20_000;
+    const CONTROLLED_TLS_SCRIPT_TEST_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[test]
     fn controlled_tls_connect_session_bounds_persistent_exchanges_over_live_sockets() {
         let script_runtime_root = std::env::temp_dir().join(format!(
@@ -8153,7 +8162,7 @@ mod controlled_tls_session_tests {
                     script_runtime_root.join("store.json").display().to_string(),
                 ),
                 sandbox: NativeNodeScriptSandbox::Unrestricted,
-                max_timeout_ms: 5000,
+                max_timeout_ms: CONTROLLED_TLS_SCRIPT_TEST_TIMEOUT_MS,
                 max_body_bytes: 4096,
             },
         ));
@@ -8195,8 +8204,8 @@ mod controlled_tls_session_tests {
             let (stream, _) = upstream_listener
                 .accept()
                 .expect("test upstream should accept proxy TLS connection");
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+            let _ = stream.set_read_timeout(Some(CONTROLLED_TLS_SCRIPT_TEST_SOCKET_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(CONTROLLED_TLS_SCRIPT_TEST_SOCKET_TIMEOUT));
             let connection = ServerConnection::new(upstream_server_config)
                 .expect("test upstream TLS connection should initialize");
             let mut tls_stream = StreamOwned::new(connection, stream);
@@ -8247,8 +8256,8 @@ mod controlled_tls_session_tests {
         let downstream_client = thread::spawn(move || {
             let stream = TcpStream::connect(proxy_address)
                 .expect("test TLS client should connect to controlled proxy session");
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+            let _ = stream.set_read_timeout(Some(CONTROLLED_TLS_SCRIPT_TEST_SOCKET_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(CONTROLLED_TLS_SCRIPT_TEST_SOCKET_TIMEOUT));
             let server_name = ServerName::try_from("example.com")
                 .expect("test server name should parse")
                 .to_owned();
@@ -8283,8 +8292,8 @@ mod controlled_tls_session_tests {
         let (proxy_stream, _) = proxy_listener
             .accept()
             .expect("test proxy should accept controlled TLS client connection");
-        let _ = proxy_stream.set_read_timeout(Some(Duration::from_secs(15)));
-        let _ = proxy_stream.set_write_timeout(Some(Duration::from_secs(15)));
+        let _ = proxy_stream.set_read_timeout(Some(CONTROLLED_TLS_SCRIPT_TEST_SOCKET_TIMEOUT));
+        let _ = proxy_stream.set_write_timeout(Some(CONTROLLED_TLS_SCRIPT_TEST_SOCKET_TIMEOUT));
         let outbound_stream = TcpStream::connect(upstream_address)
             .expect("test proxy should connect to upstream TLS server");
         let mut connect_request = Cursor::new(
@@ -8687,7 +8696,7 @@ mod controlled_tls_session_tests {
                     kind,
                     phase: http_event.phase,
                     requires_body: true,
-                    timeout_ms: 5000,
+                    timeout_ms: CONTROLLED_TLS_SCRIPT_TEST_TIMEOUT_MS,
                     max_size: 1024,
                     script_path: self.script_url.clone(),
                     tag: "controlled-tls-script".to_string(),

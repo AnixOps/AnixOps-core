@@ -269,19 +269,42 @@ async fn udp_echo() -> SocketAddr {
 async fn start_land() -> (u16, Arc<InboundStats>) {
     let inbound = Arc::new(Ss2022Inbound::new(Method::Aes128Gcm, &key(), false).unwrap());
     // The UDP side shares the TCP port. A free TCP port can still be refused
-    // for UDP (on Windows, a port in an excluded range answers WSAEACCES),
-    // so take another pair until both bind.
+    // for UDP (on Windows, a port in an excluded range answers WSAEACCES).
+    // Windows hands out TCP ephemeral ports in sequence, so retrying from the
+    // TCP side can stay inside one excluded UDP block for every attempt. Let
+    // the UDP allocator pick the port first (it skips its own excluded
+    // ranges), then claim the same port for TCP; alternate with the TCP-first
+    // order so neither protocol's excluded ranges can exhaust the attempts.
     let (listener, port, socket) = {
-        let mut attempt = 0;
-        loop {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
-                Ok(socket) => break (listener, port, socket),
-                Err(_) if attempt < 16 => attempt += 1,
-                Err(error) => panic!("no loopback port binds both TCP and UDP: {error}"),
+        let mut last_error = None;
+        let mut pair = None;
+        for attempt in 0..32 {
+            let candidate = if attempt % 2 == 0 {
+                let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let port = socket.local_addr().unwrap().port();
+                TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .map(|listener| (listener, port, socket))
+            } else {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+                    .map(|socket| (listener, port, socket))
+            };
+            match candidate {
+                Ok(found) => {
+                    pair = Some(found);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
             }
         }
+        pair.unwrap_or_else(|| {
+            panic!(
+                "no loopback port binds both TCP and UDP: {}",
+                last_error.expect("a failed attempt records its error")
+            )
+        })
     };
     let stats = Arc::new(InboundStats::default());
     tokio::spawn(serve(

@@ -270,7 +270,7 @@ fn dns_config() -> DnsConfig {
         )]),
         rules: vec![DnsRuleConfig {
             domain_suffix: vec!["cn".to_string()],
-            server: "local".to_string(),
+            server: "local".into(),
             ..DnsRuleConfig::default()
         }],
         ..DnsConfig::default()

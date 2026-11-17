@@ -159,9 +159,7 @@ async fn round_trip(port: u16, mode: Mode, security: Security, version: HttpVers
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alpn_h3_serves_http3_beside_http2() {
     let inbound = inbound(&["h3"]).await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let socket = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    let (listener, port, socket) = tcp_and_udp_on_one_loopback_port().await;
     let quic = inbound.packet().expect("alpn h3 gives xhttp a quic side");
     let stats = Arc::new(InboundStats::default());
     tokio::spawn(quic.serve(
@@ -193,4 +191,34 @@ async fn only_alpn_h3_adds_the_quic_side() {
     assert!(inbound(&[]).await.packet().is_none());
     assert!(inbound(&["h2", "http/1.1"]).await.packet().is_none());
     assert!(inbound(&["h2", "h3"]).await.packet().is_some());
+}
+
+/// HTTP/3 shares the HTTP/2 port. A free TCP port can still be refused for
+/// UDP (on Windows, a port in an excluded range answers WSAEACCES), and
+/// Windows hands out TCP ephemeral ports in sequence, so retrying from the TCP
+/// side alone can stay inside one excluded UDP block. Alternate between letting
+/// UDP and letting TCP pick the port, then claim the same port for the other.
+async fn tcp_and_udp_on_one_loopback_port() -> (TcpListener, u16, std::net::UdpSocket) {
+    let mut last_error = None;
+    for attempt in 0..32 {
+        let candidate = if attempt % 2 == 0 {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = socket.local_addr().unwrap().port();
+            TcpListener::bind(("127.0.0.1", port))
+                .await
+                .map(|listener| (listener, port, socket))
+        } else {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::net::UdpSocket::bind(("127.0.0.1", port)).map(|socket| (listener, port, socket))
+        };
+        match candidate {
+            Ok(found) => return found,
+            Err(error) => last_error = Some(error),
+        }
+    }
+    panic!(
+        "no loopback port binds both TCP and UDP: {}",
+        last_error.expect("a failed attempt records its error")
+    )
 }

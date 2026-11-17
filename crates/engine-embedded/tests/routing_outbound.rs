@@ -354,3 +354,164 @@ async fn a_rejected_host_that_keeps_retrying_is_dropped() {
         );
     }
 }
+
+fn scripted(rules: &[&str], scripts: engine_embedded::rule_scripts::RuleScripts) -> RoutedOutbound {
+    let direct: Arc<dyn TcpOutbound> = Arc::new(Recording {
+        name: "direct",
+        hits: Arc::default(),
+    });
+    let spec = RoutingSpec {
+        rules: rules.iter().map(|rule| rule.to_string()).collect(),
+        groups: Vec::new(),
+    };
+    RoutedOutbound::new(&spec, direct, BTreeMap::new())
+        .expect("spec should validate")
+        .with_rule_scripts(scripts)
+        .expect("every SCRIPT rule names a script")
+}
+
+#[test]
+fn script_rules_must_name_a_configured_script() {
+    use engine_embedded::routing::reject_code;
+    use engine_embedded::rule_scripts::{RuleScript, RuleScripts};
+
+    let spec = RoutingSpec {
+        rules: vec![
+            "SCRIPT,missing,DIRECT".to_string(),
+            "FINAL,DIRECT".to_string(),
+        ],
+        groups: Vec::new(),
+    };
+    let direct: Arc<dyn TcpOutbound> = Arc::new(Recording {
+        name: "direct",
+        hits: Arc::default(),
+    });
+    let error = RoutedOutbound::new(&spec, direct, BTreeMap::new())
+        .unwrap()
+        .with_rule_scripts(RuleScripts::default())
+        .err()
+        .expect("an unknown script is rejected");
+    assert_eq!(
+        error.message,
+        "a SCRIPT rule names a script that is not configured"
+    );
+
+    let known = RuleScripts::new(BTreeMap::from([(
+        "known".to_string(),
+        RuleScript {
+            source: "$done({matched: true})".into(),
+            argument: String::new(),
+            timeout: std::time::Duration::from_secs(1),
+        },
+    )]));
+    let outbound = scripted(&["SCRIPT,known,DIRECT", "FINAL,DIRECT"], known);
+    let rejection = outbound
+        .reload_rules(
+            &[
+                "SCRIPT,other,DIRECT".to_string(),
+                "FINAL,DIRECT".to_string(),
+            ],
+            true,
+        )
+        .expect_err("a reload naming an unknown script is rejected");
+    assert_eq!(rejection.line, Some(0));
+    assert_eq!(rejection.code, reject_code::UNKNOWN_SCRIPT);
+    assert!(outbound
+        .reload_rules(
+            &[
+                "SCRIPT,known,REJECT".to_string(),
+                "FINAL,DIRECT".to_string()
+            ],
+            true,
+        )
+        .is_ok());
+}
+
+#[cfg(feature = "scripts")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_rules_route_by_what_the_script_decides() {
+    use engine_embedded::rule_scripts::{RuleScript, RuleScripts};
+    use std::time::Duration;
+
+    let script = |source: &str, timeout: Duration| RuleScript {
+        source: source.into(),
+        argument: "443".to_string(),
+        timeout,
+    };
+    let scripts = RuleScripts::new(BTreeMap::from([
+        (
+            "corp".to_string(),
+            script(
+                "$done({matched: $request.hostname.endsWith('.corp.example') \
+                 && $request.destPort === Number($argument) && $request.protocol === 'TCP'})",
+                Duration::from_secs(1),
+            ),
+        ),
+        (
+            "throws".to_string(),
+            script("throw new Error('boom')", Duration::from_secs(1)),
+        ),
+        (
+            "slow".to_string(),
+            script(
+                "setTimeout(function () { $done({matched: true}); }, 5000);",
+                Duration::from_millis(200),
+            ),
+        ),
+        (
+            "by-address".to_string(),
+            script(
+                "$done({matched: $request.destIP === '198.51.100.7' && $request.hostname === null})",
+                Duration::from_secs(1),
+            ),
+        ),
+    ]));
+    let outbound = scripted(
+        &[
+            "DOMAIN,early.example,REJECT-NO-DROP",
+            "SCRIPT,corp,REJECT-TINYGIF",
+            "SCRIPT,throws,REJECT-DROP",
+            "SCRIPT,slow,REJECT",
+            "SCRIPT,by-address,REJECT-DROP",
+            "FINAL,DIRECT",
+        ],
+        scripts,
+    );
+    let domain = |name: &str, port| TargetAddr::Domain(name.to_string(), port);
+
+    // A rule before the scripts decides without running them.
+    assert_eq!(
+        outbound
+            .route_resolving(&domain("early.example", 443))
+            .await,
+        RouteOutcome::Reject(RejectKind::NoDrop)
+    );
+    // The script sees the connection and decides.
+    let (route, _) = outbound
+        .route_flow(&domain("git.corp.example", 443), None, None)
+        .await;
+    assert_eq!(route.rule, "SCRIPT,corp");
+    assert_eq!(route.outbound, "REJECT-TINYGIF");
+    // No match, a throwing script and one that runs out of time all fall
+    // through to the next rule.
+    let started = std::time::Instant::now();
+    let (route, _) = outbound
+        .route_flow(&domain("git.corp.example", 80), None, None)
+        .await;
+    assert_eq!(route.rule, "FINAL");
+    assert_eq!(route.outbound, "DIRECT");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        outbound.route_resolving(&ip("198.51.100.7:443")).await,
+        RouteOutcome::Reject(RejectKind::Drop)
+    );
+    // Decisions without a connection never run scripts.
+    assert_eq!(
+        outbound.route(&domain("git.corp.example", 443)),
+        RouteOutcome::Direct
+    );
+}

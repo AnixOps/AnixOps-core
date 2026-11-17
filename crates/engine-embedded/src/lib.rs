@@ -48,7 +48,10 @@ pub mod delay;
 pub mod direct;
 pub mod dns;
 pub mod dns_cache;
+pub mod dns_client;
 pub mod dns_policy;
+#[cfg(feature = "dns-quic")]
+pub mod dns_quic;
 pub mod dns_resolver;
 pub mod fake_ip;
 #[cfg(feature = "local-proxy")]
@@ -58,6 +61,7 @@ pub mod first_payload;
 #[cfg(any(feature = "local-proxy", feature = "dns-tls"))]
 pub mod http1;
 pub(crate) mod icmp;
+pub mod interface;
 #[cfg(feature = "local-proxy")]
 pub mod lan_share;
 #[cfg(feature = "local-proxy")]
@@ -75,6 +79,7 @@ pub mod reject;
 #[cfg(feature = "local-proxy")]
 pub mod replay_proxy;
 pub mod routing;
+pub mod rule_scripts;
 pub mod rule_sets;
 #[cfg(feature = "local-proxy")]
 pub mod system_proxy;

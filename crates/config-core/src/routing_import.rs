@@ -26,7 +26,7 @@ pub const ROUTING_IMPORT_MEMBER_SKIPPED_CODE: &str = "config.core.routing_import
 pub const ROUTING_IMPORT_OPTION_IGNORED_CODE: &str = "config.core.routing_import.option_ignored";
 pub const ROUTING_IMPORT_INVALID_CODE: &str = "config.core.routing_import.invalid";
 
-const SUPPORTED_RULE_TYPES: [&str; 10] = [
+const SUPPORTED_RULE_TYPES: [&str; 13] = [
     "DOMAIN",
     "DOMAIN-SUFFIX",
     "DOMAIN-KEYWORD",
@@ -37,6 +37,9 @@ const SUPPORTED_RULE_TYPES: [&str; 10] = [
     "DST-PORT",
     "DEST-PORT",
     "PROCESS-NAME",
+    "SRC-IP",
+    "SRC-IP-CIDR",
+    "IN-PORT",
 ];
 const LOGICAL_RULE_TYPES: [&str; 3] = ["AND", "OR", "NOT"];
 /// Most rule sets one import creates; the embedded engine accepts 32.

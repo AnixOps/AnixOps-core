@@ -7,8 +7,8 @@
 
 use script_runtime::{
     MemoryScriptStore, QuickJsScriptRuntime, ScriptFailure, ScriptInvocation, ScriptLimits,
-    ScriptMutation, ScriptOutcome, ScriptPhase, ScriptRequest, ScriptResponse, ScriptRunStatus,
-    ScriptStore,
+    ScriptMutation, ScriptOutcome, ScriptPhase, ScriptRequest, ScriptResponse, ScriptRuleRequest,
+    ScriptRunStatus, ScriptStore,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -57,6 +57,7 @@ fn invocation(value: &Value) -> ScriptInvocation {
             Some("cron") => ScriptPhase::Cron,
             Some("event") => ScriptPhase::Event,
             Some("generic") => ScriptPhase::Generic,
+            Some("rule") => ScriptPhase::Rule,
             other => panic!("unknown phase {other:?}"),
         },
         script_name: text(value.get("scriptName")).unwrap_or_else(|| "fixture".to_string()),
@@ -73,6 +74,23 @@ fn invocation(value: &Value) -> ScriptInvocation {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         event: text(value.get("event")),
+        rule: value.get("rule").map(|rule| ScriptRuleRequest {
+            hostname: text(rule.get("hostname")),
+            dest_ip: text(rule.get("destIP")).map(|ip| ip.parse().unwrap()),
+            dest_port: rule
+                .get("destPort")
+                .and_then(Value::as_u64)
+                .map(|port| port as u16),
+            source_ip: text(rule.get("sourceIP")).map(|ip| ip.parse().unwrap()),
+            in_port: rule
+                .get("inPort")
+                .and_then(Value::as_u64)
+                .map(|port| port as u16),
+            process_name: text(rule.get("processName")),
+            protocol: text(rule.get("protocol")),
+            user_agent: text(rule.get("userAgent")),
+            url: text(rule.get("url")),
+        }),
     }
 }
 
@@ -108,6 +126,7 @@ fn expected_mutation(value: Option<&Value>) -> ScriptMutation {
         headers: object.get("headers").map(|value| headers(Some(value))),
         body: text(object.get("body")),
         response: object.get("response").map(response),
+        matched: object.get("matched").and_then(Value::as_bool),
     }
 }
 
@@ -125,6 +144,7 @@ fn assert_mutation_eq(case: &str, actual: &ScriptMutation, expected: &ScriptMuta
                     response.body.clone(),
                 )
             }),
+            mutation.matched,
         )
     };
     assert_eq!(normalize(actual), normalize(expected), "{case}: mutation");
@@ -301,6 +321,7 @@ mod javascriptcore {
             response: None,
             binary_body: false,
             event: None,
+            rule: None,
         };
         let limits = ScriptLimits {
             timeout: Duration::from_millis(100),
@@ -408,6 +429,7 @@ fn concurrent_dispatches_share_only_the_store() {
                     response: None,
                     binary_body: false,
                     event: None,
+                    rule: None,
                 };
                 runtime.run(
                     "leaked = (typeof leaked === 'undefined') ? $argument : 'shared';\

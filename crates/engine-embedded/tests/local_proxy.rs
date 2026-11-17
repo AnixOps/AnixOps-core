@@ -265,3 +265,145 @@ fn process_name_rules_apply_to_local_proxy_connections() {
     let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
     assert_eq!(reply, 0x00);
 }
+
+#[test]
+fn src_ip_and_in_port_rules_apply_to_local_proxy_connections() {
+    let echo = echo_server();
+    let start = |rules: &str, listen: SocketAddr| {
+        let config = format!(
+            r#"{{"schema_version":1,"profile_id":"routed","routing":{{"outbounds":{{"node":{{"type":"direct"}}}},"rules":[{rules},"FINAL,node"]}}}}"#
+        );
+        LocalProxy::start(config.as_bytes(), listen, MixedSettings::default()).unwrap()
+    };
+    let port = echo.port();
+
+    // The client is on loopback.
+    let proxy = start(
+        &format!(r#""AND,((SRC-IP,127.0.0.1),(DST-PORT,{port})),REJECT""#),
+        loopback(),
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x01, "rejected by the SRC-IP rule");
+    let proxy = start(
+        &format!(r#""AND,((SRC-IP,10.9.9.0/24),(DST-PORT,{port})),REJECT""#),
+        loopback(),
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x00, "another source passes");
+
+    // IN-PORT matches the port of the listener the client reached.
+    let free = TcpListener::bind(loopback()).unwrap().local_addr().unwrap();
+    let proxy = start(
+        &format!(
+            r#""AND,((IN-PORT,{}),(DST-PORT,{port})),REJECT""#,
+            free.port()
+        ),
+        free,
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x01, "rejected by the IN-PORT rule");
+    let other = TcpListener::bind(loopback()).unwrap().local_addr().unwrap();
+    let proxy = start(
+        &format!(
+            r#""AND,((IN-PORT,{}),(DST-PORT,{port})),REJECT""#,
+            free.port()
+        ),
+        other,
+    );
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x00, "another listener port passes");
+}
+
+#[test]
+fn a_direct_outbound_bound_to_an_interface_uses_only_that_interface() {
+    let echo = echo_server();
+    let start = |interface: &str| {
+        let config = format!(
+            r#"{{"schema_version":1,"profile_id":"bound","routing":{{"outbounds":{{"corp":{{"type":"direct","interface":"{interface}"}}}},"rules":["FINAL,corp"]}}}}"#
+        );
+        LocalProxy::start(config.as_bytes(), loopback(), MixedSettings::default())
+    };
+
+    // An interface that does not exist: the flow fails instead of leaving
+    // through the default route.
+    let proxy = start("anixops-none0").unwrap();
+    let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+    assert_eq!(reply, 0x01);
+
+    // A name that cannot be an interface is refused with the config.
+    let error = start("bad\\nname").err().expect("config must be refused");
+    assert_eq!(error.code, RuntimeErrorCode::ConfigRejected);
+
+    // Loopback exists, so a flow to a loopback server goes through it.
+    let loopback_interface = if cfg!(target_os = "linux") {
+        Some("lo")
+    } else if cfg!(target_os = "macos") {
+        Some("lo0")
+    } else {
+        None
+    };
+    if let Some(name) = loopback_interface {
+        let proxy = start(name).unwrap();
+        let (mut stream, reply) = socks_connect(proxy.local_addr(), echo);
+        assert_eq!(reply, 0x00);
+        stream.write_all(b"bound").unwrap();
+        let mut echoed = [0u8; 5];
+        stream.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"bound");
+    }
+}
+
+#[test]
+fn script_rules_run_the_script_the_routing_section_names() {
+    let echo = echo_server();
+    let path = std::env::temp_dir().join(format!(
+        "anixops-rule-script-{}-{}.js",
+        std::process::id(),
+        echo.port()
+    ));
+    std::fs::write(
+        &path,
+        "$done({matched: $request.destPort === Number($argument) \
+         && $request.sourceIP === '127.0.0.1' && $request.inPort !== null})",
+    )
+    .unwrap();
+    let start = |script_path: &str, rule: &str| {
+        let config = format!(
+            r#"{{"schema_version":1,"profile_id":"scripted","routing":{{"outbounds":{{"node":{{"type":"direct"}}}},"scripts":{{"block":{{"path":{script_path:?},"argument":"{port}","timeout_secs":2}}}},"rules":["{rule}","FINAL,DIRECT"]}}}}"#,
+            port = echo.port(),
+        );
+        LocalProxy::start(config.as_bytes(), loopback(), MixedSettings::default())
+    };
+    let script_path = path.to_str().unwrap();
+
+    // A missing file, or a rule naming an unknown script, refuses the config.
+    for (script_path, rule) in [
+        ("/nonexistent/anixops-rule.js", "SCRIPT,block,REJECT"),
+        (script_path, "SCRIPT,other,REJECT"),
+    ] {
+        let error = start(script_path, rule)
+            .err()
+            .expect("config must be refused");
+        assert_eq!(error.code, RuntimeErrorCode::ConfigRejected, "{rule}");
+    }
+
+    let proxy = start(script_path, "SCRIPT,block,REJECT");
+    if cfg!(feature = "scripts") {
+        // The script matches the echo server's port: the flow is rejected.
+        let proxy = proxy.unwrap();
+        let (_stream, reply) = socks_connect(proxy.local_addr(), echo);
+        assert_eq!(reply, 0x01);
+        // Another port does not match and goes DIRECT.
+        let other = echo_server();
+        let (mut stream, reply) = socks_connect(proxy.local_addr(), other);
+        assert_eq!(reply, 0x00);
+        stream.write_all(b"script").unwrap();
+        let mut echoed = [0u8; 6];
+        stream.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"script");
+    } else {
+        let error = proxy.err().expect("this build cannot run scripts");
+        assert_eq!(error.code, RuntimeErrorCode::ConfigRejected);
+    }
+    let _ = std::fs::remove_file(&path);
+}

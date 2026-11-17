@@ -28,9 +28,10 @@ use inbound_mixed::{ClientAddrs, ClientConnector, ClientInterceptor, MixedSettin
 use tokio::sync::oneshot;
 
 use crate::config::RuntimeConfig;
-use crate::connections::Dispatcher;
+use crate::connections::{Dispatcher, FlowOrigin};
 use crate::lan_share::{LanShare, LanShareSlot};
 use crate::replay_proxy::{ReplayProxy, ReplayProxySlot};
+use crate::routing::FlowSource;
 use crate::tunnel::{
     FlowInterceptor, InterceptedFlow, TunnelSettings, TunnelStats, TunnelStatsSnapshot,
 };
@@ -301,8 +302,12 @@ impl ProcessRouting {
             None
         };
         let http = sniff::http_request_head(first);
+        let origin = FlowOrigin {
+            process: process.as_deref(),
+            source: client_source(client),
+        };
         self.0
-            .connect_client_flow(target, process.as_deref(), http.as_ref())
+            .connect_origin_flow(target, None, origin, http.as_ref())
             .await
     }
 }
@@ -366,7 +371,7 @@ impl ClientInterceptor for Decrypting {
 
     fn serve<'a>(
         &'a self,
-        _client: ClientAddrs,
+        client: ClientAddrs,
         target: &'a TargetAddr,
         host: String,
         stream: BoxStream,
@@ -380,6 +385,7 @@ impl ClientInterceptor for Decrypting {
                 target,
                 host: &host,
                 http: http.as_ref(),
+                source: client_source(client),
             };
             let flow = InterceptedFlow {
                 inbound: stream,
@@ -401,6 +407,7 @@ struct RequestedTarget<'a> {
     target: &'a TargetAddr,
     host: &'a str,
     http: Option<&'a sniff::HttpRequestHead>,
+    source: FlowSource,
 }
 
 impl TcpOutbound for RequestedTarget<'_> {
@@ -412,10 +419,23 @@ impl TcpOutbound for RequestedTarget<'_> {
         // A name target is routed by itself; an address target by the host
         // the interceptor read from the flow.
         let host = matches!(self.target, TargetAddr::Ip(_)).then_some(self.host);
+        let origin = FlowOrigin {
+            process: None,
+            source: self.source,
+        };
         Box::pin(
             self.dispatcher
-                .connect_http_flow(self.target, host, self.http),
+                .connect_origin_flow(self.target, host, origin, self.http),
         )
+    }
+}
+
+/// A proxy client's address and the listener port it reached, for
+/// `SRC-IP` and `IN-PORT` rules.
+pub(crate) fn client_source(client: ClientAddrs) -> FlowSource {
+    FlowSource {
+        address: Some(client.peer.ip().to_canonical()),
+        in_port: Some(client.local.port()),
     }
 }
 

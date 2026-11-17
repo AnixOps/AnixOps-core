@@ -380,6 +380,7 @@ mod tests {
             response: None,
             binary_body: false,
             event: None,
+            rule: None,
         }
     }
 
