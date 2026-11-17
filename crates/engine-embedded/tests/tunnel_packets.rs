@@ -414,6 +414,64 @@ fn dns_rules_send_names_to_a_direct_server() {
     tunnel.stop();
 }
 
+/// A DNS over UDP server answering every query with 10.9.8.7.
+fn start_udp_dns_server() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while let Ok((len, from)) = socket.recv_from(&mut buf) {
+            let mut answer = buf[..len].to_vec();
+            answer[2] |= 0x80;
+            answer[3] = 0x80;
+            answer[7] = 1;
+            answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 9, 8, 7]);
+            let _ = socket.send_to(&answer, from);
+        }
+    });
+    addr
+}
+
+#[test]
+fn system_servers_are_asked_directly_when_the_proxy_fails() {
+    let system = start_udp_dns_server();
+    let config = DnsConfig {
+        servers: vec![
+            DnsServerConfig {
+                name: "remote".into(),
+                url: "tcp://8.8.8.8".into(),
+                server_name: None,
+                via: DnsVia::Proxy,
+            },
+            DnsServerConfig {
+                name: "sys".into(),
+                url: "system".into(),
+                server_name: None,
+                // Ignored: the device's resolvers are always reached directly.
+                via: DnsVia::Proxy,
+            },
+        ],
+        fallback: Some("sys".into()),
+        system_servers: vec![system.to_string()],
+        ..DnsConfig::default()
+    };
+    let settings = TunnelSettings {
+        dns: Arc::new(DnsPolicy::from_config(&config).unwrap()),
+        ..settings()
+    };
+    let (sink, rx) = capture();
+    // The proxy drops everything: only the fallback to the system servers answers.
+    let mut tunnel =
+        Tunnel::start(settings, Arc::new(Redirect(start_closing_server())), sink).unwrap();
+
+    let query = dns_query();
+    let response = ask(&tunnel, &rx, &query);
+    assert_eq!(&response[..2], &query[..2]);
+    assert!(response.ends_with(&[10, 9, 8, 7]));
+    assert_eq!(tunnel.stats().dns_failed, 0);
+    tunnel.stop();
+}
+
 #[test]
 fn quic_is_refused_with_icmp_when_the_outbound_has_no_udp() {
     let (sink, rx) = capture();

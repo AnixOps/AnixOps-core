@@ -364,9 +364,23 @@ pub struct DnsConfig {
     /// Upstreams by name; `upstream` is ignored when there are any.
     #[serde(default)]
     pub servers: Vec<DnsServerConfig>,
-    /// The server for names no rule picks; the first server by default.
+    /// The server for names no rule picks; the first server by default. A
+    /// list races its servers (see [`DnsServerRef`]).
     #[serde(default)]
-    pub default: Option<String>,
+    pub default: Option<DnsServerRef>,
+    /// Servers asked when the chosen ones fail (no answer in time, or only
+    /// SERVFAIL / REFUSED), e.g. `system` for names a company VPN serves.
+    /// NXDOMAIN is an answer and does not fall back.
+    #[serde(default)]
+    pub fallback: Option<DnsServerRef>,
+    /// The device's own resolvers (`192.168.1.1`, `[fe80::1%en0]:53` is not
+    /// accepted: addresses with an optional port), which a server with the
+    /// URL `system` asks over UDP through the direct outbound. The client
+    /// fills them in from the physical network where the system resolver
+    /// would come back to the tunnel (desktop TUN); without them `system`
+    /// uses the system resolver (`getaddrinfo`).
+    #[serde(default)]
+    pub system_servers: Vec<String>,
     /// Names answered locally: `example.lan`, or `*.example.lan` for its
     /// subdomains, to 1-8 addresses.
     #[serde(default)]
@@ -389,6 +403,12 @@ pub struct FakeIpConfig {
     /// addresses are never handed out (the tunnel's own interface and DNS).
     #[serde(default = "default_fake_ip_range")]
     pub range: String,
+    /// IPv6 network for fake `AAAA` answers, /8 to /96 (e.g. `fc00::/18`),
+    /// or none to answer `AAAA` with no records. Only set it when the client
+    /// routes the network into the tunnel. A name has the same slot in both
+    /// ranges.
+    #[serde(default)]
+    pub range6: Option<String>,
     /// Most names kept; the least recently used name gives up its address
     /// when the table is full.
     #[serde(default = "default_fake_ip_max_entries")]
@@ -409,6 +429,7 @@ impl Default for FakeIpConfig {
         Self {
             enabled: false,
             range: default_fake_ip_range(),
+            range6: None,
             max_entries: default_fake_ip_max_entries(),
             filter: Vec::new(),
             default_filter: true,
@@ -435,6 +456,8 @@ impl Default for DnsConfig {
             timeout_ms: default_dns_timeout_ms(),
             servers: Vec::new(),
             default: None,
+            fallback: None,
+            system_servers: Vec::new(),
             hosts: BTreeMap::new(),
             rules: Vec::new(),
             fake_ip: FakeIpConfig::default(),
@@ -447,8 +470,10 @@ impl Default for DnsConfig {
 #[serde(deny_unknown_fields)]
 pub struct DnsServerConfig {
     pub name: String,
-    /// `1.1.1.1`, `tcp://host[:53]`, `tls://host[:853]` (DNS over TLS) or
-    /// `https://host[:443][/dns-query]` (DNS over HTTPS).
+    /// `1.1.1.1`, `tcp://host[:53]`, `udp://host[:53]`, `tls://host[:853]`
+    /// (DNS over TLS), `https://host[:443][/dns-query]` (DNS over HTTPS),
+    /// `quic://host[:853]` (DNS over QUIC) or `system` (the device's
+    /// resolvers, see [`DnsConfig::system_servers`]).
     pub url: String,
     /// TLS name when the host is an address, e.g. `cloudflare-dns.com` for
     /// `tls://1.1.1.1`.
@@ -495,7 +520,44 @@ pub struct DnsRuleConfig {
     pub domain_keyword: Vec<String>,
     #[serde(default)]
     pub rule_set: Option<String>,
-    pub server: String,
+    pub server: DnsServerRef,
+}
+
+/// One server by name, or several raced against each other: every query
+/// goes to all of them at once and the first answer that is not an error
+/// wins (NXDOMAIN only once no server has a better answer).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum DnsServerRef {
+    One(String),
+    Race(Vec<String>),
+}
+
+impl DnsServerRef {
+    pub fn names(&self) -> &[String] {
+        match self {
+            Self::One(name) => std::slice::from_ref(name),
+            Self::Race(names) => names,
+        }
+    }
+}
+
+impl Default for DnsServerRef {
+    fn default() -> Self {
+        Self::One(String::new())
+    }
+}
+
+impl From<&str> for DnsServerRef {
+    fn from(name: &str) -> Self {
+        Self::One(name.to_string())
+    }
+}
+
+impl From<String> for DnsServerRef {
+    fn from(name: String) -> Self {
+        Self::One(name)
+    }
 }
 
 impl DnsRuleConfig {

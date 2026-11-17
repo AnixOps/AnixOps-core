@@ -8,8 +8,11 @@
 //! authenticates on it and opens one stream per proxied connection.
 //! [`QuicStream`] turns a bidirectional stream into a [`BoxStream`].
 //! [`QuicConnector::with_salamander`] obfuscates every datagram with
-//! [`salamander::Salamander`].
+//! [`salamander::Salamander`]. [`QuicConnector::connect_over`] runs the
+//! connection on a proxied [`engine_outbound::UdpFlow`] instead
+//! ([`flow::FlowSocket`]).
 
+pub mod flow;
 pub mod salamander;
 
 use std::io;
@@ -113,6 +116,49 @@ impl QuicConnector {
             )?));
         self.salamander = Some(salamander);
         Ok(self)
+    }
+
+    /// No keep-alive: an idle connection closes after the idle timeout, for
+    /// clients (DNS over QUIC) that only need it while queries are sent.
+    pub fn without_keep_alive(mut self) -> io::Result<Self> {
+        let mut transport = transport_config(self.congestion, 0)?;
+        transport.keep_alive_interval(None);
+        self.client_config.transport_config(Arc::new(transport));
+        Ok(self)
+    }
+
+    /// Completes the QUIC handshake on `flow`, a UDP flow already open to
+    /// the server (through a proxy, or the direct outbound), within a
+    /// timeout. Salamander is not applied.
+    pub async fn connect_over(
+        &self,
+        flow: engine_outbound::UdpFlow,
+        timeout: Duration,
+    ) -> io::Result<QuicConnection> {
+        let peer = match self.server.parse::<std::net::IpAddr>() {
+            Ok(ip) => std::net::SocketAddr::new(ip, self.port),
+            Err(_) => flow::FlowSocket::placeholder_peer(self.port),
+        };
+        let socket = flow::FlowSocket::new(flow, peer);
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| io::Error::other("no async runtime for quic"))?;
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )?;
+        let connecting = endpoint
+            .connect_with(self.client_config.clone(), peer, &self.server_name)
+            .map_err(|_| invalid("quic connect settings are invalid"))?;
+        let connection = tokio::time::timeout(timeout.min(HANDSHAKE_TIMEOUT), connecting)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "quic handshake timed out"))?
+            .map_err(quic_error)?;
+        Ok(QuicConnection {
+            connection,
+            _endpoint: endpoint,
+        })
     }
 
     /// Resolves the server and completes the QUIC handshake, within a

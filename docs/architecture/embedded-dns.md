@@ -1,10 +1,10 @@
 # 内嵌引擎 DNS：上游、hosts、按域名分流与 fake-ip
 
-适用范围：`crates/engine-embedded`（iOS 隧道、桌面 local proxy 的嵌入式内核）。代码见 `src/dns.rs`、`src/dns_policy.rs`、`src/fake_ip.rs`，配置见 `src/config.rs` 的 `DnsConfig`。
+适用范围：`crates/engine-embedded`（iOS 隧道、桌面 local proxy 的嵌入式内核）。代码见 `src/dns.rs`、`src/dns_policy.rs`、`src/dns_client.rs`、`src/dns_quic.rs`、`src/fake_ip.rs`，配置见 `src/config.rs` 的 `DnsConfig`。
 
 ## 现状
 
-隧道把应用发往 UDP/53 的查询截下来，不做 UDP 中继，而是在一条新的 TCP 连接上转发给上游。连接经过出站，所以默认在代理一侧解析。
+隧道把应用发往 UDP/53 的查询截下来，按 `dns` 设置转发给上游（TCP、UDP、DoT、DoH、DoQ，或设备自己的解析器）。上游默认经出站连接，所以默认在代理一侧解析。
 
 - 域名规则靠连接首包的 TLS SNI / HTTP `Host` 嗅探匹配，不依赖 DNS 结果（见 `sniff.rs`）。
 - 桌面 local proxy 收到的就是域名，连接按域名交给出站，由代理服务器解析。只有命中不带 `no-resolve` 的 IP 规则（`IP-CIDR`、`GEOIP`）时才需要先解析，这次解析也走本节的 DNS 设置（见下文「DNS 泄露核对」），不用系统解析器。
@@ -17,9 +17,13 @@
   "servers": [
     { "name": "remote", "url": "https://dns.google/dns-query" },
     { "name": "cf", "url": "tls://1.1.1.1", "server_name": "cloudflare-dns.com" },
-    { "name": "local", "url": "223.5.5.5", "via": "direct" }
+    { "name": "adg", "url": "quic://dns.adguard-dns.com" },
+    { "name": "local", "url": "udp://223.5.5.5", "via": "direct" },
+    { "name": "sys", "url": "system" }
   ],
-  "default": "remote",
+  "default": ["remote", "cf"],
+  "fallback": "sys",
+  "system_servers": ["192.168.1.1"],
   "hosts": {
     "router.lan": ["192.168.1.1"],
     "*.corp.example": ["10.0.0.1", "fd00::1"]
@@ -27,7 +31,8 @@
   "rules": [
     { "domain_suffix": ["cn", "baidu.com"], "server": "local" },
     { "rule_set": "geosite-cn", "server": "local" },
-    { "domain": ["api.example.com"], "domain_keyword": ["taobao"], "server": "cf" }
+    { "domain_suffix": ["corp.example"], "server": "sys" },
+    { "domain": ["api.example.com"], "domain_keyword": ["taobao"], "server": ["cf", "adg"] }
   ]
 }
 ```
@@ -39,17 +44,52 @@
 | 写法 | 协议 | 默认端口 |
 | --- | --- | --- |
 | `1.1.1.1`、`1.1.1.1:53`、`tcp://host[:port]` | DNS over TCP | 53 |
+| `udp://host[:port]` | DNS over UDP | 53 |
 | `tls://host[:port]` | DNS over TLS（RFC 7858，ALPN `dot`） | 853 |
 | `https://host[:port][/path]` | DNS over HTTPS（RFC 8484，HTTP/1.1 POST `application/dns-message`，路径默认 `/dns-query`） | 443 |
+| `quic://host[:port]` | DNS over QUIC（RFC 9250，ALPN `doq`） | 853 |
+| `system` | 设备自己的解析器（见下文「`system`：设备的解析器」） | — |
 
+- 不写协议的地址仍是 TCP（与旧配置兼容）；要 UDP 写 `udp://`。
 - 主机写成 IP 时，可用 `server_name` 指定 TLS 证书名，例如 `tls://1.1.1.1` 配 `cloudflare-dns.com`。证书始终校验，没有 insecure 选项。
-- 每个查询各用一条连接，一问一答，`Connection: close`。
-- `tls://` 和 `https://` 需要 cargo feature `dns-tls`。默认 feature 里已包含它；不带它构建时，这类配置会被拒绝。
+- `tls://` 和 `https://` 需要 cargo feature `dns-tls`，`quic://` 需要 `dns-quic`（它包含 `dns-tls`）。默认 feature 里都已包含；不带它们构建时，这类配置会被拒绝。
 - `via` 决定怎么连到上游：
   - `proxy`（默认）：经代理。单出站配置走该出站；规则模式下，规则为上游地址选了某个节点就走那个节点，规则给出 `DIRECT`/`REJECT`（例如 GFW 列表配置的 `FINAL,DIRECT`、国内解析器命中 `GEOIP,CN,DIRECT`）时改走全局模式的目标，不会因为规则而明文直连；全局模式走全局目标；直连模式下走直连。全局目标本身拒绝时不发查询。
   - `direct`：始终直连，适合国内解析器。
-- `default` 指定没有规则命中时用的上游，缺省为第一个。
-- 不写 `servers` 时保留旧行为：`upstream`（默认 `1.1.1.1:53`）经 TCP 走代理。这时不能写 `default` 和 `rules`。
+  - `system` 上游始终直连，写了 `via` 也不改变。
+- 不写 `servers` 时保留旧行为：`upstream`（默认 `1.1.1.1:53`）经 TCP 走代理。这时不能写 `default`、`fallback` 和 `rules`。
+
+#### UDP
+
+- 每个查询经出站开一个 UDP 流（`via: direct` 时是受保护的本机套接字），换成自己的随机 id 发出，应答里再换回应用的 id。id、QR 位或问题（不区分大小写）对不上的数据报一律丢弃，防止伪造应答。
+- 1 秒没有应答就重发，最多发 3 次，总时长仍是 `timeout_ms`。
+- 应答带 TC（截断）位时，同一服务器改走 TCP 重问一次；出站不支持 UDP（例如 HTTP 代理节点）时也直接改走 TCP。
+
+#### DoQ
+
+- 握手跑在出站的 UDP 流上（`transport_quic::QuicConnector::connect_over`、`transport_quic::flow::FlowSocket`），所以既能直连也能经任何支持 UDP 的节点；节点不支持 UDP 时这次查询失败。
+- 每个查询一条双向流：两字节长度 + 报文，线上 id 为 0（RFC 9250 §4.2.1），发完即关闭发送方向，读到流结束为止；应答换回应用的 id 并核对问题。
+- 连接按 `(上游, 出站)` 保留，多个查询并发复用同一连接，最多保留 16 条；连接不发 keep-alive，30 秒没有查询自行关闭，超过 20 秒未用的连接不再复用。复用的连接出错时，最多花一半超时时间就改用新连接。
+
+### `default`、`rules[].server` 与 `fallback`：选哪些上游
+
+- `default` 指定没有规则命中时用的上游，缺省为第一个。`rules[].server` 指定规则命中时用的上游。
+- 两处都可以写一个名字，也可以写 2–4 个名字的列表，列表里的上游**同时**发出（竞速）：
+  - 第一个 NOERROR 应答立即采用，其余查询取消。
+  - NXDOMAIN 先留着，等其他上游都结束、仍没有更好的应答才采用。所以分流 DNS（公网解析器回 NXDOMAIN、公司解析器知道这个名字）放在一个列表里也能拿到公司的地址。
+  - SERVFAIL、REFUSED 等错误只在没有任何其他应答时才交给应用。
+- `fallback`（可选，写法同上）：选中的上游**没有给出应答**时（全部超时 / 连不上，或只回了 SERVFAIL、REFUSED 等错误），再问一遍这些上游。NXDOMAIN 是应答，不触发回退，以免不存在的名字被转给另一个解析器。回退和选中的是同一组上游时不再重问。回退会再用一次 `timeout_ms`。
+- 同一组上游不管写在哪里、顺序如何，共用一份缓存与在途查询。
+
+### `system`：设备的解析器
+
+用于公司 VPN 的分流 DNS（split DNS）、只有局域网解析器认识的名字，以及作为 `fallback`。
+
+- 有 `system_servers`（最多 8 个 IP，可带端口，默认 53）时：同时向这些地址发 UDP 查询（截断时改 TCP），经直连出站（受保护的套接字，不进隧道），按上面的竞速规则取应答。客户端在桌面 TUN 模式下填入物理网络的解析器地址：那里的系统解析器已经指向隧道，再用它会绕回来。
+- 没有 `system_servers` 时：用系统解析器（`getaddrinfo`）。只能回答 `A`、`AAAA`（TTL 60 秒）；查不到或其他类型回 SERVFAIL，交给 `fallback`。iOS / macOS 的 Network Extension 与 Android 的 VpnService（客户端把自己排除在 VPN 外）里，扩展自己的解析不经过隧道，系统解析器就是物理网络与公司 VPN 的解析配置；桌面 local proxy 模式不接管系统 DNS，也可以直接用。
+- `system` 上游的查询明文发往本机网络的解析器，等同 `via: direct`。只把确实需要本地解析的名字（公司域名、局域网名）分给它，或只作 `fallback`；不要把它作为默认上游，否则所有域名都会在本地明文解析（见「DNS 泄露核对」）。
+
+测试：`tests/dns_upstreams.rs`（UDP 重发、丢弃伪造应答、截断改 TCP、无 UDP 出站改 TCP、竞速取最快、应答胜过更快的 NXDOMAIN、SERVFAIL 回退、NXDOMAIN 不回退、回退到 `system_servers`、无 `system_servers` 时用系统解析器、列表校验）、`src/dns_quic.rs`（进程内 DoQ 服务器：经直连出站的 UDP 流握手、两个查询共用一条连接、分帧与 id）、`transport-quic` 的 `flow` 单元测试、`tests/tunnel_packets.rs` 的 `system_servers_are_asked_directly_when_the_proxy_fails`（包级：代理失败后回退到直连的系统解析器）。
 
 ### `hosts`：本地应答
 
@@ -70,18 +110,18 @@
 ### 错误与状态
 
 - 配置错误返回固定文案的 `config_rejected`，文案里不含域名或 URL。
-- 统计沿用 `dns_queries`、`dns_failed` 和 `dns_last_failure`。本地应答计入 `dns_queries`。
+- 统计沿用 `dns_queries`、`dns_failed` 和 `dns_last_failure`。本地应答计入 `dns_queries`。竞速或回退的一次查询只计一次；全部失败时 `dns_last_failure` 记最后一个失败原因。
 - `dns_cached`：由缓存（新鲜或过期）应答、或并入同一问题在途查询的次数，同时计入 `dns_queries`。
 
 ### 缓存与连接复用
 
 网页一次要解析多个域名，原来每个查询都经代理新建一条上游连接（DoT / DoH 还要一次 TLS 握手），一次解析约 2–3 个代理 RTT。现在（`crates/engine-embedded/src/dns_cache.rs`）：
 
-- 按 `(域名, 类型, 上游, 是否经代理)` 缓存应答。TTL 取应答与权威段记录的最小值，限制在 30 秒到 1 小时；NXDOMAIN 与空应答最多 60 秒。只缓存 NOERROR / NXDOMAIN、未截断、问题与查询一致的应答，SERVFAIL 不缓存。最多 4096 条，满了先丢过期很久的，再丢最早过期的。
+- 按 `(域名, 类型, 上游组, 是否经代理)` 缓存应答。TTL 取应答与权威段记录的最小值，限制在 30 秒到 1 小时；NXDOMAIN 与空应答最多 60 秒。只缓存 NOERROR / NXDOMAIN、未截断、问题与查询一致的应答，SERVFAIL 不缓存。最多 4096 条，满了先丢过期很久的，再丢最早过期的。
 - 命中时改写成该查询的 id 与问题（保留应用的大小写），记录 TTL 改为剩余秒数。
 - 过期后 1 小时内仍先回旧应答（TTL 30 秒），同时在后台刷新一次（RFC 8767 serve-stale），应用不等上游。
 - 同一问题已有查询在途时，新查询并入等待，不再重复发送（每个问题最多 32 个等待者）。
-- 上游连接按 `(上游, 出站)` 保留，每个最多 4 条空闲、空闲超过 20 秒不再复用。复用的连接若已被对端关闭，最多花一半超时时间就改用新连接。DoH 改为 HTTP/1.1 keep-alive，只有 `Content-Length` 定长、无多余字节、未要求 `Connection: close` 的应答才保留连接。
+- TCP / DoT / DoH 连接按 `(上游, 出站)` 保留（DoQ 见上文），每个最多 4 条空闲、空闲超过 20 秒不再复用。复用的连接若已被对端关闭，最多花一半超时时间就改用新连接。DoH 改为 HTTP/1.1 keep-alive，只有 `Content-Length` 定长、无多余字节、未要求 `Connection: close` 的应答才保留连接。
 - 缓存只在隧道生命周期内，停止隧道即清空；切换节点不清缓存，但空闲连接按出站区分，不会走到旧节点。
 
 ## DNS 泄露核对（2026-11）
@@ -92,16 +132,15 @@
    - 修复：此前 `via: proxy` 的上游按分流规则选出站，GFW 列表配置（`FINAL,DIRECT`）或把国内解析器 IP 分到 `DIRECT` 的规则会让“经代理”的查询以明文 TCP 53 直连发出，所有域名都受影响。现在规则只能把它分到某个节点，`DIRECT`/`REJECT` 一律改走全局目标（`Dispatcher::dns_outbound`、`RoutedOutbound::dns_outbound`）。
 2. **IP 规则先解析时用 `dns` 设置，不用系统解析器。** 域名目标命中不带 `no-resolve` 的 `IP-CIDR`/`GEOIP` 时要先拿到地址。
    - 修复：此前这次解析用 `getaddrinfo`，本机解析器明文收到域名（例如 `GEOSITE,cn,DIRECT`、`GEOIP,cn,DIRECT`、`FINAL,Proxy` 这类常见规则下，local proxy 收到的每个境外域名都会先在本地明文解析一次）。现在用 `PolicyResolver`（`src/dns_resolver.rs`）：hosts 本地应答，DNS 规则选上游，`proxy` 上游按上一条经代理，`direct` 上游直连；结果按 TTL 缓存，最长 10 分钟、最多 1024 条。解析失败仍拒绝连接，不回落到系统解析器。连接本身仍以域名发出。
-3. **引导解析只限这些名字。** 仍用系统解析器的只有：节点服务器地址（出站拨号、QUIC、WireGuard 端点）、`via: direct` 上游写成域名时的主机名、分到 `DIRECT` 的连接（包括 `via` 为 `DIRECT` 的远程规则集下载）。`via: proxy` 上游写成域名（如 `https://dns.google/dns-query`）时，名字随连接交给节点，不在本地解析。用户自己把境外域名分到 `DIRECT`、或把 DNS 规则指向 `direct` 上游，属于配置选择，不算泄露。
+3. **引导解析只限这些名字。** 除用户明确配置的 `system` 上游外，仍用系统解析器的只有：节点服务器地址（出站拨号、QUIC、WireGuard 端点）、`via: direct` 上游写成域名时的主机名、分到 `DIRECT` 的连接（包括 `via` 为 `DIRECT` 的远程规则集下载）。`via: proxy` 上游写成域名（如 `https://dns.google/dns-query`）时，名字随连接交给节点，不在本地解析。用户自己把境外域名分到 `DIRECT`、或把 DNS 规则指向 `direct` 上游，属于配置选择，不算泄露。
 
 测试：`tests/dns_leaks.rs`（三条路径各一组）与 `src/dns_policy.rs` 单元测试。
 
 ## 不在本次范围
 
 - fake-ip 默认关闭（见下文「fake-ip」）。不开时缓存只缩短真实解析，不省掉首次解析。
-- 不支持 UDP 上游：UDP 走代理需要逐个出站的 UDP 支持，且容易被干扰。
-- 不做 DoH over HTTP/2。HTTP/1.1 keep-alive 已能复用连接，但同一连接上一次只跑一个查询，并发靠多条连接。
-- 不支持 DoQ（DNS over QUIC）。
+- 不做 DoH over HTTP/2 / HTTP/3。HTTP/1.1 keep-alive 已能复用连接，但同一连接上一次只跑一个查询，并发靠多条连接；需要多路复用时用 DoQ。
+- UDP 上游每个查询开一个 UDP 流，不复用。经代理的 UDP 也可能被干扰，经代理时优先用 DoH / DoT / DoQ。
 
 ## fake-ip
 
@@ -114,6 +153,7 @@
   "fake_ip": {
     "enabled": true,
     "range": "198.18.0.0/15",
+    "range6": "fc00::/18",
     "max_entries": 65536,
     "filter": ["+.corp.example", "api.*.example"],
     "default_filter": true
@@ -122,6 +162,7 @@
 ```
 
 - `range`：IPv4 网段，`/8` 到 `/22`，须按前缀对齐。前 256 个地址（默认即 `198.18.0.0/24`）永不分配：客户端把隧道接口地址 `198.18.0.1` 和 DNS `198.18.0.2` 放在这里。最后一个地址也不分配。
+- `range6`（可选）：IPv6 网段，`/8` 到 `/96`，须按前缀对齐。写了它，`AAAA` 查询也回假地址；一个名字在两个网段里用同一个槽位（`range6` 起点 + 256 + 槽位号），回收也一起回收。前 256 个地址同样不分配。只有客户端把这个网段路由进隧道时才写（各客户端的隧道已路由 `::/0`）；不写时 `AAAA` 回空应答，与之前相同。
 - `max_entries`：表中最多保留的域名数，默认 65536，上限 1048576，并且不超过网段可用地址数（`/15` 为 130815）。
 - `filter`：额外的例外名单，命中的名字照常转发给上游、拿真实地址。写法：`name`（精确）、`+.name`（它和所有子域名）、带 `*` 的模式（每个 `*` 恰好代表一级标签，如 `time.*.com`）。最多 1024 条（含内置）。
 - `default_filter`：是否启用内置例外名单 `fake_ip::DEFAULT_FILTER`（默认 `true`）：`.lan`/`.local`/`.home.arpa` 等局域网名、`localhost`、NTP（`time.*.com`、`+.ntp.org` 等）、STUN（`stun.*.*`、PlayStation/Xbox/Nintendo）、captive portal 与连通性检测（`captive.apple.com`、`+.msftconnecttest.com`）、Apple 推送（`+.push.apple.com`）、QQ 本地登录。
@@ -130,7 +171,8 @@
 ### 应答
 
 - `A`：假地址，TTL 1 秒。同一个名字留在表里期间总拿到同一个地址。
-- `AAAA` 与 `HTTPS`（SVCB，类型 65）：空应答（NOERROR、无记录），应用改用 IPv4 连假地址；`HTTPS` 记录的地址提示会绕过假地址，所以一并清空。
+- `AAAA`：配了 `range6` 时回同一个名字的 IPv6 假地址，TTL 1 秒；没配时回空应答（NOERROR、无记录），应用改用 IPv4 连假地址。
+- `HTTPS`（SVCB，类型 65）：空应答。它的地址提示会绕过假地址，所以清空。
 - 其他类型（MX、TXT、SRV…）和例外名单里的名字照常走上游。
 - 统计：`TunnelStatsSnapshot.dns_fake` 计假应答数（也计入 `dns_queries`）。
 
@@ -163,7 +205,7 @@
 
 另有 `entries`、`capacity`、`assigned`、`recycled`。
 
-测试：`src/fake_ip.rs` 单元测试（分配、回收顺序、冲突、应答格式、例外名单、配置校验）、`tests/fake_ip.rs`（经 Dispatcher 还原、域名规则、DIRECT 用 dns 段解析、未命中拒绝与恢复、配置）、`tests/tunnel_packets.rs` 的 `fake_ip_answers_dns_and_sends_the_flow_by_name`（包级：DNS 拿假地址，非 TLS 的 TCP 连接按域名出站）、`tests/fake_ip_memory.rs`。
+测试：`src/fake_ip.rs` 单元测试（分配、回收顺序、冲突、应答格式、例外名单、配置校验）、`tests/fake_ip.rs`（经 Dispatcher 还原、域名规则、DIRECT 用 dns 段解析、未命中拒绝与恢复、配置）、`tests/tunnel_packets.rs` 的 `fake_ip_answers_dns_and_sends_the_flow_by_name`（包级：DNS 拿假地址，非 TLS 的 TCP 连接按域名出站）、`tests/fake_ip_memory.rs`；`range6`：`src/fake_ip.rs` 的 `range6_answers_aaaa_from_the_same_slot` 与 `tests/fake_ip.rs` 的 `a_fake_ipv6_address_goes_out_by_name`。
 
 ### 当初的评估（2026-10）
 

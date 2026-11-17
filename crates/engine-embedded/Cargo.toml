@@ -8,9 +8,11 @@ description = "In-process engine for the iOS Network Extension: userspace TCP/IP
 
 # One feature per protocol; see src/protocols.rs. `direct` is always built in.
 [features]
-default = ["dns-tls", "http", "hysteria2", "iwan", "local-proxy", "mieru", "mitm", "scripts", "shadowsocks", "snell", "socks", "trojan", "tuic", "vless", "vmess", "wireguard"]
+default = ["dns-quic", "dns-tls", "http", "hysteria2", "iwan", "local-proxy", "mieru", "mitm", "scripts", "shadowsocks", "snell", "socks", "trojan", "tuic", "vless", "vmess", "wireguard"]
 # DNS over TLS and DNS over HTTPS upstreams (`tls://`, `https://`).
 dns-tls = ["dep:transport-tls"]
+# DNS over QUIC upstreams (`quic://`, RFC 9250), through the outbound's UDP relay.
+dns-quic = ["dns-tls", "dep:transport-quic"]
 http = ["dep:outbound-http"]
 hysteria2 = ["dep:outbound-hysteria2"]
 # Panabit iWAN: a layer-3 tunnel used as a routable outbound with its own stack.
@@ -86,6 +88,7 @@ time = { version = "0.3", optional = true }
 tls-mimic = { path = "../tls-mimic", optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+transport-quic = { path = "../transport-quic", optional = true }
 transport-tls = { path = "../transport-tls", optional = true }
 
 # Desktop PROCESS-NAME lookup (src/process.rs) and the tunnel's bound interface
@@ -115,6 +118,9 @@ inbound-mixed = { path = "../inbound-mixed" }
 inbound-shadowsocks = { path = "../inbound-shadowsocks" }
 # tests/rule_sets.rs: signs lists for the signature check.
 ring = "0.17"
+# src/dns_quic.rs: an in-process DNS over QUIC server.
+rcgen = "0.14.8"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 
 # Linux TUN benchmark of the packet tunnel (.github/workflows/perf.yml).

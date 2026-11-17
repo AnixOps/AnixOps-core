@@ -43,8 +43,9 @@ pub const MAX_WAITERS: usize = 32;
 const HEADER_LEN: usize = 12;
 const TYPE_OPT: u16 = 41;
 
-/// What a cached answer is for: the question, the server that answers it and
-/// whether that server is reached through the proxy.
+/// What a cached answer is for: the question, the servers that answer it
+/// (a target of [`crate::dns_policy::DnsPolicy`]) and whether they are
+/// reached through the proxy.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub name: String,
@@ -343,6 +344,15 @@ fn skip_name(message: &[u8], mut at: usize) -> Option<usize> {
             l => at += 1 + usize::from(l),
         }
     }
+}
+
+/// The connections kept for upstreams: idle TCP / TLS / HTTPS streams, and
+/// DNS over QUIC connections (which carry many queries at once).
+#[derive(Default)]
+pub struct DnsPools {
+    pub tcp: std::sync::Mutex<UpstreamPool>,
+    #[cfg(feature = "dns-quic")]
+    pub quic: std::sync::Mutex<crate::dns_quic::QuicPool>,
 }
 
 /// Idle upstream connections, per server and outbound.

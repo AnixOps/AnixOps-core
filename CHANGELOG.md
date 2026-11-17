@@ -6,6 +6,14 @@
 
 ### Added
 
+- 嵌入式 DNS 追平 Surge（engine-embedded，见 `docs/architecture/embedded-dns.md`）：
+  - 新上游 `udp://host[:53]`（随机 id、1 秒重发至多 3 次、丢弃 id / 问题不符的数据报、截断或出站不支持 UDP 时改走 TCP）与 `quic://host[:853]`（DNS over QUIC，RFC 9250，ALPN `doq`，证书始终校验；握手跑在出站的 UDP 流上，可直连也可经节点，连接按上游与出站复用、多查询并发、无 keep-alive）。新 cargo feature `dns-quic`（默认开启，含 `dns-tls`），engine-embedded 新增对 `transport-quic` 的依赖（`Cargo.lock` 没有新包）。`transport-quic` 新增 `flow::FlowSocket`（quinn 跑在 `UdpFlow` 上）、`QuicConnector::connect_over` 与 `without_keep_alive`。
+  - 多上游竞速：`default` 与 `rules[].server` 可以写 2–4 个上游的列表，同时发出，第一个 NOERROR 立即采用；NXDOMAIN 等其他上游都结束才采用，所以公网与公司解析器放在一起也能解析公司域名。
+  - 回退：新字段 `fallback`（一个上游或列表），选中的上游全部失败或只回 SERVFAIL / REFUSED 时再问；NXDOMAIN 不回退。
+  - 设备解析器：`url` 写 `system` 的上游始终直连，问 `system_servers`（客户端填入的物理网络解析器地址，最多 8 个，竞速）或在没有地址时用系统解析器（只答 A / AAAA）。用于公司 VPN 的分流 DNS 与回退。
+  - Fake-IP IPv6：`dns.fake_ip.range6`（如 `fc00::/18`，`/8`–`/96`）配了之后 `AAAA` 也回假地址（同一槽位、TTL 1 秒），`Dispatcher` 同样还原；不配时与之前一样回空应答。`FakeIpPool` 新增 `assign6`、`has_ipv6`。
+  - 新模块 `dns_client`（竞速与回退，隧道与 `PolicyResolver` 共用）、`dns_quic`；`dns::exchange` 的连接池参数改为 `dns_cache::DnsPools`，`Upstream::target` 改为返回 `Option`，`DnsServerView` 新增 `fallback`，`DnsRuleConfig.server` / `DnsConfig.default` 改为 `DnsServerRef`（单个名字的旧配置不变）。
+  - CI：engine-embedded 的单 feature 矩阵新增 `dns-quic`。
 - 苹果平台系统代理监听（engine-embedded 新模块 `system_proxy`，`local-proxy` feature）：包隧道运行时新增控制命令 `system_proxy`、`start_system_proxy`（可选 `port`，缺省 8890，被占用时自动换空闲端口并在回答里报告实际端口，`0` 总是自动选）、`stop_system_proxy`，回答 `{"running","host","port","https_decryption","accepted","rejected","active"}`。监听只绑 `127.0.0.1`、不要凭据，连接走隧道同一个分发器（分流、连接列表、抓包、HTTPS 解密都一样），可在隧道启动前打开（客户端先拿到端口再应用接口设置），运行时停止或释放时一并关闭；整机 WireGuard 隧道不支持。iOS / macOS 的隧道用它注册系统 HTTP 代理（`NEProxySettings`），遵守代理设置的 App 不再经过用户态 TCP/IP 栈。macOS 上配置有 `PROCESS-NAME` 规则时按本机进程名分流。
 - 代理监听上的明文 HTTP 请求也能匹配 `URL-REGEX` 与 `USER-AGENT`：inbound-mixed 的 `ClientConnector` 新增带缺省实现的 `connect_client_with_first`（建连前已知的首包：明文 HTTP 的 origin-form 请求头，或隧道请求随带的首段载荷），engine-embedded 的分发器新增 `connect_client_flow`。桌面本地代理与新的系统代理监听都用它，此前经代理的明文 HTTP 只按目标匹配。
 - REJECT 系列分流策略（对齐 Surge）：规则目标新增 `REJECT-NO-DROP`、`REJECT-DROP`、`REJECT-TINYGIF`（Loon `REJECT-IMG` 同义），订阅与插件导入不再把它们并成 `REJECT`。`REJECT-DROP` 不回应（包隧道 TCP 保持到应用关闭或 60 秒，同时最多占 `max_tcp_connections` 的 1/8；UDP 不回 ICMP；本地代理不回复），`REJECT-TINYGIF` 对明文 HTTP 请求和 HTTPS 解密后的请求回 1x1 GIF。防重试风暴：同一主机 30 秒内被 `REJECT` 拒绝超过 10 次后按 `REJECT-DROP` 应答，`REJECT-NO-DROP` 不升级。`config_core::routing::PolicyTarget::Reject` 与 `RouteOutcome::Reject` 改为带 `RejectKind`；`RouteInfo` 新增不序列化的 `reject` 字段；新增 `engine_outbound::reject`（`rejected`/`rejection`/`hold`/`tiny_gif_response`）与 `engine_embedded::reject`。
