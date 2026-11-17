@@ -3,8 +3,10 @@
 //!
 //! With `dns.fake_ip.enabled`, the tunnel answers an `A` query for a name
 //! that is not in `hosts` and not in the filter with an address from
-//! [`FakeIpPool`] (TTL 1 s) and `AAAA` / `HTTPS` queries for it with an empty
-//! answer, so the app connects over IPv4 to the fake address. The
+//! [`FakeIpPool`] (TTL 1 s). With `range6` set, an `AAAA` query gets a fake
+//! IPv6 address of the same slot; without it, an empty answer, so the app
+//! connects over IPv4. `HTTPS` queries get an empty answer (their address
+//! hints would bypass the fake addresses). The
 //! [`crate::connections::Dispatcher`] turns a flow to a fake address back into
 //! its name before redirects and routing, so domain rules match every
 //! protocol (not only TLS and HTTP that the tunnel sniffs) and a proxy
@@ -33,10 +35,10 @@
 //!
 //! The first 256 addresses of the range (e.g. `198.18.0.0/24` of the default
 //! `198.18.0.0/15`) are never handed out: the clients put the tunnel's own
-//! interface and DNS addresses there.
+//! interface and DNS addresses there. The same holds for `range6`.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -204,6 +206,8 @@ pub struct FakeIpPool {
     /// Network and prefix length of the whole range.
     network: u32,
     prefix: u8,
+    /// The IPv6 range, when `AAAA` queries get fake answers.
+    v6: Option<Range6>,
     capacity: usize,
     filter: Vec<Pattern>,
     table: Mutex<Table>,
@@ -223,6 +227,14 @@ impl std::fmt::Debug for FakeIpPool {
             .field("filter", &self.filter.len())
             .finish()
     }
+}
+
+/// `range6`: its network, prefix length and first address handed out.
+#[derive(Clone, Copy, Debug)]
+struct Range6 {
+    network: u128,
+    prefix: u8,
+    first: u128,
 }
 
 /// What the tunnel does with a DNS query when Fake-IP is on.
@@ -250,6 +262,18 @@ impl FakeIpPool {
             return Err("dns fake_ip max_entries is out of range");
         }
         let capacity = config.max_entries.min(usable as usize);
+        // A /96 at least holds 2^32 addresses, more than any table.
+        let v6 =
+            config
+                .range6
+                .as_deref()
+                .map(parse_range6)
+                .transpose()?
+                .map(|(network, prefix)| Range6 {
+                    network,
+                    prefix,
+                    first: network + u128::from(RESERVED_ADDRESSES),
+                });
         let mut filter = Vec::new();
         if config.default_filter {
             for pattern in DEFAULT_FILTER {
@@ -266,6 +290,7 @@ impl FakeIpPool {
             first: network + RESERVED_ADDRESSES,
             network,
             prefix,
+            v6,
             capacity,
             filter,
             table: Mutex::new(Table {
@@ -287,13 +312,24 @@ impl FakeIpPool {
         self.capacity
     }
 
-    /// Whether `address` is inside the configured range (handed out or not).
+    /// Whether `address` is inside the configured ranges (handed out or
+    /// not).
     pub fn contains(&self, address: IpAddr) -> bool {
-        let IpAddr::V4(v4) = address else {
-            return false;
-        };
-        let mask = u32::MAX << (32 - u32::from(self.prefix));
-        u32::from(v4) & mask == self.network
+        match address {
+            IpAddr::V4(v4) => {
+                let mask = u32::MAX << (32 - u32::from(self.prefix));
+                u32::from(v4) & mask == self.network
+            }
+            IpAddr::V6(v6) => self.v6.is_some_and(|range| {
+                let mask = u128::MAX << (128 - u32::from(range.prefix));
+                u128::from(v6) & mask == range.network
+            }),
+        }
+    }
+
+    /// Whether `AAAA` queries get fake addresses (`range6` is set).
+    pub fn has_ipv6(&self) -> bool {
+        self.v6.is_some()
     }
 
     /// Whether `name` (lower case, no final dot) gets a fake address.
@@ -312,27 +348,44 @@ impl FakeIpPool {
         {
             return FakeAnswer::Forward;
         }
-        if question.qtype != TYPE_A {
-            // No IPv6 or service hints: the app connects to the A answer.
-            return FakeAnswer::Reply(dns::local_answer(query, &question, &[]));
-        }
-        let address = self.assign(&question.name);
-        let mut reply = dns::local_answer(query, &question, &[IpAddr::V4(address)]);
-        // The single A record ends with TTL (4), RDLENGTH (2) and the address (4).
-        let ttl_at = reply.len() - 10;
+        let address = match question.qtype {
+            TYPE_A => IpAddr::V4(self.assign(&question.name)),
+            TYPE_AAAA => match self.assign6(&question.name) {
+                Some(address) => IpAddr::V6(address),
+                // No IPv6 range: the app connects to the A answer.
+                None => return FakeAnswer::Reply(dns::local_answer(query, &question, &[])),
+            },
+            // No service hints: the app connects to the A / AAAA answers.
+            _ => return FakeAnswer::Reply(dns::local_answer(query, &question, &[])),
+        };
+        let mut reply = dns::local_answer(query, &question, &[address]);
+        // The single record ends with TTL (4), RDLENGTH (2) and the address.
+        let ttl_at = reply.len() - 6 - if address.is_ipv4() { 4 } else { 16 };
         reply[ttl_at..ttl_at + 4].copy_from_slice(&FAKE_TTL_SECS.to_be_bytes());
         FakeAnswer::Reply(reply)
     }
 
     /// The address of `name`, handing it one if it has none.
     pub fn assign(&self, name: &str) -> Ipv4Addr {
+        self.address_of(self.slot(name))
+    }
+
+    /// The IPv6 address of `name` (the same slot as its IPv4 one), handing
+    /// it one if it has none; `None` without `range6`.
+    pub fn assign6(&self, name: &str) -> Option<Ipv6Addr> {
+        let range = self.v6?;
+        Some(Ipv6Addr::from(range.first + u128::from(self.slot(name))))
+    }
+
+    /// The slot of `name`, taking one if it has none.
+    fn slot(&self, name: &str) -> u32 {
         let now = Instant::now();
         let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&index) = table.by_name.get(name) {
             let slot = &mut table.slots[index as usize];
             slot.referenced = true;
             slot.last_used = now;
-            return self.address_of(index);
+            return index;
         }
         let name: Arc<str> = Arc::from(name);
         self.assigned.fetch_add(1, Ordering::Relaxed);
@@ -370,16 +423,19 @@ impl FakeIpPool {
         };
         let index = index as u32;
         table.by_name.insert(name, index);
-        self.address_of(index)
+        index
     }
 
     /// The name `address` maps to, marking it used; `None` outside the
     /// range or for an address no name holds.
     pub fn lookup(&self, address: IpAddr) -> Option<Arc<str>> {
-        let IpAddr::V4(v4) = address else {
+        if !self.contains(address) {
             return None;
+        }
+        let index = match address {
+            IpAddr::V4(v4) => u32::from(v4).checked_sub(self.first)? as usize,
+            IpAddr::V6(v6) => usize::try_from(u128::from(v6).checked_sub(self.v6?.first)?).ok()?,
         };
-        let index = u32::from(v4).checked_sub(self.first)? as usize;
         let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
         let slot = table.slots.get_mut(index)?;
         let name = slot.name.clone()?;
@@ -438,6 +494,23 @@ impl FakeIpPool {
     fn address_of(&self, index: u32) -> Ipv4Addr {
         Ipv4Addr::from(self.first + index)
     }
+}
+
+/// `x::/len` with 8 <= len <= 96, the network address aligned.
+fn parse_range6(range: &str) -> Result<(u128, u8), &'static str> {
+    const INVALID: &str = "dns fake_ip range6 must be an IPv6 network from /8 to /96";
+    let (address, prefix) = range.trim().split_once('/').ok_or(INVALID)?;
+    let address: Ipv6Addr = address.parse().map_err(|_| INVALID)?;
+    let prefix: u8 = prefix.parse().map_err(|_| INVALID)?;
+    if !(8..=96).contains(&prefix) {
+        return Err(INVALID);
+    }
+    let network = u128::from(address);
+    let mask = u128::MAX << (128 - u32::from(prefix));
+    if network & mask != network {
+        return Err(INVALID);
+    }
+    Ok((network, prefix))
 }
 
 /// `a.b.c.d/len` with 8 <= len <= 22, the network address aligned.
@@ -570,6 +643,59 @@ mod tests {
     }
 
     #[test]
+    fn range6_answers_aaaa_from_the_same_slot() {
+        let pool = FakeIpPool::from_config(&FakeIpConfig {
+            range6: Some("fc00::/18".to_string()),
+            ..config(16)
+        })
+        .unwrap()
+        .unwrap();
+        assert!(pool.has_ipv6());
+        let FakeAnswer::Reply(reply) = pool.answer(&query("www.example.com", TYPE_AAAA)) else {
+            panic!("expected a fake AAAA answer");
+        };
+        assert_eq!(&reply[6..8], &[0, 1], "one answer");
+        let fake: Ipv6Addr = "fc00::100".parse().unwrap();
+        let mut tail = vec![0, 0, 0, 1, 0, 16];
+        tail.extend_from_slice(&fake.octets());
+        assert!(
+            reply.ends_with(&tail),
+            "TTL 1, first address after the reserved block"
+        );
+        // The A answer for the name uses the same slot.
+        assert_eq!(pool.assign("www.example.com"), Ipv4Addr::new(198, 18, 1, 0));
+        assert_eq!(pool.assign6("www.example.com"), Some(fake));
+        assert_eq!(pool.stats().entries, 1);
+        assert_eq!(
+            pool.lookup(IpAddr::V6(fake)).as_deref(),
+            Some("www.example.com")
+        );
+        assert!(pool.contains(IpAddr::V6("fc00:3fff::1".parse().unwrap())));
+        assert!(!pool.contains(IpAddr::V6("fc00:4000::1".parse().unwrap())));
+        assert_eq!(pool.lookup(IpAddr::V6("fc00::1".parse().unwrap())), None);
+        assert_eq!(pool.lookup(IpAddr::V6("fc00::200".parse().unwrap())), None);
+        // Service hints stay empty.
+        let FakeAnswer::Reply(reply) = pool.answer(&query("www.example.com", TYPE_HTTPS)) else {
+            panic!("expected an empty answer");
+        };
+        assert_eq!(&reply[6..8], &[0, 0]);
+
+        // Without range6, no IPv6 address is fake.
+        let v4_only = pool_with_names(&[]);
+        assert!(!v4_only.has_ipv6());
+        assert!(!v4_only.contains(IpAddr::V6(fake)));
+        assert_eq!(v4_only.assign6("www.example.com"), None);
+    }
+
+    fn pool_with_names(names: &[&str]) -> Arc<FakeIpPool> {
+        let pool = pool(16);
+        for name in names {
+            pool.assign(name);
+        }
+        pool
+    }
+
+    #[test]
     fn the_filter_keeps_real_answers() {
         let pool = FakeIpPool::from_config(&FakeIpConfig {
             filter: vec!["+.corp.example".to_string(), "api.*.example".to_string()],
@@ -622,6 +748,19 @@ mod tests {
                 ..config(16)
             };
             assert!(FakeIpPool::from_config(&section).is_err(), "{range}");
+        }
+        for range6 in [
+            "fc00::1/18",
+            "fc00::/7",
+            "fc00::/97",
+            "198.18.0.0/15",
+            "fc00::",
+        ] {
+            let section = FakeIpConfig {
+                range6: Some(range6.to_string()),
+                ..config(16)
+            };
+            assert!(FakeIpPool::from_config(&section).is_err(), "{range6}");
         }
         assert!(FakeIpPool::from_config(&config(0)).is_err());
         assert!(FakeIpPool::from_config(&config(MAX_FAKE_IP_ENTRIES + 1)).is_err());

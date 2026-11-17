@@ -48,7 +48,10 @@ pub mod delay;
 pub mod direct;
 pub mod dns;
 pub mod dns_cache;
+pub mod dns_client;
 pub mod dns_policy;
+#[cfg(feature = "dns-quic")]
+pub mod dns_quic;
 pub mod dns_resolver;
 pub mod fake_ip;
 #[cfg(feature = "local-proxy")]

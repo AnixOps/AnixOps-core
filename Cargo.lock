@@ -874,6 +874,7 @@ dependencies = [
  "tls-mimic",
  "tokio",
  "tokio-rustls",
+ "transport-quic",
  "transport-tls",
  "windows-sys 0.61.2",
 ]

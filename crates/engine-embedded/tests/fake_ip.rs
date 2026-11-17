@@ -122,6 +122,38 @@ fn a_fake_address_goes_out_by_name() {
 }
 
 #[test]
+fn a_fake_ipv6_address_goes_out_by_name() {
+    let pool = FakeIpPool::from_config(&FakeIpConfig {
+        enabled: true,
+        range6: Some("fc00::/18".to_string()),
+        ..FakeIpConfig::default()
+    })
+    .unwrap()
+    .unwrap();
+    let node = Recording::new("test-node");
+    let dispatcher = Dispatcher::single(node.clone()).with_fake_ip(Some(pool.clone()));
+    let address = pool.assign6("v6.example.com").unwrap();
+    let target = TargetAddr::Ip(SocketAddr::new(IpAddr::V6(address), 443));
+    runtime().block_on(async {
+        round_trip(&dispatcher, &target, None).await;
+        // A real IPv6 address is left alone.
+        let real = TargetAddr::Ip("[2001:db8::1]:443".parse().unwrap());
+        round_trip(&dispatcher, &real, None).await;
+        // An unused address of the range maps to no name: refused.
+        let unused = TargetAddr::Ip("[fc00::3:1]:443".parse().unwrap());
+        assert!(dispatcher.connect_flow(&unused, None).await.is_err());
+    });
+    assert_eq!(
+        node.targets(),
+        vec![
+            TargetAddr::Domain("v6.example.com".to_string(), 443),
+            TargetAddr::Ip("[2001:db8::1]:443".parse().unwrap()),
+        ]
+    );
+    assert_eq!(pool.stats().misses, 1);
+}
+
+#[test]
 fn domain_rules_match_the_name_of_a_fake_address() {
     let pool = pool();
     let node = Recording::new("test-node");

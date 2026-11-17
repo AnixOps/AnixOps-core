@@ -8,7 +8,8 @@
 //! proxy. [`PolicyResolver`] asks the `dns` section instead: hosts answer
 //! locally, DNS rules pick the server, a `proxy` server is reached through
 //! [`RoutedOutbound::dns_outbound`] (never DIRECT by a rule) and a `direct`
-//! one through the DIRECT outbound, the same way the tunnel forwards an app's
+//! or `system` one through the DIRECT outbound, raced and with the fallback
+//! as [`crate::dns_client`] does, the same way the tunnel forwards an app's
 //! query. Answers are kept for their TTL.
 
 use std::collections::HashMap;
@@ -22,7 +23,7 @@ use engine_outbound::{BoxFuture, TcpOutbound};
 
 use crate::config::DnsVia;
 use crate::dns::{self, TYPE_A, TYPE_AAAA};
-use crate::dns_cache::{self, UpstreamPool};
+use crate::dns_cache::{self, DnsPools};
 use crate::dns_policy::{DnsPolicy, Plan};
 use crate::routing::{DomainResolver, RoutedOutbound};
 
@@ -38,7 +39,7 @@ const MAX_CACHE_TTL: Duration = Duration::from_secs(600);
 pub struct PolicyResolver {
     policy: Arc<DnsPolicy>,
     routed: OnceLock<Weak<RoutedOutbound>>,
-    pool: Mutex<UpstreamPool>,
+    pools: DnsPools,
     cache: Mutex<HashMap<String, (IpAddr, Instant)>>,
     next_id: AtomicU16,
 }
@@ -51,7 +52,7 @@ impl PolicyResolver {
         Arc::new(Self {
             policy,
             routed: OnceLock::new(),
-            pool: Mutex::default(),
+            pools: DnsPools::default(),
             cache: Mutex::default(),
             next_id: AtomicU16::new(seed),
         })
@@ -102,31 +103,20 @@ impl PolicyResolver {
     async fn forward(
         &self,
         routed: &RoutedOutbound,
-        server: usize,
+        target: usize,
         query: &[u8],
     ) -> io::Result<Vec<u8>> {
-        let config = &self.policy.servers()[server];
-        let outbound: Arc<dyn TcpOutbound> = match config.via {
-            DnsVia::Direct => routed.direct().clone(),
-            DnsVia::Proxy => routed
-                .dns_outbound(config.upstream.target())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "dns server rejected by routing",
-                    )
-                })?,
+        // Routing that rejects a proxied server gives no outbound for it.
+        let outbound_for = |index: usize| -> Option<Arc<dyn TcpOutbound>> {
+            let server = &self.policy.servers()[index];
+            match (server.via, server.upstream.target()) {
+                (DnsVia::Proxy, Some(address)) => routed.dns_outbound(address),
+                _ => Some(routed.direct().clone()),
+            }
         };
-        let pool_key = (server, Arc::as_ptr(&outbound) as *const () as usize);
-        dns::exchange(
-            &config.upstream,
-            outbound.as_ref(),
-            query,
-            self.policy.timeout(),
-            Some((&self.pool, pool_key)),
-        )
-        .await
-        .map_err(|failure| io::Error::other(failure.as_str()))
+        crate::dns_client::resolve(&self.policy, target, query, &outbound_for, &self.pools)
+            .await
+            .map_err(|failure| io::Error::other(failure.as_str()))
     }
 
     fn cached(&self, name: &str) -> Option<(IpAddr, Instant)> {
