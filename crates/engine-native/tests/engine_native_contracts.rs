@@ -543,18 +543,12 @@ fn runtime_handle_contract_builds_foreground_handoff_status() {
 
 #[test]
 fn runtime_handle_contract_binds_and_releases_loopback_tcp_listener() {
-    let port = unused_loopback_port();
-    let listener = LoopbackListenerHandle::from_descriptor(&local_tcp_listener_with_bind(
+    let (port, bound_listener) = bind_local_tcp_loopback_listener_with_retry(
         "bound-loopback-local-tcp",
-        "127.0.0.1",
-        port,
         ListenerRoute::DefaultAction(RouteAction::Proxy {
             node_id: "node-1".to_string(),
         }),
-    ))
-    .expect("loopback tcp listener handle should be representable");
-    let bound_listener = BoundLoopbackTcpListenerHandle::bind(listener)
-        .expect("loopback tcp listener should bind on an available port");
+    );
     let outbound = NativeOutboundHandlerHandle::from_node(&node())
         .expect("socks outbound handler handle should be representable");
 
@@ -591,18 +585,12 @@ fn runtime_handle_contract_binds_and_releases_loopback_tcp_listener() {
 
 #[test]
 fn runtime_accept_loop_contract_accepts_loopback_tcp_connection_and_shuts_down() {
-    let port = unused_loopback_port();
-    let listener = LoopbackListenerHandle::from_descriptor(&local_tcp_listener_with_bind(
+    let (port, bound_listener) = bind_local_tcp_loopback_listener_with_retry(
         "accept-loopback-local-tcp",
-        "127.0.0.1",
-        port,
         ListenerRoute::DefaultAction(RouteAction::Proxy {
             node_id: "node-1".to_string(),
         }),
-    ))
-    .expect("loopback tcp listener handle should be representable");
-    let bound_listener = BoundLoopbackTcpListenerHandle::bind(listener)
-        .expect("loopback tcp listener should bind on an available port");
+    );
     let mut outbound_node = node();
     outbound_node.endpoint.host = "outbound.example".to_string();
     let outbound = NativeOutboundHandlerHandle::from_node(&outbound_node)
@@ -874,18 +862,12 @@ fn runtime_accept_loop_contract_writes_client_success_response_and_relays_finite
 
 #[test]
 fn runtime_accept_loop_contract_reports_unsupported_socks5_auth_methods_before_close() {
-    let port = unused_loopback_port();
-    let listener = LoopbackListenerHandle::from_descriptor(&local_tcp_listener_with_bind(
+    let (port, bound_listener) = bind_local_tcp_loopback_listener_with_retry(
         "unsupported-auth-accept-loopback-local-tcp",
-        "127.0.0.1",
-        port,
         ListenerRoute::DefaultAction(RouteAction::Proxy {
             node_id: "node-1".to_string(),
         }),
-    ))
-    .expect("loopback tcp listener handle should be representable");
-    let bound_listener = BoundLoopbackTcpListenerHandle::bind(listener)
-        .expect("loopback tcp listener should bind on an available port");
+    );
     let outbound = NativeOutboundHandlerHandle::from_node(&node())
         .expect("socks outbound handler handle should be representable");
 
@@ -923,18 +905,12 @@ fn runtime_accept_loop_contract_reports_unsupported_socks5_auth_methods_before_c
 
 #[test]
 fn runtime_accept_loop_contract_reports_unsupported_socks5_command_before_close() {
-    let port = unused_loopback_port();
-    let listener = LoopbackListenerHandle::from_descriptor(&local_tcp_listener_with_bind(
+    let (port, bound_listener) = bind_local_tcp_loopback_listener_with_retry(
         "unsupported-command-accept-loopback-local-tcp",
-        "127.0.0.1",
-        port,
         ListenerRoute::DefaultAction(RouteAction::Proxy {
             node_id: "node-1".to_string(),
         }),
-    ))
-    .expect("loopback tcp listener handle should be representable");
-    let bound_listener = BoundLoopbackTcpListenerHandle::bind(listener)
-        .expect("loopback tcp listener should bind on an available port");
+    );
     let outbound = NativeOutboundHandlerHandle::from_node(&node())
         .expect("socks outbound handler handle should be representable");
 
@@ -2694,18 +2670,12 @@ fn socks5_connect_browser_capture_proof_token_uses_connect_authority_and_proxy_u
 
 #[test]
 fn runtime_accept_loop_contract_applies_mitm_connect_reject_before_outbound() {
-    let port = unused_loopback_port();
-    let listener = LoopbackListenerHandle::from_descriptor(&local_tcp_listener_with_bind(
+    let (port, bound_listener) = bind_local_tcp_loopback_listener_with_retry(
         "mitm-reject-accept-loopback-local-tcp",
-        "127.0.0.1",
-        port,
         ListenerRoute::DefaultAction(RouteAction::Proxy {
             node_id: "node-1".to_string(),
         }),
-    ))
-    .expect("loopback tcp listener handle should be representable");
-    let bound_listener = BoundLoopbackTcpListenerHandle::bind(listener)
-        .expect("loopback tcp listener should bind on an available port");
+    );
     let outbound = NativeOutboundHandlerHandle::from_node(&NodeDescriptor {
         endpoint: Endpoint {
             host: "127.0.0.1".to_string(),
@@ -4132,18 +4102,12 @@ fn socks5_connect_target_contract_reports_invalid_and_incomplete_targets() {
 
 #[test]
 fn runtime_handle_contract_releases_accept_loop_on_runtime_release() {
-    let port = unused_loopback_port();
-    let listener = LoopbackListenerHandle::from_descriptor(&local_tcp_listener_with_bind(
+    let (port, bound_listener) = bind_local_tcp_loopback_listener_with_retry(
         "release-accept-loopback-local-tcp",
-        "127.0.0.1",
-        port,
         ListenerRoute::DefaultAction(RouteAction::Proxy {
             node_id: "node-1".to_string(),
         }),
-    ))
-    .expect("loopback tcp listener handle should be representable");
-    let bound_listener = BoundLoopbackTcpListenerHandle::bind(listener)
-        .expect("loopback tcp listener should bind on an available port");
+    );
     let outbound = NativeOutboundHandlerHandle::from_node(&node())
         .expect("socks outbound handler handle should be representable");
     let accept_loop = NativeLoopbackTcpAcceptLoopHandle::start(bound_listener, outbound)
@@ -5464,23 +5428,40 @@ fn bind_http_loopback_listener_with_retry(
     listener_id: &str,
     route: ListenerRoute,
 ) -> (u16, BoundLoopbackTcpListenerHandle) {
+    bind_loopback_listener_with_retry(listener_id, |port| {
+        http_listener_with_bind(listener_id, "127.0.0.1", port, route.clone())
+    })
+}
+
+fn bind_local_tcp_loopback_listener_with_retry(
+    listener_id: &str,
+    route: ListenerRoute,
+) -> (u16, BoundLoopbackTcpListenerHandle) {
+    bind_loopback_listener_with_retry(listener_id, |port| {
+        local_tcp_listener_with_bind(listener_id, "127.0.0.1", port, route.clone())
+    })
+}
+
+/// The listener contract requires an explicit port, so tests probe an
+/// ephemeral port and release it before the handle binds. Tests run in
+/// parallel, and another test's listener or outgoing connection can take the
+/// probed port in between; only that bind race is retried with a new port.
+fn bind_loopback_listener_with_retry(
+    listener_id: &str,
+    descriptor: impl Fn(u16) -> ListenerDescriptor,
+) -> (u16, BoundLoopbackTcpListenerHandle) {
     for _ in 0..16 {
         let port = unused_loopback_port();
-        let listener = LoopbackListenerHandle::from_descriptor(&http_listener_with_bind(
-            listener_id,
-            "127.0.0.1",
-            port,
-            route.clone(),
-        ))
-        .expect("HTTP loopback listener handle should be representable");
+        let listener = LoopbackListenerHandle::from_descriptor(&descriptor(port))
+            .expect("loopback listener handle should be representable");
         match BoundLoopbackTcpListenerHandle::bind(listener) {
             Ok(bound_listener) => return (port, bound_listener),
             Err(error) if error.code == ENGINE_NATIVE_START_BIND_FAILED_CODE => continue,
-            Err(error) => panic!(
-                "HTTP loopback listener should be bindable for test {listener_id}: {error:?}"
-            ),
+            Err(error) => {
+                panic!("loopback listener should be bindable for test {listener_id}: {error:?}")
+            }
         }
     }
 
-    panic!("HTTP loopback listener test could not acquire an available port");
+    panic!("loopback listener test {listener_id} could not acquire an available port");
 }
