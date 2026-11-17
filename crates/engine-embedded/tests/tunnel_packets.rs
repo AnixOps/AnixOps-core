@@ -115,6 +115,7 @@ fn settings() -> TunnelSettings {
             SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
             Duration::from_secs(5),
         )),
+        worker_threads: 1,
     }
 }
 
@@ -1180,5 +1181,207 @@ fn reject_close_refuses_quic_with_icmp() {
         Tunnel::start(settings(), Arc::new(Rejects(RejectAction::Close)), sink).unwrap();
     assert!(tunnel.input_packet(&udp_to_remote(40201, &[0xc0; 1200])));
     icmp_port_unreachable(&rx, 40201);
+    tunnel.stop();
+}
+
+/// A server that greets first, like SMTP or MySQL, and then echoes.
+fn start_greeting_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            thread::spawn(move || {
+                if stream.write_all(b"220 ready\r\n").is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Opens a TCP flow from `app_port` to `REMOTE:port` and waits for the
+/// server's first bytes without sending any.
+fn greeting(tunnel: &Tunnel, rx: &Receiver<Vec<u8>>, app_port: u16, port: u16) -> Vec<u8> {
+    let client_isn: u32 = 7000;
+    let mut syn = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(app_port, port, client_isn, 65535)
+        .syn()
+        .write(&mut syn, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&syn));
+    let server_isn = wait_for(rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.syn() && tcp.ack() && tcp.destination_port() == app_port =>
+        {
+            Some(tcp.sequence_number())
+        }
+        _ => None,
+    });
+    let mut ack = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(app_port, port, client_isn + 1, 65535)
+        .ack(server_isn.wrapping_add(1))
+        .write(&mut ack, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&ack));
+    wait_for(rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.destination_port() == app_port && !tcp.payload().is_empty() =>
+        {
+            Some(tcp.payload().to_vec())
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn server_first_ports_connect_without_waiting_for_the_app() {
+    let server = start_greeting_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
+
+    for (app_port, port) in [(41000, 25), (41001, 3306), (41002, 21)] {
+        assert_eq!(greeting(&tunnel, &rx, app_port, port), b"220 ready\r\n");
+    }
+    let stats = tunnel.stats();
+    assert_eq!(stats.tcp_total, 3);
+    assert_eq!(stats.tcp_first_wait_skipped, 3);
+    tunnel.stop();
+}
+
+#[test]
+fn a_destination_that_stayed_silent_is_connected_at_once_next_time() {
+    let server = start_greeting_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
+
+    // Unknown port: the first flow waits for the app, then learns.
+    assert_eq!(greeting(&tunnel, &rx, 42000, 2525), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 0);
+    // The next flow to the same destination does not wait.
+    assert_eq!(greeting(&tunnel, &rx, 42001, 2525), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 1);
+    // Another port on the same address is still sniffed.
+    assert_eq!(greeting(&tunnel, &rx, 42002, 2526), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 1);
+    tunnel.stop();
+}
+
+#[test]
+fn https_waits_for_the_app_even_when_it_is_silent() {
+    let server = start_greeting_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
+
+    let started = Instant::now();
+    assert_eq!(greeting(&tunnel, &rx, 43000, 443), b"220 ready\r\n");
+    // Held for the whole client-first wait (1 s) because nothing came.
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(greeting(&tunnel, &rx, 43001, 443), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 0);
+    tunnel.stop();
+}
+
+#[test]
+fn flows_on_a_multi_thread_tunnel_are_relayed_in_order() {
+    let echo = start_echo_server();
+    let (sink, rx) = capture();
+    let settings = TunnelSettings {
+        worker_threads: 4,
+        max_tcp_connections: 32,
+        ..settings()
+    };
+    let mut tunnel = Tunnel::start(settings, Arc::new(Redirect(echo)), sink).unwrap();
+
+    // Open every flow first, then send on all of them, so their relays run
+    // at the same time on the worker threads.
+    let ports: Vec<u16> = (44000..44016).collect();
+    let mut opened = Vec::new();
+    for &port in &ports {
+        let mut syn = Vec::new();
+        PacketBuilder::ipv4(APP, REMOTE, 64)
+            .tcp(port, 80, 1000, 65535)
+            .syn()
+            .write(&mut syn, &[])
+            .unwrap();
+        assert!(tunnel.input_packet(&syn));
+        let server_isn = wait_for(&rx, |sliced| match &sliced.transport {
+            Some(TransportSlice::Tcp(tcp))
+                if tcp.syn() && tcp.ack() && tcp.destination_port() == port =>
+            {
+                Some(tcp.sequence_number())
+            }
+            _ => None,
+        });
+        opened.push((port, server_isn));
+    }
+    for &(port, server_isn) in &opened {
+        let mut data = Vec::new();
+        PacketBuilder::ipv4(APP, REMOTE, 64)
+            .tcp(port, 80, 1001, 65535)
+            .ack(server_isn.wrapping_add(1))
+            .psh()
+            .write(
+                &mut data,
+                format!("GET /{port} HTTP/1.1\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+        assert!(tunnel.input_packet(&data));
+    }
+    let mut echoed: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+    let deadline = Instant::now() + WAIT;
+    while echoed.len() < ports.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let packet = rx.recv_timeout(left).expect("every flow is echoed");
+        let Ok(sliced) = SlicedPacket::from_ip(&packet) else {
+            continue;
+        };
+        if let Some(TransportSlice::Tcp(tcp)) = &sliced.transport {
+            let port = tcp.destination_port();
+            if ports.contains(&port) && !tcp.payload().is_empty() {
+                // The echo is one small segment; a retransmit repeats it.
+                echoed.entry(port).or_insert_with(|| tcp.payload().to_vec());
+            }
+        }
+    }
+    for port in ports {
+        // Each flow got its own bytes back, whatever thread relayed it.
+        let want = format!("GET /{port} HTTP/1.1\r\n\r\n");
+        assert_eq!(echoed[&port], want.as_bytes(), "port {port}");
+    }
+    let stats = tunnel.stats();
+    assert_eq!(stats.tcp_total, 16);
+    assert_eq!(stats.tcp_connect_failed, 0);
+    tunnel.stop();
+}
+
+#[test]
+fn dns_is_answered_on_a_multi_thread_tunnel() {
+    let config = DnsConfig {
+        hosts: BTreeMap::from([(
+            "example.com".to_string(),
+            vec!["192.0.2.7".parse().unwrap()],
+        )]),
+        ..DnsConfig::default()
+    };
+    let settings = TunnelSettings {
+        dns: Arc::new(DnsPolicy::from_config(&config).unwrap()),
+        worker_threads: 4,
+        ..settings()
+    };
+    let (sink, rx) = capture();
+    let mut tunnel =
+        Tunnel::start(settings, Arc::new(Redirect(start_closing_server())), sink).unwrap();
+    let response = ask(&tunnel, &rx, &dns_query());
+    assert!(response.ends_with(&[192, 0, 2, 7]));
     tunnel.stop();
 }

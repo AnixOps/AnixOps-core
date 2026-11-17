@@ -7,6 +7,8 @@ named <side>-<outbound>-<round>.json.
 --rules FILE: the rule_bench report (decision latency by query kind, gate).
 --scale DIR: tunnel_bench scale-<outbound>.json and udp-sessions.json (gates).
 --soak FILE: the tunnel_bench soak report (memory trend, gate).
+--cores DIR: the head on one tunnel thread vs several, files named
+  w<threads>-<outbound>-<round>.json.
 """
 
 import json
@@ -226,7 +228,40 @@ def soak_summary(path):
         print("</details>")
 
 
+def cores_summary(root):
+    print("### Tunnel threads")
+    print()
+    runs = {}
+    for path in sorted(Path(root).glob("w*.json")):
+        side, outbound, _round = path.stem.split("-", 2)
+        runs.setdefault(outbound, {}).setdefault(int(side[1:]), []).append(json.loads(path.read_text()))
+    if not runs:
+        print("No results.")
+        return
+    print("Head only, median of the rounds on one runner: one tunnel thread vs a multi-thread runtime.")
+    for outbound, sides in sorted(runs.items()):
+        counts = sorted(sides)
+        print()
+        print(f"#### Outbound `{outbound}`")
+        print()
+        print("| Metric | " + " | ".join(f"{n} thread{'s' if n > 1 else ''}" for n in counts) + " | Change |")
+        print("| --- |" + " ---: |" * (len(counts) + 1))
+        for path, label, unit, better in METRICS:
+            values = [median(sides[n], path) for n in counts]
+            change = "–"
+            first, last = values[0], values[-1]
+            if len(values) > 1 and first and last is not None:
+                pct = (last - first) / first * 100
+                good = pct > 0 if better == "higher" else pct < 0
+                mark = "" if abs(pct) < 5 else (" ✅" if good else " ⚠️")
+                change = f"{pct:+.1f}%{mark}"
+            print(f"| {label} ({unit}) | " + " | ".join(fmt(v) for v in values) + f" | {change} |")
+
+
 def main():
+    if len(sys.argv) > 2 and sys.argv[1] == "--cores":
+        cores_summary(sys.argv[2])
+        return
     if len(sys.argv) > 2 and sys.argv[1] == "--soak":
         soak_summary(sys.argv[2])
         return

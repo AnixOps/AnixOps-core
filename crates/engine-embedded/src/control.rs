@@ -22,7 +22,8 @@
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
 //! | `network_changed` | | `{"scheduled": network-change script count}` |
-//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections}` |
+//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped}` |
+//! | `set_network` | optional `type` (`wifi` \| `wired` \| `cellular`), `ssid`, `bssid`, `router`, `addresses` (IPs of the default interface) | `{"changed": bool}`: the network subnet groups match; all fields absent means unknown |
 //! | `run_script` | `tag` | `{"scheduled": bool}` |
 //! | `outbound_health` | | `{"outbounds": [{"node", "protocol", "health"}]}`, only outbounds that report health |
 //! | `resume_outbound` | `node` | `{"resumed": bool}` |
@@ -78,7 +79,16 @@
 //! [`engine_outbound::TcpOutbound::reset_sessions`]) and, unless
 //! `close_connections` is `false`, the open connections are closed so the
 //! apps behind them reconnect at once instead of waiting for a dead path to
-//! time out. It works with or without plugin scripts.
+//! time out. It works with or without plugin scripts. It also forgets every
+//! policy group health check result, which says nothing about the new
+//! network: a group is checked again as soon as a connection goes through
+//! it (see [`crate::routing`]).
+//!
+//! `set_network` tells subnet groups which network the device is on. The
+//! client sends it whenever the network changes, before `reset_network`, so
+//! the reconnecting apps already go through the new pick. The Wi-Fi name
+//! and access point never leave the engine: they are not logged, listed or
+//! exported.
 //!
 //! The script commands need a MITM config with plugin scripts; the client
 //! sends `network_changed` when the device's network changes and polls
@@ -139,6 +149,18 @@ enum ControlRequest {
     ResetNetwork {
         #[serde(default = "default_true")]
         close_connections: bool,
+    },
+    SetNetwork {
+        #[serde(default, rename = "type")]
+        kind: Option<String>,
+        #[serde(default)]
+        ssid: Option<String>,
+        #[serde(default)]
+        bssid: Option<String>,
+        #[serde(default)]
+        router: Option<String>,
+        #[serde(default)]
+        addresses: Vec<String>,
     },
     RunScript {
         tag: String,
@@ -256,6 +278,74 @@ pub struct ScriptNotificationView {
     pub open_url: Option<String>,
 }
 
+/// Most addresses `set_network` takes.
+const MAX_NETWORK_ADDRESSES: usize = 16;
+
+/// Validates a `set_network` request; every field absent means unknown.
+fn network_context(
+    kind: Option<String>,
+    ssid: Option<String>,
+    bssid: Option<String>,
+    router: Option<String>,
+    addresses: Vec<String>,
+) -> Result<Option<config_core::routing::NetworkContext>, RuntimeError> {
+    use config_core::routing::{NetworkCondition, NetworkContext, NetworkKind};
+
+    if kind.is_none()
+        && ssid.is_none()
+        && bssid.is_none()
+        && router.is_none()
+        && addresses.is_empty()
+    {
+        return Ok(None);
+    }
+    let kind = kind
+        .map(|kind| NetworkKind::parse(&kind).ok_or_else(|| invalid("network type is unknown")))
+        .transpose()?;
+    // 802.11 names are at most 32 bytes.
+    if ssid
+        .as_ref()
+        .is_some_and(|ssid| ssid.is_empty() || ssid.len() > 32)
+    {
+        return Err(invalid("ssid must be 1-32 bytes"));
+    }
+    let bssid = bssid
+        .map(
+            |bssid| match NetworkCondition::parse(&format!("BSSID:{bssid}")) {
+                Some(NetworkCondition::Bssid(bssid)) => Ok(bssid),
+                _ => Err(invalid("bssid is not a MAC address")),
+            },
+        )
+        .transpose()?;
+    let router = router
+        .map(|router| {
+            router
+                .trim()
+                .parse()
+                .map_err(|_| invalid("router is not an IP address"))
+        })
+        .transpose()?;
+    if addresses.len() > MAX_NETWORK_ADDRESSES {
+        return Err(invalid("too many network addresses"));
+    }
+    let addresses = addresses
+        .iter()
+        .map(|address| {
+            address
+                .trim()
+                .parse()
+                .map_err(|_| invalid("network address is not an IP address"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(NetworkContext {
+        kind,
+        ssid,
+        bssid,
+        router,
+        addresses,
+    }))
+}
+
 /// Runs one JSON request against the flows of `dispatcher`.
 pub fn handle(dispatcher: &Dispatcher, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
     handle_with_interceptor(dispatcher, None, request)
@@ -323,14 +413,30 @@ pub fn handle_with_interceptor(
             Ok(script(interceptor, ScriptControl::Notifications)?)
         }
         ControlRequest::NetworkChanged => Ok(script(interceptor, ScriptControl::NetworkChanged)?),
+        ControlRequest::SetNetwork {
+            kind,
+            ssid,
+            bssid,
+            router,
+            addresses,
+        } => {
+            let network = network_context(kind, ssid, bssid, router, addresses)?;
+            let changed = dispatcher
+                .routed_outbound()
+                .is_some_and(|routed| routed.set_network(network));
+            Ok(json!({ "changed": changed }))
+        }
         ControlRequest::ResetNetwork { close_connections } => {
+            let health_forgotten = dispatcher
+                .routed_outbound()
+                .map_or(0, |routed| routed.forget_health());
             let reset = dispatcher.reset_sessions();
             let closed = if close_connections {
                 tracker.close_all()
             } else {
                 0
             };
-            Ok(json!({ "reset": reset, "closed": closed }))
+            Ok(json!({ "reset": reset, "closed": closed, "health_forgotten": health_forgotten }))
         }
         ControlRequest::RunScript { tag } => Ok(script(interceptor, ScriptControl::Run { tag })?),
         ControlRequest::OutboundHealth => {

@@ -451,3 +451,150 @@ async fn apps_offering_only_http1_stay_on_http1() {
         .unwrap();
     server.abort();
 }
+
+/// Counts the connections opened through an outbound.
+struct Counting {
+    inner: H2Origin,
+    opened: std::sync::atomic::AtomicUsize,
+}
+
+impl TcpOutbound for Counting {
+    fn protocol(&self) -> &'static str {
+        "test-counting"
+    }
+
+    fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.connect(target)
+    }
+}
+
+#[tokio::test]
+async fn each_http2_stream_is_routed_on_its_own() {
+    use config_core::routing::RoutingSpec;
+    use engine_embedded::routing::RoutedOutbound;
+    use std::sync::atomic::Ordering;
+
+    let device_root = root("NetworkCore Test Device Root");
+    let origin_root = root("NetworkCore Test Origin Root");
+    let engine = Arc::new(
+        MitmEngine::new(&mitm_config(&device_root))
+            .unwrap()
+            .with_upstream_config(trusting(&origin_root.certificate, &[b"http/1.1"])),
+    );
+    let (a_tx, mut a_requests) = mpsc::unbounded_channel();
+    let (b_tx, mut b_requests) = mpsc::unbounded_channel();
+    let a = Arc::new(Counting {
+        inner: H2Origin::new(&origin_root, a_tx),
+        opened: Default::default(),
+    });
+    let b = Arc::new(Counting {
+        inner: H2Origin::new(&origin_root, b_tx),
+        opened: Default::default(),
+    });
+    let nodes = std::collections::BTreeMap::from([
+        ("node-a".to_string(), a.clone() as Arc<dyn TcpOutbound>),
+        ("node-b".to_string(), b.clone() as Arc<dyn TcpOutbound>),
+    ]);
+    let spec = RoutingSpec {
+        rules: vec![
+            r"URL-REGEX,^https://api\.example\.test/video/,node-b".to_string(),
+            r#"AND,((URL-REGEX,"^https://api\.example\.test/ads/"),(DST-PORT,443)),REJECT"#
+                .to_string(),
+            "FINAL,node-a".to_string(),
+        ],
+        groups: Vec::new(),
+    };
+    let (direct_tx, _) = mpsc::unbounded_channel();
+    let direct = Arc::new(H2Origin::new(&origin_root, direct_tx));
+    let routed = RoutedOutbound::new(&spec, direct, nodes).unwrap();
+    let dispatcher = Arc::new(Dispatcher::routed(Arc::new(routed)));
+    let target: SocketAddr = "192.0.2.30:443".parse().unwrap();
+
+    let (app, tunnel_side) = tokio::io::duplex(256 * 1024);
+    let client = tokio::spawn({
+        let config = trusting(&device_root.certificate, &[b"h2", b"http/1.1"]);
+        async move {
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let tls = connector
+                .connect(ServerName::try_from(HOST).unwrap(), app)
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+            let (client, connection) = h2::client::handshake(tls).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let (data, video1, video2, ads) = tokio::join!(
+                send(&client, "GET", "https://api.example.test/data", b""),
+                send(&client, "GET", "https://api.example.test/video/1.ts", b""),
+                send(&client, "GET", "https://api.example.test/video/2.ts", b""),
+                send(&client, "GET", "https://api.example.test/ads/x.js", b""),
+            );
+            assert_eq!(data.body, "h2 /data 0");
+            assert_eq!(video1.body, "h2 /video/1.ts 0");
+            assert_eq!(video2.body, "h2 /video/2.ts 0");
+            assert_eq!(ads.status, StatusCode::FORBIDDEN);
+            // Later streams reuse the second origin connection.
+            let video3 = send(&client, "GET", "https://api.example.test/video/3.ts", b"").await;
+            assert_eq!(video3.body, "h2 /video/3.ts 0");
+        }
+    });
+
+    let mut tunnel_side = tunnel_side;
+    let mut first = vec![0u8; 4096];
+    let n = tunnel_side.read(&mut first).await.unwrap();
+    first.truncate(n);
+    let host = engine.claim(&first, target).expect("intercepted");
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let dispatcher = dispatcher.clone();
+        async move {
+            let outbound = dispatcher.with_host(&host);
+            let flow = InterceptedFlow {
+                inbound: Box::new(tunnel_side),
+                first,
+                host: host.clone(),
+                target,
+            };
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    &outbound,
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), client)
+        .await
+        .expect("client finished")
+        .unwrap();
+    assert_eq!(
+        a_requests.recv().await.unwrap(),
+        "GET https://api.example.test/data 0 -"
+    );
+    let mut on_b = vec![
+        b_requests.recv().await.unwrap(),
+        b_requests.recv().await.unwrap(),
+        b_requests.recv().await.unwrap(),
+    ];
+    on_b.sort();
+    assert_eq!(
+        on_b,
+        vec![
+            "GET https://api.example.test/video/1.ts 0 -",
+            "GET https://api.example.test/video/2.ts 0 -",
+            "GET https://api.example.test/video/3.ts 0 -",
+        ]
+    );
+    // The rejected stream reached no origin.
+    assert!(a_requests.try_recv().is_err());
+    assert!(b_requests.try_recv().is_err());
+    assert_eq!(a.opened.load(Ordering::SeqCst), 1);
+    assert_eq!(b.opened.load(Ordering::SeqCst), 1);
+    server.abort();
+}

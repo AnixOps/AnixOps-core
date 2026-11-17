@@ -17,7 +17,7 @@ use config_core::redirect::{
     RedirectTable, REDIRECT_MATCHER_UNSUPPORTED_CODE, REDIRECT_TARGET_INVALID_CODE,
     REDIRECT_TOO_MANY_CODE,
 };
-use config_core::routing::{PolicyGroupSpec, RoutingRule, RoutingSpec};
+use config_core::routing::{NetworkRuleSpec, PolicyGroupSpec, RoutingRule, RoutingSpec};
 use config_core::rule_set::{BareDomain, RuleSet, RuleSetEntries, MAX_RULE_SET_ENTRIES};
 use engine_outbound::mux::{MuxConfig, MuxOutbound};
 use engine_outbound::registry::{OutboundRegistry, Settings};
@@ -188,10 +188,53 @@ pub struct RoutingConfig {
     /// Lists named by `RULE-SET,<name>,<target>` rules.
     #[serde(default)]
     pub rule_sets: BTreeMap<String, RuleSetConfig>,
+    /// Rule scripts named by `SCRIPT,<name>,<target>` rules (see
+    /// [`crate::rule_scripts`]); needs the `scripts` feature.
+    #[serde(default)]
+    pub scripts: BTreeMap<String, RuleScriptConfig>,
     /// Where the global mode sends every connection: a policy group id, a
     /// node id or `DIRECT`. Defaults to the first group, else the first node.
     #[serde(default)]
     pub global: Option<String>,
+}
+
+/// One rule script: the local file the client saved it to, the
+/// `$argument` it sees, and how long it may run (1 to 3 seconds, default 1).
+/// The file is read once when the engine starts.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleScriptConfig {
+    pub path: String,
+    #[serde(default)]
+    pub argument: String,
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
+}
+
+impl RuleScriptConfig {
+    fn load(&self) -> Result<crate::rule_scripts::RuleScript, RuntimeError> {
+        use crate::rule_scripts::{DEFAULT_TIMEOUT_SECS, MAX_SCRIPT_BYTES, MAX_TIMEOUT_SECS};
+        let timeout_secs = self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        if !(1..=MAX_TIMEOUT_SECS).contains(&timeout_secs) || self.argument.len() > 4096 {
+            return Err(rejected("rule script timeout or argument is out of range"));
+        }
+        let unreadable = || rejected("a rule script file is unreadable or too large");
+        let file = std::fs::File::open(&self.path).map_err(|_| unreadable())?;
+        let mut source = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(file, MAX_SCRIPT_BYTES as u64 + 1),
+            &mut source,
+        )
+        .map_err(|_| unreadable())?;
+        if source.len() > MAX_SCRIPT_BYTES {
+            return Err(unreadable());
+        }
+        Ok(crate::rule_scripts::RuleScript {
+            source: source.into(),
+            argument: self.argument.clone(),
+            timeout: std::time::Duration::from_secs(u64::from(timeout_secs)),
+        })
+    }
 }
 
 /// One rule set. `RULE-SET,<name>` rules match it by name; the sets named
@@ -340,6 +383,9 @@ pub struct PolicyGroupConfig {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: String,
+    /// Absent for a `subnet` group, whose members are its network rule
+    /// targets and its default.
+    #[serde(default)]
     pub members: Vec<String>,
     #[serde(default)]
     pub default: Option<String>,
@@ -349,6 +395,28 @@ pub struct PolicyGroupConfig {
     pub interval_secs: Option<u32>,
     #[serde(default)]
     pub tolerance_ms: Option<u16>,
+    /// Health-checked groups: a connection waits for a check while the
+    /// group has no result (first use, after the network changed) instead
+    /// of taking the first member.
+    #[serde(default)]
+    pub evaluate_before_use: bool,
+    /// `subnet` groups: the first rule whose `when` matches the network the
+    /// client reported with the `set_network` control command picks the
+    /// target, else `default`.
+    #[serde(default)]
+    pub network_rules: Vec<NetworkRuleConfig>,
+}
+
+/// Most network rules one `subnet` group may have.
+pub const MAX_NETWORK_RULES: usize = 64;
+
+/// One rule of a `subnet` group; see
+/// [`config_core::routing::NetworkRuleSpec`] for `when`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkRuleConfig {
+    pub when: String,
+    pub target: String,
 }
 
 /// The `dns` section; see [`crate::dns_policy`].
@@ -584,6 +652,11 @@ pub struct Limits {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// Threads the tunnel runs on, 1 to 16; 0 (the default) picks for the
+    /// platform: 1 on iOS and Android, the CPUs available (at most 4) on
+    /// desktop. iOS and Android always use 1.
+    #[serde(default)]
+    pub worker_threads: usize,
 }
 
 impl Default for Limits {
@@ -595,6 +668,7 @@ impl Default for Limits {
             tcp_window_bytes: default_tcp_window_bytes(),
             idle_timeout_secs: default_idle_timeout_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
+            worker_threads: 0,
         }
     }
 }
@@ -745,10 +819,24 @@ impl RuntimeConfig {
                     || routing.outbounds.len() > MAX_ROUTED_OUTBOUNDS
                     || routing.rules.len() > MAX_ROUTING_RULES
                     || routing.groups.len() > MAX_POLICY_GROUPS
+                    || routing
+                        .groups
+                        .iter()
+                        .any(|group| group.network_rules.len() > MAX_NETWORK_RULES)
                     || routing.rule_sets.len() > MAX_RULE_SETS
                     || rule_set_entries > MAX_RULE_SET_ENTRIES
                 {
                     return Err(rejected("routing section size is out of range"));
+                }
+                if routing.scripts.len() > crate::rule_scripts::MAX_RULE_SCRIPTS
+                    || !routing.scripts.keys().all(|name| is_identifier(name))
+                {
+                    return Err(rejected(
+                        "rule script names must be 1-128 characters of [A-Za-z0-9._-], at most 32",
+                    ));
+                }
+                if !routing.scripts.is_empty() && !cfg!(feature = "scripts") {
+                    return Err(rejected("SCRIPT rules are not supported by this build"));
                 }
                 if !routing.rule_sets.keys().all(|name| is_identifier(name)) {
                     return Err(rejected(
@@ -775,6 +863,7 @@ impl RuntimeConfig {
             || limits.tcp_window_bytes > 1024 * 1024
             || limits.idle_timeout_secs == 0
             || limits.connect_timeout_secs == 0
+            || limits.worker_threads > crate::tunnel::MAX_WORKER_THREADS
             || self.dns.timeout_ms == 0
         {
             return Err(rejected("resource limits are out of range"));
@@ -891,6 +980,15 @@ impl RuntimeConfig {
                     url: group.url.clone(),
                     interval_secs: group.interval_secs,
                     tolerance_ms: group.tolerance_ms,
+                    evaluate_before_use: group.evaluate_before_use,
+                    network_rules: group
+                        .network_rules
+                        .iter()
+                        .map(|rule| NetworkRuleSpec {
+                            when: rule.when.clone(),
+                            target: rule.target.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         };
@@ -917,6 +1015,12 @@ impl RuntimeConfig {
         if let Some(global) = &routing.global {
             routed = routed.with_global(global)?;
         }
+        let scripts = routing
+            .scripts
+            .iter()
+            .map(|(name, script)| Ok((name.clone(), script.load()?)))
+            .collect::<Result<BTreeMap<_, _>, RuntimeError>>()?;
+        let routed = routed.with_rule_scripts(crate::rule_scripts::RuleScripts::new(scripts))?;
         // IP rules resolve names with the `dns` section, never the system
         // resolver, so a proxied name is not looked up in the clear.
         let policy = DnsPolicy::from_config(&self.dns).map_err(rejected)?;
@@ -1093,6 +1197,14 @@ fn build_single_outbound(
     {
         return Err(rejected(
             "this protocol opens its own sockets and cannot run through a via",
+        ));
+    }
+    if outbound.via.is_some()
+        && outbound.kind == crate::direct::PROTOCOL
+        && outbound.settings.contains_key("interface")
+    {
+        return Err(rejected(
+            "a direct outbound bound to an interface cannot run through a via",
         ));
     }
     let built = registry

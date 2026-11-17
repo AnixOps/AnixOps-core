@@ -4,9 +4,9 @@
 
 ## 范围
 
-- 规则：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`（可带 `no-resolve`）、`GEOIP`、`GEOSITE`、`DST-PORT`（别名 `DEST-PORT`，单个端口或 `起-止`）、`PROCESS-NAME`、`RULE-SET`、逻辑规则 `AND`/`OR`/`NOT`、`FINAL`。
+- 规则：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`（可带 `no-resolve`）、`GEOIP`、`GEOSITE`、`DST-PORT`（别名 `DEST-PORT`，单个端口或 `起-止`）、`SRC-IP`（别名 `SRC-IP-CIDR`，地址或网段，IPv6 可加方括号）、`IN-PORT`（入站监听端口，单个或 `起-止`）、`PROCESS-NAME`、`RULE-SET`、`SCRIPT`（规则脚本，不能放在逻辑规则里）、逻辑规则 `AND`/`OR`/`NOT`、`FINAL`。
 - 逻辑规则采用 Surge 写法：`AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443)),Proxy`、`NOT,((DOMAIN-KEYWORD,ads)),DIRECT`；子规则不带目标，可以嵌套（最多 8 层），`NOT` 只能有一个子规则。含 IP 子规则的逻辑规则按 IP 规则处理，可带 `no-resolve`。
-- 策略组：`select`、`url-test`、`fallback`、`load-balance`（按目的主机一致性哈希）、`round-robin`（轮询）。
+- 策略组：`select`、`url-test`、`fallback`、`load-balance`（按目的主机一致性哈希）、`round-robin`（轮询）、`subnet`（按设备当前网络选目标，Surge `subnet` / 旧 `ssid` 组）。
 - 目标：`DIRECT`、`REJECT` 系列（`REJECT`、`REJECT-NO-DROP`、`REJECT-DROP`、`REJECT-TINYGIF`，Loon `REJECT-IMG` 等同 `REJECT-TINYGIF`）、策略组 id、节点 id（保留名大小写不敏感）。
 - 非目标：`USER-AGENT`、`URL-REGEX`、`relay` 组。
 
@@ -34,6 +34,19 @@ members = ["hk-1", "jp-1"]
 url = "https://www.gstatic.com/generate_204"   # 默认值
 interval_secs = 300                            # 默认值
 tolerance_ms = 50                              # 默认值，仅 url-test
+evaluate_before_use = false                    # 默认值，仅测速组
+
+[[policy_groups]]
+id = "ByNetwork"
+type = "subnet"            # 没有 members，成员即 default 与各规则的目标
+default = "Proxy"          # 必填：没有规则命中或网络未知时使用
+network_rules = [
+  { when = "SSID:Home", target = "DIRECT" },        # Wi-Fi 名，区分大小写
+  { when = "BSSID:aa:bb:cc:dd:ee:ff", target = "DIRECT" },
+  { when = "ROUTER:192.168.1.1", target = "DIRECT" }, # 默认网关
+  { when = "SUBNET:10.8.0.0/16", target = "DIRECT" }, # 设备地址所在网段
+  { when = "TYPE:CELLULAR", target = "Auto" },        # WIFI | WIRED | CELLULAR，也可写 CELLULAR
+]
 ```
 
 `rules` 或 `policy_groups` 任一出现时，`parse_config_document` 产出 `ParsedConfigDocument.routing`；未出现时为 `None`，现有 `routes` 默认动作不受影响。
@@ -42,7 +55,8 @@ tolerance_ms = 50                              # 默认值，仅 url-test
 
 - 规则必须以且仅以一条 `FINAL` 结尾；错误信息带规则序号，不回显节点凭据。
 - 目标解析顺序：`DIRECT`/`REJECT` 系列 → 策略组 id → 节点 id；策略组 id 不得与节点 id、保留名（含全部 `REJECT` 系列名字）重复。其他 `REJECT-*` 名字（`REJECT-200`、`REJECT-DICT` 等只在解密后才有意义的应答）不是分流目标。
-- 组成员不能是任何 `REJECT` 策略；只有 `select` 可以包含其他组；`url-test`/`fallback`/`load-balance`/`round-robin` 成员只能是节点或 `DIRECT`；只有 `url-test` 可写 `tolerance_ms`。
+- 组成员不能是任何 `REJECT` 策略；只有 `select` 与 `subnet` 可以包含其他组；`url-test`/`fallback`/`load-balance`/`round-robin` 成员只能是节点或 `DIRECT`；只有 `url-test` 可写 `tolerance_ms`；只有这四种测速组可写 `evaluate_before_use`。
+- `subnet` 组必须有 `default`，不能写 `members` 与测速字段；`network_rules` 只能出现在 `subnet` 组，`when` 必须是上面五种前缀之一（`config.core.routing_group_network_rule_invalid`）。
 - 组之间不得成环；重复成员按首次出现去重。
 - 域名统一小写、去掉结尾点；`DOMAIN-SUFFIX` 去掉开头点，匹配自身与全部子域名；`DOMAIN-KEYWORD` 匹配包含该子串的域名。
 - CIDR 归一化为网络地址（`10.1.2.3/8` → `10.0.0.0/8`）。
@@ -56,7 +70,7 @@ tolerance_ms = 50                              # 默认值，仅 url-test
 - `RoutingModel::route_to` 跳过规则直接解析一个目标（全局模式），`group_member` 给出组当前选择，`target_named` 按规则目标的方式解析名称。
 - `RuleMatcher` 的 `Display` 输出不带目标的规则行，供连接列表显示命中规则。
 - 第一条不带 `no-resolve` 的 IP 规则触发一次解析，之后所有 IP 规则使用解析结果，与 sing-box `resolve` 动作一致。解析失败时连接被拒绝（`RouteMatch::ResolveFailed`），与 sing-box 一致，不会落到 `FINAL`；需要远端解析的域名应放在 IP 规则之前用域名规则分流，或给 IP 规则加 `no-resolve`。engine-embedded 里这次解析走运行时配置的 `dns` 设置（`PolicyResolver`，见 `embedded-dns.md`「DNS 泄露核对」），不用系统解析器。
-- 组选择：`select` 用环境选择 → `default` → 第一个成员；`url-test` 取延迟最低的成员（无结果时取第一个）；`fallback` 取第一个有测速结果的成员（都没有时取第一个）；`load-balance` 在有测速结果的成员（都没有时为全部成员）中按目的域名（无域名时为 IP）做 rendezvous 哈希（FNV-1a），同一主机固定到同一成员，某成员下线时只有原本落在它上面的主机会换成员；`round-robin` 在同样的成员中按 `RoutingEnvironment::round_robin` 计数轮流选择。`group_member`（策略页显示）没有连接时返回第一个健康成员。
+- 组选择：`select` 用环境选择 → `default` → 第一个成员；`url-test` 取延迟最低的成员（无结果时取第一个），但当前成员（`RoutingEnvironment::url_test_current`）仍有结果且不比最快的慢超过 `tolerance_ms` 时保持不变；`subnet` 按顺序取第一条与 `RoutingEnvironment::network` 相符的规则的目标，都不符或网络未知时取 `default`；`fallback` 取第一个有测速结果的成员（都没有时取第一个）；`load-balance` 在有测速结果的成员（都没有时为全部成员）中按目的域名（无域名时为 IP）做 rendezvous 哈希（FNV-1a），同一主机固定到同一成员，某成员下线时只有原本落在它上面的主机会换成员；`round-robin` 在同样的成员中按 `RoutingEnvironment::round_robin` 计数轮流选择。`group_member`（策略页显示）没有连接时返回第一个健康成员。
 - `RouteResolution` 返回命中规则序号或 `FINAL`、规则目标、经过的组路径、最终 `Direct/Reject/Node(id)` 与解析出的地址，可直接用于诊断页。
 
 ## sing-box 翻译（engine-singbox）
@@ -101,7 +115,7 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 
 `import_subscription_routing(content, &nodes) -> ImportedRouting { routing, diagnostics }` 从订阅原文再读一遍规则和策略组，`nodes` 是同一份订阅解析出的节点：
 
-- Surge/Loon：`[Proxy Group]` 行 `名称 = 类型, 成员, 成员, url=..., interval=..., tolerance=...`，`[Rule]` 段规则行。
+- Surge/Loon：`[Proxy Group]` 行 `名称 = 类型, 成员, 成员, url=..., interval=..., tolerance=..., evaluate-before-use=true`，`[Rule]` 段规则行。Surge `subnet` 组（`default = A, "SSID:Home" = DIRECT, "TYPE:CELLULAR" = B`）与旧 `ssid` 组（`default = A, cellular = B, "Home" = DIRECT`，裸名按 SSID）导入为 `subnet`；不认识的键、目标未导入的规则跳过并告警，`default` 无法导入时整组跳过。
 - Clash YAML：`proxy-groups`（`name`/`type`/`proxies`/`url`/`interval`/`tolerance`）与 `rules`，`MATCH` 视为 `FINAL`。
 - 成员和规则目标按代理名称映射到节点 id，策略组 id 保留原名称；`REJECT`、`REJECT-NO-DROP`、`REJECT-DROP`、`REJECT-TINYGIF`（Loon `REJECT-IMG`）保留各自含义，其余 `REJECT-*`（Loon `REJECT-200`、`REJECT-DICT`、`REJECT-ARRAY`、`REJECT-VIDEO`）视为 `REJECT`；规则只保留 `no-resolve` 选项。
 - 导入的规则类型：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`、`GEOIP`、`GEOSITE`、`DST-PORT`/`DEST-PORT`、`PROCESS-NAME`、`RULE-SET`、Surge `DOMAIN-SET` 和 `AND`/`OR`/`NOT`。`GEOSITE,<c>` 与 `GEOIP,<CC>` 原样保留，由客户端提供 `geosite-<c>`、`geoip-<cc>` 规则集。
@@ -121,8 +135,14 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 
 - 运行时配置新增 `routing` 段（与 `outbound` 二选一）：`outbounds` 以节点 id 为键，`rules` 与 `groups` 字段同 `RoutingSpec`/`PolicyGroupSpec`。路由节点必须是 TCP 出站（Shadowsocks-2022、direct）；WireGuard 是包级隧道，只能作为单一 `outbound` 使用。
 - `engine_embedded::routing::RoutedOutbound` 对每个连接调用 `decide`，`DIRECT` 走直连出站，`REJECT` 系列直接失败（按下文「REJECT 系列」应答），节点走对应出站。select 组先用运行时 `select` 控制命令的选择，再用 `default` 或第一个成员；url-test/fallback/load-balance/round-robin 使用 `run_health_checks` 的测速结果，round-robin 的计数在 `RoutedOutbound` 内。
+- 策略组自愈（`RoutedOutbound`，详见 `routing.rs` 模块文档「Self-healing groups」）：
+  - 连接经测速组的成员建立失败（`Dispatcher` 调 `report_failure`，被规则拒绝的 `PermissionDenied` 不算）时立即只重测这个成员，同一成员 10 秒内最多一次；重测失败即去掉它的结果，下一条连接换成员，重测通过则保持不变，所以目标站点拒连不会把组推离好节点，也不会因一个坏站点去拨全组节点。UDP 失败不触发（不带 UDP 中继的节点照样能通过 TCP 测速）。
+  - `reset_network` 同时调用 `forget_health`：清空全部延迟、url-test 当前成员与失败冷却；切网前开始的测速结果作废。之后有连接经过某个还没有结果的测速组时立即测它（不等间隔）。
+  - `evaluate_before_use`：组没有结果时（首次使用、切网后）连接等待该组测完（最多 6 秒）再选成员，而不是先走可能已失效的第一个成员；测速循环没有运行（无 `local-proxy`）时不等待。
+  - `subnet` 组的网络来自控制命令 `set_network`（`type`、`ssid`、`bssid`、`router`、`addresses`），客户端在网络变化时先发 `set_network` 再发 `reset_network`。Wi-Fi 名与 BSSID 只留在内核内存里，不进日志、列表和导出。
+- 按请求路由：`USER-AGENT`、`URL-REGEX` 在明文 HTTP 流上按首个请求生效；被 MITM 解密的连接（HTTPS 与经改写钩子的明文 HTTP）里每个请求都重新分流（`mitm::request_route`）：同出站复用源站连接，`REJECT` 本地回 403，其他出站时 HTTP/1.1 换源站连接、HTTP/2 为该出站另开源站连接（每个 App 连接最多 4 条）。规则表没有这两类规则时（`RoutingTable::uses_request`）完全不做按请求路由。`URL-REGEX` 可以单独成行指向节点或策略组（也可在 AND/OR/NOT 里）；指向 `REJECT`/`REJECT-*` 的单独 `URL-REGEX` 仍由 HTTPS 解密的拦截处理，不是分流规则。
 - 隧道从 TCP 首包嗅探 TLS SNI 或 HTTP `Host`：域名规则按嗅探到的名字匹配，IP 规则仍匹配目的地址，连接仍发往原地址。UDP（含 QUIC）尚不嗅探，FakeIP 未接入。
-- 每个连接都带目的端口，`DST-PORT` 规则在隧道和本地代理里都生效。`PROCESS-NAME` 规则在桌面 local proxy 中生效：配置含该规则时，每条连接先由 `engine-embedded::process` 按连接两端地址查出发起进程（Linux `/proc`、Windows `GetExtendedTcpTable`、macOS `proc_pidfdinfo`），名称为可执行文件名，连接列表的 `process` 字段显示它。查不到（其他用户的进程、无权限）时该连接不命中 `PROCESS-NAME`。iOS 隧道没有进程信息，规则不命中。
+- 每个连接都带目的端口，`DST-PORT` 规则在隧道和本地代理里都生效。`SRC-IP` 匹配发起连接的一方：本地代理、局域网共享和回放代理里是客户端地址（双栈监听上的 IPv4 映射地址按 IPv4 比较），包隧道里是应用的源地址（隧道作网关时即局域网设备的地址）。`IN-PORT` 匹配客户端连上的本地监听端口（本地代理、局域网共享各自的端口），包隧道没有监听端口，不命中。HTTPS 解密后的连接沿用原连接的来源。`PROCESS-NAME` 规则在桌面 local proxy 中生效：配置含该规则时，每条连接先由 `engine-embedded::process` 按连接两端地址查出发起进程（Linux `/proc`、Windows `GetExtendedTcpTable`、macOS `proc_pidfdinfo`），名称为可执行文件名，连接列表的 `process` 字段显示它。查不到（其他用户的进程、无权限）时该连接不命中 `PROCESS-NAME`。iOS 隧道没有进程信息，规则不命中。
 - 规则集（`routing.rule_sets`，最多 32 个，合计 50 万条）：每个集可含 `domain`、`domain_suffix`、`domain_keyword`、`ip_cidr`。`RULE-SET,<name>` 匹配同名集；`GEOSITE,<category>` 匹配名为 `geosite-<category>` 的集（未配置时整个配置被拒绝）；`GEOIP,<CC>` 匹配 `geoip-<cc>`（小写，未配置时与以前一样不命中）。客户端以普通列表提供 GeoSite/GeoIP 数据，例如 MetaCubeX `meta-rules-dat` 的文本规则集。
 - 远程规则集：规则集带 `url` 时由内核自己下载（需要 `local-proxy` feature，iOS 与桌面构建都包含），可选 `format`（`suffix`：裸域名匹配自身与子域名，默认；`domain`：裸域名只匹配自身，即 Clash `behavior: domain`）、`interval_secs`（至少 600，默认 86400）和 `via`（经哪个策略组、节点或 `DIRECT` 下载，默认 `DIRECT`）。内联条目作为初始内容（客户端缓存的副本）；初始为空时启动即下载，之后按间隔刷新，失败保留旧内容并在 5 分钟内重试。下载为 HTTP/1.1 GET（不跟随跳转、不压缩，最大 32 MiB，60 秒超时），列表可以是 Surge/Loon/Clash classical 行、Clash `payload:` YAML 或每行一个域名/网段。可选签名校验：`public_key`（Ed25519 公钥 32 字节，base64）要求每次下载都附带分离签名，签名默认取 `<url>.sig`（可用 `signature_url` 指定），文件内容是对列表原始字节的 64 字节签名（标准或 URL-safe base64，可带 `#` / `untrusted comment:` 注释行，最大 1 KiB）；签名缺失记 `signature_missing`、格式不对记 `signature_malformed`、校验失败记 `signature_invalid`，都按下载失败处理，保留旧内容。运行时控制 `rule_sets` 返回每个集的来源、条目数、最近成功时间、最近错误（不含 URL）和是否要求签名（`signed`），`update_rule_sets` 立即刷新全部远程集。
 - 运行时控制（见 FFI 边界文档 “Runtime Control”）提供连接列表、模式切换（`rule`/`global`/`direct`，全局目标为 `routing.global`）、策略组列表与 select 切换。
@@ -139,5 +159,18 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 | `REJECT-TINYGIF` | 明文 HTTP 请求回 `200`、`image/gif` 的 1x1 GIF 并关闭；其他按 `REJECT` | 同 `REJECT` | 明文 HTTP 代理请求回 GIF；CONNECT/SOCKS5 按 `REJECT` | 解密后第一个请求回 GIF 并关闭 |
 
 防重试风暴：同一主机（域名，没有域名时为地址）30 秒内被普通 `REJECT` 拒绝超过 10 次，之后的拒绝按 `REJECT-DROP` 应答，直到该主机最近 30 秒内的拒绝不超过 10 次；被升级的拒绝本身也计数，持续猛打的客户端会一直被静默。`REJECT-NO-DROP` 永不升级。计数只针对用户流量（包隧道、本地代理、解密连接的路由），DNS 服务器路由和状态查询不计。最多跟踪 1024 个主机，满时先清掉 30 秒内没有被拒的主机，再清最早被拒的。连接列表的 `outbound`/`chain` 显示实际应答（风暴中为 `REJECT-DROP`），`error` 仍为 `rejected`。
+
+## SCRIPT 规则（规则脚本）
+
+对齐 Surge 规则脚本：`SCRIPT,<名称>,<策略>`，脚本在 `routing.scripts` 里按名称配置，例如 `"scripts": {"corp": {"path": "/…/corp.js", "argument": "443", "timeout_secs": 1}}`。`path` 是客户端保存脚本的本地文件（启动时读一次，最大 1 MiB），`argument` 为 `$argument`，`timeout_secs` 为 1–3 秒（默认 1）；最多 32 个脚本，规则（含热重载的规则）引用未配置的脚本时整个配置被拒绝（热重载返回 `unknown_script`）。需要 `scripts` feature（默认构建都包含，iOS 同样用 QuickJS）。公开版不带任何预设脚本，脚本只来自用户。
+
+- 决策按顺序进行：前面的规则先判，走到 `SCRIPT` 规则且本连接还没有该脚本的结论时，config-core 返回 `RouteMatch::ScriptPending`，engine-embedded 在阻塞线程池里运行脚本，再带着结论重新决策；IP 规则需要的解析结果沿用，不重复解析。同一连接每个脚本最多运行一次。
+- 脚本看到的 `$request`：`hostname`（小写域名）、`destIP`（目的地址或之前 IP 规则解析出的地址）、`destPort`、`sourceIP`、`inPort`、`processName`、`protocol`（`TCP`/`UDP`）、`userAgent`、`url`，未知时为 `null`；`$script.type` 为 `rule`。只有 `$done({matched: true})` 算命中；抛异常、超时、不调用 `$done`、或等待空闲槽位超过超时都按不命中继续往下判。
+- 规则脚本没有网络（`$httpClient` 失败），`$persistentStore` 只在内存里、引擎重启即清空；同时最多运行 2 个，每个 QuickJS 堆上限 4 MiB。
+- 没有具体连接的决策（DNS 服务器分流、状态查询）不运行脚本，`SCRIPT` 规则一律不命中。重定向（`redirects`）和插件规则不接受 `SCRIPT`。
+
+## 绑定网卡的直连
+
+直连出站可以写 `{"type":"direct","interface":"<名称>"}`（对齐 Surge `direct, interface=...`），把公司 VPN 或某块网卡专用的流量钉在那块网卡上，例如 `DOMAIN-SUFFIX,corp.example,CorpVPN`，`CorpVPN` 为绑定 `utun4` 的直连节点。名称在 Linux/Android 是网卡名（`wg0`，最长 15 字节，`SO_BINDTODEVICE`），macOS/iOS 是 BSD 名（`utun4`、`en0`，`IP_BOUND_IF`/`IPV6_BOUND_IF`），Windows 是“网络连接”里的适配器名（`IP_UNICAST_IF`/`IPV6_UNICAST_IF`）。网卡在每个连接时查找：VPN 后起也能立刻用上；网卡不存在时连接失败（`NotFound`，本地代理回 502 / SOCKS5 一般失败），绝不改走默认网卡。域名用系统解析器解析后逐个地址尝试。这类出站不经过进程级的 socket 保护（绑定的网卡取代了它），也不能再套 `via`。
 
 后续工作：Windows MITM 导入路径接入路由；engine-embedded 的 FakeIP、UDP/QUIC 嗅探与桌面进程名查询。

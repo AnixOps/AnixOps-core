@@ -299,6 +299,7 @@ fn grouped() -> Dispatcher {
         url: None,
         interval_secs: None,
         tolerance_ms: None,
+        ..PolicyGroupSpec::default()
     };
     let spec = RoutingSpec {
         rules: vec![

@@ -24,8 +24,9 @@ mieru = ["dep:outbound-mieru"]
 # HTTPS decryption with the shared mitm-policy rewrite engine (src/mitm).
 # HTTP/2 to apps and origins that offer it (src/mitm/http2.rs) uses `h2`.
 mitm = ["dep:bytes", "dep:engine-native", "dep:h2", "dep:http", "dep:mitm-policy", "dep:rcgen", "dep:rustls", "dep:time", "dep:tokio-rustls", "dep:transport-tls"]
-# `[Script]` execution for MITM plugins in QuickJS (script-runtime).
-scripts = ["mitm", "engine-native/quickjs"]
+# `[Script]` execution for MITM plugins and SCRIPT routing rules in QuickJS
+# (script-runtime).
+scripts = ["mitm", "engine-native/quickjs", "dep:script-runtime", "script-runtime/quickjs"]
 shadowsocks = ["dep:outbound-shadowsocks"]
 snell = ["dep:outbound-snell"]
 socks = ["dep:outbound-socks"]
@@ -82,6 +83,7 @@ ring = "0.17"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 # Content-Encoding zstd (src/capture/decode.rs); pure Rust decoder.
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+script-runtime = { path = "../script-runtime", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", optional = true }
@@ -96,14 +98,25 @@ transport-tls = { path = "../transport-tls", optional = true }
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 libc = "0.2"
 
-# LAN share address discovery (src/lan_share.rs, getifaddrs).
+# LAN share address discovery (src/lan_share.rs, getifaddrs) and DIRECT
+# bound to an interface (src/interface.rs, SO_BINDTODEVICE).
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Desktop tunnels run on several worker threads (src/tunnel.rs,
+# `limits.worker_threads`); iOS and Android keep one thread for memory.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_System_Threading",
 ] }
 

@@ -478,6 +478,7 @@ fn selected_node_and_routing_envelopes() {
             url: None,
             interval_secs: None,
             tolerance_ms: None,
+            ..PolicyGroupSpec::default()
         }],
     };
     let envelope = routing_envelope("p", &nodes, &spec).unwrap();

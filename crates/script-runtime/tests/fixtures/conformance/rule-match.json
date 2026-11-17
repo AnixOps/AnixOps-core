@@ -1,0 +1,21 @@
+{
+  "invocation": {
+    "phase": "rule",
+    "scriptName": "corp",
+    "argument": "strict",
+    "rule": {
+      "hostname": "git.corp.example",
+      "destIP": "10.0.0.8",
+      "destPort": 443,
+      "sourceIP": "192.168.1.20",
+      "protocol": "TCP"
+    }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "matched": true },
+    "notifications": [
+      { "title": "rule", "subtitle": "", "content": "rule,undefined,git.corp.example,10.0.0.8,443,192.168.1.20,,,TCP,,strict" }
+    ]
+  }
+}

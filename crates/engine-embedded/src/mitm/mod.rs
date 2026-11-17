@@ -44,6 +44,7 @@ mod http2;
 #[cfg(feature = "scripts")]
 mod http_client;
 pub mod inspect;
+mod request_route;
 #[cfg(feature = "scripts")]
 mod scheduler;
 
@@ -79,6 +80,7 @@ use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use self::http1::{Body, Conn, Framing, Head};
+use self::request_route::{Decision, RequestRoutes};
 use crate::capture::stream::SseParser;
 use crate::capture::websocket::{Deflate, WsParser};
 use crate::capture::Direction;
@@ -450,19 +452,68 @@ impl MitmEngine {
         };
 
         let authority = authority(host, flow.target.port(), HTTPS_PORT);
+        let routes = RequestRoutes::new(outbound, &target).await;
+        let reroute = Reroute {
+            routes,
+            tls_host: Some(host),
+            connect_timeout,
+        };
         if h2 {
             return self
-                .relay_h2(client, origin, host, &authority, idle_timeout)
+                .relay_h2(client, origin, host, &authority, idle_timeout, reroute)
                 .await;
         }
         self.relay(
             Conn::new(client, Vec::new()),
-            Conn::new(origin, Vec::new()),
+            Conn::new(Box::new(origin) as BoxStream, Vec::new()),
             "https",
             &authority,
             idle_timeout,
+            reroute,
         )
         .await
+    }
+
+    /// Opens an origin connection for `head` through the outbound its
+    /// request routes to (see [`request_route`]): TLS to `tls_host`
+    /// offering `h2` and `http/1.1`, or `http/1.1` alone, as `h2` says, or
+    /// plain without a host. An `h2` connection the origin did not accept
+    /// `h2` on fails.
+    async fn connect_routed(
+        &self,
+        reroute: &Reroute<'_>,
+        routes: &RequestRoutes<'_>,
+        head: &engine_outbound::sniff::HttpRequestHead,
+        h2: bool,
+    ) -> io::Result<BoxStream> {
+        let timeout = reroute.connect_timeout;
+        let timed_out = |_| io::Error::from(io::ErrorKind::TimedOut);
+        let remote = tokio::time::timeout(
+            timeout,
+            routes.router().connect_request(&routes.target, head),
+        )
+        .await
+        .map_err(timed_out)??;
+        let Some(host) = reroute.tls_host else {
+            return Ok(remote);
+        };
+        let server_name =
+            ServerName::try_from(host.to_string()).map_err(|_| invalid("invalid server name"))?;
+        let upstream = if h2 {
+            self.upstream_h2.clone()
+        } else {
+            self.upstream.clone()
+        };
+        let tls = tokio::time::timeout(
+            timeout,
+            tokio_rustls::TlsConnector::from(upstream).connect(server_name, remote),
+        )
+        .await
+        .map_err(timed_out)??;
+        if h2 && tls.get_ref().1.alpn_protocol() != Some(http2::ALPN_H2) {
+            return Err(invalid("origin did not accept h2"));
+        }
+        Ok(Box::new(tls))
     }
 
     /// Opens the TLS connection to the origin, offering `h2` only when the
@@ -514,31 +565,43 @@ impl MitmEngine {
             Err(error) => return Err(error),
         };
         let authority = authority(&flow.host, flow.target.port(), HTTP_PORT);
+        let reroute = Reroute {
+            routes: RequestRoutes::new(outbound, &target).await,
+            tls_host: None,
+            connect_timeout,
+        };
         self.relay(
             Conn::new(flow.inbound, flow.first),
             Conn::new(origin, Vec::new()),
             "http",
             &authority,
             idle_timeout,
+            reroute,
         )
         .await
     }
 
-    async fn relay<C, O>(
+    async fn relay<C>(
         &self,
         mut client: Conn<C>,
-        mut origin: Conn<O>,
+        mut origin: Conn<BoxStream>,
         scheme: &str,
         authority: &str,
         idle_timeout: Duration,
+        reroute: Reroute<'_>,
     ) -> io::Result<()>
     where
         C: AsyncRead + AsyncWrite + Unpin,
-        O: AsyncRead + AsyncWrite + Unpin,
     {
         // The connection to the origin is open: with capture on, its HTTP
         // messages are kept instead of its re-encrypted bytes.
         let capture = crate::capture::current_flow();
+        // The outbound `origin` goes through, when requests are routed.
+        let mut current_route = reroute
+            .routes
+            .as_ref()
+            .map(|routes| routes.connection.clone())
+            .unwrap_or_default();
         loop {
             let Ok(request) = tokio::time::timeout(idle_timeout, client.read_head()).await else {
                 return Ok(());
@@ -555,6 +618,44 @@ impl MitmEngine {
                 recording.publish();
                 recording
             });
+            if let Some(routes) = &reroute.routes {
+                let head = request_route::request_head(&url, request.header("User-Agent"));
+                match routes.decide(&current_route, &head).await {
+                    Decision::Keep => {}
+                    Decision::Reject => {
+                        // The body is never read, so the connection cannot
+                        // carry another request after one.
+                        let close = request.has_token("Connection", "close")
+                            || version == "HTTP/1.0"
+                            || !matches!(request_framing, Framing::Length(0));
+                        let response = response_head(403, &[], None, 0, close);
+                        if let Some(recording) = &mut recording {
+                            recording.response(&response, &[], Some("rejected"));
+                        }
+                        client.write_all(&response.encode()).await?;
+                        if close {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Decision::Switch(name) => {
+                        match self.connect_routed(&reroute, routes, &head, false).await {
+                            Ok(stream) => {
+                                origin = Conn::new(stream, Vec::new());
+                                current_route = name;
+                            }
+                            Err(_) => {
+                                let response = response_head(502, &[], None, 0, true);
+                                if let Some(recording) = &mut recording {
+                                    recording.response(&response, &[], Some("connect_failed"));
+                                }
+                                client.write_all(&response.encode()).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
             // A body no rule reads is forwarded as it arrives, not held whole.
             let stream_request = !self.needs_body(&url, HttpMitmPhase::Request);
             let stream_response = !self.needs_body(&url, HttpMitmPhase::Response);
@@ -918,6 +1019,16 @@ impl FlowInterceptor for MitmEngine {
             }
         })
     }
+}
+
+/// How a decrypted connection routes its requests one by one (see
+/// [`request_route`]).
+struct Reroute<'a> {
+    /// `None` when no rule looks at requests.
+    routes: Option<RequestRoutes<'a>>,
+    /// The server name of an HTTPS origin; `None` for plain HTTP.
+    tls_host: Option<&'a str>,
+    connect_timeout: Duration,
 }
 
 /// Answers the first request of a decrypted flow a `REJECT-TINYGIF` rule

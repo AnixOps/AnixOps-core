@@ -254,6 +254,37 @@ pub trait TcpOutbound: Send + Sync {
     fn reset_sessions(&self) -> usize {
         0
     }
+
+    /// Routes the requests of a decrypted HTTP connection one by one, for
+    /// `URL-REGEX` and `USER-AGENT` rules (see [`RequestRouter`]). Plain
+    /// outbounds keep the default `None`: every request goes where the
+    /// connection went.
+    fn request_router(&self) -> Option<&dyn RequestRouter> {
+        None
+    }
+}
+
+/// Picks an outbound per HTTP request inside one decrypted connection,
+/// as Surge does after MITM, instead of once per connection from its host.
+pub trait RequestRouter: Send + Sync {
+    /// Where a request to `target` goes: an outbound name (a node id,
+    /// `DIRECT` or `REJECT`). `request` is the request's URL and
+    /// `User-Agent`; `None` asks for the connection as it was opened. `None`
+    /// back means no rule looks at requests, so every request keeps the
+    /// connection's outbound and nothing needs comparing.
+    fn request_route<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        request: Option<&'a sniff::HttpRequestHead>,
+    ) -> BoxFuture<'a, Option<String>>;
+
+    /// Opens a connection to `target` routed for `request`, listed like any
+    /// other flow.
+    fn connect_request<'a>(
+        &'a self,
+        target: &'a TargetAddr,
+        request: &'a sniff::HttpRequestHead,
+    ) -> BoxFuture<'a, io::Result<BoxStream>>;
 }
 
 /// The error a [`TcpOutbound::probe`] that ran out of time fails with.

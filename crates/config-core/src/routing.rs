@@ -2,7 +2,7 @@
 //!
 //! This module owns the platform-neutral routing model: ordered
 //! DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD/IP-CIDR/GEOIP/GEOSITE/DST-PORT/
-//! PROCESS-NAME/RULE-SET rules and AND/OR/NOT combinations of them, a
+//! SRC-IP/IN-PORT/PROCESS-NAME/RULE-SET/SCRIPT rules and AND/OR/NOT combinations of them, a
 //! mandatory FINAL target, and
 //! select/url-test/fallback policy groups. In-process engines call
 //! [`RoutingModel::decide`] directly, and snapshot tests pin its results. The module performs no DNS, GeoIP database, health check,
@@ -31,6 +31,8 @@ pub const ROUTING_GROUP_DEFAULT_INVALID_CODE: &str = "config.core.routing_group_
 pub const ROUTING_GROUP_HEALTH_CHECK_INVALID_CODE: &str =
     "config.core.routing_group_health_check_invalid";
 pub const ROUTING_GROUP_CYCLE_CODE: &str = "config.core.routing_group_cycle";
+pub const ROUTING_GROUP_NETWORK_RULE_INVALID_CODE: &str =
+    "config.core.routing_group_network_rule_invalid";
 
 pub const DEFAULT_HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u32 = 300;
@@ -87,6 +89,12 @@ impl RejectKind {
     }
 }
 
+/// `REJECT` and Surge's `REJECT-*` variants.
+fn is_reject_target(target: &str) -> bool {
+    let target = target.trim().to_ascii_uppercase();
+    target == "REJECT" || target.starts_with("REJECT-")
+}
+
 /// Unvalidated routing input: Loon-style rule lines and policy group specs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoutingSpec {
@@ -95,15 +103,35 @@ pub struct RoutingSpec {
 }
 
 /// Unvalidated policy group input. Targets are referenced by name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyGroupSpec {
     pub id: String,
     pub kind: String,
+    /// Empty for a subnet group, which takes its members from
+    /// `network_rules` and `default`.
     pub members: Vec<String>,
+    /// Initial member of a select group; the target of a subnet group when
+    /// no network rule matches.
     pub default: Option<String>,
     pub url: Option<String>,
     pub interval_secs: Option<u32>,
     pub tolerance_ms: Option<u16>,
+    /// Health-checked groups only: a connection through the group waits for
+    /// a check when the group has no result yet (first use, or after the
+    /// network changed) instead of taking the first member.
+    pub evaluate_before_use: bool,
+    /// Subnet groups only, tried in order.
+    pub network_rules: Vec<NetworkRuleSpec>,
+}
+
+/// One rule of a subnet group: `when` the device's network matches, use
+/// `target`. `when` is `SSID:<name>`, `BSSID:<mac>`, `ROUTER:<ip>`,
+/// `SUBNET:<cidr>` (an address of the device), `TYPE:WIFI`, `TYPE:WIRED`,
+/// `TYPE:CELLULAR`, or `CELLULAR`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkRuleSpec {
+    pub when: String,
+    pub target: String,
 }
 
 /// Where a rule, FINAL, or group member sends a connection.
@@ -295,14 +323,27 @@ pub enum RuleMatcher {
     /// Lower-case name of the local process that opened the connection,
     /// when the platform can tell.
     ProcessName(String),
+    /// Address of the device or app that opened the connection, as Surge
+    /// `SRC-IP` (an address or a CIDR; Clash `SRC-IP-CIDR`).
+    SrcIp(IpCidr),
+    /// Local port of the inbound listener the connection came in on, within
+    /// an inclusive range, as Surge `IN-PORT`. The packet tunnel has no
+    /// listener port, so it never matches there.
+    InPort(u16, u16),
     /// Transport of the connection, as Surge `PROTOCOL`.
     Protocol(RuleProtocol),
     /// Lower-case glob over the `User-Agent` of a plain HTTP request, as
     /// Surge `USER-AGENT` (`*` and `?`). Other flows never match.
     UserAgent(String),
     /// Regex over the URL of a plain HTTP request (`http://host/path`), as
-    /// Surge `URL-REGEX` inside a logical rule. Other flows never match.
+    /// Surge `URL-REGEX`, alone with a node or group target or inside a
+    /// logical rule. Other flows never match.
     UrlRegex(UrlPattern),
+    /// Name of a rule script that decides, as Surge `SCRIPT`. The verdict
+    /// comes from [`RoutingEnvironment::script_matches`]; a script that has
+    /// not run yet stops [`RoutingModel::decide`] at this rule with
+    /// [`RouteMatch::ScriptPending`]. Not accepted inside a logical rule.
+    Script(String),
     /// Every rule matches.
     And(Vec<RuleMatcher>),
     /// Any rule matches.
@@ -337,6 +378,8 @@ impl RuleMatcher {
             domain: domain.as_deref(),
             ip: query.ip,
             port: query.port,
+            source: query.source,
+            in_port: query.in_port,
             process: process.as_deref(),
             network: query.network,
             user_agent: user_agent.as_deref(),
@@ -363,9 +406,13 @@ impl fmt::Display for RuleMatcher {
             Self::DstPort(start, end) if start == end => write!(formatter, "DST-PORT,{start}"),
             Self::DstPort(start, end) => write!(formatter, "DST-PORT,{start}-{end}"),
             Self::ProcessName(name) => write!(formatter, "PROCESS-NAME,{name}"),
+            Self::SrcIp(cidr) => write!(formatter, "SRC-IP,{cidr}"),
+            Self::InPort(start, end) if start == end => write!(formatter, "IN-PORT,{start}"),
+            Self::InPort(start, end) => write!(formatter, "IN-PORT,{start}-{end}"),
             Self::Protocol(protocol) => write!(formatter, "PROTOCOL,{}", protocol.name()),
             Self::UserAgent(pattern) => write!(formatter, "USER-AGENT,{pattern}"),
             Self::UrlRegex(pattern) => write!(formatter, "URL-REGEX,{}", pattern.as_str()),
+            Self::Script(name) => write!(formatter, "SCRIPT,{name}"),
             Self::And(rules) => write_logical(formatter, "AND", rules),
             Self::Or(rules) => write_logical(formatter, "OR", rules),
             Self::Not(rule) => write_logical(formatter, "NOT", std::slice::from_ref(rule)),
@@ -410,11 +457,15 @@ pub enum PolicyGroupKind {
     LoadBalance,
     /// Healthy members in turn, one connection each.
     RoundRobin,
+    /// The target of the first network rule that matches the device's
+    /// current network (Wi-Fi name, router, subnet, interface type), else
+    /// the default (Surge `subnet`).
+    Subnet,
 }
 
 impl PolicyGroupKind {
     /// The configuration name: `select`, `url-test`, `fallback`,
-    /// `load-balance` or `round-robin`.
+    /// `load-balance`, `round-robin` or `subnet`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Select => "select",
@@ -422,8 +473,116 @@ impl PolicyGroupKind {
             Self::Fallback => "fallback",
             Self::LoadBalance => "load-balance",
             Self::RoundRobin => "round-robin",
+            Self::Subnet => "subnet",
         }
     }
+
+    /// Whether the group picks its member from health check results.
+    pub fn is_health_checked(self) -> bool {
+        matches!(
+            self,
+            Self::UrlTest | Self::Fallback | Self::LoadBalance | Self::RoundRobin
+        )
+    }
+}
+
+/// Kind of network interface the device uses now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetworkKind {
+    Wifi,
+    Wired,
+    Cellular,
+}
+
+impl NetworkKind {
+    /// `wifi`, `wired` or `cellular`, case-insensitively.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "wifi" | "wi-fi" | "wlan" => Some(Self::Wifi),
+            "wired" | "ethernet" => Some(Self::Wired),
+            "cellular" | "mobile" => Some(Self::Cellular),
+            _ => None,
+        }
+    }
+}
+
+/// The network the device is on, as the client reports it. Every field is
+/// optional: a platform that cannot read the Wi-Fi name leaves `ssid` out
+/// and SSID rules never match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkContext {
+    pub kind: Option<NetworkKind>,
+    pub ssid: Option<String>,
+    /// Lower case, colon separated.
+    pub bssid: Option<String>,
+    /// Default gateway.
+    pub router: Option<IpAddr>,
+    /// Addresses of the default interface.
+    pub addresses: Vec<IpAddr>,
+}
+
+/// What a subnet group rule matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkCondition {
+    /// Exact Wi-Fi name.
+    Ssid(String),
+    /// Access point, lower case.
+    Bssid(String),
+    Router(IpAddr),
+    /// An address of the device inside the network.
+    Subnet(IpCidr),
+    Kind(NetworkKind),
+}
+
+impl NetworkCondition {
+    /// Parses `SSID:<name>`, `BSSID:<mac>`, `ROUTER:<ip>`, `SUBNET:<cidr>`,
+    /// `TYPE:<wifi|wired|cellular>` or `CELLULAR`. Prefixes are
+    /// case-insensitive; a Wi-Fi name keeps its case.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("cellular") {
+            return Some(Self::Kind(NetworkKind::Cellular));
+        }
+        let (prefix, rest) = value.split_once(':')?;
+        match prefix.trim().to_ascii_uppercase().as_str() {
+            "SSID" if !rest.is_empty() => Some(Self::Ssid(rest.to_string())),
+            "BSSID" => {
+                let mac = rest.trim().to_ascii_lowercase().replace('-', ":");
+                let valid = mac.split(':').count() == 6
+                    && mac
+                        .split(':')
+                        .all(|part| part.len() == 2 && part.bytes().all(|b| b.is_ascii_hexdigit()));
+                valid.then_some(Self::Bssid(mac))
+            }
+            "ROUTER" => rest.trim().parse().ok().map(Self::Router),
+            "SUBNET" => IpCidr::parse(rest.trim()).map(Self::Subnet),
+            "TYPE" => NetworkKind::parse(rest).map(Self::Kind),
+            _ => None,
+        }
+    }
+
+    pub fn matches(&self, network: &NetworkContext) -> bool {
+        match self {
+            Self::Ssid(ssid) => network.ssid.as_deref() == Some(ssid.as_str()),
+            Self::Bssid(bssid) => network
+                .bssid
+                .as_deref()
+                .is_some_and(|found| found.eq_ignore_ascii_case(bssid)),
+            Self::Router(router) => network.router == Some(*router),
+            Self::Subnet(cidr) => network
+                .addresses
+                .iter()
+                .any(|address| cidr.contains(*address)),
+            Self::Kind(kind) => network.kind == Some(*kind),
+        }
+    }
+}
+
+/// A validated subnet group rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkRule {
+    pub when: NetworkCondition,
+    pub target: PolicyTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,8 +600,13 @@ pub struct PolicyGroup {
     pub members: Vec<PolicyTarget>,
     /// Initial member for select groups.
     pub default: Option<PolicyTarget>,
-    /// Present for url-test and fallback groups.
+    /// Present for health-checked groups (see
+    /// [`PolicyGroupKind::is_health_checked`]).
     pub health_check: Option<HealthCheck>,
+    /// See [`PolicyGroupSpec::evaluate_before_use`].
+    pub evaluate_before_use: bool,
+    /// Rules of a subnet group, in order; empty for every other kind.
+    pub network_rules: Vec<NetworkRule>,
 }
 
 /// Validated routing model shared by every execution engine.
@@ -518,13 +682,14 @@ pub fn parse_rule_line(line: &str) -> DomainResult<RuleLine> {
             "routing rule must have a type, a value, and a target",
         ));
     }
-    if kind == "URL-REGEX" {
-        // A standalone URL-REGEX is the MITM core's (its rejects run on the
-        // full URL of every intercepted request); only logical rules bring
-        // one here.
+    if kind == "URL-REGEX" && is_reject_target(parts[2]) {
+        // A standalone URL-REGEX that rejects is the MITM core's (its rejects
+        // run on the full URL of every intercepted request). One that picks
+        // a node or group routes each request: plain HTTP flows by their
+        // first request, decrypted ones request by request.
         return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "URL-REGEX is a routing rule only inside AND, OR, or NOT",
+            "URL-REGEX with REJECT belongs to HTTPS decryption; as a routing rule it needs a node or group, or AND, OR, NOT",
         ));
     }
     let matcher = parse_matcher(&kind, parts[1])?;
@@ -541,6 +706,11 @@ fn parse_options(options: &[&str], matcher: &RuleMatcher) -> DomainResult<bool> 
     for option in options {
         if option.eq_ignore_ascii_case("no-resolve") && matcher.matches_ip() {
             no_resolve = true;
+        } else if option.eq_ignore_ascii_case("no-resolve")
+            && matches!(matcher, RuleMatcher::SrcIp(_))
+        {
+            // Clash writes it on SRC-IP-CIDR; a source address never needs
+            // a lookup.
         } else if option.eq_ignore_ascii_case("pre-matching")
             || option.eq_ignore_ascii_case("extended-matching")
         {
@@ -648,6 +818,12 @@ fn parse_sub_rule(text: &str, depth: usize) -> DomainResult<RuleMatcher> {
         }
         return parse_logical(&kind, inner, depth + 1);
     }
+    if kind == "SCRIPT" {
+        return Err(routing_error(
+            ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
+            "SCRIPT rules cannot be used inside AND, OR, or NOT",
+        ));
+    }
     let mut parts = value.split(',').map(str::trim);
     let value = parts.next().unwrap_or_default();
     // `no-resolve` is accepted for compatibility; a logical rule resolves as
@@ -683,6 +859,16 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             let (start, end) = parse_port_range(value)?;
             RuleMatcher::DstPort(start, end)
         }
+        "IN-PORT" => {
+            let (start, end) = parse_port_range(value).map_err(|_| {
+                routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "IN-PORT rule value must be a port or a start-end range",
+                )
+            })?;
+            RuleMatcher::InPort(start, end)
+        }
+        "SRC-IP" | "SRC-IP-CIDR" => RuleMatcher::SrcIp(parse_source(value)?),
         "PROCESS-NAME" => RuleMatcher::ProcessName(value.trim().to_lowercase()),
         "USER-AGENT" => {
             let pattern = value.trim().trim_matches('"').to_lowercase();
@@ -695,6 +881,21 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             RuleMatcher::UserAgent(pattern)
         }
         "URL-REGEX" => RuleMatcher::UrlRegex(UrlPattern::new(value.trim().trim_matches('"'))?),
+        "SCRIPT" => {
+            let name = value.trim();
+            let valid = !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+            if !valid {
+                return Err(routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "SCRIPT rule value must be a script name of 1-128 characters of [A-Za-z0-9._-]",
+                ));
+            }
+            RuleMatcher::Script(name.to_string())
+        }
         "PROTOCOL" => RuleMatcher::Protocol(match value.trim().to_ascii_uppercase().as_str() {
             "TCP" => RuleProtocol::Tcp,
             "UDP" => RuleProtocol::Udp,
@@ -710,8 +911,33 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
         }),
         _ => return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, RULE-SET, AND, OR, NOT, or FINAL (URL-REGEX inside AND, OR, NOT)",
+            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, SRC-IP, IN-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, URL-REGEX, RULE-SET, SCRIPT, AND, OR, NOT, or FINAL",
         )),
+    })
+}
+
+/// A `SRC-IP` value: an address (one host) or a CIDR; IPv6 may be written
+/// in brackets.
+fn parse_source(value: &str) -> DomainResult<IpCidr> {
+    let value = value.trim();
+    let unbracketed = value
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(address, rest)| format!("{address}{rest}"));
+    let value = unbracketed.as_deref().unwrap_or(value);
+    let parsed = if value.contains('/') {
+        IpCidr::parse(value)
+    } else {
+        value.parse::<IpAddr>().ok().and_then(|address| {
+            let prefix = if address.is_ipv4() { 32 } else { 128 };
+            IpCidr::parse(&format!("{address}/{prefix}"))
+        })
+    };
+    parsed.ok_or_else(|| {
+        routing_error(
+            ROUTING_RULE_VALUE_INVALID_CODE,
+            "SRC-IP rule value must be an address or an address with a prefix length",
+        )
     })
 }
 
@@ -904,10 +1130,35 @@ impl RoutingModel {
                     ip = resolved_ip;
                 }
             }
+            if let RuleMatcher::Script(name) = &rule.matcher {
+                match environment.script_matches(name) {
+                    Some(true) => {
+                        return self.resolution(
+                            RouteMatch::Rule(index),
+                            &rule.target,
+                            resolved_ip,
+                            balance_key.as_deref(),
+                            environment,
+                        )
+                    }
+                    Some(false) => continue,
+                    None => {
+                        return RouteResolution {
+                            matched: RouteMatch::ScriptPending(index),
+                            target: PolicyTarget::Reject(RejectKind::Reject),
+                            group_path: Vec::new(),
+                            outcome: RouteOutcome::Reject(RejectKind::Reject),
+                            resolved_ip,
+                        }
+                    }
+                }
+            }
             let input = MatchInput {
                 domain: domain.as_deref(),
                 ip,
                 port: query.port,
+                source: query.source,
+                in_port: query.in_port,
                 process: process.as_deref(),
                 network: query.network,
                 user_agent: user_agent.as_deref(),
@@ -1112,6 +1363,12 @@ pub struct RouteQuery {
     pub user_agent: Option<String>,
     /// URL of a plain HTTP request, for URL-REGEX rules.
     pub url: Option<String>,
+    /// Address of the device or app that opened the connection, for SRC-IP
+    /// rules.
+    pub source: Option<IpAddr>,
+    /// Local port of the inbound listener the connection came in on, for
+    /// IN-PORT rules.
+    pub in_port: Option<u16>,
 }
 
 impl RouteQuery {
@@ -1136,6 +1393,13 @@ impl RouteQuery {
 
     pub fn with_network(mut self, network: RouteNetwork) -> Self {
         self.network = Some(network);
+        self
+    }
+
+    /// Sets the source address and inbound port, for SRC-IP and IN-PORT.
+    pub fn with_source(mut self, source: Option<IpAddr>, in_port: Option<u16>) -> Self {
+        self.source = source;
+        self.in_port = in_port;
         self
     }
 }
@@ -1186,6 +1450,30 @@ pub trait RoutingEnvironment {
         0
     }
 
+    /// The member a url-test group used until now. The group keeps it
+    /// while no other member is faster by more than the group's tolerance,
+    /// so two members a few milliseconds apart do not trade places on
+    /// every check.
+    fn url_test_current(&self, _group_id: &str) -> Option<String> {
+        None
+    }
+
+    /// The network the device is on, for subnet groups; `None` when the
+    /// client has not said, and then every subnet group uses its default.
+    fn network(&self) -> Option<&NetworkContext> {
+        None
+    }
+
+    /// Verdict of the rule script `name` (a `SCRIPT` rule) for the
+    /// connection being routed. `None` means it has not run yet:
+    /// [`RoutingModel::decide`] then stops at that rule with
+    /// [`RouteMatch::ScriptPending`] so the caller can run the script, which
+    /// may take a while, outside the decision and decide again. By default
+    /// no script matches.
+    fn script_matches(&self, _name: &str) -> Option<bool> {
+        Some(false)
+    }
+
     /// Whether the named rule set holds the destination; an unknown set
     /// matches nothing.
     fn rule_set_matches(&self, _name: &str, _domain: Option<&str>, _ip: Option<IpAddr>) -> bool {
@@ -1206,6 +1494,11 @@ pub enum RouteMatch {
     Rule(usize),
     /// Resolving the domain for the IP rule at this index failed.
     ResolveFailed(usize),
+    /// The SCRIPT rule at this index has no verdict yet
+    /// ([`RoutingEnvironment::script_matches`] returned `None`): the caller
+    /// runs the script and decides again with its verdict. The resolution
+    /// rejects and carries the address resolved so far.
+    ScriptPending(usize),
     Final,
 }
 
@@ -1233,6 +1526,8 @@ struct MatchInput<'a> {
     domain: Option<&'a str>,
     ip: Option<IpAddr>,
     port: Option<u16>,
+    source: Option<IpAddr>,
+    in_port: Option<u16>,
     process: Option<&'a str>,
     network: Option<RouteNetwork>,
     user_agent: Option<&'a str>,
@@ -1269,6 +1564,12 @@ fn rule_matches(
             .port
             .is_some_and(|port| (*start..=*end).contains(&port)),
         RuleMatcher::ProcessName(name) => input.process == Some(name.as_str()),
+        RuleMatcher::SrcIp(cidr) => input
+            .source
+            .is_some_and(|source| cidr.contains(source.to_canonical())),
+        RuleMatcher::InPort(start, end) => input
+            .in_port
+            .is_some_and(|port| (*start..=*end).contains(&port)),
         RuleMatcher::Protocol(protocol) => {
             let port = input.port;
             match (protocol, input.network) {
@@ -1284,6 +1585,7 @@ fn rule_matches(
             .user_agent
             .is_some_and(|agent| wildcard_matches(pattern.as_bytes(), agent.as_bytes())),
         RuleMatcher::UrlRegex(pattern) => input.url.is_some_and(|url| pattern.is_match(url)),
+        RuleMatcher::Script(name) => environment.script_matches(name) == Some(true),
         RuleMatcher::And(rules) => rules
             .iter()
             .all(|rule| rule_matches(rule, input, environment)),
@@ -1312,16 +1614,45 @@ fn select_group_member(
             })
             .or_else(|| group.default.clone())
             .unwrap_or(first),
-        PolicyGroupKind::UrlTest => group
-            .members
-            .iter()
-            .filter_map(|member| {
-                environment
-                    .member_latency_ms(&group.id, member)
-                    .map(|latency| (latency, member))
+        PolicyGroupKind::UrlTest => {
+            let Some((best_latency, best)) = group
+                .members
+                .iter()
+                .filter_map(|member| {
+                    environment
+                        .member_latency_ms(&group.id, member)
+                        .map(|latency| (latency, member))
+                })
+                .min_by_key(|(latency, _)| *latency)
+            else {
+                return first;
+            };
+            let tolerance = group
+                .health_check
+                .as_ref()
+                .map_or(0, |check| u32::from(check.tolerance_ms));
+            let current = environment.url_test_current(&group.id).and_then(|name| {
+                let member = group.members.iter().find(|member| member.name() == name)?;
+                let latency = environment.member_latency_ms(&group.id, member)?;
+                Some((latency, member))
+            });
+            match current {
+                Some((latency, member)) if latency <= best_latency.saturating_add(tolerance) => {
+                    member.clone()
+                }
+                _ => best.clone(),
+            }
+        }
+        PolicyGroupKind::Subnet => environment
+            .network()
+            .and_then(|network| {
+                group
+                    .network_rules
+                    .iter()
+                    .find(|rule| rule.when.matches(network))
             })
-            .min_by_key(|(latency, _)| *latency)
-            .map(|(_, member)| member.clone())
+            .map(|rule| rule.target.clone())
+            .or_else(|| group.default.clone())
             .unwrap_or(first),
         PolicyGroupKind::Fallback => group
             .members
@@ -1433,15 +1764,25 @@ fn normalize_group(spec: &PolicyGroupSpec, names: &TargetNames) -> DomainResult<
         "fallback" => PolicyGroupKind::Fallback,
         "load-balance" | "loadbalance" => PolicyGroupKind::LoadBalance,
         "round-robin" | "roundrobin" => PolicyGroupKind::RoundRobin,
+        "subnet" | "ssid" => PolicyGroupKind::Subnet,
         _ => {
             return Err(routing_error(
                 ROUTING_GROUP_TYPE_UNSUPPORTED_CODE,
                 format!(
-                    "policy group {id} type must be select, url-test, fallback, load-balance, or round-robin"
+                    "policy group {id} type must be select, url-test, fallback, load-balance, round-robin, or subnet"
                 ),
             ))
         }
     };
+    if kind == PolicyGroupKind::Subnet {
+        return normalize_subnet_group(id, spec, names);
+    }
+    if !spec.network_rules.is_empty() {
+        return Err(routing_error(
+            ROUTING_GROUP_NETWORK_RULE_INVALID_CODE,
+            format!("policy group {id} is not a subnet group and cannot have network rules"),
+        ));
+    }
     if spec.members.is_empty() {
         return Err(routing_error(
             ROUTING_GROUP_MEMBERS_EMPTY_CODE,
@@ -1452,21 +1793,7 @@ fn normalize_group(spec: &PolicyGroupSpec, names: &TargetNames) -> DomainResult<
     let mut members = Vec::with_capacity(spec.members.len());
     for member in &spec.members {
         let member = names.resolve(member)?;
-        let supported = match (&member, kind) {
-            (PolicyTarget::Reject(_), _) => false,
-            (PolicyTarget::Group(_), PolicyGroupKind::Select) => true,
-            (PolicyTarget::Group(_), _) => false,
-            (PolicyTarget::Direct | PolicyTarget::Node(_), _) => true,
-        };
-        if !supported {
-            return Err(routing_error(
-                ROUTING_GROUP_MEMBER_UNSUPPORTED_CODE,
-                format!(
-                    "policy group {id} cannot contain {}; groups never contain REJECT and only select groups contain other groups",
-                    member.name()
-                ),
-            ));
-        }
+        check_member_supported(&id, kind, &member)?;
         if !members.contains(&member) {
             members.push(member);
         }
@@ -1502,6 +1829,7 @@ fn normalize_group(spec: &PolicyGroupSpec, names: &TargetNames) -> DomainResult<
             }
             None
         }
+        PolicyGroupKind::Subnet => unreachable!("subnet groups return above"),
         PolicyGroupKind::UrlTest
         | PolicyGroupKind::Fallback
         | PolicyGroupKind::LoadBalance
@@ -1540,12 +1868,108 @@ fn normalize_group(spec: &PolicyGroupSpec, names: &TargetNames) -> DomainResult<
         }
     };
 
+    if spec.evaluate_before_use && !kind.is_health_checked() {
+        return Err(routing_error(
+            ROUTING_GROUP_HEALTH_CHECK_INVALID_CODE,
+            format!(
+                "policy group {id} is {} and cannot evaluate before use",
+                kind.as_str()
+            ),
+        ));
+    }
+
     Ok(PolicyGroup {
         id,
         kind,
         members,
         default,
         health_check,
+        evaluate_before_use: spec.evaluate_before_use,
+        network_rules: Vec::new(),
+    })
+}
+
+/// Groups never contain REJECT; only select and subnet groups contain other
+/// groups.
+fn check_member_supported(
+    id: &str,
+    kind: PolicyGroupKind,
+    member: &PolicyTarget,
+) -> DomainResult<()> {
+    let supported = match (member, kind) {
+        (PolicyTarget::Reject(_), _) => false,
+        (PolicyTarget::Group(_), PolicyGroupKind::Select | PolicyGroupKind::Subnet) => true,
+        (PolicyTarget::Group(_), _) => false,
+        (PolicyTarget::Direct | PolicyTarget::Node(_), _) => true,
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(routing_error(
+            ROUTING_GROUP_MEMBER_UNSUPPORTED_CODE,
+            format!(
+                "policy group {id} cannot contain {}; groups never contain REJECT and only select and subnet groups contain other groups",
+                member.name()
+            ),
+        ))
+    }
+}
+
+/// A subnet group: a required default, network rules in order, no members
+/// of its own (they are the default and the rule targets) and no health
+/// check.
+fn normalize_subnet_group(
+    id: String,
+    spec: &PolicyGroupSpec,
+    names: &TargetNames,
+) -> DomainResult<PolicyGroup> {
+    let invalid = |message: String| routing_error(ROUTING_GROUP_NETWORK_RULE_INVALID_CODE, message);
+    if !spec.members.is_empty() {
+        return Err(invalid(format!(
+            "subnet group {id} takes its members from its network rules and default"
+        )));
+    }
+    if spec.url.is_some()
+        || spec.interval_secs.is_some()
+        || spec.tolerance_ms.is_some()
+        || spec.evaluate_before_use
+    {
+        return Err(routing_error(
+            ROUTING_GROUP_HEALTH_CHECK_INVALID_CODE,
+            format!("policy group {id} is subnet and cannot have health check fields"),
+        ));
+    }
+    let Some(default) = spec.default.as_deref() else {
+        return Err(routing_error(
+            ROUTING_GROUP_DEFAULT_INVALID_CODE,
+            format!("subnet group {id} needs a default"),
+        ));
+    };
+    let default = names.resolve(default)?;
+    check_member_supported(&id, PolicyGroupKind::Subnet, &default)?;
+    let mut members = vec![default.clone()];
+    let mut network_rules = Vec::with_capacity(spec.network_rules.len());
+    for (index, rule) in spec.network_rules.iter().enumerate() {
+        let when = NetworkCondition::parse(&rule.when).ok_or_else(|| {
+            invalid(format!(
+                "subnet group {id} network rule {index} must be SSID:, BSSID:, ROUTER:, SUBNET:, TYPE: or CELLULAR"
+            ))
+        })?;
+        let target = names.resolve(&rule.target)?;
+        check_member_supported(&id, PolicyGroupKind::Subnet, &target)?;
+        if !members.contains(&target) {
+            members.push(target.clone());
+        }
+        network_rules.push(NetworkRule { when, target });
+    }
+    Ok(PolicyGroup {
+        id,
+        kind: PolicyGroupKind::Subnet,
+        members,
+        default: Some(default),
+        health_check: None,
+        evaluate_before_use: false,
+        network_rules,
     })
 }
 

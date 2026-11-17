@@ -203,7 +203,7 @@ pub fn routing_json(spec: &RoutingSpec) -> Value {
         .groups
         .iter()
         .map(|group| {
-            json!({
+            let mut value = json!({
                 "id": group.id,
                 "type": group.kind,
                 "members": group.members,
@@ -211,7 +211,19 @@ pub fn routing_json(spec: &RoutingSpec) -> Value {
                 "url": group.url,
                 "interval_secs": group.interval_secs,
                 "tolerance_ms": group.tolerance_ms,
-            })
+            });
+            // Only when set, so a config without them stays as before.
+            if group.evaluate_before_use {
+                value["evaluate_before_use"] = json!(true);
+            }
+            if !group.network_rules.is_empty() {
+                value["network_rules"] = group
+                    .network_rules
+                    .iter()
+                    .map(|rule| json!({ "when": rule.when, "target": rule.target }))
+                    .collect();
+            }
+            value
         })
         .collect();
     json!({ "rules": spec.rules, "groups": groups })

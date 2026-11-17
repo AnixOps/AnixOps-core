@@ -43,7 +43,7 @@ use inbound_mixed::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::connections::Dispatcher;
+use crate::connections::{Dispatcher, FlowOrigin};
 use crate::control::MAX_REQUEST_LEN;
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -355,9 +355,11 @@ impl ClientConnector for LanClients {
     ) -> BoxFuture<'a, io::Result<BoxStream>> {
         Box::pin(async move {
             let label = device_label(client.peer.ip());
-            self.0
-                .connect_process_flow(target, None, Some(&label))
-                .await
+            let origin = FlowOrigin {
+                process: Some(&label),
+                source: crate::local_proxy::client_source(client),
+            };
+            self.0.connect_origin_flow(target, None, origin, None).await
         })
     }
 }

@@ -35,6 +35,7 @@ fn model(rules: &[&str]) -> RoutingModel {
             url: None,
             interval_secs: None,
             tolerance_ms: None,
+            ..PolicyGroupSpec::default()
         }],
     };
     RoutingModel::from_spec(&spec, &nodes).unwrap()

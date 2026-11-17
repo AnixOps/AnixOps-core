@@ -72,9 +72,9 @@ impl NetworkCoreBuffer {
     }
 }
 
-/// Writes one IP packet to the TUN interface. Called on the tunnel thread
-/// until `networkcore_ios_runtime_stop_tunnel` returns. The packet pointer is
-/// valid only for the duration of the call.
+/// Writes one IP packet to the TUN interface. Called on a tunnel thread, one
+/// call at a time, until `networkcore_ios_runtime_stop_tunnel` returns. The
+/// packet pointer is valid only for the duration of the call.
 pub type NetworkCorePacketWriter =
     extern "C" fn(context: *mut c_void, packet: *const u8, len: usize);
 
@@ -87,8 +87,8 @@ pub struct NetworkCorePacket {
 }
 
 /// Writes a burst of IP packets to the TUN interface, in order (feature set
-/// 4). Called on the tunnel thread until `networkcore_ios_runtime_stop_tunnel`
-/// returns; `count` is 1 to 64. The packets are valid only for the call.
+/// 4). Called on a tunnel thread, one call at a time, until
+/// `networkcore_ios_runtime_stop_tunnel` returns; `count` is 1 to 64. The packets are valid only for the call.
 pub type NetworkCorePacketBatchWriter =
     extern "C" fn(context: *mut c_void, packets: *const NetworkCorePacket, count: usize);
 
