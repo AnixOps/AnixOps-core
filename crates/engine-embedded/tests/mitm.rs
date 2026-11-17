@@ -1490,21 +1490,25 @@ async fn each_decrypted_http1_request_is_routed_on_its_own() {
     };
     assert_eq!(opened(&a), 2);
     assert_eq!(opened(&b), 1);
-    // Each origin connection is listed with the rule that picked it.
+    // Each origin connection is listed with the rule of the request that
+    // opened it: the USER-AGENT request reused the node-b connection the
+    // URL-REGEX request opened, so it opened none.
     let list = control_json(&dispatcher, r#"{"cmd":"connections"}"#);
-    let rules: Vec<String> = list["active"]
+    let mut rules: Vec<String> = list["active"]
         .as_array()
         .into_iter()
         .chain(list["closed"].as_array())
         .flatten()
         .map(|connection| connection["rule"].as_str().unwrap_or_default().to_string())
         .collect();
-    assert!(
-        rules.iter().any(|rule| rule.starts_with("URL-REGEX")),
-        "{rules:?}"
-    );
-    assert!(
-        rules.iter().any(|rule| rule.starts_with("USER-AGENT")),
+    rules.sort();
+    assert_eq!(
+        rules,
+        [
+            "FINAL",
+            "FINAL",
+            r"URL-REGEX,^http://plain\.example\.test/video/",
+        ],
         "{rules:?}"
     );
     server.abort();
