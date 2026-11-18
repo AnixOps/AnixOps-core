@@ -128,6 +128,14 @@ pub struct ImportReport {
     /// [`ImportedNode::id`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing: Option<Value>,
+    /// What importing the subscription's rules left out, one line each
+    /// (rules of unsupported types counted by type, Surge's built-in
+    /// `RULE-SET,SYSTEM`, targets that were not imported, ...), so a client
+    /// can say so instead of the rules silently matching less. English, fixed
+    /// wording with rule types, indexes and policy names; never a list URL.
+    /// Left out when nothing was.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routing_warnings: Vec<String>,
 }
 
 /// A node the engine can run. `outbound` holds its credentials.
@@ -193,7 +201,9 @@ pub fn import_text(text: &str) -> Result<ImportReport, ImportError> {
         .and_then(|document| service.normalize(&document))
         .map_err(|_| ImportError::Unrecognized)?;
     let mut report = report(&catalog.nodes);
-    report.routing = subscription_routing(text, &catalog.nodes, &report);
+    let (routing, warnings) = subscription_routing(text, &catalog.nodes, &report);
+    report.routing = routing;
+    report.routing_warnings = warnings;
     Ok(report)
 }
 
@@ -229,28 +239,50 @@ pub fn routing_json(spec: &RoutingSpec) -> Value {
     json!({ "rules": spec.rules, "groups": groups })
 }
 
+/// Most [`ImportReport::routing_warnings`] lines kept; one more says how many
+/// were left out.
+const MAX_ROUTING_WARNINGS: usize = 32;
+
 fn subscription_routing(
     text: &str,
     nodes: &[NodeDescriptor],
     report: &ImportReport,
-) -> Option<Value> {
+) -> (Option<Value>, Vec<String>) {
     if !report.unsupported.is_empty()
         || report.nodes.is_empty()
         || report.nodes.len() > MAX_ROUTED_OUTBOUNDS
         || !report.nodes.iter().all(|node| is_outbound_id(&node.id))
     {
-        return None;
+        return (None, Vec::new());
     }
     let imported = import_subscription_routing(text, nodes);
-    let spec = imported.spec?;
+    let warnings = routing_warnings(&imported.diagnostics);
+    let Some(spec) = imported.spec else {
+        return (None, warnings);
+    };
     if spec.rules.len() > MAX_ROUTING_RULES || spec.groups.len() > MAX_POLICY_GROUPS {
-        return None;
+        return (None, warnings);
     }
     let mut routing = routing_json(&spec);
     if !imported.rule_sets.is_empty() {
         routing["rule_sets"] = rule_sets_json(&imported.rule_sets);
     }
-    Some(routing)
+    (Some(routing), warnings)
+}
+
+/// The warnings of a routing import, at most [`MAX_ROUTING_WARNINGS`].
+fn routing_warnings(diagnostics: &[control_domain::Diagnostic]) -> Vec<String> {
+    let mut warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == control_domain::DiagnosticSeverity::Warning)
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    if warnings.len() > MAX_ROUTING_WARNINGS {
+        let more = warnings.len() - MAX_ROUTING_WARNINGS;
+        warnings.truncate(MAX_ROUTING_WARNINGS);
+        warnings.push(format!("{more} more were left out"));
+    }
+    warnings
 }
 
 /// The engine's `routing.rule_sets` object for imported remote sets, keyed by
@@ -310,6 +342,7 @@ pub fn report(nodes: &[NodeDescriptor]) -> ImportReport {
         nodes: Vec::new(),
         unsupported: Vec::new(),
         routing: None,
+        routing_warnings: Vec::new(),
     };
     for node in nodes {
         match outbound_json(node) {

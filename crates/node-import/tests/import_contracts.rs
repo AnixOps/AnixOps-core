@@ -110,6 +110,29 @@ fn clash_rules_and_groups_come_with_the_nodes() {
 }
 
 #[test]
+fn rules_left_out_of_the_import_are_reported() {
+    let report = import_text(CLASH).unwrap();
+    assert!(report.routing_warnings.is_empty());
+    let json = serde_json::to_value(&report).unwrap();
+    assert!(json.get("routing_warnings").is_none());
+
+    let text = CLASH.replace(
+        "  - MATCH,Proxy",
+        "  - IP-ASN,13335,Proxy\n  - IP-ASN,15169,Proxy\n  - RULE-SET,SYSTEM,DIRECT\n  - MATCH,Proxy",
+    );
+    let report = import_text(&text).unwrap();
+    assert!(report.routing.is_some());
+    let warnings = report.routing_warnings.join("\n");
+    assert!(warnings.contains("IP-ASN x2"), "{warnings}");
+    assert!(warnings.contains("rule set SYSTEM"), "{warnings}");
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        json["routing_warnings"].as_array().map(Vec::len),
+        Some(report.routing_warnings.len())
+    );
+}
+
+#[test]
 fn empty_and_unknown_text_are_rejected() {
     assert_eq!(import_text("  \n"), Err(ImportError::Empty));
     assert_eq!(
