@@ -8,13 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_outbound::reject::{self, RejectAction};
-use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
+use engine_outbound::{
+    BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpOutbound, UdpFlow,
+};
 use inbound_mixed::{
     serve, serve_intercepted, ClientAddrs, ClientConnector, ClientInterceptor, Credentials,
     MixedSettings, MixedStats,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -29,6 +31,42 @@ impl TcpOutbound for Direct {
         Box::pin(async move {
             let stream = TcpStream::connect((target.host().as_str(), target.port())).await?;
             Ok(Box::new(stream) as BoxStream)
+        })
+    }
+
+    fn open_udp<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
+        Box::pin(async move {
+            let addr = tokio::net::lookup_host((target.host().as_str(), target.port()))
+                .await?
+                .find(SocketAddr::is_ipv4)
+                .ok_or_else(|| io::Error::other("no ipv4 address"))?;
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+            socket.connect(addr).await?;
+            Ok(UdpFlow::new(
+                Box::new(UdpSend(socket.clone())),
+                Box::new(UdpRecv(socket)),
+            ))
+        })
+    }
+}
+
+struct UdpSend(Arc<UdpSocket>);
+
+impl DatagramSend for UdpSend {
+    fn send<'a>(&'a mut self, payload: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move { self.0.send(payload).await.map(|_| ()) })
+    }
+}
+
+struct UdpRecv(Arc<UdpSocket>);
+
+impl DatagramRecv for UdpRecv {
+    fn recv(&mut self) -> BoxFuture<'_, io::Result<Vec<u8>>> {
+        Box::pin(async move {
+            let mut buf = vec![0u8; 65_535];
+            let n = self.0.recv(&mut buf).await?;
+            buf.truncate(n);
+            Ok(buf)
         })
     }
 }
@@ -504,4 +542,145 @@ async fn interceptor_is_offered_plain_http_requests() {
     assert!(read_to_end(&mut client)
         .await
         .starts_with("taken 127.0.0.1"));
+}
+
+async fn udp_echo_server() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&buf[..n], from).await;
+        }
+    });
+    addr
+}
+
+async fn udp_proxy() -> (SocketAddr, Arc<MixedStats>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stats = Arc::new(MixedStats::default());
+    let settings = MixedSettings {
+        udp: true,
+        ..MixedSettings::default()
+    };
+    tokio::spawn(serve(listener, Arc::new(Direct), settings, stats.clone()));
+    (addr, stats)
+}
+
+/// Opens a UDP association and returns the control connection and the relay.
+async fn associate(proxy: SocketAddr) -> (TcpStream, SocketAddr) {
+    let mut control = TcpStream::connect(proxy).await.unwrap();
+    control.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    assert_eq!(read_n(&mut control, 2).await, [0x05, 0x00]);
+    control
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let reply = read_n(&mut control, 10).await;
+    assert_eq!(reply[..4], [0x05, 0x00, 0x00, 0x01], "associate reply");
+    let ip = std::net::Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]);
+    let port = u16::from_be_bytes([reply[8], reply[9]]);
+    assert_ne!(port, 0);
+    (control, SocketAddr::from((ip, port)))
+}
+
+fn udp_packet(header_addr: &[u8], port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0, 0, 0];
+    packet.extend_from_slice(header_addr);
+    packet.extend_from_slice(&port.to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+async fn recv_udp(socket: &UdpSocket) -> Vec<u8> {
+    let mut buf = vec![0u8; 65_535];
+    let n = tokio::time::timeout(WAIT, socket.recv(&mut buf))
+        .await
+        .expect("udp reply timed out")
+        .unwrap();
+    buf.truncate(n);
+    buf
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks5_udp_associate_relays_to_ip_and_domain_targets() {
+    let echo = udp_echo_server().await;
+    let (proxy, stats) = udp_proxy().await;
+    let (_control, relay) = associate(proxy).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(relay).await.unwrap();
+
+    // IPv4 destination: the reply carries the same address.
+    let mut ipv4 = vec![0x01];
+    ipv4.extend_from_slice(&[127, 0, 0, 1]);
+    client
+        .send(&udp_packet(&ipv4, echo.port(), b"quic initial"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_udp(&client).await,
+        udp_packet(&ipv4, echo.port(), b"quic initial")
+    );
+
+    // A name is handed to the outbound unresolved and kept in the reply.
+    let mut name = vec![0x03, 9];
+    name.extend_from_slice(b"localhost");
+    client
+        .send(&udp_packet(&name, echo.port(), b"by name"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_udp(&client).await,
+        udp_packet(&name, echo.port(), b"by name")
+    );
+
+    // A second datagram on the same flow reuses it.
+    client
+        .send(&udp_packet(&ipv4, echo.port(), b"again"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recv_udp(&client).await,
+        udp_packet(&ipv4, echo.port(), b"again")
+    );
+    assert_eq!(stats.udp_associations.load(Ordering::Relaxed), 1);
+    assert!(stats.bytes_down.load(Ordering::Relaxed) >= 24);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socks5_udp_drops_fragments_and_ends_with_the_control_connection() {
+    let echo = udp_echo_server().await;
+    let (proxy, _) = udp_proxy().await;
+    let (control, relay) = associate(proxy).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(relay).await.unwrap();
+
+    let mut ipv4 = vec![0x01];
+    ipv4.extend_from_slice(&[127, 0, 0, 1]);
+    let mut fragment = udp_packet(&ipv4, echo.port(), b"fragment");
+    fragment[2] = 1;
+    client.send(&fragment).await.unwrap();
+    client
+        .send(&udp_packet(&ipv4, echo.port(), b"whole"))
+        .await
+        .unwrap();
+    // Only the whole datagram comes back.
+    assert_eq!(
+        recv_udp(&client).await,
+        udp_packet(&ipv4, echo.port(), b"whole")
+    );
+
+    drop(control);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client
+        .send(&udp_packet(&ipv4, echo.port(), b"after close"))
+        .await
+        .ok();
+    let mut buf = [0u8; 64];
+    let late = tokio::time::timeout(Duration::from_millis(500), client.recv(&mut buf)).await;
+    assert!(
+        !matches!(late, Ok(Ok(_))),
+        "relay must stop once the control connection closes"
+    );
 }

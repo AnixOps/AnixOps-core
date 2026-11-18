@@ -1,4 +1,5 @@
-//! SOCKS5 (RFC 1928) `CONNECT` with optional username/password (RFC 1929).
+//! SOCKS5 (RFC 1928) `CONNECT`, and `UDP ASSOCIATE` when the listener allows
+//! UDP, with optional username/password (RFC 1929).
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -15,6 +16,7 @@ const METHOD_NONE: u8 = 0x00;
 const METHOD_PASSWORD: u8 = 0x02;
 const METHOD_UNACCEPTABLE: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
@@ -28,9 +30,87 @@ pub(crate) fn reply(code: u8) -> [u8; 10] {
     [VERSION, code, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0]
 }
 
+/// The success reply for `UDP ASSOCIATE`, naming the relay socket.
+pub(crate) fn bound_reply(bound: SocketAddr) -> Vec<u8> {
+    let mut out = vec![VERSION, REP_SUCCEEDED, 0];
+    push_addr(&mut out, &TargetAddr::Ip(bound));
+    out
+}
+
+/// Appends ATYP, address and port.
+fn push_addr(out: &mut Vec<u8>, target: &TargetAddr) {
+    match target {
+        TargetAddr::Ip(SocketAddr::V4(addr)) => {
+            out.push(ATYP_IPV4);
+            out.extend_from_slice(&addr.ip().octets());
+        }
+        TargetAddr::Ip(SocketAddr::V6(addr)) => {
+            out.push(ATYP_IPV6);
+            out.extend_from_slice(&addr.ip().octets());
+        }
+        TargetAddr::Domain(domain, _) => {
+            // Domains come from a parsed request, so they fit in a byte.
+            out.push(ATYP_DOMAIN);
+            out.push(domain.len() as u8);
+            out.extend_from_slice(domain.as_bytes());
+        }
+    }
+    out.extend_from_slice(&target.port().to_be_bytes());
+}
+
+/// The header of a relayed datagram (RSV, FRAG 0, address of `target`).
+pub(crate) fn udp_header(target: &TargetAddr) -> Vec<u8> {
+    let mut out = vec![0, 0, 0];
+    push_addr(&mut out, target);
+    out
+}
+
+/// Splits a datagram from the client into its destination and payload.
+/// Fragments (FRAG != 0) and malformed headers are `None`: the relay drops
+/// them, as RFC 1928 allows for fragments.
+pub(crate) fn parse_udp(packet: &[u8]) -> Option<(TargetAddr, &[u8])> {
+    if packet.len() < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
+        return None;
+    }
+    let rest = &packet[4..];
+    let (target, used) = match packet[3] {
+        ATYP_IPV4 => {
+            let b = rest.get(..6)?;
+            let ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
+            (
+                TargetAddr::Ip(SocketAddr::from((ip, u16::from_be_bytes([b[4], b[5]])))),
+                6,
+            )
+        }
+        ATYP_IPV6 => {
+            let b = rest.get(..18)?;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&b[..16]);
+            let port = u16::from_be_bytes([b[16], b[17]]);
+            (
+                TargetAddr::Ip(SocketAddr::from((Ipv6Addr::from(octets), port))),
+                18,
+            )
+        }
+        ATYP_DOMAIN => {
+            let len = usize::from(*rest.first()?);
+            let b = rest.get(1..1 + len + 2)?;
+            let domain = std::str::from_utf8(&b[..len]).ok()?;
+            if domain.is_empty() {
+                return None;
+            }
+            let port = u16::from_be_bytes([b[len], b[len + 1]]);
+            (TargetAddr::Domain(domain.to_owned(), port), 1 + len + 2)
+        }
+        _ => return None,
+    };
+    Some((target, &rest[used..]))
+}
+
 pub(crate) async fn read_request(
     client: &mut TcpStream,
     credentials: Option<&Credentials>,
+    udp: bool,
 ) -> io::Result<Request> {
     let mut head = [0u8; 2];
     read_exact(client, &mut head).await?;
@@ -56,10 +136,14 @@ pub(crate) async fn read_request(
     if request[0] != VERSION {
         return Err(invalid("bad socks5 request version"));
     }
-    if request[1] != CMD_CONNECT {
-        client.write_all(&reply(REP_COMMAND_NOT_SUPPORTED)).await?;
-        return Err(invalid("unsupported socks5 command"));
-    }
+    let reply_kind = match request[1] {
+        CMD_CONNECT => Reply::Socks5,
+        CMD_UDP_ASSOCIATE if udp => Reply::Socks5Associate,
+        _ => {
+            client.write_all(&reply(REP_COMMAND_NOT_SUPPORTED)).await?;
+            return Err(invalid("unsupported socks5 command"));
+        }
+    };
     let target = match request[3] {
         ATYP_IPV4 => {
             let mut buf = [0u8; 6];
@@ -100,7 +184,7 @@ pub(crate) async fn read_request(
     Ok(Request {
         target,
         initial: Vec::new(),
-        reply: Reply::Socks5,
+        reply: reply_kind,
     })
 }
 
