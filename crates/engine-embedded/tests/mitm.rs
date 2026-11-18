@@ -1555,3 +1555,114 @@ async fn rules_that_ignore_requests_keep_one_origin_connection() {
     assert_eq!(b.load(std::sync::atomic::Ordering::SeqCst), 0);
     server.abort();
 }
+
+/// Runs one TLS connection from an app with `app_config` through the engine
+/// to `origin`, and returns whether the app's handshake completed.
+async fn one_connection(
+    engine: &Arc<MitmEngine>,
+    origin: &Arc<Origin>,
+    app_config: ClientConfig,
+) -> bool {
+    let target: SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let (app, mut tunnel_side) = tokio::io::duplex(64 * 1024);
+    let client = tokio::spawn(async move {
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(app_config));
+        connector
+            .connect(ServerName::try_from(HOST).unwrap(), app)
+            .await
+            .is_ok()
+    });
+    let mut first = vec![0u8; 4096];
+    let n = tunnel_side.read(&mut first).await.unwrap();
+    first.truncate(n);
+    let host = engine
+        .claim(&first, target)
+        .expect("the listed host is intercepted");
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let origin = origin.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    origin.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+    let handshake = tokio::time::timeout(Duration::from_secs(10), client)
+        .await
+        .expect("client finished")
+        .unwrap();
+    // The engine records a failure as the handshake ends; give it the turn.
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    handshake
+}
+
+#[tokio::test]
+async fn mitm_hosts_marks_apps_that_refuse_the_device_root() {
+    let device_root = root("NetworkCore Test Device Root");
+    let origin_root = root("NetworkCore Test Origin Root");
+    let engine = Arc::new(
+        MitmEngine::new(&mitm_config(&device_root))
+            .unwrap()
+            .with_upstream_config(trusting(&origin_root.certificate, &[b"http/1.1"])),
+    );
+    let (requests_tx, _requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(Origin::new(&origin_root, requests_tx));
+
+    let empty = engine.mitm_hosts(false).expect("the engine decrypts");
+    assert_eq!(empty, serde_json::json!({ "enabled": true, "hosts": [] }));
+
+    // An app that trusts only the origin's own root, as a pinning app does,
+    // refuses the leaf the engine issues.
+    let pinned = trusting(&origin_root.certificate, &[b"http/1.1"]);
+    assert!(!one_connection(&engine, &origin, pinned).await);
+    let hosts = engine.mitm_hosts(false).unwrap();
+    let entry = &hosts["hosts"][0];
+    assert_eq!(entry["host"], HOST, "{hosts}");
+    assert_eq!(entry["decrypted"], 0);
+    assert_eq!(entry["failed"], 1);
+    assert_eq!(
+        entry["last_failure"], "client_rejected_certificate",
+        "{hosts}"
+    );
+    assert!(entry["last_failure_at_ms"].as_u64().unwrap() > 0);
+
+    // An app that trusts the device root is decrypted.
+    let trusting_app = trusting(&device_root.certificate, &[b"http/1.1"]);
+    assert!(one_connection(&engine, &origin, trusting_app).await);
+    let hosts = engine.mitm_hosts(false).unwrap();
+    let entry = &hosts["hosts"][0];
+    assert_eq!(entry["decrypted"], 1, "{hosts}");
+    assert_eq!(entry["failed"], 1);
+    assert_eq!(entry["failures"]["client_rejected_certificate"], 1);
+
+    let cleared = engine.mitm_hosts(true).unwrap();
+    assert_eq!(cleared["hosts"], serde_json::json!([]));
+}
+
+#[test]
+fn mitm_hosts_answers_without_decryption() {
+    let dispatcher = Dispatcher::single(Arc::new(PlainOrigin {
+        requests: mpsc::unbounded_channel().0,
+        body: Vec::new(),
+        extra_headers: "",
+    }));
+    assert_eq!(
+        control_json(&dispatcher, r#"{"cmd":"mitm_hosts"}"#),
+        serde_json::json!({ "enabled": false, "hosts": [] })
+    );
+    assert_eq!(
+        control_json(&dispatcher, r#"{"cmd":"clear_mitm_hosts"}"#),
+        serde_json::json!({ "enabled": false, "hosts": [] })
+    );
+}

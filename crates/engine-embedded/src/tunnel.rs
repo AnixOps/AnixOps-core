@@ -144,6 +144,14 @@ pub trait FlowInterceptor: Send + Sync {
         false
     }
 
+    /// The `mitm_hosts` answer: what HTTPS decryption did per host, after
+    /// forgetting it when `clear`. `None` when the interceptor decrypts
+    /// nothing.
+    fn mitm_hosts(&self, clear: bool) -> Option<serde_json::Value> {
+        let _ = clear;
+        None
+    }
+
     /// Answers a script control command; `None` when the interceptor runs
     /// no scripts.
     fn script_control(&self, request: &crate::control::ScriptControl) -> Option<serde_json::Value> {
