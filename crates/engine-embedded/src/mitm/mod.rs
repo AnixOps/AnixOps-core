@@ -44,6 +44,7 @@ mod http2;
 #[cfg(feature = "scripts")]
 mod http_client;
 pub mod inspect;
+pub(crate) mod outcomes;
 mod request_route;
 #[cfg(feature = "scripts")]
 mod scheduler;
@@ -153,6 +154,8 @@ pub struct MitmEngine {
     upstream_h2: Arc<ClientConfig>,
     leaves: Mutex<HashMap<String, Arc<ServerConfig>>>,
     decisions: Mutex<HashMap<String, bool>>,
+    /// What decryption did per host, for `mitm_hosts`.
+    outcomes: Mutex<outcomes::HostOutcomes>,
     next_request: AtomicU64,
     /// `[Rule]` lines of the accepted plugins, for the routing model.
     plugin_rules: Vec<config_core::routing::RoutingRule>,
@@ -268,6 +271,7 @@ impl MitmEngine {
             upstream_h2,
             leaves: Mutex::new(HashMap::new()),
             decisions: Mutex::new(HashMap::new()),
+            outcomes: Mutex::new(outcomes::HostOutcomes::default()),
             next_request: AtomicU64::new(1),
             plugin_rules,
             #[cfg(feature = "scripts")]
@@ -302,6 +306,36 @@ impl MitmEngine {
         self.next_request
             .fetch_add(1, Ordering::Relaxed)
             .to_string()
+    }
+
+    fn note_failure(&self, host: &str, failure: outcomes::Failure) {
+        if let Ok(mut table) = self.outcomes.lock() {
+            table.failed(host, failure, crate::capture::unix_millis());
+        }
+    }
+
+    fn note_decrypted(&self, host: &str) {
+        if let Ok(mut table) = self.outcomes.lock() {
+            table.decrypted(host, crate::capture::unix_millis());
+        }
+    }
+
+    /// The `mitm_hosts` answer: what decryption did per host, the most
+    /// recently seen first.
+    pub fn hosts_json(&self) -> serde_json::Value {
+        let hosts = self
+            .outcomes
+            .lock()
+            .map(|table| table.snapshot())
+            .unwrap_or_default();
+        serde_json::json!({ "enabled": true, "hosts": hosts })
+    }
+
+    /// Forgets what `mitm_hosts` reports.
+    pub fn clear_hosts(&self) {
+        if let Ok(mut table) = self.outcomes.lock() {
+            table.clear();
+        }
     }
 
     /// Whether TLS to `host` is intercepted.
@@ -433,12 +467,19 @@ impl MitmEngine {
             .is_ok_and(|origin| origin.get_ref().1.alpn_protocol() == Some(http2::ALPN_H2));
 
         let acceptor = tokio_rustls::TlsAcceptor::from(self.leaf_config(host, h2)?);
-        let client = tokio::time::timeout(
+        let accepted = tokio::time::timeout(
             connect_timeout,
             acceptor.accept(Prefixed::new(flow.inbound, flow.first)),
         )
         .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        .unwrap_or_else(|_| Err(io::Error::from(io::ErrorKind::TimedOut)));
+        let client = match accepted {
+            Ok(client) => client,
+            Err(error) => {
+                self.note_failure(host, outcomes::Failure::client(&error));
+                return Err(error);
+            }
+        };
         // An unreachable origin still gets the app a decrypted connection
         // (closed right away), as before origin-first ALPN, so the app sees
         // the usual leaf instead of a failed handshake. A REJECT-TINYGIF
@@ -448,8 +489,15 @@ impl MitmEngine {
             Err(error) if rejection(&error) == Some(RejectAction::TinyGif) => {
                 return answer_tiny_gif(Conn::new(client, Vec::new()), idle_timeout).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // A REJECT rule is not a decryption failure.
+                if rejection(&error).is_none() {
+                    self.note_failure(host, outcomes::Failure::origin(&error));
+                }
+                return Err(error);
+            }
         };
+        self.note_decrypted(host);
 
         let authority = authority(host, flow.target.port(), HTTPS_PORT);
         let routes = RequestRoutes::new(outbound, &target).await;
@@ -970,6 +1018,13 @@ impl FlowInterceptor for MitmEngine {
             .clone()
             .filter(|scheduler| scheduler.has_scripts())?;
         Some(Box::pin(scheduler.run()))
+    }
+
+    fn mitm_hosts(&self, clear: bool) -> Option<serde_json::Value> {
+        if clear {
+            self.clear_hosts();
+        }
+        Some(self.hosts_json())
     }
 
     #[cfg(feature = "scripts")]

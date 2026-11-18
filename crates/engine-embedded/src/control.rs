@@ -43,6 +43,8 @@
 //! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter` | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`) |
 //! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events, WebSocket messages) from `since_message` on |
 //! | `capture_h2_frames` | `id`, optional `since` | `{"h2_frames": {"seen", "dropped", "frames": [...]} \| null}`: the HTTP/2 frame headers of a decrypted `h2` connection on both links (`link`: `app` \| `origin`, `dir`, `type`, `flags`, `stream`, `length`, `error`, `value`), the last 512 |
+//! | `mitm_hosts` | | `{"enabled", "hosts": [{"host", "decrypted", "failed", "last_failure", "last_failure_at_ms", "last_decrypted_at_ms", "failures"}]}`: what HTTPS decryption did per host since the engine started, the most recently seen first, at most 256; `last_failure` is `client_rejected_certificate` (certificate alert from the app: untrusted root or pinning), `client_closed` (the app hung up during the handshake, often pinning), `client_handshake_failed`, `client_timeout`, `origin_tls` or `origin_unreachable` |
+//! | `clear_mitm_hosts` | | the `mitm_hosts` answer, after forgetting it |
 //! | `pro_status` | | [`crate::pro::ProStatus`] |
 //! | `set_pro_license` | `license` (string or `null`) | [`crate::pro::ProStatus`]: the client's stored license, `null` removes it |
 //!
@@ -238,6 +240,8 @@ enum ControlRequest {
         #[serde(default)]
         filter: String,
     },
+    MitmHosts,
+    ClearMitmHosts,
     ProStatus,
     SetProLicense {
         #[serde(default)]
@@ -439,6 +443,8 @@ pub fn handle_with_interceptor(
             Ok(json!({ "reset": reset, "closed": closed, "health_forgotten": health_forgotten }))
         }
         ControlRequest::RunScript { tag } => Ok(script(interceptor, ScriptControl::Run { tag })?),
+        ControlRequest::MitmHosts => Ok(mitm_hosts(interceptor, false)),
+        ControlRequest::ClearMitmHosts => Ok(mitm_hosts(interceptor, true)),
         ControlRequest::OutboundHealth => {
             let outbounds: Vec<_> = match dispatcher.routed_outbound() {
                 Some(routed) => routed
@@ -634,6 +640,14 @@ fn script(
     interceptor
         .and_then(|interceptor| interceptor.script_control(&request))
         .ok_or_else(|| invalid("this config runs no plugin scripts"))
+}
+
+/// What HTTPS decryption did per host; `enabled: false` with no hosts when
+/// this engine decrypts nothing.
+fn mitm_hosts(interceptor: Option<&dyn FlowInterceptor>, clear: bool) -> serde_json::Value {
+    interceptor
+        .and_then(|interceptor| interceptor.mitm_hosts(clear))
+        .unwrap_or_else(|| json!({ "enabled": false, "hosts": [] }))
 }
 
 fn storage_error(error: capture::storage::StorageError) -> RuntimeError {
