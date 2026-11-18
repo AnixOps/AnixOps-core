@@ -467,14 +467,13 @@ impl MitmEngine {
             .is_ok_and(|origin| origin.get_ref().1.alpn_protocol() == Some(http2::ALPN_H2));
 
         let acceptor = tokio_rustls::TlsAcceptor::from(self.leaf_config(host, h2)?);
-        let client = match tokio::time::timeout(
+        let accepted = tokio::time::timeout(
             connect_timeout,
             acceptor.accept(Prefixed::new(flow.inbound, flow.first)),
         )
         .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))
-        .and_then(|accepted| accepted)
-        {
+        .unwrap_or_else(|_| Err(io::Error::from(io::ErrorKind::TimedOut)));
+        let client = match accepted {
             Ok(client) => client,
             Err(error) => {
                 self.note_failure(host, outcomes::Failure::client(&error));

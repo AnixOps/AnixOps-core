@@ -142,7 +142,7 @@ impl HostOutcomes {
     /// Every host, the most recently seen first.
     pub(crate) fn snapshot(&self) -> Vec<HostOutcome> {
         let mut hosts = self.hosts.values().cloned().collect::<Vec<_>>();
-        hosts.sort_by(|a, b| b.seen.cmp(&a.seen));
+        hosts.sort_by_key(|outcome| std::cmp::Reverse(outcome.seen));
         hosts
     }
 
