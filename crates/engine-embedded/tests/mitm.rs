@@ -1567,10 +1567,11 @@ async fn one_connection(
     let (app, mut tunnel_side) = tokio::io::duplex(64 * 1024);
     let client = tokio::spawn(async move {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(app_config));
+        // Held open like a real app's, so the engine finishes its side.
         connector
             .connect(ServerName::try_from(HOST).unwrap(), app)
             .await
-            .is_ok()
+            .ok()
     });
     let mut first = vec![0u8; 4096];
     let n = tunnel_side.read(&mut first).await.unwrap();
@@ -1598,13 +1599,13 @@ async fn one_connection(
                 .await;
         }
     });
-    let handshake = tokio::time::timeout(Duration::from_secs(10), client)
+    let stream = tokio::time::timeout(Duration::from_secs(10), client)
         .await
         .expect("client finished")
         .unwrap();
-    // The engine records a failure as the handshake ends; give it the turn.
+    // The engine records the outcome as its side of the handshake ends.
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
-    handshake
+    stream.is_some()
 }
 
 #[tokio::test]
