@@ -14,6 +14,7 @@ use crate::routing::{
     parse_rule_line, NetworkCondition, NetworkRuleSpec, PolicyGroupSpec, RejectKind, RoutingModel,
     RoutingSpec,
 };
+use crate::rule_set::LAN_RULE_SET;
 use control_domain::{Diagnostic, DiagnosticSeverity, NodeDescriptor};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -957,7 +958,10 @@ fn import_plain_rule(
 }
 
 /// `RULE-SET,<url or provider>,target` and Surge `DOMAIN-SET,<url>,target`,
-/// rewritten to `RULE-SET,<id>,target`.
+/// rewritten to `RULE-SET,<id>,target` (with `no-resolve` kept). Surge's
+/// built-in `RULE-SET,LAN` names the engine's own `LAN` set unless a Clash
+/// rule provider is called that; its built-in `SYSTEM` (Apple system
+/// services, an unpublished list) is skipped with a warning.
 fn import_rule_set_rule(
     importer: &Importer,
     group_ids: &BTreeSet<String>,
@@ -970,9 +974,17 @@ fn import_rule_set_rule(
     }
     let target = resolve_rule_target(importer, group_ids, parts[2])
         .ok_or_else(|| format!("target {} was not imported", parts[2]))?;
+    let no_resolve = if parts[3..]
+        .iter()
+        .any(|option| option.eq_ignore_ascii_case("no-resolve"))
+    {
+        ",no-resolve"
+    } else {
+        ""
+    };
     let checkpoint = rule_sets.checkpoint();
     let id = rule_sets.reference(importer, group_ids, kind, parts[1], &parts[3..])?;
-    let rewritten = format!("RULE-SET,{id},{target}");
+    let rewritten = format!("RULE-SET,{id},{target}{no_resolve}");
     parse_rule_line(&rewritten)
         .map(|_| rewritten)
         .map_err(|error| {
@@ -1134,6 +1146,18 @@ impl<'a> RuleSetCollector<'a> {
     ) -> Result<String, String> {
         let value = strip_quotes(value.trim());
         let is_url = value.starts_with("https://") || value.starts_with("http://");
+        if kind == "RULE-SET" && !is_url && !self.providers.contains_key(value) {
+            // Surge's built-in sets.
+            if value.eq_ignore_ascii_case(LAN_RULE_SET) {
+                return Ok(LAN_RULE_SET.to_string());
+            }
+            if value.eq_ignore_ascii_case("SYSTEM") {
+                return Err(
+                    "Surge's built-in rule set SYSTEM (Apple system services) is not available; add the domains it should match as rules"
+                        .to_string(),
+                );
+            }
+        }
         let key = if is_url {
             format!("{kind}:{value}")
         } else {
@@ -1179,7 +1203,10 @@ impl<'a> RuleSetCollector<'a> {
         base.truncate(MAX_RULE_SET_ID_LEN);
         let base = base.trim_matches(|c| c == '-' || c == '.');
         let base = if base.is_empty() { "rule-set" } else { base };
-        let taken = |id: &str| self.sets.iter().any(|set| set.id == id);
+        // `LAN` is the engine's built-in set.
+        let taken = |id: &str| {
+            id.eq_ignore_ascii_case(LAN_RULE_SET) || self.sets.iter().any(|set| set.id == id)
+        };
         if !taken(base) {
             return base.to_string();
         }

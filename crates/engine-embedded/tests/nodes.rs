@@ -6,9 +6,12 @@
 use std::sync::Arc;
 
 use config_core::routing::{PolicyGroupSpec, RoutingSpec};
+use config_core::routing_import::ImportedRuleSet;
 use control_domain::{Endpoint, MetadataEntry, NodeDescriptor, Protocol};
 use engine_embedded::config::RuntimeConfig;
-use engine_embedded::nodes::{outbound_for_node, routing_envelope, single_node_envelope};
+use engine_embedded::nodes::{
+    outbound_for_node, routing_envelope, routing_envelope_with_sets, single_node_envelope,
+};
 use engine_embedded::protocols::default_registry;
 use engine_outbound::TcpDialer;
 
@@ -489,6 +492,48 @@ fn selected_node_and_routing_envelopes() {
         node("hy1", Protocol::Hysteria, &[("hysteria.auth", "x")]),
     ];
     assert!(routing_envelope("p", &with_unsupported, &spec).is_err());
+}
+
+#[test]
+fn routing_envelopes_carry_the_subscriptions_rule_sets() {
+    let nodes = [ss2022(), trojan()];
+    let spec = RoutingSpec {
+        rules: vec![
+            "RULE-SET,ads,REJECT".to_string(),
+            "RULE-SET,LAN,DIRECT".to_string(),
+            "FINAL,trojan".to_string(),
+        ],
+        groups: Vec::new(),
+    };
+    let sets = [ImportedRuleSet {
+        id: "ads".to_string(),
+        url: "https://lists.example/ads.list".to_string(),
+        format: Some("domain"),
+        interval_secs: Some(3600),
+        via: None,
+    }];
+    let envelope: serde_json::Value =
+        serde_json::from_str(&routing_envelope_with_sets("p", &nodes, &spec, &sets).unwrap())
+            .unwrap();
+    assert_eq!(
+        envelope["routing"]["rule_sets"],
+        serde_json::json!({"ads": {"url": "https://lists.example/ads.list", "format": "domain", "interval_secs": 3600}})
+    );
+    // Without sets the key is left out, as before.
+    let plain: serde_json::Value =
+        serde_json::from_str(&routing_envelope("p", &nodes, &spec).unwrap()).unwrap();
+    assert!(plain["routing"].get("rule_sets").is_none());
+    // The engine needs the set a rule names; LAN is built in.
+    assert!(RuntimeConfig::from_json(plain.to_string().as_bytes())
+        .and_then(|config| config
+            .build_routed(&default_registry(), Arc::new(TcpDialer))
+            .map(|_| ()))
+        .is_err());
+    #[cfg(feature = "local-proxy")]
+    assert_eq!(
+        builds(&routing_envelope_with_sets("p", &nodes, &spec, &sets).unwrap()),
+        "routed"
+    );
 }
 
 #[test]

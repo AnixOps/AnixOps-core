@@ -307,6 +307,19 @@ impl RoutingEnvironment for QueryEnvironment<'_> {
             .is_some_and(|set| set.matches(domain, ip))
     }
 
+    fn rule_set_needs_address(&self, name: &str) -> bool {
+        self.rule_sets
+            .get(name)
+            .is_some_and(|set| set.needs_address())
+    }
+
+    fn rule_set_rules(&self, name: &str) -> &[RuleMatcher] {
+        self.rule_sets
+            .get(name)
+            .map(|set| set.rules())
+            .unwrap_or(&[])
+    }
+
     fn geosite_matches(&self, category: &str, domain: &str) -> bool {
         self.rule_set_matches(&format!("geosite-{category}"), Some(domain), None)
     }
@@ -516,13 +529,13 @@ impl RoutedOutbound {
 
     /// Whether a `PROCESS-NAME` rule exists, alone or inside a logical rule.
     pub fn uses_process(&self) -> bool {
-        self.table().uses_process
+        self.table().uses_process || self.rule_sets.uses_process()
     }
 
     /// Whether a `URL-REGEX` or `USER-AGENT` rule exists (plugin rules
     /// included), alone or inside a logical rule.
     pub fn uses_request(&self) -> bool {
-        self.table().uses_request
+        self.table().uses_request || self.rule_sets.uses_request()
     }
 
     /// Puts MITM plugin rules ahead of the user's rules. A plugin names a
@@ -672,7 +685,7 @@ impl RoutedOutbound {
         }
         // Parsed straight into the compact tables; the body goes before they
         // are sorted and packed, so a large list never sits in memory twice.
-        let (builder, _skipped) = {
+        let (builder, _) = {
             let text = String::from_utf8_lossy(&body);
             RuleSetBuilder::parse_list(&text, remote.bare)
         };
@@ -683,7 +696,9 @@ impl RoutedOutbound {
         if builder.len() > MAX_RULE_SET_ENTRIES {
             return Err("too_many_entries");
         }
-        self.rule_sets.replace(&remote.name, builder.build());
+        let skipped = builder.skipped().clone();
+        self.rule_sets
+            .replace(&remote.name, builder.build(), skipped);
         Ok(())
     }
 

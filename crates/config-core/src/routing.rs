@@ -367,6 +367,48 @@ impl RuleMatcher {
         }
     }
 
+    /// Whether matching may need a destination address once the
+    /// environment's rule sets are known: an IP rule, a `RULE-SET` whose set
+    /// holds networks or rules that match one
+    /// ([`RoutingEnvironment::rule_set_needs_address`]), or a logical rule
+    /// containing either. A domain-only connection is resolved before such a
+    /// rule unless the rule says `no-resolve`, as Surge does.
+    pub fn wants_address(&self, environment: &dyn RoutingEnvironment) -> bool {
+        match self {
+            Self::IpCidr(_) | Self::GeoIp(_) => true,
+            Self::RuleSet(name) => environment.rule_set_needs_address(name),
+            Self::And(rules) | Self::Or(rules) => {
+                rules.iter().any(|rule| rule.wants_address(environment))
+            }
+            Self::Not(rule) => rule.wants_address(environment),
+            _ => false,
+        }
+    }
+
+    /// Whether `no-resolve` means something on this rule: an IP rule, a
+    /// `RULE-SET` (whose set may hold networks), or a logical rule
+    /// containing either.
+    pub fn accepts_no_resolve(&self) -> bool {
+        match self {
+            Self::IpCidr(_) | Self::GeoIp(_) | Self::RuleSet(_) => true,
+            Self::And(rules) | Self::Or(rules) => rules.iter().any(Self::accepts_no_resolve),
+            Self::Not(rule) => rule.accepts_no_resolve(),
+            _ => false,
+        }
+    }
+
+    /// Whether the rule, or one inside it, names a rule set, a rule script
+    /// or GeoIP/GeoSite data: matchers a rule set cannot hold, since they
+    /// would reach back into the environment's sets.
+    fn uses_environment_data(&self) -> bool {
+        match self {
+            Self::RuleSet(_) | Self::Script(_) | Self::GeoIp(_) | Self::GeoSite(_) => true,
+            Self::And(rules) | Self::Or(rules) => rules.iter().any(Self::uses_environment_data),
+            Self::Not(rule) => rule.uses_environment_data(),
+            _ => false,
+        }
+    }
+
     /// Whether this matcher alone matches `query`, as a rule would inside
     /// [`RoutingModel::decide`] but without ever resolving a domain: an IP
     /// rule matches only a query that carries an address.
@@ -704,7 +746,7 @@ pub fn parse_rule_line(line: &str) -> DomainResult<RuleLine> {
 fn parse_options(options: &[&str], matcher: &RuleMatcher) -> DomainResult<bool> {
     let mut no_resolve = false;
     for option in options {
-        if option.eq_ignore_ascii_case("no-resolve") && matcher.matches_ip() {
+        if option.eq_ignore_ascii_case("no-resolve") && matcher.accepts_no_resolve() {
             no_resolve = true;
         } else if option.eq_ignore_ascii_case("no-resolve")
             && matches!(matcher, RuleMatcher::SrcIp(_))
@@ -719,7 +761,7 @@ fn parse_options(options: &[&str], matcher: &RuleMatcher) -> DomainResult<bool> 
         } else {
             return Err(routing_error(
                 ROUTING_RULE_OPTION_UNSUPPORTED_CODE,
-                "routing rule option is unsupported; only IP rules accept no-resolve",
+                "routing rule option is unsupported; only IP and RULE-SET rules accept no-resolve",
             ));
         }
     }
@@ -835,6 +877,22 @@ fn parse_sub_rule(text: &str, depth: usize) -> DomainResult<RuleMatcher> {
         ));
     }
     parse_matcher(&kind, value)
+}
+
+/// One line of a downloaded rule set that is not a plain domain or network:
+/// `TYPE,value` (an optional `no-resolve` is ignored, as the `RULE-SET` rule
+/// decides) or `AND|OR|NOT,(...)`, with no target. Rule sets, rule scripts
+/// and GeoIP/GeoSite data are refused: a set cannot reach back into the
+/// environment's sets. The error names nothing from the line.
+pub(crate) fn parse_rule_set_entry(line: &str) -> DomainResult<RuleMatcher> {
+    let matcher = parse_sub_rule(line, 1)?;
+    if matcher.uses_environment_data() {
+        return Err(routing_error(
+            ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
+            "a rule set cannot hold RULE-SET, SCRIPT, GEOIP or GEOSITE rules",
+        ));
+    }
+    Ok(matcher)
 }
 
 /// The matcher of a rule type and its value.
@@ -1042,6 +1100,7 @@ impl RoutingModel {
     /// Decides where a connection goes, resolving policy groups to a node.
     ///
     /// Rules are evaluated in order. The first IP rule without `no-resolve`
+    /// (or `RULE-SET` whose set holds networks, after its domains missed)
     /// asks the environment to resolve a domain-only destination once; like a
     /// sing-box `resolve` action, the resolved address is then used by every
     /// later IP rule and is reported in the result. As in sing-box, a failed
@@ -1114,7 +1173,35 @@ impl RoutingModel {
                 continue;
             }
             let rule = &self.rules[index];
-            if rule.matcher.matches_ip() && ip.is_none() && !rule.no_resolve && !resolve_attempted {
+            if ip.is_none()
+                && !rule.no_resolve
+                && !resolve_attempted
+                && rule.matcher.wants_address(environment)
+            {
+                if let (RuleMatcher::RuleSet(_), Some(_)) = (&rule.matcher, domain.as_deref()) {
+                    // A set is tried on the domain first, so a connection its
+                    // domains hold is never resolved for its networks.
+                    let input = MatchInput {
+                        domain: domain.as_deref(),
+                        ip: None,
+                        port: query.port,
+                        source: query.source,
+                        in_port: query.in_port,
+                        process: process.as_deref(),
+                        network: query.network,
+                        user_agent: user_agent.as_deref(),
+                        url,
+                    };
+                    if rule_matches(&rule.matcher, &input, environment) {
+                        return self.resolution(
+                            RouteMatch::Rule(index),
+                            &rule.target,
+                            resolved_ip,
+                            balance_key.as_deref(),
+                            environment,
+                        );
+                    }
+                }
                 resolve_attempted = true;
                 if let Some(domain) = domain.as_deref() {
                     resolved_ip = environment.resolve(domain);
@@ -1479,6 +1566,20 @@ pub trait RoutingEnvironment {
     fn rule_set_matches(&self, _name: &str, _domain: Option<&str>, _ip: Option<IpAddr>) -> bool {
         false
     }
+
+    /// Whether the named rule set holds networks, or rules that match an
+    /// address ([`crate::rule_set::RuleSet::needs_address`]), so a
+    /// domain-only connection is resolved for it unless the `RULE-SET` rule
+    /// says `no-resolve`. An unknown set needs none.
+    fn rule_set_needs_address(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// The rules of the named set other than its domains and networks
+    /// ([`crate::rule_set::RuleSet::rules`]), tried one by one after them.
+    fn rule_set_rules(&self, _name: &str) -> &[RuleMatcher] {
+        &[]
+    }
 }
 
 /// Environment with no runtime state: select groups use their default and
@@ -1556,7 +1657,13 @@ fn rule_matches(
         }),
         RuleMatcher::IpCidr(cidr) => ip.is_some_and(|ip| cidr.contains(ip)),
         RuleMatcher::GeoIp(country) => ip.is_some_and(|ip| environment.geoip_matches(country, ip)),
-        RuleMatcher::RuleSet(name) => environment.rule_set_matches(name, domain, ip),
+        RuleMatcher::RuleSet(name) => {
+            environment.rule_set_matches(name, domain, ip)
+                || environment
+                    .rule_set_rules(name)
+                    .iter()
+                    .any(|rule| rule_matches(rule, input, environment))
+        }
         RuleMatcher::GeoSite(category) => {
             domain.is_some_and(|domain| environment.geosite_matches(category, domain))
         }

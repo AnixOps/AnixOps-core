@@ -488,7 +488,7 @@ rules:
         spec.rules,
         vec![
             "RULE-SET,reject,REJECT".to_string(),
-            "RULE-SET,cncidr,DIRECT".to_string(),
+            "RULE-SET,cncidr,DIRECT,no-resolve".to_string(),
             "GEOSITE,cn,DIRECT".to_string(),
             "PROCESS-NAME,Telegram,Proxy".to_string(),
             "AND,((RULE-SET,reject),(DST-PORT,443)),Proxy".to_string(),
@@ -547,7 +547,10 @@ RULE-SET,https://rules.example/surge/Apple.list,DIRECT,update-interval=7200
 DOMAIN-SET,https://rules.example/surge/reject.txt,REJECT
 RULE-SET,https://rules.example/surge/Apple.list,Proxy
 RULE-SET,SYSTEM,DIRECT
+RULE-SET,LAN,DIRECT,no-resolve
+AND,((RULE-SET,LAN),(DST-PORT,445)),REJECT
 RULE-SET,https://other.example/lists/Apple.list,Proxy
+RULE-SET,https://rules.example/surge/LAN.list,Proxy
 FINAL,Proxy
 
 [Remote Rule]
@@ -563,7 +566,10 @@ https://rules.example/loon/Off.list, policy=Proxy, tag=Off, enabled=false
             "RULE-SET,Apple,DIRECT".to_string(),
             "RULE-SET,reject,REJECT".to_string(),
             "RULE-SET,Apple,Proxy".to_string(),
+            "RULE-SET,LAN,DIRECT,no-resolve".to_string(),
+            "AND,((RULE-SET,LAN),(DST-PORT,445)),REJECT".to_string(),
             "RULE-SET,Apple-2,Proxy".to_string(),
+            "RULE-SET,LAN-2,Proxy".to_string(),
             "RULE-SET,Netflix,Proxy".to_string(),
             "FINAL,Proxy".to_string(),
         ]
@@ -579,13 +585,13 @@ https://rules.example/loon/Off.list, policy=Proxy, tag=Off, enabled=false
             ("Apple", None, Some(7200)),
             ("reject", Some("domain"), None),
             ("Apple-2", None, None),
+            ("LAN-2", None, None),
             ("Netflix", None, None),
         ]
     );
-    assert!(imported
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("rule set SYSTEM is not a URL")));
+    assert!(imported.diagnostics.iter().any(|diagnostic| diagnostic
+        .message
+        .contains("built-in rule set SYSTEM (Apple system services) is not available")));
 }
 
 const NETWORK_PROFILE: &str = r#"

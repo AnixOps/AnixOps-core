@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use config_core::routing::RoutingSpec;
+use config_core::routing_import::ImportedRuleSet;
 use control_domain::NodeDescriptor;
 use serde_json::{json, Value};
 
@@ -52,18 +53,31 @@ pub fn single_node_envelope(
 
 /// Envelope with every node as a routed outbound plus `routing`'s rules and
 /// policy groups. Fails if any node is unsupported, since rules and groups may
-/// refer to it.
+/// refer to it. Rules naming the subscription's own rule sets need
+/// [`routing_envelope_with_sets`]: without the sets the engine refuses them.
 pub fn routing_envelope(
     profile_id: &str,
     nodes: &[NodeDescriptor],
     routing: &RoutingSpec,
+) -> Result<String, Unsupported> {
+    routing_envelope_with_sets(profile_id, nodes, routing, &[])
+}
+
+/// [`routing_envelope`] with the remote rule sets the subscription's rules
+/// name (`ImportedRouting::rule_sets`) as `routing.rule_sets`, as
+/// `node-import` writes them; the engine downloads them itself.
+pub fn routing_envelope_with_sets(
+    profile_id: &str,
+    nodes: &[NodeDescriptor],
+    routing: &RoutingSpec,
+    rule_sets: &[ImportedRuleSet],
 ) -> Result<String, Unsupported> {
     let mut outbounds = BTreeMap::new();
     for node in nodes {
         outbounds.insert(node.id.clone(), outbound_for_node(node)?);
     }
     let section = node_import::routing_json(routing);
-    let envelope = json!({
+    let mut envelope = json!({
         "schema_version": CONFIG_SCHEMA_VERSION,
         "profile_id": profile_id,
         "routing": {
@@ -72,5 +86,8 @@ pub fn routing_envelope(
             "groups": section["groups"],
         },
     });
+    if !rule_sets.is_empty() {
+        envelope["routing"]["rule_sets"] = node_import::rule_sets_json(rule_sets);
+    }
     Ok(envelope.to_string())
 }
