@@ -10,21 +10,52 @@
 //! `HashSet<String>` costs some 90 bytes per entry. That keeps a 200 000-line
 //! ad-blocking list near 5 MB instead of 18 MB, which matters inside the iOS
 //! network extension's memory limit. Downloaded lists are parsed straight into
-//! the buffer ([`RuleSetBuilder::parse_list`]) without a `String` per line. Like a sing-box `rule_set` without
-//! a `resolve` action, the IP part matches only a destination that is already
-//! an address; domains are never resolved for it.
+//! the buffer ([`RuleSetBuilder::parse_list`]) without a `String` per line.
+//! [`RuleSet::matches`] never resolves a domain for the IP part; the
+//! `RULE-SET` rule does that, as Surge does, when the set holds networks
+//! ([`RuleSet::needs_address`]) and the rule does not say `no-resolve`.
+//!
+//! A downloaded list may also hold other rule types (`PROCESS-NAME`,
+//! `USER-AGENT`, `DST-PORT`, `AND`, ...): they are kept as
+//! [`RuleSet::rules`] and tried one by one after the tables. What a list
+//! holds that no set can is counted by type ([`RuleSetBuilder::skipped`]) so
+//! the client can show it instead of the set silently matching less.
 
 use control_domain::DomainResult;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use crate::routing::{
-    normalize_rule_domain, routing_error, IpCidr, ROUTING_RULE_VALUE_INVALID_CODE,
+    normalize_rule_domain, parse_rule_set_entry, routing_error, IpCidr, RuleMatcher,
+    ROUTING_RULE_VALUE_INVALID_CODE,
 };
 
 /// Most entries a configured or downloaded set may hold: room for the
 /// mainland China domain and network lists with headroom.
 pub const MAX_RULE_SET_ENTRIES: usize = 500_000;
+
+/// Most rules other than domains and networks one set may hold: they are
+/// tried one by one, so lists keep few (a few dozen `PROCESS-NAME` or
+/// `USER-AGENT` lines). Lines past this are counted as skipped.
+pub const MAX_RULE_SET_RULES: usize = 4_096;
+
+/// Most distinct rule types [`RuleSetBuilder::skipped`] names; the rest are
+/// counted under [`SKIPPED_OTHER`].
+const MAX_SKIPPED_KINDS: usize = 16;
+
+/// What [`RuleSetBuilder::skipped`] counts a line under when it has no rule
+/// type (a malformed bare entry) or names one that is not a plain token.
+pub const SKIPPED_INVALID: &str = "INVALID";
+
+/// What [`RuleSetBuilder::skipped`] counts the rule types past the first
+/// sixteen under.
+pub const SKIPPED_OTHER: &str = "OTHER";
+
+/// Name of the built-in set Surge calls `LAN`: local names and the private,
+/// shared, loopback and link-local networks ([`RuleSet::lan`]). A set the
+/// config names `LAN` replaces it.
+pub const LAN_RULE_SET: &str = "LAN";
 
 /// A sorted, deduplicated list of domains in one buffer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,6 +140,8 @@ pub struct RuleSetBuilder {
     domain_keywords: Vec<String>,
     v4: Vec<(u32, u32)>,
     v6: Vec<(u128, u128)>,
+    rules: Vec<RuleMatcher>,
+    skipped: BTreeMap<String, usize>,
 }
 
 impl RuleSetBuilder {
@@ -129,10 +162,18 @@ impl RuleSetBuilder {
             + self.domain_keywords.len()
             + self.v4.len()
             + self.v6.len()
+            + self.rules.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Lines the list held that no set can, by rule type (upper case, such
+    /// as `IP-ASN` or `SCRIPT`), [`SKIPPED_INVALID`] for malformed lines and
+    /// [`SKIPPED_OTHER`] past sixteen types.
+    pub fn skipped(&self) -> &BTreeMap<String, usize> {
+        &self.skipped
     }
 
     fn push_domain(&mut self, value: &str) -> DomainResult<()> {
@@ -191,6 +232,7 @@ impl RuleSetBuilder {
             domain_keywords: self.domain_keywords,
             v4: merge_ranges(self.v4),
             v6: merge_ranges(self.v6),
+            rules: self.rules.into_boxed_slice(),
         }
     }
 }
@@ -206,9 +248,39 @@ pub struct RuleSet {
     /// Sorted, non-overlapping inclusive ranges.
     v4: Vec<(u32, u32)>,
     v6: Vec<(u128, u128)>,
+    /// Rules other than domains and networks, tried one by one after them.
+    rules: Box<[RuleMatcher]>,
 }
 
 impl RuleSet {
+    /// Surge's built-in `LAN` set ([`LAN_RULE_SET`]): `localhost` and the
+    /// `.local` names, and the private (RFC 1918, RFC 4193), shared address
+    /// space (RFC 6598), loopback and link-local networks. It holds
+    /// networks, so a domain-only connection reaching it is resolved unless
+    /// the rule says `no-resolve`, as in Surge.
+    pub fn lan() -> Self {
+        Self::from_entries(&RuleSetEntries {
+            domain: vec!["localhost".to_string()],
+            domain_suffix: vec!["local".to_string()],
+            ip_cidr: [
+                "10.0.0.0/8",
+                "100.64.0.0/10",
+                "127.0.0.0/8",
+                "169.254.0.0/16",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "::1/128",
+                "fc00::/7",
+                "fe80::/10",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ..RuleSetEntries::default()
+        })
+        .expect("the built-in LAN set is valid")
+    }
+
     pub fn new<'a>(
         domain_suffixes: impl IntoIterator<Item = &'a str>,
         ip_cidrs: impl IntoIterator<Item = &'a str>,
@@ -248,6 +320,41 @@ impl RuleSet {
             + self.domain_keywords.len()
             + self.v4.len()
             + self.v6.len()
+            + self.rules.len()
+    }
+
+    /// Rules other than domains and networks, which [`RuleSet::matches`]
+    /// does not try: the routing model tries them with the whole connection.
+    pub fn rules(&self) -> &[RuleMatcher] {
+        &self.rules
+    }
+
+    /// Whether the set holds networks, or a rule that matches an address,
+    /// so a domain-only connection must be resolved to match all of it.
+    pub fn needs_address(&self) -> bool {
+        !self.v4.is_empty() || !self.v6.is_empty() || self.rules.iter().any(RuleMatcher::matches_ip)
+    }
+
+    /// Whether a rule of the set matches the local process.
+    pub fn uses_process(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule_uses(rule, &|matcher| {
+                matches!(matcher, RuleMatcher::ProcessName(_))
+            })
+        })
+    }
+
+    /// Whether a rule of the set matches the URL or `User-Agent` of a
+    /// request.
+    pub fn uses_request(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule_uses(rule, &|matcher| {
+                matches!(
+                    matcher,
+                    RuleMatcher::UserAgent(_) | RuleMatcher::UrlRegex(_)
+                )
+            })
+        })
     }
 
     /// `domain` is lower case without a trailing dot, as
@@ -281,8 +388,20 @@ impl RuleSet {
     }
 }
 
+/// Whether `matcher`, or a rule inside it, is one `leaf` accepts.
+fn rule_uses(matcher: &RuleMatcher, leaf: &dyn Fn(&RuleMatcher) -> bool) -> bool {
+    match matcher {
+        RuleMatcher::And(rules) | RuleMatcher::Or(rules) => {
+            rules.iter().any(|rule| rule_uses(rule, leaf))
+        }
+        RuleMatcher::Not(rule) => rule_uses(rule, leaf),
+        other => leaf(other),
+    }
+}
+
 /// Unvalidated rule set entries, as a config lists them or a downloaded list
-/// yields them.
+/// yields them. Only domains and networks: other rule types in a list are
+/// skipped here and kept only by [`RuleSetBuilder`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuleSetEntries {
     pub domain: Vec<String>,
@@ -342,6 +461,16 @@ enum EntryKind {
 /// valid.
 trait ListSink {
     fn add(&mut self, kind: EntryKind, value: &str) -> bool;
+
+    /// A line of another rule type, whole (`TYPE,value` or a logical rule);
+    /// returns whether it was kept.
+    fn add_rule(&mut self, _line: &str) -> bool {
+        false
+    }
+
+    /// A line that was not kept, under its rule type (see
+    /// [`RuleSetBuilder::skipped`]).
+    fn skip(&mut self, _kind: &str) {}
 }
 
 impl ListSink for RuleSetEntries {
@@ -371,6 +500,28 @@ impl ListSink for RuleSetBuilder {
             EntryKind::Network => is_network(value) && self.push_cidr(value).is_ok(),
         }
     }
+
+    fn add_rule(&mut self, line: &str) -> bool {
+        if self.rules.len() >= MAX_RULE_SET_RULES {
+            return false;
+        }
+        match parse_rule_set_entry(line) {
+            Ok(rule) => {
+                self.rules.push(rule);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn skip(&mut self, kind: &str) {
+        let kind = if self.skipped.contains_key(kind) || self.skipped.len() < MAX_SKIPPED_KINDS {
+            kind
+        } else {
+            SKIPPED_OTHER
+        };
+        *self.skipped.entry(kind.to_string()).or_default() += 1;
+    }
 }
 
 /// Reads a downloaded list into `sink` and returns how many lines were
@@ -390,6 +541,7 @@ fn parse_list_into(sink: &mut impl ListSink, text: &str, bare: BareDomain) -> us
         let line = line.strip_prefix("- ").unwrap_or(line).trim();
         let line = line.trim_matches(|c| c == '\'' || c == '"').trim();
         if !push_line(sink, line, bare) {
+            sink.skip(skipped_kind(line));
             skipped += 1;
         }
     }
@@ -404,7 +556,7 @@ fn push_line(sink: &mut impl ListSink, line: &str, bare: BareDomain) -> bool {
             "DOMAIN-SUFFIX" => EntryKind::Suffix,
             "DOMAIN-KEYWORD" => EntryKind::Keyword,
             "IP-CIDR" | "IP-CIDR6" => EntryKind::Network,
-            _ => return false,
+            _ => return sink.add_rule(line),
         };
         return sink.add(kind, value);
     }
@@ -421,6 +573,65 @@ fn push_line(sink: &mut impl ListSink, line: &str, bare: BareDomain) -> bool {
         (None, BareDomain::Exact) => sink.add(EntryKind::Domain, line),
     }
 }
+
+/// The rule type a skipped line is counted under: its first field in upper
+/// case when that is a plain token (letters, digits, `-`, at most 32), else
+/// [`SKIPPED_INVALID`]. Nothing else of the line is kept.
+fn skipped_kind(line: &str) -> &'static str {
+    let Some((kind, _)) = line.split_once(',') else {
+        return SKIPPED_INVALID;
+    };
+    let kind = kind.trim();
+    let token = !kind.is_empty()
+        && kind.len() <= 32
+        && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if !token {
+        return SKIPPED_INVALID;
+    }
+    // Leaked once per distinct type, at most a few dozen known names; any
+    // other token is folded into OTHER so a hostile list cannot grow this.
+    KNOWN_RULE_TYPES
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(kind))
+        .copied()
+        .unwrap_or(SKIPPED_OTHER)
+}
+
+/// Rule types a skipped line is reported under by name; any other is
+/// [`SKIPPED_OTHER`].
+const KNOWN_RULE_TYPES: &[&str] = &[
+    "AND",
+    "CELLULAR-RADIO",
+    "DEST-PORT",
+    "DEVICE-NAME",
+    "DOMAIN",
+    "DOMAIN-KEYWORD",
+    "DOMAIN-REGEX",
+    "DOMAIN-SET",
+    "DOMAIN-SUFFIX",
+    "DOMAIN-WILDCARD",
+    "DST-PORT",
+    "GEOIP",
+    "GEOSITE",
+    "HOSTNAME-TYPE",
+    "IN-PORT",
+    "IP-ASN",
+    "IP-CIDR",
+    "IP-CIDR6",
+    "NOT",
+    "OR",
+    "PROCESS-NAME",
+    "PROCESS-PATH",
+    "PROTOCOL",
+    "RULE-SET",
+    "SCRIPT",
+    "SRC-IP",
+    "SRC-IP-CIDR",
+    "SRC-PORT",
+    "SUBNET",
+    "URL-REGEX",
+    "USER-AGENT",
+];
 
 fn is_domain(value: &str) -> bool {
     normalize_rule_domain(value).is_ok()
@@ -561,7 +772,7 @@ mod tests {
     fn downloaded_lists_build_the_same_set_without_a_string_per_line() {
         let text = "payload:\n  - '+.google.com'\n  - \"Exact.example\"\nDOMAIN-SUFFIX,.classic.example\n\
             DOMAIN,api.example,REJECT\nDOMAIN-KEYWORD,adtrack\nIP-CIDR,10.0.0.0/8,no-resolve\n192.0.2.1\n\
-            DOMAIN-SUFFIX,Google.com\nUSER-AGENT,curl*\nnot a domain\n";
+            DOMAIN-SUFFIX,Google.com\nnot a domain\n";
         let (entries, skipped) = RuleSetEntries::parse_list(text, BareDomain::Exact);
         let (builder, built_skipped) = RuleSetBuilder::parse_list(text, BareDomain::Exact);
         assert_eq!(built_skipped, skipped);
@@ -578,6 +789,105 @@ mod tests {
         assert!(!built.matches(Some("example.org"), None));
         // The google.com suffix listed twice is stored once.
         assert_eq!(built.len(), entries.len() - 1);
+    }
+
+    #[test]
+    fn other_rule_types_are_kept_as_rules_and_the_rest_counted_by_type() {
+        let text = "DOMAIN-SUFFIX,example.com\nPROCESS-NAME,Telegram\nUSER-AGENT,curl*\n\
+            DST-PORT,5222\nAND,((DOMAIN-KEYWORD,ads),(DST-PORT,443))\nIP-ASN,13335,no-resolve\n\
+            IP-ASN,15169\nRULE-SET,https://lists.example/a.list\nGEOIP,US\nSCRIPT,pick\n\
+            X-MADE-UP,1\nnot a domain\n";
+        let (builder, skipped) = RuleSetBuilder::parse_list(text, BareDomain::Suffix);
+        assert_eq!(skipped, 7);
+        let counted = builder
+            .skipped()
+            .iter()
+            .map(|(kind, count)| (kind.as_str(), *count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counted,
+            [
+                ("GEOIP", 1),
+                ("INVALID", 1),
+                ("IP-ASN", 2),
+                ("OTHER", 1),
+                ("RULE-SET", 1),
+                ("SCRIPT", 1),
+            ]
+        );
+        let set = builder.build();
+        assert_eq!(set.rules().len(), 4);
+        assert_eq!(set.len(), 5);
+        assert!(set.uses_process());
+        assert!(set.uses_request());
+        // Domains only and port rules need no address.
+        assert!(!set.needs_address());
+        // The tables alone never try the rules.
+        assert!(!set.matches(Some("ads.test"), None));
+
+        let (builder, _) = RuleSetBuilder::parse_list(
+            "PROCESS-NAME,a\nOR,((IP-CIDR,10.0.0.0/8),(DST-PORT,1))\n",
+            BareDomain::Suffix,
+        );
+        assert!(builder.build().needs_address());
+    }
+
+    #[test]
+    fn rules_past_the_limit_are_counted_as_skipped() {
+        let text = (0..MAX_RULE_SET_RULES + 2)
+            .map(|index| format!("PROCESS-NAME,app-{index}\n"))
+            .collect::<String>();
+        let (builder, skipped) = RuleSetBuilder::parse_list(&text, BareDomain::Suffix);
+        assert_eq!(skipped, 2);
+        assert_eq!(builder.skipped().get("PROCESS-NAME"), Some(&2));
+        assert_eq!(builder.build().rules().len(), MAX_RULE_SET_RULES);
+    }
+
+    #[test]
+    fn skipped_types_past_sixteen_fold_into_other() {
+        let text = KNOWN_RULE_TYPES
+            .iter()
+            .map(|kind| format!("{kind},\n"))
+            .collect::<String>();
+        let (builder, skipped) = RuleSetBuilder::parse_list(&text, BareDomain::Suffix);
+        assert_eq!(skipped, KNOWN_RULE_TYPES.len());
+        assert_eq!(builder.skipped().len(), MAX_SKIPPED_KINDS + 1);
+        assert_eq!(
+            builder.skipped().get(SKIPPED_OTHER),
+            Some(&(KNOWN_RULE_TYPES.len() - MAX_SKIPPED_KINDS))
+        );
+    }
+
+    #[test]
+    fn the_lan_set_holds_local_names_and_private_networks() {
+        let set = RuleSet::lan();
+        assert!(set.needs_address());
+        for domain in ["localhost", "printer.local", "local"] {
+            assert!(set.matches(Some(domain), None), "{domain}");
+        }
+        assert!(!set.matches(Some("localhost.example"), None));
+        for ip in [
+            "10.1.2.3",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert!(set.matches(None, Some(ip.parse().unwrap())), "{ip}");
+        }
+        for ip in [
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "2001:db8::1",
+            "198.18.0.1",
+        ] {
+            assert!(!set.matches(None, Some(ip.parse().unwrap())), "{ip}");
+        }
     }
 
     #[test]

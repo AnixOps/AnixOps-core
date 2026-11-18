@@ -53,6 +53,38 @@ fn geosite_and_geoip_rules_match_their_sets() {
 }
 
 #[test]
+fn the_built_in_lan_set_is_there_unless_the_config_names_one() {
+    let routed = routed(r#""RULE-SET,LAN,DIRECT,no-resolve","FINAL,hk""#, "").unwrap();
+    assert_eq!(routed.route(&ip("192.168.1.20:445")), RouteOutcome::Direct);
+    assert_eq!(routed.route(&ip("[fe80::1]:445")), RouteOutcome::Direct);
+    assert_eq!(
+        routed.route(&domain("nas.local", 445)),
+        RouteOutcome::Direct
+    );
+    assert_eq!(
+        routed.route(&ip("8.8.8.8:53")),
+        RouteOutcome::Node("hk".to_string())
+    );
+    // Built in, so not in the list of configured sets.
+    assert!(routed.rule_sets().status().is_empty());
+
+    let routed = routed_lan_override();
+    assert_eq!(
+        routed.route(&ip("192.168.1.20:445")),
+        RouteOutcome::Node("hk".to_string())
+    );
+    assert_eq!(routed.route(&ip("192.0.2.1:445")), RouteOutcome::Direct);
+}
+
+fn routed_lan_override() -> Arc<RoutedOutbound> {
+    routed(
+        r#""RULE-SET,LAN,DIRECT,no-resolve","FINAL,hk""#,
+        r#""LAN":{"ip_cidr":["192.0.2.0/24"]}"#,
+    )
+    .unwrap()
+}
+
+#[test]
 fn rules_naming_missing_or_bad_sets_are_rejected() {
     assert!(routed(r#""GEOSITE,google,hk","FINAL,hk""#, "").is_err());
     assert!(routed(
@@ -155,6 +187,44 @@ mod remote {
 
         assert_eq!(routed.rule_sets().refresh_now(), 1);
         wait_until(|| hits.load(Ordering::SeqCst) == 2);
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn downloads_keep_other_rule_types_and_count_what_no_set_holds() {
+        let (url, _) = list_server(
+            "DOMAIN-SUFFIX,ads.test\nUSER-AGENT,BadBot*\nIP-ASN,13335\nIP-ASN,15169\nSCRIPT,x\n",
+        );
+        let routed = routed(
+            r#""RULE-SET,ads,REJECT","FINAL,hk""#,
+            &format!(r#""ads":{{"url":"{url}"}}"#),
+        )
+        .unwrap();
+        assert!(!routed.uses_request());
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.spawn(routed.clone().run_rule_set_updates());
+        wait_until(|| routed.rule_sets().status()[0].updated_at_ms.is_some());
+        let status = &routed.rule_sets().status()[0];
+        assert_eq!(status.entries, 2);
+        assert_eq!(
+            status
+                .skipped
+                .iter()
+                .map(|(kind, count)| (kind.as_str(), *count))
+                .collect::<Vec<_>>(),
+            [("IP-ASN", 2), ("SCRIPT", 1)]
+        );
+        // The USER-AGENT line inside the set turns on per-request routing.
+        assert!(routed.uses_request());
+        assert_eq!(
+            routed.route(&domain("x.ads.test", 443)),
+            RouteOutcome::Reject(RejectKind::Reject)
+        );
         runtime.shutdown_background();
     }
 

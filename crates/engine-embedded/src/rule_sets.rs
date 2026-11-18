@@ -14,12 +14,18 @@
 //! and installs the list only when the signature over its exact bytes
 //! verifies ([`verify_list_signature`]). A missing or wrong signature keeps
 //! the previous entries like any failed download.
+//!
+//! The set [`LAN_RULE_SET`] (Surge's built-in `LAN`) is always there unless
+//! the config names its own. A downloaded list may hold rule types no set
+//! can (`IP-ASN`, `SCRIPT`, ...): they are counted by type in
+//! [`RuleSetStatus::skipped`] so the client can say what the set ignores.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use config_core::rule_set::{BareDomain, RuleSet};
+use config_core::rule_set::{BareDomain, RuleSet, LAN_RULE_SET};
 use serde::Serialize;
 use tokio::sync::Notify;
 
@@ -109,6 +115,10 @@ pub struct RuleSetStatus {
     pub last_error: Option<&'static str>,
     /// Whether downloads must carry a valid signature.
     pub signed: bool,
+    /// Lines of the last download that the set could not hold, by rule type
+    /// (such as `IP-ASN` or `SCRIPT`; `INVALID` for malformed lines, `OTHER`
+    /// past sixteen types). Empty when nothing was skipped.
+    pub skipped: BTreeMap<String, usize>,
 }
 
 pub struct RuleSetStore {
@@ -116,6 +126,11 @@ pub struct RuleSetStore {
     remotes: Vec<RemoteRuleSet>,
     status: Mutex<BTreeMap<String, RuleSetStatus>>,
     refresh: Notify,
+    /// Whether some set holds a `PROCESS-NAME` rule, or a `URL-REGEX` or
+    /// `USER-AGENT` one; kept with every replace so the per-connection
+    /// checks never walk the sets.
+    uses_process: AtomicBool,
+    uses_request: AtomicBool,
 }
 
 impl RuleSetStore {
@@ -138,16 +153,45 @@ impl RuleSetStore {
                     updated_at_ms: None,
                     last_error: None,
                     signed: remote.is_some_and(|remote| remote.signature.is_some()),
+                    skipped: BTreeMap::new(),
                 };
                 (name.clone(), status)
             })
             .collect();
-        Self {
+        // Not in the status list: nothing to download or count.
+        sets.entry(LAN_RULE_SET.to_string())
+            .or_insert_with(|| Arc::new(RuleSet::lan()));
+        let store = Self {
             sets: RwLock::new(sets),
             remotes,
             status: Mutex::new(status),
             refresh: Notify::new(),
-        }
+            uses_process: AtomicBool::new(false),
+            uses_request: AtomicBool::new(false),
+        };
+        store.update_uses(&store.read());
+        store
+    }
+
+    /// Whether some set holds a `PROCESS-NAME` rule.
+    pub fn uses_process(&self) -> bool {
+        self.uses_process.load(Ordering::Relaxed)
+    }
+
+    /// Whether some set holds a `URL-REGEX` or `USER-AGENT` rule.
+    pub fn uses_request(&self) -> bool {
+        self.uses_request.load(Ordering::Relaxed)
+    }
+
+    fn update_uses(&self, sets: &BTreeMap<String, Arc<RuleSet>>) {
+        self.uses_process.store(
+            sets.values().any(|set| set.uses_process()),
+            Ordering::Relaxed,
+        );
+        self.uses_request.store(
+            sets.values().any(|set| set.uses_request()),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -183,17 +227,23 @@ impl RuleSetStore {
         self.refresh.notified().await;
     }
 
-    /// Installs a downloaded set for every later connection.
-    pub fn replace(&self, name: &str, set: RuleSet) {
+    /// Installs a downloaded set for every later connection, with the
+    /// lines its list held that it could not ([`RuleSetStatus::skipped`]).
+    pub fn replace(&self, name: &str, set: RuleSet, skipped: BTreeMap<String, usize>) {
         let entries = set.len();
-        self.sets
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(name.to_string(), Arc::new(set));
+        {
+            let mut sets = self
+                .sets
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sets.insert(name.to_string(), Arc::new(set));
+            self.update_uses(&sets);
+        }
         if let Some(status) = lock(&self.status).get_mut(name) {
             status.entries = entries;
             status.updated_at_ms = Some(unix_millis());
             status.last_error = None;
+            status.skipped = skipped;
         }
     }
 

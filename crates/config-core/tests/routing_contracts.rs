@@ -636,6 +636,148 @@ fn ip_rules_resolve_once_and_no_resolve_rules_skip_domains() {
     assert_eq!(direct_ip.outcome, RouteOutcome::Reject(RejectKind::Reject));
 }
 
+/// Rule sets from a fixed map, with a resolver that answers one domain and
+/// counts lookups.
+struct SetEnvironment {
+    sets: BTreeMap<String, config_core::rule_set::RuleSet>,
+    lookups: std::cell::Cell<usize>,
+}
+
+impl SetEnvironment {
+    fn new(sets: &[(&str, &str)]) -> Self {
+        use config_core::rule_set::{BareDomain, RuleSetBuilder};
+        let sets = sets
+            .iter()
+            .map(|(name, list)| {
+                let (builder, _) = RuleSetBuilder::parse_list(list, BareDomain::Suffix);
+                (name.to_string(), builder.build())
+            })
+            .collect();
+        Self {
+            sets,
+            lookups: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl RoutingEnvironment for SetEnvironment {
+    fn resolve(&self, domain: &str) -> Option<IpAddr> {
+        self.lookups.set(self.lookups.get() + 1);
+        (domain == "cdn.test").then(|| "203.0.113.9".parse().unwrap())
+    }
+
+    fn rule_set_matches(&self, name: &str, domain: Option<&str>, ip: Option<IpAddr>) -> bool {
+        self.sets
+            .get(name)
+            .is_some_and(|set| set.matches(domain, ip))
+    }
+
+    fn rule_set_needs_address(&self, name: &str) -> bool {
+        self.sets.get(name).is_some_and(|set| set.needs_address())
+    }
+
+    fn rule_set_rules(&self, name: &str) -> &[RuleMatcher] {
+        self.sets.get(name).map(|set| set.rules()).unwrap_or(&[])
+    }
+}
+
+#[test]
+fn rule_sets_with_networks_resolve_domains_like_surge() {
+    let environment = SetEnvironment::new(&[
+        (
+            "cn-ip",
+            "DOMAIN-SUFFIX,listed.test\nIP-CIDR,203.0.113.0/24\n",
+        ),
+        ("names", "DOMAIN-SUFFIX,names.test\n"),
+    ]);
+    let model = RoutingModel::from_spec(
+        &spec(
+            &["RULE-SET,names,jp-1", "RULE-SET,cn-ip,DIRECT", "FINAL,hk-1"],
+            vec![],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+
+    // A domain the set's domains hold matches without a lookup.
+    let listed = model.decide(&RouteQuery::domain("www.listed.test"), &environment);
+    assert_eq!(listed.matched, RouteMatch::Rule(1));
+    assert_eq!(listed.resolved_ip, None);
+    assert_eq!(environment.lookups.get(), 0);
+
+    // A domain-only set never resolves.
+    let named = model.decide(&RouteQuery::domain("a.names.test"), &environment);
+    assert_eq!(named.matched, RouteMatch::Rule(0));
+    assert_eq!(environment.lookups.get(), 0);
+
+    // Another domain is resolved once for the set's networks.
+    let resolved = model.decide(&RouteQuery::domain("cdn.test"), &environment);
+    assert_eq!(resolved.matched, RouteMatch::Rule(1));
+    assert_eq!(resolved.outcome, RouteOutcome::Direct);
+    assert_eq!(
+        resolved.resolved_ip,
+        Some("203.0.113.9".parse::<IpAddr>().unwrap())
+    );
+    assert_eq!(environment.lookups.get(), 1);
+
+    // A failed lookup rejects, as for IP rules.
+    let failed = model.decide(&RouteQuery::domain("unknown.test"), &environment);
+    assert_eq!(failed.matched, RouteMatch::ResolveFailed(1));
+    assert_eq!(failed.outcome, RouteOutcome::Reject(RejectKind::Reject));
+
+    // no-resolve keeps the set to the domains.
+    let model = RoutingModel::from_spec(
+        &spec(&["RULE-SET,cn-ip,DIRECT,no-resolve", "FINAL,hk-1"], vec![]),
+        &node_ids(),
+    )
+    .unwrap();
+    let lookups = environment.lookups.get();
+    let skipped = model.decide(&RouteQuery::domain("cdn.test"), &environment);
+    assert_eq!(skipped.matched, RouteMatch::Final);
+    assert_eq!(environment.lookups.get(), lookups);
+    let listed = model.decide(&RouteQuery::domain("listed.test"), &environment);
+    assert_eq!(listed.matched, RouteMatch::Rule(0));
+    assert_eq!(
+        parse_rule_line("RULE-SET,cn-ip,DIRECT,no-resolve").unwrap(),
+        RuleLine::Rule {
+            matcher: RuleMatcher::RuleSet("cn-ip".to_string()),
+            target: "DIRECT".to_string(),
+            no_resolve: true,
+        }
+    );
+}
+
+#[test]
+fn rule_set_rules_match_the_whole_connection() {
+    let environment = SetEnvironment::new(&[(
+        "apps",
+        "PROCESS-NAME,Telegram\nAND,((DOMAIN-KEYWORD,video),(DST-PORT,443))\n",
+    )]);
+    let model = RoutingModel::from_spec(
+        &spec(&["RULE-SET,apps,jp-1", "FINAL,hk-1"], vec![]),
+        &node_ids(),
+    )
+    .unwrap();
+    let mut by_process = RouteQuery::domain("api.example");
+    by_process.process = Some("telegram".to_string());
+    assert_eq!(
+        model.decide(&by_process, &environment).matched,
+        RouteMatch::Rule(0)
+    );
+    let video = RouteQuery::domain("video.example").with_port(443);
+    assert_eq!(
+        model.decide(&video, &environment).matched,
+        RouteMatch::Rule(0)
+    );
+    let other_port = RouteQuery::domain("video.example").with_port(80);
+    assert_eq!(
+        model.decide(&other_port, &environment).matched,
+        RouteMatch::Final
+    );
+    // Neither rule needs an address, so nothing was resolved.
+    assert_eq!(environment.lookups.get(), 0);
+}
+
 #[test]
 fn routing_toml_rejects_unknown_group_fields() {
     let error = parse_config_document(
