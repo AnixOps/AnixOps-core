@@ -175,6 +175,11 @@ pub const NODE_METADATA_ANX_JACKET: &str = "anx.jacket";
 pub const NODE_METADATA_ANX_WG_PORT: &str = "anx.wg_port";
 /// TCP port of the ANX-bare jacket (user to domestic ingress only).
 pub const NODE_METADATA_ANX_BARE_PORT: &str = "anx.bare_port";
+/// The subscription origin (`scheme://host:port`) whose ANX license applies to
+/// the node (anx spec §2.4.1: one device key per origin). Only the client sets
+/// it, from where it fetched the subscription; it never comes from the
+/// subscription's own text.
+pub const NODE_METADATA_ANX_LICENSE_ORIGIN: &str = "anx.license_origin";
 /// Id of the node this one connects through (`via`, a proxy chain).
 pub const NODE_METADATA_VIA: &str = "proxy.via";
 /// Client multiplexing the subscription turned on for the node (Clash
