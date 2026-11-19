@@ -17,7 +17,7 @@
 //! | `set_block_quic` | `enabled` | `{"block_quic": bool}`: refuse UDP to port 443 so apps fall back to TCP |
 //! | `groups` | | `{"groups": [`[`crate::routing::GroupView`]`]}` |
 //! | `select` | `group`, `member` | `{"now": member}` |
-//! | `rule_sets` | | `{"rule_sets": [`[`crate::rule_sets::RuleSetStatus`]`]}` |
+//! | `rule_sets` | | `{"rule_sets": [`[`crate::rule_sets::RuleSetStatus`]`], "missing": [names]}`: `missing` lists the `geoip-<cc>` and `asn-<number>` sets `GEOIP` and `IP-ASN` rules use that the config lacks ([`crate::routing::RoutedOutbound::missing_data_sets`]) |
 //! | `update_rule_sets` | | `{"scheduled": remote set count}` |
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
@@ -400,11 +400,14 @@ pub fn handle_with_interceptor(
             Ok(json!({ "now": routed.select(&group, &member)? }))
         }
         ControlRequest::RuleSets => {
-            let sets = dispatcher
-                .routed_outbound()
+            let routed = dispatcher.routed_outbound();
+            let sets = routed
                 .map(|routed| routed.rule_sets().status())
                 .unwrap_or_default();
-            Ok(json!({ "rule_sets": sets }))
+            let missing = routed
+                .map(|routed| routed.missing_data_sets())
+                .unwrap_or_default();
+            Ok(json!({ "rule_sets": sets, "missing": missing }))
         }
         ControlRequest::UpdateRuleSets => {
             let scheduled = dispatcher

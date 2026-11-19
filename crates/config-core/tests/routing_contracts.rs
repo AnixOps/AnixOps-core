@@ -1619,3 +1619,98 @@ fn script_rules_stop_for_a_verdict_and_follow_it() {
         ROUTING_RULE_OPTION_UNSUPPORTED_CODE
     );
 }
+
+/// Looks AS numbers up in the sets `asn-<number>`, as the embedded engine does.
+struct AsnEnvironment(SetEnvironment);
+
+impl RoutingEnvironment for AsnEnvironment {
+    fn ip_asn_matches(&self, number: u32, ip: IpAddr) -> bool {
+        self.0
+            .rule_set_matches(&format!("asn-{number}"), None, Some(ip))
+    }
+
+    fn rule_set_matches(&self, name: &str, domain: Option<&str>, ip: Option<IpAddr>) -> bool {
+        self.0.rule_set_matches(name, domain, ip)
+    }
+
+    fn rule_set_needs_address(&self, name: &str) -> bool {
+        self.0.rule_set_needs_address(name)
+    }
+
+    fn rule_set_rules(&self, name: &str) -> &[RuleMatcher] {
+        self.0.rule_set_rules(name)
+    }
+
+    fn resolve(&self, domain: &str) -> Option<IpAddr> {
+        self.0.resolve(domain)
+    }
+}
+
+#[test]
+fn ip_asn_rules_match_the_networks_the_environment_has() {
+    for (line, number, no_resolve) in [
+        ("IP-ASN,13335,DIRECT", 13335, false),
+        ("ip-asn,AS15169,DIRECT,no-resolve", 15169, true),
+    ] {
+        assert_eq!(
+            parse_rule_line(line).unwrap(),
+            RuleLine::Rule {
+                matcher: RuleMatcher::IpAsn(number),
+                target: "DIRECT".to_string(),
+                no_resolve,
+            }
+        );
+    }
+    for invalid in [
+        "IP-ASN,0,DIRECT",
+        "IP-ASN,AS,DIRECT",
+        "IP-ASN,+5,DIRECT",
+        "IP-ASN,cloudflare,DIRECT",
+    ] {
+        assert!(parse_rule_line(invalid).is_err(), "{invalid}");
+    }
+    assert_eq!(RuleMatcher::IpAsn(13335).to_string(), "IP-ASN,13335");
+
+    let environment = AsnEnvironment(SetEnvironment::new(&[
+        ("asn-13335", "203.0.113.0/24\n"),
+        // A list may hold IP-ASN and GEOIP lines; they look the address up in those sets.
+        ("cloud", "DOMAIN-SUFFIX,cloud.test\nIP-ASN,13335\n"),
+    ]));
+    let model = RoutingModel::from_spec(
+        &spec(
+            &["IP-ASN,64500,jp-1", "IP-ASN,13335,DIRECT", "FINAL,hk-1"],
+            vec![],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+    let address = |ip: &str| RouteQuery::ip(ip.parse().unwrap());
+    // AS 64500 has no data and never matches; the address falls through.
+    assert_eq!(
+        model.decide(&address("203.0.113.7"), &environment).matched,
+        RouteMatch::Rule(1)
+    );
+    assert_eq!(
+        model.decide(&address("198.51.100.7"), &environment).matched,
+        RouteMatch::Final
+    );
+    // A domain is resolved for the rule.
+    let resolved = model.decide(&RouteQuery::domain("cdn.test"), &environment);
+    assert_eq!(resolved.matched, RouteMatch::Rule(1));
+
+    let model = RoutingModel::from_spec(
+        &spec(&["RULE-SET,cloud,jp-1", "FINAL,hk-1"], vec![]),
+        &node_ids(),
+    )
+    .unwrap();
+    assert_eq!(
+        model.decide(&address("203.0.113.7"), &environment).matched,
+        RouteMatch::Rule(0)
+    );
+    assert_eq!(
+        model
+            .decide(&RouteQuery::domain("cdn.test"), &environment)
+            .matched,
+        RouteMatch::Rule(0)
+    );
+}

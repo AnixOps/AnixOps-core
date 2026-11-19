@@ -329,6 +329,10 @@ impl RoutingEnvironment for QueryEnvironment<'_> {
         self.rule_set_matches(&name, None, Some(ip))
     }
 
+    fn ip_asn_matches(&self, number: u32, ip: IpAddr) -> bool {
+        self.rule_set_matches(&format!("asn-{number}"), None, Some(ip))
+    }
+
     fn resolve(&self, _domain: &str) -> Option<IpAddr> {
         self.resolved
     }
@@ -593,6 +597,30 @@ impl RoutedOutbound {
     /// The rule sets, for their status and manual refreshes.
     pub fn rule_sets(&self) -> &Arc<RuleSetStore> {
         &self.rule_sets
+    }
+
+    /// The sets `GEOIP` and `IP-ASN` rules look addresses up in
+    /// (`geoip-<cc>`, `asn-<number>`), in the rules or inside a rule set,
+    /// that the engine does not have: those rules never match, so the client
+    /// shows them instead of letting them fail silently. Sorted, at most
+    /// [`MAX_MISSING_DATA_SETS`].
+    pub fn missing_data_sets(&self) -> Vec<String> {
+        let table = self.table();
+        let sets = self.rule_sets.read();
+        let mut names = BTreeSet::new();
+        for rule in &table.model.rules {
+            data_sets(&rule.matcher, &mut names);
+        }
+        for set in sets.values() {
+            for rule in set.rules() {
+                data_sets(rule, &mut names);
+            }
+        }
+        names
+            .into_iter()
+            .filter(|name| !sets.contains_key(name))
+            .take(MAX_MISSING_DATA_SETS)
+            .collect()
     }
 
     /// Downloads every remote rule set when it is due, forever: right away
@@ -1705,6 +1733,28 @@ fn matches_request(matcher: &RuleMatcher) -> bool {
         RuleMatcher::And(rules) | RuleMatcher::Or(rules) => rules.iter().any(matches_request),
         RuleMatcher::Not(rule) => matches_request(rule),
         _ => false,
+    }
+}
+
+/// Most names [`RoutedOutbound::missing_data_sets`] lists.
+pub const MAX_MISSING_DATA_SETS: usize = 64;
+
+/// The sets the `GEOIP` and `IP-ASN` rules in `matcher` look addresses up in.
+fn data_sets(matcher: &RuleMatcher, names: &mut BTreeSet<String>) {
+    match matcher {
+        RuleMatcher::GeoIp(country) => {
+            names.insert(format!("geoip-{}", country.to_ascii_lowercase()));
+        }
+        RuleMatcher::IpAsn(number) => {
+            names.insert(format!("asn-{number}"));
+        }
+        RuleMatcher::And(rules) | RuleMatcher::Or(rules) => {
+            for rule in rules {
+                data_sets(rule, names);
+            }
+        }
+        RuleMatcher::Not(rule) => data_sets(rule, names),
+        _ => {}
     }
 }
 

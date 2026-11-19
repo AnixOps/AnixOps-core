@@ -76,6 +76,30 @@ fn the_built_in_lan_set_is_there_unless_the_config_names_one() {
     assert_eq!(routed.route(&ip("192.0.2.1:445")), RouteOutcome::Direct);
 }
 
+#[test]
+fn ip_asn_rules_use_asn_sets_and_missing_data_is_listed() {
+    let routed = routed(
+        r#""IP-ASN,13335,DIRECT,no-resolve","IP-ASN,64500,REJECT,no-resolve","GEOIP,US,REJECT,no-resolve","GEOIP,CN,DIRECT,no-resolve","FINAL,hk""#,
+        r#""asn-13335":{"ip_cidr":["203.0.113.0/24"]},"geoip-cn":{"ip_cidr":["1.0.1.0/24"]}"#,
+    )
+    .unwrap();
+    assert_eq!(routed.route(&ip("203.0.113.7:443")), RouteOutcome::Direct);
+    assert_eq!(routed.route(&ip("1.0.1.9:443")), RouteOutcome::Direct);
+    // AS 64500 and US have no data: they never match, and say so.
+    assert_eq!(
+        routed.route(&ip("198.51.100.7:443")),
+        RouteOutcome::Node("hk".to_string())
+    );
+    assert_eq!(routed.missing_data_sets(), ["asn-64500", "geoip-us"]);
+
+    let complete = routed(
+        r#""GEOIP,CN,DIRECT","FINAL,hk""#,
+        r#""geoip-cn":{"ip_cidr":["1.0.1.0/24"]}"#,
+    )
+    .unwrap();
+    assert!(complete.missing_data_sets().is_empty());
+}
+
 fn routed_lan_override() -> Arc<RoutedOutbound> {
     routed(
         r#""RULE-SET,LAN,DIRECT,no-resolve","FINAL,hk""#,
