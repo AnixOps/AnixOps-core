@@ -21,29 +21,30 @@ use config_core::routing_import::{import_subscription_routing, ImportedRuleSet};
 use control_domain::{
     NodeCatalog, NodeDescriptor, Protocol, SubscriptionService, SubscriptionSource,
     NODE_METADATA_ANX_ALPN, NODE_METADATA_ANX_BARE_PORT, NODE_METADATA_ANX_FINGERPRINT,
-    NODE_METADATA_ANX_JACKET, NODE_METADATA_ANX_PUBLIC_KEY, NODE_METADATA_ANX_SERVER_NAME,
-    NODE_METADATA_ANX_USER_KEY, NODE_METADATA_ANX_WG_PORT, NODE_METADATA_HYSTERIA2_OBFS_PASSWORD,
-    NODE_METADATA_HYSTERIA2_OBFS_TYPE, NODE_METADATA_HYSTERIA2_PASSWORD,
-    NODE_METADATA_IWAN_ENCRYPT, NODE_METADATA_IWAN_MTU, NODE_METADATA_IWAN_PASSWORD,
-    NODE_METADATA_IWAN_USERNAME, NODE_METADATA_MIERU_PASSWORD, NODE_METADATA_MIERU_PORT_RANGE,
-    NODE_METADATA_MIERU_TRANSPORT, NODE_METADATA_MIERU_USERNAME, NODE_METADATA_MULTIPLEX,
-    NODE_METADATA_PATH, NODE_METADATA_SHADOWSOCKS_METHOD, NODE_METADATA_SHADOWSOCKS_PASSWORD,
-    NODE_METADATA_SNELL_MODE, NODE_METADATA_SNELL_OBFS, NODE_METADATA_SNELL_OBFS_HOST,
-    NODE_METADATA_SNELL_OBFS_URI, NODE_METADATA_SNELL_PSK, NODE_METADATA_SNELL_REUSE,
-    NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_SNELL_VERSION, NODE_METADATA_TLS_ALPN,
-    NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
-    NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
-    NODE_METADATA_TLS_UTLS_FINGERPRINT, NODE_METADATA_TROJAN_PASSWORD,
-    NODE_METADATA_TUIC_CONGESTION_CONTROL, NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID,
-    NODE_METADATA_V2RAY_TRANSPORT_EXTRA, NODE_METADATA_V2RAY_TRANSPORT_HOST,
-    NODE_METADATA_V2RAY_TRANSPORT_MODE, NODE_METADATA_V2RAY_TRANSPORT_PATH,
-    NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME, NODE_METADATA_V2RAY_TRANSPORT_TYPE,
-    NODE_METADATA_VIA, NODE_METADATA_VIA_UNRESOLVED, NODE_METADATA_VLESS_ENCRYPTION,
-    NODE_METADATA_VLESS_FLOW, NODE_METADATA_VLESS_UUID, NODE_METADATA_VMESS_ALTER_ID,
-    NODE_METADATA_VMESS_SECURITY, NODE_METADATA_VMESS_UUID, NODE_METADATA_WIREGUARD_ALLOWED_IPS,
-    NODE_METADATA_WIREGUARD_LOCAL_ADDRESS, NODE_METADATA_WIREGUARD_MTU,
-    NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY, NODE_METADATA_WIREGUARD_PRE_SHARED_KEY,
-    NODE_METADATA_WIREGUARD_PRIVATE_KEY, NODE_METADATA_WIREGUARD_RESERVED,
+    NODE_METADATA_ANX_JACKET, NODE_METADATA_ANX_LICENSE_ORIGIN, NODE_METADATA_ANX_PUBLIC_KEY,
+    NODE_METADATA_ANX_SERVER_NAME, NODE_METADATA_ANX_USER_KEY, NODE_METADATA_ANX_WG_PORT,
+    NODE_METADATA_HYSTERIA2_OBFS_PASSWORD, NODE_METADATA_HYSTERIA2_OBFS_TYPE,
+    NODE_METADATA_HYSTERIA2_PASSWORD, NODE_METADATA_IWAN_ENCRYPT, NODE_METADATA_IWAN_MTU,
+    NODE_METADATA_IWAN_PASSWORD, NODE_METADATA_IWAN_USERNAME, NODE_METADATA_MIERU_PASSWORD,
+    NODE_METADATA_MIERU_PORT_RANGE, NODE_METADATA_MIERU_TRANSPORT, NODE_METADATA_MIERU_USERNAME,
+    NODE_METADATA_MULTIPLEX, NODE_METADATA_PATH, NODE_METADATA_SHADOWSOCKS_METHOD,
+    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SNELL_MODE, NODE_METADATA_SNELL_OBFS,
+    NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI, NODE_METADATA_SNELL_PSK,
+    NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_SNELL_VERSION,
+    NODE_METADATA_TLS_ALPN, NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE,
+    NODE_METADATA_TLS_REALITY_PUBLIC_KEY, NODE_METADATA_TLS_REALITY_SHORT_ID,
+    NODE_METADATA_TLS_SERVER_NAME, NODE_METADATA_TLS_UTLS_FINGERPRINT,
+    NODE_METADATA_TROJAN_PASSWORD, NODE_METADATA_TUIC_CONGESTION_CONTROL,
+    NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID, NODE_METADATA_V2RAY_TRANSPORT_EXTRA,
+    NODE_METADATA_V2RAY_TRANSPORT_HOST, NODE_METADATA_V2RAY_TRANSPORT_MODE,
+    NODE_METADATA_V2RAY_TRANSPORT_PATH, NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME,
+    NODE_METADATA_V2RAY_TRANSPORT_TYPE, NODE_METADATA_VIA, NODE_METADATA_VIA_UNRESOLVED,
+    NODE_METADATA_VLESS_ENCRYPTION, NODE_METADATA_VLESS_FLOW, NODE_METADATA_VLESS_UUID,
+    NODE_METADATA_VMESS_ALTER_ID, NODE_METADATA_VMESS_SECURITY, NODE_METADATA_VMESS_UUID,
+    NODE_METADATA_WIREGUARD_ALLOWED_IPS, NODE_METADATA_WIREGUARD_LOCAL_ADDRESS,
+    NODE_METADATA_WIREGUARD_MTU, NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
+    NODE_METADATA_WIREGUARD_PRE_SHARED_KEY, NODE_METADATA_WIREGUARD_PRIVATE_KEY,
+    NODE_METADATA_WIREGUARD_RESERVED,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -710,12 +711,15 @@ fn wireguard(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     Ok(outbound)
 }
 
-/// This device's ANX license (anx spec §2.4.1): the device key and where the
-/// license the panel signed for it is kept. The client sets it once it has a
-/// device key; every ANX outbound built afterwards carries it, and the
-/// outbound reads the license file each time it connects, so a refreshed
-/// license needs no new import. Absent (the default), ANX outbounds are as
-/// before: a node that does not require licenses never asks for one.
+/// This device's ANX license for one subscription origin (anx spec §2.4.1):
+/// the device key and where the license the panel signed for it is kept. The
+/// client keeps one device key per origin, so two panels never see the same
+/// key, and sets them with [`set_anx_licenses`]; an ANX outbound built
+/// afterwards carries the license of its node's origin
+/// (`anx.license_origin`), and reads the license file each time it connects,
+/// so a refreshed license needs no new import. A node without a license for
+/// its origin is as before: a node that does not require licenses never asks
+/// for one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct AnxLicense {
     /// The device's private key, PKCS#8 DER in hex.
@@ -729,15 +733,40 @@ pub struct AnxLicense {
 
 static ANX_LICENSE: std::sync::RwLock<Option<AnxLicense>> = std::sync::RwLock::new(None);
 
-/// Sets (or with `None` clears) the license every ANX outbound carries.
+type LicensesByOrigin = std::collections::BTreeMap<String, AnxLicense>;
+
+static ANX_LICENSES: std::sync::RwLock<LicensesByOrigin> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Sets (or with `None` clears) the license of the ANX outbounds whose node
+/// names no origin (`anx.license_origin`). Older clients used it for every
+/// node, which gave every panel the same device key; clients now use
+/// [`set_anx_licenses`].
 pub fn set_anx_license(license: Option<AnxLicense>) {
     if let Ok(mut current) = ANX_LICENSE.write() {
         *current = license;
     }
 }
 
-fn anx_license() -> Option<AnxLicense> {
-    ANX_LICENSE.read().ok().and_then(|current| current.clone())
+/// Replaces the licenses by subscription origin (`scheme://host:port`,
+/// lowercased, as the client writes `anx.license_origin`). A node whose
+/// origin has none here gets no license, never another origin's.
+pub fn set_anx_licenses(licenses: LicensesByOrigin) {
+    if let Ok(mut current) = ANX_LICENSES.write() {
+        *current = licenses;
+    }
+}
+
+/// The license `node`'s outbound carries: its origin's, or without an origin
+/// the one [`set_anx_license`] set.
+fn anx_license(node: &NodeDescriptor) -> Option<AnxLicense> {
+    match metadata(node, NODE_METADATA_ANX_LICENSE_ORIGIN) {
+        Some(origin) => ANX_LICENSES
+            .read()
+            .ok()
+            .and_then(|licenses| licenses.get(origin).cloned()),
+        None => ANX_LICENSE.read().ok().and_then(|current| current.clone()),
+    }
 }
 
 /// ANX-A under the A2 jacket. The public engine does not compile the
@@ -782,7 +811,7 @@ fn anx(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     {
         outbound["bare_port"] = json!(port);
     }
-    if let Some(license) = anx_license() {
+    if let Some(license) = anx_license(node) {
         outbound["device_key"] = json!(license.device_key);
         outbound["device_alg"] = json!(license.device_alg);
         outbound["license_cert_path"] = json!(license.license_cert_path);
