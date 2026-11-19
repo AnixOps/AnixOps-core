@@ -17,8 +17,11 @@
 //! | `set_block_quic` | `enabled` | `{"block_quic": bool}`: refuse UDP to port 443 so apps fall back to TCP |
 //! | `groups` | | `{"groups": [`[`crate::routing::GroupView`]`]}` |
 //! | `select` | `group`, `member` | `{"now": member}` |
-//! | `rule_sets` | | `{"rule_sets": [`[`crate::rule_sets::RuleSetStatus`]`]}` |
+//! | `rule_sets` | | `{"rule_sets": [`[`crate::rule_sets::RuleSetStatus`]`], "missing": [names]}`: `missing` lists the `geoip-<cc>` and `asn-<number>` sets `GEOIP` and `IP-ASN` rules use that the config lacks ([`crate::routing::RoutedOutbound::missing_data_sets`]) |
 //! | `update_rule_sets` | | `{"scheduled": remote set count}` |
+//! | `rule_hits` | | [`crate::routing::RuleHitsView`]: every rule in order, then FINAL, with how often it decided a flow since the rules were loaded |
+//! | `clear_rule_hits` | | the `rule_hits` answer, after setting the counts to zero |
+//! | `test_route` | `host` (domain or IP), optional `port` (default 443), `network` (`tcp` \| `udp`), `address` (the domain's IP, as a lookup would give it), `process`, `url`, `user_agent`, `source` (the app's IP) | `{"mode", "test":` [`crate::routing::RouteTest`]`}`: which rule decides such a connection and where it goes, without opening or counting one |
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
 //! | `network_changed` | | `{"scheduled": network-change script count}` |
@@ -100,6 +103,9 @@
 //! client keeps them in its profile (`mode`, `block_quic`, a select group's
 //! `default`) for the next start.
 
+use std::net::IpAddr;
+
+use config_core::routing::{RouteNetwork, RouteQuery};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -145,6 +151,25 @@ enum ControlRequest {
     },
     RuleSets,
     UpdateRuleSets,
+    RuleHits,
+    ClearRuleHits,
+    TestRoute {
+        host: String,
+        #[serde(default = "default_test_port")]
+        port: u16,
+        #[serde(default)]
+        network: Option<String>,
+        #[serde(default)]
+        address: Option<String>,
+        #[serde(default)]
+        process: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        user_agent: Option<String>,
+        #[serde(default)]
+        source: Option<String>,
+    },
     Scripts,
     ScriptNotifications,
     NetworkChanged,
@@ -400,11 +425,67 @@ pub fn handle_with_interceptor(
             Ok(json!({ "now": routed.select(&group, &member)? }))
         }
         ControlRequest::RuleSets => {
-            let sets = dispatcher
-                .routed_outbound()
+            let routed = dispatcher.routed_outbound();
+            let sets = routed
                 .map(|routed| routed.rule_sets().status())
                 .unwrap_or_default();
-            Ok(json!({ "rule_sets": sets }))
+            let missing = routed
+                .map(|routed| routed.missing_data_sets())
+                .unwrap_or_default();
+            Ok(json!({ "rule_sets": sets, "missing": missing }))
+        }
+        ControlRequest::RuleHits => {
+            let routed = dispatcher
+                .routed_outbound()
+                .ok_or_else(|| invalid("this config has no routing rules"))?;
+            serde_json::to_value(routed.rule_hits())
+        }
+        ControlRequest::ClearRuleHits => {
+            let routed = dispatcher
+                .routed_outbound()
+                .ok_or_else(|| invalid("this config has no routing rules"))?;
+            routed.clear_rule_hits();
+            serde_json::to_value(routed.rule_hits())
+        }
+        ControlRequest::TestRoute {
+            host,
+            port,
+            network,
+            address,
+            process,
+            url,
+            user_agent,
+            source,
+        } => {
+            let routed = dispatcher
+                .routed_outbound()
+                .ok_or_else(|| invalid("this config has no routing rules"))?;
+            let ip = |text: Option<String>, message: &'static str| {
+                text.filter(|text| !text.trim().is_empty())
+                    .map(|text| text.trim().parse::<IpAddr>().map_err(|_| invalid(message)))
+                    .transpose()
+            };
+            let host = host.trim().trim_end_matches('.');
+            if host.is_empty() || host.len() > 253 {
+                return Err(invalid("test_route needs a host name or an IP address"));
+            }
+            let network = match network.as_deref() {
+                None | Some("tcp") => RouteNetwork::Tcp,
+                Some("udp") => RouteNetwork::Udp,
+                Some(_) => return Err(invalid("network must be tcp or udp")),
+            };
+            let mut query = match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+                Ok(address) => RouteQuery::ip(address),
+                Err(_) => RouteQuery::domain(host.to_string()),
+            }
+            .with_port(port)
+            .with_network(network)
+            .with_source(ip(source, "source is not an IP address")?, None);
+            query.process = process.filter(|name| !name.trim().is_empty());
+            query.url = url.filter(|url| !url.is_empty());
+            query.user_agent = user_agent.filter(|agent| !agent.is_empty());
+            let test = routed.test_route(&query, ip(address, "address is not an IP address")?);
+            Ok(json!({ "mode": dispatcher.mode(), "test": test }))
         }
         ControlRequest::UpdateRuleSets => {
             let scheduled = dispatcher
@@ -656,6 +737,10 @@ fn storage_error(error: capture::storage::StorageError) -> RuntimeError {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_test_port() -> u16 {
+    443
 }
 
 fn invalid(message: &'static str) -> RuntimeError {

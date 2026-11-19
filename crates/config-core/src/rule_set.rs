@@ -798,7 +798,7 @@ mod tests {
             IP-ASN,15169\nRULE-SET,https://lists.example/a.list\nGEOIP,US\nSCRIPT,pick\n\
             X-MADE-UP,1\nnot a domain\n";
         let (builder, skipped) = RuleSetBuilder::parse_list(text, BareDomain::Suffix);
-        assert_eq!(skipped, 7);
+        assert_eq!(skipped, 4);
         let counted = builder
             .skipped()
             .iter()
@@ -806,22 +806,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             counted,
-            [
-                ("GEOIP", 1),
-                ("INVALID", 1),
-                ("IP-ASN", 2),
-                ("OTHER", 1),
-                ("RULE-SET", 1),
-                ("SCRIPT", 1),
-            ]
+            [("INVALID", 1), ("OTHER", 1), ("RULE-SET", 1), ("SCRIPT", 1)]
         );
         let set = builder.build();
-        assert_eq!(set.rules().len(), 4);
-        assert_eq!(set.len(), 5);
+        // PROCESS-NAME, USER-AGENT, DST-PORT, AND, both IP-ASN and GEOIP.
+        assert_eq!(set.rules().len(), 7);
+        assert_eq!(set.len(), 8);
         assert!(set.uses_process());
         assert!(set.uses_request());
-        // Domains only and port rules need no address.
-        assert!(!set.needs_address());
+        // IP-ASN and GEOIP need the address.
+        assert!(set.needs_address());
         // The tables alone never try the rules.
         assert!(!set.matches(Some("ads.test"), None));
 

@@ -313,6 +313,11 @@ pub enum RuleMatcher {
     IpCidr(IpCidr),
     /// Upper-case ISO 3166-1 alpha-2 country code.
     GeoIp(String),
+    /// Autonomous system number of the destination address, as Surge
+    /// `IP-ASN` (`13335` or `AS13335`). The networks come from the
+    /// environment ([`RoutingEnvironment::ip_asn_matches`]); without them
+    /// the rule never matches.
+    IpAsn(u32),
     /// Name of a [`crate::rule_set::RuleSet`] the environment supplies.
     RuleSet(String),
     /// Lower-case GeoSite category (such as `cn` or `google`) whose domains
@@ -360,7 +365,7 @@ impl RuleMatcher {
     /// logical rule containing one.
     pub fn matches_ip(&self) -> bool {
         match self {
-            Self::IpCidr(_) | Self::GeoIp(_) => true,
+            Self::IpCidr(_) | Self::GeoIp(_) | Self::IpAsn(_) => true,
             Self::And(rules) | Self::Or(rules) => rules.iter().any(Self::matches_ip),
             Self::Not(rule) => rule.matches_ip(),
             _ => false,
@@ -375,7 +380,7 @@ impl RuleMatcher {
     /// rule unless the rule says `no-resolve`, as Surge does.
     pub fn wants_address(&self, environment: &dyn RoutingEnvironment) -> bool {
         match self {
-            Self::IpCidr(_) | Self::GeoIp(_) => true,
+            Self::IpCidr(_) | Self::GeoIp(_) | Self::IpAsn(_) => true,
             Self::RuleSet(name) => environment.rule_set_needs_address(name),
             Self::And(rules) | Self::Or(rules) => {
                 rules.iter().any(|rule| rule.wants_address(environment))
@@ -390,7 +395,7 @@ impl RuleMatcher {
     /// containing either.
     pub fn accepts_no_resolve(&self) -> bool {
         match self {
-            Self::IpCidr(_) | Self::GeoIp(_) | Self::RuleSet(_) => true,
+            Self::IpCidr(_) | Self::GeoIp(_) | Self::IpAsn(_) | Self::RuleSet(_) => true,
             Self::And(rules) | Self::Or(rules) => rules.iter().any(Self::accepts_no_resolve),
             Self::Not(rule) => rule.accepts_no_resolve(),
             _ => false,
@@ -398,11 +403,12 @@ impl RuleMatcher {
     }
 
     /// Whether the rule, or one inside it, names a rule set, a rule script
-    /// or GeoIP/GeoSite data: matchers a rule set cannot hold, since they
-    /// would reach back into the environment's sets.
+    /// or GeoSite data: matchers a rule set cannot hold, since they would
+    /// reach back into the environment's sets. `GEOIP` and `IP-ASN` may sit
+    /// in a set: they only look an address up in another set's networks.
     fn uses_environment_data(&self) -> bool {
         match self {
-            Self::RuleSet(_) | Self::Script(_) | Self::GeoIp(_) | Self::GeoSite(_) => true,
+            Self::RuleSet(_) | Self::Script(_) | Self::GeoSite(_) => true,
             Self::And(rules) | Self::Or(rules) => rules.iter().any(Self::uses_environment_data),
             Self::Not(rule) => rule.uses_environment_data(),
             _ => false,
@@ -443,6 +449,7 @@ impl fmt::Display for RuleMatcher {
             Self::IpCidr(cidr) if cidr.network().is_ipv6() => write!(formatter, "IP-CIDR6,{cidr}"),
             Self::IpCidr(cidr) => write!(formatter, "IP-CIDR,{cidr}"),
             Self::GeoIp(country) => write!(formatter, "GEOIP,{country}"),
+            Self::IpAsn(number) => write!(formatter, "IP-ASN,{number}"),
             Self::RuleSet(name) => write!(formatter, "RULE-SET,{name}"),
             Self::GeoSite(category) => write!(formatter, "GEOSITE,{category}"),
             Self::DstPort(start, end) if start == end => write!(formatter, "DST-PORT,{start}"),
@@ -882,14 +889,16 @@ fn parse_sub_rule(text: &str, depth: usize) -> DomainResult<RuleMatcher> {
 /// One line of a downloaded rule set that is not a plain domain or network:
 /// `TYPE,value` (an optional `no-resolve` is ignored, as the `RULE-SET` rule
 /// decides) or `AND|OR|NOT,(...)`, with no target. Rule sets, rule scripts
-/// and GeoIP/GeoSite data are refused: a set cannot reach back into the
-/// environment's sets. The error names nothing from the line.
+/// and GeoSite data are refused: a set cannot reach back into the
+/// environment's sets. `GEOIP` and `IP-ASN` are kept, since they only look
+/// the address up in another set's networks. The error names nothing from
+/// the line.
 pub(crate) fn parse_rule_set_entry(line: &str) -> DomainResult<RuleMatcher> {
     let matcher = parse_sub_rule(line, 1)?;
     if matcher.uses_environment_data() {
         return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "a rule set cannot hold RULE-SET, SCRIPT, GEOIP or GEOSITE rules",
+            "a rule set cannot hold RULE-SET, SCRIPT or GEOSITE rules",
         ));
     }
     Ok(matcher)
@@ -911,6 +920,7 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             )
         })?),
         "GEOIP" => RuleMatcher::GeoIp(normalize_country_code(value)?),
+        "IP-ASN" => RuleMatcher::IpAsn(parse_asn(value)?),
         "RULE-SET" => RuleMatcher::RuleSet(value.to_string()),
         "GEOSITE" => RuleMatcher::GeoSite(normalize_category(value)?),
         "DST-PORT" | "DEST-PORT" => {
@@ -1396,7 +1406,10 @@ impl RuleIndex {
                 matcher => index.others.push((
                     position,
                     rule.no_resolve
-                        && matches!(matcher, RuleMatcher::IpCidr(_) | RuleMatcher::GeoIp(_)),
+                        && matches!(
+                            matcher,
+                            RuleMatcher::IpCidr(_) | RuleMatcher::GeoIp(_) | RuleMatcher::IpAsn(_)
+                        ),
                 )),
             }
         }
@@ -1506,6 +1519,12 @@ pub trait RoutingEnvironment {
     fn geoip_matches(&self, country: &str, ip: IpAddr) -> bool {
         self.geoip_country(ip)
             .is_some_and(|found| found.eq_ignore_ascii_case(country))
+    }
+
+    /// Whether `ip` belongs to the autonomous system `number`; nothing by
+    /// default, since no ASN data is built in.
+    fn ip_asn_matches(&self, _number: u32, _ip: IpAddr) -> bool {
+        false
     }
 
     /// Whether the lower-case GeoSite `category` holds `domain` (lower case,
@@ -1657,6 +1676,7 @@ fn rule_matches(
         }),
         RuleMatcher::IpCidr(cidr) => ip.is_some_and(|ip| cidr.contains(ip)),
         RuleMatcher::GeoIp(country) => ip.is_some_and(|ip| environment.geoip_matches(country, ip)),
+        RuleMatcher::IpAsn(number) => ip.is_some_and(|ip| environment.ip_asn_matches(*number, ip)),
         RuleMatcher::RuleSet(name) => {
             environment.rule_set_matches(name, domain, ip)
                 || environment
@@ -2197,6 +2217,23 @@ fn wildcard_matches(pattern: &[u8], text: &[u8]) -> bool {
 
 fn normalize_query_domain(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// An `IP-ASN` value: a decimal AS number from 1, with or without `AS`.
+fn parse_asn(value: &str) -> DomainResult<u32> {
+    let value = value.trim();
+    let digits = value
+        .strip_prefix("AS")
+        .or_else(|| value.strip_prefix("as"))
+        .or_else(|| value.strip_prefix("As"))
+        .unwrap_or(value);
+    match digits.parse::<u32>() {
+        Ok(number) if number > 0 && digits.bytes().all(|byte| byte.is_ascii_digit()) => Ok(number),
+        _ => Err(routing_error(
+            ROUTING_RULE_VALUE_INVALID_CODE,
+            "IP-ASN rule value must be an AS number such as 13335",
+        )),
+    }
 }
 
 fn normalize_country_code(value: &str) -> DomainResult<String> {
