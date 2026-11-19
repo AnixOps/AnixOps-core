@@ -85,7 +85,7 @@ use std::time::{Duration, Instant};
 use config_core::routing::{
     parse_rule_line, NetworkContext, PolicyGroupKind, PolicyGroupSpec, PolicyTarget, RejectKind,
     RouteMatch, RouteNetwork, RouteOutcome, RouteQuery, RouteResolution, RoutingEnvironment,
-    RoutingModel, RoutingRule, RoutingSpec, RuleIndex, RuleLine, RuleMatcher,
+    RoutingModel, RoutingRule, RoutingSpec, RuleIndex, RuleLine, RuleMatcher, RuleProtocol,
 };
 use config_core::rule_set::RuleSet;
 use engine_outbound::sniff::HttpRequestHead;
@@ -125,6 +125,9 @@ pub struct RoutedOutbound {
     url_test_now: RwLock<BTreeMap<String, String>>,
     /// The network the client reported, for subnet groups.
     network: RwLock<Option<NetworkContext>>,
+    /// Names the user gave devices by address, for `DEVICE-NAME` rules
+    /// ([`RoutedOutbound::set_devices`]).
+    devices: RwLock<BTreeMap<IpAddr, String>>,
     health: Mutex<HealthState>,
     /// Wakes the check loop for a check asked for out of turn.
     health_wake: tokio::sync::Notify,
@@ -360,13 +363,17 @@ impl DomainResolver for SystemResolver {
     }
 }
 
-/// Where a flow came from, for `SRC-IP` and `IN-PORT` rules: the address
-/// of the app or device that opened it and the local port of the listener
-/// it came in on (none for the packet tunnel).
+/// The most device names [`RoutedOutbound::set_devices`] takes.
+pub const MAX_DEVICES: usize = 256;
+
+/// Where a flow came from, for `SRC-IP`, `SRC-PORT` and `IN-PORT` rules:
+/// the address and port of the app or device that opened it and the local
+/// port of the listener it came in on (none for the packet tunnel).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FlowSource {
     pub address: Option<IpAddr>,
     pub in_port: Option<u16>,
+    pub port: Option<u16>,
 }
 
 /// Why a flow went where it did: the matched rule (`FINAL` when none did),
@@ -392,6 +399,7 @@ struct QueryEnvironment<'a> {
     selected: &'a BTreeMap<String, String>,
     url_test_now: &'a BTreeMap<String, String>,
     network: Option<&'a NetworkContext>,
+    devices: &'a BTreeMap<IpAddr, String>,
     resolved: Option<IpAddr>,
     round_robin: &'a AtomicUsize,
     /// Verdicts of the rule scripts run for this connection so far; `None`
@@ -461,6 +469,10 @@ impl RoutingEnvironment for QueryEnvironment<'_> {
 
     fn network(&self) -> Option<&NetworkContext> {
         self.network
+    }
+
+    fn device_name(&self, source: IpAddr) -> Option<&str> {
+        self.devices.get(&source).map(String::as_str)
     }
 }
 
@@ -548,6 +560,7 @@ impl RoutedOutbound {
             used_groups: Mutex::default(),
             url_test_now: RwLock::default(),
             network: RwLock::default(),
+            devices: RwLock::default(),
             health: Mutex::default(),
             health_wake: tokio::sync::Notify::new(),
             health_done: tokio::sync::Notify::new(),
@@ -744,7 +757,7 @@ impl RoutedOutbound {
         let info = describe(&table, &resolution);
         let (rule_index, needs_address) = match resolution.matched {
             RouteMatch::Rule(index) | RouteMatch::ScriptPending(index) => (Some(index), false),
-            RouteMatch::ResolveFailed(index) => {
+            RouteMatch::ResolveFailed(index) | RouteMatch::FinalAfterResolveFailed(index) => {
                 (Some(index), address.is_none() && query.ip.is_none())
             }
             RouteMatch::Final => (None, false),
@@ -990,12 +1003,17 @@ impl RoutedOutbound {
             .network
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let devices = self
+            .devices
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         body(&QueryEnvironment {
             rule_sets: &rule_sets,
             latencies: &latencies,
             selected: &selected,
             url_test_now: &url_test_now,
             network: network.as_ref(),
+            devices: &devices,
             resolved,
             round_robin: &self.round_robin,
             scripts,
@@ -1063,7 +1081,28 @@ impl RoutedOutbound {
     /// query go out in the clear, and a server name is never resolved here.
     /// `None` when the global target rejects.
     pub fn dns_outbound(&self, server: &TargetAddr) -> Option<Arc<dyn TcpOutbound>> {
-        if let RouteOutcome::Node(id) = self.route(server) {
+        self.dns_outbound_as(server, None)
+    }
+
+    /// [`Self::dns_outbound`] for a query sent as `dns`
+    /// ([`RuleProtocol::Doh`] or [`RuleProtocol::Doq`]), which
+    /// `PROTOCOL,DOH` and `PROTOCOL,DOQ` rules match.
+    pub fn dns_outbound_as(
+        &self,
+        server: &TargetAddr,
+        dns: Option<RuleProtocol>,
+    ) -> Option<Arc<dyn TcpOutbound>> {
+        let mut query = query(server);
+        if let Some(dns) = dns {
+            query.dns = Some(dns);
+            query.network = Some(if dns == RuleProtocol::Doq {
+                RouteNetwork::Udp
+            } else {
+                RouteNetwork::Tcp
+            });
+        }
+        let outcome = self.decide(&self.table(), &query, None, None).outcome;
+        if let RouteOutcome::Node(id) = outcome {
             if let Some(node) = self.nodes.get(&id) {
                 return Some(node.clone());
             }
@@ -1240,7 +1279,8 @@ impl RoutedOutbound {
     ) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
         let mut query = query(target)
             .with_network(network)
-            .with_source(source.address, source.in_port);
+            .with_source(source.address, source.in_port)
+            .with_source_port(source.port);
         if let Some(http) = http {
             query.user_agent.clone_from(&http.user_agent);
             query.url.clone_from(&http.url);
@@ -1440,6 +1480,58 @@ impl RoutedOutbound {
         forgotten
     }
 
+    /// Checks device names given as address → name (config `devices`,
+    /// control `set_devices`): at most [`MAX_DEVICES`], each address an IP
+    /// and each name 1-64 characters without control characters.
+    pub fn parse_devices(
+        devices: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<IpAddr, String>, &'static str> {
+        if devices.len() > MAX_DEVICES {
+            return Err("at most 256 device names");
+        }
+        devices
+            .iter()
+            .map(|(address, name)| {
+                let address = address
+                    .trim()
+                    .parse::<IpAddr>()
+                    .map_err(|_| "device addresses must be IP addresses")?
+                    .to_canonical();
+                let name = name.trim();
+                if name.is_empty()
+                    || name.chars().count() > 64
+                    || name.chars().any(char::is_control)
+                {
+                    return Err("device names must be 1-64 characters");
+                }
+                Ok((address, name.to_lowercase()))
+            })
+            .collect()
+    }
+
+    /// Names devices by the address their connections come from, for
+    /// `DEVICE-NAME` rules, replacing the names given before. Returns whether
+    /// they changed. Connections already open keep their route.
+    pub fn set_devices(&self, devices: BTreeMap<IpAddr, String>) -> bool {
+        let mut current = self
+            .devices
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current == devices {
+            return false;
+        }
+        *current = devices;
+        true
+    }
+
+    /// The device names in use, by address.
+    pub fn devices(&self) -> BTreeMap<IpAddr, String> {
+        self.devices
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Sets the network the device is on, for subnet groups; `None` when
     /// the client does not know. Returns whether it changed. Connections
     /// already open keep their route.
@@ -1499,7 +1591,11 @@ impl RoutedOutbound {
         loop {
             let resolution = self.decide(table, query, resolved, Some(&verdicts));
             match resolution.matched {
-                RouteMatch::ResolveFailed(_) if resolved.is_none() => {
+                // With `dns-failed` the first pass, which has no address yet,
+                // already names FINAL: look the name up first all the same.
+                RouteMatch::ResolveFailed(_) | RouteMatch::FinalAfterResolveFailed(_)
+                    if resolved.is_none() =>
+                {
                     let Some(domain) = query.domain.as_deref() else {
                         return resolution;
                     };
@@ -1676,7 +1772,9 @@ fn due_groups<'a>(
 fn count_hit(table: &RoutingTable, resolution: &RouteResolution) {
     match resolution.matched {
         RouteMatch::Rule(index) | RouteMatch::ResolveFailed(index) => table.hits.record(index),
-        RouteMatch::Final => table.hits.record(table.model.rules.len()),
+        RouteMatch::Final | RouteMatch::FinalAfterResolveFailed(_) => {
+            table.hits.record(table.model.rules.len())
+        }
         RouteMatch::ScriptPending(_) => {}
     }
 }
@@ -1692,6 +1790,7 @@ fn describe(table: &RoutingTable, resolution: &RouteResolution) -> RouteInfo {
         RouteMatch::ScriptPending(index) => {
             format!("{} (script pending)", table.model.rules[index].matcher)
         }
+        RouteMatch::FinalAfterResolveFailed(_) => "FINAL (dns-failed)".to_string(),
         RouteMatch::Final => "FINAL".to_string(),
     };
     let (outbound, reject) = match &resolution.outcome {
@@ -1864,7 +1963,7 @@ fn check_rule_lines(
                     return reject(Some(index), reject_code::UNKNOWN_SCRIPT);
                 }
             }
-            RuleLine::Final { target } => {
+            RuleLine::Final { target, .. } => {
                 if !known_target(&target) {
                     return reject(Some(index), reject_code::UNKNOWN_TARGET);
                 }

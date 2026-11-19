@@ -110,7 +110,9 @@ impl PolicyResolver {
         let outbound_for = |index: usize| -> Option<Arc<dyn TcpOutbound>> {
             let server = &self.policy.servers()[index];
             match (server.via, server.upstream.target()) {
-                (DnsVia::Proxy, Some(address)) => routed.dns_outbound(address),
+                (DnsVia::Proxy, Some(address)) => {
+                    routed.dns_outbound_as(address, server.upstream.rule_protocol())
+                }
                 _ => Some(routed.direct().clone()),
             }
         };

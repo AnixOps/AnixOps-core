@@ -100,6 +100,9 @@ fn resolution_snapshot(resolution: &RouteResolution) -> Value {
         "matched": match resolution.matched {
             RouteMatch::Rule(index) => format!("rule:{index}"),
             RouteMatch::ResolveFailed(index) => format!("resolve_failed:{index}"),
+            RouteMatch::FinalAfterResolveFailed(index) => {
+                format!("final_after_resolve_failed:{index}")
+            }
             RouteMatch::ScriptPending(index) => format!("script_pending:{index}"),
             RouteMatch::Final => "final".to_string(),
         },
@@ -232,7 +235,15 @@ fn parses_rule_lines() {
     assert_eq!(
         parse_rule_line("FINAL,Proxy").unwrap(),
         RuleLine::Final {
-            target: "Proxy".to_string()
+            target: "Proxy".to_string(),
+            dns_failed: false,
+        }
+    );
+    assert_eq!(
+        parse_rule_line("FINAL,Proxy,dns-failed").unwrap(),
+        RuleLine::Final {
+            target: "Proxy".to_string(),
+            dns_failed: true,
         }
     );
 
@@ -240,10 +251,7 @@ fn parses_rule_lines() {
         ("DOMAIN,example.com", ROUTING_RULE_LINE_INVALID_CODE),
         ("FINAL", ROUTING_RULE_LINE_INVALID_CODE),
         ("FINAL,Proxy,extra", ROUTING_RULE_LINE_INVALID_CODE),
-        (
-            "SUBNET,SSID:Home,DIRECT",
-            ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-        ),
+        ("UID,501,DIRECT", ROUTING_RULE_TYPE_UNSUPPORTED_CODE),
         (
             "DOMAIN,exa mple.com,DIRECT",
             ROUTING_RULE_VALUE_INVALID_CODE,
@@ -371,7 +379,7 @@ fn reject_variants_are_policies_of_their_own() {
                 "DOMAIN,d.test,REJECT-TINYGIF",
                 // Loon's name for the same 1x1 image.
                 "DOMAIN,e.test,REJECT-IMG",
-                "FINAL,REJECT-DROP",
+                "FINAL,REJECT",
             ],
             vec![],
         ),
@@ -901,7 +909,7 @@ fn malformed_logical_and_port_rules_are_rejected() {
         "AND,((DOMAIN,a.com)(DOMAIN,b.com)),DIRECT",
         "AND,((DOMAIN,a.com,DIRECT)),DIRECT",
         "AND,((DOMAIN)),DIRECT",
-        "AND,((SUBNET,SSID:Home)),DIRECT",
+        "AND,((SUBNET,SSID:)),DIRECT",
         "DST-PORT,99999,DIRECT",
         "DST-PORT,500-400,DIRECT",
         "GEOSITE,bad category,DIRECT",
@@ -1091,7 +1099,7 @@ fn protocol_rules_match_the_transport_and_port() {
         assert_eq!(resolution.matched, expected, "{query:?}");
     }
     assert_eq!(
-        parse_rule_line("PROTOCOL,STUN,REJECT").unwrap_err().code,
+        parse_rule_line("PROTOCOL,DOH3,REJECT").unwrap_err().code,
         ROUTING_RULE_VALUE_INVALID_CODE
     );
 }
@@ -1245,6 +1253,7 @@ fn network_conditions_parse_surge_subnet_keys() {
         bssid: Some("aa:bb:cc:dd:ee:0f".to_string()),
         router: Some("192.168.1.1".parse().unwrap()),
         addresses: vec!["192.168.1.20".parse().unwrap()],
+        radio: None,
     };
     for when in [
         "SSID:My Home",
@@ -1713,4 +1722,273 @@ fn ip_asn_rules_match_the_networks_the_environment_has() {
             .matched,
         RouteMatch::Rule(0)
     );
+}
+
+/// What the batch of Surge rule types that look at the connection's origin,
+/// host kind and network sees: source port, device names and the network.
+#[derive(Default)]
+struct OriginEnvironment {
+    dns: BTreeMap<String, IpAddr>,
+    devices: BTreeMap<IpAddr, String>,
+    network: Option<NetworkContext>,
+}
+
+impl RoutingEnvironment for OriginEnvironment {
+    fn geoip_country(&self, _ip: IpAddr) -> Option<String> {
+        None
+    }
+
+    fn resolve(&self, domain: &str) -> Option<IpAddr> {
+        self.dns.get(domain).copied()
+    }
+
+    fn selected_member(&self, _group_id: &str) -> Option<String> {
+        None
+    }
+
+    fn member_latency_ms(&self, _group_id: &str, _member: &PolicyTarget) -> Option<u32> {
+        None
+    }
+
+    fn network(&self) -> Option<&NetworkContext> {
+        self.network.as_ref()
+    }
+
+    fn device_name(&self, source: IpAddr) -> Option<&str> {
+        self.devices.get(&source).map(String::as_str)
+    }
+}
+
+#[test]
+fn surge_origin_and_network_rules_parse_and_print_back() {
+    for (line, printed) in [
+        ("SRC-PORT,5000-5100,DIRECT", "SRC-PORT,5000-5100"),
+        ("SRC-PORT,8080,DIRECT", "SRC-PORT,8080"),
+        ("HOSTNAME-TYPE,ipv6,DIRECT", "HOSTNAME-TYPE,IPV6"),
+        ("HOSTNAME-TYPE,SIMPLE,DIRECT", "HOSTNAME-TYPE,SIMPLE"),
+        ("SUBNET,SSID:My Home,DIRECT", "SUBNET,SSID:My Home"),
+        ("SUBNET,TYPE:CELLULAR,DIRECT", "SUBNET,TYPE:CELLULAR"),
+        (
+            "SUBNET,ROUTER:192.168.1.1,DIRECT",
+            "SUBNET,ROUTER:192.168.1.1",
+        ),
+        ("SUBNET,10.0.0.0/8,DIRECT", "SUBNET,SUBNET:10.0.0.0/8"),
+        (
+            "DEVICE-NAME,Living Room TV,DIRECT",
+            "DEVICE-NAME,living room tv",
+        ),
+        ("CELLULAR-RADIO,nr,DIRECT", "CELLULAR-RADIO,NR"),
+        ("PROTOCOL,stun,REJECT", "PROTOCOL,STUN"),
+        ("PROTOCOL,DOH,DIRECT", "PROTOCOL,DOH"),
+        ("PROTOCOL,DOQ,DIRECT", "PROTOCOL,DOQ"),
+    ] {
+        let RuleLine::Rule { matcher, .. } = parse_rule_line(line).unwrap() else {
+            panic!("{line} is not a rule");
+        };
+        assert_eq!(matcher.to_string(), printed, "{line}");
+        // What a rule prints parses back to the same rule.
+        let again = parse_rule_line(&format!("{printed},DIRECT")).unwrap();
+        assert!(
+            matches!(again, RuleLine::Rule { matcher: ref back, .. } if *back == matcher),
+            "{line}"
+        );
+    }
+    for line in [
+        "SRC-PORT,0-70000,DIRECT",
+        "HOSTNAME-TYPE,FQDN,DIRECT",
+        "SUBNET,SSID:,DIRECT",
+        "SUBNET,nowhere,DIRECT",
+        "DEVICE-NAME,\"\",DIRECT",
+        "CELLULAR-RADIO,5G NR,DIRECT",
+        "PROTOCOL,DOH3,DIRECT",
+    ] {
+        assert_eq!(
+            parse_rule_line(line).unwrap_err().code,
+            ROUTING_RULE_VALUE_INVALID_CODE,
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn surge_origin_and_network_rules_match() {
+    use config_core::routing::RouteNetwork;
+    let model = RoutingModel::from_spec(
+        &spec(
+            &[
+                "SRC-PORT,5000-5100,hk-1",
+                "DEVICE-NAME,living room tv,jp-1",
+                "CELLULAR-RADIO,NR,jp-1",
+                "SUBNET,SSID:My Home,DIRECT",
+                "HOSTNAME-TYPE,SIMPLE,DIRECT",
+                "HOSTNAME-TYPE,IPV6,REJECT",
+                "PROTOCOL,STUN,REJECT",
+                "PROTOCOL,DOH,hk-1",
+                "FINAL,REJECT-DROP",
+            ],
+            vec![],
+        ),
+        &node_ids(),
+    )
+    .unwrap();
+    let tv: IpAddr = "192.168.1.30".parse().unwrap();
+    let mut environment = OriginEnvironment {
+        devices: BTreeMap::from([(tv, "Living Room TV".to_string())]),
+        ..OriginEnvironment::default()
+    };
+    let decide = |query: &RouteQuery, environment: &OriginEnvironment| {
+        model.decide(query, environment).matched
+    };
+
+    // SRC-PORT: the port the connection was opened from.
+    let from_port = |port: u16| RouteQuery::domain("a.example.com").with_source_port(Some(port));
+    assert_eq!(decide(&from_port(5050), &environment), RouteMatch::Rule(0));
+    assert_eq!(decide(&from_port(6000), &environment), RouteMatch::Final);
+    assert_eq!(
+        decide(&RouteQuery::domain("a.example.com"), &environment),
+        RouteMatch::Final
+    );
+
+    // DEVICE-NAME: by source address, IPv4-mapped included.
+    let from = |source: &str| {
+        RouteQuery::domain("a.example.com").with_source(Some(source.parse().unwrap()), None)
+    };
+    assert_eq!(
+        decide(&from("192.168.1.30"), &environment),
+        RouteMatch::Rule(1)
+    );
+    assert_eq!(
+        decide(&from("::ffff:192.168.1.30"), &environment),
+        RouteMatch::Rule(1)
+    );
+    assert_eq!(
+        decide(&from("192.168.1.31"), &environment),
+        RouteMatch::Final
+    );
+
+    // HOSTNAME-TYPE: a name without a dot, an IPv6 destination.
+    assert_eq!(
+        decide(&RouteQuery::domain("router"), &environment),
+        RouteMatch::Rule(4)
+    );
+    assert_eq!(
+        decide(
+            &RouteQuery::ip("2001:db8::1".parse().unwrap()),
+            &environment
+        ),
+        RouteMatch::Rule(5)
+    );
+    // An IPv4-mapped address is IPv4.
+    assert_eq!(
+        decide(
+            &RouteQuery::ip("::ffff:198.51.100.1".parse().unwrap()),
+            &environment
+        ),
+        RouteMatch::Final
+    );
+
+    // PROTOCOL,STUN: UDP to a STUN port only.
+    let stun = |port: u16, network: RouteNetwork| {
+        RouteQuery::domain("stun.example.com")
+            .with_port(port)
+            .with_network(network)
+    };
+    assert_eq!(
+        decide(&stun(3478, RouteNetwork::Udp), &environment),
+        RouteMatch::Rule(6)
+    );
+    assert_eq!(
+        decide(&stun(19302, RouteNetwork::Udp), &environment),
+        RouteMatch::Rule(6)
+    );
+    assert_eq!(
+        decide(&stun(3478, RouteNetwork::Tcp), &environment),
+        RouteMatch::Final
+    );
+
+    // PROTOCOL,DOH: only the engine's own DoH query, never an app's HTTPS.
+    let mut doh = RouteQuery::domain("dns.example.com")
+        .with_port(443)
+        .with_network(RouteNetwork::Tcp);
+    assert_eq!(decide(&doh, &environment), RouteMatch::Final);
+    doh.dns = Some(config_core::routing::RuleProtocol::Doh);
+    assert_eq!(decide(&doh, &environment), RouteMatch::Rule(7));
+    doh.dns = Some(config_core::routing::RuleProtocol::Doq);
+    assert_eq!(decide(&doh, &environment), RouteMatch::Final);
+
+    // SUBNET and CELLULAR-RADIO: never before the network is known.
+    let query = RouteQuery::domain("a.example.com");
+    assert_eq!(decide(&query, &environment), RouteMatch::Final);
+    environment.network = Some(NetworkContext {
+        kind: Some(NetworkKind::Wifi),
+        ssid: Some("My Home".to_string()),
+        ..NetworkContext::default()
+    });
+    assert_eq!(decide(&query, &environment), RouteMatch::Rule(3));
+    environment.network = Some(NetworkContext {
+        kind: Some(NetworkKind::Cellular),
+        radio: Some("NR".to_string()),
+        ..NetworkContext::default()
+    });
+    assert_eq!(decide(&query, &environment), RouteMatch::Rule(2));
+    environment.network = Some(NetworkContext {
+        kind: Some(NetworkKind::Cellular),
+        radio: Some("LTE".to_string()),
+        ..NetworkContext::default()
+    });
+    assert_eq!(decide(&query, &environment), RouteMatch::Final);
+    // A radio reported off cellular does not count.
+    environment.network = Some(NetworkContext {
+        kind: Some(NetworkKind::Wifi),
+        radio: Some("NR".to_string()),
+        ..NetworkContext::default()
+    });
+    assert_eq!(decide(&query, &environment), RouteMatch::Final);
+}
+
+#[test]
+fn final_dns_failed_sends_failed_lookups_to_final() {
+    let rules = ["DOMAIN,direct.test,DIRECT", "IP-CIDR,10.0.0.0/8,DIRECT"];
+    let environment = OriginEnvironment {
+        dns: BTreeMap::from([("lan.test".to_string(), "10.1.2.3".parse().unwrap())]),
+        ..OriginEnvironment::default()
+    };
+
+    // Without the option a failed lookup rejects.
+    let plain = RoutingModel::from_spec(
+        &spec(&[rules[0], rules[1], "FINAL,hk-1"], vec![]),
+        &node_ids(),
+    )
+    .unwrap();
+    assert!(!plain.final_dns_failed);
+    let failed = plain.decide(&RouteQuery::domain("gone.test"), &environment);
+    assert_eq!(failed.matched, RouteMatch::ResolveFailed(1));
+    assert_eq!(failed.outcome, RouteOutcome::Reject(RejectKind::Reject));
+
+    // With it the connection goes to FINAL's target.
+    let model = RoutingModel::from_spec(
+        &spec(&[rules[0], rules[1], "FINAL,hk-1,dns-failed"], vec![]),
+        &node_ids(),
+    )
+    .unwrap();
+    assert!(model.final_dns_failed);
+    let failed = model.decide(&RouteQuery::domain("gone.test"), &environment);
+    assert_eq!(failed.matched, RouteMatch::FinalAfterResolveFailed(1));
+    assert_eq!(failed.outcome, RouteOutcome::Node("hk-1".to_string()));
+    assert_eq!(failed.resolved_ip, None);
+
+    // A lookup that works, and a rule before the IP rule, are unchanged.
+    let resolved = model.decide(&RouteQuery::domain("lan.test"), &environment);
+    assert_eq!(resolved.matched, RouteMatch::Rule(1));
+    assert_eq!(resolved.outcome, RouteOutcome::Direct);
+    let named = model.decide(&RouteQuery::domain("direct.test"), &environment);
+    assert_eq!(named.matched, RouteMatch::Rule(0));
+
+    for line in ["FINAL,hk-1,dns-failed,extra", "FINAL,hk-1,no-resolve"] {
+        assert_eq!(
+            parse_rule_line(line).unwrap_err().code,
+            ROUTING_RULE_LINE_INVALID_CODE,
+            "{line}"
+        );
+    }
 }

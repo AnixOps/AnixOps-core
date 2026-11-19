@@ -2,8 +2,9 @@
 //!
 //! This module owns the platform-neutral routing model: ordered
 //! DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD/IP-CIDR/GEOIP/GEOSITE/DST-PORT/
-//! SRC-IP/IN-PORT/PROCESS-NAME/RULE-SET/SCRIPT rules and AND/OR/NOT combinations of them, a
-//! mandatory FINAL target, and
+//! SRC-IP/SRC-PORT/IN-PORT/PROCESS-NAME/HOSTNAME-TYPE/SUBNET/DEVICE-NAME/
+//! CELLULAR-RADIO/RULE-SET/SCRIPT rules and AND/OR/NOT combinations of them, a
+//! mandatory FINAL target (optionally `dns-failed`), and
 //! select/url-test/fallback policy groups. In-process engines call
 //! [`RoutingModel::decide`] directly, and snapshot tests pin its results. The module performs no DNS, GeoIP database, health check,
 //! or network work; those inputs come from a [`RoutingEnvironment`].
@@ -214,7 +215,11 @@ fn mask_ip(address: IpAddr, prefix_len: u8) -> IpAddr {
 
 /// Values of a `PROTOCOL` rule. `QUIC` is UDP to port 443, `HTTPS` TCP to
 /// port 443 and `HTTP` TCP to port 80, as far as routing can tell before
-/// the first bytes.
+/// the first bytes. `STUN` is UDP to a STUN/TURN port (3478, 3479, 5349 and
+/// 19302-19309). As in Surge, `DOH` and `DOQ` match the engine's own
+/// DNS-over-HTTPS and DNS-over-QUIC queries to a proxied server
+/// ([`RouteQuery::dns`]), so a rule can pick the proxy they go through;
+/// an app's connections never match them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleProtocol {
     Tcp,
@@ -222,6 +227,9 @@ pub enum RuleProtocol {
     Quic,
     Http,
     Https,
+    Stun,
+    Doh,
+    Doq,
 }
 
 impl RuleProtocol {
@@ -232,6 +240,37 @@ impl RuleProtocol {
             Self::Quic => "QUIC",
             Self::Http => "HTTP",
             Self::Https => "HTTPS",
+            Self::Stun => "STUN",
+            Self::Doh => "DOH",
+            Self::Doq => "DOQ",
+        }
+    }
+}
+
+/// UDP ports STUN and TURN use: 3478 and 3479 (RFC 8489), 5349 (over TLS
+/// or DTLS) and Google's 19302-19309.
+fn is_stun_port(port: u16) -> bool {
+    matches!(port, 3478 | 3479 | 5349 | 19302..=19309)
+}
+
+/// What the destination host of a connection is, for `HOSTNAME-TYPE`
+/// rules (Surge): an IPv4 or IPv6 address, a domain with a dot, or a
+/// simple name without one (`localhost`, `router`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostnameType {
+    Ipv4,
+    Ipv6,
+    Domain,
+    Simple,
+}
+
+impl HostnameType {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "IPV4",
+            Self::Ipv6 => "IPV6",
+            Self::Domain => "DOMAIN",
+            Self::Simple => "SIMPLE",
         }
     }
 }
@@ -331,10 +370,32 @@ pub enum RuleMatcher {
     /// Address of the device or app that opened the connection, as Surge
     /// `SRC-IP` (an address or a CIDR; Clash `SRC-IP-CIDR`).
     SrcIp(IpCidr),
+    /// Port the app or device opened the connection from, within an
+    /// inclusive range, as Surge `SRC-PORT`.
+    SrcPort(u16, u16),
     /// Local port of the inbound listener the connection came in on, within
     /// an inclusive range, as Surge `IN-PORT`. The packet tunnel has no
     /// listener port, so it never matches there.
     InPort(u16, u16),
+    /// What kind of host the connection asked for, as Surge
+    /// `HOSTNAME-TYPE`: a domain the connection carries (named, sniffed or
+    /// from Fake-IP) decides over its address.
+    HostnameType(HostnameType),
+    /// The network the device is on, as Surge `SUBNET` (`SSID:<name>`,
+    /// `BSSID:<mac>`, `ROUTER:<ip>`, `TYPE:WIFI|WIRED|CELLULAR`, or a CIDR
+    /// one of the device's addresses is in). It never matches while the
+    /// client has not reported the network
+    /// ([`RoutingEnvironment::network`]).
+    Subnet(NetworkCondition),
+    /// Lower-case name the user gave the device that opened the connection
+    /// (by its source address, [`RoutingEnvironment::device_name`]), as Surge
+    /// `DEVICE-NAME`. Unnamed devices never match.
+    DeviceName(String),
+    /// Upper-case radio access technology of the cellular network the
+    /// device is on (`LTE`, `NR`, `NRNSA`, `WCDMA` and the like), as Surge
+    /// `CELLULAR-RADIO`. It never matches off cellular or while the client
+    /// has not reported the radio ([`NetworkContext::radio`]).
+    CellularRadio(String),
     /// Transport of the connection, as Surge `PROTOCOL`.
     Protocol(RuleProtocol),
     /// Lower-case glob over the `User-Agent` of a plain HTTP request, as
@@ -427,7 +488,9 @@ impl RuleMatcher {
             ip: query.ip,
             port: query.port,
             source: query.source,
+            source_port: query.source_port,
             in_port: query.in_port,
+            dns: query.dns,
             process: process.as_deref(),
             network: query.network,
             user_agent: user_agent.as_deref(),
@@ -456,8 +519,14 @@ impl fmt::Display for RuleMatcher {
             Self::DstPort(start, end) => write!(formatter, "DST-PORT,{start}-{end}"),
             Self::ProcessName(name) => write!(formatter, "PROCESS-NAME,{name}"),
             Self::SrcIp(cidr) => write!(formatter, "SRC-IP,{cidr}"),
+            Self::SrcPort(start, end) if start == end => write!(formatter, "SRC-PORT,{start}"),
+            Self::SrcPort(start, end) => write!(formatter, "SRC-PORT,{start}-{end}"),
             Self::InPort(start, end) if start == end => write!(formatter, "IN-PORT,{start}"),
             Self::InPort(start, end) => write!(formatter, "IN-PORT,{start}-{end}"),
+            Self::HostnameType(kind) => write!(formatter, "HOSTNAME-TYPE,{}", kind.name()),
+            Self::Subnet(condition) => write!(formatter, "SUBNET,{condition}"),
+            Self::DeviceName(name) => write!(formatter, "DEVICE-NAME,{name}"),
+            Self::CellularRadio(radio) => write!(formatter, "CELLULAR-RADIO,{radio}"),
             Self::Protocol(protocol) => write!(formatter, "PROTOCOL,{}", protocol.name()),
             Self::UserAgent(pattern) => write!(formatter, "USER-AGENT,{pattern}"),
             Self::UrlRegex(pattern) => write!(formatter, "URL-REGEX,{}", pattern.as_str()),
@@ -568,10 +637,13 @@ pub struct NetworkContext {
     pub router: Option<IpAddr>,
     /// Addresses of the default interface.
     pub addresses: Vec<IpAddr>,
+    /// Upper-case radio access technology on cellular (`LTE`, `NR`, ...),
+    /// for `CELLULAR-RADIO` rules; `None` off cellular or when unknown.
+    pub radio: Option<String>,
 }
 
-/// What a subnet group rule matches.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a subnet group rule or a `SUBNET` rule matches.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NetworkCondition {
     /// Exact Wi-Fi name.
     Ssid(String),
@@ -610,6 +682,12 @@ impl NetworkCondition {
         }
     }
 
+    /// A `SUBNET` rule value: a condition as for [`NetworkCondition::parse`],
+    /// or a bare CIDR, which is `SUBNET:<cidr>`.
+    fn parse_rule_value(value: &str) -> Option<Self> {
+        Self::parse(value).or_else(|| IpCidr::parse(value).map(Self::Subnet))
+    }
+
     pub fn matches(&self, network: &NetworkContext) -> bool {
         match self {
             Self::Ssid(ssid) => network.ssid.as_deref() == Some(ssid.as_str()),
@@ -623,6 +701,20 @@ impl NetworkCondition {
                 .iter()
                 .any(|address| cidr.contains(*address)),
             Self::Kind(kind) => network.kind == Some(*kind),
+        }
+    }
+}
+
+impl fmt::Display for NetworkCondition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ssid(ssid) => write!(formatter, "SSID:{ssid}"),
+            Self::Bssid(bssid) => write!(formatter, "BSSID:{bssid}"),
+            Self::Router(router) => write!(formatter, "ROUTER:{router}"),
+            Self::Subnet(cidr) => write!(formatter, "SUBNET:{cidr}"),
+            Self::Kind(NetworkKind::Wifi) => formatter.write_str("TYPE:WIFI"),
+            Self::Kind(NetworkKind::Wired) => formatter.write_str("TYPE:WIRED"),
+            Self::Kind(NetworkKind::Cellular) => formatter.write_str("TYPE:CELLULAR"),
         }
     }
 }
@@ -663,6 +755,9 @@ pub struct PolicyGroup {
 pub struct RoutingModel {
     pub rules: Vec<RoutingRule>,
     pub final_target: PolicyTarget,
+    /// `FINAL,<target>,dns-failed`: a connection whose domain cannot be
+    /// resolved for an IP rule goes to FINAL instead of being rejected.
+    pub final_dns_failed: bool,
     pub groups: Vec<PolicyGroup>,
 }
 
@@ -676,6 +771,8 @@ pub enum RuleLine {
     },
     Final {
         target: String,
+        /// `dns-failed`: see [`RoutingModel::final_dns_failed`].
+        dns_failed: bool,
     },
 }
 
@@ -717,10 +814,19 @@ pub fn parse_rule_line(line: &str) -> DomainResult<RuleLine> {
         return match parts.as_slice() {
             [_, target] if !target.is_empty() => Ok(RuleLine::Final {
                 target: (*target).to_string(),
+                dns_failed: false,
             }),
+            [_, target, option]
+                if !target.is_empty() && option.eq_ignore_ascii_case("dns-failed") =>
+            {
+                Ok(RuleLine::Final {
+                    target: (*target).to_string(),
+                    dns_failed: true,
+                })
+            }
             _ => Err(routing_error(
                 ROUTING_RULE_LINE_INVALID_CODE,
-                "FINAL rule must have exactly one target",
+                "FINAL rule must have exactly one target, optionally followed by dns-failed",
             )),
         };
     }
@@ -937,6 +1043,60 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             RuleMatcher::InPort(start, end)
         }
         "SRC-IP" | "SRC-IP-CIDR" => RuleMatcher::SrcIp(parse_source(value)?),
+        "SRC-PORT" => {
+            let (start, end) = parse_port_range(value).map_err(|_| {
+                routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "SRC-PORT rule value must be a port or a start-end range",
+                )
+            })?;
+            RuleMatcher::SrcPort(start, end)
+        }
+        "HOSTNAME-TYPE" => {
+            RuleMatcher::HostnameType(match value.trim().to_ascii_uppercase().as_str() {
+                "IPV4" => HostnameType::Ipv4,
+                "IPV6" => HostnameType::Ipv6,
+                "DOMAIN" => HostnameType::Domain,
+                "SIMPLE" => HostnameType::Simple,
+                _ => {
+                    return Err(routing_error(
+                        ROUTING_RULE_VALUE_INVALID_CODE,
+                        "HOSTNAME-TYPE rule value must be IPV4, IPV6, DOMAIN, or SIMPLE",
+                    ))
+                }
+            })
+        }
+        "SUBNET" => RuleMatcher::Subnet(NetworkCondition::parse_rule_value(value).ok_or_else(
+            || {
+                routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "SUBNET rule value must be SSID:<name>, BSSID:<mac>, ROUTER:<ip>, TYPE:WIFI, TYPE:WIRED, TYPE:CELLULAR, or a CIDR",
+                )
+            },
+        )?),
+        "DEVICE-NAME" => {
+            let name = value.trim().trim_matches('"').to_lowercase();
+            if name.is_empty() || name.chars().count() > 64 {
+                return Err(routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "DEVICE-NAME rule value must be a device name of 1-64 characters",
+                ));
+            }
+            RuleMatcher::DeviceName(name)
+        }
+        "CELLULAR-RADIO" => {
+            let radio = value.trim().to_ascii_uppercase();
+            let valid = !radio.is_empty()
+                && radio.len() <= 24
+                && radio.bytes().all(|byte| byte.is_ascii_alphanumeric());
+            if !valid {
+                return Err(routing_error(
+                    ROUTING_RULE_VALUE_INVALID_CODE,
+                    "CELLULAR-RADIO rule value must be a radio technology such as LTE or NR",
+                ));
+            }
+            RuleMatcher::CellularRadio(radio)
+        }
         "PROCESS-NAME" => RuleMatcher::ProcessName(value.trim().to_lowercase()),
         "USER-AGENT" => {
             let pattern = value.trim().trim_matches('"').to_lowercase();
@@ -970,16 +1130,19 @@ fn parse_matcher(kind: &str, value: &str) -> DomainResult<RuleMatcher> {
             "QUIC" => RuleProtocol::Quic,
             "HTTP" => RuleProtocol::Http,
             "HTTPS" => RuleProtocol::Https,
+            "STUN" => RuleProtocol::Stun,
+            "DOH" => RuleProtocol::Doh,
+            "DOQ" => RuleProtocol::Doq,
             _ => {
                 return Err(routing_error(
                     ROUTING_RULE_VALUE_INVALID_CODE,
-                    "PROTOCOL rule value must be TCP, UDP, QUIC, HTTP, or HTTPS",
+                    "PROTOCOL rule value must be TCP, UDP, QUIC, HTTP, HTTPS, STUN, DOH, or DOQ",
                 ))
             }
         }),
         _ => return Err(routing_error(
             ROUTING_RULE_TYPE_UNSUPPORTED_CODE,
-            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, GEOSITE, DST-PORT, SRC-IP, IN-PORT, PROCESS-NAME, PROTOCOL, USER-AGENT, URL-REGEX, RULE-SET, SCRIPT, AND, OR, NOT, or FINAL",
+            "routing rule type must be DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, DOMAIN-WILDCARD, IP-CIDR, IP-CIDR6, GEOIP, IP-ASN, GEOSITE, DST-PORT, SRC-IP, SRC-PORT, IN-PORT, PROCESS-NAME, HOSTNAME-TYPE, SUBNET, DEVICE-NAME, CELLULAR-RADIO, PROTOCOL, USER-AGENT, URL-REGEX, RULE-SET, SCRIPT, AND, OR, NOT, or FINAL",
         )),
     })
 }
@@ -1061,6 +1224,7 @@ impl RoutingModel {
 
         let mut rules = Vec::with_capacity(spec.rules.len());
         let mut final_target = None;
+        let mut final_dns_failed = false;
         for (index, line) in spec.rules.iter().enumerate() {
             if final_target.is_some() {
                 return Err(routing_error(
@@ -1080,12 +1244,13 @@ impl RoutingModel {
                         .map_err(|error| with_rule_index(error, index))?,
                     no_resolve,
                 }),
-                RuleLine::Final { target } => {
+                RuleLine::Final { target, dns_failed } => {
                     final_target = Some(
                         names
                             .resolve(&target)
                             .map_err(|error| with_rule_index(error, index))?,
                     );
+                    final_dns_failed = dns_failed;
                 }
             }
         }
@@ -1099,6 +1264,7 @@ impl RoutingModel {
         Ok(Self {
             rules,
             final_target,
+            final_dns_failed,
             groups,
         })
     }
@@ -1114,7 +1280,9 @@ impl RoutingModel {
     /// asks the environment to resolve a domain-only destination once; like a
     /// sing-box `resolve` action, the resolved address is then used by every
     /// later IP rule and is reported in the result. As in sing-box, a failed
-    /// resolution rejects the connection instead of falling through to FINAL.
+    /// resolution rejects the connection instead of falling through to FINAL,
+    /// unless FINAL says `dns-failed` (Surge): the connection then goes to
+    /// FINAL's target, reported as [`RouteMatch::FinalAfterResolveFailed`].
     pub fn decide(
         &self,
         query: &RouteQuery,
@@ -1196,7 +1364,9 @@ impl RoutingModel {
                         ip: None,
                         port: query.port,
                         source: query.source,
+                        source_port: query.source_port,
                         in_port: query.in_port,
+                        dns: query.dns,
                         process: process.as_deref(),
                         network: query.network,
                         user_agent: user_agent.as_deref(),
@@ -1215,6 +1385,15 @@ impl RoutingModel {
                 resolve_attempted = true;
                 if let Some(domain) = domain.as_deref() {
                     resolved_ip = environment.resolve(domain);
+                    if resolved_ip.is_none() && self.final_dns_failed {
+                        return self.resolution(
+                            RouteMatch::FinalAfterResolveFailed(index),
+                            &self.final_target,
+                            None,
+                            balance_key.as_deref(),
+                            environment,
+                        );
+                    }
                     if resolved_ip.is_none() {
                         return RouteResolution {
                             matched: RouteMatch::ResolveFailed(index),
@@ -1255,7 +1434,9 @@ impl RoutingModel {
                 ip,
                 port: query.port,
                 source: query.source,
+                source_port: query.source_port,
                 in_port: query.in_port,
+                dns: query.dns,
                 process: process.as_deref(),
                 network: query.network,
                 user_agent: user_agent.as_deref(),
@@ -1469,6 +1650,13 @@ pub struct RouteQuery {
     /// Local port of the inbound listener the connection came in on, for
     /// IN-PORT rules.
     pub in_port: Option<u16>,
+    /// Port the app or device opened the connection from, for SRC-PORT
+    /// rules.
+    pub source_port: Option<u16>,
+    /// The connection is the engine's own encrypted DNS query to a proxied
+    /// server, for `PROTOCOL,DOH` and `PROTOCOL,DOQ` rules:
+    /// [`RuleProtocol::Doh`] or [`RuleProtocol::Doq`].
+    pub dns: Option<RuleProtocol>,
 }
 
 impl RouteQuery {
@@ -1500,6 +1688,12 @@ impl RouteQuery {
     pub fn with_source(mut self, source: Option<IpAddr>, in_port: Option<u16>) -> Self {
         self.source = source;
         self.in_port = in_port;
+        self
+    }
+
+    /// Sets the port the connection was opened from, for SRC-PORT.
+    pub fn with_source_port(mut self, port: Option<u16>) -> Self {
+        self.source_port = port;
         self
     }
 }
@@ -1564,9 +1758,17 @@ pub trait RoutingEnvironment {
         None
     }
 
-    /// The network the device is on, for subnet groups; `None` when the
-    /// client has not said, and then every subnet group uses its default.
+    /// The network the device is on, for subnet groups and `SUBNET` and
+    /// `CELLULAR-RADIO` rules; `None` when the client has not said, and then
+    /// every subnet group uses its default and those rules never match.
     fn network(&self) -> Option<&NetworkContext> {
+        None
+    }
+
+    /// The name the user gave the device at `source` (the address a
+    /// connection came from), for `DEVICE-NAME` rules; compared
+    /// case-insensitively. No device has one by default.
+    fn device_name(&self, _source: IpAddr) -> Option<&str> {
         None
     }
 
@@ -1614,6 +1816,9 @@ pub enum RouteMatch {
     Rule(usize),
     /// Resolving the domain for the IP rule at this index failed.
     ResolveFailed(usize),
+    /// Resolving the domain for the IP rule at this index failed, and FINAL
+    /// says `dns-failed`, so FINAL's target took the connection.
+    FinalAfterResolveFailed(usize),
     /// The SCRIPT rule at this index has no verdict yet
     /// ([`RoutingEnvironment::script_matches`] returned `None`): the caller
     /// runs the script and decides again with its verdict. The resolution
@@ -1647,7 +1852,9 @@ struct MatchInput<'a> {
     ip: Option<IpAddr>,
     port: Option<u16>,
     source: Option<IpAddr>,
+    source_port: Option<u16>,
     in_port: Option<u16>,
+    dns: Option<RuleProtocol>,
     process: Option<&'a str>,
     network: Option<RouteNetwork>,
     user_agent: Option<&'a str>,
@@ -1694,17 +1901,56 @@ fn rule_matches(
         RuleMatcher::SrcIp(cidr) => input
             .source
             .is_some_and(|source| cidr.contains(source.to_canonical())),
+        RuleMatcher::SrcPort(start, end) => input
+            .source_port
+            .is_some_and(|port| (*start..=*end).contains(&port)),
         RuleMatcher::InPort(start, end) => input
             .in_port
             .is_some_and(|port| (*start..=*end).contains(&port)),
+        RuleMatcher::HostnameType(kind) => {
+            let found = match (domain, input.ip) {
+                (Some(domain), _) if domain.contains('.') => Some(HostnameType::Domain),
+                (Some(_), _) => Some(HostnameType::Simple),
+                (None, Some(IpAddr::V4(_))) => Some(HostnameType::Ipv4),
+                (None, Some(IpAddr::V6(address))) if address.to_ipv4_mapped().is_some() => {
+                    Some(HostnameType::Ipv4)
+                }
+                (None, Some(IpAddr::V6(_))) => Some(HostnameType::Ipv6),
+                (None, None) => None,
+            };
+            found == Some(*kind)
+        }
+        RuleMatcher::Subnet(condition) => environment
+            .network()
+            .is_some_and(|network| condition.matches(network)),
+        RuleMatcher::DeviceName(name) => input.source.is_some_and(|source| {
+            environment
+                .device_name(source.to_canonical())
+                .is_some_and(|found| found.trim().to_lowercase() == *name)
+        }),
+        RuleMatcher::CellularRadio(radio) => environment.network().is_some_and(|network| {
+            network.kind == Some(NetworkKind::Cellular)
+                && network
+                    .radio
+                    .as_deref()
+                    .is_some_and(|found| found.eq_ignore_ascii_case(radio))
+        }),
         RuleMatcher::Protocol(protocol) => {
             let port = input.port;
+            if let Some(dns) = input.dns {
+                // The engine's own DNS query: only DOH / DOQ say anything
+                // about it beyond its transport.
+                if matches!(protocol, RuleProtocol::Doh | RuleProtocol::Doq) {
+                    return *protocol == dns;
+                }
+            }
             match (protocol, input.network) {
                 (RuleProtocol::Tcp, Some(RouteNetwork::Tcp))
                 | (RuleProtocol::Udp, Some(RouteNetwork::Udp)) => true,
                 (RuleProtocol::Quic, Some(RouteNetwork::Udp))
                 | (RuleProtocol::Https, Some(RouteNetwork::Tcp)) => port == Some(443),
                 (RuleProtocol::Http, Some(RouteNetwork::Tcp)) => port == Some(80),
+                (RuleProtocol::Stun, Some(RouteNetwork::Udp)) => port.is_some_and(is_stun_port),
                 _ => false,
             }
         }

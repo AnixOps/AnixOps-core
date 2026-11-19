@@ -1143,3 +1143,72 @@ fn capture_is_off_by_default_and_keeps_bytes_once_on() {
         assert_eq!(status["used_bytes"], 0);
     });
 }
+
+#[test]
+fn control_names_devices_reports_the_radio_and_tests_source_ports() {
+    runtime().block_on(async {
+        let nodes = BTreeMap::from([(
+            "hk-1".to_string(),
+            Arc::new(Echo("test-node")) as Arc<dyn TcpOutbound>,
+        )]);
+        let spec = RoutingSpec {
+            rules: vec![
+                "SRC-PORT,7000,hk-1".to_string(),
+                "DEVICE-NAME,TV,hk-1".to_string(),
+                "CELLULAR-RADIO,NR,hk-1".to_string(),
+                "FINAL,DIRECT".to_string(),
+            ],
+            groups: Vec::new(),
+        };
+        let routed = RoutedOutbound::new(&spec, Arc::new(Echo("direct")), nodes).unwrap();
+        let dispatcher = Dispatcher::routed(Arc::new(routed));
+        let rule = |request: &str| control_json(&dispatcher, request)["test"]["rule"].clone();
+
+        assert_eq!(
+            rule(r#"{"cmd":"test_route","host":"a.test","source_port":7000}"#),
+            "SRC-PORT,7000"
+        );
+        let from_tv = r#"{"cmd":"test_route","host":"a.test","source":"192.168.1.30"}"#;
+        assert_eq!(rule(from_tv), "FINAL");
+
+        let answer = control_json(
+            &dispatcher,
+            r#"{"cmd":"set_devices","devices":{"192.168.1.30":"TV"}}"#,
+        );
+        assert_eq!(answer["changed"], true);
+        assert_eq!(
+            control_json(&dispatcher, r#"{"cmd":"devices"}"#)["devices"],
+            serde_json::json!({ "192.168.1.30": "tv" })
+        );
+        assert_eq!(rule(from_tv), "DEVICE-NAME,tv");
+        // A list longer than a short request is taken whole.
+        let many = (0..200)
+            .map(|index| (format!("10.0.0.{index}"), format!("device {index}")))
+            .collect::<BTreeMap<_, _>>();
+        let request = serde_json::json!({ "cmd": "set_devices", "devices": many }).to_string();
+        assert!(request.len() > control::MAX_REQUEST_LEN);
+        assert_eq!(control_json(&dispatcher, &request)["changed"], true);
+        assert_eq!(rule(from_tv), "FINAL");
+
+        let answer = control_json(
+            &dispatcher,
+            r#"{"cmd":"set_network","type":"cellular","radio":"nr"}"#,
+        );
+        assert_eq!(answer["changed"], true);
+        assert_eq!(
+            rule(r#"{"cmd":"test_route","host":"a.test"}"#),
+            "CELLULAR-RADIO,NR"
+        );
+
+        for refused in [
+            r#"{"cmd":"set_network","type":"cellular","radio":"5G NR"}"#,
+            r#"{"cmd":"set_devices","devices":{"tv.local":"TV"}}"#,
+            r#"{"cmd":"set_devices","devices":{"192.168.1.30":""}}"#,
+        ] {
+            assert!(
+                control::handle(&dispatcher, refused.as_bytes()).is_err(),
+                "{refused}"
+            );
+        }
+    });
+}

@@ -839,7 +839,9 @@ fn spawn_dns_exchange(job: DnsExchange) {
         let outbound_for = |index: usize| -> Option<Arc<dyn TcpOutbound>> {
             let server = &policy.servers()[index];
             match server.upstream.target() {
-                Some(target) if proxied => dispatcher.dns_outbound(server.via, target),
+                Some(target) if proxied => {
+                    dispatcher.dns_outbound_as(server.via, target, server.upstream.rule_protocol())
+                }
                 Some(target) => dispatcher.dns_outbound(DnsVia::Direct, target),
                 // `system`: always direct.
                 None => Some(dispatcher.direct().clone()),
@@ -1121,6 +1123,7 @@ async fn run_udp_flow(
                 source: FlowSource {
                     address: Some(app.ip().to_canonical()),
                     in_port: None,
+                    port: Some(app.port()),
                 },
             };
             dispatcher.open_origin_udp_flow(&target, None, origin).await
@@ -1378,6 +1381,7 @@ async fn handle_tcp(
     let source = FlowSource {
         address: Some(inbound_app.ip().to_canonical()),
         in_port: None,
+        port: Some(inbound_app.port()),
     };
     let server_first = &shared.server_first;
     let wait = server_first.wait(target);

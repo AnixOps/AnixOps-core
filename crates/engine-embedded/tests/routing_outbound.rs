@@ -575,3 +575,143 @@ fn rules_count_the_flows_they_decide_and_the_tester_counts_none() {
         .all(|rule| rule.hits == 0 && rule.last_hit_at_ms.is_none()));
     assert_eq!(cleared.final_rule.hits, 0);
 }
+
+#[test]
+fn source_port_device_name_doh_and_final_dns_failed_route() {
+    use config_core::routing::{RouteNetwork, RuleProtocol};
+    use engine_embedded::routing::FlowSource;
+
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let lookups = Arc::new(Mutex::new(Vec::new()));
+    let recording = |name| -> Arc<dyn TcpOutbound> {
+        Arc::new(Recording {
+            name,
+            hits: hits.clone(),
+        })
+    };
+    let nodes = BTreeMap::from([
+        ("hk-1".to_string(), recording("hk-1")),
+        ("jp-1".to_string(), recording("jp-1")),
+    ]);
+    let spec = RoutingSpec {
+        rules: vec![
+            "SRC-PORT,6000-6010,hk-1".to_string(),
+            "DEVICE-NAME,Living Room TV,hk-1".to_string(),
+            "PROTOCOL,DOH,hk-1".to_string(),
+            "IP-CIDR6,2001:db8::/32,hk-1".to_string(),
+            "FINAL,jp-1,dns-failed".to_string(),
+        ],
+        groups: vec![],
+    };
+    let outbound = RoutedOutbound::new(&spec, recording("direct"), nodes)
+        .expect("spec should validate")
+        .with_resolver(Arc::new(FixedResolver {
+            lookups: lookups.clone(),
+        }));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let tv: IpAddr = "192.168.1.30".parse().unwrap();
+    let flow = |port: u16| {
+        let outbound = &outbound;
+        runtime.block_on(async move {
+            outbound
+                .route_network_flow(
+                    &ip("203.0.113.9:443"),
+                    None,
+                    None,
+                    RouteNetwork::Tcp,
+                    None,
+                    FlowSource {
+                        address: Some(tv),
+                        in_port: None,
+                        port: Some(port),
+                    },
+                )
+                .await
+                .0
+        })
+    };
+
+    // SRC-PORT: the port the app opened the connection from.
+    let route = flow(6005);
+    assert_eq!(route.rule, "SRC-PORT,6000-6010");
+    assert_eq!(route.outbound, "hk-1");
+    assert_eq!(flow(5000).rule, "FINAL");
+
+    // DEVICE-NAME: names given by address, compared without case.
+    let devices = BTreeMap::from([(tv.to_string(), "living room TV".to_string())]);
+    let parsed = RoutedOutbound::parse_devices(&devices).unwrap();
+    assert!(outbound.set_devices(parsed.clone()));
+    assert!(!outbound.set_devices(parsed));
+    assert_eq!(
+        outbound.devices(),
+        BTreeMap::from([(tv, "living room tv".to_string())])
+    );
+    assert_eq!(flow(5000).rule, "DEVICE-NAME,living room tv");
+    assert!(outbound.set_devices(BTreeMap::new()));
+    assert_eq!(flow(5000).rule, "FINAL");
+    for bad in [
+        BTreeMap::from([("tv.local".to_string(), "TV".to_string())]),
+        BTreeMap::from([(tv.to_string(), " ".to_string())]),
+        BTreeMap::from([(tv.to_string(), "a\nb".to_string())]),
+        (0..=engine_embedded::routing::MAX_DEVICES)
+            .map(|index| {
+                (
+                    format!("10.0.{}.{}", index / 256, index % 256),
+                    "x".to_string(),
+                )
+            })
+            .collect(),
+    ] {
+        assert!(RoutedOutbound::parse_devices(&bad).is_err(), "{bad:?}");
+    }
+
+    // PROTOCOL,DOH: only the engine's own DoH query to the server.
+    let server = ip("1.1.1.1:443");
+    let connect = |picked: Option<Arc<dyn TcpOutbound>>| {
+        let picked = picked.expect("an outbound");
+        runtime.block_on(async {
+            let _ = picked.connect(&server).await;
+        });
+        hits.lock().unwrap().pop().unwrap()
+    };
+    assert_eq!(
+        connect(outbound.dns_outbound_as(&server, Some(RuleProtocol::Doh))),
+        "hk-1"
+    );
+    assert_eq!(connect(outbound.dns_outbound(&server)), "jp-1");
+    assert_eq!(
+        connect(outbound.dns_outbound_as(&server, Some(RuleProtocol::Doq))),
+        "jp-1"
+    );
+
+    // FINAL,...,dns-failed: a name that does not resolve for the IP rule
+    // goes to FINAL after a real lookup instead of being rejected.
+    let before = outbound.rule_hits().final_rule.hits;
+    let (route, picked) = runtime.block_on(outbound.route_flow(
+        &TargetAddr::Domain("gone.example".to_string(), 443),
+        None,
+        None,
+    ));
+    assert_eq!(route.rule, "FINAL (dns-failed)");
+    assert_eq!(route.outbound, "jp-1");
+    assert!(picked.is_some());
+    assert_eq!(*lookups.lock().unwrap(), ["gone.example"]);
+    assert_eq!(outbound.rule_hits().final_rule.hits, before + 1);
+    // One that resolves goes on to the IP rules as usual.
+    let (route, _) = runtime.block_on(outbound.route_flow(
+        &TargetAddr::Domain("v6.example".to_string(), 443),
+        None,
+        None,
+    ));
+    assert_eq!(route.rule, "IP-CIDR6,2001:db8::/32");
+    assert_eq!(route.outbound, "hk-1");
+    // The tester, given no address, names the IP rule that needs one.
+    let test = outbound.test_route(
+        &config_core::routing::RouteQuery::domain("gone.example").with_port(443),
+        None,
+    );
+    assert_eq!(test.rule, "IP-CIDR6,2001:db8::/32");
+    assert!(test.needs_address);
+}

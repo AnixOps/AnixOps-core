@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use config_core::redirect::{RedirectHost, RedirectTable, RedirectTo};
-use config_core::routing::{RejectKind, RouteNetwork, RouteQuery};
+use config_core::routing::{RejectKind, RouteNetwork, RouteQuery, RuleProtocol};
 use engine_outbound::sniff::HttpRequestHead;
 use engine_outbound::{
     BoxFuture, BoxStream, DatagramRecv, DatagramSend, RequestRouter, TargetAddr, TcpDialer,
@@ -788,7 +788,8 @@ impl Dispatcher {
         }
         .with_port(target.port())
         .with_network(network)
-        .with_source(origin.source.address, origin.source.in_port);
+        .with_source(origin.source.address, origin.source.in_port)
+        .with_source_port(origin.source.port);
         if query.domain.is_none() {
             query.domain = host.map(str::to_string);
         }
@@ -882,12 +883,24 @@ impl Dispatcher {
     /// [`RoutedOutbound::dns_outbound`]), so a `proxy` server is never asked
     /// in the clear because a rule said DIRECT. `None` when routing rejects.
     pub fn dns_outbound(&self, via: DnsVia, server: &TargetAddr) -> Option<Arc<dyn TcpOutbound>> {
+        self.dns_outbound_as(via, server, None)
+    }
+
+    /// [`Self::dns_outbound`] for a query sent as `dns` (DoH or DoQ, see
+    /// [`crate::dns::Upstream::rule_protocol`]), for `PROTOCOL,DOH` and
+    /// `PROTOCOL,DOQ` rules.
+    pub fn dns_outbound_as(
+        &self,
+        via: DnsVia,
+        server: &TargetAddr,
+        dns: Option<RuleProtocol>,
+    ) -> Option<Arc<dyn TcpOutbound>> {
         if via == DnsVia::Direct || self.mode() == Mode::Direct {
             return Some(self.direct.clone());
         }
         match (&self.routed, self.mode()) {
             (Some(routed), Mode::Global) => routed.route_global().1,
-            (Some(routed), _) => routed.dns_outbound(server),
+            (Some(routed), _) => routed.dns_outbound_as(server, dns),
             (None, _) => Some(self.outbound.clone()),
         }
     }

@@ -447,6 +447,7 @@ pub(crate) fn client_source(client: ClientAddrs) -> FlowSource {
     FlowSource {
         address: Some(client.peer.ip().to_canonical()),
         in_port: Some(client.local.port()),
+        port: Some(client.peer.port()),
     }
 }
 

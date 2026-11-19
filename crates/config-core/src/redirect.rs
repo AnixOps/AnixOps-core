@@ -153,9 +153,12 @@ fn check_matcher(matcher: &RuleMatcher) -> DomainResult<()> {
         | RuleMatcher::IpAsn(_)
         | RuleMatcher::GeoSite(_)
         | RuleMatcher::RuleSet(_)
-        | RuleMatcher::Script(_) => Err(DomainError::new(
+        | RuleMatcher::Script(_)
+        | RuleMatcher::Subnet(_)
+        | RuleMatcher::DeviceName(_)
+        | RuleMatcher::CellularRadio(_) => Err(DomainError::new(
             REDIRECT_MATCHER_UNSUPPORTED_CODE,
-            "GEOIP, IP-ASN, GEOSITE, RULE-SET and SCRIPT cannot select a redirect",
+            "GEOIP, IP-ASN, GEOSITE, RULE-SET, SCRIPT, SUBNET, DEVICE-NAME and CELLULAR-RADIO cannot select a redirect",
         )),
         RuleMatcher::And(rules) | RuleMatcher::Or(rules) => {
             rules.iter().try_for_each(check_matcher)
