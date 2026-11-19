@@ -78,7 +78,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -195,6 +195,105 @@ pub struct RoutingTable {
     pub uses_request: bool,
     /// 0 for the table the engine started with, then one more per reload.
     pub generation: u64,
+    /// How often each rule of `model`, then FINAL, decided a flow; a reload
+    /// starts from zero.
+    pub hits: Arc<RuleHits>,
+}
+
+/// Per-rule hit counters of one [`RoutingTable`]: one slot per rule, the
+/// last for FINAL. Counted on the flow path with relaxed atomics, never a
+/// lock.
+#[derive(Debug, Default)]
+pub struct RuleHits {
+    counts: Box<[AtomicU64]>,
+    /// Unix milliseconds of the latest hit, 0 for none.
+    last_at_ms: Box<[AtomicU64]>,
+}
+
+impl RuleHits {
+    fn new(slots: usize) -> Self {
+        Self {
+            counts: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            last_at_ms: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record(&self, slot: usize) {
+        if let (Some(count), Some(last)) = (self.counts.get(slot), self.last_at_ms.get(slot)) {
+            count.fetch_add(1, Ordering::Relaxed);
+            last.store(unix_millis(), Ordering::Relaxed);
+        }
+    }
+
+    fn clear(&self) {
+        for slot in self.counts.iter().chain(self.last_at_ms.iter()) {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn view(&self, slot: usize, rule: String, target: &PolicyTarget) -> RuleHit {
+        let load = |slots: &[AtomicU64]| {
+            slots
+                .get(slot)
+                .map_or(0, |value| value.load(Ordering::Relaxed))
+        };
+        RuleHit {
+            rule,
+            target: target.name().to_string(),
+            hits: load(&self.counts),
+            last_hit_at_ms: Some(load(&self.last_at_ms)).filter(|at| *at != 0),
+        }
+    }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// One rule, or FINAL, with how often it decided a flow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuleHit {
+    /// The rule as the connection list shows it (`DOMAIN-SUFFIX,example.com`),
+    /// or `FINAL`.
+    pub rule: String,
+    /// The policy it sends to: a group, a node, `DIRECT` or a REJECT policy.
+    pub target: String,
+    pub hits: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_hit_at_ms: Option<u64>,
+}
+
+/// Every rule in order (plugin rules first, as they match), then FINAL, with
+/// their hits since the table was built ([`RoutedOutbound::rule_hits`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuleHitsView {
+    pub generation: u64,
+    pub rules: Vec<RuleHit>,
+    #[serde(rename = "final")]
+    pub final_rule: RuleHit,
+}
+
+/// What [`RoutedOutbound::test_route`] decided for a made-up connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteTest {
+    /// Index of the deciding rule in [`RuleHitsView::rules`]; `None` for
+    /// FINAL.
+    pub rule_index: Option<usize>,
+    pub rule: String,
+    /// Policy groups from the rule's target to the outbound, then the
+    /// outbound.
+    pub chain: Vec<String>,
+    /// A node id, `DIRECT` or a REJECT policy.
+    pub outbound: String,
+    /// The rule at `rule_index` needs the destination's address, which the
+    /// test was not given: `chain` and `outbound` are what a failed lookup
+    /// would do (reject). Test again with the address.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub needs_address: bool,
 }
 
 /// What a successful [`RoutedOutbound::reload_rules`] did.
@@ -597,6 +696,70 @@ impl RoutedOutbound {
     /// The rule sets, for their status and manual refreshes.
     pub fn rule_sets(&self) -> &Arc<RuleSetStore> {
         &self.rule_sets
+    }
+
+    /// Every rule in force, then FINAL, with how often each decided a flow
+    /// since the rules were loaded (a reload starts from zero; see
+    /// `generation`).
+    pub fn rule_hits(&self) -> RuleHitsView {
+        let table = self.table();
+        let rules = table
+            .model
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                table
+                    .hits
+                    .view(index, rule.matcher.to_string(), &rule.target)
+            })
+            .collect();
+        let final_rule = table.hits.view(
+            table.model.rules.len(),
+            "FINAL".to_string(),
+            &table.model.final_target,
+        );
+        RuleHitsView {
+            generation: table.generation,
+            rules,
+            final_rule,
+        }
+    }
+
+    /// Sets every rule's hits back to zero.
+    pub fn clear_rule_hits(&self) {
+        self.table().hits.clear();
+    }
+
+    /// Which rule would decide a connection described by `query`, and where
+    /// it would go, without opening or counting anything: the rule tester.
+    /// `address` is the destination's address for a domain `query`, as a
+    /// lookup would give it; without one, a rule that needs it stops the test
+    /// ([`RouteTest::needs_address`]). Rule scripts are not run and count as
+    /// not matching. Groups pick their member as they would now; a round-robin
+    /// group counts the test as one of its connections.
+    pub fn test_route(&self, query: &RouteQuery, address: Option<IpAddr>) -> RouteTest {
+        let table = self.table();
+        let resolution = self.decide(&table, query, address, None);
+        let info = describe(&table, &resolution);
+        let (rule_index, needs_address) = match resolution.matched {
+            RouteMatch::Rule(index) | RouteMatch::ScriptPending(index) => (Some(index), false),
+            RouteMatch::ResolveFailed(index) => {
+                (Some(index), address.is_none() && query.ip.is_none())
+            }
+            RouteMatch::Final => (None, false),
+        };
+        let rule = match rule_index {
+            Some(index) if needs_address => table.model.rules[index].matcher.to_string(),
+            _ => info.rule,
+        };
+        RouteTest {
+            rule_index,
+            rule,
+            chain: info.chain,
+            outbound: info.outbound,
+            needs_address,
+        }
     }
 
     /// The sets `GEOIP` and `IP-ASN` rules look addresses up in
@@ -1091,6 +1254,7 @@ impl RoutedOutbound {
         if self.evaluate_before_use(&table, &resolution).await {
             resolution = self.resolve_query(&table, &query).await;
         }
+        count_hit(&table, &resolution);
         self.note_used(&table, &resolution);
         let outbound = self.outbound_of(&resolution.outcome);
         (describe(&table, &resolution), outbound)
@@ -1507,6 +1671,16 @@ fn due_groups<'a>(
         .collect()
 }
 
+/// Counts the rule, or FINAL, that decided a flow. A decision stopped at a
+/// rule script never reaches a flow.
+fn count_hit(table: &RoutingTable, resolution: &RouteResolution) {
+    match resolution.matched {
+        RouteMatch::Rule(index) | RouteMatch::ResolveFailed(index) => table.hits.record(index),
+        RouteMatch::Final => table.hits.record(table.model.rules.len()),
+        RouteMatch::ScriptPending(_) => {}
+    }
+}
+
 /// The rule, group path and outbound of a decision, as the connection
 /// list shows them.
 fn describe(table: &RoutingTable, resolution: &RouteResolution) -> RouteInfo {
@@ -1588,8 +1762,10 @@ fn compile_table(
         uses_process,
         uses_request,
         generation,
+        hits: Arc::default(),
     };
     add_plugin_rules(&mut table, plugin_rules, node_ids, rule_sets);
+    table.hits = Arc::new(RuleHits::new(table.model.rules.len() + 1));
     Ok(table)
 }
 
@@ -1794,7 +1970,10 @@ impl TcpOutbound for RoutedOutbound {
 
 impl RoutedOutbound {
     async fn outbound_for(&self, target: &TargetAddr) -> io::Result<&Arc<dyn TcpOutbound>> {
-        match self.route_resolving(target).await {
+        let table = self.table();
+        let resolution = self.resolve_query(&table, &query(target)).await;
+        count_hit(&table, &resolution);
+        match resolution.outcome {
             RouteOutcome::Reject(kind) => Err(engine_outbound::reject::rejected(
                 crate::reject::action(kind),
             )),

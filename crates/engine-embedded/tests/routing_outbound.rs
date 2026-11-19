@@ -517,3 +517,61 @@ async fn script_rules_route_by_what_the_script_decides() {
         RouteOutcome::Direct
     );
 }
+
+#[test]
+fn rules_count_the_flows_they_decide_and_the_tester_counts_none() {
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let outbound = routed(&hits);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for target in ["10.1.2.3:443", "10.9.9.9:80", "203.0.113.9:443"] {
+            let _ = outbound.connect(&ip(target)).await;
+        }
+    });
+
+    let view = outbound.rule_hits();
+    assert_eq!(view.generation, 0);
+    assert_eq!(view.rules.len(), 4);
+    assert_eq!(view.rules[0].rule, "IP-CIDR,10.0.0.0/8");
+    assert_eq!(view.rules[0].target, "DIRECT");
+    assert_eq!(view.rules[0].hits, 2);
+    assert!(view.rules[0].last_hit_at_ms.is_some());
+    assert_eq!(view.rules[1].hits, 0);
+    assert_eq!(view.rules[1].last_hit_at_ms, None);
+    assert_eq!(view.final_rule.rule, "FINAL");
+    assert_eq!(view.final_rule.target, "Proxy");
+    assert_eq!(view.final_rule.hits, 1);
+
+    // The tester decides without counting.
+    let test = outbound.test_route(
+        &config_core::routing::RouteQuery::domain("www.example.jp").with_port(443),
+        None,
+    );
+    assert_eq!(test.rule_index, Some(2));
+    assert_eq!(test.rule, "DOMAIN-SUFFIX,example.jp");
+    assert_eq!(test.chain, ["jp-1"]);
+    assert_eq!(test.outbound, "jp-1");
+    assert!(!test.needs_address);
+    // A domain reaching an IP rule that resolves needs its address.
+    let other = config_core::routing::RouteQuery::domain("other.example").with_port(443);
+    let test = outbound.test_route(&other, None);
+    assert_eq!(test.rule_index, Some(3));
+    assert!(test.needs_address);
+    assert_eq!(test.rule, "IP-CIDR6,2001:db8::/32");
+    // With the address it goes on: not in 2001:db8::/32, so FINAL.
+    let test = outbound.test_route(&other, Some("203.0.113.9".parse().unwrap()));
+    assert_eq!(test.rule_index, None);
+    assert_eq!(test.rule, "FINAL");
+    assert_eq!(test.chain, ["Proxy", "jp-1"]);
+    assert_eq!(outbound.rule_hits(), view);
+
+    outbound.clear_rule_hits();
+    let cleared = outbound.rule_hits();
+    assert!(cleared
+        .rules
+        .iter()
+        .all(|rule| rule.hits == 0 && rule.last_hit_at_ms.is_none()));
+    assert_eq!(cleared.final_rule.hits, 0);
+}
