@@ -118,12 +118,12 @@ fn rules_left_out_of_the_import_are_reported() {
 
     let text = CLASH.replace(
         "  - MATCH,Proxy",
-        "  - CELLULAR-RADIO,LTE,Proxy\n  - CELLULAR-RADIO,NR,Proxy\n  - RULE-SET,SYSTEM,DIRECT\n  - MATCH,Proxy",
+        "  - UID,501,Proxy\n  - UID,502,Proxy\n  - RULE-SET,SYSTEM,DIRECT\n  - MATCH,Proxy",
     );
     let report = import_text(&text).unwrap();
     assert!(report.routing.is_some());
     let warnings = report.routing_warnings.join("\n");
-    assert!(warnings.contains("CELLULAR-RADIO x2"), "{warnings}");
+    assert!(warnings.contains("UID x2"), "{warnings}");
     assert!(warnings.contains("rule set SYSTEM"), "{warnings}");
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(

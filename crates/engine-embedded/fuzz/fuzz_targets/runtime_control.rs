@@ -149,10 +149,13 @@ fn control(handle: usize, request: &[u8]) {
             let answer = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
             let parsed: serde_json::Value = serde_json::from_slice(answer).expect("answer is JSON");
             assert!(parsed.is_object(), "answer is not an object");
-            // Only `reload_rules` may be longer than the short limit.
+            // Only `reload_rules` and `set_devices` may be longer than the
+            // short limit.
             let reload = serde_json::from_slice::<serde_json::Value>(request)
                 .ok()
-                .is_some_and(|request| request["cmd"] == "reload_rules");
+                .is_some_and(|request| {
+                    request["cmd"] == "reload_rules" || request["cmd"] == "set_devices"
+                });
             assert!(
                 request.len() <= MAX_REQUEST_LEN
                     || (reload && request.len() <= MAX_RELOAD_REQUEST_LEN),

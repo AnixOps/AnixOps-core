@@ -159,6 +159,8 @@ fn surge_profile_imports_supported_rules_and_groups() {
         ]
     );
     assert_eq!(model.final_target, PolicyTarget::Group("Proxy".to_string()));
+    // Surge `FINAL,<policy>,dns-failed` keeps its option.
+    assert!(model.final_dns_failed);
 
     let ids = model
         .groups
@@ -737,4 +739,53 @@ FINAL,DIRECT
         .collect::<Vec<_>>()
         .join("\n");
     assert!(messages.contains("URL-REGEX x2"), "{messages}");
+}
+
+#[test]
+fn surge_origin_network_and_protocol_rules_import() {
+    let profile = r#"
+[Proxy]
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503
+
+[Proxy Group]
+Proxy = select, HK, DIRECT
+
+[Rule]
+SRC-PORT,5000-5100,Proxy
+HOSTNAME-TYPE,SIMPLE,DIRECT
+SUBNET,SSID:My Home,DIRECT
+DEVICE-NAME,Living Room TV,Proxy
+CELLULAR-RADIO,NR,Proxy
+PROTOCOL,STUN,REJECT
+PROTOCOL,DOH,Proxy
+PROTOCOL,DOH3,Proxy
+FINAL,Proxy
+"#;
+    let nodes = parse_nodes(profile);
+    let imported = import_subscription_routing(profile, &nodes);
+    let spec = imported.spec.clone().expect("surge routing should import");
+    assert_eq!(
+        spec.rules,
+        vec![
+            "SRC-PORT,5000-5100,Proxy".to_string(),
+            "HOSTNAME-TYPE,SIMPLE,DIRECT".to_string(),
+            "SUBNET,SSID:My Home,DIRECT".to_string(),
+            "DEVICE-NAME,Living Room TV,Proxy".to_string(),
+            "CELLULAR-RADIO,NR,Proxy".to_string(),
+            "PROTOCOL,STUN,REJECT".to_string(),
+            "PROTOCOL,DOH,Proxy".to_string(),
+            "FINAL,Proxy".to_string(),
+        ]
+    );
+    let model = imported.routing.expect("the rules should build");
+    assert!(!model.final_dns_failed);
+    // PROTOCOL,DOH3 is not supported: skipped with its reason, not silently.
+    let messages = imported
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(messages.contains("rule 7 was skipped"), "{messages}");
+    assert!(messages.contains("DOH"), "{messages}");
 }

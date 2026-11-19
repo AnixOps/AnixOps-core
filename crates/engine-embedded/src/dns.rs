@@ -12,6 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use config_core::routing::RuleProtocol;
 use engine_outbound::{BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -268,6 +269,21 @@ impl Upstream {
             #[cfg(feature = "dns-quic")]
             Self::Quic { target, .. } => Some(target),
             Self::System(_) => None,
+        }
+    }
+
+    /// What `PROTOCOL,DOH` and `PROTOCOL,DOQ` rules see a query to this
+    /// server as: [`RuleProtocol::Doh`] for `https://`,
+    /// [`RuleProtocol::Doq`] for `quic://`, `None` for the rest.
+    // Without `dns-tls` and `dns-quic` only the catch-all arm is left.
+    #[allow(clippy::match_single_binding)]
+    pub fn rule_protocol(&self) -> Option<RuleProtocol> {
+        match self {
+            #[cfg(feature = "dns-tls")]
+            Self::Https { .. } => Some(RuleProtocol::Doh),
+            #[cfg(feature = "dns-quic")]
+            Self::Quic { .. } => Some(RuleProtocol::Doq),
+            _ => None,
         }
     }
 }

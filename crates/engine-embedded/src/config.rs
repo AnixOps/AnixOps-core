@@ -196,6 +196,11 @@ pub struct RoutingConfig {
     /// node id or `DIRECT`. Defaults to the first group, else the first node.
     #[serde(default)]
     pub global: Option<String>,
+    /// Device names by the address their connections come from, for
+    /// `DEVICE-NAME` rules (see [`RoutedOutbound::parse_devices`]); the
+    /// `set_devices` control command replaces them while running.
+    #[serde(default)]
+    pub devices: BTreeMap<String, String>,
 }
 
 /// One rule script: the local file the client saved it to, the
@@ -1021,6 +1026,7 @@ impl RuntimeConfig {
             .map(|(name, script)| Ok((name.clone(), script.load()?)))
             .collect::<Result<BTreeMap<_, _>, RuntimeError>>()?;
         let routed = routed.with_rule_scripts(crate::rule_scripts::RuleScripts::new(scripts))?;
+        routed.set_devices(RoutedOutbound::parse_devices(&routing.devices).map_err(rejected)?);
         // IP rules resolve names with the `dns` section, never the system
         // resolver, so a proxied name is not looked up in the clear.
         let policy = DnsPolicy::from_config(&self.dns).map_err(rejected)?;

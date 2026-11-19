@@ -27,7 +27,7 @@ pub const ROUTING_IMPORT_MEMBER_SKIPPED_CODE: &str = "config.core.routing_import
 pub const ROUTING_IMPORT_OPTION_IGNORED_CODE: &str = "config.core.routing_import.option_ignored";
 pub const ROUTING_IMPORT_INVALID_CODE: &str = "config.core.routing_import.invalid";
 
-const SUPPORTED_RULE_TYPES: [&str; 14] = [
+const SUPPORTED_RULE_TYPES: [&str; 20] = [
     "DOMAIN",
     "DOMAIN-SUFFIX",
     "DOMAIN-KEYWORD",
@@ -42,6 +42,12 @@ const SUPPORTED_RULE_TYPES: [&str; 14] = [
     "SRC-IP",
     "SRC-IP-CIDR",
     "IN-PORT",
+    "SRC-PORT",
+    "HOSTNAME-TYPE",
+    "SUBNET",
+    "DEVICE-NAME",
+    "CELLULAR-RADIO",
+    "PROTOCOL",
 ];
 const LOGICAL_RULE_TYPES: [&str; 3] = ["AND", "OR", "NOT"];
 /// Most rule sets one import creates; the embedded engine accepts 32.
@@ -880,7 +886,13 @@ fn import_rules(
                 );
                 continue;
             };
+            // Surge `FINAL,<policy>,dns-failed`: a failed lookup for an IP
+            // rule goes to FINAL instead of being rejected.
+            let dns_failed = parts[2..]
+                .iter()
+                .any(|option| option.eq_ignore_ascii_case("dns-failed"));
             match resolve_rule_target(importer, group_ids, target) {
+                Some(target) if dns_failed => imported.push(format!("FINAL,{target},dns-failed")),
                 Some(target) => imported.push(format!("FINAL,{target}")),
                 None => importer.warn(
                     ROUTING_IMPORT_RULE_SKIPPED_CODE,

@@ -21,12 +21,14 @@
 //! | `update_rule_sets` | | `{"scheduled": remote set count}` |
 //! | `rule_hits` | | [`crate::routing::RuleHitsView`]: every rule in order, then FINAL, with how often it decided a flow since the rules were loaded |
 //! | `clear_rule_hits` | | the `rule_hits` answer, after setting the counts to zero |
-//! | `test_route` | `host` (domain or IP), optional `port` (default 443), `network` (`tcp` \| `udp`), `address` (the domain's IP, as a lookup would give it), `process`, `url`, `user_agent`, `source` (the app's IP) | `{"mode", "test":` [`crate::routing::RouteTest`]`}`: which rule decides such a connection and where it goes, without opening or counting one |
+//! | `test_route` | `host` (domain or IP), optional `port` (default 443), `network` (`tcp` \| `udp`), `address` (the domain's IP, as a lookup would give it), `process`, `url`, `user_agent`, `source` (the app's IP), `source_port` | `{"mode", "test":` [`crate::routing::RouteTest`]`}`: which rule decides such a connection and where it goes, without opening or counting one |
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
 //! | `network_changed` | | `{"scheduled": network-change script count}` |
 //! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped}` |
-//! | `set_network` | optional `type` (`wifi` \| `wired` \| `cellular`), `ssid`, `bssid`, `router`, `addresses` (IPs of the default interface) | `{"changed": bool}`: the network subnet groups match; all fields absent means unknown |
+//! | `set_network` | optional `type` (`wifi` \| `wired` \| `cellular`), `ssid`, `bssid`, `router`, `addresses` (IPs of the default interface), `radio` (cellular radio technology such as `LTE` or `NR`) | `{"changed": bool}`: the network subnet groups and `SUBNET` / `CELLULAR-RADIO` rules match; all fields absent means unknown |
+//! | `devices` | | `{"devices": {ip: name}}` |
+//! | `set_devices` | `devices` (`{ip: name}`, at most 256) | `{"changed": bool}`: the names `DEVICE-NAME` rules match, replacing the earlier ones |
 //! | `run_script` | `tag` | `{"scheduled": bool}` |
 //! | `outbound_health` | | `{"outbounds": [{"node", "protocol", "health"}]}`, only outbounds that report health |
 //! | `resume_outbound` | `node` | `{"resumed": bool}` |
@@ -103,6 +105,7 @@
 //! client keeps them in its profile (`mode`, `block_quic`, a select group's
 //! `default`) for the next start.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use config_core::routing::{RouteNetwork, RouteQuery};
@@ -121,10 +124,11 @@ use crate::{RuntimeError, RuntimeErrorCode};
 /// without policy groups.
 pub const SINGLE_NODE: &str = "proxy";
 
-/// Largest request accepted, except `reload_rules`.
+/// Largest request accepted, except `reload_rules` and `set_devices`.
 pub const MAX_REQUEST_LEN: usize = 4096;
 
-/// Largest `reload_rules` request accepted: 4096 rules of a typical length.
+/// Largest `reload_rules` or `set_devices` request accepted: 4096 rules of
+/// a typical length.
 pub const MAX_RELOAD_REQUEST_LEN: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +173,8 @@ enum ControlRequest {
         user_agent: Option<String>,
         #[serde(default)]
         source: Option<String>,
+        #[serde(default)]
+        source_port: Option<u16>,
     },
     Scripts,
     ScriptNotifications,
@@ -188,6 +194,12 @@ enum ControlRequest {
         router: Option<String>,
         #[serde(default)]
         addresses: Vec<String>,
+        #[serde(default)]
+        radio: Option<String>,
+    },
+    Devices,
+    SetDevices {
+        devices: BTreeMap<String, String>,
     },
     RunScript {
         tag: String,
@@ -317,6 +329,7 @@ fn network_context(
     bssid: Option<String>,
     router: Option<String>,
     addresses: Vec<String>,
+    radio: Option<String>,
 ) -> Result<Option<config_core::routing::NetworkContext>, RuntimeError> {
     use config_core::routing::{NetworkCondition, NetworkContext, NetworkKind};
 
@@ -325,6 +338,7 @@ fn network_context(
         && bssid.is_none()
         && router.is_none()
         && addresses.is_empty()
+        && radio.is_none()
     {
         return Ok(None);
     }
@@ -366,12 +380,27 @@ fn network_context(
                 .map_err(|_| invalid("network address is not an IP address"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let radio = radio
+        .map(|radio| {
+            let radio = radio.trim().to_ascii_uppercase();
+            if radio.is_empty()
+                || radio.len() > 24
+                || !radio.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            {
+                return Err(invalid(
+                    "radio must be a radio technology such as LTE or NR",
+                ));
+            }
+            Ok(radio)
+        })
+        .transpose()?;
     Ok(Some(NetworkContext {
         kind,
         ssid,
         bssid,
         router,
         addresses,
+        radio,
     }))
 }
 
@@ -392,7 +421,12 @@ pub fn handle_with_interceptor(
     let long = request.len() > MAX_REQUEST_LEN;
     let request: ControlRequest = serde_json::from_slice(request)
         .map_err(|_| invalid("control request is not a known command"))?;
-    if long && !matches!(request, ControlRequest::ReloadRules { .. }) {
+    if long
+        && !matches!(
+            request,
+            ControlRequest::ReloadRules { .. } | ControlRequest::SetDevices { .. }
+        )
+    {
         return Err(invalid("control request size is out of range"));
     }
     let tracker = dispatcher.tracker();
@@ -456,6 +490,7 @@ pub fn handle_with_interceptor(
             url,
             user_agent,
             source,
+            source_port,
         } => {
             let routed = dispatcher
                 .routed_outbound()
@@ -480,7 +515,8 @@ pub fn handle_with_interceptor(
             }
             .with_port(port)
             .with_network(network)
-            .with_source(ip(source, "source is not an IP address")?, None);
+            .with_source(ip(source, "source is not an IP address")?, None)
+            .with_source_port(source_port);
             query.process = process.filter(|name| !name.trim().is_empty());
             query.url = url.filter(|url| !url.is_empty());
             query.user_agent = user_agent.filter(|agent| !agent.is_empty());
@@ -504,12 +540,31 @@ pub fn handle_with_interceptor(
             bssid,
             router,
             addresses,
+            radio,
         } => {
-            let network = network_context(kind, ssid, bssid, router, addresses)?;
+            let network = network_context(kind, ssid, bssid, router, addresses, radio)?;
             let changed = dispatcher
                 .routed_outbound()
                 .is_some_and(|routed| routed.set_network(network));
             Ok(json!({ "changed": changed }))
+        }
+        ControlRequest::Devices => {
+            let devices = dispatcher
+                .routed_outbound()
+                .map(|routed| routed.devices())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(address, name)| (address.to_string(), name))
+                .collect::<BTreeMap<_, _>>();
+            Ok(json!({ "devices": devices }))
+        }
+        ControlRequest::SetDevices { devices } => {
+            let routed = dispatcher
+                .routed_outbound()
+                .ok_or_else(|| invalid("this config has no routing rules"))?;
+            let devices =
+                crate::routing::RoutedOutbound::parse_devices(&devices).map_err(invalid)?;
+            Ok(json!({ "changed": routed.set_devices(devices) }))
         }
         ControlRequest::ResetNetwork { close_connections } => {
             let health_forgotten = dispatcher
