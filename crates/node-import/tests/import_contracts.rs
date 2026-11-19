@@ -421,27 +421,27 @@ proxies:
 proxy-groups:
   - { name: Proxy, type: select, proxies: [HK 01, DIRECT] }
 rule-providers:
-  gfw:
+  listed:
     type: http
     behavior: domain
-    url: https://rules.example/gfw.txt
+    url: https://rules.example/listed.txt
     interval: 86400
     proxy: Proxy
 rules:
-  - RULE-SET,gfw,Proxy
+  - RULE-SET,listed,Proxy
   - GEOSITE,cn,DIRECT
   - MATCH,DIRECT
 "#;
     let routing = import_text(text).unwrap().routing.unwrap();
     assert_eq!(
         routing["rules"],
-        serde_json::json!(["RULE-SET,gfw,Proxy", "GEOSITE,cn,DIRECT", "FINAL,DIRECT"])
+        serde_json::json!(["RULE-SET,listed,Proxy", "GEOSITE,cn,DIRECT", "FINAL,DIRECT"])
     );
     assert_eq!(
         routing["rule_sets"],
         serde_json::json!({
-            "gfw": {
-                "url": "https://rules.example/gfw.txt",
+            "listed": {
+                "url": "https://rules.example/listed.txt",
                 "format": "domain",
                 "interval_secs": 86400,
                 "via": "Proxy"
@@ -449,7 +449,7 @@ rules:
         })
     );
     // Without remote sets the key is left out.
-    let plain = text.replace("RULE-SET,gfw,Proxy", "DOMAIN-SUFFIX,gfw.example,Proxy");
+    let plain = text.replace("RULE-SET,listed,Proxy", "DOMAIN-SUFFIX,listed.example,Proxy");
     assert!(import_text(&plain).unwrap().routing.unwrap()["rule_sets"].is_null());
 }
 
@@ -463,21 +463,21 @@ fn rule_set_public_key_mark_becomes_public_key() {
 proxies:
   - {{ name: HK 01, type: ss, server: 82.47.34.99, port: 11111, cipher: aes-256-gcm, password: f43c0eee-13b9-4f07-bec9-d4b744141503 }}
 rule-providers:
-  gfw:
+  listed:
     type: http
     behavior: domain
-    url: "https://rules.example/gfw.txt#anixops:pubkey={key}"
+    url: "https://rules.example/listed.txt#anixops:pubkey={key}"
 rules:
-  - RULE-SET,gfw,HK 01
+  - RULE-SET,listed,HK 01
   - MATCH,DIRECT
 "#
     );
     let routing = import_text(&text).unwrap().routing.unwrap();
     assert_eq!(
-        routing["rule_sets"]["gfw"]["url"],
-        "https://rules.example/gfw.txt"
+        routing["rule_sets"]["listed"]["url"],
+        "https://rules.example/listed.txt"
     );
-    assert_eq!(routing["rule_sets"]["gfw"]["public_key"], key);
+    assert_eq!(routing["rule_sets"]["listed"]["public_key"], key);
 }
 
 /// A land node behind a Panabit iWAN line, as the panel sends it to the App:

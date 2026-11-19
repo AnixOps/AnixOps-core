@@ -322,7 +322,7 @@ production-ready on a platform:
 direct TLS 1.3 handshake against OpenSSL, and the `REALITY interop (Linux)` job
 against Xray-core and sing-box REALITY servers on loopback. CI cannot prove
 that a real server survives active probing or that the ClientHello passes a
-real censor.
+real-world network filter.
 
 Before describing VLESS + REALITY as usable on iOS, the maintainer records here
 (no keys, UUIDs, short ids or server addresses):

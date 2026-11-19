@@ -1,4 +1,4 @@
-//! Trojan TCP outbound (trojan-gfw protocol) over standard TLS.
+//! Trojan TCP outbound (Trojan protocol) over standard TLS.
 //!
 //! After the TLS handshake the client sends
 //! `hex(SHA-224(password)) CRLF CMD ATYP DST.ADDR DST.PORT CRLF` and then the

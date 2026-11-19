@@ -2,7 +2,7 @@
 //! (one outbound, or every node with the subscription's rules and policy
 //! groups) turned into the envelope for a routing mode, and the policy group
 //! choices a client shows and switches. Pure JSON work, no files or network.
-//! There are no preset list modes (绕过大陆, GFW 列表, 回国): the rules are the
+//! There are no preset list modes (预设名单分流): the rules are the
 //! subscription's and the user's own (docs/no-presets.md).
 
 use serde::{Deserialize, Serialize};

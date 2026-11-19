@@ -1,4 +1,4 @@
-//! Trojan server inbound (trojan-gfw protocol).
+//! Trojan server inbound (Trojan protocol).
 //!
 //! The client sends `hex(SHA-224(password)) CRLF CMD ATYP DST.ADDR DST.PORT
 //! CRLF` and then the payload, usually in the first TLS record. Users are
