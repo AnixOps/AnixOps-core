@@ -50,7 +50,8 @@ fn only_rule_and_direct_modes_exist() {
         );
     }
     // No preset list modes (docs/no-presets.md).
-    for removed in ["bypass_china", "gfw_list", "return_china", "global"] { // neutral-terms: allow (values saved by earlier versions)
+    let removed_modes = ["bypass_china", "gfw_list", "return_china", "global"]; // neutral-terms: allow (values saved by earlier versions)
+    for removed in removed_modes {
         assert_eq!(RoutingMode::parse(removed), None, "{removed}");
     }
     assert_eq!(RoutingMode::default(), RoutingMode::Rule);
