@@ -65,7 +65,7 @@ network_rules = [
 
 `RoutingModel::decide(&RouteQuery, &dyn RoutingEnvironment) -> RouteResolution`
 
-- `RouteQuery { domain, ip, port, process }`：FakeIP/嗅探得到的域名、目的地址、目的端口（`DST-PORT`）与发起连接的本地进程名（`PROCESS-NAME`，大小写不敏感，平台无法得知时为空，规则不命中）。
+- `RouteQuery { domain, ip, port, process }`：FakeIP/嗅探得到的域名、目的地址、目的端口（`DST-PORT`）与发起连接的本地进程名（`PROCESS-NAME`，大小写不敏感，平台无法得知时为空，规则不命中）。进程名的来源：桌面本地代理在 Linux、Windows、macOS 按客户端连接查系统表；包隧道只在 Linux 和 Windows 查（TCP 按连接两端、UDP 按应用绑定的本地地址，含 FakeIP 地址），macOS/iOS 的隧道在 Network Extension 里看不到其他进程的套接字、Android 不开放这些表，所以隧道流量在这三个平台上不命中 `PROCESS-NAME`，客户端应提示。只有配置用到 `PROCESS-NAME`（含规则集里的）时才查，在阻塞线程上进行。
 - `RoutingEnvironment` 提供 GeoIP 查询（`geoip_matches`）、GeoSite 查询（`geosite_matches`）、DNS 解析、select 当前选择、成员测速结果；全部方法有保守默认值，`StaticRoutingEnvironment` 即无运行时状态。
 - `RoutingModel::route_to` 跳过规则直接解析一个目标（全局模式），`group_member` 给出组当前选择，`target_named` 按规则目标的方式解析名称。
 - `RuleMatcher` 的 `Display` 输出不带目标的规则行，供连接列表显示命中规则。

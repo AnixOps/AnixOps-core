@@ -1112,11 +1112,12 @@ async fn run_udp_flow(
             return;
         }
     }
+    let process = flow_process(&dispatcher, move || crate::process::udp_process_name(app)).await;
     let opened = {
         let open: BoxFuture<'_, io::Result<UdpFlow>> = Box::pin(async {
             let target = TargetAddr::Ip(destination);
             let origin = FlowOrigin {
-                process: None,
+                process: process.as_deref(),
                 source: FlowSource {
                     address: Some(app.ip().to_canonical()),
                     in_port: None,
@@ -1316,6 +1317,20 @@ async fn answer_rejected(
     }
 }
 
+/// The local process behind a tunnel flow, for `PROCESS-NAME` rules: looked
+/// up on a blocking thread with `lookup`, only where the tunnel can see the
+/// app's socket ([`crate::process::TUNNEL_LOOKUP`]) and only when a rule
+/// needs it.
+async fn flow_process(
+    dispatcher: &Dispatcher,
+    lookup: impl FnOnce() -> Option<String> + Send + 'static,
+) -> Option<String> {
+    if !crate::process::TUNNEL_LOOKUP || !dispatcher.wants_process() {
+        return None;
+    }
+    tokio::task::spawn_blocking(lookup).await.ok().flatten()
+}
+
 /// Length of the TLS handshake record `bytes` starts with, header included.
 fn tls_record_len(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 5 || bytes[0] != 0x16 || bytes[1] != 0x03 {
@@ -1335,8 +1350,9 @@ async fn handle_tcp(
 ) {
     // The app (or, with the tunnel as a gateway, the device) that opened
     // the flow, for SRC-IP rules; the tunnel has no listener port.
+    let inbound_app = inbound.local_addr();
     let source = FlowSource {
-        address: Some(inbound.local_addr().ip().to_canonical()),
+        address: Some(inbound_app.ip().to_canonical()),
         in_port: None,
     };
     let server_first = &shared.server_first;
@@ -1370,9 +1386,13 @@ async fn handle_tcp(
 
     let host = sniff::host(&first);
     let http = sniff::http_request_head(&first);
+    let process = flow_process(dispatcher, move || {
+        crate::process::process_name(inbound_app, target)
+    })
+    .await;
     let target = TargetAddr::Ip(target);
     let origin = FlowOrigin {
-        process: None,
+        process: process.as_deref(),
         source,
     };
     let connect = dispatcher.connect_origin_flow(&target, host.as_deref(), origin, http.as_ref());

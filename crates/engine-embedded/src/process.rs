@@ -15,6 +15,15 @@
 //! A lookup reads kernel tables and, on Linux and macOS, walks every
 //! process's descriptors, so it blocks: callers run it on a blocking thread
 //! and only for configs that have `PROCESS-NAME` rules.
+//!
+//! The packet tunnel uses the same lookup on Linux and Windows
+//! ([`TUNNEL_LOOKUP`]): the app's socket there is an ordinary host socket
+//! whose addresses are the ones the tunnel sees in the packets (the fake
+//! address included), so a TCP flow is found by its two ends and a UDP flow
+//! by its local end ([`udp_process_name`]). On macOS and iOS the tunnel runs
+//! in a Network Extension that cannot see other processes' sockets, and on
+//! Android the tables are closed to apps, so there the tunnel's flows give no
+//! name and `PROCESS-NAME` rules do not match them.
 
 use std::net::SocketAddr;
 
@@ -24,6 +33,31 @@ pub fn process_name(client: SocketAddr, server: SocketAddr) -> Option<String> {
     let client = canonical(client);
     let server = canonical(server);
     platform::process_name(client, server)
+}
+
+/// Whether the packet tunnel looks up the process behind its flows.
+pub const TUNNEL_LOOKUP: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+
+/// The executable name of the process whose UDP socket is bound to `local`
+/// (or to the wildcard address on its port). Linux and Windows only.
+pub fn udp_process_name(local: SocketAddr) -> Option<String> {
+    let local = canonical(local);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        platform::udp_process_name(local)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = local;
+        None
+    }
+}
+
+/// Whether a UDP socket bound to `bound` receives datagrams for `local`.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+fn udp_bound_to(bound: SocketAddr, local: SocketAddr) -> bool {
+    let bound = canonical(bound);
+    bound.port() == local.port() && (bound.ip() == local.ip() || bound.ip().is_unspecified())
 }
 
 fn canonical(addr: SocketAddr) -> SocketAddr {
@@ -48,11 +82,31 @@ mod platform {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     const TCP_TABLES: [&str; 2] = ["/proc/net/tcp", "/proc/net/tcp6"];
+    const UDP_TABLES: [&str; 2] = ["/proc/net/udp", "/proc/net/udp6"];
 
     pub fn process_name(client: SocketAddr, server: SocketAddr) -> Option<String> {
-        let inode = TCP_TABLES
+        let inode = TCP_TABLES.iter().find_map(|table| {
+            socket_inode(table, |local, remote| {
+                super::canonical(local) == client && super::canonical(remote) == server
+            })
+        })?;
+        process_of(inode)
+    }
+
+    pub fn udp_process_name(local: SocketAddr) -> Option<String> {
+        // A socket bound to this address wins over one bound to the wildcard.
+        let inode = UDP_TABLES
             .iter()
-            .find_map(|table| socket_inode(table, client, server))?;
+            .find_map(|table| socket_inode(table, |bound, _| super::canonical(bound) == local))
+            .or_else(|| {
+                UDP_TABLES.iter().find_map(|table| {
+                    socket_inode(table, |bound, _| super::udp_bound_to(bound, local))
+                })
+            })?;
+        process_of(inode)
+    }
+
+    fn process_of(inode: u64) -> Option<String> {
         let pid = owner_pid(inode)?;
         fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
@@ -65,9 +119,9 @@ mod platform {
             })
     }
 
-    /// The inode of the socket from `client` to `server` in one of the
-    /// `/proc/net` TCP tables.
-    fn socket_inode(table: &str, client: SocketAddr, server: SocketAddr) -> Option<u64> {
+    /// The inode of the first socket in one of the `/proc/net` tables whose
+    /// local and remote addresses `wanted` accepts.
+    fn socket_inode(table: &str, wanted: impl Fn(SocketAddr, SocketAddr) -> bool) -> Option<u64> {
         let text = fs::read_to_string(table).ok()?;
         text.lines().skip(1).find_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -76,7 +130,7 @@ mod platform {
             }
             let local = parse_socket(fields[1])?;
             let remote = parse_socket(fields[2])?;
-            if super::canonical(local) != client || super::canonical(remote) != server {
+            if !wanted(local, remote) {
                 return None;
             }
             fields[9].parse::<u64>().ok().filter(|inode| *inode != 0)
@@ -131,7 +185,7 @@ mod platform {
 
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
+        GetExtendedTcpTable, GetExtendedUdpTable, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -145,6 +199,52 @@ mod platform {
     /// `MIB_TCPROW_OWNER_PID` and `MIB_TCP6ROW_OWNER_PID` sizes.
     const ROW_V4: usize = 24;
     const ROW_V6: usize = 56;
+    /// `MIB_UDPROW_OWNER_PID` and `MIB_UDP6ROW_OWNER_PID` sizes.
+    const UDP_ROW_V4: usize = 12;
+    const UDP_ROW_V6: usize = 28;
+
+    pub fn udp_process_name(local: SocketAddr) -> Option<String> {
+        let family = if local.is_ipv4() { AF_INET } else { AF_INET6 };
+        let rows = udp_rows(family)?;
+        // A socket bound to this address wins over one bound to the wildcard.
+        let pid = rows
+            .iter()
+            .find(|(bound, _)| super::canonical(*bound) == local)
+            .or_else(|| {
+                rows.iter()
+                    .find(|(bound, _)| super::udp_bound_to(*bound, local))
+            })
+            .map(|(_, pid)| *pid)?;
+        image_name(pid)
+    }
+
+    /// Every bound UDP socket of `family` with its owning process.
+    fn udp_rows(family: u32) -> Option<Vec<(SocketAddr, u32)>> {
+        let table = owner_table(|buffer, size| {
+            // SAFETY: `buffer` has room for `*size` bytes and `size` is a
+            // valid pointer; the call writes at most that many bytes or
+            // reports the size it needs.
+            unsafe { GetExtendedUdpTable(buffer, size, 0, family, UDP_TABLE_OWNER_PID, 0) }
+        })?;
+        let count = usize::try_from(read_u32(&table, 0)?).ok()?;
+        let row_size = if family == AF_INET {
+            UDP_ROW_V4
+        } else {
+            UDP_ROW_V6
+        };
+        Some(
+            (0..count)
+                .filter_map(|index| {
+                    let row = table.get(4 + index * row_size..4 + (index + 1) * row_size)?;
+                    if family == AF_INET {
+                        Some((v4_socket(&row[0..4], &row[4..8])?, read_u32(row, 8)?))
+                    } else {
+                        Some((v6_socket(&row[0..16], &row[20..24])?, read_u32(row, 24)?))
+                    }
+                })
+                .collect(),
+        )
+    }
 
     pub fn process_name(client: SocketAddr, server: SocketAddr) -> Option<String> {
         let pid = if client.is_ipv4() {
@@ -182,23 +282,22 @@ mod platform {
     }
 
     fn tcp_table(family: u32) -> Option<Vec<u8>> {
+        owner_table(|buffer, size| {
+            // SAFETY: `buffer` has room for `*size` bytes and `size` is a
+            // valid pointer; the call writes at most that many bytes or
+            // reports the size it needs.
+            unsafe { GetExtendedTcpTable(buffer, size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0) }
+        })
+    }
+
+    /// Calls `fill` with a buffer growing to the size it asks for, at most
+    /// four times, and returns the table it wrote.
+    fn owner_table(fill: impl Fn(*mut core::ffi::c_void, *mut u32) -> u32) -> Option<Vec<u8>> {
         let mut size = 0u32;
         for _ in 0..4 {
             // u32 storage keeps the table's DWORD alignment.
             let mut buffer = vec![0u32; (size as usize).div_ceil(4)];
-            // SAFETY: `buffer` has room for `size` bytes and `size` is a valid
-            // pointer; the call writes at most `size` bytes or reports the
-            // size it needs.
-            let result = unsafe {
-                GetExtendedTcpTable(
-                    buffer.as_mut_ptr().cast(),
-                    &mut size,
-                    0,
-                    family,
-                    TCP_TABLE_OWNER_PID_ALL,
-                    0,
-                )
-            };
+            let result = fill(buffer.as_mut_ptr().cast(), &mut size);
             match result {
                 NO_ERROR => {
                     let bytes = buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
@@ -423,5 +522,21 @@ mod tests {
         let local = parse_socket("00000000000000000000000001000000:0050").unwrap();
         assert_eq!(local.to_string(), "[::1]:80");
         assert!(parse_socket("zz:1").is_none());
+    }
+
+    #[test]
+    fn udp_sockets_are_found_by_their_local_end() {
+        let own = std::env::current_exe()
+            .ok()
+            .and_then(|path| super::file_name(&path));
+        let bound = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = bound.local_addr().unwrap();
+        assert_eq!(super::udp_process_name(local), own);
+
+        // A socket on the wildcard address receives for every local address.
+        let wildcard = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        let seen = std::net::SocketAddr::from(([198, 18, 0, 1], port));
+        assert_eq!(super::udp_process_name(seen), own);
     }
 }
