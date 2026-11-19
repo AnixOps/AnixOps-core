@@ -40,6 +40,8 @@
 //! never puts credentials or traffic into errors, status or logs.
 
 pub mod capture;
+#[cfg(feature = "local-proxy")]
+pub mod checkup;
 pub mod config;
 pub mod connections;
 pub mod control;

@@ -149,7 +149,7 @@ async fn fetch_status_line(
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProbeUrl {
     pub(crate) tls: bool,
     pub(crate) host: String,
