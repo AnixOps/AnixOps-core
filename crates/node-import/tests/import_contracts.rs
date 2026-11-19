@@ -449,7 +449,10 @@ rules:
         })
     );
     // Without remote sets the key is left out.
-    let plain = text.replace("RULE-SET,listed,Proxy", "DOMAIN-SUFFIX,listed.example,Proxy");
+    let plain = text.replace(
+        "RULE-SET,listed,Proxy",
+        "DOMAIN-SUFFIX,listed.example,Proxy",
+    );
     assert!(import_text(&plain).unwrap().routing.unwrap()["rule_sets"].is_null());
 }
 
