@@ -379,7 +379,7 @@ fn reject_variants_are_policies_of_their_own() {
                 "DOMAIN,d.test,REJECT-TINYGIF",
                 // Loon's name for the same 1x1 image.
                 "DOMAIN,e.test,REJECT-IMG",
-                "FINAL,REJECT",
+                "FINAL,REJECT-DROP",
             ],
             vec![],
         ),
@@ -1824,7 +1824,7 @@ fn surge_origin_and_network_rules_match() {
                 "HOSTNAME-TYPE,IPV6,REJECT",
                 "PROTOCOL,STUN,REJECT",
                 "PROTOCOL,DOH,hk-1",
-                "FINAL,REJECT-DROP",
+                "FINAL,REJECT",
             ],
             vec![],
         ),
