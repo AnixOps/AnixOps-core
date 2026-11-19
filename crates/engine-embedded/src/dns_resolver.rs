@@ -3,7 +3,7 @@
 //! A domain target that reaches an IP rule (`IP-CIDR`, `GEOIP`) without
 //! `no-resolve` needs an address before the rule can match. The system
 //! resolver would send that name in the clear to the local network's
-//! resolver, which in a censored network both reveals the site and returns a
+//! resolver, which on a network with on-path interference both reveals the site and returns a
 //! poisoned answer, even when the connection itself then goes through the
 //! proxy. [`PolicyResolver`] asks the `dns` section instead: hosts answer
 //! locally, DNS rules pick the server, a `proxy` server is reached through

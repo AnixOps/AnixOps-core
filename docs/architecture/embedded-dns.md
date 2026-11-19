@@ -54,7 +54,7 @@
 - 主机写成 IP 时，可用 `server_name` 指定 TLS 证书名，例如 `tls://1.1.1.1` 配 `cloudflare-dns.com`。证书始终校验，没有 insecure 选项。
 - `tls://` 和 `https://` 需要 cargo feature `dns-tls`，`quic://` 需要 `dns-quic`（它包含 `dns-tls`）。默认 feature 里都已包含；不带它们构建时，这类配置会被拒绝。
 - `via` 决定怎么连到上游：
-  - `proxy`（默认）：经代理。单出站配置走该出站；规则模式下，规则为上游地址选了某个节点就走那个节点，规则给出 `DIRECT`/`REJECT`（例如 GFW 列表配置的 `FINAL,DIRECT`、国内解析器命中 `GEOIP,CN,DIRECT`）时改走全局模式的目标，不会因为规则而明文直连；全局模式走全局目标；直连模式下走直连。全局目标本身拒绝时不发查询。
+  - `proxy`（默认）：经代理。单出站配置走该出站；规则模式下，规则为上游地址选了某个节点就走那个节点，规则给出 `DIRECT`/`REJECT`（例如只把部分域名列给代理的配置的 `FINAL,DIRECT`、国内解析器命中 `GEOIP,CN,DIRECT`）时改走全局模式的目标，不会因为规则而明文直连；全局模式走全局目标；直连模式下走直连。全局目标本身拒绝时不发查询。
   - `direct`：始终直连，适合国内解析器。
   - `system` 上游始终直连，写了 `via` 也不改变。
 - 不写 `servers` 时保留旧行为：`upstream`（默认 `1.1.1.1:53`）经 TCP 走代理。这时不能写 `default`、`fallback` 和 `rules`。
@@ -129,7 +129,7 @@
 目标：不出现“在境内明文解析境外域名”的路径。三条路径的结论：
 
 1. **走代理的域名不在本地解析。** 隧道里应用先发 DNS 查询，查询按 `dns` 设置转发，默认上游 `via: proxy`；连接按嗅探到的 SNI/`Host` 匹配域名规则，连到应用拿到的地址。local proxy 收到域名时，连接以域名交给节点，由出口解析。
-   - 修复：此前 `via: proxy` 的上游按分流规则选出站，GFW 列表配置（`FINAL,DIRECT`）或把国内解析器 IP 分到 `DIRECT` 的规则会让“经代理”的查询以明文 TCP 53 直连发出，所有域名都受影响。现在规则只能把它分到某个节点，`DIRECT`/`REJECT` 一律改走全局目标（`Dispatcher::dns_outbound`、`RoutedOutbound::dns_outbound`）。
+   - 修复：此前 `via: proxy` 的上游按分流规则选出站，只把部分域名列给代理的配置（`FINAL,DIRECT`）或把国内解析器 IP 分到 `DIRECT` 的规则会让“经代理”的查询以明文 TCP 53 直连发出，所有域名都受影响。现在规则只能把它分到某个节点，`DIRECT`/`REJECT` 一律改走全局目标（`Dispatcher::dns_outbound`、`RoutedOutbound::dns_outbound`）。
 2. **IP 规则先解析时用 `dns` 设置，不用系统解析器。** 域名目标命中不带 `no-resolve` 的 `IP-CIDR`/`GEOIP` 时要先拿到地址。
    - 修复：此前这次解析用 `getaddrinfo`，本机解析器明文收到域名（例如 `GEOSITE,cn,DIRECT`、`GEOIP,cn,DIRECT`、`FINAL,Proxy` 这类常见规则下，local proxy 收到的每个境外域名都会先在本地明文解析一次）。现在用 `PolicyResolver`（`src/dns_resolver.rs`）：hosts 本地应答，DNS 规则选上游，`proxy` 上游按上一条经代理，`direct` 上游直连；结果按 TTL 缓存，最长 10 分钟、最多 1024 条。解析失败仍拒绝连接，不回落到系统解析器。连接本身仍以域名发出。
 3. **引导解析只限这些名字。** 除用户明确配置的 `system` 上游外，仍用系统解析器的只有：节点服务器地址（出站拨号、QUIC、WireGuard 端点）、`via: direct` 上游写成域名时的主机名、分到 `DIRECT` 的连接（包括 `via` 为 `DIRECT` 的远程规则集下载）。`via: proxy` 上游写成域名（如 `https://dns.google/dns-query`）时，名字随连接交给节点，不在本地解析。用户自己把境外域名分到 `DIRECT`、或把 DNS 规则指向 `direct` 上游，属于配置选择，不算泄露。

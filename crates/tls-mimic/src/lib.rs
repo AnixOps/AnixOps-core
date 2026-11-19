@@ -1,4 +1,4 @@
-//! Browser-shaped TLS for censorship-resistant outbounds.
+//! Browser-shaped TLS for outbounds that should look like ordinary browser traffic.
 //!
 //! `tls-mimic` builds ClientHello messages that match a real browser's
 //! fingerprint (cipher suites, extension set and order, GREASE, key shares,
