@@ -1112,7 +1112,7 @@ async fn run_udp_flow(
             return;
         }
     }
-    let process = flow_process(&dispatcher, move || crate::process::udp_process_name(app)).await;
+    let process = flow_process(&dispatcher, move || flow_lookup::udp(app)).await;
     let opened = {
         let open: BoxFuture<'_, io::Result<UdpFlow>> = Box::pin(async {
             let target = TargetAddr::Ip(destination);
@@ -1317,15 +1317,39 @@ async fn answer_rejected(
     }
 }
 
+/// Process lookups for tunnel flows: [`crate::process`] where the build has
+/// it (feature `local-proxy`), nothing otherwise.
+#[cfg(feature = "local-proxy")]
+mod flow_lookup {
+    pub use crate::process::{
+        process_name as tcp, udp_process_name as udp, TUNNEL_LOOKUP as ENABLED,
+    };
+}
+
+#[cfg(not(feature = "local-proxy"))]
+mod flow_lookup {
+    use std::net::SocketAddr;
+
+    pub const ENABLED: bool = false;
+
+    pub fn tcp(_app: SocketAddr, _server: SocketAddr) -> Option<String> {
+        None
+    }
+
+    pub fn udp(_app: SocketAddr) -> Option<String> {
+        None
+    }
+}
+
 /// The local process behind a tunnel flow, for `PROCESS-NAME` rules: looked
 /// up on a blocking thread with `lookup`, only where the tunnel can see the
-/// app's socket ([`crate::process::TUNNEL_LOOKUP`]) and only when a rule
+/// app's socket (`process::TUNNEL_LOOKUP`) and only when a rule
 /// needs it.
 async fn flow_process(
     dispatcher: &Dispatcher,
     lookup: impl FnOnce() -> Option<String> + Send + 'static,
 ) -> Option<String> {
-    if !crate::process::TUNNEL_LOOKUP || !dispatcher.wants_process() {
+    if !flow_lookup::ENABLED || !dispatcher.wants_process() {
         return None;
     }
     tokio::task::spawn_blocking(lookup).await.ok().flatten()
@@ -1350,7 +1374,7 @@ async fn handle_tcp(
 ) {
     // The app (or, with the tunnel as a gateway, the device) that opened
     // the flow, for SRC-IP rules; the tunnel has no listener port.
-    let inbound_app = inbound.local_addr();
+    let inbound_app = *inbound.local_addr();
     let source = FlowSource {
         address: Some(inbound_app.ip().to_canonical()),
         in_port: None,
@@ -1386,10 +1410,7 @@ async fn handle_tcp(
 
     let host = sniff::host(&first);
     let http = sniff::http_request_head(&first);
-    let process = flow_process(dispatcher, move || {
-        crate::process::process_name(inbound_app, target)
-    })
-    .await;
+    let process = flow_process(dispatcher, move || flow_lookup::tcp(inbound_app, target)).await;
     let target = TargetAddr::Ip(target);
     let origin = FlowOrigin {
         process: process.as_deref(),
