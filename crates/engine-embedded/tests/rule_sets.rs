@@ -234,15 +234,18 @@ mod remote {
         runtime.spawn(routed.clone().run_rule_set_updates());
         wait_until(|| routed.rule_sets().status()[0].updated_at_ms.is_some());
         let status = &routed.rule_sets().status()[0];
-        assert_eq!(status.entries, 2);
+        // The domain, USER-AGENT and both IP-ASN lines; SCRIPT cannot be held.
+        assert_eq!(status.entries, 4);
         assert_eq!(
             status
                 .skipped
                 .iter()
                 .map(|(kind, count)| (kind.as_str(), *count))
                 .collect::<Vec<_>>(),
-            [("IP-ASN", 2), ("SCRIPT", 1)]
+            [("SCRIPT", 1)]
         );
+        // The IP-ASN lines have no ASN data to look in, and say so.
+        assert_eq!(routed.missing_data_sets(), ["asn-13335", "asn-15169"]);
         // The USER-AGENT line inside the set turns on per-request routing.
         assert!(routed.uses_request());
         assert_eq!(
