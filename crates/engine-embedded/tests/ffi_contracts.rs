@@ -37,7 +37,7 @@ extern "C" fn count_packets(context: *mut c_void, _packet: *const u8, _len: usiz
 fn versions_match_the_swift_handshake() {
     assert_eq!(networkcore_ios_abi_version(), 1);
     assert_eq!(networkcore_ios_schema_version(), 1);
-    assert_eq!(networkcore_ios_feature_set_version(), 4);
+    assert_eq!(networkcore_ios_feature_set_version(), 5);
 }
 
 #[test]
@@ -422,6 +422,7 @@ fn header_declares_every_exported_symbol() {
         "networkcore_ios_runtime_collect_status",
         "networkcore_ios_runtime_control",
         "networkcore_ios_measure_delay",
+        "networkcore_ios_checkup",
         "networkcore_ios_mitm_inspect_plugin",
         "networkcore_ios_decode_body",
         "networkcore_ios_set_bound_interface",
@@ -629,6 +630,118 @@ fn measure_delay_maps_failures_to_stable_codes() {
         },
         NETWORKCORE_IOS_ERR_INVALID_ARGUMENT
     );
+}
+
+#[cfg(feature = "local-proxy")]
+fn checkup(config: &str, options: Option<&str>) -> (i32, Option<serde_json::Value>) {
+    let mut buffer = NetworkCoreBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    let (options_ptr, options_len) = options.map_or((ptr::null(), 0), |o| (o.as_ptr(), o.len()));
+    let code = unsafe {
+        networkcore_ios_checkup(
+            config.as_ptr(),
+            config.len(),
+            options_ptr,
+            options_len,
+            &mut buffer,
+        )
+    };
+    let report = (buffer.len > 0).then(|| {
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
+        serde_json::from_slice(bytes).unwrap()
+    });
+    unsafe { networkcore_ios_runtime_free_buffer(buffer) };
+    (code, report)
+}
+
+#[cfg(feature = "local-proxy")]
+#[test]
+fn checkup_reports_latency_through_the_outbound() {
+    let server = http_server(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    let options = format!(
+        r#"{{"samples":2,"timeout_ms":5000,"handshake_url":"http://{server}/","latency_url":"http://{server}/generate_204"}}"#
+    );
+    let (code, report) = checkup(DIRECT_CONFIG, Some(&options));
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    let latency = &report.expect("report")["latency"];
+    assert_eq!(latency["samples"], 2);
+    assert_eq!(latency["handshake_loss_pct"], 0.0);
+    assert_eq!(latency["request_loss_pct"], 0.0);
+    assert!(latency["request_ms"].is_number());
+}
+
+#[cfg(feature = "local-proxy")]
+#[test]
+fn checkup_reports_an_unreachable_node_as_loss() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let options = format!(
+        r#"{{"samples":1,"timeout_ms":2000,"handshake_url":"http://{closed}/","latency_url":"http://{closed}/"}}"#
+    );
+    let (code, report) = checkup(DIRECT_CONFIG, Some(&options));
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    let latency = &report.expect("report")["latency"];
+    assert_eq!(latency["request_loss_pct"], 100.0);
+    assert!(latency["request_ms"].is_null());
+    assert!(latency["failure"].is_string());
+}
+
+#[cfg(feature = "local-proxy")]
+#[test]
+fn checkup_maps_bad_input_to_stable_codes() {
+    for options in [
+        r#"{"samples":0}"#,
+        r#"{"unknown":1}"#,
+        r#"{"latency_url":"ftp://example.com/"}"#,
+        "not json",
+    ] {
+        assert_eq!(
+            checkup(DIRECT_CONFIG, Some(options)),
+            (NETWORKCORE_IOS_ERR_INVALID_ARGUMENT, None),
+            "{options}"
+        );
+    }
+    let long = format!(r#"{{"latency_url":"http://a.test/{}"}}"#, "a".repeat(4096));
+    assert_eq!(
+        checkup(DIRECT_CONFIG, Some(&long)).0,
+        NETWORKCORE_IOS_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        checkup("{}", None),
+        (NETWORKCORE_IOS_ERR_CONFIG_REJECTED, None)
+    );
+    let mut buffer = NetworkCoreBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    // A length without bytes.
+    let code = unsafe {
+        networkcore_ios_checkup(
+            DIRECT_CONFIG.as_ptr(),
+            DIRECT_CONFIG.len(),
+            ptr::null(),
+            4,
+            &mut buffer,
+        )
+    };
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+    unsafe { networkcore_ios_runtime_free_buffer(buffer) };
+    let code = unsafe {
+        networkcore_ios_checkup(
+            DIRECT_CONFIG.as_ptr(),
+            DIRECT_CONFIG.len(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
 }
 
 #[cfg(feature = "mitm")]

@@ -90,6 +90,7 @@ XCFramework 只能由 GitHub Actions `macos-26` runner 从同一 commit 的受�
 | `networkcore_ios_mitm_inspect_plugin` | Swift -> Rust | MITM 插件检查（feature set 3）：导入一份 Loon / Surge / Quantumult X 插件文本，JSON 写入 Rust-owned buffer：名称、支持等级、hostname、行计数与需下载的远程资源（`script` 需用户同意，`map_local_data` 下载后经 `mitm.resource_assets` 传入）；不需要 handle，主 App 导入插件时调用 |
 | `networkcore_ios_runtime_start_tunnel_batched` | Swift -> Rust | 批量写包（feature set 4）：与 `start_tunnel` 相同，但同一时刻就绪的出包（1–64 个）一次交给 `NetworkCorePacketBatchWriter`，Extension 每批只调一次 `writePackets` |
 | `networkcore_ios_runtime_input_packets` | Swift -> Rust | 批量读包（feature set 4）：一次 `readPackets` 回调的全部包在一次调用、一次加锁内入队，`out_accepted` 返回入队个数 |
+| `networkcore_ios_checkup` | Swift -> Rust | 节点体检（feature set 5）：`CheckupOptions` JSON（空为默认，最长 4096 字节）进，`CheckupReport` JSON 写入 Rust-owned buffer；延迟、可选吞吐与负载下延迟，节点不通也返回 OK 并在报告里记丢包与失败码；不需要 handle，阻塞调用线程，只由用户触发，见 `node-checkup.md` |
 
 所有 exported symbol 必须使用明确前缀 `networkcore_ios_`，避免和 Apple SDK、系统库或第三方内核冲突。所有 ABI
 struct 必须采用 C-compatible layout，字段必须固定大小、对齐和 ownership；Swift-only object layout 不得作为 ABI。

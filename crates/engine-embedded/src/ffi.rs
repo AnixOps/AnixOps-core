@@ -21,8 +21,8 @@ pub const NETWORKCORE_IOS_SCHEMA_VERSION: u32 = crate::config::CONFIG_SCHEMA_VER
 /// 2 added `networkcore_ios_runtime_control`, 3 added
 /// `networkcore_ios_mitm_inspect_plugin`, 4 added
 /// `networkcore_ios_runtime_start_tunnel_batched` and
-/// `networkcore_ios_runtime_input_packets`.
-pub const NETWORKCORE_IOS_FEATURE_SET_VERSION: u32 = 4;
+/// `networkcore_ios_runtime_input_packets`, 5 added `networkcore_ios_checkup`.
+pub const NETWORKCORE_IOS_FEATURE_SET_VERSION: u32 = 5;
 
 pub const NETWORKCORE_IOS_OK: i32 = 0;
 pub const NETWORKCORE_IOS_ERR_ARTIFACT_MISSING: i32 = 1;
@@ -50,6 +50,9 @@ const MAX_URL_LEN: usize = 2048;
 /// Longest delay test timeout accepted across the boundary.
 #[cfg(feature = "local-proxy")]
 const MAX_DELAY_TIMEOUT_MS: u32 = 60_000;
+/// Largest checkup options document accepted across the boundary.
+#[cfg(feature = "local-proxy")]
+const MAX_CHECKUP_OPTIONS_LEN: usize = 4096;
 /// Largest IP packet accepted from the TUN side.
 const MAX_PACKET_LEN: usize = 65_535;
 
@@ -473,6 +476,79 @@ pub unsafe extern "C" fn networkcore_ios_measure_delay(
             Err(DelayError::InvalidUrl) => NETWORKCORE_IOS_ERR_INVALID_ARGUMENT,
             Err(DelayError::Timeout) => NETWORKCORE_IOS_ERR_DELAY_TIMEOUT,
             Err(DelayError::Failed(_) | DelayError::NotHttp) => NETWORKCORE_IOS_ERR_DELAY_FAILED,
+        }
+    })
+}
+
+/// Node checkup (节点体检, see [`crate::checkup`]): latency, and with
+/// `throughput` set the download speed and loaded latency, of the outbound
+/// of `config`. `options` is a `CheckupOptions` JSON document (snake_case,
+/// unknown fields rejected); `options_len` 0 runs the defaults. Writes the
+/// `CheckupReport` JSON to `out`. Blocks the calling thread for the whole
+/// checkup (up to about a minute with a download); needs no runtime handle.
+/// Only the user starts it.
+///
+/// Options that are too long, not JSON, unknown or out of range return
+/// `NETWORKCORE_IOS_ERR_INVALID_ARGUMENT`; a config the engine rejects
+/// returns its config code; a node that does not answer still returns
+/// `NETWORKCORE_IOS_OK`, with the failure and loss in the report.
+///
+/// # Safety
+///
+/// `config` must point to `config_len` readable bytes, `options` to
+/// `options_len` readable bytes (it may be null when `options_len` is 0), and
+/// `out` must be a valid pointer to writable storage for one
+/// `NetworkCoreBuffer`. The buffer must be released with
+/// `networkcore_ios_runtime_free_buffer`.
+#[cfg(feature = "local-proxy")]
+#[no_mangle]
+pub unsafe extern "C" fn networkcore_ios_checkup(
+    config: *const u8,
+    config_len: usize,
+    options: *const u8,
+    options_len: usize,
+    out: *mut NetworkCoreBuffer,
+) -> i32 {
+    use crate::checkup::{run_checkup, CheckupError, CheckupOptions};
+
+    guarded(|| {
+        if out.is_null() {
+            return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: checked non-null above.
+        unsafe { out.write(NetworkCoreBuffer::from_vec(Vec::new())) };
+        if config.is_null()
+            || config_len == 0
+            || config_len > MAX_CONFIG_LEN
+            || options_len > MAX_CHECKUP_OPTIONS_LEN
+            || (options.is_null() && options_len != 0)
+        {
+            return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller guarantees `config_len` readable bytes.
+        let config = unsafe { std::slice::from_raw_parts(config, config_len) };
+        let options = if options_len == 0 {
+            CheckupOptions::default()
+        } else {
+            // SAFETY: checked non-null above; the caller guarantees `options_len` readable bytes.
+            let options = unsafe { std::slice::from_raw_parts(options, options_len) };
+            match serde_json::from_slice::<CheckupOptions>(options) {
+                Ok(options) => options,
+                Err(_) => return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT,
+            }
+        };
+        match run_checkup(config, &options) {
+            Ok(report) => match serde_json::to_vec(&report) {
+                Ok(bytes) => {
+                    // SAFETY: checked non-null above; the empty placeholder owns no memory.
+                    unsafe { out.write(NetworkCoreBuffer::from_vec(bytes)) };
+                    NETWORKCORE_IOS_OK
+                }
+                Err(_) => NETWORKCORE_IOS_ERR_INTERNAL_ERROR,
+            },
+            Err(CheckupError::Config(err)) => code_for(err.code),
+            Err(CheckupError::InvalidOptions(_)) => NETWORKCORE_IOS_ERR_INVALID_ARGUMENT,
+            Err(CheckupError::Runtime(_)) => NETWORKCORE_IOS_ERR_INTERNAL_ERROR,
         }
     })
 }
