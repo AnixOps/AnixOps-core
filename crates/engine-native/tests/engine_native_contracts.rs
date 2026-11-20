@@ -1390,6 +1390,13 @@ fn plain_http_rewrite_application_applies_header_body_and_defers_script_dispatch
     );
 }
 
+/// Script budget for tests that start a real `node`. A cold `node` start under the parallel test
+/// harness has taken over a second on hosted macOS runners, which a 1 s rule timeout turned into
+/// an unexecuted script. These tests check what the script does, not how fast `node` starts, so
+/// they give it the same headroom as the controlled TLS script test. Production defaults
+/// (`SCRIPT_RUNTIME_DEFAULT_TIMEOUT_MS`, the rule's own `timeout`) are unchanged.
+const NODE_SCRIPT_TEST_BUDGET_MS: usize = 20_000;
+
 #[test]
 fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
     let root = std::env::temp_dir().join(format!(
@@ -1415,14 +1422,14 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
         script_assets,
         persistent_store_path: Some(root.join("store.json").display().to_string()),
         sandbox: NativeNodeScriptSandbox::Unrestricted,
-        max_timeout_ms: 5000,
+        max_timeout_ms: NODE_SCRIPT_TEST_BUDGET_MS,
         max_body_bytes: 4096,
     });
     let request_dispatch = HttpMitmScriptDispatch {
         kind: HttpMitmScriptKind::Request,
         phase: HttpMitmPhase::Request,
         requires_body: true,
-        timeout_ms: 1000,
+        timeout_ms: NODE_SCRIPT_TEST_BUDGET_MS,
         max_size: 1024,
         script_path: script_url.clone(),
         tag: "runtime.request".to_string(),
@@ -1444,8 +1451,16 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
 
     let request_execution = executor.execute(&request_dispatch, &request);
 
-    assert!(request_execution.executed);
-    assert!(request_execution.applied);
+    assert!(
+        request_execution.executed,
+        "{:?}",
+        request_execution.diagnostics
+    );
+    assert!(
+        request_execution.applied,
+        "{:?}",
+        request_execution.diagnostics
+    );
     assert!(String::from_utf8(
         request_execution
             .body
@@ -1462,7 +1477,7 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
         kind: HttpMitmScriptKind::Response,
         phase: HttpMitmPhase::Response,
         requires_body: true,
-        timeout_ms: 1000,
+        timeout_ms: NODE_SCRIPT_TEST_BUDGET_MS,
         max_size: 1024,
         script_path: script_url,
         tag: "runtime.response".to_string(),
@@ -1484,7 +1499,11 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
 
     let response_execution = executor.execute(&response_dispatch, &response);
 
-    assert!(response_execution.executed);
+    assert!(
+        response_execution.executed,
+        "{:?}",
+        response_execution.diagnostics
+    );
     assert_eq!(response_execution.status_code, Some(202));
     assert!(String::from_utf8(
         response_execution
@@ -1543,7 +1562,7 @@ fn native_http_mitm_hook_applies_locally_mapped_script_dispatch() {
             script_assets,
             persistent_store_path: Some(root.join("store.json").display().to_string()),
             sandbox: NativeNodeScriptSandbox::Unrestricted,
-            max_timeout_ms: 5000,
+            max_timeout_ms: NODE_SCRIPT_TEST_BUDGET_MS,
             max_body_bytes: 4096,
         },
     ));
@@ -1562,8 +1581,8 @@ fn native_http_mitm_hook_applies_locally_mapped_script_dispatch() {
 
     let report = hook.plan_plain_http(&message);
 
-    assert!(report.applied);
-    assert!(report.script_dispatch_executed);
+    assert!(report.applied, "{:?}", report.diagnostics);
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
     assert!(!report.script_dispatch_deferred);
     assert!(!report.script_dispatch_failed);
     assert!(String::from_utf8(report.body)
@@ -5279,7 +5298,7 @@ impl MitmPluginService for ScriptDispatchingMitmPluginService {
                 kind: HttpMitmScriptKind::Request,
                 phase: HttpMitmPhase::Request,
                 requires_body: true,
-                timeout_ms: 1000,
+                timeout_ms: NODE_SCRIPT_TEST_BUDGET_MS,
                 max_size: 1024,
                 script_path: self.script_url.clone(),
                 tag: "runtime.hook".to_string(),
