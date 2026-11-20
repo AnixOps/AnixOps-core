@@ -27,7 +27,7 @@
 
 ## 后续步骤
 
-1. 客户端接入：桌面 IPC 与 iOS / Android FFI 暴露 `run_checkup`，节点详情页加“节点体检”。
+1. 客户端接入：iOS / macOS 走 C ABI `networkcore_ios_checkup`（feature set 5，JSON 进出，见 `ios-embedded-runtime-ffi-boundary-design.md`）；桌面与 Android 走 anixops-net client-core 的 `node_checkup` 命令；节点详情页加“节点体检”。
 2. 上传方向与 HTTP/3：上传需要 POST 体；HTTP/3 走节点的 UDP 中继（`TcpOutbound::open_udp`），不支持 UDP 的协议报“不支持”而不是失败。
 3. 服务可用性：用户自己提供检查规则（Speedtest 的规则格式，JSON），公开版不内置第三方服务名单（与“公开版不带预设”一致）。
 4. 出口信息：出口地址与地区沿用现有查询；出口信誉查询要访问第三方，只在用户另行打开时运行。

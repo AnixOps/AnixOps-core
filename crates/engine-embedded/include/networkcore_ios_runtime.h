@@ -10,8 +10,8 @@
  *     networkcore_ios_runtime_free_buffer.
  *   - The runtime handle is released with networkcore_ios_runtime_free_handle.
  *   - networkcore_ios_measure_delay is also linked into the containing app, which tests
- *     nodes with it without starting a tunnel; so are networkcore_ios_mitm_inspect_plugin and
- *     networkcore_ios_decode_body.
+ *     nodes with it without starting a tunnel; so are networkcore_ios_checkup,
+ *     networkcore_ios_mitm_inspect_plugin and networkcore_ios_decode_body.
  *   - The packet writer runs on the tunnel thread until stop_tunnel returns and must
  *     not call back into the library.
  */
@@ -89,6 +89,15 @@ int32_t networkcore_ios_runtime_control(NetworkCoreRuntime *handle, const uint8_
  * the node did not answer. */
 int32_t networkcore_ios_measure_delay(const uint8_t *config, size_t config_len, const uint8_t *url, size_t url_len,
                                       uint32_t timeout_ms, uint32_t *out_millis);
+/* Node checkup (feature set 5): latency, and with "throughput" set the download speed and loaded
+ * latency, of the outbound of `config`; see src/checkup.rs and docs/architecture/node-checkup.md.
+ * `options` is a CheckupOptions JSON document (snake_case, at most 4096 bytes, unknown fields
+ * rejected); options_len 0 (options may be NULL) runs the defaults. Writes the CheckupReport JSON
+ * to `out`. Blocks the calling thread for the whole checkup; needs no runtime handle; only the user
+ * starts it. Bad options return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT; a node that does not answer
+ * returns NETWORKCORE_IOS_OK with the loss and failure in the report. */
+int32_t networkcore_ios_checkup(const uint8_t *config, size_t config_len, const uint8_t *options, size_t options_len,
+                                NetworkCoreBuffer *out);
 /* MITM plugin inspection (feature set 3): imports one Loon / Surge / Quantumult X plugin text
  * (at most 1 MiB, UTF-8) and writes JSON to `out`: {"name", "level": "full|partial|unsupported",
  * "hostnames", "excluded_hostnames", "lines": {"supported", "partial", "unsupported", "deferred"},
