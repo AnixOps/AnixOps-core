@@ -85,6 +85,11 @@ jobs:
         shell: bash
         run: bash .github/scripts/verify-repository-policy.sh fast
 
+      # Neutral terminology (AnixOps-design guidelines/terminology.md); the script and word list are
+      # byte-identical copies of the AnixOps-design baseline.
+      - name: Neutral terminology
+        run: python3 .github/scripts/neutral_terms.py
+
       - name: Verify change classifier contracts
         shell: bash
         run: |
