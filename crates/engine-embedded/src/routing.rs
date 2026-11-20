@@ -347,7 +347,7 @@ pub trait DomainResolver: Send + Sync {
 
 /// The operating system resolver (`getaddrinfo`), first address returned.
 /// Only for tests and callers without a `dns` section: on a device in a
-/// censored network it sends the name in the clear to the local resolver.
+/// filtered network it sends the name in the clear to the local resolver.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemResolver;
 
@@ -1076,7 +1076,7 @@ impl RoutedOutbound {
 
     /// The outbound for a DNS server reached through the proxy: the node a
     /// rule picks for the server's address, else the global target. A rule
-    /// that sends the server DIRECT (`FINAL,DIRECT` of a GFW-list config, a
+    /// that sends the server DIRECT (`FINAL,DIRECT` of a list-based config, a
     /// GeoIP rule for a domestic resolver) or REJECT never makes a proxied
     /// query go out in the clear, and a server name is never resolved here.
     /// `None` when the global target rejects.
