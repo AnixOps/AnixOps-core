@@ -25,6 +25,7 @@
 - [Proxy Engine Adapter Interface](architecture/proxy-engine-adapter.md)
 - [规则与策略组模型（M2）](architecture/routing-policy-group-model.md)
 - [内嵌引擎 DNS：上游、hosts、按域名分流与 fake-ip](architecture/embedded-dns.md)
+- [节点体检：延迟、吞吐与负载下延迟](architecture/node-checkup.md)
 - [前置节点（`via`）与入口 → 传输 → 出口模型](architecture/outbound-via.md)
 - [出站多路复用（`multiplex`）与连接复用](architecture/outbound-multiplex.md)
 - [Pro 版开关（`engine-embedded::pro`）](architecture/pro-edition.md)
