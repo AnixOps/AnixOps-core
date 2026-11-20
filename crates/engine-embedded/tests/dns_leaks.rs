@@ -138,9 +138,9 @@ impl Outbounds {
     }
 }
 
-/// A list-only config: listed names to the proxy, everything else
+/// A list-style config: listed names to the proxy, everything else
 /// DIRECT, plus a rule that sends one DNS server to a chosen node.
-fn list_cfg(outbounds: &Outbounds) -> RoutedOutbound {
+fn listed_only(outbounds: &Outbounds) -> RoutedOutbound {
     let nodes = BTreeMap::from([
         ("hk-1".to_string(), outbounds.make("hk-1")),
         ("jp-1".to_string(), outbounds.make("jp-1")),
@@ -203,7 +203,7 @@ async fn connect_via(dispatcher: &Dispatcher, via: DnsVia, server: &TargetAddr) 
 #[test]
 fn proxied_dns_servers_never_go_direct_by_a_rule() {
     let outbounds = Outbounds::new();
-    let routed = Arc::new(list_cfg(&outbounds).with_resolver(Arc::new(NoLookups)));
+    let routed = Arc::new(listed_only(&outbounds).with_resolver(Arc::new(NoLookups)));
     let dispatcher = Dispatcher::routed(routed);
 
     runtime().block_on(async {
@@ -233,7 +233,7 @@ fn proxied_dns_servers_never_go_direct_by_a_rule() {
 #[test]
 fn proxied_names_go_out_by_name() {
     let outbounds = Outbounds::new();
-    let routed = list_cfg(&outbounds).with_resolver(Arc::new(NoLookups));
+    let routed = listed_only(&outbounds).with_resolver(Arc::new(NoLookups));
 
     runtime().block_on(async {
         let _ = routed.connect(&domain("www.blocked.example", 443)).await;
@@ -360,7 +360,7 @@ fn only_direct_servers_and_their_rule_names_go_direct() {
 
     let outbounds = Outbounds::new();
     let dispatcher = Dispatcher::routed(Arc::new(
-        list_cfg(&outbounds).with_resolver(Arc::new(NoLookups)),
+        listed_only(&outbounds).with_resolver(Arc::new(NoLookups)),
     ));
     runtime().block_on(async {
         // A proxied DoH server given by name goes to the node by name.

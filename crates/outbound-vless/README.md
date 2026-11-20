@@ -27,5 +27,5 @@ for Vision users, each datagram a big-endian `u16` length plus payload. XUDP
 
 The `reality_interop` tests are ignored by default and run in the
 `REALITY interop (Linux)` CI job against Xray-core and sing-box servers.
-Whether a given server survives real-world on-path traffic classifiers still needs manual
+Whether a given server survives real-world network interference still needs manual
 validation on real networks.
