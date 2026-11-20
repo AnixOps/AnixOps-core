@@ -1451,8 +1451,16 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
 
     let request_execution = executor.execute(&request_dispatch, &request);
 
-    assert!(request_execution.executed, "{:?}", request_execution.diagnostics);
-    assert!(request_execution.applied, "{:?}", request_execution.diagnostics);
+    assert!(
+        request_execution.executed,
+        "{:?}",
+        request_execution.diagnostics
+    );
+    assert!(
+        request_execution.applied,
+        "{:?}",
+        request_execution.diagnostics
+    );
     assert!(String::from_utf8(
         request_execution
             .body
@@ -1491,7 +1499,11 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
 
     let response_execution = executor.execute(&response_dispatch, &response);
 
-    assert!(response_execution.executed, "{:?}", response_execution.diagnostics);
+    assert!(
+        response_execution.executed,
+        "{:?}",
+        response_execution.diagnostics
+    );
     assert_eq!(response_execution.status_code, Some(202));
     assert!(String::from_utf8(
         response_execution
