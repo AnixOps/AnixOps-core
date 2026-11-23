@@ -7,7 +7,7 @@ use engine_outbound::{Dialer, TcpOutbound};
 use serde::Deserialize;
 use transport_grpc::{GrpcConnector, GrpcSettings};
 use transport_tls::{parse_sha256_pins, TlsConnector, TlsSettings};
-use transport_ws::{WsConnector, WsSettings};
+use transport_ws::{alpn_for_websocket, WsConnector, WsSettings};
 use transport_xhttp::{
     HttpVersion, Security as XhttpSecurity, XhttpConnector, XhttpSettings, XhttpTarget,
 };
@@ -102,6 +102,7 @@ impl OutboundFactory for VmessFactory {
         let security =
             Security::from_name(&settings.security).ok_or("unsupported vmess security")?;
         let grpc_transport = matches!(settings.transport, Some(TransportSettings::Grpc { .. }));
+        let ws_transport = matches!(settings.transport, Some(TransportSettings::Ws { .. }));
         // XHTTP picks HTTP/1.1 or HTTP/2 from the configured ALPN, as Xray does.
         let xhttp_version = match &settings.transport {
             Some(TransportSettings::Xhttp(_)) => Some(
@@ -118,11 +119,14 @@ impl OutboundFactory for VmessFactory {
                         .server_name
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| settings.server.clone()),
-                    // gRPC and XHTTP over HTTP/2 need ALPN `h2`.
+                    // gRPC and XHTTP over HTTP/2 need ALPN `h2`; WebSocket offers
+                    // HTTP/1.1 only.
                     alpn: if tls.alpn.is_empty()
                         && (grpc_transport || xhttp_version == Some(HttpVersion::Http2))
                     {
                         vec!["h2".to_owned()]
+                    } else if ws_transport {
+                        alpn_for_websocket(tls.alpn)
                     } else {
                         tls.alpn
                     },

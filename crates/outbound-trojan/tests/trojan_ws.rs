@@ -58,6 +58,13 @@ fn parse_request(buf: &[u8]) -> Option<(String, u16, usize)> {
 }
 
 async fn trojan_ws_server() -> (SocketAddr, Arc<Mutex<String>>) {
+    trojan_ws_server_with_alpn(Vec::new()).await
+}
+
+/// A server offering `alpn` (in its order of preference). One that
+/// negotiates `h2` behaves as an HTTP/2 server would with an HTTP/1.1
+/// request: it never answers the WebSocket upgrade.
+async fn trojan_ws_server_with_alpn(alpn: Vec<Vec<u8>>) -> (SocketAddr, Arc<Mutex<String>>) {
     let key = KeyPair::generate().unwrap();
     let cert = CertificateParams::new(vec!["trojan.test".to_string()])
         .unwrap()
@@ -73,6 +80,8 @@ async fn trojan_ws_server() -> (SocketAddr, Arc<Mutex<String>>) {
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
             )
             .unwrap();
+    let mut config = config;
+    config.alpn_protocols = alpn;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -86,6 +95,9 @@ async fn trojan_ws_server() -> (SocketAddr, Arc<Mutex<String>>) {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
+                if tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice()) {
+                    return;
+                }
                 // The callback signature is fixed by tungstenite.
                 #[allow(clippy::result_large_err)]
                 let callback = move |request: &Request,
@@ -219,4 +231,36 @@ async fn factory_builds_the_ws_transport_from_settings() {
         let bad = bad.as_object().unwrap().clone();
         assert!(registry.build("trojan", &bad, Arc::new(TcpDialer)).is_err());
     }
+}
+
+/// Share links often carry `alpn=h2,http/1.1`. A server that prefers h2
+/// would pick it and the HTTP/1.1 upgrade would fail; WebSocket must offer
+/// HTTP/1.1 only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_never_offers_h2() {
+    let echo = echo_server().await;
+    let (server, seen_path) =
+        trojan_ws_server_with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]).await;
+    let mut registry = OutboundRegistry::new();
+    registry.register(Arc::new(TrojanFactory));
+    let settings = serde_json::json!({
+        "server": server.ip().to_string(),
+        "port": server.port(),
+        "password": PASSWORD,
+        "server_name": "trojan.test",
+        "insecure": true,
+        "alpn": ["h2", "http/1.1"],
+        "transport": {"type": "ws", "path": "/alpn"},
+    });
+    let settings = settings.as_object().unwrap().clone();
+    let trojan = registry
+        .build("trojan", &settings, Arc::new(TcpDialer))
+        .unwrap();
+    let mut stream = trojan.connect(&TargetAddr::Ip(echo)).await.unwrap();
+    stream.write_all(b"alpn").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut echoed = [0u8; 4];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"alpn");
+    assert_eq!(*seen_path.lock().unwrap(), "/alpn");
 }
