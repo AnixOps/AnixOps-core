@@ -527,6 +527,56 @@ fn a_corrupt_store_file_is_set_aside_and_the_store_starts_empty() {
 }
 
 #[test]
+fn runtimes_opening_one_store_file_share_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-script-store-shared-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.json");
+    // A temporary file an older version left behind is cleaned up.
+    std::fs::write(dir.join("store.json.tmp"), b"{\"half").unwrap();
+
+    let (first, _) = script_runtime::open_script_store(&path);
+    // Another spelling of the same file, as a second runtime would open it.
+    let (second, recovery) = script_runtime::open_script_store(dir.join(".").join("store.json"));
+    assert_eq!(recovery, script_runtime::ScriptStoreRecovery::Opened);
+    assert!(first.write("a", "1"));
+    assert!(second.write("b", "2"));
+    assert_eq!(first.read("b").as_deref(), Some("2"));
+
+    // Writers on several threads never tear the file or leave temporaries.
+    std::thread::scope(|scope| {
+        for thread in 0..4 {
+            let store = if thread % 2 == 0 { &first } else { &second };
+            scope.spawn(move || {
+                for round in 0..25 {
+                    assert!(store.write(&format!("k{thread}"), &round.to_string()));
+                }
+            });
+        }
+    });
+    drop(first);
+    drop(second);
+    let reopened = script_runtime::JsonFileScriptStore::open(&path).expect("valid JSON");
+    assert_eq!(reopened.read("a").as_deref(), Some("1"));
+    assert_eq!(reopened.read("b").as_deref(), Some("2"));
+    for thread in 0..4 {
+        assert_eq!(reopened.read(&format!("k{thread}")).as_deref(), Some("24"));
+    }
+    let names = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["store.json"], "no temporary file is left behind");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn json_file_store_skips_writes_that_change_nothing() {
     let dir = std::env::temp_dir().join(format!(
         "networkcore-script-store-same-{}-{}",
