@@ -1648,3 +1648,23 @@ shadowsocks=82.47.34.99:8390, method=aes-256-gcm, password=password, tag=Plain
         &["Plain"],
     );
 }
+
+#[test]
+fn sip002_links_with_a_slash_and_encoded_keys_import_decoded() {
+    let report = import_text(
+        "ss://2022-blake3-aes-128-gcm:AAECAwQFBgcICQoLDA0ODw%3D%3D@203.0.113.20:8388/?outline=1#SS2022\n\
+         trojan://pw@trojan.example.test:443/?sni=edge.example.test#Trojan\n",
+    )
+    .unwrap();
+
+    let names: Vec<_> = report.nodes.iter().map(|node| node.name.as_str()).collect();
+    assert_eq!(names, ["SS2022", "Trojan"]);
+    let ss = &report.nodes[0];
+    assert_eq!(ss.server, "203.0.113.20");
+    assert_eq!(ss.port, 8388);
+    assert_eq!(ss.outbound["method"], "2022-blake3-aes-128-gcm");
+    assert_eq!(ss.outbound["password"], "AAECAwQFBgcICQoLDA0ODw==");
+    let trojan = &report.nodes[1];
+    assert_eq!(trojan.port, 443);
+    assert_eq!(trojan.outbound["server_name"], "edge.example.test");
+}

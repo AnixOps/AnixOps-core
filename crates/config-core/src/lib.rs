@@ -3395,6 +3395,7 @@ fn parse_iwan_link(link: &str) -> DomainResult<NodeDescriptor> {
     let (userinfo, host_port) = main_without_query
         .rsplit_once('@')
         .ok_or_else(|| invalid("iwan link must contain a login and an endpoint"))?;
+    let host_port = strip_share_link_path(host_port);
     let (username, password) = userinfo
         .split_once(':')
         .ok_or_else(|| invalid("iwan link login must be username:password"))?;
@@ -3479,6 +3480,7 @@ fn parse_anx_link(link: &str) -> DomainResult<NodeDescriptor> {
     let (user_key, host_port) = main_without_query
         .rsplit_once('@')
         .ok_or_else(|| invalid("anx link must contain a user key and an endpoint"))?;
+    let host_port = strip_share_link_path(host_port);
     let user_key = required_trimmed(
         user_key.to_string(),
         SUBSCRIPTION_ANX_LINK_INVALID_CODE,
@@ -3666,6 +3668,7 @@ fn parse_mieru_link(link: &str) -> DomainResult<NodeDescriptor> {
             "Mieru link must contain credentials and endpoint",
         )
     })?;
+    let host_port = strip_share_link_path(host_port);
     let (username, password) = userinfo.split_once(':').ok_or_else(|| {
         domain_error(
             SUBSCRIPTION_MIERU_LINK_INVALID_CODE,
@@ -3883,42 +3886,53 @@ fn parse_shadowsocks_link(link: &str) -> DomainResult<NodeDescriptor> {
             }),
     );
 
-    let decoded_main = if main_without_query.contains('@') {
-        main_without_query.to_string()
-    } else {
-        decode_base64_text(main_without_query).ok_or_else(|| {
-            domain_error(
-                SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
-                "shadowsocks link payload is not valid base64",
-            )
-        })?
+    let (credentials, host_port) = match main_without_query.rsplit_once('@') {
+        // SIP002: `ss://userinfo@host:port[/][?query]`.
+        Some((userinfo, host_port)) => (
+            shadowsocks_sip002_credentials(userinfo),
+            host_port.to_string(),
+        ),
+        // Legacy: `ss://base64(method:password@host:port)`, the credentials
+        // in plain text inside the base64.
+        None => {
+            let decoded =
+                decode_legacy_shadowsocks_payload(main_without_query).ok_or_else(|| {
+                    domain_error(
+                        SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
+                        "shadowsocks link payload is not valid base64",
+                    )
+                })?;
+            let (userinfo, host_port) = decoded.rsplit_once('@').ok_or_else(|| {
+                domain_error(
+                    SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
+                    "shadowsocks link must contain credentials and endpoint",
+                )
+            })?;
+            let credentials = decode_base64_text(userinfo).unwrap_or_else(|| userinfo.to_string());
+            let credentials = credentials
+                .split_once(':')
+                .map(|(method, password)| (method.to_string(), password.to_string()));
+            (credentials, host_port.to_string())
+        }
     };
-
-    let (userinfo, host_port) = decoded_main.rsplit_once('@').ok_or_else(|| {
-        domain_error(
-            SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
-            "shadowsocks link must contain credentials and endpoint",
-        )
-    })?;
-    let credentials = decode_base64_text(userinfo).unwrap_or_else(|| userinfo.to_string());
-    let (method, password) = credentials.split_once(':').ok_or_else(|| {
+    let (method, password) = credentials.ok_or_else(|| {
         domain_error(
             SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
             "shadowsocks credentials must contain method and password",
         )
     })?;
     let method = required_trimmed(
-        method.to_string(),
+        method,
         SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
         "shadowsocks method cannot be empty",
     )?;
     let password = required_trimmed(
-        password.to_string(),
+        password,
         SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
         "shadowsocks password cannot be empty",
     )?;
     // SIP002 puts a `/` between the port and the query (`@host:8388/?plugin=`).
-    let host_port = host_port.strip_suffix('/').unwrap_or(host_port);
+    let host_port = strip_share_link_path(&host_port);
     let (host, port) = parse_host_port_for(
         host_port,
         SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
@@ -3959,6 +3973,46 @@ fn parse_shadowsocks_link(link: &str) -> DomainResult<NodeDescriptor> {
     })
 }
 
+/// SIP002 userinfo as `(method, password)`: either `method:password`
+/// percent-encoded (required for the 2022 methods, whose base64 keys hold
+/// `+`, `/` and `=`), or base64url of `method:password`, whose `=` padding
+/// may itself be percent-encoded. `%XX` only: `+` stays `+`. A value that
+/// is not valid percent encoding (a raw `50%off`) is kept as written.
+fn shadowsocks_sip002_credentials(userinfo: &str) -> Option<(String, String)> {
+    let decode = |value: &str| percent_decode(value).unwrap_or_else(|_| value.to_string());
+    if let Some((method, password)) = userinfo.split_once(':') {
+        return Some((decode(method), decode(password)));
+    }
+    let userinfo = decode(userinfo);
+    let credentials = decode_base64_text(&userinfo).unwrap_or(userinfo);
+    let (method, password) = credentials.split_once(':')?;
+    Some((method.to_string(), password.to_string()))
+}
+
+/// Decodes a legacy `ss://base64(method:password@host:port)` payload,
+/// also when a SIP002-style `/` follows it (`ss://<base64>/?plugin=`).
+/// `/` is a base64 character, so the payload is first decoded as written
+/// and the `/` is dropped only when that does not give a usable endpoint.
+fn decode_legacy_shadowsocks_payload(payload: &str) -> Option<String> {
+    let decode = |payload: &str| {
+        decode_base64_text(payload).filter(|decoded| {
+            decoded.rsplit_once('@').is_some_and(|(_, host_port)| {
+                parse_host_port_for(
+                    strip_share_link_path(host_port),
+                    SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
+                    "shadowsocks",
+                )
+                .is_ok()
+            })
+        })
+    };
+    decode(payload)
+        .or_else(|| payload.strip_suffix('/').and_then(decode))
+        // Neither gives an endpoint: keep the decoded text so the caller
+        // reports what is wrong with it.
+        .or_else(|| decode_base64_text(payload))
+}
+
 fn parse_trojan_link(link: &str) -> DomainResult<NodeDescriptor> {
     let payload = link.strip_prefix("trojan://").ok_or_else(|| {
         domain_error(
@@ -3977,6 +4031,7 @@ fn parse_trojan_link(link: &str) -> DomainResult<NodeDescriptor> {
             "trojan link must contain password and endpoint",
         )
     })?;
+    let host_port = strip_share_link_path(host_port);
     let password = percent_decode(password).unwrap_or_else(|_| password.to_string());
     let password = required_trimmed(
         password,
@@ -4040,6 +4095,7 @@ fn parse_vless_link(link: &str) -> DomainResult<NodeDescriptor> {
             "vless link must contain uuid and endpoint",
         )
     })?;
+    let host_port = strip_share_link_path(host_port);
     let uuid = percent_decode(uuid).unwrap_or_else(|_| uuid.to_string());
     let uuid = required_trimmed(
         uuid,
@@ -4237,6 +4293,7 @@ fn parse_hysteria2_link(link: &str) -> DomainResult<NodeDescriptor> {
         payload,
         SUBSCRIPTION_HYSTERIA2_LINK_INVALID_CODE,
         "hysteria2",
+        QuicAuthority::Hysteria2,
     )?;
     let password = required_trimmed(
         parsed.userinfo.clone(),
@@ -4253,15 +4310,30 @@ fn parse_hysteria2_link(link: &str) -> DomainResult<NodeDescriptor> {
         &parsed.host,
         SUBSCRIPTION_HYSTERIA2_LINK_INVALID_CODE,
     )?;
-    if let Some(server_ports) = parsed.query.get("mport") {
-        let server_ports = normalize_hysteria2_server_port_ranges(
-            vec![server_ports.to_string()],
+    // Port hopping is written in the authority (`host:443,5000-6000`, the
+    // official URI format) or as `mport=`; both together are merged, the
+    // authority's entries first.
+    let mut server_ports: Vec<String> = parsed
+        .server_ports
+        .as_deref()
+        .into_iter()
+        .flat_map(|ports| ports.split(','))
+        .map(str::to_string)
+        .collect();
+    if let Some(mport) = parsed.query.get("mport") {
+        for range in normalize_hysteria2_server_port_ranges(
+            vec![mport.to_string()],
             SUBSCRIPTION_HYSTERIA2_LINK_INVALID_CODE,
-        )?
-        .join(",");
+        )? {
+            if !server_ports.contains(&range) {
+                server_ports.push(range);
+            }
+        }
+    }
+    if !server_ports.is_empty() {
         metadata.push(MetadataEntry {
             key: NODE_METADATA_HYSTERIA2_SERVER_PORTS.to_string(),
-            value: server_ports,
+            value: server_ports.join(","),
         });
     }
     if let Some(kind) = parsed.query.get("obfs") {
@@ -4323,7 +4395,12 @@ fn parse_tuic_link(link: &str) -> DomainResult<NodeDescriptor> {
             "tuic link must start with tuic://",
         )
     })?;
-    let parsed = parse_quic_share_link(payload, SUBSCRIPTION_TUIC_LINK_INVALID_CODE, "tuic")?;
+    let parsed = parse_quic_share_link(
+        payload,
+        SUBSCRIPTION_TUIC_LINK_INVALID_CODE,
+        "tuic",
+        QuicAuthority::HostPort,
+    )?;
     let (uuid, password) = parsed
         .userinfo
         .split_once(':')
@@ -4387,6 +4464,7 @@ fn parse_wireguard_link(link: &str) -> DomainResult<NodeDescriptor> {
         payload,
         SUBSCRIPTION_WIREGUARD_LINK_INVALID_CODE,
         "wireguard",
+        QuicAuthority::HostPort,
     )?;
     let private_key = validate_wireguard_key(
         &parsed.userinfo,
@@ -4552,14 +4630,27 @@ struct ParsedQuicShareLink {
     userinfo: String,
     host: String,
     port: u16,
+    /// Normalized port-hopping list from a Hysteria2 authority.
+    server_ports: Option<String>,
     name: Option<String>,
     query: BTreeMap<String, String>,
+}
+
+/// How a QUIC-family share link writes its `host:port`.
+#[derive(Debug, Clone, Copy)]
+enum QuicAuthority {
+    /// `host:port`, the port required.
+    HostPort,
+    /// The Hysteria2 URI format: the port defaults to 443 and may be a
+    /// port-hopping list.
+    Hysteria2,
 }
 
 fn parse_quic_share_link(
     payload: &str,
     code: &'static str,
     protocol_name: &'static str,
+    authority_format: QuicAuthority,
 ) -> DomainResult<ParsedQuicShareLink> {
     let (without_fragment, fragment) = split_once_optional(payload, '#');
     let name = fragment
@@ -4585,12 +4676,20 @@ fn parse_quic_share_link(
             format!("{protocol_name} link credentials are not valid percent encoding"),
         )
     })?;
-    let (host, port) = parse_host_port_for(host_port, code, protocol_name)?;
+    let host_port = strip_share_link_path(host_port);
+    let (host, port, server_ports) = match authority_format {
+        QuicAuthority::HostPort => {
+            let (host, port) = parse_host_port_for(host_port, code, protocol_name)?;
+            (host, port, None)
+        }
+        QuicAuthority::Hysteria2 => parse_hysteria2_authority(host_port, code)?,
+    };
     let query = parse_share_link_query(query, code, protocol_name)?;
     Ok(ParsedQuicShareLink {
         userinfo,
         host,
         port,
+        server_ports,
         name,
         query,
     })
@@ -5325,6 +5424,55 @@ fn normalize_hysteria2_packet_size(value: String, code: &'static str) -> DomainR
         ));
     }
     Ok(value.to_string())
+}
+
+/// The authority of a share link's `host:port/...` part: everything before
+/// the first `/` (`host:8388/?plugin=` in SIP002, `host/?sni=` in the
+/// Hysteria2 URI format). Call it on the part after the last `@` only:
+/// userinfo (standard base64, raw passwords, WireGuard keys) may contain
+/// `/`, an authority cannot, not even inside IPv6 brackets.
+fn strip_share_link_path(host_port: &str) -> &str {
+    host_port
+        .split_once('/')
+        .map_or(host_port, |(authority, _)| authority)
+}
+
+/// The port the Hysteria2 URI format means when the authority has none.
+const HYSTERIA2_DEFAULT_PORT: u16 = 443;
+
+/// A Hysteria2 URI authority: `host`, `host:port` or a port-hopping list
+/// `host:port,start-end,...`. Without a port it is 443. With a list the
+/// node connects to the first entry (the start of a range) and the whole
+/// list comes back normalized (`443,5000:6000`) for the server ports.
+fn parse_hysteria2_authority(
+    host_port: &str,
+    code: &'static str,
+) -> DomainResult<(String, u16, Option<String>)> {
+    let port_text = match host_port.strip_prefix('[') {
+        Some(rest) => rest
+            .split_once(']')
+            .and_then(|(_, rest)| rest.strip_prefix(':')),
+        None => host_port.rsplit_once(':').map(|(_, port)| port),
+    };
+    let Some(port_text) = port_text else {
+        // `parse_host_port_for` still rejects an empty host or an
+        // unclosed `[`.
+        let (host, port) = parse_host_port_for(
+            &format!("{host_port}:{HYSTERIA2_DEFAULT_PORT}"),
+            code,
+            "hysteria2",
+        )?;
+        return Ok((host, port, None));
+    };
+    if !port_text.contains([',', '-']) {
+        let (host, port) = parse_host_port_for(host_port, code, "hysteria2")?;
+        return Ok((host, port, None));
+    }
+    let ranges = normalize_hysteria2_server_port_ranges(vec![port_text.to_string()], code)?;
+    let port = hysteria2_server_port_range_start(&ranges[0], code)?;
+    let host_part = &host_port[..host_port.len() - port_text.len() - 1];
+    let (host, port) = parse_host_port_for(&format!("{host_part}:{port}"), code, "hysteria2")?;
+    Ok((host, port, Some(ranges.join(","))))
 }
 
 fn parse_host_port_for(

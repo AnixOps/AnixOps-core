@@ -96,6 +96,25 @@ no system DNS/TUN mutation, no daemon/control socket.
 `skipped_count`（总数）输出，没有跳过时两个键都不输出。跳过的条目没有成为节点，不像 `unsupported` 那样关闭
 `routing`；引用它们的规则和组成员按 `routing_warnings` 的既有方式跳过并告警。
 
+## 分享链接写法
+
+各分享链接解析器（`ss`、`trojan`、`vless`、`hysteria2`/`hy2`、`tuic`、`wireguard`、`mierus`、`iwan`、`anx`）
+对 `host:port` 部分的约定：
+
+- 按最后一个 `@` 切出 userinfo 之后，端点在第一个 `/` 处截断，所以 `host:port/?query`、`host:port/#name`、
+  `[v6]:port/?query`（SIP002 规范示例、Outline 的 `/?outline=1`、部分面板导出的写法）与 `host:port?query`
+  等价。截断只作用于 `@` 之后：标准 base64 的 userinfo、未编码的密码和 WireGuard 私钥里的 `/` 保持不变。
+- Hysteria2 按官方 URI 格式：省略端口（`hysteria2://auth@example.com/?sni=...`、`[v6]/?...`）时为 443；端口位置
+  的端口跳跃列表 `host:123,5000-6000` 以第一项（区间取起点）为连接端口，整份列表规范化后（`123,5000:6000`）写入
+  `hysteria2.server_ports`；同时带 `mport=` 时两者合并，authority 中的条目在前、重复项去掉。其余协议没有默认
+  端口，省略端口的链接按上一节规则只跳过该条并告警，不影响列表中的其他链接。
+- Shadowsocks SIP002 明文 userinfo（`method:password`）按 RFC 3986 做百分号解码（只解 `%XX`，`+` 不当空格），
+  所以 SS-2022 的 `2022-blake3-aes-256-gcm:YctPZ6U7xPPcU%2Bgp3u%2BOX%3D%3D` 得到 `YctPZ6U7xPPcU+gp3u+OX==`，
+  多用户的 `iPSK%3AuPSK` 得到 `iPSK:uPSK`；不含 `:` 的 userinfo 先百分号解码（处理 `%3D` 填充）再按 base64
+  解码。不是合法百分号编码的值（如未编码的 `50%off`）保持原文。旧式整段 base64 的 `ss://base64(method:password@host:port)`
+  不做百分号解码；其后跟 `/` 时先按原文解码，得不到可用端点再去掉末尾的 `/` 重试（`/` 也是 base64 字符）。
+- 已保存的导入结果不会自动更正：之前导入的 SS-2022 百分号编码链接，要刷新订阅或重新导入才会得到解码后的密钥。
+
 ## 去重和优先级
 
 节点 id 是策略引用的唯一键。订阅 catalog 接入不得静默覆盖本地配置或其他订阅节点：
