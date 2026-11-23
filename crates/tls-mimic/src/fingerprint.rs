@@ -73,11 +73,13 @@ pub enum Fingerprint {
     Edge,
     /// Desktop Firefox: no GREASE, fixed extension order, X25519MLKEM768 +
     /// X25519 + P-256 key shares (the hybrid share reuses the X25519 share's
-    /// key), delegated_credentials, record_size_limit, ECH GREASE (captured
-    /// from Firefox 160).
+    /// key), delegated_credentials, record_size_limit, ECH GREASE with the
+    /// payload as long as the padded ClientHelloInner and AES-128-GCM or
+    /// ChaCha20-Poly1305 (captured from Firefox 160).
     Firefox,
     /// Firefox ESR: the Firefox shape plus one more CBC suite and the FFDHE
-    /// groups (captured from Firefox 153 ESR).
+    /// groups, and the older rounding of the ECH GREASE inner hello
+    /// (captured from Firefox 153 ESR).
     FirefoxEsr,
 }
 
@@ -299,6 +301,181 @@ pub enum HybridX25519 {
     Shared,
 }
 
+/// HPKE AEAD identifiers (RFC 9180 §7.3) an ECH GREASE extension can name.
+pub const HPKE_AEAD_AES_128_GCM: u16 = 0x0001;
+pub const HPKE_AEAD_AES_256_GCM: u16 = 0x0002;
+pub const HPKE_AEAD_CHACHA20_POLY1305: u16 = 0x0003;
+
+/// The ECH GREASE payload lengths Chrome and Edge draw from: a 128 to 224
+/// byte ClientHelloInner in steps of 32, plus the 16-byte AEAD tag.
+pub const ECH_GREASE_DRAWN_PAYLOAD_LENGTHS: [u16; 4] = [144, 176, 208, 240];
+
+/// The server name length [`EchPayloadLength::PaddedInner`] pads to when a
+/// profile does not say (Firefox's default).
+pub const ECH_GREASE_DEFAULT_MAX_NAME_LEN: u8 = 100;
+
+/// Shortest and longest drawn ECH GREASE payload a profile may list: the
+/// payload is at least the 16-byte AEAD tag plus one byte.
+const ECH_GREASE_MIN_PAYLOAD_LEN: u16 = 17;
+const ECH_GREASE_MAX_PAYLOAD_LEN: u16 = 2048;
+
+/// Length of the AEAD tag at the end of an ECH payload; every HPKE AEAD a
+/// profile can name has a 16-byte tag.
+const ECH_AEAD_TAG_LEN: usize = 16;
+
+/// What an ECH GREASE extension looks like on the wire, beyond its fixed
+/// parts (outer variant, HKDF-SHA256, a random config id, and an
+/// encapsulated key that is a fresh X25519 public key). Browsers differ in
+/// how long the payload is and which AEAD they name, and both are visible to
+/// anyone who reads the ClientHello, so a profile says what its browser does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EchGreaseShape {
+    pub payload_length: EchPayloadLength,
+    /// HPKE AEAD identifiers; each connection names one of them, drawn
+    /// uniformly.
+    pub aeads: Vec<u16>,
+}
+
+impl Default for EchGreaseShape {
+    /// Chrome and Edge: a payload length drawn from
+    /// [`ECH_GREASE_DRAWN_PAYLOAD_LENGTHS`] and AES-128-GCM.
+    fn default() -> Self {
+        Self {
+            payload_length: EchPayloadLength::Drawn(ECH_GREASE_DRAWN_PAYLOAD_LENGTHS.to_vec()),
+            aeads: vec![HPKE_AEAD_AES_128_GCM],
+        }
+    }
+}
+
+impl EchGreaseShape {
+    fn validate(&self) -> io::Result<()> {
+        if self.aeads.is_empty() {
+            return Err(invalid_data("fingerprint has ECH GREASE without an AEAD"));
+        }
+        if self
+            .aeads
+            .iter()
+            .any(|aead| !(HPKE_AEAD_AES_128_GCM..=HPKE_AEAD_CHACHA20_POLY1305).contains(aead))
+        {
+            return Err(invalid_data(
+                "fingerprint has ECH GREASE with an unknown HPKE AEAD",
+            ));
+        }
+        match &self.payload_length {
+            EchPayloadLength::Drawn(lengths) => {
+                if lengths.is_empty() {
+                    return Err(invalid_data(
+                        "fingerprint has ECH GREASE without a payload length",
+                    ));
+                }
+                if lengths.iter().any(|length| {
+                    !(ECH_GREASE_MIN_PAYLOAD_LEN..=ECH_GREASE_MAX_PAYLOAD_LEN).contains(length)
+                }) {
+                    return Err(invalid_data(
+                        "fingerprint has an ECH GREASE payload length out of range",
+                    ));
+                }
+            }
+            EchPayloadLength::PaddedInner { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+/// How long an ECH GREASE payload is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EchPayloadLength {
+    /// One of these lengths, drawn per connection (Chrome, Edge).
+    Drawn(Vec<u16>),
+    /// The length of the ClientHelloInner the browser would have encrypted:
+    /// the outer ClientHello's TLS 1.3 part with the extensions it shares
+    /// referenced through ech_outer_extensions ([`ech_inner_len`]), the
+    /// server name padded to `max_name_len` bytes, the whole rounded up to a
+    /// multiple of 32 as `rounding` says, plus the AEAD tag (Firefox). It is
+    /// fixed for a given server name, ALPN and resumption state, so a drawn
+    /// length would differ from the browser on most connections.
+    PaddedInner {
+        max_name_len: u8,
+        rounding: EchInnerRounding,
+    },
+}
+
+/// How [`EchPayloadLength::PaddedInner`] rounds the padded ClientHelloInner
+/// up to a multiple of 32 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EchInnerRounding {
+    /// RFC 9849 §6.1.3: `31 - ((L - 1) % 32)` bytes, so a length that is
+    /// already a multiple of 32 stays as it is (Firefox 160).
+    Rfc9849,
+    /// The earlier draft rule: `31 - (L % 32)` bytes, which adds 31 bytes to a
+    /// length that is already a multiple of 32 (Firefox 153 ESR).
+    Legacy,
+}
+
+impl EchInnerRounding {
+    /// The payload length for a ClientHelloInner of `inner_len` bytes
+    /// ([`ech_inner_len`]) and a server name of `server_name_len` bytes.
+    pub fn payload_len(self, max_name_len: u8, inner_len: usize, server_name_len: usize) -> usize {
+        let name_padding = usize::from(max_name_len).saturating_sub(server_name_len);
+        let padded = inner_len + name_padding;
+        let rounding = match self {
+            EchInnerRounding::Rfc9849 => 31 - (padded.saturating_sub(1) % 32),
+            EchInnerRounding::Legacy => 31 - (padded % 32),
+        };
+        padded + rounding + ECH_AEAD_TAG_LEN
+    }
+}
+
+/// Length of the EncodedClientHelloInner a browser builds from an outer
+/// ClientHello with `cipher_suites` suites and these extensions (type and
+/// body, in any order, pre_shared_key included): legacy version, random, an
+/// empty legacy session id, the same suites, null compression; then the
+/// server name and pre_shared_key as they are, the inner ECH marker,
+/// supported_versions with TLS 1.3 only (and the outer list's GREASE value),
+/// and every other TLS 1.3 extension referenced through one
+/// ech_outer_extensions entry. Extensions only TLS 1.2 uses
+/// (extended_master_secret, renegotiation_info, ec_point_formats,
+/// session_ticket), padding and the outer ECH extension are left out.
+pub fn ech_inner_len<'a>(
+    cipher_suites: usize,
+    extensions: impl Iterator<Item = (u16, &'a [u8])>,
+) -> usize {
+    // legacy_version, random, legacy_session_id, cipher_suites,
+    // legacy_compression_methods and the extensions length field.
+    let mut len = 2 + 32 + 1 + 2 + 2 * cipher_suites + 2 + 2;
+    // encrypted_client_hello of the inner variant: one byte.
+    len += 4 + 1;
+    let mut versions = 1;
+    let mut referenced = 0;
+    for (ext_type, body) in extensions {
+        match ext_type {
+            EXT_SERVER_NAME | EXT_PRE_SHARED_KEY => len += 4 + body.len(),
+            EXT_SUPPORTED_VERSIONS => {
+                versions += body
+                    .get(1..)
+                    .unwrap_or_default()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .filter(|pair| is_grease(u16::from_be_bytes(**pair)))
+                    .count();
+            }
+            EXT_ECH
+            | EXT_PADDING
+            | EXT_EXTENDED_MASTER_SECRET
+            | EXT_RENEGOTIATION_INFO
+            | EXT_EC_POINT_FORMATS
+            | EXT_SESSION_TICKET => {}
+            _ => referenced += 1,
+        }
+    }
+    len += 4 + 1 + 2 * versions;
+    if referenced > 0 {
+        len += 4 + 1 + 2 * referenced;
+    }
+    len
+}
+
 /// ClientHello extensions in the order a fingerprint lists them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Extension {
@@ -331,7 +508,10 @@ pub enum Extension {
         code_point: u16,
         protocols: Vec<Vec<u8>>,
     },
-    EchGrease,
+    /// GREASE encrypted_client_hello (RFC 9849 §6.2): an outer ECH extension
+    /// with a fresh X25519 public key as the encapsulated key and random
+    /// bytes as the payload, shaped as the browser shapes it.
+    EchGrease(EchGreaseShape),
     /// BoringSSL-style padding: present only when the ClientHello would
     /// otherwise be 256 to 511 bytes long, and then pads it to 512.
     Padding,
@@ -367,7 +547,7 @@ impl Extension {
             Extension::SupportedVersions(_) => EXT_SUPPORTED_VERSIONS,
             Extension::CompressCertificate(_) => EXT_COMPRESS_CERTIFICATE,
             Extension::ApplicationSettings { code_point, .. } => *code_point,
-            Extension::EchGrease => EXT_ECH,
+            Extension::EchGrease(_) => EXT_ECH,
             Extension::Padding => EXT_PADDING,
             Extension::Raw { id, .. } => *id,
         })
@@ -459,6 +639,7 @@ impl ClientHelloSpec {
                 Extension::ApplicationSettings { protocols, .. } if protocols.is_empty() => {
                     return Err(invalid_data("fingerprint has ALPS without protocols"));
                 }
+                Extension::EchGrease(shape) => shape.validate()?,
                 _ => {}
             }
         }
@@ -758,10 +939,14 @@ pub fn build_from_spec_with_psk(
     }
     let sni_allowed = server_name.parse::<std::net::IpAddr>().is_err() && !server_name.is_empty();
 
-    // Everything except padding is encoded first; padding depends on the
-    // length of the rest and goes back into the slot the spec gives it.
+    // Everything except ECH GREASE and padding is encoded first. The ECH
+    // payload length can depend on the other extensions, so ECH keeps a
+    // placeholder in its slot and is filled in once they are known; padding
+    // depends on the length of all the rest and goes back into the slot the
+    // spec gives it.
     let mut encoded: Vec<(u16, Vec<u8>)> = Vec::with_capacity(extensions.len());
     let mut padding_slot = None;
+    let mut ech_slot = None;
     let mut first_grease_used = false;
     for extension in &extensions {
         match extension {
@@ -769,6 +954,11 @@ pub fn build_from_spec_with_psk(
             Extension::Alpn if alpn.is_empty() => continue,
             Extension::Padding => {
                 padding_slot = Some(encoded.len());
+                continue;
+            }
+            Extension::EchGrease(shape) => {
+                ech_slot = Some((encoded.len(), shape));
+                encoded.push((EXT_ECH, Vec::new()));
                 continue;
             }
             _ => {}
@@ -796,6 +986,23 @@ pub fn build_from_spec_with_psk(
             Code::Value(id) => *id,
         })
         .collect();
+
+    if let Some((slot, shape)) = ech_slot {
+        // The inner ClientHello a browser would build from this outer one,
+        // including a pre_shared_key it resumes with.
+        let inner_len = ech_inner_len(
+            suites.len(),
+            encoded
+                .iter()
+                .map(|(ext_type, body)| (*ext_type, body.as_slice()))
+                .chain(psk_body.as_deref().map(|body| (EXT_PRE_SHARED_KEY, body))),
+        );
+        let body = encode_ech_grease(shape, inner_len, server_name.len())?;
+        if body.len() > usize::from(u16::MAX) {
+            return Err(invalid_data("ClientHello extension too large"));
+        }
+        encoded[slot].1 = body;
+    }
 
     if let Some(slot) = padding_slot {
         // Handshake header, version, random, session id, suites, compression
@@ -1018,29 +1225,65 @@ fn encode_extension(
             }
         }
         Extension::ApplicationSettings { protocols, .. } => put_protocols(&mut out, protocols)?,
-        Extension::EchGrease => {
-            // ECHClientHello(outer) with HPKE X25519/HKDF-SHA256/AES-128-GCM
-            // and a random config id, encapsulated key and payload, matching
-            // BoringSSL's GREASE ECH.
-            const PAYLOAD_LENS: [usize; 4] = [144, 176, 208, 240];
-            let mut seed = [0u8; 2];
-            fill_random(&mut seed)?;
-            let payload_len = PAYLOAD_LENS[(seed[1] % 4) as usize];
-            out.push(0);
-            put_u16(&mut out, 0x0001);
-            put_u16(&mut out, 0x0001);
-            out.push(seed[0]);
-            let mut enc = [0u8; 32];
-            fill_random(&mut enc)?;
-            put_u16(&mut out, 32);
-            out.extend_from_slice(&enc);
-            let mut payload = vec![0u8; payload_len];
-            fill_random(&mut payload)?;
-            put_u16(&mut out, payload_len as u16);
-            out.extend_from_slice(&payload);
+        // Encoded by the caller once the other extensions are known.
+        Extension::EchGrease(_) => {
+            return Err(invalid_data(
+                "ECH GREASE is encoded after the other extensions",
+            ))
         }
     }
     Ok(out)
+}
+
+/// Body of a GREASE encrypted_client_hello extension (RFC 9849 §6.2):
+/// ECHClientHello of the outer variant with HKDF-SHA256, an AEAD drawn from
+/// the shape, a random config id, a fresh X25519 public key as the
+/// encapsulated key, and a random payload of the shape's length.
+///
+/// The encapsulated key is what a real HPKE sender would put there: browsers
+/// generate an X25519 key pair for GREASE ECH too, so the key is a canonical
+/// u-coordinate on the curve. Random bytes would have the top bit set on half
+/// of the connections and lie on the twist on half of the rest, which anyone
+/// reading the ClientHello can check. The key is not the key_share key, which
+/// would be a tell of its own.
+fn encode_ech_grease(
+    shape: &EchGreaseShape,
+    inner_len: usize,
+    server_name_len: usize,
+) -> io::Result<Vec<u8>> {
+    let payload_len = match &shape.payload_length {
+        EchPayloadLength::Drawn(lengths) => usize::from(pick(lengths)?),
+        EchPayloadLength::PaddedInner {
+            max_name_len,
+            rounding,
+        } => rounding.payload_len(*max_name_len, inner_len, server_name_len),
+    };
+    let aead = pick(&shape.aeads)?;
+    let mut config_id = [0u8; 1];
+    fill_random(&mut config_id)?;
+    let enc = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng)).to_bytes();
+    let mut payload = vec![0u8; payload_len];
+    fill_random(&mut payload)?;
+
+    let mut out = Vec::with_capacity(10 + enc.len() + payload_len);
+    out.push(0);
+    put_u16(&mut out, 0x0001);
+    put_u16(&mut out, aead);
+    out.push(config_id[0]);
+    put_u16(&mut out, enc.len() as u16);
+    out.extend_from_slice(&enc);
+    put_u16(&mut out, payload_len as u16);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// One entry of `list`, drawn uniformly.
+fn pick(list: &[u16]) -> io::Result<u16> {
+    if list.is_empty() {
+        return Err(invalid_data("nothing to draw from"));
+    }
+    let index = (random_u32()? as usize) % list.len();
+    Ok(list[index])
 }
 
 pub(crate) fn put_u16(out: &mut Vec<u8>, value: u16) {

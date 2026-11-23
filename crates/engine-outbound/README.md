@@ -20,6 +20,11 @@ It contains interfaces only, plus the default `TcpDialer`:
   default `open_udp`, which fails with `ErrorKind::Unsupported`.
   `UdpFlow::message_stream` adapts a stream that carries one datagram per
   write and read.
+- `accept`: the shared accept step of TCP serve loops (`inbound-mixed`,
+  `engine-inbound`, the node management API). Errors of one connection
+  (`ECONNABORTED`, `WSAECONNRESET`) are skipped, resource errors (`EMFILE`,
+  `ENFILE`, `ENOBUFS`, `ENOMEM`, unknown) pause 50 ms doubling to 1 s, and
+  only an unusable listener (`EINVAL`, `EBADF`, `ENOTSOCK`) ends the loop.
 
 Errors are `std::io::Error`; implementations must not put credentials in error
 messages.

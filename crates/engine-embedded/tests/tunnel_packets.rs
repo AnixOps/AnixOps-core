@@ -108,6 +108,8 @@ fn settings() -> TunnelSettings {
         tcp_window_bytes: 64 * 1024,
         max_tcp_connections: 8,
         max_udp_flows: 256,
+        tcp_evict_idle: Duration::from_secs(30),
+        udp_evict_idle: Duration::from_secs(15),
         max_dns_in_flight: 4,
         idle_timeout: Duration::from_secs(30),
         connect_timeout: Duration::from_secs(5),
@@ -1539,5 +1541,202 @@ fn dns_is_answered_on_a_multi_thread_tunnel() {
         Tunnel::start(settings, Arc::new(Redirect(start_closing_server())), sink).unwrap();
     let response = ask(&tunnel, &rx, &dns_query());
     assert!(response.ends_with(&[192, 0, 2, 7]));
+    tunnel.stop();
+}
+
+/// Sends a SYN from `app_port` to `REMOTE:80`; returns the client's ISN.
+fn tcp_syn(tunnel: &Tunnel, app_port: u16) -> u32 {
+    let client_isn: u32 = 9000;
+    let mut syn = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(app_port, 80, client_isn, 65535)
+        .syn()
+        .write(&mut syn, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&syn));
+    client_isn
+}
+
+/// Sends `payload` on an open flow from `app_port`.
+fn tcp_send(tunnel: &Tunnel, app_port: u16, seq: u32, ack: u32, payload: &[u8]) {
+    let mut data = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(app_port, 80, seq, 65535)
+        .ack(ack)
+        .psh()
+        .write(&mut data, payload)
+        .unwrap();
+    assert!(tunnel.input_packet(&data));
+}
+
+/// The tunnel's ISN from its SYN-ACK to `app_port`.
+fn syn_ack(sliced: &SlicedPacket<'_>, app_port: u16) -> Option<u32> {
+    match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.syn() && tcp.ack() && tcp.destination_port() == app_port =>
+        {
+            Some(tcp.sequence_number())
+        }
+        _ => None,
+    }
+}
+
+/// Payload the tunnel sends `app_port`, if any.
+fn tcp_payload(sliced: &SlicedPacket<'_>, app_port: u16) -> Option<Vec<u8>> {
+    match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.destination_port() == app_port && !tcp.payload().is_empty() =>
+        {
+            Some(tcp.payload().to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// Whether the tunnel closes the flow to `app_port` (FIN or RST).
+fn tcp_closed(sliced: &SlicedPacket<'_>, app_port: u16) -> bool {
+    matches!(
+        &sliced.transport,
+        Some(TransportSlice::Tcp(tcp)) if tcp.destination_port() == app_port && (tcp.fin() || tcp.rst())
+    )
+}
+
+/// Opens a relayed flow from `app_port` and checks that `payload` echoes;
+/// returns (next client sequence, next acknowledgement).
+fn echo_flow(tunnel: &Tunnel, rx: &Receiver<Vec<u8>>, app_port: u16, payload: &[u8]) -> (u32, u32) {
+    let client_isn = tcp_syn(tunnel, app_port);
+    let server_isn = wait_for(rx, |sliced| syn_ack(sliced, app_port));
+    tcp_send(
+        tunnel,
+        app_port,
+        client_isn + 1,
+        server_isn.wrapping_add(1),
+        payload,
+    );
+    let echoed = wait_for(rx, |sliced| tcp_payload(sliced, app_port));
+    assert_eq!(echoed, payload);
+    let len = payload.len() as u32;
+    let (seq, ack) = (client_isn + 1 + len, server_isn.wrapping_add(1 + len));
+    // Acknowledge the echo so the tunnel has nothing left to resend.
+    let mut packet = Vec::new();
+    PacketBuilder::ipv4(APP, REMOTE, 64)
+        .tcp(app_port, 80, seq, 65535)
+        .ack(ack)
+        .write(&mut packet, &[])
+        .unwrap();
+    assert!(tunnel.input_packet(&packet));
+    (seq, ack)
+}
+
+/// At `max_tcp_connections` a new connection takes the place of the one
+/// that has been idle longest instead of being closed at once.
+#[test]
+fn a_new_tcp_connection_at_the_limit_closes_the_idle_one() {
+    let echo = start_echo_server();
+    let (sink, rx) = capture();
+    let settings = TunnelSettings {
+        max_tcp_connections: 1,
+        tcp_evict_idle: Duration::from_millis(300),
+        ..settings()
+    };
+    let mut tunnel = Tunnel::start(settings, Arc::new(Redirect(echo)), sink).unwrap();
+
+    echo_flow(&tunnel, &rx, 41000, b"one");
+    thread::sleep(Duration::from_millis(600));
+
+    // The new flow is relayed, and the idle one is closed for it.
+    let client_isn = tcp_syn(&tunnel, 41001);
+    let mut idle_closed = false;
+    let server_isn = wait_for(&rx, |sliced| {
+        idle_closed |= tcp_closed(sliced, 41000);
+        syn_ack(sliced, 41001)
+    });
+    tcp_send(
+        &tunnel,
+        41001,
+        client_isn + 1,
+        server_isn.wrapping_add(1),
+        b"two",
+    );
+    let mut echoed = None;
+    wait_for(&rx, |sliced| {
+        idle_closed |= tcp_closed(sliced, 41000);
+        if echoed.is_none() {
+            echoed = tcp_payload(sliced, 41001);
+        }
+        (idle_closed && echoed.is_some()).then_some(())
+    });
+    assert_eq!(echoed.unwrap(), b"two");
+
+    let stats = tunnel.stats();
+    assert_eq!(stats.tcp_evicted, 1);
+    assert_eq!(stats.tcp_rejected, 0);
+    assert_eq!(stats.tcp_total, 2);
+    tunnel.stop();
+}
+
+/// A connection that carried data recently is not closed for a new one:
+/// the new one is refused.
+#[test]
+fn an_active_tcp_connection_is_not_closed_for_a_new_one() {
+    let echo = start_echo_server();
+    let (sink, rx) = capture();
+    let settings = TunnelSettings {
+        max_tcp_connections: 1,
+        tcp_evict_idle: Duration::from_secs(30),
+        ..settings()
+    };
+    let mut tunnel = Tunnel::start(settings, Arc::new(Redirect(echo)), sink).unwrap();
+
+    let (seq, ack) = echo_flow(&tunnel, &rx, 41100, b"one");
+    tcp_syn(&tunnel, 41101);
+    let deadline = Instant::now() + WAIT;
+    while tunnel.stats().tcp_rejected == 0 {
+        assert!(Instant::now() < deadline, "the new connection is refused");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(tunnel.stats().tcp_evicted, 0);
+
+    // The first connection still relays.
+    tcp_send(&tunnel, 41100, seq, ack, b"again");
+    // The unacknowledged first echo may come again before it.
+    wait_for(&rx, |sliced| {
+        tcp_payload(sliced, 41100).filter(|payload| payload.as_slice() == b"again")
+    });
+    tunnel.stop();
+}
+
+/// At `max_udp_flows` a new flow takes the place of an idle one; the
+/// active flow keeps relaying on the same flow.
+#[test]
+fn a_new_udp_flow_at_the_limit_replaces_the_idle_one() {
+    let echo = start_udp_echo_server();
+    let (sink, rx) = capture();
+    let settings = TunnelSettings {
+        max_udp_flows: 2,
+        udp_evict_idle: Duration::from_millis(300),
+        ..settings()
+    };
+    let mut tunnel = Tunnel::start(settings, Arc::new(UdpRedirect(echo)), sink).unwrap();
+
+    assert!(tunnel.input_packet(&udp_to_remote(45001, b"idle")));
+    echoed(&rx, 45001, b"idle");
+    assert!(tunnel.input_packet(&udp_to_remote(45002, b"busy")));
+    echoed(&rx, 45002, b"busy");
+    thread::sleep(Duration::from_millis(600));
+    assert!(tunnel.input_packet(&udp_to_remote(45002, b"still busy")));
+    echoed(&rx, 45002, b"still busy");
+
+    assert!(tunnel.input_packet(&udp_to_remote(45003, b"new")));
+    echoed(&rx, 45003, b"new");
+    let stats = tunnel.stats();
+    assert_eq!(stats.udp_evicted, 1);
+    assert_eq!(stats.udp_dropped, 0);
+    assert_eq!(stats.udp_flows, 3);
+
+    // The busy flow was kept: no new flow is opened for it.
+    assert!(tunnel.input_packet(&udp_to_remote(45002, b"kept")));
+    echoed(&rx, 45002, b"kept");
+    assert_eq!(tunnel.stats().udp_flows, 3);
     tunnel.stop();
 }

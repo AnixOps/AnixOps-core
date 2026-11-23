@@ -46,6 +46,24 @@ the physical default route is never touched.
 
 The physical interface of each family is recorded before the routes go in.
 The host installs an `engine_outbound::protect` socket protector that calls
-`bind_socket_to_interface` (`IP_UNICAST_IF` / `IPV6_UNICAST_IF`) so the
-engine's own sockets to proxy servers, DNS upstreams and direct destinations
-do not loop back into the adapter.
+`PhysicalInterfaceHandle::bind_socket` on `WindowsTun::physical_interface_handle`
+(`IP_UNICAST_IF` / `IPV6_UNICAST_IF`) so the engine's own sockets to proxy
+servers, DNS upstreams and direct destinations do not loop back into the
+adapter.
+
+The physical interface follows network changes while the adapter is open.
+A watcher registered with `NotifyRouteChange2` and `NotifyIpInterfaceChange`
+waits until the burst of notifications settles (0.5 s quiet, at most 3 s),
+reads the routing table (`GetIpForwardTable2`) and picks, per family, the
+connected interface with a default route (`0.0.0.0/0`, `::/0`) and the lowest
+route + interface metric, never the TUN adapter itself (its capture routes
+make `GetBestInterfaceEx` answer with the adapter). The shared handle is
+updated in place, so every socket made afterwards uses the new interface; a
+family that has lost its default route fails with `NetworkUnreachable`
+instead of looping into the adapter, and gains one again when IPv6 arrives
+later. `WindowsTun::on_physical_interface_change` runs a host callback after
+each change: the host reports it with `engine_outbound::protect::path_changed`
+(a WireGuard node moves its UDP socket) and sends the engine `reset_network`
+so connections still pinned to the old interface close and reconnect.
+`WindowsTun::refresh_physical_interface` does the same pick on demand, for a
+host that noticed a change (or a wake from sleep) itself.

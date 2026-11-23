@@ -66,6 +66,8 @@ fn share_serves_the_setup_page_and_relays_with_a_device_label() {
     // No `mitm` section: no decryption and no certificate to offer.
     assert_eq!(status["https_decryption"], false);
     assert_eq!(status["certificate"], false);
+    // Only this computer itself is kept from other devices by default.
+    assert_eq!(status["block_private_networks"], false);
     let share = share_addr(&status);
 
     // A browser that opened the share's own address.
@@ -149,5 +151,88 @@ fn share_restarts_on_a_new_port_and_reports_busy_ports() {
     // The old share was stopped before the new port was tried.
     assert!(TcpStream::connect(first).is_err());
     assert_eq!(control(&proxy, r#"{"cmd":"lan_share"}"#)["running"], false);
+    proxy.stop();
+}
+
+#[test]
+fn share_can_keep_devices_off_private_networks() {
+    let mut proxy = LocalProxy::start(DIRECT, loopback(), MixedSettings::default()).unwrap();
+    let status = control(
+        &proxy,
+        r#"{"cmd":"start_lan_share","port":0,"block_private_networks":true}"#,
+    );
+    assert_eq!(status["running"], true);
+    assert_eq!(status["block_private_networks"], true);
+    // The computer's own programs (loopback clients) are not checked.
+    let share = share_addr(&status);
+    let echo = echo_server();
+    let mut stream = TcpStream::connect(share).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    write!(stream, "CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\n").unwrap();
+    let mut established = [0u8; 39];
+    stream.read_exact(&mut established).unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection established\r\n\r\n");
+    drop(stream);
+    proxy.stop();
+}
+
+/// Answers every request with `200` and the request line it got.
+fn http_server() -> SocketAddr {
+    let listener = TcpListener::bind(loopback()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{line}",
+                    line.len()
+                );
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn plain_http_rules_see_requests_from_phones() {
+    // Plain HTTP to `blocked.test/ad` and from the `BadAgent` user agent is
+    // refused; everything else goes through the node.
+    const ROUTED: &[u8] = br#"{"schema_version":1,"profile_id":"desktop","routing":{"outbounds":{"node":{"type":"direct"}},"rules":["OR,((URL-REGEX,\"^http://blocked\\.test/ad\"),(USER-AGENT,BadAgent*)),REJECT","FINAL,node"]}}"#;
+    let mut proxy = LocalProxy::start(ROUTED, loopback(), MixedSettings::default()).unwrap();
+    let share = share_addr(&control(&proxy, r#"{"cmd":"start_lan_share","port":0}"#));
+    let origin = http_server();
+    let get = |host: &str, agent: &str| {
+        fetch(
+            share,
+            &format!(
+                "GET http://{origin}/ad HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\n\r\n"
+            ),
+        )
+    };
+
+    let allowed = get("allowed.test", "curl/8");
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    let by_url = get("blocked.test", "curl/8");
+    assert!(by_url.starts_with("HTTP/1.1 502"), "URL-REGEX: {by_url}");
+    let by_agent = get("allowed.test", "BadAgent/1.0");
+    assert!(
+        by_agent.starts_with("HTTP/1.1 502"),
+        "USER-AGENT: {by_agent}"
+    );
     proxy.stop();
 }

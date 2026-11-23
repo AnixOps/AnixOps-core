@@ -1,6 +1,10 @@
 use tls_mimic::cert::{parse_leaf, verify_signature, OID_ED25519};
 use tls_mimic::crypto::RecordCipher;
-use tls_mimic::fingerprint::{build_from_spec, is_grease, Code, Extension, HybridX25519};
+use tls_mimic::fingerprint::{
+    build_from_spec, build_from_spec_with_psk, is_grease, Code, EchGreaseShape, EchInnerRounding,
+    EchPayloadLength, Extension, HybridX25519, PskShape,
+};
+use tls_mimic::ja::{is_x25519_public_key, EchOuter};
 use tls_mimic::{
     build_client_hello, CipherSuite, ClientHelloSpec, Fingerprint, HashAlg, SESSION_ID_OFFSET,
 };
@@ -409,6 +413,254 @@ fn firefox_reuses_its_x25519_key_in_the_hybrid_share() {
             built.secrets.hybrid_x25519_public(),
             Some(built.secrets.x25519_public())
         );
+    }
+}
+
+/// The outer ECH extension of a ClientHello this crate built.
+fn ech_of(message: &[u8]) -> EchOuter {
+    tls_mimic::ja::parse_client_hello(message)
+        .unwrap()
+        .ech_outer()
+        .expect("outer ECH extension")
+}
+
+const ECH_GREASE_PROFILES: [Fingerprint; 5] = [
+    Fingerprint::Chrome,
+    Fingerprint::ChromeNoPq,
+    Fingerprint::Edge,
+    Fingerprint::Firefox,
+    Fingerprint::FirefoxEsr,
+];
+
+/// Browsers fill the GREASE ECH encapsulated key with a real X25519 public
+/// key: a canonical u-coordinate on the curve. Random bytes have the top bit
+/// set half of the time and lie on the twist half of the rest, so one
+/// ClientHello would give a forgery away.
+#[test]
+fn ech_grease_enc_is_a_fresh_x25519_public_key() {
+    for fingerprint in ECH_GREASE_PROFILES {
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            let built = build_client_hello(fingerprint, "www.example.com", None).unwrap();
+            let ech = ech_of(&built.message);
+            assert_eq!(ech.kdf, 0x0001, "{}", fingerprint.name());
+            assert_eq!(ech.enc.len(), 32, "{}", fingerprint.name());
+            assert_eq!(ech.enc[31] & 0x80, 0, "{}", fingerprint.name());
+            assert!(
+                is_x25519_public_key(&ech.enc),
+                "{}: {:02x?}",
+                fingerprint.name(),
+                ech.enc
+            );
+            // Its own key, not the key share's.
+            assert_ne!(
+                ech.enc,
+                built.secrets.x25519_public(),
+                "{}",
+                fingerprint.name()
+            );
+            assert!(!seen.contains(&ech.enc), "{}", fingerprint.name());
+            seen.push(ech.enc);
+        }
+    }
+    // Safari sends no ECH GREASE.
+    let built = build_client_hello(Fingerprint::Safari, "www.example.com", None).unwrap();
+    assert_eq!(
+        tls_mimic::ja::parse_client_hello(&built.message)
+            .unwrap()
+            .ech_outer(),
+        None
+    );
+}
+
+/// Chrome and Edge draw the payload length from 144, 176, 208 and 240 and
+/// name AES-128-GCM, as the captures under tests/data show.
+#[test]
+fn chromium_ech_grease_draws_its_payload_length() {
+    for fingerprint in [
+        Fingerprint::Chrome,
+        Fingerprint::ChromeNoPq,
+        Fingerprint::Edge,
+    ] {
+        let mut lengths = Vec::new();
+        for _ in 0..64 {
+            let built = build_client_hello(fingerprint, "www.example.com", None).unwrap();
+            let ech = ech_of(&built.message);
+            assert!(
+                [144, 176, 208, 240].contains(&ech.payload_len),
+                "{}: {}",
+                fingerprint.name(),
+                ech.payload_len
+            );
+            assert_eq!(ech.aead, 0x0001, "{}", fingerprint.name());
+            if !lengths.contains(&ech.payload_len) {
+                lengths.push(ech.payload_len);
+            }
+        }
+        assert!(lengths.len() > 1, "{}: {lengths:?}", fingerprint.name());
+    }
+}
+
+/// Firefox pads the ClientHelloInner it would encrypt (server name to 100
+/// bytes, then to a multiple of 32), so its GREASE ECH payload length is
+/// fixed for a server name: 240 bytes for Firefox 160 and 239 for Firefox
+/// 153 ESR, which rounds the older way, for every first connection to a name
+/// of up to 100 bytes (tests/data/firefox-*.hex). A drawn length would differ
+/// from the browser on most connections and could never be 239.
+#[test]
+fn firefox_ech_grease_payload_is_the_padded_inner_hello() {
+    for (fingerprint, short, long, resumed) in [
+        (Fingerprint::Firefox, 240, 304, 400),
+        (Fingerprint::FirefoxEsr, 239, 303, 399),
+    ] {
+        let name = fingerprint.name();
+        for len in 1..=100 {
+            let server_name = "a".repeat(len);
+            let built = build_client_hello(fingerprint, &server_name, None).unwrap();
+            assert_eq!(ech_of(&built.message).payload_len, short, "{name} {len}");
+        }
+        // A longer name is not padded; the inner hello is only rounded up.
+        let built = build_client_hello(fingerprint, &"a".repeat(150), None).unwrap();
+        assert_eq!(ech_of(&built.message).payload_len, long, "{name}");
+        // Resumption: the inner hello carries the pre_shared_key as well.
+        let spec = fingerprint.spec().unwrap();
+        let psk = PskShape {
+            identity: &[7u8; 100],
+            obfuscated_age: 1,
+            binder_len: 32,
+        };
+        let built = build_from_spec_with_psk(&spec, "fp.example.test", None, Some(psk)).unwrap();
+        assert_eq!(ech_of(&built.message).payload_len, resumed, "{name}");
+
+        // Firefox names AES-128-GCM or ChaCha20-Poly1305 at random.
+        let mut aeads = Vec::new();
+        for _ in 0..64 {
+            let built = build_client_hello(fingerprint, "www.example.com", None).unwrap();
+            let aead = ech_of(&built.message).aead;
+            assert!(aead == 0x0001 || aead == 0x0003, "{name}: {aead:#06x}");
+            if !aeads.contains(&aead) {
+                aeads.push(aead);
+            }
+        }
+        assert_eq!(aeads.len(), 2, "{name}");
+    }
+}
+
+fn ech_grease_of(spec: &ClientHelloSpec) -> Option<EchGreaseShape> {
+    spec.extensions
+        .iter()
+        .find_map(|extension| match extension {
+            Extension::EchGrease(shape) => Some(shape.clone()),
+            _ => None,
+        })
+}
+
+#[test]
+fn profile_json_shapes_ech_grease() {
+    // Chrome, Edge and Chrome without PQ keep the bare name, so their
+    // profiles stay readable by builds that predate the ECH keys.
+    for fingerprint in [
+        Fingerprint::Chrome,
+        Fingerprint::ChromeNoPq,
+        Fingerprint::Edge,
+    ] {
+        let spec = fingerprint.builtin_spec().unwrap();
+        assert_eq!(ech_grease_of(&spec), Some(EchGreaseShape::default()));
+        let json = spec.to_json();
+        assert!(json.contains("\"ech_grease\""), "{json}");
+        assert!(!json.contains("inner_padding") && !json.contains("payload_lengths"));
+    }
+    for (fingerprint, rounding) in [
+        (Fingerprint::Firefox, EchInnerRounding::Rfc9849),
+        (Fingerprint::FirefoxEsr, EchInnerRounding::Legacy),
+    ] {
+        let spec = fingerprint.builtin_spec().unwrap();
+        assert_eq!(
+            ech_grease_of(&spec),
+            Some(EchGreaseShape {
+                payload_length: EchPayloadLength::PaddedInner {
+                    max_name_len: 100,
+                    rounding,
+                },
+                aeads: vec![0x0001, 0x0003],
+            }),
+            "{}",
+            fingerprint.name()
+        );
+    }
+    assert_eq!(
+        Fingerprint::Safari
+            .builtin_spec()
+            .unwrap()
+            .extensions
+            .iter()
+            .filter(|e| matches!(e, Extension::EchGrease(_)))
+            .count(),
+        0
+    );
+
+    let with_ech = |ech: &str| {
+        let text = SMALL_PROFILE.replacen("\"alpn\",\n", &format!("\"alpn\",\n    {ech},\n"), 1);
+        assert!(text.contains(ech), "{ech}");
+        ClientHelloSpec::from_json(&text)
+    };
+    let bare = with_ech("\"ech_grease\"").unwrap();
+    assert_eq!(ech_grease_of(&bare), Some(EchGreaseShape::default()));
+    let drawn = with_ech(
+        "{ \"type\": \"ech_grease\", \"payload_lengths\": [176, \"0x00f0\"], \"aeads\": [\"0x0003\"] }",
+    )
+    .unwrap();
+    assert_eq!(
+        ech_grease_of(&drawn),
+        Some(EchGreaseShape {
+            payload_length: EchPayloadLength::Drawn(vec![176, 240]),
+            aeads: vec![0x0003],
+        })
+    );
+    let padded =
+        with_ech("{ \"type\": \"ech_grease\", \"inner_padding\": { \"rounding\": \"legacy\" } }")
+            .unwrap();
+    assert_eq!(
+        ech_grease_of(&padded),
+        Some(EchGreaseShape {
+            payload_length: EchPayloadLength::PaddedInner {
+                max_name_len: 100,
+                rounding: EchInnerRounding::Legacy,
+            },
+            aeads: vec![0x0001],
+        })
+    );
+    for spec in [&bare, &drawn, &padded] {
+        assert_eq!(&ClientHelloSpec::from_json(&spec.to_json()).unwrap(), spec);
+    }
+    // The shape decides what goes on the wire.
+    for _ in 0..16 {
+        let ech = ech_of(
+            &build_from_spec(&drawn, "example.com", None)
+                .unwrap()
+                .message,
+        );
+        assert!(ech.payload_len == 176 || ech.payload_len == 240);
+        assert_eq!(ech.aead, 0x0003);
+    }
+
+    for bad in [
+        // both length rules, an unknown rounding, an unknown key
+        "{ \"type\": \"ech_grease\", \"payload_lengths\": [144], \"inner_padding\": { \"rounding\": \"legacy\" } }",
+        "{ \"type\": \"ech_grease\", \"inner_padding\": { \"rounding\": \"round\" } }",
+        "{ \"type\": \"ech_grease\", \"inner_padding\": { \"rounding\": \"legacy\", \"x\": 1 } }",
+        "{ \"type\": \"ech_grease\", \"inner_padding\": { \"max_name_len\": 100 } }",
+        "{ \"type\": \"ech_grease\", \"inner_padding\": { \"max_name_len\": 256, \"rounding\": \"legacy\" } }",
+        "{ \"type\": \"ech_grease\", \"padding\": 1 }",
+        // lengths and AEADs this client cannot or should not send
+        "{ \"type\": \"ech_grease\", \"payload_lengths\": [] }",
+        "{ \"type\": \"ech_grease\", \"payload_lengths\": [16] }",
+        "{ \"type\": \"ech_grease\", \"payload_lengths\": [4096] }",
+        "{ \"type\": \"ech_grease\", \"aeads\": [] }",
+        "{ \"type\": \"ech_grease\", \"aeads\": [\"0x0004\"] }",
+        "{ \"type\": \"ech_grease\", \"aeads\": [\"0xffff\"] }",
+    ] {
+        assert!(with_ech(bad).is_err(), "{bad}");
     }
 }
 

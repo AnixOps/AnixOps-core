@@ -24,8 +24,9 @@ use ring::digest;
 
 use crate::crypto::invalid_data;
 use crate::fingerprint::{
-    is_grease, ClientHelloSpec, Code, Extension, HybridX25519, GROUP_X25519, GROUP_X25519_MLKEM768,
-    MLKEM768_ENCAPSULATION_KEY_LEN,
+    ech_inner_len, is_grease, ClientHelloSpec, Code, EchGreaseShape, EchInnerRounding,
+    EchPayloadLength, Extension, HybridX25519, ECH_GREASE_DEFAULT_MAX_NAME_LEN, GROUP_X25519,
+    GROUP_X25519_MLKEM768, MLKEM768_ENCAPSULATION_KEY_LEN,
 };
 
 const EXT_SERVER_NAME: u16 = 0x0000;
@@ -55,6 +56,18 @@ pub struct Hello {
     pub cipher_suites: Vec<u16>,
     /// Extensions in wire order with their bodies.
     pub extensions: Vec<(u16, Vec<u8>)>,
+}
+
+/// The visible fields of an outer encrypted_client_hello extension (real
+/// or GREASE, the two look alike by design).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EchOuter {
+    pub kdf: u16,
+    pub aead: u16,
+    pub config_id: u8,
+    /// The HPKE encapsulated key; for X25519 a public key.
+    pub enc: Vec<u8>,
+    pub payload_len: u16,
 }
 
 struct Reader<'a> {
@@ -247,6 +260,38 @@ impl Hello {
         })
     }
 
+    /// The outer encrypted_client_hello extension, `None` when there is none
+    /// or it is not the outer variant.
+    pub fn ech_outer(&self) -> Option<EchOuter> {
+        let mut body = Reader {
+            data: self.extension(EXT_ECH)?,
+        };
+        if body.u8().ok()? != 0 {
+            return None;
+        }
+        let kdf = body.u16().ok()?;
+        let aead = body.u16().ok()?;
+        let config_id = body.u8().ok()?;
+        let enc_len = usize::from(body.u16().ok()?);
+        let enc = body.take(enc_len).ok()?.to_vec();
+        let payload_len = body.u16().ok()?;
+        body.take(usize::from(payload_len)).ok()?;
+        body.data.is_empty().then_some(EchOuter {
+            kdf,
+            aead,
+            config_id,
+            enc,
+            payload_len,
+        })
+    }
+
+    /// Whether the ClientHello uses GREASE anywhere a fingerprint records it
+    /// (cipher suites or extension types).
+    fn uses_grease(&self) -> bool {
+        self.cipher_suites.iter().any(|suite| is_grease(*suite))
+            || self.extensions.iter().any(|(id, _)| is_grease(*id))
+    }
+
     fn groups(&self) -> Vec<u16> {
         self.extension(EXT_SUPPORTED_GROUPS)
             .map(|body| u16_list(body, 2))
@@ -414,8 +459,10 @@ fn codes(values: &[u16]) -> Vec<Code> {
 /// reuses the X25519 share's key ([`Hello::hybrid_x25519`]), the server name
 /// and ALPN come from the connection, ECH and padding become the generated
 /// extensions, a pre_shared_key (resumption) is dropped, and any extension
-/// this crate has no name for is kept as `raw`. Whether the browser permutes
-/// its extensions cannot be seen in one capture, so the caller says.
+/// this crate has no name for is kept as `raw`. ECH GREASE keeps the
+/// capture's AEAD and the payload length rule that explains it
+/// ([`ech_grease_from_hello`]). Whether the browser permutes its extensions
+/// cannot be seen in one capture, so the caller says.
 pub fn spec_from_hello(hello: &Hello, permute_extensions: bool) -> io::Result<ClientHelloSpec> {
     let mut extensions = Vec::with_capacity(hello.extensions.len());
     for (ext_type, body) in &hello.extensions {
@@ -465,7 +512,7 @@ pub fn spec_from_hello(hello: &Hello, permute_extensions: bool) -> io::Result<Cl
                     protocols,
                 }
             }
-            EXT_ECH => Extension::EchGrease,
+            EXT_ECH => Extension::EchGrease(ech_grease_from_hello(hello)),
             EXT_PADDING => Extension::Padding,
             EXT_PRE_SHARED_KEY => continue,
             id => Extension::Raw {
@@ -483,6 +530,187 @@ pub fn spec_from_hello(hello: &Hello, permute_extensions: bool) -> io::Result<Cl
     };
     spec.validate()?;
     Ok(spec)
+}
+
+/// The ECH GREASE shape that explains a captured outer ECH extension. One
+/// capture shows one AEAD, so the shape names that one. For the payload
+/// length it tries the rule of the browser family the ClientHello looks like
+/// first (one that uses GREASE draws its length, as Chrome does; one without
+/// pads the inner ClientHello, as Firefox does), then the other, and keeps
+/// the captured length as the only one to draw when neither explains it.
+pub fn ech_grease_from_hello(hello: &Hello) -> EchGreaseShape {
+    let default = EchGreaseShape::default();
+    let Some(ech) = hello.ech_outer() else {
+        return default;
+    };
+    let aeads = vec![ech.aead];
+    let drawn = match &default.payload_length {
+        EchPayloadLength::Drawn(lengths) if lengths.contains(&ech.payload_len) => {
+            Some(default.payload_length.clone())
+        }
+        _ => None,
+    };
+    let padded = hello.server_name().and_then(|name| {
+        let inner_len = ech_inner_len(
+            hello.cipher_suites.len(),
+            hello
+                .extensions
+                .iter()
+                .map(|(ext_type, body)| (*ext_type, body.as_slice())),
+        );
+        [EchInnerRounding::Rfc9849, EchInnerRounding::Legacy]
+            .into_iter()
+            .find(|rounding| {
+                rounding.payload_len(ECH_GREASE_DEFAULT_MAX_NAME_LEN, inner_len, name.len())
+                    == usize::from(ech.payload_len)
+            })
+            .map(|rounding| EchPayloadLength::PaddedInner {
+                max_name_len: ECH_GREASE_DEFAULT_MAX_NAME_LEN,
+                rounding,
+            })
+    });
+    let payload_length = if hello.uses_grease() {
+        drawn.or(padded)
+    } else {
+        padded.or(drawn)
+    }
+    .unwrap_or_else(|| EchPayloadLength::Drawn(vec![ech.payload_len]));
+    EchGreaseShape {
+        payload_length,
+        aeads,
+    }
+}
+
+/// Whether `bytes` is an X25519 public key as a key pair generator produces
+/// it (RFC 7748): 32 bytes, a canonical little-endian u-coordinate below
+/// 2^255 - 19, on Curve25519 rather than its quadratic twist, that is
+/// u^3 + 486662 u^2 + u is a square modulo p. Browsers' GREASE ECH keys are;
+/// 32 random bytes are not, three times out of four.
+pub fn is_x25519_public_key(bytes: &[u8]) -> bool {
+    let Ok(bytes) = <[u8; 32]>::try_from(bytes) else {
+        return false;
+    };
+    if bytes[31] & 0x80 != 0 {
+        return false;
+    }
+    let mut u = [0u64; 4];
+    for (limb, chunk) in u.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *limb = u64::from_le_bytes(*chunk);
+    }
+    if field::at_least_p(&u) {
+        return false;
+    }
+    let u_squared = field::mul(&u, &u);
+    let a_u = field::mul(&[486662, 0, 0, 0], &u);
+    let sum = field::add(&field::add(&u_squared, &a_u), &[1, 0, 0, 0]);
+    let rhs = field::mul(&u, &sum);
+    // Euler's criterion: rhs^((p - 1) / 2) is 1 for a nonzero square, 0 for
+    // zero and p - 1 otherwise.
+    let symbol = field::canonical(field::pow(&rhs, &field::HALF_P_MINUS_ONE));
+    symbol == [0, 0, 0, 0] || symbol == [1, 0, 0, 0]
+}
+
+/// Arithmetic modulo p = 2^255 - 19 on four little-endian 64-bit limbs, only
+/// for [`is_x25519_public_key`]: values stay below 2^256 and are reduced to
+/// their canonical form at the end. Not constant time; it only looks at
+/// public keys.
+mod field {
+    pub(super) type Limbs = [u64; 4];
+
+    const P: Limbs = [
+        0xffff_ffff_ffff_ffed,
+        u64::MAX,
+        u64::MAX,
+        0x7fff_ffff_ffff_ffff,
+    ];
+    /// (p - 1) / 2 = 2^254 - 10.
+    pub(super) const HALF_P_MINUS_ONE: Limbs = [
+        0xffff_ffff_ffff_fff6,
+        u64::MAX,
+        u64::MAX,
+        0x3fff_ffff_ffff_ffff,
+    ];
+
+    /// Adds `carry` * 2^256 back in as `carry` * 38 (2^256 = 38 mod p).
+    fn fold(mut value: Limbs, mut carry: u128) -> Limbs {
+        while carry != 0 {
+            let mut next = carry * 38;
+            for limb in value.iter_mut() {
+                let sum = u128::from(*limb) + next;
+                *limb = sum as u64;
+                next = sum >> 64;
+            }
+            carry = next;
+        }
+        value
+    }
+
+    pub(super) fn add(a: &Limbs, b: &Limbs) -> Limbs {
+        let mut sum = [0u64; 4];
+        let mut carry = 0u128;
+        for i in 0..4 {
+            let total = u128::from(a[i]) + u128::from(b[i]) + carry;
+            sum[i] = total as u64;
+            carry = total >> 64;
+        }
+        fold(sum, carry)
+    }
+
+    pub(super) fn mul(a: &Limbs, b: &Limbs) -> Limbs {
+        let mut wide = [0u64; 8];
+        for i in 0..4 {
+            let mut carry = 0u128;
+            for j in 0..4 {
+                let total = u128::from(wide[i + j]) + u128::from(a[i]) * u128::from(b[j]) + carry;
+                wide[i + j] = total as u64;
+                carry = total >> 64;
+            }
+            wide[i + 4] = carry as u64;
+        }
+        let mut low = [0u64; 4];
+        let mut carry = 0u128;
+        for i in 0..4 {
+            let total = u128::from(wide[i]) + u128::from(wide[i + 4]) * 38 + carry;
+            low[i] = total as u64;
+            carry = total >> 64;
+        }
+        fold(low, carry)
+    }
+
+    pub(super) fn pow(base: &Limbs, exponent: &Limbs) -> Limbs {
+        let mut result = [1, 0, 0, 0];
+        for limb in exponent.iter().rev() {
+            for bit in (0..64).rev() {
+                result = mul(&result, &result);
+                if (limb >> bit) & 1 == 1 {
+                    result = mul(&result, base);
+                }
+            }
+        }
+        result
+    }
+
+    pub(super) fn at_least_p(value: &Limbs) -> bool {
+        for i in (0..4).rev() {
+            if value[i] != P[i] {
+                return value[i] > P[i];
+            }
+        }
+        true
+    }
+
+    pub(super) fn canonical(mut value: Limbs) -> Limbs {
+        while at_least_p(&value) {
+            let mut borrow = 0u64;
+            for i in 0..4 {
+                let (difference, under) = value[i].overflowing_sub(P[i]);
+                let (difference, under_again) = difference.overflowing_sub(borrow);
+                value[i] = difference;
+                borrow = u64::from(under || under_again);
+            }
+        }
+        value
+    }
 }
 
 /// MD5 (RFC 1321), only for JA3; nothing here depends on its security.
@@ -554,6 +782,55 @@ mod tests {
             ),
             "57edf4a22be3c955ac49da2e2107b67a"
         );
+    }
+
+    fn u_coordinate(value: u64) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn x25519_public_keys_are_told_from_random_bytes() {
+        // u = 9 is the base point and 4, 6, 7, 8 are on the curve; 2, 3 and 5
+        // are on the twist (u^3 + 486662 u^2 + u is not a square).
+        for on_curve in [0, 1, 4, 6, 7, 8, 9, 10, 11] {
+            assert!(is_x25519_public_key(&u_coordinate(on_curve)), "{on_curve}");
+        }
+        for on_twist in [2, 3, 5] {
+            assert!(!is_x25519_public_key(&u_coordinate(on_twist)), "{on_twist}");
+        }
+        // Not canonical: p itself, anything with the top bit set, a wrong length.
+        let mut p = [0xffu8; 32];
+        p[0] = 0xed;
+        p[31] = 0x7f;
+        assert!(!is_x25519_public_key(&p));
+        let mut top_bit = u_coordinate(9);
+        top_bit[31] |= 0x80;
+        assert!(!is_x25519_public_key(&top_bit));
+        assert!(!is_x25519_public_key(&[9u8; 31]));
+        // Public keys a key pair generator made.
+        for _ in 0..32 {
+            let secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+            let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+            assert!(is_x25519_public_key(&public));
+        }
+        // And the encapsulated keys of the committed browser captures.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        let mut keys = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "hex") {
+                continue;
+            }
+            let capture = std::fs::read_to_string(&path).unwrap();
+            let hello = parse_client_hello(&decode_hex(&capture).unwrap()).unwrap();
+            if let Some(ech) = hello.ech_outer() {
+                assert!(is_x25519_public_key(&ech.enc), "{}", path.display());
+                keys += 1;
+            }
+        }
+        assert!(keys >= 4, "{keys}");
     }
 
     /// The ClientHello of the JA4 reference implementation's README example

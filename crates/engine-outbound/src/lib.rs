@@ -15,6 +15,7 @@
 //! Errors are plain [`std::io::Error`] values. Implementations must keep
 //! credentials (UUIDs, passwords, private keys) out of error messages.
 
+pub mod accept;
 pub mod mux;
 pub mod protect;
 pub mod quic_sniff;

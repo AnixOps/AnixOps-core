@@ -10,7 +10,8 @@ Fingerprints:
 - `Fingerprint::Chrome` (default): desktop Chrome shape with GREASE cipher,
   group, version, signature scheme and extension values, per-connection
   permutation of all non-GREASE extensions, `X25519MLKEM768` + `X25519` key
-  shares with an X25519 key each, ECH GREASE (`0xfe0d`), ALPS on the new code
+  shares with an X25519 key each, ECH GREASE (`0xfe0d`, payload length drawn
+  from 144, 176, 208 and 240, AES-128-GCM), ALPS on the new code
   point (`0x44cd`), brotli certificate compression offer, the `0xca34`
   extension Chrome 157 stable sends (as captured), and ALPN `h2`, `http/1.1`.
 - `Fingerprint::ChromeNoPq`: the same without the post-quantum hybrid group
@@ -22,9 +23,15 @@ Fingerprints:
   extension order, `X25519MLKEM768` + `X25519` + `P-256` key shares (the
   hybrid share ends with the X25519 share's key, as Firefox sends it),
   delegated_credentials and record_size_limit, zlib/brotli/zstd certificate
-  compression offer, ECH GREASE last.
+  compression offer, ECH GREASE last with the payload as long as the
+  ClientHelloInner Firefox pads (server name to 100 bytes, then RFC 9849
+  rounding to a multiple of 32, plus the AEAD tag: 240 bytes for a first
+  connection to a name of up to 100 bytes) and AES-128-GCM or
+  ChaCha20-Poly1305 at random.
 - `Fingerprint::FirefoxEsr` (`firefox-esr`): Firefox 153 ESR, the Firefox
-  shape plus the `0xc00a` suite and the FFDHE groups.
+  shape plus the `0xc00a` suite and the FFDHE groups; its ECH GREASE inner
+  hello is rounded the older way (`31 - (L % 32)`), so the payload is 239
+  bytes where Firefox 160 sends 240.
 - `Fingerprint::Safari`: Safari and every other client of Apple's network
   stack (NSURLSession) on iOS and macOS, taken from Safari 26.6.2 on macOS
   26.7.2: its own cipher order (with the CBC and 3DES suites), a fixed
@@ -37,7 +44,14 @@ Every fingerprint is checked against its browser by JA4, JA3N (JA3 with the
 extensions sorted), for browsers that do not permute extensions JA3
 (`tls_mimic::ja`), and by whether the `X25519MLKEM768` share ends with the
 `X25519` share's key (`Hello::hybrid_x25519`), which JA3 and JA4 do not see
-but anyone who reads the ClientHello can compare.
+but anyone who reads the ClientHello can compare. The ECH GREASE extension is
+checked too: its AEAD and payload length must be ones the profile produces
+for that ClientHello, and where nothing in the profile's ClientHello length is
+drawn at random (Firefox, Safari) the whole length must equal the browser's.
+The encapsulated key of every ECH GREASE extension is a fresh X25519 public
+key (a canonical point on the curve, as browsers send it, never the key
+share's key); random bytes would give a forgery away on three connections out
+of four (`ja::is_x25519_public_key`).
 `tests/browser_fingerprints.rs` compares the captures committed under
 `tests/data/` on every test run;
 `.github/workflows/browser-fingerprints.yml` captures current Chrome, Edge,
@@ -59,7 +73,11 @@ BoringSSL-style `padding`, `raw` for an extension with a fixed body that
 this crate has no name for, and on `key_share` whether the `X25519MLKEM768`
 share reuses the `X25519` share's key: `"hybrid_x25519": "shared"` as in
 Firefox, or the default `"separate"`, a key of its own, as in Chrome, Edge
-and Safari). `install_profiles` replaces them for the process with a
+and Safari; and on `ech_grease` the payload length rule and the AEADs:
+`"payload_lengths"` drawn per connection, or `"inner_padding"` with
+`"max_name_len"` and `"rounding"` (`"rfc9849"` or `"legacy"`) computed from
+the ClientHelloInner as Firefox does, and `"aeads"`; the bare
+`"ech_grease"` is the Chrome and Edge shape). `install_profiles` replaces them for the process with a
 delivered bundle:
 
 ```json
@@ -77,7 +95,10 @@ runtime config) are the delivery points. `hybrid_x25519` is written only when
 it is `"shared"`, so only Firefox profiles carry it; builds from before the
 key reject a bundle that has it, and a Firefox profile written for them
 (without the key) gets a key of its own on newer builds, so a bundle with a
-Firefox profile has to be made for the builds it goes to.
+Firefox profile has to be made for the builds it goes to. The same holds for
+the `ech_grease` parameters: they are written only when they differ from the
+Chrome and Edge shape, so only Firefox profiles carry them, and builds from
+before them reject a bundle that has them.
 
 The client supports only what these protocols need: TLS 1.3 full handshakes
 and resumption with a session ticket the caller offers (`connect_resuming`,

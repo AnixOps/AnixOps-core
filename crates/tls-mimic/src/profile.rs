@@ -32,12 +32,34 @@
 //! its own (Chrome, Edge, Safari); it is left out when a profile is written,
 //! so such profiles stay readable by builds that predate the key. Those
 //! builds reject a profile that has it, and with it the whole bundle.
+//!
+//! `ech_grease` takes how long the payload is and which HPKE AEADs it may
+//! name. The bare `"ech_grease"` is the Chrome and Edge shape: a length drawn
+//! from 144, 176, 208 and 240, and AES-128-GCM (`0x0001`). Otherwise:
+//!
+//! ```json
+//! { "type": "ech_grease", "payload_lengths": [144, 176, 208, 240], "aeads": ["0x0001"] }
+//! { "type": "ech_grease", "inner_padding": { "max_name_len": 100, "rounding": "rfc9849" },
+//!   "aeads": ["0x0001", "0x0003"] }
+//! ```
+//!
+//! `payload_lengths` lists lengths drawn per connection; `inner_padding`
+//! computes the length from the ClientHelloInner the browser would encrypt
+//! (Firefox; `rounding` is `"rfc9849"` or `"legacy"`, `max_name_len`
+//! defaults to 100); the two exclude each other. `aeads` (default
+//! `["0x0001"]`) is drawn per connection. The default shape is written as the
+//! bare name, so Chrome and Edge profiles stay readable by builds that
+//! predate these keys; those builds reject a profile that has them, and with
+//! it the whole bundle.
 
 use std::io;
 
 use serde_json::{json, Map, Value};
 
-use crate::fingerprint::{ClientHelloSpec, Code, Extension, HybridX25519};
+use crate::fingerprint::{
+    ClientHelloSpec, Code, EchGreaseShape, EchInnerRounding, EchPayloadLength, Extension,
+    HybridX25519, ECH_GREASE_DEFAULT_MAX_NAME_LEN,
+};
 
 /// Largest profile or bundle document accepted.
 pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
@@ -232,6 +254,62 @@ fn parse_hybrid_x25519(value: &Value, what: &str) -> io::Result<HybridX25519> {
     }
 }
 
+fn parse_inner_rounding(value: &Value, what: &str) -> io::Result<EchInnerRounding> {
+    match value.as_str() {
+        Some("rfc9849") => Ok(EchInnerRounding::Rfc9849),
+        Some("legacy") => Ok(EchInnerRounding::Legacy),
+        _ => Err(bad(format!(
+            "{what}: rounding must be \"rfc9849\" or \"legacy\", got {value}"
+        ))),
+    }
+}
+
+fn parse_inner_padding(value: &Value, what: &str) -> io::Result<EchPayloadLength> {
+    let mut fields = Fields::new(value, "ech_grease inner_padding")?;
+    let max_name_len = match fields.take("max_name_len") {
+        None => ECH_GREASE_DEFAULT_MAX_NAME_LEN,
+        Some(value) => value
+            .as_u64()
+            .and_then(|len| u8::try_from(len).ok())
+            .ok_or_else(|| {
+                bad(format!(
+                    "{what}: max_name_len must be 0 to 255, got {value}"
+                ))
+            })?,
+    };
+    let rounding = parse_inner_rounding(fields.require("rounding")?, what)?;
+    fields.finish()?;
+    Ok(EchPayloadLength::PaddedInner {
+        max_name_len,
+        rounding,
+    })
+}
+
+/// The parameters of `ech_grease`; the bare name is the default shape.
+fn parse_ech_grease(fields: &mut Option<Fields<'_>>, what: &str) -> io::Result<EchGreaseShape> {
+    let default = EchGreaseShape::default();
+    let lengths = param(fields, what, "payload_lengths").ok();
+    let inner = param(fields, what, "inner_padding").ok();
+    let payload_length = match (lengths, inner) {
+        (Some(_), Some(_)) => {
+            return Err(bad(format!(
+                "{what}: payload_lengths and inner_padding exclude each other"
+            )))
+        }
+        (Some(lengths), None) => EchPayloadLength::Drawn(parse_u16s(lengths, what)?),
+        (None, Some(inner)) => parse_inner_padding(inner, what)?,
+        (None, None) => default.payload_length,
+    };
+    let aeads = match param(fields, what, "aeads") {
+        Ok(aeads) => parse_u16s(aeads, what)?,
+        Err(_) => default.aeads,
+    };
+    Ok(EchGreaseShape {
+        payload_length,
+        aeads,
+    })
+}
+
 /// Looks up one parameter of an extension; a bare string has none.
 fn param<'a>(
     fields: &mut Option<Fields<'a>>,
@@ -304,7 +382,7 @@ fn parse_extension(value: &Value) -> io::Result<Extension> {
             code_point: parse_u16(param(&mut fields, &what, "code_point")?, &what)?,
             protocols: parse_names(param(&mut fields, &what, "protocols")?, &what)?,
         },
-        "ech_grease" => Extension::EchGrease,
+        "ech_grease" => Extension::EchGrease(parse_ech_grease(&mut fields, &what)?),
         "padding" => Extension::Padding,
         "raw" => Extension::Raw {
             id: parse_u16(param(&mut fields, &what, "id")?, &what)?,
@@ -378,6 +456,34 @@ fn names_json(names: &[Vec<u8>]) -> Value {
     )
 }
 
+fn ech_grease_json(shape: &EchGreaseShape) -> Value {
+    let mut object = Map::new();
+    object.insert("type".to_owned(), Value::String("ech_grease".to_owned()));
+    match &shape.payload_length {
+        EchPayloadLength::Drawn(lengths) => {
+            object.insert("payload_lengths".to_owned(), json!(lengths));
+        }
+        EchPayloadLength::PaddedInner {
+            max_name_len,
+            rounding,
+        } => {
+            let rounding = match rounding {
+                EchInnerRounding::Rfc9849 => "rfc9849",
+                EchInnerRounding::Legacy => "legacy",
+            };
+            object.insert(
+                "inner_padding".to_owned(),
+                json!({ "max_name_len": max_name_len, "rounding": rounding }),
+            );
+        }
+    }
+    object.insert(
+        "aeads".to_owned(),
+        Value::Array(shape.aeads.iter().map(|aead| u16_json(*aead)).collect()),
+    );
+    Value::Object(object)
+}
+
 fn extension_json(extension: &Extension) -> Value {
     let bare = |name: &str| Value::String(name.to_owned());
     match extension {
@@ -430,7 +536,9 @@ fn extension_json(extension: &Extension) -> Value {
             "code_point": u16_json(*code_point),
             "protocols": names_json(protocols),
         }),
-        Extension::EchGrease => bare("ech_grease"),
+        // The default is written bare: see the module documentation.
+        Extension::EchGrease(shape) if *shape == EchGreaseShape::default() => bare("ech_grease"),
+        Extension::EchGrease(shape) => ech_grease_json(shape),
         Extension::Padding => bare("padding"),
         Extension::Raw { id, body } => {
             json!({ "type": "raw", "id": u16_json(*id), "body": hex_json(body) })

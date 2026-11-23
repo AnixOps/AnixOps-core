@@ -36,6 +36,7 @@ use tokio::sync::oneshot;
 
 use crate::connections::Dispatcher;
 use crate::control::MAX_REQUEST_LEN;
+use crate::local_proxy::ClientProcess;
 use crate::{RuntimeError, RuntimeErrorCode};
 
 /// The process name of the listener's connections in the connection list,
@@ -145,6 +146,7 @@ impl ReplayProxy {
             https_decryption: self.https_decryption,
             accepted: self.stats.accepted.load(Ordering::Relaxed),
             rejected: self.stats.rejected.load(Ordering::Relaxed),
+            accept_errors: self.stats.accept_errors.load(Ordering::Relaxed),
             active: self.stats.active.load(Ordering::Relaxed),
         }
     }
@@ -183,6 +185,9 @@ pub struct ReplayProxyStatus {
     pub accepted: u64,
     pub rejected: u64,
     pub active: u64,
+    /// Failed accepts the listener survived (a client that reset before
+    /// it was accepted, or descriptors or memory running short).
+    pub accept_errors: u64,
 }
 
 /// Where a runtime keeps its listener; stopping the runtime stops it.
@@ -267,20 +272,26 @@ fn default_decrypt() -> bool {
     true
 }
 
-/// Routes the listener's connections under [`PROCESS_NAME`].
+/// Routes the listener's connections under [`PROCESS_NAME`], passing the
+/// head of a plain HTTP request to `USER-AGENT` and `URL-REGEX` rules.
 struct ReplayClients(Arc<Dispatcher>);
 
 impl ClientConnector for ReplayClients {
     fn connect_client<'a>(
         &'a self,
-        _client: ClientAddrs,
+        client: ClientAddrs,
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, io::Result<BoxStream>> {
-        Box::pin(async move {
-            self.0
-                .connect_process_flow(target, None, Some(PROCESS_NAME))
-                .await
-        })
+        Box::pin(ClientProcess::Named(PROCESS_NAME).connect(&self.0, client, target, &[]))
+    }
+
+    fn connect_client_with_first<'a>(
+        &'a self,
+        client: ClientAddrs,
+        target: &'a TargetAddr,
+        first: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(ClientProcess::Named(PROCESS_NAME).connect(&self.0, client, target, first))
     }
 }
 

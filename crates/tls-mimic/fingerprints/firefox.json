@@ -1,5 +1,5 @@
 {
-  "note": "Desktop Firefox 160 (captured from Firefox 160.0 on Linux, 2026-11-13): no GREASE, fixed extension order, X25519MLKEM768 + X25519 + P-256 key shares (the hybrid share ends with the X25519 share's key, as captured), delegated_credentials (0x0022) and record_size_limit (0x001c) sent as captured, ECH GREASE last.",
+  "note": "Desktop Firefox 160 (captured from Firefox 160.0 on Linux, 2026-11-13): no GREASE, fixed extension order, X25519MLKEM768 + X25519 + P-256 key shares (the hybrid share ends with the X25519 share's key, as captured), delegated_credentials (0x0022) and record_size_limit (0x001c) sent as captured, ECH GREASE last: its payload is as long as the ClientHelloInner Firefox pads (server name to 100 bytes, RFC 9849 rounding; 240 bytes for a first connection to a name of up to 100 bytes) and it names AES-128-GCM or ChaCha20-Poly1305 at random.",
   "cipher_suites": [
     "0x1301", "0x1303", "0x1302", "0xc02b", "0xc02f", "0xcca9", "0xcca8", "0xc02c",
     "0xc030", "0xc013", "0xc014", "0x009c", "0x009d", "0x002f", "0x0035"
@@ -21,7 +21,11 @@
     { "type": "psk_key_exchange_modes", "modes": [1] },
     { "type": "raw", "body": "4001", "id": "0x001c" },
     { "type": "compress_certificate", "algorithms": ["0x0001", "0x0002", "0x0003"] },
-    "ech_grease"
+    {
+      "type": "ech_grease",
+      "inner_padding": { "max_name_len": 100, "rounding": "rfc9849" },
+      "aeads": ["0x0001", "0x0003"]
+    }
   ],
   "permute_extensions": false,
   "alpn": ["h2", "http/1.1"]

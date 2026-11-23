@@ -13,9 +13,10 @@ kernel that anix-agent drives on a proxy server). It mirrors `engine-outbound`:
   is kept until it is collected once), `online()` reports open connections per
   user and remote IP. `UserIndex` gives a protocol a cached credential lookup.
 - `server::serve`: TCP accept loop with a connection cap and handshake/connect
-  timeouts that relays every accepted stream through an
-  `engine_outbound::TcpOutbound` (direct or routed) and charges bytes to the
-  user as they move. `server::handle_connection` is the same per-connection
+  timeouts (transient `accept` errors are survived and counted in
+  `InboundStats::accept_errors`, see `engine_outbound::accept`) that relays
+  every accepted stream through an `engine_outbound::TcpOutbound` (direct or
+  routed) and charges bytes to the user as they move. `server::handle_connection` is the same per-connection
   path for TLS or QUIC transports, and `ConnectionContext::new` gives a
   transport that accepts connections itself the context of the serve loop.
 - `proxy_protocol`: PROXY protocol versions 1 and 2. With

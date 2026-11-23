@@ -419,6 +419,8 @@ mod linux {
             tcp_window_bytes: 64 * 1024,
             max_tcp_connections: 512,
             max_udp_flows: 256,
+            tcp_evict_idle: engine_embedded::tunnel::DEFAULT_TCP_EVICT_IDLE,
+            udp_evict_idle: engine_embedded::tunnel::DEFAULT_UDP_EVICT_IDLE,
             max_dns_in_flight: 32,
             idle_timeout: Duration::from_secs(300),
             connect_timeout: Duration::from_secs(10),

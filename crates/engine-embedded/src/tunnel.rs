@@ -187,9 +187,50 @@ const FIRST_PAYLOAD_MAX: usize = 4096;
 const FIRST_TLS_RECORD_MAX: usize = 5 + 16 * 1024;
 const RELAY_BUFFER_BYTES: usize = 8 * 1024;
 const DNS_PORT: u16 = 53;
-/// UDP flows open at once by default ([`TunnelSettings::max_udp_flows`]);
-/// datagrams for a new flow beyond the limit are dropped.
+/// TCP connections relayed at once by default
+/// ([`TunnelSettings::max_tcp_connections`]). Each holds two stack windows
+/// and relay buffers, so iOS keeps 128 inside the ~50 MB Network Extension
+/// limit; Android gets 512 and desktop (macOS, Windows, Linux TUN and the
+/// system proxy) 1024, where a browser with many tabs alone opens hundreds.
+/// The runtime lowers this and [`DEFAULT_MAX_UDP_FLOWS`] to the process's
+/// file-descriptor budget where that is smaller (see `fd_budget`).
+#[cfg(target_os = "ios")]
+pub const DEFAULT_MAX_TCP_CONNECTIONS: usize = 128;
+#[cfg(target_os = "android")]
+pub const DEFAULT_MAX_TCP_CONNECTIONS: usize = 512;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub const DEFAULT_MAX_TCP_CONNECTIONS: usize = 1024;
+/// UDP flows open at once by default ([`TunnelSettings::max_udp_flows`]):
+/// 256 on iOS for the Network Extension memory limit, 4096 elsewhere
+/// (about 2.2 KiB each). A new flow past the limit takes the place of an
+/// idle one (see [`TunnelSettings::udp_evict_idle`]).
+#[cfg(target_os = "ios")]
 pub const DEFAULT_MAX_UDP_FLOWS: usize = 256;
+#[cfg(not(target_os = "ios"))]
+pub const DEFAULT_MAX_UDP_FLOWS: usize = 4096;
+/// Default [`TunnelSettings::tcp_evict_idle`].
+pub const DEFAULT_TCP_EVICT_IDLE: Duration = Duration::from_secs(30);
+/// Default [`TunnelSettings::udp_evict_idle`].
+pub const DEFAULT_UDP_EVICT_IDLE: Duration = Duration::from_secs(15);
+/// A full UDP table frees up to 1/this of its slots per pass, so the next
+/// new flows find room without another pass.
+const UDP_EVICT_BATCH: usize = 16;
+/// The share of a full UDP table one app socket may keep when another
+/// needs room, as 1/this.
+const UDP_SOURCE_SHARE: usize = 4;
+/// The least an app socket's flow must have been idle to go for another
+/// socket's new flow (at most [`TunnelSettings::udp_evict_idle`]), so a
+/// game or call exchanging datagrams right now keeps its NAT mapping.
+const UDP_SOURCE_MIN_IDLE: Duration = Duration::from_secs(2);
+/// After a pass over a full UDP table found nothing to close, new flows are
+/// dropped without another pass for this long.
+const UDP_RESCAN_AFTER: Duration = Duration::from_millis(250);
+/// After no idle TCP connection was found, new ones are refused without
+/// another look for this long.
+const TCP_RESCAN_AFTER: Duration = Duration::from_millis(100);
+/// How long a new TCP connection waits for the place of the idle one it
+/// closed.
+const TCP_EVICT_WAIT: Duration = Duration::from_secs(1);
 /// Datagrams queued per flow while it connects or sends.
 const UDP_FLOW_QUEUE: usize = 64;
 /// A UDP flow without traffic in either direction for this long is closed.
@@ -199,10 +240,23 @@ const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct TunnelSettings {
     pub mtu: u16,
     pub tcp_window_bytes: u32,
+    /// TCP connections relayed at once. When all are taken, a new one
+    /// closes the connection that has been without payload longest, if that
+    /// is at least [`Self::tcp_evict_idle`]; otherwise it is refused.
     pub max_tcp_connections: usize,
-    /// UDP flows (app socket, destination) open at once; datagrams for a new
-    /// flow beyond this are dropped. DNS to port 53 does not count.
+    /// UDP flows (app socket, destination) open at once. DNS to port 53 does
+    /// not count. When all are taken, flows that ended and then those idle
+    /// for at least [`Self::udp_evict_idle`] make room, longest idle first;
+    /// failing that, an app socket holding more than a quarter of the table
+    /// gives up its least active flow (idle for 2 s at least); failing
+    /// that, the datagram of the new
+    /// flow is dropped.
     pub max_udp_flows: usize,
+    /// How long a TCP connection must have carried no payload either way
+    /// before a new connection may take its place at the limit.
+    pub tcp_evict_idle: Duration,
+    /// The same for UDP flows (no datagram either way).
+    pub udp_evict_idle: Duration,
     pub max_dns_in_flight: usize,
     pub idle_timeout: Duration,
     pub connect_timeout: Duration,
@@ -268,8 +322,10 @@ pub struct TunnelStats {
     pub(crate) tcp_active: AtomicU64,
     pub(crate) tcp_total: AtomicU64,
     pub(crate) tcp_rejected: AtomicU64,
+    pub(crate) tcp_evicted: AtomicU64,
     pub(crate) tcp_connect_failed: AtomicU64,
     pub(crate) udp_dropped: AtomicU64,
+    pub(crate) udp_evicted: AtomicU64,
     pub(crate) udp_flows: AtomicU64,
     pub(crate) udp_failed: AtomicU64,
     pub(crate) dns_queries: AtomicU64,
@@ -296,9 +352,16 @@ pub struct TunnelStatsSnapshot {
     pub packets_out: u64,
     pub tcp_active: u64,
     pub tcp_total: u64,
+    /// New TCP connections refused because `max_tcp_connections` were open
+    /// and none of them had been idle long enough to close.
     pub tcp_rejected: u64,
+    /// Idle TCP connections closed to make room for a new one at
+    /// `max_tcp_connections`.
+    pub tcp_evicted: u64,
     pub tcp_connect_failed: u64,
     pub udp_dropped: u64,
+    /// UDP flows closed to make room for a new one at `max_udp_flows`.
+    pub udp_evicted: u64,
     /// UDP flows opened through the outbound.
     pub udp_flows: u64,
     /// UDP flows the outbound could not open, including outbounds without UDP.
@@ -349,8 +412,10 @@ impl TunnelStats {
             tcp_active: get(&self.tcp_active),
             tcp_total: get(&self.tcp_total),
             tcp_rejected: get(&self.tcp_rejected),
+            tcp_evicted: get(&self.tcp_evicted),
             tcp_connect_failed: get(&self.tcp_connect_failed),
             udp_dropped: get(&self.udp_dropped),
+            udp_evicted: get(&self.udp_evicted),
             udp_flows: get(&self.udp_flows),
             udp_failed: get(&self.udp_failed),
             dns_queries: get(&self.dns_queries),
@@ -625,36 +690,75 @@ fn spawn_tasks(
     let tcp_shared = Arc::new(TcpShared {
         drop_holds: Semaphore::new((settings.max_tcp_connections / 8).max(1)),
         server_first: ServerFirst::default(),
+        live: LiveTcp::default(),
     });
     let tcp_dispatcher = dispatcher.clone();
     let tcp_stats = stats.clone();
     let tcp_settings = settings.clone();
     tokio::spawn(async move {
+        // When the last look found no idle connection to close.
+        let mut none_idle_at: Option<tokio::time::Instant> = None;
         while let Some((stream, _local, remote)) = tcp_listener.next().await {
-            let Ok(permit) = tcp_permits.clone().try_acquire_owned() else {
-                bump(&tcp_stats.tcp_rejected);
-                drop(stream);
-                continue;
+            // At the limit, the connection idle longest makes room; the new
+            // one waits for its permit, which comes back as soon as the
+            // closed connection's task ends.
+            let permit = match tcp_permits.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let now = tokio::time::Instant::now();
+                    let look = none_idle_at
+                        .is_none_or(|at| now.saturating_duration_since(at) >= TCP_RESCAN_AFTER);
+                    if look && tcp_shared.live.evict_idle(now, tcp_settings.tcp_evict_idle) {
+                        none_idle_at = None;
+                        bump(&tcp_stats.tcp_evicted);
+                        None
+                    } else {
+                        if look {
+                            none_idle_at = Some(now);
+                        }
+                        bump(&tcp_stats.tcp_rejected);
+                        drop(stream);
+                        continue;
+                    }
+                }
             };
-            bump(&tcp_stats.tcp_total);
+            let permits = tcp_permits.clone();
             let dispatcher = tcp_dispatcher.clone();
             let stats = tcp_stats.clone();
             let settings = tcp_settings.clone();
             let interceptor = interceptor.clone();
             let shared = tcp_shared.clone();
             tokio::spawn(async move {
-                let _permit = permit;
+                let _permit = match permit {
+                    Some(permit) => permit,
+                    None => {
+                        match tokio::time::timeout(TCP_EVICT_WAIT, permits.acquire_owned()).await {
+                            Ok(Ok(permit)) => permit,
+                            _ => {
+                                bump(&stats.tcp_rejected);
+                                return;
+                            }
+                        }
+                    }
+                };
+                bump(&stats.tcp_total);
+                let activity = Arc::new(LastActive::new());
+                let live = shared.live.register(activity.clone());
                 stats.tcp_active.fetch_add(1, Ordering::Relaxed);
-                handle_tcp(
-                    stream,
-                    remote,
-                    &dispatcher,
-                    interceptor.as_deref(),
-                    &stats,
-                    &settings,
-                    &shared,
-                )
-                .await;
+                tokio::select! {
+                    () = handle_tcp(
+                        stream,
+                        remote,
+                        &dispatcher,
+                        interceptor.as_deref(),
+                        &stats,
+                        &settings,
+                        &shared,
+                        &activity,
+                    ) => {}
+                    // Closed to make room: dropping the flow closes both sides.
+                    () = live.evicted() => {}
+                }
                 stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -915,10 +1019,18 @@ fn spawn_dns_exchange(job: DnsExchange) {
     });
 }
 
+/// A UDP flow's key: (app socket, destination).
+type FlowKey = (SocketAddr, SocketAddr);
+
 /// Open UDP flows keyed by (app socket, destination). Owned by the task that
-/// reads datagrams from the stack.
+/// reads datagrams from the stack, so it needs no lock.
 #[derive(Default)]
-struct UdpFlows(HashMap<(SocketAddr, SocketAddr), FlowSender>);
+struct UdpFlows {
+    map: HashMap<FlowKey, FlowSender>,
+    /// When the last pass over the full table found nothing to close (see
+    /// [`UDP_RESCAN_AFTER`]).
+    no_room_at: Option<tokio::time::Instant>,
+}
 
 impl UdpFlows {
     #[allow(clippy::too_many_arguments)]
@@ -935,7 +1047,7 @@ impl UdpFlows {
         settings: &TunnelSettings,
     ) {
         let key = (src, dst);
-        let payload = if let Some(flow) = self.0.get(&key) {
+        let payload = if let Some(flow) = self.map.get(&key) {
             match flow.try_send(payload) {
                 Ok(()) => return,
                 Err(TrySendError::Full(_)) => {
@@ -948,17 +1060,16 @@ impl UdpFlows {
         } else {
             payload
         };
-        self.0.remove(&key);
-        if self.0.len() >= settings.max_udp_flows {
-            self.0.retain(|_, flow| !flow.is_closed());
-            if self.0.len() >= settings.max_udp_flows {
-                bump(&stats.udp_dropped);
-                return;
-            }
+        self.map.remove(&key);
+        if self.map.len() >= settings.max_udp_flows
+            && !self.make_room(src, tokio::time::Instant::now(), settings, stats)
+        {
+            bump(&stats.udp_dropped);
+            return;
         }
         let (flow, packets) = flow_queue();
         let _ = flow.try_send(payload);
-        self.0.insert(key, flow);
+        self.map.insert(key, flow);
         tokio::spawn(run_udp_flow(
             packets,
             src,
@@ -973,6 +1084,91 @@ impl UdpFlows {
     }
 }
 
+impl UdpFlows {
+    /// Frees room in the full table for a new flow from `src`, in one pass:
+    /// flows that ended go; then up to a batch of those idle longest, idle
+    /// for at least `udp_evict_idle`; when none is idle, the least active
+    /// flows of the app socket holding the most, idle for at least
+    /// [`UDP_SOURCE_MIN_IDLE`], if that is more than its share (a quarter;
+    /// the new flow counts for its own socket), so one
+    /// app fanning out to many peers cannot starve the others. Closing a
+    /// flow drops its sender, and its task ends once the queued datagrams
+    /// are gone. Returns `false` when nothing could go; new flows are then
+    /// dropped without another pass for [`UDP_RESCAN_AFTER`], so a full
+    /// table costs one pass per batch of new flows, not one per datagram.
+    fn make_room(
+        &mut self,
+        src: SocketAddr,
+        now: tokio::time::Instant,
+        settings: &TunnelSettings,
+        stats: &TunnelStats,
+    ) -> bool {
+        if let Some(at) = self.no_room_at {
+            if now.saturating_duration_since(at) < UDP_RESCAN_AFTER {
+                return false;
+            }
+        }
+        self.no_room_at = None;
+        let max = settings.max_udp_flows;
+        self.map.retain(|_, flow| !flow.is_closed());
+        if self.map.len() < max {
+            return true;
+        }
+        let batch = (max / UDP_EVICT_BATCH).max(1);
+        let share = (max / UDP_SOURCE_SHARE).max(1);
+        let mut idle = Vec::new();
+        let mut per_source: HashMap<SocketAddr, usize> = HashMap::new();
+        for (key, flow) in &self.map {
+            *per_source.entry(key.0).or_default() += 1;
+            let quiet = flow.idle(now);
+            if quiet >= settings.udp_evict_idle {
+                idle.push((quiet, *key));
+            }
+        }
+        let mut victims = longest_idle(idle, batch);
+        if victims.is_empty() {
+            let hog = per_source
+                .into_iter()
+                .map(|(source, flows)| (source, flows + usize::from(source == src)))
+                .filter(|&(_, flows)| flows > share)
+                .max_by_key(|&(_, flows)| flows);
+            if let Some((hog, flows)) = hog {
+                let min_idle = UDP_SOURCE_MIN_IDLE.min(settings.udp_evict_idle);
+                let own: Vec<_> = self
+                    .map
+                    .iter()
+                    .filter(|(key, _)| key.0 == hog)
+                    .map(|(key, flow)| (flow.idle(now), *key))
+                    .filter(|&(quiet, _)| quiet >= min_idle)
+                    .collect();
+                victims = longest_idle(own, batch.min(flows - share));
+            }
+        }
+        if victims.is_empty() {
+            self.no_room_at = Some(now);
+            return false;
+        }
+        for key in victims {
+            if self.map.remove(&key).is_some() {
+                bump(&stats.udp_evicted);
+            }
+        }
+        true
+    }
+}
+
+/// The keys of the `count` flows idle longest among `flows`.
+fn longest_idle(mut flows: Vec<(Duration, FlowKey)>, count: usize) -> Vec<FlowKey> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if flows.len() > count {
+        flows.select_nth_unstable_by(count - 1, |a, b| b.0.cmp(&a.0));
+        flows.truncate(count);
+    }
+    flows.into_iter().map(|(_, key)| key).collect()
+}
+
 /// The datagrams waiting for one UDP flow.
 ///
 /// A flow holds one of these for as long as it lives, and a tunnel may hold
@@ -981,6 +1177,8 @@ impl UdpFlows {
 /// block of slots and padded counters up front (about a kilobyte per flow).
 struct FlowQueue {
     state: std::sync::Mutex<FlowQueueState>,
+    /// The last datagram either way, for closing idle flows at the limit.
+    activity: LastActive,
     /// Woken on every datagram and when either end leaves; `notify_one`
     /// keeps a permit, so a wake between a check and the wait is not lost.
     ready: tokio::sync::Notify,
@@ -995,6 +1193,7 @@ struct FlowQueueState {
 fn flow_queue() -> (FlowSender, FlowReceiver) {
     let queue = Arc::new(FlowQueue {
         state: std::sync::Mutex::default(),
+        activity: LastActive::new(),
         ready: tokio::sync::Notify::new(),
     });
     (FlowSender(queue.clone()), FlowReceiver(queue))
@@ -1027,12 +1226,18 @@ impl FlowSender {
         }
         state.packets.push_back(packet);
         drop(state);
+        self.0.activity.touch();
         self.0.ready.notify_one();
         Ok(())
     }
 
     fn is_closed(&self) -> bool {
         self.0.state().closed
+    }
+
+    /// How long the flow has been without a datagram either way at `now`.
+    fn idle(&self, now: tokio::time::Instant) -> Duration {
+        self.0.activity.idle(now)
     }
 }
 
@@ -1061,6 +1266,13 @@ impl FlowReceiver {
             }
             self.0.ready.notified().await;
         }
+    }
+}
+
+impl FlowReceiver {
+    /// Records a reply passing to the app now.
+    fn touch(&self) {
+        self.0.activity.touch();
     }
 }
 
@@ -1154,6 +1366,7 @@ async fn run_udp_flow(
                     in_port: None,
                     port: Some(app.port()),
                 },
+                lan_peer: None,
             };
             dispatcher.open_origin_udp_flow(&target, None, origin).await
         });
@@ -1207,6 +1420,7 @@ async fn run_udp_flow(
                 if replies.send((reply, destination, app)).await.is_err() {
                     break;
                 }
+                packets.touch();
                 active = true;
                 pending = next_reply(recv);
             }
@@ -1320,6 +1534,117 @@ struct TcpShared {
     drop_holds: Semaphore,
     /// Destinations that do not get the first-payload wait.
     server_first: ServerFirst,
+    /// The connections that hold a permit, for closing the idle one.
+    live: LiveTcp,
+}
+
+/// When a TCP connection or UDP flow last carried data: milliseconds after
+/// it was opened, so one atomic store per read keeps it current and any
+/// thread can read it.
+struct LastActive {
+    opened: tokio::time::Instant,
+    millis: AtomicU64,
+}
+
+impl LastActive {
+    fn new() -> Self {
+        Self {
+            opened: tokio::time::Instant::now(),
+            millis: AtomicU64::new(0),
+        }
+    }
+
+    /// Records data passing now.
+    fn touch(&self) {
+        let millis = u64::try_from(self.opened.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.millis.store(millis, Ordering::Relaxed);
+    }
+
+    /// How long it has been without data at `now`.
+    fn idle(&self, now: tokio::time::Instant) -> Duration {
+        let last = self.opened + Duration::from_millis(self.millis.load(Ordering::Relaxed));
+        now.saturating_duration_since(last)
+    }
+}
+
+/// The live TCP connections of a tunnel and when each last carried data.
+/// A connection is registered while it holds its permit; at the limit the
+/// one idle longest is told to close ([`LiveTcp::evict_idle`]).
+#[derive(Default)]
+struct LiveTcp {
+    next_id: AtomicU64,
+    table: std::sync::Mutex<HashMap<u64, LiveEntry>>,
+}
+
+struct LiveEntry {
+    activity: Arc<LastActive>,
+    evict: Arc<tokio::sync::Notify>,
+}
+
+impl LiveTcp {
+    fn table(&self) -> std::sync::MutexGuard<'_, HashMap<u64, LiveEntry>> {
+        self.table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn register(&self, activity: Arc<LastActive>) -> LiveConn<'_> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let evict = Arc::new(tokio::sync::Notify::new());
+        self.table().insert(
+            id,
+            LiveEntry {
+                activity,
+                evict: evict.clone(),
+            },
+        );
+        LiveConn {
+            live: self,
+            id,
+            evict,
+        }
+    }
+
+    /// Tells the connection idle longest to close, if it has been idle for
+    /// at least `min_idle` at `now`; `true` when one was told. One pass over
+    /// the table, only when it is full. The connection leaves the table at
+    /// once, so the next new connection picks another one.
+    fn evict_idle(&self, now: tokio::time::Instant, min_idle: Duration) -> bool {
+        let mut table = self.table();
+        let victim = table
+            .iter()
+            .map(|(id, entry)| (entry.activity.idle(now), *id))
+            .filter(|(idle, _)| *idle >= min_idle)
+            .max_by_key(|(idle, _)| *idle)
+            .map(|(_, id)| id);
+        let Some(entry) = victim.and_then(|id| table.remove(&id)) else {
+            return false;
+        };
+        drop(table);
+        // Keeps a permit when the connection is not waiting yet.
+        entry.evict.notify_one();
+        true
+    }
+}
+
+/// A registered connection; leaves the table when dropped.
+struct LiveConn<'a> {
+    live: &'a LiveTcp,
+    id: u64,
+    evict: Arc<tokio::sync::Notify>,
+}
+
+impl LiveConn<'_> {
+    /// Completes when the connection was chosen to make room.
+    async fn evicted(&self) {
+        self.evict.notified().await;
+    }
+}
+
+impl Drop for LiveConn<'_> {
+    fn drop(&mut self) {
+        self.live.table().remove(&self.id);
+    }
 }
 
 /// Answers a TCP flow a routing rule rejected, once its first bytes are
@@ -1395,6 +1720,8 @@ fn tls_record_len(bytes: &[u8]) -> Option<usize> {
     Some(5 + usize::from(u16::from_be_bytes([bytes[3], bytes[4]])))
 }
 
+/// Relays one TCP flow, recording in `activity` when payload passes.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp(
     mut inbound: netstack_smoltcp::TcpStream,
     target: SocketAddr,
@@ -1403,6 +1730,7 @@ async fn handle_tcp(
     stats: &TunnelStats,
     settings: &TunnelSettings,
     shared: &TcpShared,
+    activity: &Arc<LastActive>,
 ) {
     // The app (or, with the tunnel as a gateway, the device) that opened
     // the flow, for SRC-IP rules; the tunnel has no listener port.
@@ -1431,7 +1759,12 @@ async fn handle_tcp(
             let http = sniff::http_request_head(&first);
             let outbound = dispatcher.with_origin_request(&host, http.as_ref(), source);
             let flow = InterceptedFlow {
-                inbound: Box::new(inbound),
+                // Payload either way through the app's side keeps the flow
+                // from looking idle.
+                inbound: Box::new(Active {
+                    inner: inbound,
+                    activity: activity.clone(),
+                }),
                 first,
                 host: host.clone(),
                 target,
@@ -1448,6 +1781,7 @@ async fn handle_tcp(
     let origin = FlowOrigin {
         process: process.as_deref(),
         source,
+        lan_peer: None,
     };
     let connect = dispatcher.connect_origin_flow(&target, host.as_deref(), origin, http.as_ref());
     let mut remote = match tokio::time::timeout(settings.connect_timeout, connect).await {
@@ -1482,7 +1816,6 @@ async fn handle_tcp(
     }
     drop(first);
 
-    let activity = Arc::new(AtomicU64::new(0));
     let mut inbound = Counted::new(inbound, activity.clone(), &stats.bytes_up);
     let mut remote = Counted::new(remote, activity.clone(), &stats.bytes_down);
     let copy = tokio::io::copy_bidirectional_with_sizes(
@@ -1492,7 +1825,8 @@ async fn handle_tcp(
         RELAY_BUFFER_BYTES,
     );
     tokio::pin!(copy);
-    let mut last_seen = activity.load(Ordering::Relaxed);
+    // Ends once a whole `idle_timeout` passed without payload either way.
+    let mut wait = settings.idle_timeout;
     loop {
         tokio::select! {
             result = &mut copy => {
@@ -1504,26 +1838,72 @@ async fn handle_tcp(
                 }
                 break;
             }
-            _ = tokio::time::sleep(settings.idle_timeout) => {
-                let seen = activity.load(Ordering::Relaxed);
-                if seen == last_seen {
+            _ = tokio::time::sleep(wait) => {
+                let idle = activity.idle(tokio::time::Instant::now());
+                if idle >= settings.idle_timeout {
                     break;
                 }
-                last_seen = seen;
+                wait = settings.idle_timeout - idle;
             }
         }
     }
 }
 
-/// Counts bytes read from the wrapped stream and records activity for the idle timer.
+/// A stream that records in `activity` when payload passes either way.
+struct Active<S> {
+    inner: S,
+    activity: Arc<LastActive>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Active<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            this.activity.touch();
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Active<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+            this.activity.touch();
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Counts bytes read from the wrapped stream and records activity for the
+/// idle timer and for closing idle connections at the limit.
 struct Counted<'a, S> {
     inner: S,
-    activity: Arc<AtomicU64>,
+    activity: Arc<LastActive>,
     bytes_read: &'a AtomicU64,
 }
 
 impl<'a, S> Counted<'a, S> {
-    fn new(inner: S, activity: Arc<AtomicU64>, bytes_read: &'a AtomicU64) -> Self {
+    fn new(inner: S, activity: Arc<LastActive>, bytes_read: &'a AtomicU64) -> Self {
         Self {
             inner,
             activity,
@@ -1544,7 +1924,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counted<'_, S> {
         let n = (buf.filled().len() - before) as u64;
         if n > 0 {
             this.bytes_read.fetch_add(n, Ordering::Relaxed);
-            this.activity.fetch_add(1, Ordering::Relaxed);
+            this.activity.touch();
         }
         result
     }
@@ -1614,5 +1994,199 @@ mod tests {
             b""
         );
         assert!(started.elapsed() < Duration::from_millis(900));
+    }
+
+    #[test]
+    fn connection_limits_stay_tight_only_on_ios() {
+        #[cfg(target_os = "ios")]
+        let expected = (128, 256);
+        #[cfg(target_os = "android")]
+        let expected = (512, 4096);
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        let expected = (1024, 4096);
+        assert_eq!(
+            (DEFAULT_MAX_TCP_CONNECTIONS, DEFAULT_MAX_UDP_FLOWS),
+            expected
+        );
+        let limits = crate::config::Limits::default();
+        assert_eq!(limits.max_tcp_connections, DEFAULT_MAX_TCP_CONNECTIONS);
+        assert_eq!(limits.max_udp_flows, DEFAULT_MAX_UDP_FLOWS);
+        let parsed: crate::config::Limits = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.max_tcp_connections, DEFAULT_MAX_TCP_CONNECTIONS);
+        assert_eq!(parsed.max_udp_flows, DEFAULT_MAX_UDP_FLOWS);
+    }
+
+    /// Marks `activity` as having carried data `after` its start.
+    fn active_after(activity: &LastActive, after: Duration) {
+        activity
+            .millis
+            .store(after.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn the_tcp_connection_idle_longest_makes_room() {
+        let live = LiveTcp::default();
+        let quiet = Arc::new(LastActive::new());
+        let busy = Arc::new(LastActive::new());
+        let quiet_conn = live.register(quiet.clone());
+        let busy_conn = live.register(busy.clone());
+        active_after(&busy, Duration::from_secs(60));
+        let now = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        // Nobody has been idle for two minutes: the new connection is refused.
+        assert!(!live.evict_idle(now, Duration::from_secs(120)));
+        assert!(live.evict_idle(now, DEFAULT_TCP_EVICT_IDLE));
+        tokio::time::timeout(Duration::from_secs(1), quiet_conn.evicted())
+            .await
+            .expect("the idle connection is told to close");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), busy_conn.evicted())
+                .await
+                .is_err(),
+            "the active connection stays"
+        );
+        // The busy one was active just now; the quiet one already left.
+        assert!(!live.evict_idle(now, DEFAULT_TCP_EVICT_IDLE));
+        drop(quiet_conn);
+        drop(busy_conn);
+        assert!(live.table().is_empty());
+    }
+
+    fn udp_settings(max_udp_flows: usize) -> TunnelSettings {
+        TunnelSettings {
+            mtu: 1500,
+            tcp_window_bytes: 64 * 1024,
+            max_tcp_connections: 8,
+            max_udp_flows,
+            tcp_evict_idle: DEFAULT_TCP_EVICT_IDLE,
+            udp_evict_idle: DEFAULT_UDP_EVICT_IDLE,
+            max_dns_in_flight: 4,
+            idle_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(5),
+            dns: Arc::new(DnsPolicy::tcp(
+                SocketAddr::from(([1, 1, 1, 1], 53)),
+                Duration::from_secs(5),
+            )),
+            worker_threads: 1,
+        }
+    }
+
+    fn app(port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 2], port))
+    }
+
+    fn peer(port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 80], port))
+    }
+
+    /// Adds a flow as `forward` does; the flow lives while the receiver does.
+    fn open(flows: &mut UdpFlows, src: SocketAddr, dst: SocketAddr) -> FlowReceiver {
+        let (sender, receiver) = flow_queue();
+        flows.map.insert((src, dst), sender);
+        receiver
+    }
+
+    fn is_closed(flow: &FlowReceiver) -> bool {
+        flow.0.state().closed
+    }
+
+    #[test]
+    fn a_full_udp_table_closes_its_idle_flow_for_a_new_one() {
+        let settings = udp_settings(2);
+        let stats = TunnelStats::default();
+        let mut flows = UdpFlows::default();
+        let idle = open(&mut flows, app(5001), peer(7001));
+        let busy = open(&mut flows, app(5002), peer(7002));
+        active_after(&busy.0.activity, Duration::from_secs(60));
+        let now = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        assert!(flows.make_room(app(5003), now, &settings, &stats));
+        assert!(is_closed(&idle), "the idle flow's task ends");
+        assert!(!is_closed(&busy));
+        assert!(flows.map.contains_key(&(app(5002), peer(7002))));
+        assert_eq!(stats.snapshot().udp_evicted, 1);
+        assert_eq!(stats.snapshot().udp_dropped, 0);
+    }
+
+    #[test]
+    fn one_app_fanning_out_does_not_block_another() {
+        let settings = udp_settings(4);
+        let stats = TunnelStats::default();
+        let mut flows = UdpFlows::default();
+        // One socket talks to four peers, none idle long enough to go for
+        // the idle rule (15 s) but past the socket's minimum.
+        let fan: Vec<_> = (7001..7005)
+            .map(|port| open(&mut flows, app(6881), peer(port)))
+            .collect();
+        for flow in &fan {
+            active_after(&flow.0.activity, Duration::from_secs(55));
+        }
+        let now = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        assert!(flows.make_room(app(5000), now, &settings, &stats));
+        assert_eq!(fan.iter().filter(|flow| is_closed(flow)).count(), 1);
+        assert_eq!(flows.map.len(), 3);
+        assert_eq!(stats.snapshot().udp_evicted, 1);
+    }
+
+    #[test]
+    fn a_fanning_out_app_keeps_flows_that_carried_data_just_now() {
+        let settings = udp_settings(4);
+        let stats = TunnelStats::default();
+        let mut flows = UdpFlows::default();
+        let fan: Vec<_> = (7001..7005)
+            .map(|port| open(&mut flows, app(6881), peer(port)))
+            .collect();
+        for flow in &fan {
+            active_after(&flow.0.activity, Duration::from_secs(59));
+        }
+        let now = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        // Each was active within the last second: none goes.
+        assert!(!flows.make_room(app(5000), now, &settings, &stats));
+        assert!(fan.iter().all(|flow| !is_closed(flow)));
+        assert_eq!(stats.snapshot().udp_evicted, 0);
+    }
+
+    #[test]
+    fn without_anything_to_close_the_full_table_is_not_scanned_again_at_once() {
+        let settings = udp_settings(2);
+        let stats = TunnelStats::default();
+        let mut flows = UdpFlows::default();
+        let first = open(&mut flows, app(5001), peer(7001));
+        let second = open(&mut flows, app(5002), peer(7002));
+        active_after(&first.0.activity, Duration::from_secs(60));
+        active_after(&second.0.activity, Duration::from_secs(60));
+        let now = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        // Two apps with one active flow each: nothing may go.
+        assert!(!flows.make_room(app(5003), now, &settings, &stats));
+        // A flow that ended is only noticed after the pause...
+        drop(first);
+        assert!(!flows.make_room(app(5003), now, &settings, &stats));
+        assert_eq!(flows.map.len(), 2);
+        // ...and then cleared without closing anything else.
+        let later = now + UDP_RESCAN_AFTER;
+        assert!(flows.make_room(app(5003), later, &settings, &stats));
+        assert_eq!(flows.map.len(), 1);
+        assert!(!is_closed(&second));
+        assert_eq!(stats.snapshot().udp_evicted, 0);
+    }
+
+    #[test]
+    fn a_full_table_frees_a_batch_of_idle_flows_in_one_pass() {
+        let settings = udp_settings(64);
+        let stats = TunnelStats::default();
+        let mut flows = UdpFlows::default();
+        let open_flows: Vec<_> = (0..64)
+            .map(|i| open(&mut flows, app(10_000 + i), peer(7000)))
+            .collect();
+        let now = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        assert!(flows.make_room(app(9999), now, &settings, &stats));
+        // 64 / 16: the next three new flows need no pass.
+        assert_eq!(flows.map.len(), 60);
+        assert_eq!(open_flows.iter().filter(|flow| is_closed(flow)).count(), 4);
+        assert_eq!(stats.snapshot().udp_evicted, 4);
     }
 }
