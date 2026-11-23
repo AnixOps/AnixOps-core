@@ -35,15 +35,15 @@
 //! | `metrics` | `anonymous` (optional bool) | `{"content_type", "text"}`: [`crate::metrics`] in the Prometheus text format |
 //! | `reload_rules` | `rules`, optional `dry_run` | `{"reloaded": bool, "rules", "generation"}` or `{"reloaded": false, "error": {"line", "code"}}` |
 //! | `outbound_reuse` | | `{"outbounds": [{"node", "protocol", "reuse"}]}`: connection pool (`mux`) and TLS resumption counters, only outbounds that keep them |
-//! | `capture` | | [`crate::capture::CaptureStatus`] |
+//! | `capture` | | [`crate::capture::CaptureStatus`]: `enabled`, `max_total_bytes`, `used_bytes`, `connections`, `dropped_exchanges`, `dropped_bodies` (what the budget let go of since the last clear) |
 //! | `set_capture` | `enabled`, optional `max_total_bytes` | [`crate::capture::CaptureStatus`]: keep the bytes of new connections |
-//! | `clear_capture` | | [`crate::capture::CaptureStatus`] |
+//! | `clear_capture` | | [`crate::capture::CaptureStatus`]: connections still open record their later exchanges under new indexes |
 //! | `capture_connection` | `id` | `{"capture": {...} \| null}`: kept bytes and decrypted HTTP messages of one connection |
 //! | `export_capture` | `format` (`pcapng` \| `har` \| `curl` \| `code` \| `postman` \| `insomnia`), optional `id`, `exchange` (index in that connection's `http`), `language` (`code`: `python` \| `javascript` \| `swift` \| `kotlin` \| `go`), `redact` (default `true`) | `{"format", "file_name", "content_type", "size", "redacted", "data_base64"}` |
 //! | `set_capture_storage` | `dir`, `key_base64` (32 bytes the client keeps), optional `retention_days` (default 7, 1–365) | `{"retention_days", "purged"}`: where `save_capture` writes; old sessions are deleted |
 //! | `save_capture` | optional `name` | `{"session": {"session", "name", "saved_at_ms", "expires_at_ms", "size", "connections", "requests"}}`: seals what capture holds |
 //! | `capture_sessions` | | `{"sessions": [...]}`, newest first; a session this key cannot open has `"unreadable": true` |
-//! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off |
+//! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off; its connections get new ids from [`crate::capture::LOADED_ID_BASE`] (2^52) up, so no live connection writes into them |
 //! | `delete_capture` | `session` | `{"deleted": bool}` |
 //! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter` | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`) |
 //! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events, WebSocket messages) from `since_message` on |

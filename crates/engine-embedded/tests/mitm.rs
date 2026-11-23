@@ -540,6 +540,169 @@ async fn bodies_no_rule_reads_stream_past_the_body_limit_and_keep_the_connection
     server.abort();
 }
 
+/// A plain HTTP origin that sends the raw bytes of the first request it
+/// reads to `requests`, answers with `response` exactly as given and
+/// closes.
+struct RawOrigin {
+    requests: mpsc::UnboundedSender<Vec<u8>>,
+    response: &'static [u8],
+}
+
+impl TcpOutbound for RawOrigin {
+    fn protocol(&self) -> &'static str {
+        "test-raw-origin"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move {
+            let (near, mut far) = tokio::io::duplex(64 * 1024);
+            let requests = self.requests.clone();
+            let response = self.response;
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = far.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let _ = requests.send(buf);
+                far.write_all(response).await.unwrap();
+                let _ = far.shutdown().await;
+            });
+            Ok(Box::new(near) as BoxStream)
+        })
+    }
+}
+
+/// Relays `request` (the first bytes of a plain HTTP flow) to an origin
+/// answering `response`: what the app got, to the end, and what the
+/// origin was sent.
+async fn plain_exchange(request: &[u8], response: &'static [u8]) -> (Vec<u8>, Vec<u8>) {
+    let device_root = root("NetworkCore Test Device Root");
+    let engine = Arc::new(MitmEngine::new(&mitm_config(&device_root)).unwrap());
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(RawOrigin {
+        requests: requests_tx,
+        response,
+    });
+    let target: SocketAddr = "192.0.2.22:80".parse().unwrap();
+    let host = engine
+        .claim(request, target)
+        .expect("plain HTTP is claimed");
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first: request.to_vec(),
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let origin = origin.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    origin.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), app.read_to_end(&mut received))
+        .await
+        .expect("relayed in time")
+        .unwrap();
+    let sent = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the origin was asked")
+        .unwrap();
+    // The app is done: a connection relayed raw ends both ways.
+    drop(app);
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("served in time")
+        .unwrap();
+    (received, sent)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[tokio::test]
+async fn plain_http_the_relay_cannot_rewrite_still_goes_through() {
+    let get = b"GET /report HTTP/1.1\r\nHost: plain.example.test\r\n\r\n";
+
+    // A file name in GBK, as an old server sends it.
+    let gbk: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"\xb1\xa8\xb1\xed.xls\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    let (received, _) = plain_exchange(get, gbk).await;
+    assert!(
+        contains(&received, b"filename=\"\xb1\xa8\xb1\xed.xls\"\r\n"),
+        "{}",
+        String::from_utf8_lossy(&received)
+    );
+    assert!(received.ends_with(b"\r\n\r\nhello"));
+
+    // An internet radio stream answers `ICY 200 OK`.
+    let icy: &'static [u8] = b"ICY 200 OK\r\nicy-name: radio\r\n\r\nAUDIO-FRAMES";
+    let (received, _) = plain_exchange(get, icy).await;
+    assert_eq!(received, icy);
+
+    // Lines ending in a bare LF, and a length given twice alike.
+    let lf: &'static [u8] = b"HTTP/1.1 200 OK\nContent-Length: 5, 5\nConnection: close\n\nhello";
+    let (received, _) = plain_exchange(get, lf).await;
+    assert!(received.starts_with(b"HTTP/1.1 200"), "{received:?}");
+    assert!(received.ends_with(b"\r\n\r\nhello"));
+
+    // Lengths that disagree are not guessed at: the app gets a 502.
+    let conflicting: &'static [u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+    let (received, _) = plain_exchange(get, conflicting).await;
+    assert!(received.starts_with(b"HTTP/1.1 502"), "{received:?}");
+
+    // A request head the relay cannot read goes to the origin as it came.
+    let odd = b"GET /x HTTP/1.1\r\nHost: plain.example.test\r\nBad Name: \xff\r\n\r\n";
+    let ok: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let (received, sent) = plain_exchange(odd, ok).await;
+    assert_eq!(sent, odd);
+    assert_eq!(received, ok);
+}
+
+#[test]
+fn plain_requests_to_a_forward_proxy_are_left_alone() {
+    let device_root = root("NetworkCore Test Device Root");
+    let engine = MitmEngine::new(&mitm_config(&device_root)).unwrap();
+    let target: SocketAddr = "192.0.2.23:3128".parse().unwrap();
+    assert_eq!(
+        engine.claim(
+            b"GET http://plain.example.test/ HTTP/1.1\r\nHost: plain.example.test\r\n\r\n",
+            target
+        ),
+        None
+    );
+    assert_eq!(
+        engine.claim(
+            b"OPTIONS * HTTP/1.1\r\nHost: plain.example.test\r\n\r\n",
+            target
+        ),
+        None
+    );
+    assert!(engine
+        .claim(
+            b"GET / HTTP/1.1\r\nHost: plain.example.test\r\n\r\n",
+            target
+        )
+        .is_some());
+}
+
 #[test]
 fn plugins_over_one_mib_are_accepted() {
     let device_root = root("NetworkCore Test Device Root");

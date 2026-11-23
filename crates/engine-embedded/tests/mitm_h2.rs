@@ -598,3 +598,154 @@ async fn each_http2_stream_is_routed_on_its_own() {
     assert_eq!(b.opened.load(Ordering::SeqCst), 1);
     server.abort();
 }
+
+/// Bytes the going-away origin answers its one request with: more than one
+/// stream's receive window, so the end is still in flight as it goes away.
+const BIG: usize = 300 * 1024;
+
+/// An HTTP/2 origin that goes away (GOAWAY) as soon as its first request
+/// arrives, answers that one with [`BIG`] bytes and takes no other.
+struct GoAwayOrigin {
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl TcpOutbound for GoAwayOrigin {
+    fn protocol(&self) -> &'static str {
+        "test-go-away-origin"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move {
+            let (near, far) = tokio::io::duplex(256 * 1024);
+            let acceptor = self.acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(far).await else {
+                    return;
+                };
+                let Ok(mut connection) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                let Some(Ok((_, mut respond))) = connection.accept().await else {
+                    return;
+                };
+                connection.graceful_shutdown();
+                tokio::spawn(async move {
+                    let response = Response::builder().status(200).body(()).unwrap();
+                    let mut send = respond.send_response(response, false).unwrap();
+                    let mut data = Bytes::from(vec![b'z'; BIG]);
+                    while !data.is_empty() {
+                        send.reserve_capacity(data.len());
+                        let Some(Ok(capacity)) =
+                            std::future::poll_fn(|cx| send.poll_capacity(cx)).await
+                        else {
+                            return;
+                        };
+                        let chunk = data.split_to(capacity.min(data.len()));
+                        send.send_data(chunk, false).unwrap();
+                    }
+                    send.send_data(Bytes::new(), true).unwrap();
+                });
+                // Driven until the GOAWAY is final and the stream done.
+                while let Some(next) = connection.accept().await {
+                    if let Ok((_, mut respond)) = next {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    }
+                }
+            });
+            Ok(Box::new(near) as BoxStream)
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_origin_going_away_finishes_its_streams_and_sends_the_app_away_too() {
+    let device_root = root("NetworkCore Test Device Root");
+    let origin_root = root("NetworkCore Test Origin Root");
+    let engine = Arc::new(
+        MitmEngine::new(&mitm_config(&device_root))
+            .unwrap()
+            .with_upstream_config(trusting(&origin_root.certificate, &[b"http/1.1"])),
+    );
+    let (requests_tx, _requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(GoAwayOrigin {
+        acceptor: H2Origin::new(&origin_root, requests_tx).acceptor,
+    });
+    let target: SocketAddr = "192.0.2.32:443".parse().unwrap();
+    let (app, mut tunnel_side) = tokio::io::duplex(256 * 1024);
+    let client = tokio::spawn({
+        let config = trusting(&device_root.certificate, &[b"h2", b"http/1.1"]);
+        async move {
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let tls = connector
+                .connect(ServerName::try_from(HOST).unwrap(), app)
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+            let (client, connection) = h2::client::handshake(tls).await.unwrap();
+            let connection = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            // The stream the origin took comes whole, END_STREAM included.
+            let first = send(&client, "GET", "https://api.example.test/big", b"").await;
+            assert_eq!(first.status, StatusCode::OK);
+            assert_eq!(first.body.len(), BIG);
+
+            // A request after the origin went away was never processed: it
+            // is refused (or the app is told to go away first), so the app
+            // may send it again on a new connection.
+            let retry = async {
+                let mut ready = client.clone().ready().await?;
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("https://api.example.test/again")
+                    .body(())
+                    .unwrap();
+                let (response, _) = ready.send_request(request, true)?;
+                response.await.map(|_| ())
+            }
+            .await;
+            let error = retry.expect_err("the origin is gone");
+            assert!(
+                error.reason() == Some(h2::Reason::REFUSED_STREAM) || error.is_go_away(),
+                "{error:?}"
+            );
+
+            // And the app's connection ends instead of hanging.
+            drop(client);
+            tokio::time::timeout(Duration::from_secs(10), connection)
+                .await
+                .expect("the app's connection ended")
+                .unwrap();
+        }
+    });
+
+    let mut first = vec![0u8; 4096];
+    let n = tunnel_side.read(&mut first).await.unwrap();
+    first.truncate(n);
+    let host = engine.claim(&first, target).expect("intercepted");
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn(async move {
+        let _ = engine
+            .serve_flow(
+                flow,
+                origin.as_ref(),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(20), client)
+        .await
+        .expect("client finished")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the relay ended")
+        .unwrap();
+}

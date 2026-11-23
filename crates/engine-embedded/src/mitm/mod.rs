@@ -655,11 +655,28 @@ impl MitmEngine {
             let Ok(request) = tokio::time::timeout(idle_timeout, client.read_head()).await else {
                 return Ok(());
             };
-            let Some(request) = request? else {
-                return Ok(());
+            let request = match request {
+                Ok(Some(request)) => request,
+                Ok(None) => return Ok(()),
+                // A head this relay cannot read goes on as it came (its
+                // bytes are still buffered) and the connection is relayed
+                // unchanged from here, as it would be without decryption.
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    return passthrough(client, origin).await;
+                }
+                Err(error) => return Err(error),
             };
-            let (method, path, version) = split_request_line(&request.start_line)?;
-            let request_framing = request.framing()?;
+            let parsed = match (split_request_line(&request.start_line), request.framing()) {
+                (Ok(line), Ok(framing)) => Some((line, framing)),
+                _ => None,
+            };
+            let Some(((method, path, version), request_framing)) = parsed else {
+                // A request this relay does not rewrite (an unknown framing,
+                // a target that is not a path) goes on unchanged, and so
+                // does the rest of the connection.
+                origin.write_all(&request.encode()).await?;
+                return passthrough(client, origin).await;
+            };
             let url = format!("{scheme}://{authority}{path}");
             // Filed when this iteration ends, whichever way it ends.
             let mut recording = capture.as_ref().map(|capture| {
@@ -718,9 +735,9 @@ impl MitmEngine {
                         }
                         body
                     }
-                    Body::TooLarge(raw) => {
+                    Body::TooLarge { raw, body, size } => {
                         if let Some(recording) = &mut recording {
-                            recording.exchange.request_body = CapturedBody::of(&raw);
+                            recording.exchange.request_body = CapturedBody { data: body, size };
                             recording.exchange.note = Some("too_large");
                             recording.exchange.rules_skipped = true;
                         }
@@ -809,21 +826,39 @@ impl MitmEngine {
             }
 
             // Interim 1xx responses go straight to the client.
-            let response = loop {
+            let (response, status) = loop {
                 let head = tokio::time::timeout(idle_timeout, origin.read_head())
                     .await
-                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-                let Some(head) = head else {
-                    return Err(io::ErrorKind::UnexpectedEof.into());
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+                let head = match head {
+                    Ok(Some(head)) => head,
+                    Ok(None) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    // A response head this relay cannot read (its bytes are
+                    // still buffered) goes to the app as it came, and the
+                    // connection is relayed unchanged from here.
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        if let Some(recording) = &mut recording {
+                            recording.unparsed();
+                        }
+                        return passthrough(client, origin).await;
+                    }
+                    Err(error) => return Err(error),
                 };
-                let status = response_status(&head.start_line)?;
+                let Ok(status) = response_status(&head.start_line) else {
+                    // Not HTTP/1.x (`ICY 200 OK` of an internet radio
+                    // stream): relayed unchanged.
+                    if let Some(recording) = &mut recording {
+                        recording.unparsed();
+                    }
+                    client.write_all(&head.encode()).await?;
+                    return passthrough(client, origin).await;
+                };
                 if (100..200).contains(&status) && status != 101 {
                     client.write_all(&head.encode()).await?;
                     continue;
                 }
-                break head;
+                break (head, status);
             };
-            let status = response_status(&response.start_line)?;
             let streaming = status == 101
                 || response.header("Content-Type").is_some_and(|value| {
                     value.to_ascii_lowercase().starts_with("text/event-stream")
@@ -882,13 +917,25 @@ impl MitmEngine {
             }
             let no_body = method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304;
             let framing = if no_body {
-                Framing::Length(0)
+                Ok(Framing::Length(0))
             } else if response.header("Transfer-Encoding").is_none()
                 && response.header("Content-Length").is_none()
             {
-                Framing::UntilClose
+                Ok(Framing::UntilClose)
             } else {
-                response.framing()?
+                response.framing()
+            };
+            let Ok(framing) = framing else {
+                // Lengths that disagree, or a transfer coding nobody can
+                // read: the end of this response is unknown, so the app
+                // gets a 502 and the connection closes (RFC 9112 section
+                // 6.3).
+                let head = response_head(502, &[], None, 0, true);
+                if let Some(recording) = &mut recording {
+                    recording.response(&head, &[], Some("unparsed"));
+                }
+                client.write_all(&head.encode()).await?;
+                return Ok(());
             };
             let close = client_close
                 || framing == Framing::UntilClose
@@ -947,9 +994,10 @@ impl MitmEngine {
             let mut response_headers = response.headers.clone();
             let response_body = match origin.read_body(framing, MAX_BODY_BYTES).await? {
                 Body::Complete(body) => decoded_for_rules(&mut response_headers, body),
-                Body::TooLarge(raw) => {
+                Body::TooLarge { raw, body, size } => {
                     if let Some(recording) = &mut recording {
-                        recording.response(&response, &raw, Some("too_large"));
+                        recording.response(&response, &[], Some("too_large"));
+                        recording.exchange.response_body = CapturedBody { data: body, size };
                         recording.exchange.rules_skipped = true;
                     }
                     client.write_all(&response.encode()).await?;
@@ -1135,10 +1183,21 @@ impl<'a> Recording<'a> {
     ) -> Self {
         Self {
             capture,
-            exchange: HttpExchange::new(method, url, headers),
+            exchange: HttpExchange::new(
+                &http1::display(method),
+                &http1::display(url),
+                &http1::display_headers(headers),
+            ),
             filed: None,
             events: None,
         }
+    }
+
+    /// The response could not be read and the connection is relayed
+    /// unchanged from here: no rule ran on it.
+    fn unparsed(&mut self) {
+        self.exchange.note = Some("unparsed");
+        self.exchange.rules_skipped = true;
     }
 
     /// Files the exchange as it stands, still in progress, or refreshes
@@ -1203,7 +1262,7 @@ impl<'a> Recording<'a> {
     /// `body`.
     fn response(&mut self, head: &Head, body: &[u8], note: Option<&'static str>) {
         self.exchange.status = response_status(&head.start_line).ok();
-        self.exchange.response_headers = head.headers.clone();
+        self.exchange.response_headers = http1::display_headers(&head.headers);
         self.exchange.response_body = CapturedBody::of(body);
         if note.is_some() {
             self.exchange.note = note;
@@ -1311,12 +1370,14 @@ fn is_tls(first: &[u8]) -> bool {
 }
 
 /// The `Host` of a plain HTTP/1.x request that starts in `first`, when its
-/// method is one the relay serves.
+/// method is one the relay serves and its target is a path. An absolute
+/// target (`GET http://... HTTP/1.1`, to a forward proxy) or `OPTIONS *`
+/// is not one an origin is asked for, so such a connection is left alone.
 fn plain_http_host(first: &[u8]) -> Option<String> {
     let method = PLAIN_HTTP_METHODS
         .iter()
-        .any(|method| first.starts_with(method.as_bytes()));
-    if !method {
+        .find(|method| first.starts_with(method.as_bytes()))?;
+    if first.get(method.len()) != Some(&b'/') {
         return None;
     }
     crate::sniff::http_host(first)

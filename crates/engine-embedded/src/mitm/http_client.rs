@@ -129,7 +129,7 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let body = match conn.read_body(framing, MAX_BODY_BYTES).await.map_err(io)? {
         Body::Complete(body) => body,
-        Body::TooLarge(_) => return Err(TOO_LARGE),
+        Body::TooLarge { .. } => return Err(TOO_LARGE),
     };
     Ok(ScriptResponse {
         status,

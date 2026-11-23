@@ -513,9 +513,17 @@ fn static_version(version: &str) -> &'static str {
 }
 
 fn static_note(note: &str) -> Option<&'static str> {
-    ["answered_locally", "streaming", "too_large"]
-        .into_iter()
-        .find(|known| *known == note)
+    [
+        "answered_locally",
+        "streaming",
+        "too_large",
+        "rejected",
+        "connect_failed",
+        "unparsed",
+        "busy",
+    ]
+    .into_iter()
+    .find(|known| *known == note)
 }
 
 fn encode(inner: &Inner) -> Vec<u8> {
@@ -818,8 +826,10 @@ fn decode(data: &[u8]) -> Option<Vec<(u64, Captured)>> {
             kept,
             seen,
             http,
+            http_base: 0,
             h2,
             memory: 0,
+            loaded: false,
         };
         captured.memory = captured.memory_estimate();
         connections.push((id, captured));

@@ -103,6 +103,18 @@ HTTP/2 / HTTP/1.1 解密。其余主机的 QUIC 照常放行，不影响非解�
 - 规则命中但没有执行（SSE、升级、超 1 MiB 的 `too_large`）时，条目写
   `rules_skipped: true`，检查器显示「改写未生效：流式响应」（超限时为「正文过大」）。
   取舍见 D3。
+- HTTP/2 一条连接上同时为规则持有的正文合计不超过 2 MiB（`MAX_HELD_BODY_BYTES`，
+  每个持有的正文在规划时大约还有两份拷贝）：放不下的那条不等待（等待的流占着流控窗口，
+  会卡住持有额度的流），按原样转发，条目写 `note: "busy"`、`rules_skipped: true`。
+- 源站 HTTP/2 连接发 GOAWAY 或关闭时，App 一侧也优雅关闭：App 收到 GOAWAY，
+  进行中的流继续转完（最多 `idle_timeout`），源站没有处理的流回 `REFUSED_STREAM`
+  （App 可以在新连接上安全重试），源站 RST_STREAM 的原因原样转给 App。
+- HTTP/1：头部里不是 UTF-8 的字节（GBK / Latin-1 文件名）原样转发；裸 LF 行尾、
+  折行头、重复且相同的 `Content-Length` 照常读取；读不懂的请求头或响应头（含
+  `ICY 200 OK`）不再断开连接，而是从这里起原样透传，响应条目写 `note: "unparsed"`；
+  值不一致的 `Content-Length` 回 502 后关闭（RFC 9112 §6.3）。显式代理形式的请求目标
+  （`GET http://…`、`OPTIONS *`）不接管。chunked 正文的分块行、扩展与 trailer 一并
+  计入上限（超出按 `too_large` 原样转发），分块大小只接受至多 16 位十六进制数。
 - 门槛：内存上界由单元测试卡住（2 万条事件，相当于每秒 50 条跑近 7 分钟，单交换
   事件内存 ≤ 64 KiB + 512 × 64 字节，且与预算记账一致）；端到端测试覆盖 chunked
   事件跨块、事件在流未结束时就到达 App、`since_rev` 进行中 → 结束、规则跳过提示。
