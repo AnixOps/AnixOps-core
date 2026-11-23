@@ -1,13 +1,17 @@
+use std::net::IpAddr;
+
 use config_core::routing::{
-    PolicyGroupKind, PolicyTarget, RejectKind, RouteOutcome, RouteQuery, RuleMatcher,
-    StaticRoutingEnvironment,
+    PolicyGroupKind, PolicyTarget, RejectKind, RouteOutcome, RouteQuery, RoutingEnvironment,
+    RuleMatcher, StaticRoutingEnvironment,
 };
 use config_core::routing_import::{
-    import_subscription_routing, ImportedRouting, ImportedRuleSet,
+    import_subscription_routing, ImportedRouting, ImportedRuleSet, MAX_IMPORT_WARNINGS,
+    MAX_SOURCE_GROUP_MEMBERS, MAX_SOURCE_POLICY_GROUPS, MAX_SOURCE_RULE_LEN,
     ROUTING_IMPORT_GROUP_SKIPPED_CODE, ROUTING_IMPORT_INVALID_CODE,
     ROUTING_IMPORT_MEMBER_SKIPPED_CODE, ROUTING_IMPORT_READY_CODE,
     ROUTING_IMPORT_RULE_SKIPPED_CODE,
 };
+use config_core::rule_set::{RuleSet, LAN_RULE_SET};
 use config_core::CoreSubscriptionService;
 use control_domain::{NodeDescriptor, RawSubscription, SubscriptionService};
 
@@ -788,4 +792,365 @@ FINAL,Proxy
         .join("\n");
     assert!(messages.contains("rule 7 was skipped"), "{messages}");
     assert!(messages.contains("DOH"), "{messages}");
+}
+
+/// A subconverter-style Surge profile: built-in policies and aliases in
+/// `[Proxy]`, and a node of a type the importer skips.
+const SURGE_PROFILE_WITH_SKIPPED_PROXIES: &str = r#"
+[General]
+loglevel = notify
+
+[Proxy]
+DIRECT = direct
+Home = direct, interface=en0
+Block = reject-drop
+HY2 = hysteria2, hy2.example.test, 443, password=hy2-secret
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503
+
+[Proxy Group]
+Proxy = select, HK, HY2, Home
+
+[Rule]
+DOMAIN-SUFFIX,lan.example,Home
+DOMAIN-SUFFIX,ads.example,Block
+DOMAIN-SUFFIX,video.example,HY2
+FINAL,Proxy
+"#;
+
+#[test]
+fn built_in_policy_aliases_route_as_their_policy_and_skipped_proxies_are_left_out() {
+    let nodes = parse_nodes(SURGE_PROFILE_WITH_SKIPPED_PROXIES);
+    assert_eq!(nodes.len(), 1);
+    let hk = node_id(&nodes, "HK");
+
+    let imported = import_subscription_routing(SURGE_PROFILE_WITH_SKIPPED_PROXIES, &nodes);
+    let model = imported
+        .routing
+        .clone()
+        .expect("routing should import without the skipped proxy");
+
+    assert_eq!(
+        model
+            .rules
+            .iter()
+            .map(|rule| (rule.matcher.clone(), rule.target.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                RuleMatcher::DomainSuffix("lan.example".to_string()),
+                PolicyTarget::Direct
+            ),
+            (
+                RuleMatcher::DomainSuffix("ads.example".to_string()),
+                PolicyTarget::Reject(RejectKind::Drop)
+            ),
+        ]
+    );
+    assert_eq!(model.final_target, PolicyTarget::Group("Proxy".to_string()));
+    assert_eq!(
+        model.group("Proxy").unwrap().members,
+        vec![PolicyTarget::Node(hk), PolicyTarget::Direct]
+    );
+
+    let messages = imported
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("member HY2 was skipped")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("target HY2 was not imported")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.contains(&"proxy Home options were ignored: it routes as DIRECT"),
+        "{messages:?}"
+    );
+    assert!(diagnostic_codes(&imported)
+        .contains(&config_core::routing_import::ROUTING_IMPORT_OPTION_IGNORED_CODE));
+    assert!(messages.iter().all(|message| !message.contains("secret")));
+}
+
+#[test]
+fn clash_built_in_policy_proxies_route_as_their_policy() {
+    let profile = CLASH_PROFILE
+        .replace(
+            "proxy-groups:",
+            "  - name: Local\n    type: direct\n  - name: Ads\n    type: reject\nproxy-groups:",
+        )
+        .replace(
+            "  - MATCH,Proxy",
+            "  - DOMAIN,lan.example,Local\n  - DOMAIN,ads.example,Ads\n  - MATCH,Proxy",
+        );
+    let nodes = parse_nodes(&profile);
+    assert_eq!(nodes.len(), 2);
+
+    let imported = import_subscription_routing(&profile, &nodes);
+    let model = imported.routing.expect("clash routing should import");
+    let targets = model
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.matcher {
+            RuleMatcher::Domain(domain) => Some((domain.as_str(), rule.target.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        vec![
+            ("lan.example", PolicyTarget::Direct),
+            ("ads.example", PolicyTarget::Reject(RejectKind::Reject)),
+        ]
+    );
+}
+
+fn warning_messages(imported: &ImportedRouting) -> String {
+    imported
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const ONE_NODE_CLASH: &str = r#"
+proxies:
+  - { name: HK 01, type: ss, server: 82.47.34.99, port: 11111, cipher: aes-256-gcm, password: f43c0eee-13b9-4f07-bec9-d4b744141503 }
+"#;
+
+#[test]
+fn clash_geoip_lan_and_private_route_to_the_built_in_lan_set() {
+    let profile = format!(
+        "{ONE_NODE_CLASH}{}",
+        r#"proxy-groups:
+  - { name: Proxy, type: select, proxies: [HK 01, DIRECT] }
+rule-providers:
+  LAN:
+    type: http
+    behavior: ipcidr
+    url: https://rules.example/lan.txt
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,lan,DIRECT,no-resolve
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOIP,"Private",Proxy
+  - AND,((GEOIP,LAN),(DST-PORT,445)),REJECT
+  - OR,((GEOIP,private),(GEOIP,CN)),DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,Proxy
+"#
+    );
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    let spec = imported.spec.clone().expect("clash routing should import");
+    assert_eq!(
+        spec.rules,
+        vec![
+            "RULE-SET,LAN,DIRECT".to_string(),
+            "RULE-SET,LAN,DIRECT,no-resolve".to_string(),
+            "RULE-SET,LAN,DIRECT,no-resolve".to_string(),
+            "RULE-SET,LAN,Proxy".to_string(),
+            "AND,((RULE-SET,LAN),(DST-PORT,445)),REJECT".to_string(),
+            "OR,((RULE-SET,LAN),(GEOIP,CN)),DIRECT".to_string(),
+            "GEOIP,CN,DIRECT".to_string(),
+            "FINAL,Proxy".to_string(),
+        ]
+    );
+    // The built-in set, never the rule provider that happens to be called LAN.
+    assert!(imported.rule_sets.is_empty(), "{:?}", imported.rule_sets);
+    assert!(
+        !diagnostic_codes(&imported).contains(&ROUTING_IMPORT_RULE_SKIPPED_CODE),
+        "{}",
+        warning_messages(&imported)
+    );
+
+    let model = imported.routing.expect("routing should validate");
+    let environment = LanEnvironment(RuleSet::lan());
+    let lan = model.decide(
+        &RouteQuery {
+            ip: Some("192.168.1.1".parse().unwrap()),
+            port: Some(80),
+            ..RouteQuery::default()
+        },
+        &environment,
+    );
+    assert_eq!(lan.outcome, RouteOutcome::Direct);
+    let public = model.decide(
+        &RouteQuery {
+            ip: Some("1.1.1.1".parse().unwrap()),
+            port: Some(443),
+            ..RouteQuery::default()
+        },
+        &environment,
+    );
+    assert_eq!(public.outcome, RouteOutcome::Node(node_id(&nodes, "HK 01")));
+}
+
+/// Holds only the engine's built-in `LAN` set.
+struct LanEnvironment(RuleSet);
+
+impl RoutingEnvironment for LanEnvironment {
+    fn rule_set_matches(&self, name: &str, domain: Option<&str>, ip: Option<IpAddr>) -> bool {
+        name == LAN_RULE_SET && self.0.matches(domain, ip)
+    }
+
+    fn rule_set_needs_address(&self, name: &str) -> bool {
+        name == LAN_RULE_SET && self.0.needs_address()
+    }
+}
+
+/// `count` select groups `G0 -> G1 -> ... -> G<count-1>`, the last one
+/// holding `tail`, behind `FINAL,G0`.
+fn surge_group_chain(count: usize, tail: &str) -> String {
+    let mut profile = String::from(
+        "[Proxy]\nHK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503\n\n[Proxy Group]\n",
+    );
+    for index in 0..count {
+        if index + 1 == count {
+            profile.push_str(&format!("G{index} = select, {tail}\n"));
+        } else {
+            profile.push_str(&format!("G{index} = select, G{}\n", index + 1));
+        }
+    }
+    profile.push_str("\n[Rule]\nFINAL,G0\n");
+    profile
+}
+
+#[test]
+fn too_many_policy_groups_are_refused_before_any_work() {
+    let profile = surge_group_chain(MAX_SOURCE_POLICY_GROUPS + 1, "HK");
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    assert!(imported.spec.is_none());
+    assert_eq!(diagnostic_codes(&imported), [ROUTING_IMPORT_INVALID_CODE]);
+    assert!(
+        warning_messages(&imported).contains(&format!("more than {MAX_SOURCE_POLICY_GROUPS}")),
+        "{}",
+        warning_messages(&imported)
+    );
+}
+
+#[test]
+fn long_group_chains_import_or_drop_in_linear_rounds() {
+    // Every group resolves through the next one down to the node.
+    let profile = surge_group_chain(MAX_SOURCE_POLICY_GROUPS, "HK");
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    let spec = imported.spec.expect("a chain ending in a node imports");
+    assert_eq!(spec.groups.len(), MAX_SOURCE_POLICY_GROUPS);
+
+    // The last group names nothing that exists, so every group above it
+    // empties in turn and FINAL has no target left.
+    let profile = surge_group_chain(MAX_SOURCE_POLICY_GROUPS, "Missing");
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    assert!(imported.spec.is_none());
+    let skipped = imported
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == ROUTING_IMPORT_GROUP_SKIPPED_CODE)
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(skipped.len(), MAX_SOURCE_POLICY_GROUPS);
+    // Dropped from the empty end up, one round each.
+    let last = MAX_SOURCE_POLICY_GROUPS - 1;
+    assert_eq!(
+        skipped[0],
+        format!("policy group G{last} was skipped: none of its members can be imported")
+    );
+    assert_eq!(
+        skipped[last],
+        "policy group G0 was skipped: none of its members can be imported"
+    );
+    assert_eq!(
+        imported.diagnostics.last().unwrap().code,
+        ROUTING_IMPORT_INVALID_CODE
+    );
+}
+
+#[test]
+fn a_group_with_too_many_members_is_skipped() {
+    let mut profile = String::from(
+        "[Proxy]\nHK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503\n\n[Proxy Group]\nProxy = select, HK, DIRECT\nHuge = select, HK",
+    );
+    for index in 0..MAX_SOURCE_GROUP_MEMBERS {
+        profile.push_str(&format!(", Missing{index}"));
+    }
+    profile.push_str("\n\n[Rule]\nDOMAIN,huge.example,Huge\nFINAL,Proxy\n");
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    let spec = imported
+        .spec
+        .clone()
+        .expect("the other group still imports");
+    assert_eq!(spec.groups.len(), 1);
+    assert_eq!(spec.rules, vec!["FINAL,Proxy".to_string()]);
+    let messages = warning_messages(&imported);
+    assert!(
+        messages.contains(&format!(
+            "policy group Huge was skipped: it has more than {MAX_SOURCE_GROUP_MEMBERS} members"
+        )),
+        "{messages}"
+    );
+    assert!(messages.contains("rule 0 was skipped: target Huge was not imported"));
+}
+
+#[test]
+fn import_warnings_are_capped_with_a_count() {
+    let mut profile = String::from(
+        "[Proxy]\nHK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503\n\n[Proxy Group]\nProxy = select, HK",
+    );
+    let missing = MAX_IMPORT_WARNINGS + 10;
+    for index in 0..missing {
+        profile.push_str(&format!(", Missing{index}"));
+    }
+    profile.push_str("\n\n[Rule]\nFINAL,Proxy\n");
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    assert!(imported.spec.is_some());
+    let warnings = imported
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code != ROUTING_IMPORT_READY_CODE)
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), MAX_IMPORT_WARNINGS + 1);
+    assert_eq!(
+        warnings.last().unwrap().message,
+        "10 more import warnings were left out"
+    );
+}
+
+#[test]
+fn logical_rules_with_many_references_stay_linear_and_long_lines_are_skipped() {
+    // Many references to the same set: rewritten in one pass.
+    let references = vec!["(RULE-SET,LAN)"; 2_000].join(",");
+    let profile = format!(
+        "[Proxy]\nHK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503\n\n[Rule]\nOR,({references}),DIRECT\nFINAL,HK\n"
+    );
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    let spec = imported.spec.expect("the logical rule imports");
+    assert_eq!(spec.rules.len(), 2);
+    assert!(spec.rules[0].starts_with("OR,((RULE-SET,LAN),(RULE-SET,LAN),"));
+
+    // A line longer than the limit is skipped before it is parsed.
+    let count = MAX_SOURCE_RULE_LEN / "(RULE-SET,LAN),".len() + 1;
+    let references = vec!["(RULE-SET,LAN)"; count].join(",");
+    let profile = format!(
+        "[Proxy]\nHK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503\n\n[Rule]\nOR,({references}),DIRECT\nFINAL,HK\n"
+    );
+    let nodes = parse_nodes(&profile);
+    let imported = import_subscription_routing(&profile, &nodes);
+    let spec = imported.spec.clone().expect("the other rules import");
+    assert_eq!(spec.rules, vec![format!("FINAL,{}", node_id(&nodes, "HK"))]);
+    assert!(warning_messages(&imported).contains(&format!(
+        "rule 0 was skipped: it is longer than {MAX_SOURCE_RULE_LEN} bytes"
+    )));
 }

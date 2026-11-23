@@ -16,9 +16,13 @@ pub mod share_link;
 
 pub use share_link::share_link;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use config_core::certificate_pin;
-use config_core::routing::RoutingSpec;
-use config_core::routing_import::{import_subscription_routing, ImportedRuleSet};
+use config_core::routing::{parse_rule_line, RoutingSpec, RuleLine};
+use config_core::routing_import::{
+    import_subscription_routing, ImportedRuleSet, ROUTING_IMPORT_INVALID_CODE,
+};
 use control_domain::{
     NodeCatalog, NodeDescriptor, Protocol, SubscriptionService, SubscriptionSource,
     NODE_METADATA_ANX_ALPN, NODE_METADATA_ANX_BARE_PORT, NODE_METADATA_ANX_FINGERPRINT,
@@ -28,16 +32,18 @@ use control_domain::{
     NODE_METADATA_HYSTERIA2_PASSWORD, NODE_METADATA_IWAN_ENCRYPT, NODE_METADATA_IWAN_MTU,
     NODE_METADATA_IWAN_PASSWORD, NODE_METADATA_IWAN_USERNAME, NODE_METADATA_MIERU_PASSWORD,
     NODE_METADATA_MIERU_PORT_RANGE, NODE_METADATA_MIERU_TRANSPORT, NODE_METADATA_MIERU_USERNAME,
-    NODE_METADATA_MULTIPLEX, NODE_METADATA_PATH, NODE_METADATA_SHADOWSOCKS_METHOD,
-    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SNELL_MODE, NODE_METADATA_SNELL_OBFS,
-    NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI, NODE_METADATA_SNELL_PSK,
-    NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_SNELL_VERSION,
-    NODE_METADATA_TLS_ALPN, NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
-    NODE_METADATA_TLS_CERTIFICATE_SHA256, NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE,
-    NODE_METADATA_TLS_REALITY_PUBLIC_KEY, NODE_METADATA_TLS_REALITY_SHORT_ID,
-    NODE_METADATA_TLS_SERVER_NAME, NODE_METADATA_TLS_UTLS_FINGERPRINT,
-    NODE_METADATA_TROJAN_PASSWORD, NODE_METADATA_TUIC_CONGESTION_CONTROL,
-    NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID, NODE_METADATA_V2RAY_TRANSPORT_EXTRA,
+    NODE_METADATA_MULTIPLEX, NODE_METADATA_PATH, NODE_METADATA_PROXY_PASSWORD,
+    NODE_METADATA_PROXY_USERNAME, NODE_METADATA_SHADOWSOCKS_METHOD,
+    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SHADOWSOCKS_PLUGIN, NODE_METADATA_SNELL_MODE,
+    NODE_METADATA_SNELL_OBFS, NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI,
+    NODE_METADATA_SNELL_PSK, NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY,
+    NODE_METADATA_SNELL_VERSION, NODE_METADATA_TLS_ALPN,
+    NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
+    NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+    NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
+    NODE_METADATA_TLS_UTLS_FINGERPRINT, NODE_METADATA_TROJAN_PASSWORD,
+    NODE_METADATA_TUIC_CONGESTION_CONTROL, NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID,
+    NODE_METADATA_UNSUPPORTED_OPTION, NODE_METADATA_V2RAY_TRANSPORT_EXTRA,
     NODE_METADATA_V2RAY_TRANSPORT_HOST, NODE_METADATA_V2RAY_TRANSPORT_MODE,
     NODE_METADATA_V2RAY_TRANSPORT_PATH, NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME,
     NODE_METADATA_V2RAY_TRANSPORT_TYPE, NODE_METADATA_VIA, NODE_METADATA_VIA_UNRESOLVED,
@@ -46,7 +52,9 @@ use control_domain::{
     NODE_METADATA_WIREGUARD_ALLOWED_IPS, NODE_METADATA_WIREGUARD_LOCAL_ADDRESS,
     NODE_METADATA_WIREGUARD_MTU, NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
     NODE_METADATA_WIREGUARD_PRE_SHARED_KEY, NODE_METADATA_WIREGUARD_PRIVATE_KEY,
-    NODE_METADATA_WIREGUARD_RESERVED,
+    NODE_METADATA_WIREGUARD_RESERVED, NODE_UNSUPPORTED_OPTION_ECH,
+    NODE_UNSUPPORTED_OPTION_HTTP_OBFS, NODE_UNSUPPORTED_OPTION_HTTP_PROXY_HEADERS,
+    NODE_UNSUPPORTED_OPTION_TRANSPORT, NODE_UNSUPPORTED_OPTION_XHTTP,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -63,6 +71,9 @@ pub fn outbound_json(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     if metadata(node, NODE_METADATA_VIA_UNRESOLVED).is_some() {
         return Err("it connects through an outbound that is not one of the imported nodes");
     }
+    if let Some(option) = metadata(node, NODE_METADATA_UNSUPPORTED_OPTION) {
+        return Err(unsupported_option_reason(option));
+    }
     let mut outbound = match &node.protocol {
         Protocol::Shadowsocks => shadowsocks(node),
         Protocol::Vless => vless(node),
@@ -75,7 +86,9 @@ pub fn outbound_json(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         Protocol::Iwan => iwan(node),
         Protocol::Anx => anx(node),
         Protocol::WireGuard => wireguard(node),
-        _ => Err("protocol is not implemented by the embedded engine yet"),
+        Protocol::Http => http(node),
+        Protocol::Socks => socks(node),
+        _ => Err("this protocol is not supported yet"),
     }?;
     if let Some(via) = metadata(node, NODE_METADATA_VIA) {
         // These dial their own UDP or tunnel and cannot ride another node
@@ -109,14 +122,45 @@ pub fn outbound_json(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     Ok(outbound)
 }
 
+/// Why a node whose source names an option no node field carries
+/// ([`NODE_METADATA_UNSUPPORTED_OPTION`]) cannot run.
+fn unsupported_option_reason(option: &str) -> Unsupported {
+    match option {
+        NODE_UNSUPPORTED_OPTION_HTTP_OBFS => {
+            "http header obfuscation transports are not implemented yet"
+        }
+        NODE_UNSUPPORTED_OPTION_TRANSPORT => {
+            "transports other than tcp, ws, grpc and xhttp are not implemented yet"
+        }
+        NODE_UNSUPPORTED_OPTION_ECH => "encrypted client hello (ECH) is not implemented yet",
+        NODE_UNSUPPORTED_OPTION_XHTTP => {
+            "xhttp options other than path, host, mode and headers are not implemented yet"
+        }
+        NODE_UNSUPPORTED_OPTION_HTTP_PROXY_HEADERS => {
+            "extra headers or a request path of an http proxy are not implemented yet"
+        }
+        _ => "an option of this node is not implemented yet",
+    }
+}
+
 /// Largest subscription text [`import_text`] accepts.
 pub const MAX_IMPORT_TEXT_LEN: usize = 4 * 1024 * 1024;
 
 /// Most nodes, rules and policy groups a routed config may carry. The engine
-/// (`engine_embedded::config`) enforces the same limits.
+/// (`engine_embedded::config`) enforces the same limits. 64 nodes is what
+/// the iOS packet tunnel's memory budget is sized for (each routed node is
+/// a live outbound, and health checks probe every member of a group at
+/// once); a subscription with more nodes routes the ones its rules and
+/// groups name (see [`ImportReport::routed_node_ids`]).
 pub const MAX_ROUTED_OUTBOUNDS: usize = 64;
 pub const MAX_ROUTING_RULES: usize = 4096;
 pub const MAX_POLICY_GROUPS: usize = 64;
+/// Most network rules one `subnet` group may have; the engine enforces the
+/// same limit.
+pub const MAX_NETWORK_RULES: usize = 64;
+/// Longest `via` chain, the node itself included; the engine enforces the
+/// same limit.
+pub const MAX_VIA_CHAIN: usize = 4;
 
 /// Nodes found in a subscription text, in its order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -125,26 +169,87 @@ pub struct ImportReport {
     pub unsupported: Vec<UnsupportedNode>,
     /// The subscription's rules, policy groups and remote rule sets as the
     /// engine's `routing` section without `outbounds` (see [`routing_json`]
-    /// and [`rule_sets_json`]). Present only when
-    /// every node can run, every node id is a valid outbound id and the result
-    /// fits the limits above; rules and groups name nodes by
-    /// [`ImportedNode::id`].
+    /// and [`rule_sets_json`]); rules and groups name nodes by
+    /// [`ImportedNode::id`]. Nodes that cannot run (and nodes whose id is not
+    /// a valid outbound id, or whose `via` chain cannot run) are left out of
+    /// it: group members naming them are dropped, groups left without
+    /// members are dropped, and rules sending traffic to either are skipped,
+    /// each with a [`ImportReport::routing_warnings`] line. Absent when the
+    /// subscription has no rules, or when what is left is not a valid
+    /// routing (no FINAL rule, ...) or does not fit the limits above; a
+    /// [`ImportReport::routing_warnings`] line then says why.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing: Option<Value>,
+    /// With [`ImportReport::routing`], the ids of the nodes its
+    /// `routing.outbounds` must hold, in subscription order: every node that
+    /// can be routed when they are at most [`MAX_ROUTED_OUTBOUNDS`],
+    /// otherwise only the nodes the rules, groups and rule set downloads
+    /// name, with the nodes they connect through. A client adds the node it
+    /// sends global mode to (and that node's `via` chain) when it is not
+    /// listed; the list leaves room for that ([`MAX_VIA_CHAIN`] entries).
+    /// Absent without routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_node_ids: Option<Vec<String>>,
     /// What importing the subscription's rules left out, one line each
-    /// (rules of unsupported types counted by type, Surge's built-in
-    /// `RULE-SET,SYSTEM`, targets that were not imported, ...), so a client
-    /// can say so instead of the rules silently matching less. English, fixed
-    /// wording with rule types, indexes and policy names; never a list URL.
-    /// Left out when nothing was.
+    /// (nodes that cannot run, counted; rules of unsupported types counted
+    /// by type, Surge's built-in `RULE-SET,SYSTEM`, targets that were not
+    /// imported, ...) and, when there is no routing, why, so a client can
+    /// say so instead of the rules silently matching less or the
+    /// subscription silently running one node. English, fixed wording with
+    /// counts, limits, rule types, indexes and policy names; never a node's
+    /// credentials or a list URL. The summary lines (nodes left out, why
+    /// there is no routing) come first. Left out when nothing was.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub routing_warnings: Vec<String>,
+    /// Subscription entries that could not be read and were left out so the
+    /// others still import (a proxy type no reader knows, a malformed share
+    /// link, a field of the wrong type), at most [`MAX_SKIPPED_ENTRIES`].
+    /// Unlike [`ImportReport::unsupported`] these never became nodes, and
+    /// they do not keep [`ImportReport::routing`] out: rules and group
+    /// members that name them are left out with a
+    /// [`ImportReport::routing_warnings`] line instead. Built-in policy
+    /// entries (Surge's `DIRECT = direct`, a Clash `type: direct` proxy) are
+    /// not listed. Left out when nothing was skipped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedEntry>,
+    /// How many entries were skipped, also those past
+    /// [`MAX_SKIPPED_ENTRIES`]. Left out when none were.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skipped_count: usize,
+}
+
+/// A subscription entry left out of the import, with a fixed reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedEntry {
+    /// The stable reason code (`subscription.core.*`), such as
+    /// `subscription.core.clash_yaml_unsupported`.
+    pub code: String,
+    /// English, fixed wording: the entry's format and position, its name
+    /// and type when they read as labels, and why it was skipped. Never the
+    /// entry's text or credentials.
+    pub message: String,
+}
+
+/// Most [`ImportReport::skipped`] entries kept.
+pub const MAX_SKIPPED_ENTRIES: usize = 32;
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// A node the engine can run. `outbound` holds its credentials.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImportedNode {
+    /// Stable node id: the same server keeps it when the subscription
+    /// reorders, adds, removes or renames entries
+    /// (`docs/architecture/subscription-node-ids.md`).
     pub id: String,
+    /// The id earlier releases gave this node (name plus position), so a
+    /// client can move a selection it saved under that id to [`Self::id`].
+    /// Only reliable for the subscription content the client saved it with.
+    /// Left out for nodes that never had another id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_id: Option<String>,
     pub name: String,
     /// The outbound `type`.
     pub protocol: String,
@@ -198,15 +303,20 @@ pub fn import_text(text: &str) -> Result<ImportReport, ImportError> {
         id: "import".to_string(),
         location: format!("inline:{text}"),
     };
-    let catalog: NodeCatalog = service
+    let document = service
         .fetch(&source)
         .and_then(|raw| service.parse(&raw))
-        .and_then(|document| service.normalize(&document))
+        .map_err(|_| ImportError::Unrecognized)?;
+    let catalog: NodeCatalog = service
+        .normalize(&document)
         .map_err(|_| ImportError::Unrecognized)?;
     let mut report = report(&catalog.nodes);
-    let (routing, warnings) = subscription_routing(text, &catalog.nodes, &report);
-    report.routing = routing;
-    report.routing_warnings = warnings;
+    (report.skipped, report.skipped_count) = skipped_entries(&document.diagnostics);
+    let fitted =
+        fit_subscription_routing(text, &catalog.nodes, &|node| outbound_json(node).is_ok());
+    report.routing = fitted.routing;
+    report.routed_node_ids = fitted.routed_node_ids;
+    report.routing_warnings = fitted.warnings;
     Ok(report)
 }
 
@@ -246,31 +356,267 @@ pub fn routing_json(spec: &RoutingSpec) -> Value {
 /// were left out.
 const MAX_ROUTING_WARNINGS: usize = 32;
 
-fn subscription_routing(
+/// A subscription's rules and policy groups fitted to the nodes that can
+/// run; see [`fit_subscription_routing`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FittedRouting {
+    /// As [`ImportReport::routing`].
+    pub routing: Option<Value>,
+    /// The rules and groups `routing` was built from, for an engine envelope
+    /// (`engine_embedded::nodes::routing_envelope_with_sets`). `None`
+    /// without routing.
+    pub spec: Option<RoutingSpec>,
+    /// The remote rule sets `spec` names; empty without routing.
+    pub rule_sets: Vec<ImportedRuleSet>,
+    /// As [`ImportReport::routed_node_ids`].
+    pub routed_node_ids: Option<Vec<String>>,
+    /// As [`ImportReport::routing_warnings`].
+    pub warnings: Vec<String>,
+}
+
+/// Imports the rules and policy groups of subscription `text` for the
+/// `nodes` read from it, keeping to the nodes the engine can route.
+///
+/// A node can be routed when `runnable` accepts it, its id is a valid
+/// outbound id, and the nodes it connects through (`via`, at most
+/// [`MAX_VIA_CHAIN`] including itself) can be routed too. The others are
+/// left out of the import: group members and rules naming them are dropped
+/// with a warning each, as for any target that was not imported, so one
+/// node that cannot run no longer costs the whole subscription its rules.
+/// When more than [`MAX_ROUTED_OUTBOUNDS`] nodes can be routed, only those
+/// the rules, groups and rule sets name are
+/// ([`ImportReport::routed_node_ids`]).
+///
+/// Routing is left out, with a warning line saying why, when the
+/// subscription's rules do not form a valid routing, or the result exceeds
+/// [`MAX_ROUTING_RULES`], [`MAX_POLICY_GROUPS`] or [`MAX_NETWORK_RULES`],
+/// or names more nodes than fit. A subscription without rules gets neither
+/// routing nor warnings.
+pub fn fit_subscription_routing(
     text: &str,
     nodes: &[NodeDescriptor],
-    report: &ImportReport,
-) -> (Option<Value>, Vec<String>) {
-    if !report.unsupported.is_empty()
-        || report.nodes.is_empty()
-        || report.nodes.len() > MAX_ROUTED_OUTBOUNDS
-        || !report.nodes.iter().all(|node| is_outbound_id(&node.id))
-    {
-        return (None, Vec::new());
+    runnable: &dyn Fn(&NodeDescriptor) -> bool,
+) -> FittedRouting {
+    let mut by_id: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        by_id.entry(node.id.as_str()).or_insert(index);
     }
-    let imported = import_subscription_routing(text, nodes);
-    let warnings = routing_warnings(&imported.diagnostics);
-    let Some(spec) = imported.spec else {
-        return (None, warnings);
+    let usable = nodes
+        .iter()
+        .map(|node| is_outbound_id(&node.id) && runnable(node))
+        .collect::<Vec<_>>();
+    let mut routable = Vec::new();
+    let (mut cannot_run, mut invalid_ids, mut broken_chains) = (0usize, 0usize, 0usize);
+    for (index, node) in nodes.iter().enumerate() {
+        if !is_outbound_id(&node.id) {
+            invalid_ids += 1;
+        } else if !usable[index] {
+            cannot_run += 1;
+        } else if via_chain(nodes, &by_id, &usable, index).is_none() {
+            broken_chains += 1;
+        } else {
+            routable.push(node.clone());
+        }
+    }
+
+    let imported = import_subscription_routing(text, &routable);
+    if imported.spec.is_none() && imported.diagnostics.is_empty() {
+        // The subscription has no rules: nothing to say.
+        return FittedRouting {
+            routing: None,
+            spec: None,
+            rule_sets: Vec::new(),
+            routed_node_ids: None,
+            warnings: Vec::new(),
+        };
+    }
+    let mut summary = Vec::new();
+    for (count, what) in [
+        (cannot_run, "that cannot run"),
+        (invalid_ids, "whose ids are not valid outbound ids"),
+        (broken_chains, "whose via chain cannot run or is too long"),
+    ] {
+        if count > 0 {
+            summary.push(format!(
+                "{count} {} {what} {} left out of the subscription's rules and policy groups",
+                if count == 1 { "node" } else { "nodes" },
+                if count == 1 { "was" } else { "were" },
+            ));
+        }
+    }
+    // The line saying why the import produced no routing leads, so the
+    // cap on the other lines never cuts it.
+    let (invalid, others): (Vec<_>, Vec<_>) = imported
+        .diagnostics
+        .iter()
+        .cloned()
+        .partition(|diagnostic| diagnostic.code == ROUTING_IMPORT_INVALID_CODE);
+    let diagnostics = routing_warnings(&others);
+    let invalid = invalid
+        .into_iter()
+        .last()
+        .map(|diagnostic| diagnostic.message);
+    let without = |summary: Vec<String>, reason: Option<String>| {
+        let mut warnings = summary;
+        warnings.extend(reason);
+        warnings.extend(diagnostics.iter().cloned());
+        FittedRouting {
+            routing: None,
+            spec: None,
+            rule_sets: Vec::new(),
+            routed_node_ids: None,
+            warnings,
+        }
     };
-    if spec.rules.len() > MAX_ROUTING_RULES || spec.groups.len() > MAX_POLICY_GROUPS {
-        return (None, warnings);
+    let Some(spec) = imported.spec else {
+        // The import's own warning says why.
+        return without(summary, invalid);
+    };
+    if spec.rules.len() > MAX_ROUTING_RULES {
+        let reason = format!("{} rules, more than {MAX_ROUTING_RULES}", spec.rules.len());
+        return without(summary, Some(not_used(reason)));
     }
+    if spec.groups.len() > MAX_POLICY_GROUPS {
+        let reason = format!(
+            "{} policy groups, more than {MAX_POLICY_GROUPS}",
+            spec.groups.len()
+        );
+        return without(summary, Some(not_used(reason)));
+    }
+    if let Some(group) = spec
+        .groups
+        .iter()
+        .find(|group| group.network_rules.len() > MAX_NETWORK_RULES)
+    {
+        let reason = format!(
+            "policy group {} has {} network rules, more than {MAX_NETWORK_RULES}",
+            group.id,
+            group.network_rules.len()
+        );
+        return without(summary, Some(not_used(reason)));
+    }
+    if routable.is_empty() {
+        return without(summary, Some(not_used("no node can run".to_string())));
+    }
+
+    let routed_node_ids = if routable.len() <= MAX_ROUTED_OUTBOUNDS {
+        routable
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        let named = named_nodes(&spec, &imported.rule_sets, nodes, &by_id, &usable);
+        // Room for the node global mode sends to, with its chain.
+        let limit = MAX_ROUTED_OUTBOUNDS - MAX_VIA_CHAIN;
+        if named.len() > limit {
+            let reason = format!(
+                "{} nodes can run and the rules and policy groups name {} of them, more than {limit}",
+                routable.len(),
+                named.len()
+            );
+            return without(summary, Some(not_used(reason)));
+        }
+        named
+    };
+
     let mut routing = routing_json(&spec);
     if !imported.rule_sets.is_empty() {
         routing["rule_sets"] = rule_sets_json(&imported.rule_sets);
     }
-    (Some(routing), warnings)
+    let mut warnings = summary;
+    warnings.extend(diagnostics);
+    FittedRouting {
+        routing: Some(routing),
+        spec: Some(spec),
+        rule_sets: imported.rule_sets,
+        routed_node_ids: Some(routed_node_ids),
+        warnings,
+    }
+}
+
+fn not_used(reason: String) -> String {
+    format!("subscription rules and policy groups were not used: {reason}")
+}
+
+/// The indexes of node `index` and of the nodes it connects through, when
+/// each is `usable` and the chain is at most [`MAX_VIA_CHAIN`] long; `None`
+/// otherwise (a node it names is missing or unusable, a cycle, or a chain
+/// the engine refuses).
+fn via_chain(
+    nodes: &[NodeDescriptor],
+    by_id: &BTreeMap<&str, usize>,
+    usable: &[bool],
+    index: usize,
+) -> Option<Vec<usize>> {
+    let mut chain = vec![index];
+    let mut current = index;
+    while let Some(via) = metadata(&nodes[current], NODE_METADATA_VIA) {
+        let next = *by_id.get(via)?;
+        if !usable[next] || chain.len() >= MAX_VIA_CHAIN {
+            return None;
+        }
+        chain.push(next);
+        current = next;
+    }
+    Some(chain)
+}
+
+/// The ids of the routable nodes `spec` and `rule_sets` name (group
+/// members, defaults and network rule targets, rule targets, rule set
+/// download `via`), with the nodes they connect through, in subscription
+/// order.
+fn named_nodes(
+    spec: &RoutingSpec,
+    rule_sets: &[ImportedRuleSet],
+    nodes: &[NodeDescriptor],
+    by_id: &BTreeMap<&str, usize>,
+    usable: &[bool],
+) -> Vec<String> {
+    let targets = spec
+        .rules
+        .iter()
+        .filter_map(|rule| match parse_rule_line(rule) {
+            Ok(RuleLine::Rule { target, .. }) | Ok(RuleLine::Final { target, .. }) => Some(target),
+            Err(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for group in &spec.groups {
+        names.extend(group.members.iter().map(|member| member.trim()));
+        names.extend(group.default.iter().map(|default| default.trim()));
+        names.extend(group.network_rules.iter().map(|rule| rule.target.trim()));
+    }
+    names.extend(targets.iter().map(|target| target.trim()));
+    names.extend(rule_sets.iter().filter_map(|set| set.via.as_deref()));
+    let mut named = BTreeSet::new();
+    for name in names {
+        let Some(&index) = by_id.get(name) else {
+            continue;
+        };
+        if let Some(chain) = via_chain(nodes, by_id, usable, index) {
+            named.extend(chain);
+        }
+    }
+    named
+        .into_iter()
+        .map(|index| nodes[index].id.clone())
+        .collect()
+}
+
+/// The entries a subscription parser left out (its warnings), at most
+/// [`MAX_SKIPPED_ENTRIES`], and how many there were.
+fn skipped_entries(diagnostics: &[control_domain::Diagnostic]) -> (Vec<SkippedEntry>, usize) {
+    let mut skipped = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == control_domain::DiagnosticSeverity::Warning)
+        .map(|diagnostic| SkippedEntry {
+            code: diagnostic.code.clone(),
+            message: diagnostic.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    let count = skipped.len();
+    skipped.truncate(MAX_SKIPPED_ENTRIES);
+    (skipped, count)
 }
 
 /// The warnings of a routing import, at most [`MAX_ROUTING_WARNINGS`].
@@ -345,12 +691,16 @@ pub fn report(nodes: &[NodeDescriptor]) -> ImportReport {
         nodes: Vec::new(),
         unsupported: Vec::new(),
         routing: None,
+        routed_node_ids: None,
         routing_warnings: Vec::new(),
+        skipped: Vec::new(),
+        skipped_count: 0,
     };
     for node in nodes {
         match outbound_json(node) {
             Ok(outbound) => report.nodes.push(ImportedNode {
                 id: node.id.clone(),
+                legacy_id: config_core::node_id::legacy_node_id(node).map(str::to_string),
                 name: node.name.clone(),
                 protocol: outbound["type"].as_str().unwrap_or_default().to_string(),
                 server: node.endpoint.host.clone(),
@@ -418,6 +768,10 @@ fn shadowsocks(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         metadata(node, NODE_METADATA_SHADOWSOCKS_METHOD).ok_or("shadowsocks method is missing")?;
     let password = metadata(node, NODE_METADATA_SHADOWSOCKS_PASSWORD)
         .ok_or("shadowsocks password is missing")?;
+    // Without its plugin the server would only see bytes it drops.
+    if metadata(node, NODE_METADATA_SHADOWSOCKS_PLUGIN).is_some() {
+        return Err("shadowsocks plugins (obfs, websocket, shadow-tls) are not implemented yet");
+    }
     if !matches!(
         method,
         "2022-blake3-aes-128-gcm"
@@ -519,6 +873,9 @@ fn vmess(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         None | Some("0")
     ) {
         return Err("vmess alterId other than 0 (legacy headers) is not supported");
+    }
+    if metadata(node, NODE_METADATA_TLS_REALITY_PUBLIC_KEY).is_some() {
+        return Err("vmess over REALITY is not supported");
     }
     let transport = v2ray_transport(node)?;
     Ok(json!({
@@ -983,12 +1340,97 @@ fn alpn_list(node: &NodeDescriptor) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// An HTTP proxy (`outbound-http`), over TLS when the node enables it (an
+/// HTTPS proxy). The credentials are checked here as the outbound checks
+/// them, so a node it would refuse is reported instead of failing the
+/// whole routed config.
+fn http(node: &NodeDescriptor) -> Result<Value, Unsupported> {
+    let username = metadata(node, NODE_METADATA_PROXY_USERNAME);
+    let password = metadata(node, NODE_METADATA_PROXY_PASSWORD);
+    match (username, password) {
+        (None, Some(_)) => return Err("http proxy password is set without a username"),
+        (Some(username), _) if username.contains(':') => {
+            return Err("http proxy username cannot contain ':'")
+        }
+        _ => {}
+    }
+    if metadata(node, NODE_METADATA_TLS_REALITY_PUBLIC_KEY).is_some() {
+        return Err("http proxy over REALITY is not supported");
+    }
+    let tls = metadata(node, NODE_METADATA_TLS_ENABLED) == Some("true");
+    let pins = certificate_pins(node)?;
+    if !tls && !pins.is_empty() {
+        return Err("certificate pins are set on a node without tls");
+    }
+    // `tls` is a flag here, not the TLS object other outbounds take.
+    let mut outbound = json!({
+        "type": "http",
+        "server": node.endpoint.host,
+        "port": node.endpoint.port,
+        "tls": tls,
+    });
+    if let Some(username) = username {
+        outbound["username"] = json!(username);
+    }
+    if let Some(password) = password {
+        outbound["password"] = json!(password);
+    }
+    if tls {
+        if let Some(server_name) = metadata(node, NODE_METADATA_TLS_SERVER_NAME) {
+            outbound["server_name"] = json!(server_name);
+        }
+        outbound["insecure"] = json!(metadata(node, NODE_METADATA_TLS_INSECURE) == Some("true"));
+        pins.insert_into(&mut outbound);
+    }
+    Ok(outbound)
+}
+
+/// A SOCKS5 proxy (`outbound-socks`). The outbound has no TLS, so a node
+/// that asks for it is reported rather than run in the clear.
+fn socks(node: &NodeDescriptor) -> Result<Value, Unsupported> {
+    if metadata(node, NODE_METADATA_TLS_ENABLED) == Some("true")
+        || metadata(node, NODE_METADATA_TLS_REALITY_PUBLIC_KEY).is_some()
+    {
+        return Err("socks over tls is not supported");
+    }
+    if !certificate_pins(node)?.is_empty() {
+        return Err("certificate pins are set on a node without tls");
+    }
+    let mut outbound = json!({
+        "type": "socks",
+        "server": node.endpoint.host,
+        "port": node.endpoint.port,
+    });
+    match (
+        metadata(node, NODE_METADATA_PROXY_USERNAME),
+        metadata(node, NODE_METADATA_PROXY_PASSWORD),
+    ) {
+        (None, None) => {}
+        (Some(username), Some(password)) => {
+            // RFC 1929 carries each in one length byte.
+            let fits = |value: &str| (1..=255).contains(&value.len());
+            if !fits(username) || !fits(password) {
+                return Err("socks username and password must be 1 to 255 bytes");
+            }
+            outbound["username"] = json!(username);
+            outbound["password"] = json!(password);
+        }
+        _ => return Err("socks username and password must be set together"),
+    }
+    Ok(outbound)
+}
+
 fn trojan(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     let password =
         metadata(node, NODE_METADATA_TROJAN_PASSWORD).ok_or("trojan password is missing")?;
     let transport = v2ray_transport(node)?;
     if metadata(node, NODE_METADATA_TLS_ENABLED) == Some("false") {
         return Err("trojan without tls is not supported");
+    }
+    // Running it as plain TLS would only reach the REALITY server's cover
+    // site.
+    if metadata(node, NODE_METADATA_TLS_REALITY_PUBLIC_KEY).is_some() {
+        return Err("trojan over REALITY is not implemented yet");
     }
     let pins = certificate_pins(node)?;
     let mut outbound = json!({

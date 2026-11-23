@@ -118,21 +118,16 @@ outbounds for catalog conversion and rendered back into a generated sing-box
 config. It does not add remote fetching, multi-node selectors, XHTTP/ECH or
 multiplex inference, arbitrary native-field translation, or HTTP/2/HTTP/3 MITM.
 
-Clash YAML may be imported as a catalog-only parser gate when the payload has a
-top-level `proxies` list. The initial supported proxy subset reads only
-`name`, `type`, `server`, `port`, `cipher`, `password`, and `uuid`; it accepts
-`ss`/`shadowsocks`, `trojan`, `vless`, and `vmess` proxy types and maps them to
-the corresponding `Protocol` plus the same per-protocol metadata used by URL
-imports. Imported Clash nodes must include
-`NODE_METADATA_SOURCE_FORMAT=clash-yaml`; unsupported Clash proxy types must
-fail with `subscription.core.clash_yaml_unsupported`, and malformed supported
-proxies must fail with `subscription.core.clash_yaml_invalid` without echoing
-raw subscription content or secrets. Clash `proxy-groups`, `rules`, provider
-URLs, transport options, TLS options, UDP flags, and adapter rendering remain
-deferred. This does not make Linux `run-url` render or run Clash YAML. The
-Windows GUI may consume the basic node catalog through its explicit local-profile
-import, but unsupported transport and TLS fields remain absent from generated
-config.
+Clash YAML is imported when the payload has a top-level `proxies` list. Each
+proxy maps to the corresponding `Protocol` plus the same per-protocol metadata
+used by URL imports, with `NODE_METADATA_SOURCE_FORMAT=clash-yaml`; unsupported
+Clash proxy types are skipped with `subscription.core.clash_yaml_unsupported`
+and malformed proxies with `subscription.core.clash_yaml_invalid`, without
+echoing raw subscription content or secrets. Vmess, VLESS and Trojan proxies
+keep their TLS, REALITY and transport options as the equivalent share link
+does (see "Clash, Surge, Loon and Quantumult X TLS and transport options"
+below), so they import as the same outbound. Clash `proxy-groups`, `rules` and
+rule providers are imported by `routing_import`.
 
 sing-box JSON may be imported as a catalog-only parser gate when the payload
 has a top-level `outbounds` list. The supported outbound subset reads `type`,
@@ -155,7 +150,8 @@ and malformed supported outbounds must fail with
 content or secrets. For catalog conversion, only the documented V2Ray-family
 and Hysteria2/TUIC subsets are retained; other sing-box TLS, transport,
 multiplex, route, DNS, inbound, experimental, and adapter fields remain
-deferred. This does not make Linux `run-url` render or run sing-box JSON. A
+deferred; a Shadowsocks `plugin` is recorded by name (see below). This does
+not make Linux `run-url` render or run sing-box JSON. A
 native sing-box JSON document selected in the Windows GUI still bypasses this
 catalog converter and is copied unchanged.
 
@@ -169,8 +165,10 @@ has a `[Proxy]` section. The initial supported line subset reads
 types must fail with `subscription.core.surge_proxy_line_unsupported`, and
 malformed supported proxy lines must fail with
 `subscription.core.surge_proxy_line_invalid` without echoing raw subscription
-content or secrets. Surge proxy groups, rules, policy logic, TLS/transport
-options, UDP flags, and adapter rendering remain deferred. This does not make
+content or secrets. Shadowsocks lines record `obfs` and ShadowTLS as a plugin;
+VMess and Trojan lines keep their TLS and WebSocket options (see below). Surge
+UDP flags and adapter rendering remain deferred; proxy groups and rules are
+imported by `routing_import`. This does not make
 Linux `run-url` render or run Surge. The Windows GUI can use the basic
 normalized node through local-profile import only.
 
@@ -185,8 +183,11 @@ UUID field. Imported Loon nodes must include
 types must fail with `subscription.core.loon_proxy_line_unsupported`, and
 malformed supported proxy lines must fail with
 `subscription.core.loon_proxy_line_invalid` without echoing raw subscription
-content or secrets. Loon policy groups, rules, TLS/transport options, UDP
-flags, remote proxy providers, and adapter rendering remain deferred. This does
+content or secrets. Shadowsocks lines record `obfs-name` and ShadowTLS as a
+plugin; VMess, VLESS and Trojan lines keep their TLS, REALITY and transport
+options (see below). Loon UDP flags, remote proxy providers, and adapter
+rendering remain deferred; policy groups and rules are imported by
+`routing_import`. This does
 not make Linux `run-url` render or run Loon. The Windows GUI can use the basic
 normalized node through local-profile import only.
 
@@ -203,15 +204,64 @@ proxy/server line types must fail with
 `subscription.core.quantumult_x_proxy_line_unsupported`, and malformed supported
 proxy/server lines must fail with
 `subscription.core.quantumult_x_proxy_line_invalid` without echoing raw
-subscription content or secrets. Quantumult X `[server_remote]`, policies,
-filters, rewrite/task sections, TLS/transport/obfs options, UDP flags, remote
-subscription fetching, and adapter rendering remain deferred. This does not
+subscription content or secrets. Shadowsocks lines record `obfs` as a plugin;
+VMess, VLESS and Trojan lines keep their `obfs`, TLS and REALITY options (see
+below). Quantumult X `[server_remote]`, rewrite/task sections, UDP flags,
+remote subscription fetching, and adapter rendering remain deferred. This does not
 make Linux `run-url` render or run Quantumult X. The Windows GUI can use the
 basic normalized node through local-profile import only.
 
 Hysteria v1 and other non-listed formats remain follow-up formats.
 They must still enter through `SubscriptionService` and `NodeCatalog`, not
 through platform-specific parsers.
+
+### Clash, Surge, Loon and Quantumult X TLS and transport options
+
+The proxy-line and Clash readers spell a node's TLS, REALITY and transport
+options as the fields of the equivalent share link and write them through the
+same mapping, so `node-import` builds the same outbound from a Clash proxy, a
+Surge/Loon/Quantumult X line, or the share link for that node:
+
+| Share-link field | Clash | Surge | Loon | Quantumult X |
+| --- | --- | --- | --- | --- |
+| `security=tls` | `tls: true` | `tls=true` | `over-tls=true` | `over-tls=true`, `obfs=over-tls`, `obfs=wss` |
+| `security=reality`, `pbk`, `sid` | `reality-opts: {public-key, short-id}` | – | `public-key=`, `short-id=` | `reality-base64-pubkey=`, `reality-hex-shortid=` |
+| `sni` | `servername` / `sni` | `sni=` | `sni=` / `tls-name=` | `tls-host=`, else `obfs-host=` of a TLS `obfs` |
+| `insecure` | `skip-cert-verify` | `skip-cert-verify=` | `skip-cert-verify=` | `tls-verification=false` |
+| `alpn` | `alpn: [...]` | – | `alpn=` | – |
+| `fp` | `client-fingerprint` | – | – | – |
+| `type=ws`, `path`, `host` | `network: ws`, `ws-opts: {path, headers: {Host}}` | `ws=true`, `ws-path=`, `ws-headers=Host:...` | `transport=ws`, `path=`, `host=` | `obfs=ws`/`wss`, `obfs-uri=`, `obfs-host=` |
+| `type=grpc`, `serviceName` | `network: grpc`, `grpc-opts: {grpc-service-name}` | – | `transport=grpc`, `grpc-service-name=` | – |
+| `type=h2` | `network: h2`, `h2-opts: {host, path}` | – | – | – |
+| `type=httpupgrade` | `ws-opts: {v2ray-http-upgrade: true}` | – | – | – |
+| `type=xhttp`, `path`, `host`, `mode` | `network: xhttp`, `xhttp-opts` | – | – | – |
+| `flow` | `flow` | – | `flow=` | `vless-flow=` |
+| VMess `scy`, `aid` | `cipher`, `alterId` | `encrypt-method=` | positional cipher, `alterId=` | `method=` |
+
+Trojan runs TLS unless the source turns it off; vmess and VLESS run TLS only
+when the source says so, and a node whose source does not ask for TLS stays a
+plaintext node, as `security=none` does. VMess `none`/`zero` security is not
+kept: the client chooses the VMess security and servers accept any, so such a
+node runs with `auto`. Certificate pins come from the `certificate_pin`
+spellings listed in the config-core README.
+
+Options the engine cannot carry make the node unsupported instead of running
+it differently: Clash `network: http`, Loon `transport=http` and Quantumult X
+`obfs=http` (HTTP/1.1 header obfuscation), unknown transports, Clash
+`ech-opts` with `enable: true`, and `xhttp-opts` keys other than `path`,
+`host`, `mode` and `headers` are written as `proxy.unsupported_option` (a fixed
+code), which `node-import` reports with a fixed reason. Transports the mapping
+knows but the engine does not run (`h2`, `httpupgrade`) are reported by
+`node-import` the same way as for share links. Trojan and vmess nodes with
+REALITY settings are unsupported.
+
+Shadowsocks SIP003 plugins are recorded by name only, as
+`shadowsocks.plugin` (their options can hold passwords): share-link
+`?plugin=` (also after SIP002's `/`), Clash `plugin`, sing-box `plugin`,
+Surge `obfs=` and `shadow-tls-password=`, Loon `obfs-name=`, positional
+`http`/`tls` and `shadow-tls-password=`, and Quantumult X `obfs=`. The engine
+implements no plugin, so `node-import` reports these nodes as unsupported
+rather than running them as plain Shadowsocks.
 
 ## sing-box Translation
 

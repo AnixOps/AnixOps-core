@@ -376,6 +376,36 @@ run URL 和状态，以 `task_state: pending_ci`、`next_action: resume_after_ci
 
 如果 GitHub CLI 不可用，可在 GitHub 网页端进入 `Actions`，选择 `CI`，手动触发 `workflow_dispatch`。
 
+## 客户端跟进：订阅导入保留 TLS/传输层参数（fix/k2-import-tls-fields）
+
+客户端按 git rev 固定内核，以下事项需在 AnixOps/anixops-net 的客户端 PR 中完成，内核无法代做：
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- Windows/Linux Tauri 应用（`apps/windows-gui/src/gui/tauri_ui.rs` 选单节点处）：按 `profile_node_id` 过滤已保存选择时同时要求 `outbound_for_node(node).is_ok()`，已保存的节点现在变为不支持时回落到 `single_node_envelope(.., None)`（内核已改为取第一个可运行节点），而不是整份配置失败。
+- iOS：`TunnelNodeImport.swift` 保留更具体的 `unsupportedPlugin` 提示。
+- 发布说明提示用户刷新订阅或重新导入：已保存的出站是旧导入结果，不会自动更新。
+- Surge `sni=off` 目前仍按服务器名发送 SNI（读取器文档注释已说明），是否改为报不支持待定。
+
+## 客户端跟进：分享链接端口后的 `/`、省略端口与 SIP002 百分号解码（fix/k2-share-link）
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- 发布说明提示：之前以 `ss://2022-...:<百分号编码密钥>@...` 导入的 SS-2022 节点保存的是未解码的密钥，刷新订阅或重新导入后才能连接；桌面 `embedded_nodes` 缓存的出站 JSON 与 iOS 节点库保存的导入报告不会自动更正。
+- iOS/Android 若有各自的分享链接解析器（如 Swift `ShadowsocksNodeLink`），应与内核保持一致：接受 `host:port/?query`、Hysteria2 省略端口为 443、SIP002 明文 userinfo 百分号解码。
+- node-import 的 hysteria2 出站目前不读 `hysteria2.server_ports`，端口跳跃列表只作为元数据保留，节点使用连接端口。
+
+## 客户端跟进：订阅节点稳定 id（fix/k2-node-id）
+
+订阅节点的 id 改为与名称、位置无关的稳定 id（规则见 `docs/architecture/subscription-node-ids.md`），升级内核后所有订阅节点的 id 都会变。客户端（AnixOps/anixops-net）按 git rev 固定内核，以下事项必须在客户端 PR 中完成，否则升级后第一次加载就会丢失用户的选择：
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- 迁移（必须，保留一个版本即 1.0.x）：升级后第一次加载**本地已保存的订阅内容**时（刷新之前），对保存的旧 id 用 `config_core::node_id::find_node`（或 node-import 报告里的 `ImportedNode.legacy_id`）找到节点，把新 id 写回。旧 id 依赖位置，刷新后的新内容不要再按旧 id 查找。要迁移的位置：
+  - client-core：`state.selected_node`、`group_choices`、按 id 保存的 NodeEdits（`changed`/`removed`）。
+  - Windows/Linux Tauri：`profile_node_id`、`embedded/profile.json` 里的策略组默认值、`embedded_nodes` 缓存、`node-edits.json`、`profile_node_catalog`。`single_node_envelope` 已按旧 id 回退并返回带新 id 的节点，调用方要把返回节点的 id 写回 `profile_node_id`。
+  - iOS/macOS：`NodeLibrary.selectedID`、`groupSelections`、联动组 default、保存的 `nodes[].id`、延迟缓存的键。iOS 保存的是导入报告而非原文时，可按 `legacy_id`，或按名称 + server + port 与保存的节点匹配。
+- 刷新后的兜底（建议）：所选 id 不在新节点列表里时回退默认节点并提示用户“所选节点已不在订阅中，已改用 X”，不要静默切换；提示文案进三端字符串目录（简中、繁中、英文）。
+- 客户端测试：刷新时在列表开头插入节点、重排、改名后所选节点和策略组选择不变；旧 id 迁移测试。
+- 发布说明提示：节点 id 格式改变；更换服务器地址、端口、传输或 SNI 的节点会被当作新节点。
+
 ## 后续预计人工事项
 
 iOS/macOS（Apple Developer、App Store Connect、TestFlight、App Review）与 Windows 代码签名相关的人工事项随客户端在 AnixOps/anixops-net 跟踪。

@@ -57,7 +57,7 @@ P3 baseline 源码接入按以下顺序执行：
 
 1. 应用层或 CLI 明确提供订阅 source；在当前阶段只允许 `inline:` source。
 2. `SubscriptionService::fetch` 返回 `RawSubscription`；unsupported source 必须返回稳定 `DomainError`，不得泄漏 URL token、header、credential 或 payload secret。
-3. `SubscriptionService::parse` 返回 `SubscriptionDocument`；解析失败诊断不得包含原始 secret。
+3. `SubscriptionService::parse` 返回 `SubscriptionDocument`；解析失败诊断不得包含原始 secret。逐条容错规则见下文「条目级容错」。
 4. `SubscriptionService::normalize` 返回 `NodeCatalog`。
 5. 运行层对 `NodeCatalog.nodes` 做最小 catalog gate，生成可传给 `RuntimeConfigRequest.nodes` 的 typed nodes。
 6. `RuntimeOrchestrator::start_runtime_with_subscription_catalogs` 或 `reload_runtime_with_subscription_catalogs` 继续把 gated `RuntimeConfigRequest.nodes` 传给 `ProxyEngineConfig.nodes`。
@@ -68,6 +68,77 @@ P3 baseline 源码接入按以下顺序执行：
 
 Current blocked anchors for CI governance: no remote subscription fetching, no file subscription loading,
 no system DNS/TUN mutation, no daemon/control socket.
+
+## 条目级容错
+
+链接列表（明文与 base64）、Clash YAML、sing-box JSON、Quantumult X、Loon 和 Surge 的解析器逐条解析：
+
+- 认出格式后，单个条目无法解析（类型不支持、字段缺失或类型不对、端口非法、链接格式错误）时跳过该条目，
+  在 `SubscriptionDocument.diagnostics` 追加一条 `Warning`，其余条目照常导入。只有一条可用节点都没有时才
+  返回错误，错误是第一个被跳过条目的原错误（code 不变）；只含一条坏链接的输入仍按原 code 失败。
+- 警告的 `code` 沿用该条目原来的错误 code（如 `subscription.core.clash_yaml_unsupported`、
+  `subscription.core.trojan_link_invalid`），`message` 为固定英文：格式、条目序号（从 1 起）、看起来像标签的
+  条目名与类型、原错误说明，例如 `clash proxy 3 (HY2, type hysteria2) was skipped: ...`。不包含条目原文、
+  密码、UUID、密钥或链接；名称含 `://`、`@`、控制字符或超过 64 个字符时省略。`source` 为 `subscription.core`。
+- 内置策略条目不是节点，静默跳过、不计入警告：Surge/Loon `[Proxy]` 的 `DIRECT = direct`、`REJECT = reject`、
+  `X = reject-drop` 等，以及别名 `Home = direct, interface=en0`；Quantumult X 的 `direct`/`reject`；Clash 的
+  `type: direct`/`reject`/`reject-drop`/`dns`；sing-box 的 `direct`/`block`/`dns`/`selector`/`urltest`/`bridge`。
+  规则与策略组引用这些名称时按对应策略导入（见 `routing-policy-group-model.md`「订阅导入」）。
+- 链接列表里不认识的 scheme 一行照旧静默跳过；已知 scheme 的坏链接按上面规则跳过并告警。
+- Loon 与 Surge 共用 `[Proxy]` 段：Loon 解析器只在至少一行按 Loon 位置参数写法解析成节点时认领该段，
+  其余行（Surge 写法或不支持的类型）跳过并告警；没有一行成为 Loon 节点时交给 Surge 解析器，除非每一行都是
+  Loon 位置写法且都失败，此时返回第一行的 Loon 错误。端口后第一个字段决定写法：未加引号、`键=值` 且键为单词、
+  值不只是 `=` 填充时是 Surge 选项，否则是 Loon 位置参数，所以 base64 密码（`"AAAAAAAAAAAAAAAAAAAAAA=="`、
+  未加引号的 `aGVsbG8=`、SS-2022 多用户 `serverKey==:userKey==`）按位置读取并原样保留 `=`。
+- 第一方 TOML 格式保持严格，任一条目错误整体失败。
+
+`node-import::import_text` 把这些警告作为报告顶层的 `skipped`（`[{code, message}]`，最多 32 条）与
+`skipped_count`（总数）输出，没有跳过时两个键都不输出。跳过的条目没有成为节点；引用它们的规则和组成员按
+`routing_warnings` 的既有方式跳过并告警。`unsupported` 里的节点（读出来了但本构建不能运行）同样只从规则与
+策略组里去掉，不再关闭整份 `routing`，见 `routing-policy-group-model.md`「引擎出站上限与不能运行的节点」。
+
+## HTTP 与 SOCKS5 代理节点
+
+各格式的 HTTP / HTTPS 与 SOCKS5 代理条目都导入为节点（`Protocol::Http`、`Protocol::Socks`），用户名和密码存入
+`proxy.username`、`proxy.password`，HTTPS 的 TLS 设置用其他协议共用的 `tls.*` 键（服务器名缺省为服务器地址）：
+
+- 链接：`http://[user[:pass]@]host:port[#name]`、`https://...`（可带 `sni`/`peer`、`insecure`/`allowInsecure`/
+  `skip-cert-verify`）、`socks5://`、`socks5h://`、`socks://`（v2rayN 把 `user:pass` 整体 base64 放在 userinfo
+  里，也接受）。用户名和密码百分号解码。`http(s)://` 行只有在写明端口、没有路径、查询参数只有上面这些字段（以及
+  `via`），并且带凭据或 `#名称` 时才算代理链接；订阅地址、规则列表这类网址照旧按不认识的行静默跳过。
+- Clash：`type: http`（`username`、`password`、`tls`、`sni`/`servername`、`skip-cert-verify`、`fingerprint`）与
+  `type: socks5`。HTTP 的 `headers` 非空时节点报不支持（引擎不发送额外请求头），不会去掉它们运行。
+- Surge / Loon：`http`、`https`、`socks5`、`socks5-tls`，用户名和密码可以按位置写（`user, "pass"`），也可以写
+  `username=`、`password=`；选项 `tls`/`over-tls`、`sni`/`tls-name`、`skip-cert-verify` 与证书固定照常读取。
+  一个 `[Proxy]` 段只有 HTTP/SOCKS5 行时不算 Loon 写法，交给 Surge 解析器（两者写法相同）。
+- Quantumult X：`http=`、`https=`、`socks5=`（`username`、`password`、`over-tls`、`tls-host`、`tls-verification`、
+  `tls-cert-sha256`、`tls-pubkey-sha256`）。
+- sing-box：`type: http`（`username`、`password`、`tls`；`path` 不是 `/` 或带 `headers` 时报不支持）与
+  `type: socks`（只接受 `version` 为 5 或不写）。
+
+node-import 生成 `outbound-http`（`"tls": true` 时带 `server_name`、`insecure` 与证书固定）与 `outbound-socks`
+出站。SOCKS5 over TLS（Surge `socks5-tls`、Quantumult X `socks5` + `over-tls`）报不支持（`socks over tls is not
+supported`），不会以明文运行；只有密码没有用户名、HTTP 用户名含 `:`、SOCKS5 用户名或密码超过 255 字节等同样报
+不支持，原因不含凭据。
+
+## 分享链接写法
+
+各分享链接解析器（`ss`、`trojan`、`vless`、`hysteria2`/`hy2`、`tuic`、`wireguard`、`mierus`、`iwan`、`anx`）
+对 `host:port` 部分的约定：
+
+- 按最后一个 `@` 切出 userinfo 之后，端点在第一个 `/` 处截断，所以 `host:port/?query`、`host:port/#name`、
+  `[v6]:port/?query`（SIP002 规范示例、Outline 的 `/?outline=1`、部分面板导出的写法）与 `host:port?query`
+  等价。截断只作用于 `@` 之后：标准 base64 的 userinfo、未编码的密码和 WireGuard 私钥里的 `/` 保持不变。
+- Hysteria2 按官方 URI 格式：省略端口（`hysteria2://auth@example.com/?sni=...`、`[v6]/?...`）时为 443；端口位置
+  的端口跳跃列表 `host:123,5000-6000` 以第一项（区间取起点）为连接端口，整份列表规范化后（`123,5000:6000`）写入
+  `hysteria2.server_ports`；同时带 `mport=` 时两者合并，authority 中的条目在前、重复项去掉。其余协议没有默认
+  端口，省略端口的链接按上一节规则只跳过该条并告警，不影响列表中的其他链接。
+- Shadowsocks SIP002 明文 userinfo（`method:password`）按 RFC 3986 做百分号解码（只解 `%XX`，`+` 不当空格），
+  所以 SS-2022 的 `2022-blake3-aes-256-gcm:YctPZ6U7xPPcU%2Bgp3u%2BOX%3D%3D` 得到 `YctPZ6U7xPPcU+gp3u+OX==`，
+  多用户的 `iPSK%3AuPSK` 得到 `iPSK:uPSK`；不含 `:` 的 userinfo 先百分号解码（处理 `%3D` 填充）再按 base64
+  解码。不是合法百分号编码的值（如未编码的 `50%off`）保持原文。旧式整段 base64 的 `ss://base64(method:password@host:port)`
+  不做百分号解码；其后跟 `/` 时先按原文解码，得不到可用端点再去掉末尾的 `/` 重试（`/` 也是 base64 字符）。
+- 已保存的导入结果不会自动更正：之前导入的 SS-2022 百分号编码链接，要刷新订阅或重新导入才会得到解码后的密钥。
 
 ## 去重和优先级
 

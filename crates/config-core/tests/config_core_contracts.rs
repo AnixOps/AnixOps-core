@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use config_core::{
-    parse_config_document, CoreConfigurationService, CoreSubscriptionService,
+    node_id, parse_config_document, CoreConfigurationService, CoreSubscriptionService,
     CONFIG_LISTENER_BIND_PORT_INVALID_CODE, CONFIG_LISTENER_NETWORK_UNSUPPORTED_CODE,
     CONFIG_LISTENER_ROUTE_CONFLICT_CODE, CONFIG_LISTENER_ROUTE_MISSING_CODE,
     CONFIG_MIGRATION_UNSUPPORTED_CODE, CONFIG_NODE_HOST_EMPTY_CODE, CONFIG_NODE_PORT_INVALID_CODE,
@@ -12,12 +12,13 @@ use config_core::{
 };
 use control_domain::{
     ConfigurationService, Diagnostic, ListenerKind, ListenerNetwork, ListenerRoute, MetadataEntry,
-    OperatingSystem, PlatformCapabilities, Protocol, RawSubscription, RouteAction, SchemaVersion,
-    SubscriptionService, SubscriptionSource, NODE_METADATA_HYSTERIA2_OBFS_MAX_PACKET_SIZE,
-    NODE_METADATA_HYSTERIA2_OBFS_MIN_PACKET_SIZE, NODE_METADATA_HYSTERIA2_OBFS_PASSWORD,
-    NODE_METADATA_HYSTERIA2_OBFS_TYPE, NODE_METADATA_HYSTERIA2_PASSWORD,
-    NODE_METADATA_HYSTERIA2_SERVER_PORTS, NODE_METADATA_SHADOWSOCKS_METHOD,
-    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
+    NodeDescriptor, OperatingSystem, PlatformCapabilities, Protocol, RawSubscription, RouteAction,
+    SchemaVersion, SubscriptionService, SubscriptionSource,
+    NODE_METADATA_HYSTERIA2_OBFS_MAX_PACKET_SIZE, NODE_METADATA_HYSTERIA2_OBFS_MIN_PACKET_SIZE,
+    NODE_METADATA_HYSTERIA2_OBFS_PASSWORD, NODE_METADATA_HYSTERIA2_OBFS_TYPE,
+    NODE_METADATA_HYSTERIA2_PASSWORD, NODE_METADATA_HYSTERIA2_SERVER_PORTS,
+    NODE_METADATA_SHADOWSOCKS_METHOD, NODE_METADATA_SHADOWSOCKS_PASSWORD,
+    NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
     NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
     NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
     NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
@@ -155,7 +156,7 @@ fn parses_single_shadowsocks_url_subscription_into_node_catalog() {
 
     assert_eq!(catalog.nodes.len(), 1);
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "ss-82-47-34-99-11111");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "ss-82-47-34-99-11111");
     assert_eq!(node.name, "香港");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -203,7 +204,7 @@ fn parses_single_trojan_url_subscription_into_node_catalog() {
 
     assert_eq!(catalog.nodes.len(), 1);
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "trojan-example-com-443");
+    assert_stable_id(node, "trojan-example-com-443", "trojan-example-com-443");
     assert_eq!(node.name, "HK Trojan");
     assert_eq!(node.protocol, Protocol::Trojan);
     assert_eq!(node.endpoint.host, "example.com");
@@ -238,7 +239,7 @@ fn parses_single_vless_url_subscription_into_node_catalog() {
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "vless-example-net-443");
+    assert_stable_id(node, "vless-example-net-443", "vless-example-net-443");
     assert_eq!(node.name, "US VLESS");
     assert_eq!(node.protocol, Protocol::Vless);
     assert_eq!(node.endpoint.host, "example.net");
@@ -282,7 +283,11 @@ fn parses_single_vmess_url_subscription_into_node_catalog() {
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "vmess-edge-example-net-443");
+    assert_stable_id(
+        node,
+        "vmess-edge-example-net-443",
+        "vmess-edge-example-net-443",
+    );
     assert_eq!(node.name, "JP VMess");
     assert_eq!(node.protocol, Protocol::Vmess);
     assert_eq!(node.endpoint.host, "edge.example.net");
@@ -486,7 +491,7 @@ rules: []
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "clash-ss-hk-clash");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "clash-ss-hk-clash");
     assert_eq!(node.name, "HK Clash");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -550,7 +555,7 @@ fn parses_sing_box_json_subscription_into_node_catalog() {
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "sing-box-ss-hk-sing-box");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "sing-box-ss-hk-sing-box");
     assert_eq!(node.name, "HK sing-box");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -598,7 +603,11 @@ fn parses_hysteria2_and_tuic_share_links_with_quic_tls_options() {
 
     assert_eq!(catalog.nodes.len(), 2);
     let hysteria2 = &catalog.nodes[0];
-    assert_eq!(hysteria2.id, "hysteria2-edge-example-test-443");
+    assert_stable_id(
+        hysteria2,
+        "hysteria2-edge-example-test-443",
+        "hysteria2-edge-example-test-443",
+    );
     assert_eq!(hysteria2.name, "Hysteria 2");
     assert_eq!(hysteria2.protocol, Protocol::Hysteria2);
     assert_eq!(hysteria2.endpoint.host, "edge.example.test");
@@ -666,7 +675,11 @@ fn parses_hysteria2_and_tuic_share_links_with_quic_tls_options() {
     );
 
     let tuic = &catalog.nodes[1];
-    assert_eq!(tuic.id, "tuic-tuic-example-test-443");
+    assert_stable_id(
+        tuic,
+        "tuic-tuic-example-test-443",
+        "tuic-tuic-example-test-443",
+    );
     assert_eq!(tuic.name, "TUIC Node");
     assert_eq!(tuic.protocol, Protocol::Tuic);
     assert_metadata(
@@ -870,7 +883,11 @@ fn parses_hysteria2_and_tuic_sing_box_outbounds_into_node_catalog() {
 
     assert_eq!(catalog.nodes.len(), 2);
     let hysteria2 = &catalog.nodes[0];
-    assert_eq!(hysteria2.id, "sing-box-hysteria2-hysteria2-json");
+    assert_stable_id(
+        hysteria2,
+        "hysteria2-hy2-example-test-3000",
+        "sing-box-hysteria2-hysteria2-json",
+    );
     assert_eq!(hysteria2.endpoint.port, 3000);
     assert_eq!(hysteria2.protocol, Protocol::Hysteria2);
     assert_metadata(
@@ -897,7 +914,11 @@ fn parses_hysteria2_and_tuic_sing_box_outbounds_into_node_catalog() {
     );
 
     let tuic = &catalog.nodes[1];
-    assert_eq!(tuic.id, "sing-box-tuic-tuic-json");
+    assert_stable_id(
+        tuic,
+        "tuic-tuic-example-test-443",
+        "sing-box-tuic-tuic-json",
+    );
     assert_eq!(tuic.protocol, Protocol::Tuic);
     assert_metadata(
         &tuic.metadata,
@@ -1042,7 +1063,11 @@ static=Proxy, HK Quantumult X
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "quantumult-x-ss-hk-quantumult-x");
+    assert_stable_id(
+        node,
+        "ss-82-47-34-99-11111",
+        "quantumult-x-ss-hk-quantumult-x",
+    );
     assert_eq!(node.name, "HK Quantumult X");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -1106,7 +1131,7 @@ Proxy = select, HK Loon
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "loon-ss-hk-loon");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "loon-ss-hk-loon");
     assert_eq!(node.name, "HK Loon");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -1166,7 +1191,7 @@ Proxy = select, HK Surge
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "surge-ss-hk-surge");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "surge-ss-hk-surge");
     assert_eq!(node.name, "HK Surge");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -1969,6 +1994,24 @@ fn assert_diagnostic(diagnostics: &[Diagnostic], code: &str) {
     );
 }
 
+/// Asserts that `node` has the stable id `{prefix}-{endpoint hash}` and that
+/// releases before stable ids called it `legacy`.
+fn assert_stable_id(node: &NodeDescriptor, prefix: &str, legacy: &str) {
+    let hash = node
+        .id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .unwrap_or_else(|| panic!("{} should start with {prefix}-", node.id));
+    assert_eq!(hash.len(), node_id::ENDPOINT_HASH_HEX, "{}", node.id);
+    assert!(
+        hash.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{}",
+        node.id
+    );
+    assert_eq!(node_id::legacy_node_id(node), Some(legacy));
+}
+
 fn assert_metadata(metadata: &[MetadataEntry], key: &str, value: &str) {
     assert!(
         metadata
@@ -1982,5 +2025,1044 @@ fn assert_no_metadata(metadata: &[MetadataEntry], key: &str) {
     assert!(
         metadata.iter().all(|entry| entry.key != key),
         "unexpected metadata {key}: {metadata:?}"
+    );
+}
+
+fn parse_subscription(source_id: &str, content: &str) -> control_domain::SubscriptionDocument {
+    CoreSubscriptionService::new()
+        .parse(&RawSubscription {
+            source_id: source_id.to_string(),
+            content: content.to_string(),
+        })
+        .unwrap_or_else(|error| panic!("{source_id} should parse: {error:?}"))
+}
+
+/// The skipped-entry warnings of a document as `(code, message)`, after
+/// checking that each is a warning that repeats no credential.
+fn skipped_entries(document: &control_domain::SubscriptionDocument) -> Vec<(String, String)> {
+    document
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            assert_eq!(
+                diagnostic.severity,
+                control_domain::DiagnosticSeverity::Warning
+            );
+            assert!(
+                !diagnostic.message.contains("secret"),
+                "{}",
+                diagnostic.message
+            );
+            (diagnostic.code.clone(), diagnostic.message.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn clash_list_skips_unsupported_and_malformed_proxies_and_keeps_the_rest() {
+    let document = parse_subscription(
+        "clash-mixed",
+        r#"
+proxies:
+  - name: HK
+    type: ss
+    server: 82.47.34.99
+    port: 11111
+    cipher: aes-256-gcm
+    password: hk-secret
+  - name: Direct Out
+    type: direct
+  - name: HY2
+    type: hysteria2
+    server: hy2.example.test
+    port: 443
+    password: hy2-secret
+  - name: WG
+    type: wireguard
+    server: wg.example.test
+    port: 51820
+  - name: Bad Port
+    type: trojan
+    server: bad.example.test
+    port: not-a-port
+    password: trojan-secret
+  - name: Odd
+    type: ss
+    server: odd.example.test
+    port: 443
+    cipher: aes-256-gcm
+    password: [1, 2]
+"#,
+    );
+
+    let names = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["HK"]);
+    let skipped = skipped_entries(&document);
+    assert_eq!(
+        skipped
+            .iter()
+            .map(|(code, _)| code.as_str())
+            .collect::<Vec<_>>(),
+        [
+            config_core::SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_CLASH_YAML_INVALID_CODE,
+            config_core::SUBSCRIPTION_CLASH_YAML_INVALID_CODE,
+        ]
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("clash proxy 3 (HY2, type hysteria2) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[1]
+            .1
+            .starts_with("clash proxy 4 (WG, type wireguard) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[2]
+            .1
+            .starts_with("clash proxy 5 (Bad Port, type trojan) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[3]
+            .1
+            .starts_with("clash proxy 6 (Odd, type ss) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn clash_list_without_any_supported_proxy_still_fails_with_the_first_reason() {
+    let error = CoreSubscriptionService::new()
+        .parse(&RawSubscription {
+            source_id: "clash-unsupported".to_string(),
+            content: r#"
+proxies:
+  - name: Direct Out
+    type: direct
+  - name: HY2
+    type: hysteria2
+    server: hy2.example.test
+    port: 443
+    password: hy2-secret
+"#
+            .to_string(),
+        })
+        .expect_err("a list without supported proxies should fail");
+
+    assert_eq!(
+        error.code,
+        config_core::SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE
+    );
+    assert!(!error.message.contains("secret"));
+}
+
+#[test]
+fn surge_proxy_section_skips_built_in_policies_and_bad_lines() {
+    let document = parse_subscription(
+        "surge-mixed",
+        r#"
+[General]
+loglevel = notify
+
+[Proxy]
+DIRECT = direct
+Home = direct, interface=en0
+Block = reject-drop
+HY2 = hysteria2, hy2.example.test, 443, password=hy2-secret
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=hk-secret
+Bad = trojan, bad.example.test, 99999, password=trojan-secret
+"#,
+    );
+
+    // The Surge reader took the section, not the Loon one.
+    assert_eq!(document.nodes.len(), 1);
+    let node = &document.nodes[0];
+    assert_stable_id(node, "ss-82-47-34-99-11111", "surge-ss-hk");
+    assert_metadata(
+        &node.metadata,
+        NODE_METADATA_SOURCE_FORMAT,
+        "surge-proxy-line",
+    );
+    let skipped = skipped_entries(&document);
+    assert_eq!(skipped.len(), 2, "{skipped:?}");
+    assert_eq!(
+        skipped[0].0,
+        config_core::SUBSCRIPTION_SURGE_PROXY_LINE_UNSUPPORTED_CODE
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("surge proxy line 4 (HY2, type hysteria2) was skipped: "),
+        "{skipped:?}"
+    );
+    assert_eq!(
+        skipped[1].0,
+        config_core::SUBSCRIPTION_SURGE_PROXY_LINE_INVALID_CODE
+    );
+    assert!(
+        skipped[1]
+            .1
+            .starts_with("surge proxy line 6 (Bad, type trojan) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn surge_proxy_section_of_built_in_policies_only_fails() {
+    let error = CoreSubscriptionService::new()
+        .parse(&RawSubscription {
+            source_id: "surge-builtins".to_string(),
+            content: "[Proxy]\nDIRECT = direct\nREJECT = reject\n".to_string(),
+        })
+        .expect_err("a section without nodes should fail");
+
+    assert_eq!(
+        error.code,
+        config_core::SUBSCRIPTION_SURGE_PROXY_LINE_UNSUPPORTED_CODE
+    );
+}
+
+#[test]
+fn surge_style_trojan_and_vmess_lines_stay_with_the_surge_reader() {
+    let document = parse_subscription(
+        "surge-trojan-vmess",
+        r#"
+[Proxy]
+T1 = trojan, t1.example.test, 443, password=abc=, sni=t1.example.test
+T2 = trojan, t2.example.test, 443, sni=t2.example.test, password=def
+V1 = vmess, v1.example.test, 443, username=00000000-0000-0000-0000-000000000001
+"#,
+    );
+
+    assert!(
+        document.diagnostics.is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    let names = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["T1", "T2", "V1"]);
+    let legacy_ids = document
+        .nodes
+        .iter()
+        .map(|node| node_id::legacy_node_id(node).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        legacy_ids,
+        ["surge-trojan-t1", "surge-trojan-t2", "surge-vmess-v1"]
+    );
+    assert_stable_id(
+        &document.nodes[0],
+        "trojan-t1-example-test-443",
+        "surge-trojan-t1",
+    );
+    assert_metadata(
+        &document.nodes[0].metadata,
+        NODE_METADATA_TROJAN_PASSWORD,
+        "abc=",
+    );
+}
+
+#[test]
+fn loon_positional_passwords_with_base64_padding_stay_positional() {
+    let document = parse_subscription(
+        "loon-padding",
+        r#"
+[Proxy]
+香港 = Shadowsocks,1.2.3.4,443,2022-blake3-aes-128-gcm,"AAAAAAAAAAAAAAAAAAAAAA==",fast-open=false,udp=true
+JP=Shadowsocks,jp.example.test,8443,2022-blake3-aes-256-gcm,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=,udp=true
+TQ = trojan, tq.example.test, 443, "aGVsbG8=", over-tls=true, tls-name=tq.example.test
+TU = trojan, tu.example.test, 443, aGVsbG8=, tls-name=tu.example.test
+"#,
+    );
+
+    assert!(
+        document.diagnostics.is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    assert_eq!(document.nodes.len(), 4);
+    for node in &document.nodes {
+        assert_metadata(
+            &node.metadata,
+            NODE_METADATA_SOURCE_FORMAT,
+            "loon-proxy-line",
+        );
+    }
+    let hong_kong = &document.nodes[0];
+    assert_eq!(hong_kong.name, "香港");
+    assert_eq!(hong_kong.protocol, Protocol::Shadowsocks);
+    assert_metadata(
+        &hong_kong.metadata,
+        NODE_METADATA_SHADOWSOCKS_METHOD,
+        "2022-blake3-aes-128-gcm",
+    );
+    assert_metadata(
+        &hong_kong.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "AAAAAAAAAAAAAAAAAAAAAA==",
+    );
+    let japan = &document.nodes[1];
+    assert_eq!(japan.name, "JP");
+    assert_metadata(
+        &japan.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    );
+    for trojan in &document.nodes[2..] {
+        assert_eq!(trojan.protocol, Protocol::Trojan);
+        assert_metadata(&trojan.metadata, NODE_METADATA_TROJAN_PASSWORD, "aGVsbG8=");
+    }
+}
+
+#[test]
+fn loon_proxy_section_skips_unsupported_lines() {
+    let document = parse_subscription(
+        "loon-mixed",
+        r#"
+[Proxy]
+HY2 = Hysteria2, hy2.example.test, 443, "hy2-secret"
+HK = Shadowsocks, 82.47.34.99, 11111, aes-256-gcm, "hk-secret"
+DIRECT = direct
+SG = Shadowsocks, 1.2.3.4, 443, 2022-blake3-aes-128-gcm, "AAAAAAAAAAAAAAAAAAAAAA=="
+"#,
+    );
+
+    let names = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["HK", "SG"]);
+    let skipped = skipped_entries(&document);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(
+        skipped[0].0,
+        config_core::SUBSCRIPTION_LOON_PROXY_LINE_UNSUPPORTED_CODE
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("loon proxy line 1 (HY2, type Hysteria2) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn sing_box_outbounds_skip_unsupported_and_malformed_entries() {
+    let document = parse_subscription(
+        "sing-box-mixed",
+        r#"{
+  "outbounds": [
+    {"type": "selector", "tag": "proxy", "outbounds": ["ss-out"]},
+    {"type": "shadowsocks", "tag": "ss-out", "server": "82.47.34.99", "server_port": 11111,
+     "method": "aes-256-gcm", "password": "ss-secret"},
+    {"type": "socks", "tag": "socks-out", "server": "socks.example.test", "server_port": 1080,
+     "version": "4", "password": "socks-secret"},
+    {"type": "shadowtls", "tag": "stls-out", "server": "stls.example.test", "server_port": 443,
+     "password": "stls-secret"},
+    {"type": "trojan", "tag": "odd-out", "server": "odd.example.test", "server_port": [443],
+     "password": "trojan-secret"},
+    {"type": "direct", "tag": "direct"}
+  ]
+}"#,
+    );
+
+    let tags = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(tags, ["ss-out"]);
+    let skipped = skipped_entries(&document);
+    assert_eq!(
+        skipped
+            .iter()
+            .map(|(code, _)| code.as_str())
+            .collect::<Vec<_>>(),
+        [
+            config_core::SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_SING_BOX_JSON_INVALID_CODE,
+        ]
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("sing-box outbound 3 (socks-out, type socks) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[2]
+            .1
+            .starts_with("sing-box outbound 5 (odd-out, type trojan) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn quantumult_x_server_local_skips_unsupported_lines() {
+    let document = parse_subscription(
+        "quantumult-x-mixed",
+        r#"
+[server_local]
+shadowsocks=82.47.34.99:11111, method=aes-256-gcm, password=ss-secret, tag=HK
+hysteria2=hy2.example.test:443, password=hy2-secret, tag=HY2 Node
+"#,
+    );
+
+    assert_eq!(document.nodes.len(), 1);
+    assert_eq!(document.nodes[0].name, "HK");
+    let skipped = skipped_entries(&document);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(
+        skipped[0].0,
+        config_core::SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_UNSUPPORTED_CODE
+    );
+    assert!(
+        skipped[0].1.starts_with(
+            "quantumult x server_local line 2 (HY2 Node, type hysteria2) was skipped: "
+        ),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn link_list_skips_malformed_links_of_known_schemes() {
+    let links = concat!(
+        "ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM#Supported\n",
+        "trojan://trojan-secret@example.com:99999#Bad%20Port\n",
+        "vmess://not-json-secret\n",
+    );
+    for content in [
+        links.to_string(),
+        base64::engine::general_purpose::STANDARD.encode(links),
+    ] {
+        let document = parse_subscription("links-mixed", &content);
+        assert_eq!(document.nodes.len(), 1);
+        assert_eq!(document.nodes[0].name, "Supported");
+        let skipped = skipped_entries(&document);
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|(code, _)| code.as_str())
+                .collect::<Vec<_>>(),
+            [
+                config_core::SUBSCRIPTION_TROJAN_LINK_INVALID_CODE,
+                config_core::SUBSCRIPTION_VMESS_LINK_INVALID_CODE,
+            ]
+        );
+        assert!(
+            skipped[0]
+                .1
+                .starts_with("share link 2 (type trojan) was skipped: "),
+            "{skipped:?}"
+        );
+    }
+}
+
+/// The value of metadata `key`, if any.
+fn metadata_value<'a>(metadata: &'a [MetadataEntry], key: &str) -> Option<&'a str> {
+    metadata
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.value.as_str())
+}
+
+/// Clash YAML booleans, lists and maps under `tls`, `skip-cert-verify`,
+/// `alpn`, `ws-opts` and `reality-opts` are read, not a reason to drop the
+/// proxy or the whole file, and land in the share-link metadata keys.
+#[test]
+fn clash_tls_reality_and_transport_options_reach_the_metadata() {
+    let nodes = import_nodes(
+        "clash-tls",
+        r#"
+proxies:
+  - name: VLESS WS
+    type: vless
+    server: a.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000002
+    tls: true
+    servername: cdn.example.test
+    skip-cert-verify: true
+    alpn: [h2, http/1.1]
+    network: ws
+    ws-opts:
+      path: /ray
+      headers: {Host: cdn.example.test}
+  - name: Reality
+    type: vless
+    server: b.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000003
+    tls: true
+    servername: www.example.com
+    flow: xtls-rprx-vision
+    client-fingerprint: safari
+    reality-opts: {public-key: PUBLICKEY, short-id: "0123"}
+  - name: VMess gRPC
+    type: vmess
+    server: c.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000005
+    alterId: 0
+    cipher: aes-128-gcm
+    tls: "true"
+    network: grpc
+    grpc-opts: {grpc-service-name: tunnel}
+  - name: Plain
+    type: vless
+    server: d.example.test
+    port: 80
+    uuid: 00000000-0000-0000-0000-000000000004
+"#
+        .to_string(),
+    );
+    assert_eq!(nodes.len(), 4);
+    let ws = &nodes[0].metadata;
+    assert_metadata(ws, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(ws, NODE_METADATA_TLS_SERVER_NAME, "cdn.example.test");
+    assert_metadata(ws, NODE_METADATA_TLS_INSECURE, "true");
+    assert_metadata(ws, NODE_METADATA_TLS_ALPN, "h2,http/1.1");
+    assert_metadata(ws, NODE_METADATA_V2RAY_TRANSPORT_TYPE, "ws");
+    assert_metadata(ws, NODE_METADATA_V2RAY_TRANSPORT_PATH, "/ray");
+    assert_metadata(ws, NODE_METADATA_V2RAY_TRANSPORT_HOST, "cdn.example.test");
+
+    let reality = &nodes[1].metadata;
+    assert_metadata(reality, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(reality, NODE_METADATA_TLS_SERVER_NAME, "www.example.com");
+    assert_metadata(reality, NODE_METADATA_TLS_REALITY_PUBLIC_KEY, "PUBLICKEY");
+    // A quoted short id keeps its leading zero.
+    assert_metadata(reality, NODE_METADATA_TLS_REALITY_SHORT_ID, "0123");
+    assert_metadata(reality, NODE_METADATA_TLS_UTLS_FINGERPRINT, "safari");
+    assert_metadata(reality, NODE_METADATA_VLESS_FLOW, "xtls-rprx-vision");
+
+    let grpc = &nodes[2].metadata;
+    assert_metadata(grpc, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(grpc, NODE_METADATA_TLS_SERVER_NAME, "c.example.test");
+    assert_metadata(grpc, NODE_METADATA_V2RAY_TRANSPORT_TYPE, "grpc");
+    assert_metadata(grpc, NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME, "tunnel");
+    assert_metadata(grpc, NODE_METADATA_VMESS_ALTER_ID, "0");
+    assert_metadata(grpc, NODE_METADATA_VMESS_SECURITY, "aes-128-gcm");
+
+    // No TLS asked for: written as off, not left out.
+    assert_metadata(&nodes[3].metadata, NODE_METADATA_TLS_ENABLED, "false");
+    assert_no_metadata(&nodes[3].metadata, NODE_METADATA_V2RAY_TRANSPORT_TYPE);
+}
+
+#[test]
+fn proxy_line_tls_and_transport_options_reach_the_metadata() {
+    let surge = import_nodes(
+        "surge-tls",
+        "\
+[Proxy]
+VMess = vmess, a.example.test, 443, username=00000000-0000-0000-0000-000000000005, tls=true, sni=cdn.example.test, skip-cert-verify=1, ws=true, ws-path=/v, ws-headers=Host:cdn.example.test|X-Edge:1
+Trojan = trojan, b.example.test, 443, password=trojan-password, sni=edge.example.test
+"
+        .to_string(),
+    );
+    assert_metadata(&surge[0].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &surge[0].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "cdn.example.test",
+    );
+    assert_metadata(&surge[0].metadata, NODE_METADATA_TLS_INSECURE, "true");
+    assert_metadata(&surge[0].metadata, NODE_METADATA_V2RAY_TRANSPORT_PATH, "/v");
+    assert_metadata(
+        &surge[0].metadata,
+        NODE_METADATA_V2RAY_TRANSPORT_HOST,
+        "cdn.example.test",
+    );
+    assert_metadata(&surge[1].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &surge[1].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "edge.example.test",
+    );
+
+    let loon = import_nodes(
+        "loon-tls",
+        r#"
+[Proxy]
+Reality = VLESS, a.example.test, 443, "00000000-0000-0000-0000-000000000002", transport=tcp, over-tls=true, sni=www.example.com, flow=xtls-rprx-vision, public-key=PUBLICKEY, short-id=ab12
+VMess = vmess, b.example.test, 443, auto, "00000000-0000-0000-0000-000000000005", transport=ws, path=/v, host=cdn.example.test, over-tls=true, tls-name=cdn.example.test
+"#
+        .to_string(),
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+        "PUBLICKEY",
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_TLS_REALITY_SHORT_ID,
+        "ab12",
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "www.example.com",
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_VLESS_FLOW,
+        "xtls-rprx-vision",
+    );
+    assert_metadata(&loon[1].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &loon[1].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "cdn.example.test",
+    );
+    assert_metadata(&loon[1].metadata, NODE_METADATA_V2RAY_TRANSPORT_TYPE, "ws");
+    assert_metadata(&loon[1].metadata, NODE_METADATA_VMESS_SECURITY, "auto");
+
+    let quantumult_x = import_nodes(
+        "quantumult-x-tls",
+        "\
+[server_local]
+vless=a.example.test:443, method=none, password=00000000-0000-0000-0000-000000000002, obfs=over-tls, obfs-host=www.example.com, reality-base64-pubkey=PUBLICKEY, reality-hex-shortid=ab12, vless-flow=xtls-rprx-vision, tag=Reality
+vmess=b.example.test:443, method=none, password=00000000-0000-0000-0000-000000000005, obfs=ws, obfs-uri=/v, obfs-host=cdn.example.test, tag=WS
+"
+        .to_string(),
+    );
+    assert_metadata(&quantumult_x[0].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &quantumult_x[0].metadata,
+        NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+        "PUBLICKEY",
+    );
+    assert_metadata(
+        &quantumult_x[0].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "www.example.com",
+    );
+    // `obfs=ws` is WebSocket without TLS; VMess `none` runs as `auto`.
+    assert_metadata(
+        &quantumult_x[1].metadata,
+        NODE_METADATA_TLS_ENABLED,
+        "false",
+    );
+    assert_metadata(
+        &quantumult_x[1].metadata,
+        NODE_METADATA_V2RAY_TRANSPORT_TYPE,
+        "ws",
+    );
+    assert_metadata(
+        &quantumult_x[1].metadata,
+        NODE_METADATA_V2RAY_TRANSPORT_HOST,
+        "cdn.example.test",
+    );
+    assert_no_metadata(&quantumult_x[1].metadata, NODE_METADATA_VMESS_SECURITY);
+}
+
+/// Shadowsocks plugins are recorded by name in every format, without their
+/// options, and options no node field carries are marked instead of dropped.
+#[test]
+fn shadowsocks_plugins_and_uncarried_options_are_recorded() {
+    use control_domain::{
+        NODE_METADATA_SHADOWSOCKS_PLUGIN, NODE_METADATA_UNSUPPORTED_OPTION,
+        NODE_UNSUPPORTED_OPTION_HTTP_OBFS, NODE_UNSUPPORTED_OPTION_TRANSPORT,
+    };
+    let plugin = |content: &str| {
+        let nodes = import_nodes("ss-plugin", content.to_string());
+        nodes
+            .iter()
+            .map(|node| {
+                metadata_value(&node.metadata, NODE_METADATA_SHADOWSOCKS_PLUGIN).map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        plugin(
+            "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dbing.com#A\n\
+             ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:8389#B\n"
+        ),
+        [Some("obfs-local".to_string()), None]
+    );
+    assert_eq!(
+        plugin(
+            "proxies:\n  - {name: A, type: ss, server: h.example.test, port: 1, cipher: aes-256-gcm, password: p, plugin: v2ray-plugin, plugin-opts: {mode: websocket}}\n"
+        ),
+        [Some("v2ray-plugin".to_string())]
+    );
+    assert_eq!(
+        plugin("[Proxy]\nA = ss, h.example.test, 1, encrypt-method=aes-256-gcm, password=p, obfs=tls, obfs-host=bing.com\n"),
+        [Some("obfs-local".to_string())]
+    );
+    assert_eq!(
+        plugin("[Proxy]\nA = Shadowsocks, h.example.test, 1, aes-256-gcm, \"p\", obfs-name=http, obfs-host=bing.com\n"),
+        [Some("obfs-local".to_string())]
+    );
+    assert_eq!(
+        plugin("[server_local]\nshadowsocks=h.example.test:1, method=aes-256-gcm, password=p, obfs=wss, tag=A\n"),
+        [Some("v2ray-plugin".to_string())]
+    );
+    for node in import_nodes("ss-plugin", "proxies:\n  - {name: A, type: ss, server: h.example.test, port: 1, cipher: aes-256-gcm, password: p, plugin: shadow-tls, plugin-opts: {password: tls-secret}}\n".to_string()) {
+        let entries = format!("{:?}", node.metadata);
+        assert!(!entries.contains("tls-secret"), "{entries}");
+    }
+
+    let nodes = import_nodes(
+        "uncarried",
+        "\
+proxies:
+  - {name: HTTP, type: vmess, server: a.example.test, port: 80, uuid: 00000000-0000-0000-0000-000000000005, network: http}
+  - {name: KCP, type: vmess, server: b.example.test, port: 80, uuid: 00000000-0000-0000-0000-000000000005, network: kcp}
+"
+        .to_string(),
+    );
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_UNSUPPORTED_OPTION,
+        NODE_UNSUPPORTED_OPTION_HTTP_OBFS,
+    );
+    assert_metadata(
+        &nodes[1].metadata,
+        NODE_METADATA_UNSUPPORTED_OPTION,
+        NODE_UNSUPPORTED_OPTION_TRANSPORT,
+    );
+}
+
+/// The node named `name` in a parsed document.
+fn node_named<'a>(
+    document: &'a control_domain::SubscriptionDocument,
+    name: &str,
+) -> &'a control_domain::NodeDescriptor {
+    document
+        .nodes
+        .iter()
+        .find(|node| node.name == name)
+        .unwrap_or_else(|| panic!("missing node {name}: {:?}", document.nodes))
+}
+
+#[test]
+fn share_links_accept_a_slash_between_the_port_and_the_query() {
+    let wireguard_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let peer_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    let anx_key = "cd".repeat(32);
+    let content = format!(
+        "ss://YWVzLTEyOC1nY206dGVzdA@192.168.100.1:8888/?outline=1#SS\n\
+         ss://YWVzLTEyOC1nY206dGVzdA@[2001:db8::1]:8388/#SS%20v6\n\
+         trojan://pw@trojan.example.test:443/?sni=edge.example.test#Trojan\n\
+         trojan://pw@[2001:db8::2]:443/#Trojan%20v6\n\
+         vless://00000000-0000-0000-0000-000000000002@vless.example.test:443/?encryption=none&type=tcp#VLESS\n\
+         vless://00000000-0000-0000-0000-000000000002@[2001:db8::3]:8443/?encryption=none#VLESS%20v6\n\
+         hysteria2://pw@hy.example.test:8443/?sni=hy.example.test#HY2\n\
+         hy2://pw@[2001:db8::4]:8443/#HY2%20v6\n\
+         tuic://00000000-0000-0000-0000-000000000001:pw@tuic.example.test:443/?sni=tuic.example.test&congestion_control=bbr#TUIC\n\
+         tuic://00000000-0000-0000-0000-000000000001:pw@[2001:db8::5]:443/?congestion_control=bbr#TUIC%20v6\n\
+         wireguard://{wireguard_key}@wg.example.test:51820/?publickey={peer_key}&address=10.7.0.2%2F32#WG\n\
+         wireguard://{wireguard_key}@[2001:db8::6]:51820/?publickey={peer_key}&address=10.7.0.3%2F32#WG%20v6\n\
+         mierus://alice:pass@mieru.example.test:3010/?mtu=1400#Mieru\n\
+         mierus://alice:pass@1.2.3.4/?port=6666&protocol=TCP#Mieru%20Simple\n\
+         iwan://user:pw@203.0.113.10:4567/?mtu=1400#IWAN\n\
+         iwan://user:pw@[2001:db8::8]:4567/#IWAN%20v6\n\
+         anx://{anx_key}@203.0.113.7:8443/?pk=aa%3Abb#ANX\n\
+         anx://{anx_key}@[2001:db8::9]:8443/?pk=aa%3Abb#ANX%20v6\n"
+    );
+    let document = parse_subscription("slash-links", &content);
+
+    assert!(
+        skipped_entries(&document).is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    let expected = [
+        ("SS", Protocol::Shadowsocks, "192.168.100.1", 8888),
+        ("SS v6", Protocol::Shadowsocks, "2001:db8::1", 8388),
+        ("Trojan", Protocol::Trojan, "trojan.example.test", 443),
+        ("Trojan v6", Protocol::Trojan, "2001:db8::2", 443),
+        ("VLESS", Protocol::Vless, "vless.example.test", 443),
+        ("VLESS v6", Protocol::Vless, "2001:db8::3", 8443),
+        ("HY2", Protocol::Hysteria2, "hy.example.test", 8443),
+        ("HY2 v6", Protocol::Hysteria2, "2001:db8::4", 8443),
+        ("TUIC", Protocol::Tuic, "tuic.example.test", 443),
+        ("TUIC v6", Protocol::Tuic, "2001:db8::5", 443),
+        ("WG", Protocol::WireGuard, "wg.example.test", 51820),
+        ("WG v6", Protocol::WireGuard, "2001:db8::6", 51820),
+        ("Mieru", Protocol::Mieru, "mieru.example.test", 3010),
+        ("Mieru Simple", Protocol::Mieru, "1.2.3.4", 6666),
+        ("IWAN", Protocol::Iwan, "203.0.113.10", 4567),
+        ("IWAN v6", Protocol::Iwan, "2001:db8::8", 4567),
+        ("ANX", Protocol::Anx, "203.0.113.7", 8443),
+        ("ANX v6", Protocol::Anx, "2001:db8::9", 8443),
+    ];
+    assert_eq!(document.nodes.len(), expected.len());
+    for (name, protocol, host, port) in expected {
+        let node = node_named(&document, name);
+        assert_eq!(node.protocol, protocol, "{name}");
+        assert_eq!(node.endpoint.host, host, "{name}");
+        assert_eq!(node.endpoint.port, port, "{name}");
+    }
+    assert_metadata(
+        &node_named(&document, "Trojan").metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "edge.example.test",
+    );
+    assert_metadata(
+        &node_named(&document, "WG").metadata,
+        NODE_METADATA_WIREGUARD_PRIVATE_KEY,
+        wireguard_key,
+    );
+}
+
+#[test]
+fn sip002_specification_examples_parse() {
+    let document = parse_subscription(
+        "sip002-examples",
+        concat!(
+            "ss://YWVzLTEyOC1nY206dGVzdA@192.168.100.1:8888#Example1\n",
+            "ss://cmM0LW1kNTpwYXNzd2Q@192.168.100.1:8888/?plugin=obfs-local%3Bobfs%3Dhttp#Example2\n",
+            "ss://2022-blake3-aes-256-gcm:YctPZ6U7xPPcU%2Bgp3u%2BOX%3D%3D@192.168.100.1:8888#Example3\n",
+        ),
+    );
+
+    assert!(
+        skipped_entries(&document).is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    let example1 = node_named(&document, "Example1");
+    assert_metadata(
+        &example1.metadata,
+        NODE_METADATA_SHADOWSOCKS_METHOD,
+        "aes-128-gcm",
+    );
+    assert_metadata(
+        &example1.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "test",
+    );
+    let example2 = node_named(&document, "Example2");
+    assert_eq!(example2.endpoint.port, 8888);
+    assert_metadata(
+        &example2.metadata,
+        NODE_METADATA_SHADOWSOCKS_METHOD,
+        "rc4-md5",
+    );
+    assert_metadata(
+        &example2.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "passwd",
+    );
+    assert_metadata(&example2.metadata, "shadowsocks.plugin", "obfs-local");
+    let example3 = node_named(&document, "Example3");
+    assert_metadata(
+        &example3.metadata,
+        NODE_METADATA_SHADOWSOCKS_METHOD,
+        "2022-blake3-aes-256-gcm",
+    );
+    assert_metadata(
+        &example3.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "YctPZ6U7xPPcU+gp3u+OX==",
+    );
+}
+
+#[test]
+fn sip002_plaintext_userinfo_is_percent_decoded() {
+    let document = parse_subscription(
+        "sip002-userinfo",
+        concat!(
+            // The vector the iOS link parser tests use too.
+            "ss://2022-blake3-aes-128-gcm:AAECAwQFBgcICQoLDA0ODw%3D%3D@a.example.test:443#Encoded\n",
+            "ss://2022-blake3-aes-128-gcm:%2B%2B%2B%2B%2F%2F%2F%2F%2B%2B%2B%2B%2F%2F%2F%2FAQIDBA%3D%3D@b.example.test:443#Slashes\n",
+            // SS-2022 multi-user `iPSK:uPSK`.
+            "ss://2022-blake3-aes-128-gcm:AAECAwQFBgcICQoLDA0ODw%3D%3D%3AEBESExQVFhcYGRobHB0eHw%3D%3D@c.example.test:443#Multi\n",
+            // Not encoded: `+`, `/` and `=` stay as written, `+` is not a space.
+            "ss://2022-blake3-aes-128-gcm:++++////++++////AQIDBA==@d.example.test:443#Raw\n",
+            // A stray `%` is not valid percent encoding: kept as written.
+            "ss://aes-256-gcm:50%off@e.example.test:443#Stray\n",
+            // base64url userinfo with percent-encoded `=` padding.
+            "ss://YWVzLTI1Ni1nY206cGFzcw%3D%3D@f.example.test:443#Padded\n",
+            // The whole userinfo percent-encoded, `:` included.
+            "ss://aes-256-gcm%3Apass%2Bword@g.example.test:443#Colon\n",
+        ),
+    );
+
+    assert!(
+        skipped_entries(&document).is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    for (name, method, password) in [
+        (
+            "Encoded",
+            "2022-blake3-aes-128-gcm",
+            "AAECAwQFBgcICQoLDA0ODw==",
+        ),
+        (
+            "Slashes",
+            "2022-blake3-aes-128-gcm",
+            "++++////++++////AQIDBA==",
+        ),
+        (
+            "Multi",
+            "2022-blake3-aes-128-gcm",
+            "AAECAwQFBgcICQoLDA0ODw==:EBESExQVFhcYGRobHB0eHw==",
+        ),
+        ("Raw", "2022-blake3-aes-128-gcm", "++++////++++////AQIDBA=="),
+        ("Stray", "aes-256-gcm", "50%off"),
+        ("Padded", "aes-256-gcm", "pass"),
+        ("Colon", "aes-256-gcm", "pass+word"),
+    ] {
+        let node = node_named(&document, name);
+        assert_eq!(
+            metadata_value(&node.metadata, NODE_METADATA_SHADOWSOCKS_METHOD),
+            Some(method),
+            "{name}"
+        );
+        assert_eq!(
+            metadata_value(&node.metadata, NODE_METADATA_SHADOWSOCKS_PASSWORD),
+            Some(password),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn legacy_shadowsocks_links_keep_raw_passwords_and_accept_a_trailing_slash() {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let percent = engine.encode("aes-128-gcm:50%25off@percent.example.test:8388");
+    let document = parse_subscription(
+        "legacy-ss",
+        &format!(
+            // `%25` inside the base64 is the password, not an escape.
+            "ss://{percent}#Percent\n\
+             ss://YWVzLTEyOC1nY206cHdAbGVnYWN5LmV4YW1wbGUudGVzdDo4Mzg4/?plugin=none#Slash\n\
+             ss://YWVzLTEyOC1nY206cHcxMkBsZWdhY3kuZXhhbXBsZS50ZXN0OjgzODg/#Slash%20Unpadded\n"
+        ),
+    );
+
+    assert!(
+        skipped_entries(&document).is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    let percent = node_named(&document, "Percent");
+    assert_metadata(
+        &percent.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "50%25off",
+    );
+    let slash = node_named(&document, "Slash");
+    assert_eq!(slash.endpoint.host, "legacy.example.test");
+    assert_eq!(slash.endpoint.port, 8388);
+    assert_metadata(&slash.metadata, NODE_METADATA_SHADOWSOCKS_PASSWORD, "pw");
+    // Decoded as written, `<55 chars>/` gives `...:8388?`; the `/` is
+    // dropped instead.
+    let unpadded = node_named(&document, "Slash Unpadded");
+    assert_eq!(unpadded.endpoint.port, 8388);
+    assert_metadata(
+        &unpadded.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "pw12",
+    );
+}
+
+#[test]
+fn hysteria2_links_default_the_port_and_read_port_hopping_from_the_authority() {
+    let document = parse_subscription(
+        "hysteria2-authority",
+        concat!(
+            "hysteria2://letmein@example.com/?insecure=1&obfs=salamander&obfs-password=gawrgura&sni=real.example.com#Official\n",
+            "hy2://pw@[2001:db8::4]/?sni=v6.example.test#No%20Port%20v6\n",
+            "hy2://pw@bare.example.test#Bare\n",
+            "hysteria2://letmein@example.com:123,5000-6000/?sni=real.example.com#Hopping\n",
+            "hysteria2://pw@[2001:db8::5]:20000-30000?mport=443,20000-30000#Merged\n",
+        ),
+    );
+
+    assert!(
+        skipped_entries(&document).is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    let official = node_named(&document, "Official");
+    assert_eq!(official.endpoint.host, "example.com");
+    assert_eq!(official.endpoint.port, 443);
+    assert_metadata(
+        &official.metadata,
+        NODE_METADATA_HYSTERIA2_PASSWORD,
+        "letmein",
+    );
+    assert_metadata(
+        &official.metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "real.example.com",
+    );
+    assert_eq!(
+        metadata_value(&official.metadata, NODE_METADATA_HYSTERIA2_SERVER_PORTS),
+        None
+    );
+    let v6 = node_named(&document, "No Port v6");
+    assert_eq!(v6.endpoint.host, "2001:db8::4");
+    assert_eq!(v6.endpoint.port, 443);
+    assert_eq!(node_named(&document, "Bare").endpoint.port, 443);
+    let hopping = node_named(&document, "Hopping");
+    assert_eq!(hopping.endpoint.host, "example.com");
+    assert_eq!(hopping.endpoint.port, 123);
+    assert_metadata(
+        &hopping.metadata,
+        NODE_METADATA_HYSTERIA2_SERVER_PORTS,
+        "123,5000:6000",
+    );
+    let merged = node_named(&document, "Merged");
+    assert_eq!(merged.endpoint.host, "2001:db8::5");
+    assert_eq!(merged.endpoint.port, 20000);
+    assert_metadata(
+        &merged.metadata,
+        NODE_METADATA_HYSTERIA2_SERVER_PORTS,
+        "20000:30000,443",
+    );
+}
+
+#[test]
+fn share_links_without_a_required_port_are_skipped_alone() {
+    let document = parse_subscription(
+        "missing-port",
+        concat!(
+            "tuic://00000000-0000-0000-0000-000000000001:pw@tuic.example.test/?congestion_control=bbr#TUIC\n",
+            "trojan://pw@trojan.example.test/?sni=trojan.example.test#Trojan\n",
+            "hysteria2://pw@hy.example.test:not-a-port/#Bad%20HY2\n",
+            "hysteria2://pw@hy.example.test/#HY2\n",
+        ),
+    );
+
+    let names = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["HY2"]);
+    assert_eq!(document.nodes[0].endpoint.port, 443);
+    let codes = skipped_entries(&document)
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        codes,
+        [
+            config_core::SUBSCRIPTION_TUIC_LINK_INVALID_CODE,
+            config_core::SUBSCRIPTION_TROJAN_LINK_INVALID_CODE,
+            config_core::SUBSCRIPTION_HYSTERIA2_LINK_INVALID_CODE,
+        ]
     );
 }

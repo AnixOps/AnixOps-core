@@ -1992,3 +1992,52 @@ fn final_dns_failed_sends_failed_lookups_to_final() {
         );
     }
 }
+
+/// `count` select groups `G0 -> G1 -> ...`, the last one holding `tail`.
+fn group_chain(count: usize, tail: &str) -> Vec<PolicyGroupSpec> {
+    (0..count)
+        .map(|index| {
+            let next = if index + 1 == count {
+                tail.to_string()
+            } else {
+                format!("G{}", index + 1)
+            };
+            group(&format!("G{index}"), "select", &[next.as_str()])
+        })
+        .collect()
+}
+
+#[test]
+fn long_group_chains_are_checked_for_cycles_without_recursion() {
+    // Deep enough to overflow a test thread's stack with one frame per
+    // group, as the recursive check did.
+    const DEPTH: usize = 100_000;
+    let model = RoutingModel::from_spec(
+        &spec(&["FINAL,G0"], group_chain(DEPTH, "hk-1")),
+        &node_ids(),
+    )
+    .expect("a chain ending in a node is valid");
+    assert_eq!(model.groups.len(), DEPTH);
+
+    // Closing the chain on itself is still a cycle, with the same error.
+    let error =
+        RoutingModel::from_spec(&spec(&["FINAL,G0"], group_chain(DEPTH, "G0")), &node_ids())
+            .unwrap_err();
+    assert_eq!(error.code, ROUTING_GROUP_CYCLE_CODE);
+    assert_eq!(error.message, "policy group G0 is part of a group cycle");
+
+    // A large group with repeated members keeps each member once.
+    let members = ["hk-1", "jp-1"].repeat(10_000);
+    let model = RoutingModel::from_spec(
+        &spec(&["FINAL,Big"], vec![group("Big", "select", &members)]),
+        &node_ids(),
+    )
+    .unwrap();
+    assert_eq!(
+        model.group("Big").unwrap().members,
+        vec![
+            PolicyTarget::Node("hk-1".to_string()),
+            PolicyTarget::Node("jp-1".to_string())
+        ]
+    );
+}

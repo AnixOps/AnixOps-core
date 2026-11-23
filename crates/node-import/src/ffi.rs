@@ -54,10 +54,16 @@ pub extern "C" fn networkcore_import_abi_version() -> u32 {
 /// Parses `text` (UTF-8) and writes the report as JSON:
 /// `{"nodes":[{"id","name","protocol","server","port","outbound"}],
 ///   "unsupported":[{"name","protocol","reason"}], "routing"?:{"rules","groups","rule_sets"?},
-///   "routing_warnings"?:[string]}`;
-/// `routing` appears only when the subscription's rules can run (see
-/// [`crate::ImportReport::routing`]); `routing_warnings` lists what importing
-/// the rules left out (see [`crate::ImportReport::routing_warnings`]).
+///   "routed_node_ids"?:[string], "routing_warnings"?:[string],
+///   "skipped"?:[{"code","message"}], "skipped_count"?:n}`;
+/// `routing` appears when the subscription's rules can run with the nodes
+/// that can (see [`crate::ImportReport::routing`]), with `routed_node_ids`
+/// naming the nodes its outbounds must hold (see
+/// [`crate::ImportReport::routed_node_ids`]); `routing_warnings` lists what
+/// importing the rules left out, and why there is no routing when there is
+/// none (see [`crate::ImportReport::routing_warnings`]);
+/// `skipped` lists subscription entries that could not be read and were left
+/// out while the others imported (see [`crate::ImportReport::skipped`]).
 ///
 /// # Safety
 ///

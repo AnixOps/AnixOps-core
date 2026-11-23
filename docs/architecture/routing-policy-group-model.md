@@ -117,6 +117,7 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 
 - Surge/Loon：`[Proxy Group]` 行 `名称 = 类型, 成员, 成员, url=..., interval=..., tolerance=..., evaluate-before-use=true`，`[Rule]` 段规则行。Surge `subnet` 组（`default = A, "SSID:Home" = DIRECT, "TYPE:CELLULAR" = B`）与旧 `ssid` 组（`default = A, cellular = B, "Home" = DIRECT`，裸名按 SSID）导入为 `subnet`；不认识的键、目标未导入的规则跳过并告警，`default` 无法导入时整组跳过。
 - Clash YAML：`proxy-groups`（`name`/`type`/`proxies`/`url`/`interval`/`tolerance`）与 `rules`，`MATCH` 视为 `FINAL`。
+- 内置策略别名：Surge/Loon `[Proxy]` 中 `名称 = direct`（含 `Home = direct, interface=en0`）、`名称 = reject`/`reject-*`，以及 Clash `proxies` 中 `type: direct`/`reject`/`reject-drop` 的条目不是节点；成员和规则目标写这些名称时分别按 `DIRECT` 和对应的 `REJECT` 类型导入（同名的节点或策略组优先）。别名带的选项（如 `interface=`）不导入，给出 `config.core.routing_import.option_ignored` 警告 `proxy Home options were ignored: it routes as DIRECT`。订阅解析时跳过的条目（见 `subscription-catalog-runtime-orchestration.md`「条目级容错」）不是节点，引用它们的成员和规则按「目标未导入」跳过并告警。
 - 成员和规则目标按代理名称映射到节点 id，策略组 id 保留原名称；`REJECT`、`REJECT-NO-DROP`、`REJECT-DROP`、`REJECT-TINYGIF`（Loon `REJECT-IMG`）保留各自含义，其余 `REJECT-*`（Loon `REJECT-200`、`REJECT-DICT`、`REJECT-ARRAY`、`REJECT-VIDEO`）视为 `REJECT`；规则只保留 `no-resolve` 选项。
 - 导入的规则类型：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`/`IP-CIDR6`、`GEOIP`、`IP-ASN`、`GEOSITE`、`DST-PORT`/`DEST-PORT`、`PROCESS-NAME`、`SRC-IP`、`IN-PORT`、`SRC-PORT`、`HOSTNAME-TYPE`、`SUBNET`、`DEVICE-NAME`、`CELLULAR-RADIO`、`PROTOCOL`、`RULE-SET`、Surge `DOMAIN-SET` 和 `AND`/`OR`/`NOT`；`FINAL` 的 `dns-failed` 保留。`GEOSITE,<c>` 与 `GEOIP,<CC>` 原样保留，由客户端提供 `geosite-<c>`、`geoip-<cc>` 规则集。
 - 规则测试与命中计数：运行时控制 `test_route` 按当前规则判定一条假想连接（`host` 为域名或 IP，可给 `port`、`network`、`address`、`process`、`url`、`user_agent`、`source`），返回决定它的规则序号与文本、策略组链和出站，不建连接也不计数；需要地址而没给时返回 `needs_address`。`rule_hits` 返回每条规则（插件规则在前）与 FINAL 自规则载入以来决定的连接数和最近命中时间，`clear_rule_hits` 清零，热重载后从零开始。
@@ -125,6 +126,17 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 - 节点名过滤：Surge `include-all-proxies`、Clash `include-all`/`include-all-proxies` 加入全部节点；Surge `policy-regex-filter`、Clash `filter`（可用反引号分隔多个模式）只保留名称匹配的节点，Clash `exclude-filter` 去掉匹配的节点，按订阅中的节点顺序追加在显式成员之后。两者原本作用于外部列表/provider（不导入），所以没有成员的组带过滤器时从全部节点中筛选；有成员且没有 include-all 的组忽略过滤器并警告；正则无法编译（Rust `regex` 语法，不支持环视）时不加节点并警告。
 - 不支持的规则类型、目标未导入的规则、`relay` 等组、组内 `REJECT`、url-test/fallback 内的组成员都会跳过并给出警告；成员全部被跳过的组也会跳过，引用它的规则随之跳过。`FINAL` 之后的规则忽略。
 - 跳过后剩余内容仍无法通过 `RoutingModel::from_spec`（如没有 `FINAL`、组成环）时整体不导入，返回 `None` 和 `config.core.routing_import.invalid` 警告。诊断只包含规则类型、组名和节点名，不包含节点凭据。
+- Clash `GEOIP,LAN` 与 mihomo `GEOIP,private`（不区分大小写，可带引号与 `no-resolve`，逻辑规则内同样）指私有网络而不是国家，改写为内核内置的 `RULE-SET,LAN`；不会指向同名的 Clash provider，也不生成远程集。此前它们按国家代码导入，因为内核没有 `geoip-lan` 数据而永不命中。
+- 导入规模上限（`routing_import` 的公开常量）：规则行（含 Loon `[Remote Rule]`）最多 `MAX_SOURCE_RULES` = 65536 行、策略组最多 `MAX_SOURCE_POLICY_GROUPS` = 512 个、全部组成员（含名称过滤展开的节点）合计最多 `MAX_SOURCE_GROUP_MEMBERSHIPS` = 65536 个，超出时在做任何与规模相关的工作之前整体不导入，`config.core.routing_import.invalid` 警告写明数量与上限。单个组成员超过 `MAX_SOURCE_GROUP_MEMBERS` = 4096 个时跳过该组；单条规则超过 `MAX_SOURCE_RULE_LEN` = 64 KiB 时跳过该规则。警告最多保留 `MAX_IMPORT_WARNINGS` = 1024 条，其余计数为一条 `N more import warnings were left out`；说明为什么整体不导入的那条警告总是保留。组的取舍按轮次进行：每轮只重新检查引用了上一轮被丢弃的组的成员，长链组的导入与成员数成线性；逻辑规则内的规则集引用一次扫描改写；`RoutingModel::from_spec` 的组成环检查改为显式栈，深链不会耗尽调用栈。
+
+### 引擎出站上限与不能运行的节点（node-import）
+
+`node_import::fit_subscription_routing(text, &nodes, runnable)`（`import_text` 与 `engine_embedded::nodes::subscription_routing_envelope` 都用它）把订阅规则适配到本构建能运行的节点：
+
+- 能路由的节点：`runnable` 接受、id 是合法出站 id、`via` 链上的节点都能路由且链长不超过 `MAX_VIA_CHAIN` = 4。其余节点不参与规则导入：引用它们的组成员和规则按“目标未导入”跳过，各有一条警告，成员全被跳过的组随之跳过。一个不支持的节点不再让整份订阅失去规则与策略组。`routing_warnings` 开头先按原因汇总被排除的节点数（不能运行、id 不合法、`via` 链不能运行或过长）。
+- 引擎每份配置最多 `MAX_ROUTED_OUTBOUNDS` = 64 个出站（iOS 包隧道的内存预算按此设计：每个出站是一个常驻出站，测速组会同时探测全部成员），该上限不变。能路由的节点不超过 64 个时全部写入；超过时只写规则、策略组成员、默认成员、网络规则目标和规则集下载 `via` 指向的节点及其 `via` 链，`ImportReport::routed_node_ids`（JSON `routed_node_ids`）按订阅顺序列出 `routing.outbounds` 必须包含的节点 id。客户端在全局模式选中的节点不在其中时把它（及其链）加上，因此被引用的节点最多 `64 - MAX_VIA_CHAIN` = 60 个，超过时不导出 `routing`。
+- 不导出 `routing` 时 `routing_warnings` 第一条说明原因：规则超过 `MAX_ROUTING_RULES`、策略组超过 `MAX_POLICY_GROUPS`、某个 `subnet` 组网络规则超过 `MAX_NETWORK_RULES`、没有能运行的节点、被引用的节点超过 60 个（`subscription rules and policy groups were not used: ...`），或导入本身的 `invalid` 警告；客户端据此提示，而不是静默退回单节点。订阅没有规则时既无 `routing` 也无警告。
+- `engine_embedded::nodes::subscription_routing_envelope(profile_id, content, parsed, nodes, selected_node_id)` 按 id 用用户编辑后的节点判断能否运行，写入 `routed_node_ids` 与选中节点的链（放得下时），并用引擎自己的 `RuntimeConfig::from_json` 校验；被拒绝时 `envelope` 为 `None`，警告第一条说明原因。
 
 ## 本地代理接入
 

@@ -51,8 +51,9 @@ use node_import::{MAX_POLICY_GROUPS, MAX_ROUTED_OUTBOUNDS, MAX_ROUTING_RULES};
 const MAX_RULE_SETS: usize = 32;
 /// Longest `routing.rule_set_cache_dir`, in bytes.
 const MAX_CACHE_DIR_LEN: usize = 4096;
-/// Longest `via` chain, the outbound itself included.
-const MAX_VIA_CHAIN: usize = 4;
+/// Longest `via` chain, the outbound itself included; shared with the
+/// importer.
+const MAX_VIA_CHAIN: usize = node_import::MAX_VIA_CHAIN;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -424,8 +425,9 @@ pub struct PolicyGroupConfig {
     pub network_rules: Vec<NetworkRuleConfig>,
 }
 
-/// Most network rules one `subnet` group may have.
-pub const MAX_NETWORK_RULES: usize = 64;
+/// Most network rules one `subnet` group may have; shared with the
+/// importer.
+pub const MAX_NETWORK_RULES: usize = node_import::MAX_NETWORK_RULES;
 
 /// One rule of a `subnet` group; see
 /// [`config_core::routing::NetworkRuleSpec`] for `when`.

@@ -5411,7 +5411,12 @@ fn mitm_browser_capture_session_plan_links_proxy_browser_and_plugin_without_muta
         .expect("session-plan report should be present");
     assert_eq!(session.status, "ready");
     assert_eq!(session.url_source, "cli-argument-redacted");
-    assert_eq!(session.node_id, "ss-82-47-34-99-11111");
+    // Stable node id: protocol, server, port and an endpoint hash.
+    assert!(
+        session.node_id.starts_with("ss-82-47-34-99-11111-"),
+        "{}",
+        session.node_id
+    );
     assert_eq!(session.node_name, "香港");
     assert_eq!(session.proxy_url, "http://127.0.0.1:7891");
     assert!(session
@@ -8553,10 +8558,9 @@ fn browser_capture_session_plan_json_output_contains_session_fields() {
         "https://example.com/capture"
     );
     assert_eq!(json["browser_capture"]["session_plan"]["status"], "ready");
-    assert_eq!(
-        json["browser_capture"]["session_plan"]["node_id"],
-        "ss-82-47-34-99-11111"
-    );
+    assert!(json["browser_capture"]["session_plan"]["node_id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("ss-82-47-34-99-11111-")));
     assert_eq!(json["browser_capture"]["session_plan"]["node_name"], "香港");
     assert_eq!(
         json["browser_capture"]["session_plan"]["target_url"],

@@ -2164,10 +2164,12 @@ fn normalize_group(spec: &PolicyGroupSpec, names: &TargetNames) -> DomainResult<
     }
 
     let mut members = Vec::with_capacity(spec.members.len());
+    // A set beside the list, so a large group dedupes in linear time.
+    let mut seen = BTreeSet::new();
     for member in &spec.members {
         let member = names.resolve(member)?;
         check_member_supported(&id, kind, &member)?;
-        if !members.contains(&member) {
+        if seen.insert(member.clone()) {
             members.push(member);
         }
     }
@@ -2321,6 +2323,7 @@ fn normalize_subnet_group(
     let default = names.resolve(default)?;
     check_member_supported(&id, PolicyGroupKind::Subnet, &default)?;
     let mut members = vec![default.clone()];
+    let mut seen = BTreeSet::from([default.clone()]);
     let mut network_rules = Vec::with_capacity(spec.network_rules.len());
     for (index, rule) in spec.network_rules.iter().enumerate() {
         let when = NetworkCondition::parse(&rule.when).ok_or_else(|| {
@@ -2330,7 +2333,7 @@ fn normalize_subnet_group(
         })?;
         let target = names.resolve(&rule.target)?;
         check_member_supported(&id, PolicyGroupKind::Subnet, &target)?;
-        if !members.contains(&target) {
+        if seen.insert(target.clone()) {
             members.push(target.clone());
         }
         network_rules.push(NetworkRule { when, target });
@@ -2362,33 +2365,43 @@ fn reject_group_cycles(groups: &[PolicyGroup]) -> DomainResult<()> {
         })
         .collect::<BTreeMap<_, _>>();
 
-    // 0 = unvisited, 1 = on the current path, 2 = done.
-    fn visit<'a>(
-        id: &'a str,
-        edges: &BTreeMap<&'a str, Vec<&'a str>>,
-        state: &mut BTreeMap<&'a str, u8>,
-    ) -> DomainResult<()> {
-        match state.get(id).copied().unwrap_or(0) {
-            1 => {
-                return Err(routing_error(
-                    ROUTING_GROUP_CYCLE_CODE,
-                    format!("policy group {id} is part of a group cycle"),
-                ))
+    // 0 = unvisited, 1 = on the current path, 2 = done. Depth-first with
+    // an explicit stack of (group, next child), so a long chain of groups
+    // cannot overflow the thread's stack.
+    let mut state: BTreeMap<&str, u8> = BTreeMap::new();
+    for root in edges.keys().copied() {
+        if state.get(root).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        state.insert(root, 1);
+        let mut stack: Vec<(&str, usize)> = vec![(root, 0)];
+        while let Some(&(id, next)) = stack.last() {
+            let child = edges
+                .get(id)
+                .and_then(|children| children.get(next))
+                .copied();
+            let Some(child) = child else {
+                state.insert(id, 2);
+                stack.pop();
+                continue;
+            };
+            if let Some(top) = stack.last_mut() {
+                top.1 += 1;
             }
-            2 => return Ok(()),
-            _ => {}
+            match state.get(child).copied().unwrap_or(0) {
+                1 => {
+                    return Err(routing_error(
+                        ROUTING_GROUP_CYCLE_CODE,
+                        format!("policy group {child} is part of a group cycle"),
+                    ))
+                }
+                2 => {}
+                _ => {
+                    state.insert(child, 1);
+                    stack.push((child, 0));
+                }
+            }
         }
-        state.insert(id, 1);
-        for child in edges.get(id).into_iter().flatten().copied() {
-            visit(child, edges, state)?;
-        }
-        state.insert(id, 2);
-        Ok(())
-    }
-
-    let mut state = BTreeMap::new();
-    for id in edges.keys().copied() {
-        visit(id, &edges, &mut state)?;
     }
     Ok(())
 }
