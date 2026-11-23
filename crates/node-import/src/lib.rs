@@ -141,10 +141,10 @@ pub struct ImportReport {
     pub routing_warnings: Vec<String>,
     /// Subscription entries that could not be read and were left out so the
     /// others still import (a proxy type no reader knows, a malformed share
-    /// link, a field of the wrong type), in subscription order, at most
-    /// [`MAX_SKIPPED_ENTRIES`]. Unlike [`ImportReport::unsupported`] these
-    /// never became nodes, and they do not keep [`ImportReport::routing`]
-    /// out: rules and group members that name them are left out with a
+    /// link, a field of the wrong type), at most [`MAX_SKIPPED_ENTRIES`].
+    /// Unlike [`ImportReport::unsupported`] these never became nodes, and
+    /// they do not keep [`ImportReport::routing`] out: rules and group
+    /// members that name them are left out with a
     /// [`ImportReport::routing_warnings`] line instead. Built-in policy
     /// entries (Surge's `DIRECT = direct`, a Clash `type: direct` proxy) are
     /// not listed. Left out when nothing was skipped.

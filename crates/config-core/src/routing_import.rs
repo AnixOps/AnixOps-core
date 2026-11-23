@@ -332,7 +332,8 @@ struct RawClashProxyGroup {
 #[serde(untagged)]
 enum RawClashRoutingProxies {
     List(Vec<serde_json::Value>),
-    Other(serde::de::IgnoredAny),
+    // Only the variant matters: any other shape means no aliases.
+    Other(#[allow(dead_code)] serde::de::IgnoredAny),
 }
 
 /// Clash `proxies` entries whose `type` is a built-in policy, by name.
