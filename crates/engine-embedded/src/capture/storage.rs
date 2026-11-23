@@ -89,10 +89,7 @@ impl StorageError {
 impl Storage {
     /// Checks the key and creates `dir` when missing.
     pub fn new(dir: &str, key: &[u8], retention_days: Option<u32>) -> Result<Self, StorageError> {
-        if key.len() != KEY_LEN {
-            return Err(StorageError::InvalidKey);
-        }
-        let key = UnboundKey::new(&CHACHA20_POLY1305, key).map_err(|_| StorageError::InvalidKey)?;
+        let key = sealing_key(key)?;
         if dir.trim().is_empty() {
             return Err(StorageError::InvalidDirectory);
         }
@@ -100,7 +97,7 @@ impl Storage {
         fs::create_dir_all(&dir).map_err(|_| StorageError::InvalidDirectory)?;
         Ok(Self {
             dir,
-            key: LessSafeKey::new(key),
+            key,
             retention_days: retention_days
                 .unwrap_or(DEFAULT_RETENTION_DAYS)
                 .clamp(1, MAX_RETENTION_DAYS),
@@ -135,89 +132,50 @@ impl Storage {
         purged
     }
 
-    /// Seals `inner` into a new session file; its listing entry.
+    /// Seals `inner` into a session file; its listing entry. The file is
+    /// session `id` when given (it replaces a session of that id: the
+    /// engine's own run, see [`super::CaptureStore::run_session`]), else a
+    /// new one.
     pub(super) fn save(
         &self,
         inner: &Inner,
         name: Option<&str>,
         now_ms: u64,
+        id: Option<&str>,
     ) -> Result<Value, StorageError> {
-        let random = SystemRandom::new();
-        let mut tag = [0u8; 4];
-        random
-            .fill(&mut tag)
-            .map_err(|_| StorageError::WriteFailed)?;
-        let id = format!("{now_ms}-{}", hex(&tag));
-        let requests: usize = inner.connections.values().map(|c| c.http.len()).sum();
-        let name: String = name
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or("")
-            .chars()
-            .take(MAX_NAME_CHARS)
-            .collect();
-        let meta = json!({
-            "name": name,
-            "saved_at_ms": now_ms,
-            "connections": inner.connections.len(),
-            "requests": requests,
-        });
-        let mut meta = serde_json::to_vec(&meta).map_err(|_| StorageError::WriteFailed)?;
-        let mut body = encode(inner);
-
-        let mut file = Vec::with_capacity(MAGIC.len() + meta.len() + body.len() + 64);
-        file.extend_from_slice(MAGIC);
-        self.seal(&random, &mut meta, 0, &mut file)?;
-        self.seal(&random, &mut body, 1, &mut file)?;
-        drop(body);
-
-        let path = self.dir.join(format!("{id}.{EXTENSION}"));
-        let partial = self.dir.join(format!(".{id}.partial"));
-        fs::write(&partial, &file)
-            .and_then(|()| fs::rename(&partial, &path))
-            .map_err(|_| {
-                let _ = fs::remove_file(&partial);
-                StorageError::WriteFailed
-            })?;
+        let id = match id {
+            Some(id) => {
+                self.path(id)?;
+                id.to_string()
+            }
+            None => new_session_id(now_ms).ok_or(StorageError::WriteFailed)?,
+        };
+        let sealed = seal_inner(&self.key, inner, name, now_ms)?;
+        let path = self.write(&id, &sealed.file)?;
         Ok(self.entry(
             &id,
             &path,
             Some(meta_value(
                 &id,
                 now_ms,
-                &name,
-                inner.connections.len(),
-                requests,
+                &sealed.name,
+                sealed.connections,
+                sealed.requests,
             )),
         ))
     }
 
-    /// `part` 0 is the meta part (length-prefixed), 1 the connections.
-    fn seal(
-        &self,
-        random: &SystemRandom,
-        data: &mut Vec<u8>,
-        part: u8,
-        file: &mut Vec<u8>,
-    ) -> Result<(), StorageError> {
-        let mut nonce = [0u8; NONCE_LEN];
-        random
-            .fill(&mut nonce)
-            .map_err(|_| StorageError::WriteFailed)?;
-        self.key
-            .seal_in_place_append_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::from(aad(part)),
-                data,
-            )
-            .map_err(|_| StorageError::WriteFailed)?;
-        file.extend_from_slice(&nonce);
-        if part == 0 {
-            let len = u32::try_from(data.len()).map_err(|_| StorageError::WriteFailed)?;
-            file.extend_from_slice(&len.to_be_bytes());
-        }
-        file.extend_from_slice(data);
-        Ok(())
+    /// Writes a session file in one step: a partial file renamed into place.
+    fn write(&self, id: &str, file: &[u8]) -> Result<PathBuf, StorageError> {
+        let path = self.dir.join(format!("{id}.{EXTENSION}"));
+        let partial = self.dir.join(format!(".{id}.partial"));
+        fs::write(&partial, file)
+            .and_then(|()| fs::rename(&partial, &path))
+            .map_err(|_| {
+                let _ = fs::remove_file(&partial);
+                StorageError::WriteFailed
+            })?;
+        Ok(path)
     }
 
     fn open<'a>(&self, nonce: &[u8], part: u8, data: &'a mut [u8]) -> Option<&'a mut [u8]> {
@@ -289,25 +247,77 @@ impl Storage {
     pub(super) fn load(&self, id: &str) -> Result<Vec<(u64, Captured)>, StorageError> {
         let path = self.path(id)?;
         let mut file = fs::read(&path).map_err(|_| StorageError::NoSuchSession)?;
+        let (_, body) = self.open_file(&mut file)?;
+        decode(body).ok_or(StorageError::Unreadable)
+    }
+
+    /// The meta and connections parts of a whole session file, opened in
+    /// place.
+    fn open_file<'a>(&self, file: &'a mut [u8]) -> Result<(Value, &'a [u8]), StorageError> {
         if file.len() > MAX_BODY_FILE || !file.starts_with(MAGIC) {
             return Err(StorageError::Unreadable);
         }
-        let mut at = MAGIC.len() + NONCE_LEN;
+        let length_at = MAGIC.len() + NONCE_LEN;
+        let meta_at = length_at + 4;
         let meta_len = file
-            .get(at..at + 4)
+            .get(length_at..meta_at)
             .and_then(|bytes| bytes.try_into().ok())
             .map(u32::from_be_bytes)
             .ok_or(StorageError::Unreadable)? as usize;
-        at += 4 + meta_len;
-        let body_nonce: [u8; NONCE_LEN] = file
-            .get(at..at + NONCE_LEN)
-            .and_then(|bytes| bytes.try_into().ok())
+        let body_at = meta_at
+            .checked_add(meta_len)
+            .filter(|at| at.saturating_add(NONCE_LEN) <= file.len())
             .ok_or(StorageError::Unreadable)?;
-        let body = &mut file[at + NONCE_LEN..];
-        let plain = self
-            .open(&body_nonce, 1, body)
+        let (head, rest) = file.split_at_mut(body_at);
+        let (nonces, meta) = head.split_at_mut(meta_at);
+        let meta = self
+            .open(&nonces[MAGIC.len()..length_at], 0, meta)
+            .and_then(|plain| serde_json::from_slice(plain).ok())
             .ok_or(StorageError::Unreadable)?;
-        decode(plain).ok_or(StorageError::Unreadable)
+        let (body_nonce, body) = rest.split_at_mut(NONCE_LEN);
+        let body: &'a [u8] = self
+            .open(body_nonce, 1, body)
+            .ok_or(StorageError::Unreadable)?;
+        Ok((meta, body))
+    }
+
+    /// Session `id` sealed again under `key` (32 bytes), with the same
+    /// contents: the file a client copies into a store of its own (the app
+    /// beside a tunnel that keeps its key to itself). Never written here.
+    pub fn reseal(&self, id: &str, key: &[u8]) -> Result<Vec<u8>, StorageError> {
+        let target = sealing_key(key)?;
+        let path = self.path(id)?;
+        let mut file = fs::read(&path).map_err(|_| StorageError::NoSuchSession)?;
+        let (meta, body) = self.open_file(&mut file)?;
+        let meta = serde_json::to_vec(&meta).map_err(|_| StorageError::Unreadable)?;
+        let body = body.to_vec();
+        drop(file);
+        sealed_file(&target, meta, body)
+    }
+
+    /// Keeps `file`, a whole session file sealed with this storage's key
+    /// (from [`Self::reseal`]), as session `id`; its listing entry. A file
+    /// this key cannot open is refused, so nothing unreadable is kept; a
+    /// session already there is replaced (the same id is the same save).
+    pub fn import(&self, id: &str, file: &[u8]) -> Result<Value, StorageError> {
+        self.path(id)?;
+        // Opened on a copy: `open_file` decrypts in place, and the sealed
+        // bytes are what is kept.
+        let mut check = file.to_vec();
+        let (meta, body) = self.open_file(&mut check)?;
+        decode(body).ok_or(StorageError::Unreadable)?;
+        let entry = meta_value(
+            id,
+            meta.get("saved_at_ms")
+                .and_then(Value::as_u64)
+                .ok_or(StorageError::Unreadable)?,
+            meta.get("name").and_then(Value::as_str).unwrap_or(""),
+            meta.get("connections").and_then(Value::as_u64).unwrap_or(0) as usize,
+            meta.get("requests").and_then(Value::as_u64).unwrap_or(0) as usize,
+        );
+        drop(check);
+        let path = self.write(id, file)?;
+        Ok(self.entry(id, &path, Some(entry)))
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, StorageError> {
@@ -327,6 +337,94 @@ impl Storage {
         }
         Ok(self.dir.join(format!("{id}.{EXTENSION}")))
     }
+}
+
+/// A new session id `<now_ms>-<8 random hex>`.
+pub(super) fn new_session_id(now_ms: u64) -> Option<String> {
+    let mut tag = [0u8; 4];
+    SystemRandom::new().fill(&mut tag).ok()?;
+    Some(format!("{now_ms}-{}", hex(&tag)))
+}
+
+/// What [`seal_inner`] made.
+pub(super) struct Sealed {
+    pub name: String,
+    pub connections: usize,
+    pub requests: usize,
+    pub file: Vec<u8>,
+}
+
+/// `inner` as a whole session file sealed with `key`, named `name` (cut to
+/// [`MAX_NAME_CHARS`]) and dated `now_ms`.
+pub(super) fn seal_inner(
+    key: &LessSafeKey,
+    inner: &Inner,
+    name: Option<&str>,
+    now_ms: u64,
+) -> Result<Sealed, StorageError> {
+    let requests: usize = inner.connections.values().map(|c| c.http.len()).sum();
+    let name: String = name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let meta = json!({
+        "name": name,
+        "saved_at_ms": now_ms,
+        "connections": inner.connections.len(),
+        "requests": requests,
+    });
+    let meta = serde_json::to_vec(&meta).map_err(|_| StorageError::WriteFailed)?;
+    let file = sealed_file(key, meta, encode(inner))?;
+    Ok(Sealed {
+        name,
+        connections: inner.connections.len(),
+        requests,
+        file,
+    })
+}
+
+/// The AEAD key of 32 raw bytes.
+pub(super) fn sealing_key(key: &[u8]) -> Result<LessSafeKey, StorageError> {
+    if key.len() != KEY_LEN {
+        return Err(StorageError::InvalidKey);
+    }
+    UnboundKey::new(&CHACHA20_POLY1305, key)
+        .map(LessSafeKey::new)
+        .map_err(|_| StorageError::InvalidKey)
+}
+
+/// A whole session file: the meta part (length-prefixed), then the
+/// connections, each under a fresh nonce.
+fn sealed_file(
+    key: &LessSafeKey,
+    mut meta: Vec<u8>,
+    mut body: Vec<u8>,
+) -> Result<Vec<u8>, StorageError> {
+    let random = SystemRandom::new();
+    let mut file = Vec::with_capacity(MAGIC.len() + meta.len() + body.len() + 64);
+    file.extend_from_slice(MAGIC);
+    for (part, data) in [(0u8, &mut meta), (1, &mut body)] {
+        let mut nonce = [0u8; NONCE_LEN];
+        random
+            .fill(&mut nonce)
+            .map_err(|_| StorageError::WriteFailed)?;
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(aad(part)),
+            data,
+        )
+        .map_err(|_| StorageError::WriteFailed)?;
+        file.extend_from_slice(&nonce);
+        if part == 0 {
+            let len = u32::try_from(data.len()).map_err(|_| StorageError::WriteFailed)?;
+            file.extend_from_slice(&len.to_be_bytes());
+        }
+        file.extend_from_slice(data);
+    }
+    Ok(file)
 }
 
 fn meta_value(id: &str, saved_at: u64, name: &str, connections: usize, requests: usize) -> Value {
@@ -360,7 +458,7 @@ fn session_id(path: &Path) -> Option<String> {
 }
 
 /// The save time in a session id `<ms>-<8 hex>`.
-fn saved_at(id: &str) -> Option<u64> {
+pub(super) fn saved_at(id: &str) -> Option<u64> {
     let (millis, tag) = id.split_once('-')?;
     let valid = tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit());
     if !valid || millis.is_empty() || !millis.bytes().all(|b| b.is_ascii_digit()) {
@@ -912,7 +1010,7 @@ mod tests {
         let entry = {
             let inner = super::super::lock(&store.inner);
             storage
-                .save(&inner, Some(" morning run "), 1_000_000)
+                .save(&inner, Some(" morning run "), 1_000_000, None)
                 .unwrap()
         };
         let id = entry["session"].as_str().unwrap().to_string();
@@ -964,14 +1062,77 @@ mod tests {
     }
 
     #[test]
+    fn resealed_sessions_open_only_in_the_store_of_the_new_key() {
+        let tunnel_dir = temp_dir("reseal-tunnel");
+        let app_dir = temp_dir("reseal-app");
+        let tunnel = Storage::new(tunnel_dir.to_str().unwrap(), &[1u8; KEY_LEN], None).unwrap();
+        let app = Storage::new(app_dir.to_str().unwrap(), &[2u8; KEY_LEN], None).unwrap();
+        let store = sample_store();
+        let now = super::super::unix_millis();
+        let id = {
+            let inner = super::super::lock(&store.inner);
+            tunnel
+                .save(&inner, Some("on disconnect"), now, None)
+                .unwrap()["session"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        assert_eq!(tunnel.reseal(&id, &[2u8; 3]), Err(StorageError::InvalidKey));
+        assert_eq!(
+            tunnel.reseal("1-00000000", &[2u8; KEY_LEN]),
+            Err(StorageError::NoSuchSession)
+        );
+        // The tunnel's own file is not the app's: refused, nothing kept.
+        let original = fs::read(tunnel_dir.join(format!("{id}.anxcap"))).unwrap();
+        assert_eq!(app.import(&id, &original), Err(StorageError::Unreadable));
+        assert!(app.list(now).is_empty());
+
+        let copy = tunnel.reseal(&id, &[2u8; KEY_LEN]).unwrap();
+        assert_ne!(copy, original);
+        assert!(!copy.windows(14).any(|w| w == b"secret payload"));
+        assert_eq!(app.import("../x", &copy), Err(StorageError::NoSuchSession));
+        let entry = app.import(&id, &copy).unwrap();
+        assert_eq!(entry["session"], id.as_str());
+        assert_eq!(entry["name"], "on disconnect");
+        assert_eq!(entry["connections"], 2);
+        assert_eq!(entry["requests"], 1);
+        assert_eq!(entry["size"], copy.len() as u64);
+        // Importing again replaces it.
+        app.import(&id, &copy).unwrap();
+        let listed = app.list(now);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "on disconnect");
+
+        let loaded = app.load(&id).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[1].1.http[0].response_body.data, b"secret payload");
+        // Damaged copies are refused.
+        let mut damaged = copy.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        assert_eq!(app.import(&id, &damaged), Err(StorageError::Unreadable));
+        assert_eq!(
+            app.import(&id, &copy[..copy.len() / 2]),
+            Err(StorageError::Unreadable)
+        );
+        assert_eq!(app.import(&id, b""), Err(StorageError::Unreadable));
+        let _ = fs::remove_dir_all(&tunnel_dir);
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
     fn old_sessions_are_purged_and_ids_cannot_name_paths() {
         let dir = temp_dir("purge");
         let storage = Storage::new(dir.to_str().unwrap(), &[1u8; KEY_LEN], Some(7)).unwrap();
         let store = sample_store();
         {
             let inner = super::super::lock(&store.inner);
-            storage.save(&inner, None, 1_000).unwrap();
-            storage.save(&inner, None, 1_000 + 6 * DAY_MS).unwrap();
+            storage.save(&inner, None, 1_000, None).unwrap();
+            storage
+                .save(&inner, None, 1_000 + 6 * DAY_MS, None)
+                .unwrap();
         }
         fs::write(dir.join("notes.txt"), b"keep").unwrap();
         assert_eq!(storage.purge(1_000 + 7 * DAY_MS + 1), 1);

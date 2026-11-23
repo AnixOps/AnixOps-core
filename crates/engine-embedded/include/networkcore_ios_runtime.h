@@ -114,6 +114,15 @@ int32_t networkcore_ios_mitm_inspect_plugin(const uint8_t *text, size_t text_len
 int32_t networkcore_ios_decode_body(const uint8_t *data, size_t data_len, const uint8_t *content_encoding,
                                     size_t content_encoding_len, uint8_t complete, uint8_t *truncated,
                                     NetworkCoreBuffer *out);
+/* Capture viewer (feature set 6): saved capture sessions opened with no runtime handle, in the
+ * app's own process, while the tunnel is off. One JSON request {"cmd": ...} in, one JSON answer in
+ * `out`: set_capture_storage {dir, key_base64}, capture_sessions, load_capture {session},
+ * import_capture {session, data_base64} (a file from the engine's copy_capture), delete_capture,
+ * clear_capture, capture, capture_requests, capture_connection, capture_exchange,
+ * capture_h2_frames, export_capture (pcapng, har, zip, ...) and connections. Requests up to 96 MiB.
+ * A refused request returns NETWORKCORE_IOS_ERR_INVALID_ARGUMENT with {"error": "<message>"} in
+ * `out`. See src/capture_viewer.rs. */
+int32_t networkcore_ios_capture_viewer(const uint8_t *request, size_t request_len, NetworkCoreBuffer *out);
 /* Bound interface (macOS packet tunnel): pins every socket the engine opens to the interface with
  * this index (if_nametoindex), so it leaves through the physical network instead of looping into
  * the tunnel's default route. 0 leaves that family unpinned; both 0 removes the pin. Process-wide,

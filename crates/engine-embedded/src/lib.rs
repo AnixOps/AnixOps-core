@@ -41,6 +41,7 @@
 //! never puts credentials or traffic into errors, status or logs.
 
 pub mod capture;
+pub mod capture_viewer;
 #[cfg(feature = "local-proxy")]
 pub mod checkup;
 pub mod config;

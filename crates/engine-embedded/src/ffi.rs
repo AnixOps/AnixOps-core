@@ -21,8 +21,9 @@ pub const NETWORKCORE_IOS_SCHEMA_VERSION: u32 = crate::config::CONFIG_SCHEMA_VER
 /// 2 added `networkcore_ios_runtime_control`, 3 added
 /// `networkcore_ios_mitm_inspect_plugin`, 4 added
 /// `networkcore_ios_runtime_start_tunnel_batched` and
-/// `networkcore_ios_runtime_input_packets`, 5 added `networkcore_ios_checkup`.
-pub const NETWORKCORE_IOS_FEATURE_SET_VERSION: u32 = 5;
+/// `networkcore_ios_runtime_input_packets`, 5 added `networkcore_ios_checkup`,
+/// 6 added `networkcore_ios_capture_viewer`.
+pub const NETWORKCORE_IOS_FEATURE_SET_VERSION: u32 = 6;
 
 pub const NETWORKCORE_IOS_OK: i32 = 0;
 pub const NETWORKCORE_IOS_ERR_ARTIFACT_MISSING: i32 = 1;
@@ -634,6 +635,58 @@ pub unsafe extern "C" fn networkcore_ios_mitm_inspect_plugin(
             }
             None => NETWORKCORE_IOS_ERR_INVALID_ARGUMENT,
         }
+    })
+}
+
+/// Answers one JSON request with the capture viewer, which opens saved
+/// capture sessions with no runtime handle, in the app's own process (see
+/// [`crate::capture_viewer`]): `set_capture_storage`, `capture_sessions`,
+/// `load_capture`, `import_capture`, `delete_capture`, the capture read
+/// commands, `export_capture` and `connections`. Requests up to
+/// [`crate::control::MAX_VIEWER_REQUEST_LEN`] bytes.
+///
+/// Returns `NETWORKCORE_IOS_ERR_INVALID_ARGUMENT` for a request that is not
+/// one of those, or that the storage refused; `out` then holds
+/// `{"error": "<fixed message>"}` (no paths, no key bytes), e.g.
+/// "capture session cannot be read with this key".
+///
+/// # Safety
+///
+/// `request` must point to `request_len` readable bytes and `out` must be a
+/// valid pointer to writable storage for one `NetworkCoreBuffer`, which must
+/// be released with `networkcore_ios_runtime_free_buffer`.
+#[no_mangle]
+pub unsafe extern "C" fn networkcore_ios_capture_viewer(
+    request: *const u8,
+    request_len: usize,
+    out: *mut NetworkCoreBuffer,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: checked non-null above.
+        unsafe { out.write(NetworkCoreBuffer::from_vec(Vec::new())) };
+        if request.is_null()
+            || request_len == 0
+            || request_len > crate::control::MAX_VIEWER_REQUEST_LEN
+        {
+            return NETWORKCORE_IOS_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller guarantees `request_len` readable bytes.
+        let request = unsafe { std::slice::from_raw_parts(request, request_len) };
+        let (bytes, code) = match crate::capture_viewer::control(request) {
+            Ok(bytes) => (bytes, NETWORKCORE_IOS_OK),
+            Err(err) => (
+                serde_json::json!({ "error": err.message })
+                    .to_string()
+                    .into_bytes(),
+                code_for(err.code),
+            ),
+        };
+        // SAFETY: checked non-null above; the empty placeholder owns no memory.
+        unsafe { out.write(NetworkCoreBuffer::from_vec(bytes)) };
+        code
     })
 }
 

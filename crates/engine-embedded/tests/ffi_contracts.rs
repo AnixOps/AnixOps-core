@@ -37,7 +37,7 @@ extern "C" fn count_packets(context: *mut c_void, _packet: *const u8, _len: usiz
 fn versions_match_the_swift_handshake() {
     assert_eq!(networkcore_ios_abi_version(), 1);
     assert_eq!(networkcore_ios_schema_version(), 1);
-    assert_eq!(networkcore_ios_feature_set_version(), 5);
+    assert_eq!(networkcore_ios_feature_set_version(), 6);
 }
 
 #[test]
@@ -437,6 +437,52 @@ fn control_answers_json_and_rejects_bad_requests() {
     unsafe { networkcore_ios_runtime_free_handle(handle) };
 }
 
+fn viewer(request: &str) -> (i32, serde_json::Value) {
+    let mut buffer = NetworkCoreBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    let code =
+        unsafe { networkcore_ios_capture_viewer(request.as_ptr(), request.len(), &mut buffer) };
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) }.to_vec();
+    unsafe { networkcore_ios_runtime_free_buffer(buffer) };
+    (code, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[test]
+fn capture_viewer_needs_no_runtime_and_explains_refusals() {
+    let (code, status) = viewer(r#"{"cmd":"capture"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    assert_eq!(status["enabled"], false);
+    let (code, listed) = viewer(r#"{"cmd":"connections"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    assert!(listed["closed"].is_array());
+
+    let (code, answer) = viewer(r#"{"cmd":"set_capture","enabled":true}"#);
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+    assert_eq!(
+        answer["error"],
+        "the capture viewer only opens saved sessions"
+    );
+    let (code, answer) = viewer(r#"{"cmd":"capture_sessions"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+    assert_eq!(answer["error"], "capture storage is not set");
+    let (code, _) = viewer(r#"{"cmd":"close_all"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+
+    let mut buffer = NetworkCoreBuffer {
+        ptr: ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    let code = unsafe { networkcore_ios_capture_viewer(ptr::null(), 0, &mut buffer) };
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+    unsafe { networkcore_ios_runtime_free_buffer(buffer) };
+    let code = unsafe { networkcore_ios_capture_viewer(b"{}".as_ptr(), 2, ptr::null_mut()) };
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+}
+
 #[test]
 fn header_declares_every_exported_symbol() {
     let header = include_str!("../include/networkcore_ios_runtime.h");
@@ -456,6 +502,7 @@ fn header_declares_every_exported_symbol() {
         "networkcore_ios_checkup",
         "networkcore_ios_mitm_inspect_plugin",
         "networkcore_ios_decode_body",
+        "networkcore_ios_capture_viewer",
         "networkcore_ios_set_bound_interface",
         "networkcore_ios_runtime_free_buffer",
         "networkcore_ios_runtime_free_handle",

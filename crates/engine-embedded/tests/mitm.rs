@@ -1404,6 +1404,117 @@ async fn capture_keeps_decrypted_http_under_the_origin_connection() {
     assert_eq!(loaded["enabled"], false, "{loaded}");
     let rows = control_json(&dispatcher, r#"{"cmd":"capture_requests"}"#);
     assert_eq!(rows["requests"][0]["method"], "POST", "{rows}");
+    // The app's copy: sealed again under the app's key, opened by the
+    // capture viewer with no engine.
+    let app_dir = std::env::temp_dir().join(format!("anixops-app-sessions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&app_dir);
+    let app_key = base64::engine::general_purpose::STANDARD.encode([3u8; 32]);
+    let copy = control_json(
+        &dispatcher,
+        &serde_json::json!({ "cmd": "copy_capture", "session": session, "key_base64": app_key })
+            .to_string(),
+    );
+    assert_eq!(copy["session"], session.as_str());
+    assert_eq!(copy["file_name"], format!("{session}.anxcap"));
+    let sealed = base64_field(&copy["data_base64"]);
+    assert_eq!(copy["size"], sealed.len());
+    assert!(!sealed.windows(13).any(|window| window == b"captured body"));
+    let import = serde_json::json!({
+        "cmd": "import_capture",
+        "session": session,
+        "data_base64": copy["data_base64"],
+    })
+    .to_string();
+    // A running engine never imports: sessions reach it only through its own saves.
+    assert!(engine_embedded::control::handle(&dispatcher, import.as_bytes()).is_err());
+
+    let viewer = engine_embedded::capture::CaptureStore::default();
+    let view = |request: &str| -> serde_json::Value {
+        let answer = engine_embedded::control::handle_capture_viewer(&viewer, request.as_bytes())
+            .unwrap_or_else(|error| panic!("{request}: {}", error.message));
+        serde_json::from_slice(&answer).unwrap()
+    };
+    view(
+        &serde_json::json!({
+            "cmd": "set_capture_storage",
+            "dir": app_dir.to_str().unwrap(),
+            "key_base64": app_key,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        view(r#"{"cmd":"capture_sessions"}"#)["sessions"],
+        serde_json::json!([])
+    );
+    let imported = view(&import);
+    assert_eq!(
+        imported["session"]["session"],
+        session.as_str(),
+        "{imported}"
+    );
+    assert_eq!(imported["session"]["name"], "plain");
+    assert_eq!(
+        view(r#"{"cmd":"capture_sessions"}"#)["sessions"][0]["requests"],
+        1
+    );
+    let loaded = view(&format!(
+        r#"{{"cmd":"load_capture","session":"{session}"}}"#
+    ));
+    assert_eq!(loaded["enabled"], false);
+    let rows = view(r#"{"cmd":"capture_requests","filter":"method:post"}"#);
+    let row = &rows["requests"][0];
+    assert_eq!(row["method"], "POST", "{rows}");
+    let listed = view(r#"{"cmd":"connections"}"#);
+    let loaded_id = row["connection_id"].as_u64().unwrap();
+    let entry = listed["closed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == loaded_id)
+        .expect("the loaded connection is listed");
+    assert_eq!(entry["captured"], true);
+    assert!(entry["ended_at_ms"].as_u64().is_some());
+    assert!(listed["active"].as_array().unwrap().is_empty());
+    let capture = view(&format!(
+        r#"{{"cmd":"capture_connection","id":{loaded_id}}}"#
+    ));
+    assert_eq!(capture["capture"]["http"][0]["method"], "POST");
+    let zip = view(r#"{"cmd":"export_capture","format":"zip"}"#);
+    assert_eq!(zip["content_type"], "application/zip");
+    assert!(zip["file_name"].as_str().unwrap().ends_with(".zip"));
+    // Neither live capture nor saving: the viewer only opens what was saved.
+    for refused in [
+        r#"{"cmd":"set_capture","enabled":true}"#,
+        r#"{"cmd":"save_capture"}"#,
+        r#"{"cmd":"mode"}"#,
+        r#"{"cmd":"close_all"}"#,
+    ] {
+        assert!(
+            engine_embedded::control::handle_capture_viewer(&viewer, refused.as_bytes()).is_err(),
+            "{refused}"
+        );
+    }
+    // A copy the app's key cannot open is not kept.
+    let foreign = serde_json::json!({
+        "cmd": "import_capture",
+        "session": "1-00000000",
+        "data_base64": base64::engine::general_purpose::STANDARD.encode(
+            std::fs::read(dir.join(format!("{session}.anxcap"))).unwrap()
+        ),
+    })
+    .to_string();
+    let error =
+        engine_embedded::control::handle_capture_viewer(&viewer, foreign.as_bytes()).unwrap_err();
+    assert_eq!(
+        error.message,
+        "capture session cannot be read with this key"
+    );
+    let deleted = view(&format!(
+        r#"{{"cmd":"delete_capture","session":"{session}"}}"#
+    ));
+    assert_eq!(deleted["deleted"], true);
+    let _ = std::fs::remove_dir_all(&app_dir);
+
     let deleted = control_json(
         &dispatcher,
         &format!(r#"{{"cmd":"delete_capture","session":"{session}"}}"#),
