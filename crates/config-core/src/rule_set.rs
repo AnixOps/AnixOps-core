@@ -12,7 +12,7 @@
 //! network extension's memory limit. Downloaded lists are parsed straight into
 //! the buffer ([`RuleSetBuilder::parse_list`]) without a `String` per line.
 //! [`RuleSet::matches`] never resolves a domain for the IP part; the
-//! `RULE-SET` rule does that, as Surge does, when the set holds networks
+//! `RULE-SET` rule does that, as the common rule syntax defines it, when the set holds networks
 //! ([`RuleSet::needs_address`]) and the rule does not say `no-resolve`.
 //!
 //! A downloaded list may also hold other rule types (`PROCESS-NAME`,
@@ -257,7 +257,7 @@ impl RuleSet {
     /// `.local` names, and the private (RFC 1918, RFC 4193), shared address
     /// space (RFC 6598), loopback and link-local networks. It holds
     /// networks, so a domain-only connection reaching it is resolved unless
-    /// the rule says `no-resolve`, as in Surge.
+    /// the rule says `no-resolve`, as in the common rule syntax.
     pub fn lan() -> Self {
         Self::from_entries(&RuleSetEntries {
             domain: vec!["localhost".to_string()],

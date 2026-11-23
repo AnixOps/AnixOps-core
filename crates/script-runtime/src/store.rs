@@ -11,7 +11,7 @@ pub const SCRIPT_STORE_MAX_KEY_BYTES: usize = 256;
 pub const SCRIPT_STORE_MAX_VALUE_BYTES: usize = 512 * 1024;
 pub const SCRIPT_STORE_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
-/// Key-value storage shared by all scripts of one runtime, as in Loon.
+/// Key-value storage shared by all scripts of one runtime, as plugin scripts expect.
 pub trait ScriptStore: Send + Sync {
     fn read(&self, key: &str) -> Option<String>;
     /// Returns `false` when the write is refused (size limits) or not durable.

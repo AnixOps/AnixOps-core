@@ -8,7 +8,7 @@ AnixOps Net 的客户端（Windows/Linux 桌面客户端、Windows MSI 与 porta
 
 - 构建 Linux、macOS、Windows、iOS 可用的统一网络控制内核。
 - 维护三层运行架构：NetworkCore 控制层、执行内核 adapter 层、公有执行内核层；桌面与 iOS 都运行自研的嵌入式引擎（`engine-embedded`），协议按 crate 模块化增减，不再托管第三方内核。
-- 支持类似 Loon、Quantumult X 的 MITM 插件系统，优先兼容 Loon 插件格式的高频子集。
+- 提供 MITM 插件系统，兼容常见插件与规则语法，优先覆盖高频子集。
 - 为 [AnixOps/anixops-net](https://github.com/AnixOps/anixops-net) 的全平台客户端提供稳定的内核接口：Rust crate、`platform-*` adapter 和 iOS/macOS 使用的 C ABI 静态库。
 
 ## 工作方式
@@ -19,6 +19,7 @@ AnixOps Net 的客户端（Windows/Linux 桌面客户端、Windows MSI 与 porta
 
 - 进度与计划：[ROADMAP.md](ROADMAP.md)、[TODO.md](TODO.md)、[CHANGELOG.md](CHANGELOG.md)
 - 版本能力边界：[Alpha Release Feature Matrix](docs/alpha-release-feature-matrix.md)
+- 性能与压测：[docs/performance-ci.md](docs/performance-ci.md)（门槛、所在 workflow 与可点开核实的 run，含 9 种出站各 5000 并发的结果）
 - 发布：[docs/release-strategy.md](docs/release-strategy.md)；人工事项：[docs/manual-intervention.md](docs/manual-intervention.md)
 - 运维交接：[P0 维护手册](docs/MAINTENANCE_P0.md)、[交付证据](docs/P4_EXECUTION_STATUS.md)、[维护事件 JSON schema](docs/contracts/maintenance-event.schema.json)（只统一诊断事件校验、序列化和适配边界，NetworkCore 运行时尚未接入运维通信）
 

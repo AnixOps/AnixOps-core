@@ -5,7 +5,7 @@
 | 指标 | 门槛 | 工具 | Workflow / Job | 何时运行 |
 | --- | --- | --- | --- | --- |
 | R2 规则决策 | 1 万条规则，单次决策 p99 ≤ 50 µs | `crates/config-core/examples/rule_bench.rs` | `perf.yml` / Rule decision benchmark | 改动 config-core 或引擎的 PR、手动 |
-| F2 并发连接 | 5000 条 TCP 同时建立并各回显 1 字节（redirect、ss2022 两种出站） | `tunnel_bench scale` | `perf.yml` / Tunnel scale | 同上 |
+| F2 并发连接 | 5000 条 TCP 同时建立并各回显 1 字节（PR 测 redirect、ss2022；手动 `scale_outbounds=all` 测全部 9 种出站，门槛相同） | `tunnel_bench scale` | `perf.yml` / Tunnel scale | 同上 |
 | F3 UDP 会话 | 10 万个 UDP 流同时打开，进程 RSS ≤ 300 MiB | `tunnel_bench udp-sessions` | `perf.yml` / Tunnel scale | 同上 |
 | F7 长稳 | 预热后 RSS 斜率 ≤ 1 MiB/h，连接失败率 ≤ 0.1%，结束无残留流与 fd | `tunnel_bench soak` | `soak.yml` | 每周六 5.5 h（托管 runner）；24 h 手动选自托管 runner；改动 soak 本身的 PR 跑 30 min 冒烟（斜率门槛放宽到 20 MiB/h） |
 | I3 HTTPS 解密成功率 | `testdata/capture-sites.txt` 的 60 个真实站点，直连可达的站点里，经隧道解密后状态码类别一致且交换进了抓包（HAR）的 ≥ 95% | `capture_bench` + `.github/scripts/capture-gates.py` | `capture-gates.yml` | 改动 engine-embedded / mitm-policy / netstack 等的 PR、main、手动；`release.yml` 发布前必跑 |
@@ -29,13 +29,39 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 - 隧道线程：配置 `limits.worker_threads`（0 = 按平台默认）。iOS、Android 恒为 1 个线程（current-thread runtime，iOS 网络扩展有硬内存上限；这两个平台的构建不含 tokio 多线程调度器）；macOS、Windows、Linux 默认每个 CPU 一个工作线程，最多 4 个，上限 16。用户态 TCP/IP 栈仍是一个任务，多线程分摊的是各条流的转发、加解密和出站 I/O。`tunnel_bench` 的 `run`、`scale`、`soak` 默认跟产品一样按平台取值，所以 F2、F3、F7 门槛测的是桌面默认的多线程运行时；`capture_bench`（I3/I4/F8）固定 1 线程，与此前结果可比。
 - 长稳的 RSS 斜率是去掉前 15% 采样后的最小二乘斜率，每 60 s 采样一次；完整曲线在 job summary 和 artifact `tunnel-soak` 里。
 - 24 h 长稳需要自托管 runner，准备步骤见 [manual-intervention.md](manual-intervention.md)。
-- 手动调整门槛：`perf.yml` 的 `max_rule_p99_us`、`concurrent`、`udp_flows`、`max_udp_rss_mb` 输入；`soak.yml` 的 `hours`、`max_slope_mb_per_h` 输入。
+- 手动调整门槛：`perf.yml` 的 `max_rule_p99_us`、`concurrent`、`udp_flows`、`max_udp_rss_mb` 输入（`scale_outbounds` 只选出站，不改门槛）；`soak.yml` 的 `hours`、`max_slope_mb_per_h` 输入。
 
 ## 首次结果（2026-11-13，GitHub 托管 ubuntu runner）
 
 - R2：1 万条规则 p99 约 35 µs（runner 之间约有 2 倍波动）。
 - F2：5000 并发全部回显成功，redirect / ss2022 回显 p99 约 3 ms，隧道进程约 52 KiB/连接。
 - F3：10 万 UDP 流 RSS 222 MiB（约 2.2 KiB/流）。此前每流两个任务加一个 tokio mpsc 通道，是 4.2 KiB/流、417 MiB；现在每流一个任务、按需分配的队列，打开流的 future 用完即释放。该数字用的是不带缓冲的模拟出站，不含真实出站每流的接收缓冲；真实出站（直连、Shadowsocks、SOCKS5、VMess、Hysteria2、TUIC）此前每流常驻 64 KiB，现在空闲时不持有接收缓冲（读取时借用每线程一块的 64 KiB 临时缓冲），见 `crates/engine-outbound/README.md`。
+
+## 全出站 5000 并发（2026-11-23，GitHub 托管 ubuntu runner）
+
+手动触发 `perf.yml`，输入 `scale_outbounds=all`，其余输入为默认值（`concurrent=5000`）。门槛与 PR 上的 F2 相同，没有放宽：5000 条 TCP 连接全部建立、每条都回显成功，任何一种出站不达标 job 就失败。
+
+- Run：[Tunnel perf #207](https://github.com/AnixOps/AnixOps-core/actions/runs/45188721934)，job “Tunnel scale (5000 conns, 100k UDP flows)”，结论 success；每种出站的 JSON 报告在该 run 的 artifact `tunnel-scale` 里（保留 14 天，数字也打印在 job 日志的 “Concurrent connections” 步骤中，日志随 run 保留）。
+- 被测代码：commit `616c2ca`，即 [#271](https://github.com/AnixOps/AnixOps-core/pull/271) 的分支头，squash 合并为 main 上的 `e461eeb`，代码相同。
+- 方法：`tunnel_bench scale`，每种出站的服务端是基准进程内起的本机服务端（TLS 用自签证书，客户端按 SHA-256 固定），隧道端按产品同样的 JSON 设置从出站注册表构建客户端；WireGuard 的对端是 boringtun 加第二个隧道终结 TCP。只测隧道进程的 CPU 与内存。每连接内存 = （5000 条全开时 RSS − 开始前 RSS）÷ 5000。
+
+| 出站 | 建立 | 回显成功 | 回显 p50 | 回显 p99 | 回显最大 | 全部建立耗时 | 每连接内存 | 关闭后残留连接 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| redirect（无协议，隧道自身开销） | 5000 | 5000 | 2.56 ms | 4.74 ms | 6.15 ms | 0.64 s | 54.5 KiB | 0 |
+| Shadowsocks 2022 | 5000 | 5000 | 2.85 ms | 5.15 ms | 6.79 ms | 0.70 s | 56.0 KiB | 0 |
+| Trojan（TLS） | 5000 | 5000 | 2.99 ms | 5.44 ms | 6.85 ms | 1.18 s | 62.4 KiB | 0 |
+| VLESS（TLS） | 5000 | 5000 | 2.89 ms | 5.46 ms | 6.60 ms | 1.18 s | 62.2 KiB | 0 |
+| VLESS（REALITY） | 5000 | 5000 | 2.99 ms | 5.09 ms | 7.15 ms | 1.79 s | 65.1 KiB | 0 |
+| VMess | 5000 | 5000 | 3.06 ms | 5.78 ms | 8.23 ms | 0.79 s | 73.0 KiB | 0 |
+| SOCKS5 | 5000 | 5000 | 2.81 ms | 5.11 ms | 6.50 ms | 0.73 s | 54.4 KiB | 0 |
+| HTTP CONNECT | 5000 | 5000 | 2.77 ms | 5.22 ms | 6.42 ms | 0.75 s | 54.3 KiB | 0 |
+| WireGuard | 5000 | 5000 | 15.7 ms | 70.5 ms | 102 ms | 1.00 s | 72.6 KiB | 0 |
+
+- 9 种出站都是 5000/5000 建立、5000/5000 回显，`connect_failed`、`echo_failed`、`tcp_rejected` 均为 0。
+- 除 WireGuard 外，回显 p99 在 4.7–5.8 ms，每连接 54–73 KiB；带 TLS 的出站建立更慢（握手 CPU：Trojan / VLESS 约 2.4 s、REALITY 约 4.4 s 累计 CPU，无协议约 1.0 s）。
+- WireGuard 回显 p99 约 70 ms：5000 条 TCP 都要经过出站自己的用户态 TCP/IP 栈再封进同一条 UDP 隧道，对端也是用户态栈；多出的延迟应来自这两层栈的排队（推断，尚未单独剖析），没有连接失败。
+- 范围：这是本机回环上的容量与正确性测试，不代表真实网络的吞吐或延迟；ANX 协议不在本仓库，未包含在内。
+- 复现：在本仓库 Actions 里手动运行 “Tunnel perf”，`scale_outbounds` 填 `all`；或按 `crates/engine-embedded/examples/tunnel_bench.rs` 开头的说明在 Linux 上建 TUN 后运行 `tunnel_bench scale --outbound <名称>`。
 
 ## 抓包门槛首次结果（2026-11-14，GitHub 托管 ubuntu runner）
 

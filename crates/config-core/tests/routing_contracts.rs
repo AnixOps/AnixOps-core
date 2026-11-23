@@ -700,7 +700,7 @@ impl RoutingEnvironment for SetEnvironment {
 }
 
 #[test]
-fn rule_sets_with_networks_resolve_domains_like_surge() {
+fn rule_sets_with_networks_resolve_unlisted_domains() {
     let environment = SetEnvironment::new(&[
         (
             "cn-ip",

@@ -213,7 +213,7 @@ fn rule_sets_route_large_lists_without_resolving_domains() {
     };
     let nodes = BTreeMap::from([("proxy".to_string(), recording("proxy"))]);
     let spec = RoutingSpec {
-        // A set with networks resolves a domain it does not list, like Surge; `no-resolve` keeps the
+        // A set with networks resolves a domain it does not list; `no-resolve` keeps the
         // lookup out, which is what this test is about.
         rules: vec![
             "RULE-SET,china,DIRECT,no-resolve".to_string(),

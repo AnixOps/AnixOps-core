@@ -4,8 +4,8 @@
 //!
 //! An app whose request is refused at once often retries at once, and a
 //! blocked analytics or ad endpoint can then be dialed hundreds of times a
-//! minute, each a new flow through the engine. As in Surge, when one host
-//! has been rejected by a plain `REJECT` more than [`STORM_LIMIT`] times
+//! minute, each a new flow through the engine. When one host has been
+//! rejected by a plain `REJECT` more than [`STORM_LIMIT`] times
 //! within [`STORM_WINDOW`], its next rejections are answered like
 //! `REJECT-DROP` (nothing at all), so the app waits for its own timeout
 //! instead of spinning. The host goes back to a plain `REJECT` once it has

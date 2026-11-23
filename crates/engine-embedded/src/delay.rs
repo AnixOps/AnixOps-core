@@ -1,4 +1,4 @@
-//! URL delay tests for desktop node lists, like a Clash `url-test`: the time
+//! URL delay tests for desktop node lists, as a `url-test` group measures: the time
 //! an outbound takes to connect to an HTTP(S) URL and return the first line of
 //! its response.
 //!
