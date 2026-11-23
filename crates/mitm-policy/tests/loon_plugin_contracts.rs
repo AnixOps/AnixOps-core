@@ -1182,3 +1182,101 @@ fn plugin_url_regex_with_a_policy_routes_and_a_rejecting_one_stays_with_the_core
     );
     assert_eq!(rules[0].target, PolicyTarget::Group("PROXY".to_string()));
 }
+
+const ARGUMENT_PLUGIN: &str = concat!(
+    "#!name = Argument Scripts\n",
+    "[Script]\n",
+    "http-response ^https://a\\.example\\.test/feed script-path=https://scripts.example.test/feed.js, requires-body=true, argument=[{HideAds},{Mode}], enable={Enabled}\n",
+    "http-response ^https://a\\.example\\.test/off script-path=https://scripts.example.test/off.js, requires-body=true, enable={Off}\n",
+    "http-response ^https://a\\.example\\.test/json script-path=https://scripts.example.test/json.js, requires-body=true, argument={\"lang\":\"zh\",\"hide\":true}\n",
+    "http-response ^https://a\\.example\\.test/missing script-path=https://scripts.example.test/missing.js, enable={Missing}\n",
+    "[Argument]\n",
+    "HideAds = switch,true,tag=Hide ads\n",
+    "Mode = select,\"a,b\",c,tag=Mode\n",
+    "Enabled = switch,true\n",
+    "Off = switch,false\n",
+    "[MITM]\n",
+    "hostname = a.example.test\n",
+);
+
+#[test]
+fn script_arguments_and_switches_resolve_from_the_plugin_arguments() {
+    let plugin = import_loon_plugin(ARGUMENT_PLUGIN).expect("argument plugin should import");
+    let status_of = |reason: &str| {
+        plugin
+            .report
+            .lines
+            .iter()
+            .find(|line| line.reason == reason)
+            .map(|line| line.status)
+    };
+    assert_eq!(
+        status_of("script.disabled"),
+        Some(LoonLineStatus::Ignored),
+        "{}",
+        plugin.report.render_text("arguments")
+    );
+    assert_eq!(
+        status_of("script.enable_unresolved"),
+        Some(LoonLineStatus::Partial),
+        "{}",
+        plugin.report.render_text("arguments")
+    );
+
+    // The merged policy has no `[Argument]`: every value travels resolved.
+    let merged = merged_plugin_source("Arguments", &[&plugin]);
+    assert!(!merged.contains("[Argument]"), "{merged}");
+    let engine = loaded_engine(&merged);
+
+    let feed = engine
+        .evaluate_script("https://a.example.test/feed", MitmPolicyPhase::Response)
+        .expect("feed script should evaluate");
+    assert_eq!(feed.kind, MitmPolicyScriptKind::HttpResponse, "{merged}");
+    assert_eq!(feed.argument, "HideAds=true&Mode=a,b", "{merged}");
+
+    let off = engine
+        .evaluate_script("https://a.example.test/off", MitmPolicyPhase::Response)
+        .expect("disabled script should evaluate");
+    assert_eq!(off.kind, MitmPolicyScriptKind::None, "{merged}");
+
+    let json = engine
+        .evaluate_script("https://a.example.test/json", MitmPolicyPhase::Response)
+        .expect("JSON argument script should evaluate");
+    assert_eq!(json.kind, MitmPolicyScriptKind::HttpResponse, "{merged}");
+    assert_eq!(json.argument, r#"{"lang":"zh","hide":true}"#, "{merged}");
+
+    // An `enable` naming nothing the plugin declares keeps the script on.
+    let missing = engine
+        .evaluate_script("https://a.example.test/missing", MitmPolicyPhase::Response)
+        .expect("unresolved switch script should evaluate");
+    assert_eq!(missing.kind, MitmPolicyScriptKind::HttpResponse, "{merged}");
+}
+
+#[test]
+fn merged_plugins_keep_their_own_argument_values() {
+    let plugin = |host: &str, lang: &str| {
+        import_loon_plugin(&format!(
+            "#!name = {host}\n\
+             [Argument]\n\
+             Lang = input,{lang}\n\
+             [Script]\n\
+             http-request ^https://{host}/api script-path=https://scripts.example.test/{host}.js, argument=lang={{Lang}}\n\
+             [MITM]\n\
+             hostname = {host}\n"
+        ))
+        .expect("plugin should import")
+    };
+    let first = plugin("one.example.test", "zh");
+    let second = plugin("two.example.test", "en");
+    let engine = loaded_engine(&merged_plugin_source("Both", &[&first, &second]));
+    for (url, expected) in [
+        ("https://one.example.test/api", "lang=zh"),
+        ("https://two.example.test/api", "lang=en"),
+    ] {
+        let dispatch = engine
+            .evaluate_script(url, MitmPolicyPhase::Request)
+            .expect("script should evaluate");
+        assert_eq!(dispatch.kind, MitmPolicyScriptKind::HttpRequest, "{url}");
+        assert_eq!(dispatch.argument, expected, "{url}");
+    }
+}

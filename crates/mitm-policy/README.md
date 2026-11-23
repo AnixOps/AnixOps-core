@@ -79,6 +79,18 @@ The plugin as a whole is graded `full`, `partial`, or `unsupported`.
 - Surge module arguments (`#!arguments=Name:default,...`) replace `{{{Name}}}`
   with the default value before grading; a `#` default turns the line into a
   comment.
+- Script `argument=` and `enable=` (or `enabled=`) values are resolved
+  against `#!arguments` and `[Argument]` defaults at import, wherever the
+  `[Argument]` section sits, because the merged policy carries no
+  `[Argument]` and the core reads `enable` as a plain boolean. `{Name}`,
+  `{{{Name}}}` and the list form `[{A},{B}]` (`A=x&B=y`) use the declared
+  default; braces that name no declared argument, such as JSON, stay as
+  written. A resolved argument that still holds braces or starts with `[` is
+  encoded so the core's own template pass leaves it alone, and decoded when
+  the dispatch leaves the core. An `enable` that resolves to `false`, `0`,
+  `no` or `off` comments the script out (`script.disabled`, ignored); one
+  that names no declared argument keeps the script on and is graded partial
+  (`script.enable_unresolved`).
 - `[Script]` `http-request` and `http-response` lines (P1) are planned by the
   `mitm_anixops` core and run on desktop in the in-process QuickJS runtime of
   `crates/script-runtime`. `binary-body-mode` is supported: the core reports
@@ -113,6 +125,37 @@ The plugin as a whole is graded `full`, `partial`, or `unsupported`.
   pair, and every matching body rule applies in order. Url-first body rewrite
   lines in `[Rewrite]` are supported too. jq lines (`http-response-jq`,
   `response-body-jq`) are unsupported because the core is built without jq.
+
+## Applying a plan to an HTTP event
+
+`MitmPluginService::handle_http_mitm_event` builds the plan without passing
+the body to the core, so a body the core cannot read never fails the plan:
+
+- URL reject, redirect and header rules apply to every message. A
+  `URL_REWRITE_200` rule (`<pattern> <url> 200`) is not a redirect; the
+  message continues unchanged.
+- `header-replace-regex` rules are evaluated against every current value of
+  their header, after the rules before them, and replace the header value by
+  value (the header is deleted and added back, so it moves to the end). With
+  several `Set-Cookie` headers only the matching one changes. A value whose
+  rewrite exceeds the core's value capacity stays unchanged with a
+  `mitm.policy.http_event.header_regex_skipped` warning.
+- Body rules (regex, jq) run only on a text body: UTF-8 without NUL bytes.
+  Any other body keeps it unchanged with a
+  `mitm.policy.http_event.binary_body_rules_skipped` warning; script
+  dispatch, including `binary-body-mode` scripts, is unaffected.
+- The body chain runs on the whole body. When its output outgrows the
+  buffer the chain is retried with a larger one, up to
+  `MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES` (4 MiB). A body that cannot be
+  rewritten whole is left unchanged with a `body_rewrite_skipped` warning
+  rather than dropping the message's other mutations; when more than 16 body
+  rules match, every regex rule still applies and the warning
+  `body_rewrite_records_capped` says jq steps past the core's record cap were
+  not run.
+- `needs_body` asks the data plane to hold the body back only for body rules
+  and for scripts with `requires-body=true`; a script without it gets no
+  body and cannot replace one (engine-native ignores a body such a script
+  returns, with `engine.native.runtime.http_script_body_ignored`).
 
 The corpus in `tests/fixtures/loon-plugins` has an expected level for each
 plugin, and `tests/loon_plugin_contracts.rs` prints the graded report for

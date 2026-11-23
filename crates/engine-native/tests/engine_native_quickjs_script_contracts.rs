@@ -10,6 +10,7 @@ use engine_native::{
     scaled_memory_limit, NativeHttpMitmPluginHook, NativePlainHttpMessage,
     NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig,
     ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE,
+    ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE,
     ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_FAILED_CODE, QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES,
 };
 use std::collections::BTreeMap;
@@ -21,6 +22,7 @@ const SCRIPT_URL: &str = "https://scripts.networkcore.test/contract.js";
 struct ScriptDispatchingService {
     timeout_ms: usize,
     binary_body_mode: bool,
+    requires_body: bool,
 }
 
 impl MitmPluginService for ScriptDispatchingService {
@@ -66,7 +68,7 @@ impl MitmPluginService for ScriptDispatchingService {
             script_dispatch: Some(HttpMitmScriptDispatch {
                 kind,
                 phase: http_event.phase,
-                requires_body: true,
+                requires_body: self.requires_body,
                 timeout_ms: self.timeout_ms,
                 max_size: 4096,
                 script_path: SCRIPT_URL.to_string(),
@@ -114,6 +116,20 @@ fn hook_with(
     timeout_ms: usize,
     binary_body_mode: bool,
 ) -> NativeHttpMitmPluginHook {
+    hook_for(
+        executor,
+        ScriptDispatchingService {
+            timeout_ms,
+            binary_body_mode,
+            requires_body: true,
+        },
+    )
+}
+
+fn hook_for(
+    executor: NativeQuickJsScriptExecutor,
+    service: ScriptDispatchingService,
+) -> NativeHttpMitmPluginHook {
     NativeHttpMitmPluginHook::new(
         PluginInstance {
             manifest: PluginManifest {
@@ -129,10 +145,7 @@ fn hook_with(
             },
             loaded_source: None,
         },
-        Arc::new(ScriptDispatchingService {
-            timeout_ms,
-            binary_body_mode,
-        }),
+        Arc::new(service),
     )
     .with_quickjs_script_executor(executor)
 }
@@ -207,6 +220,41 @@ fn quickjs_binary_body_mode_passes_bytes_both_ways() {
 
     assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
     assert_eq!(report.body, vec![0x08, 0x96, 0x01, 0x00, 0xc3, 0xff]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A script without `requires-body` never read the body, and the data plane
+/// streams such bodies, so a body it returns is not applied.
+#[test]
+fn quickjs_script_without_requires_body_cannot_replace_the_body() {
+    let dir = temp_dir("header-only");
+    let script = dir.join("header-only.js");
+    std::fs::write(
+        &script,
+        "$done({ body: 'replaced', headers: { 'Content-Type': 'application/json', 'X-Script': '1' } });",
+    )
+    .unwrap();
+    let hook = hook_for(
+        executor(&script, None),
+        ScriptDispatchingService {
+            timeout_ms: 1000,
+            binary_body_mode: false,
+            requires_body: false,
+        },
+    );
+
+    let report = hook.plan_plain_http(&message(HttpMitmPhase::Response, "{\"items\":[]}"));
+
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+    assert_eq!(String::from_utf8(report.body).unwrap(), "{\"items\":[]}");
+    assert!(report
+        .headers
+        .iter()
+        .any(|header| header.key == "X-Script" && header.value == "1"));
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

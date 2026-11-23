@@ -335,7 +335,10 @@ iOS 只能在 iOS platform crate 和 Network Extension 设计出现后，通过 
    和 CHANGELOG 中同步 tag/commit。
 3. 先更新 `crates/mitm-anixops-sys` 的 unsafe ABI，使 Rust struct/function
    声明与 header 对齐；新增常量、enum、struct 和 extern function 必须能在
-   CI 中由 version/contract test 触达。
+   CI 中由 version/contract test 触达。每个 C enum 的全部枚举值都必须在 Rust
+   `#[repr(C)]` enum 中以相同数值出现（C 回传未声明的值是未定义行为），
+   `rust_enums_mirror_every_c_enumerator` 直接解析 header 校验，升级后该测试
+   必须通过。
 4. 再更新 `crates/mitm-policy` safe wrapper，把新增 C ABI 映射为
    NetworkCore-owned Rust 类型和稳定 diagnostic/error code；不得把 upstream demo
    proxy shim 当作 NetworkCore production data plane。

@@ -776,7 +776,9 @@ impl MitmEngine {
                 .unwrap_or(path.as_str())
                 .to_string();
             let mut headers = from_metadata(&report.headers);
-            if !stream_request {
+            if stream_request {
+                keep_streamed_body_headers(&mut headers, &request.headers);
+            } else {
                 remove(&mut headers, "Transfer-Encoding");
                 remove(&mut headers, "Content-Length");
                 if had_body || !report.body.is_empty() {
@@ -921,9 +923,11 @@ impl MitmEngine {
                     return Ok(());
                 }
                 let final_status = report.final_status_code.unwrap_or(status);
+                let mut headers = from_metadata(&report.headers);
+                keep_streamed_body_headers(&mut headers, &response.headers);
                 let head = Head {
                     start_line: format!("HTTP/1.1 {final_status} {}", reason(final_status)),
-                    headers: from_metadata(&report.headers),
+                    headers,
                 };
                 client.write_all(&head.encode()).await?;
                 if let Some(recording) = &mut recording {
@@ -1459,6 +1463,25 @@ fn from_metadata(headers: &[MetadataEntry]) -> Vec<(String, String)> {
 
 fn remove(headers: &mut Vec<(String, String)>, name: &str) {
     headers.retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+}
+
+/// Headers that frame and encode a body.
+const BODY_FRAMING_HEADERS: [&str; 3] = ["Content-Length", "Transfer-Encoding", "Content-Encoding"];
+
+/// A streamed body goes on exactly as `original` framed and encoded it, so
+/// those headers stay the original's whatever a rule or a script without
+/// `requires-body` did to the head (a script's `$done({headers})` replaces
+/// all of them).
+fn keep_streamed_body_headers(headers: &mut Vec<(String, String)>, original: &[(String, String)]) {
+    for name in BODY_FRAMING_HEADERS {
+        remove(headers, name);
+        headers.extend(
+            original
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .cloned(),
+        );
+    }
 }
 
 #[cfg(feature = "scripts")]

@@ -17,8 +17,9 @@ use control_domain::{
     AuditDecision, AuditEvent, CertificateTrustState, Diagnostic, DiagnosticSeverity, DomainError,
     DomainResult, GrantedPermissions, HookPoint, HttpBodyMutation, HttpEvent, HttpHeaderMutation,
     HttpHeaderMutationOperation, HttpMitmAction, HttpMitmEvent, HttpMitmOutcome, HttpMitmPhase,
-    HttpMitmScriptDispatch, HttpMitmScriptKind, MitmHostnameDecision, MitmPluginService,
-    PluginInstance, PluginManifest, PluginPackage, PluginPermission, PluginResult,
+    HttpMitmScriptDispatch, HttpMitmScriptKind, MetadataEntry, MitmHostnameDecision,
+    MitmPluginService, PluginInstance, PluginManifest, PluginPackage, PluginPermission,
+    PluginResult,
 };
 use mitm_anixops_sys as sys;
 use std::cell::Cell;
@@ -54,6 +55,26 @@ pub const MITM_POLICY_HTTP_EVENT_MUTATION_DEFERRED_CODE: &str =
     "mitm.policy.http_event.mutation_deferred";
 pub const MITM_POLICY_HTTP_EVENT_SOURCE_MISSING_CODE: &str =
     "mitm.policy.http_event.source_missing";
+/// Body rules matched a body that is not NUL-free UTF-8 text (protobuf,
+/// gRPC, images): they are skipped, every other part of the plan stands.
+pub const MITM_POLICY_HTTP_EVENT_BINARY_BODY_SKIPPED_CODE: &str =
+    "mitm.policy.http_event.binary_body_rules_skipped";
+/// The body rewrite chain could not be applied whole and was skipped.
+pub const MITM_POLICY_HTTP_EVENT_BODY_REWRITE_SKIPPED_CODE: &str =
+    "mitm.policy.http_event.body_rewrite_skipped";
+/// More body rules matched than the core records; jq steps past the
+/// recorded ones did not run.
+pub const MITM_POLICY_HTTP_EVENT_BODY_REWRITE_RECORDS_CAPPED_CODE: &str =
+    "mitm.policy.http_event.body_rewrite_records_capped";
+/// A `header-replace-regex` rule left a header value as it was because the
+/// core could not rewrite it (the result exceeds its value limit, or the
+/// value holds a NUL byte).
+pub const MITM_POLICY_HTTP_EVENT_HEADER_REGEX_SKIPPED_CODE: &str =
+    "mitm.policy.http_event.header_regex_skipped";
+/// More header rules matched than the core plans at once; the rest did not
+/// apply.
+pub const MITM_POLICY_HTTP_EVENT_HEADER_REWRITES_CAPPED_CODE: &str =
+    "mitm.policy.http_event.header_rewrites_capped";
 pub const MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_MESSAGE: &str = concat!(
     "mitm_anixops policy produced an HTTP mutation plan; applying it still requires ",
     "NetworkCore HTTP/TLS data plane integration",
@@ -127,6 +148,11 @@ pub enum MitmPolicyHeaderOperation {
     Replace,
     Delete,
     Set,
+    /// `header-replace-regex` / `response-header-replace-regex`: the
+    /// replacement applies to each current value of the header. A plan made
+    /// without those values carries the unexpanded template, which must
+    /// never be written as the header's value.
+    ReplaceRegex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +230,33 @@ pub struct MitmPolicyRewritePlan {
     pub header_rewrite_truncated: bool,
     pub script: MitmPolicyScriptDispatch,
 }
+
+/// Result of [`AnixOpsMitmPolicyEngine::apply_body_chain_whole`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MitmPolicyBodyChainOutcome {
+    /// Every matching rule applied to `body`. `records_capped` when more
+    /// rules matched than `chain` records (see [`sys::ANIXOPS_BODY_CHAIN_CAP`]).
+    Applied {
+        body: String,
+        chain: MitmPolicyBodyRewriteChain,
+        records_capped: bool,
+    },
+    /// The chain could not run whole, so none of it applies; `reason` says why.
+    Skipped {
+        chain: MitmPolicyBodyRewriteChain,
+        reason: &'static str,
+    },
+}
+
+/// Largest body a rewrite chain may grow to. The output buffer starts at the
+/// body's size plus the core's value capacity and doubles up to this.
+pub const MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Messages the core writes into rewrite results.
+const CORE_HEADER_REWRITTEN: &str = "header rewritten";
+const CORE_HEADER_REGEX_NOT_MATCHED: &str = "header regex not matched";
+const CORE_BODY_TRUNCATED: &str = "body truncated";
+const CORE_REPLACEMENT_TRUNCATED: &str = "replacement truncated";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MitmPolicyLastError {
@@ -395,15 +448,100 @@ impl AnixOpsMitmPolicyEngine {
         Ok(rewrite_result_from_sys(&out))
     }
 
+    /// Runs every body rule matching `url` on `body`. The output buffer holds
+    /// the body plus [`sys::ANIXOPS_VALUE_CAP`] bytes; a chain that grows the
+    /// body further, or matches more than [`sys::ANIXOPS_BODY_CHAIN_CAP`]
+    /// rules, comes back `truncated` (see [`Self::apply_body_chain_whole`]).
     pub fn apply_body_chain(
         &self,
         url: &str,
         phase: MitmPolicyPhase,
         body: &str,
     ) -> DomainResult<(String, MitmPolicyBodyRewriteChain)> {
+        self.apply_body_chain_with_capacity(
+            url,
+            phase,
+            body,
+            body.len().saturating_add(sys::ANIXOPS_VALUE_CAP),
+        )
+    }
+
+    /// [`Self::apply_body_chain`] that tells apart the two reasons the core
+    /// reports `truncated`, since it sets the same flag for both:
+    ///
+    /// - A rule's output did not fit the buffer. The core then carries a cut
+    ///   body on to the next rule, so the chain is run again with a buffer
+    ///   twice as large, up to [`MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES`].
+    /// - More rules matched than the result records. The body itself is
+    ///   whole: once two runs with different buffers produce the same body
+    ///   and no recorded rule reports a cut, it is used as it is.
+    ///
+    /// A chain that still does not fit is [`MitmPolicyBodyChainOutcome::Skipped`]
+    /// as a whole, never applied cut short.
+    pub fn apply_body_chain_whole(
+        &self,
+        url: &str,
+        phase: MitmPolicyPhase,
+        body: &str,
+    ) -> DomainResult<MitmPolicyBodyChainOutcome> {
+        let mut capacity = body.len().saturating_add(sys::ANIXOPS_VALUE_CAP);
+        let mut previous: Option<String> = None;
+        loop {
+            let (out, chain) = self.apply_body_chain_with_capacity(url, phase, body, capacity)?;
+            if !chain.truncated {
+                return Ok(MitmPolicyBodyChainOutcome::Applied {
+                    body: out,
+                    chain,
+                    records_capped: false,
+                });
+            }
+            // A mock body is cut to the core's value capacity whatever the
+            // buffer: a larger one cannot help.
+            if chain
+                .rewrites
+                .iter()
+                .any(|rewrite| rewrite.message == CORE_REPLACEMENT_TRUNCATED)
+            {
+                return Ok(MitmPolicyBodyChainOutcome::Skipped {
+                    chain,
+                    reason: "a mock body exceeds the policy core's value capacity",
+                });
+            }
+            let records_full = chain.rewrites.len() >= sys::ANIXOPS_BODY_CHAIN_CAP;
+            let recorded_cut = chain
+                .rewrites
+                .iter()
+                .any(|rewrite| rewrite.message == CORE_BODY_TRUNCATED);
+            if records_full && !recorded_cut && previous.as_deref() == Some(out.as_str()) {
+                return Ok(MitmPolicyBodyChainOutcome::Applied {
+                    body: out,
+                    chain,
+                    records_capped: true,
+                });
+            }
+            if capacity >= MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES {
+                return Ok(MitmPolicyBodyChainOutcome::Skipped {
+                    chain,
+                    reason: "the rewritten body exceeds the body rewrite output limit",
+                });
+            }
+            previous = records_full.then_some(out);
+            capacity = capacity
+                .saturating_mul(2)
+                .min(MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES);
+        }
+    }
+
+    fn apply_body_chain_with_capacity(
+        &self,
+        url: &str,
+        phase: MitmPolicyPhase,
+        body: &str,
+        capacity: usize,
+    ) -> DomainResult<(String, MitmPolicyBodyRewriteChain)> {
         let url = c_string(url, "mitm URL contains an unsupported nul byte")?;
         let body = c_string(body, "mitm body contains an unsupported nul byte")?;
-        let mut out_body = vec![0 as c_char; body.as_bytes().len() + sys::ANIXOPS_VALUE_CAP];
+        let mut out_body = vec![0 as c_char; capacity.max(1)];
         let mut out_chain = empty_body_rewrite_chain();
         let status = unsafe {
             sys::anixops_rewrite_apply_body_chain(
@@ -672,6 +810,10 @@ impl From<sys::AnixOpsRewriteAction> for MitmPolicyRewriteAction {
             | sys::AnixOpsRewriteAction::ResponseHeaderAdd
             | sys::AnixOpsRewriteAction::ResponseHeaderReplaceRegex
             | sys::AnixOpsRewriteAction::HeaderDel => Self::HeaderMutation,
+            // A transparent URL rewrite has no outcome in the data plane, and
+            // the importer grades the line unsupported: the message continues
+            // unchanged. It must never become a redirect with status 200.
+            sys::AnixOpsRewriteAction::UrlRewrite200 => Self::Other,
         }
     }
 }
@@ -817,7 +959,8 @@ impl AnixOpsMitmPluginService {
     }
 
     /// Whether planning a message to `url` in `phase` reads its body: a
-    /// body rewrite (including jq) or a script matches. When nothing does,
+    /// body rewrite (including jq) or a script with `requires-body=true`
+    /// matches. When nothing does,
     /// the data plane can forward the body as it arrives instead of holding
     /// it whole, and only the head is planned.
     pub fn needs_body(
@@ -834,10 +977,10 @@ impl AnixOpsMitmPluginService {
         let (plan, _) = engine.build_rewrite_plan(url, phase, "")?;
         let (_, chain) = engine.apply_body_chain(url, phase, "")?;
         engine.keep();
-        Ok(plan.requires_body
-            || plan.script.kind != MitmPolicyScriptKind::None
-            || !chain.rewrites.is_empty()
-            || chain.truncated)
+        // `requires_body` covers a body rewrite and a script with
+        // `requires-body=true`. A script without it never sees the body,
+        // so matching one does not hold the body back.
+        Ok(plan.requires_body || !chain.rewrites.is_empty() || chain.truncated)
     }
 }
 
@@ -1027,42 +1170,102 @@ impl MitmPluginService for AnixOpsMitmPluginService {
 
         let mut engine = EngineLease::acquire(source)?;
         let phase = policy_phase_from_domain(http_event.phase);
-        let body = String::from_utf8_lossy(&http_event.body);
-        let (plan, _) = engine.build_rewrite_plan(&http_event.url, phase, &body)?;
+        // The URL decides the action, the header rules and the script; the
+        // body is never handed to the core here, so a binary body (NUL
+        // bytes) cannot fail the plan and take the reject, redirect, header
+        // rewrites and script dispatch down with it.
+        let (plan, _) = engine.build_rewrite_plan(&http_event.url, phase, "")?;
+        let mut diagnostics = vec![mitm_policy_diagnostic(
+            DiagnosticSeverity::Info,
+            MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_CODE,
+            MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_MESSAGE,
+        )];
 
         let action = domain_action_from_policy_rewrite(&plan.rewrite);
-        let mut header_mutations = plan
-            .header_rewrites
-            .iter()
-            .map(domain_header_mutation_from_policy)
-            .collect::<Vec<_>>();
+        let mut header_mutations = header_mutations_from_plan(
+            &engine,
+            &http_event.url,
+            phase,
+            &plan,
+            &http_event.headers,
+            &mut diagnostics,
+        );
         if let Some(outcome) = header_block {
             header_mutations.extend(outcome.header_mutations);
         }
         // Every matching body rule applies in order, so one Loon
         // `[Body Rewrite]` line with several replacement pairs takes effect.
+        // Body rules only run on text; whatever happens to them, the rest of
+        // the plan stands.
+        let mut keep_engine = true;
         let body_mutation = if plan.rewrite.action == MitmPolicyRewriteAction::BodyMutation {
-            let (mut chained_body, chain) =
-                engine.apply_body_chain(&http_event.url, phase, &body)?;
-            let mut rewritten = chain.rewritten;
-            // The core matches jq rules but has no jq backend; jaq runs them.
-            if !chain.truncated {
-                if let Some(jq_body) = loon_jq::apply_jq_steps(source, phase, &chain, &chained_body)
-                {
-                    chained_body = jq_body;
-                    rewritten = true;
+            match text_body(&http_event.body) {
+                None => {
+                    diagnostics.push(mitm_policy_diagnostic(
+                        DiagnosticSeverity::Warning,
+                        MITM_POLICY_HTTP_EVENT_BINARY_BODY_SKIPPED_CODE,
+                        "body rewrite rules match, but the body is not UTF-8 text without NUL bytes, so they were skipped",
+                    ));
+                    None
                 }
+                Some(body) => match engine.apply_body_chain_whole(&http_event.url, phase, body) {
+                    Ok(MitmPolicyBodyChainOutcome::Applied {
+                        body: mut chained_body,
+                        chain,
+                        records_capped,
+                    }) => {
+                        if records_capped {
+                            diagnostics.push(mitm_policy_diagnostic(
+                                DiagnosticSeverity::Warning,
+                                MITM_POLICY_HTTP_EVENT_BODY_REWRITE_RECORDS_CAPPED_CODE,
+                                format!(
+                                    "more than {cap} body rules match; all of them applied, but jq steps after the first {cap} matching rules did not run",
+                                    cap = sys::ANIXOPS_BODY_CHAIN_CAP
+                                ),
+                            ));
+                        }
+                        let mut rewritten = chain.rewritten;
+                        // The core matches jq rules but has no jq backend; jaq runs them.
+                        if let Some(jq_body) =
+                            loon_jq::apply_jq_steps(source, phase, &chain, &chained_body)
+                        {
+                            chained_body = jq_body;
+                            rewritten = true;
+                        }
+                        (rewritten && chained_body.as_bytes() != http_event.body.as_slice()).then(
+                            || HttpBodyMutation {
+                                body: chained_body.into_bytes(),
+                                truncated: false,
+                            },
+                        )
+                    }
+                    Ok(MitmPolicyBodyChainOutcome::Skipped { reason, .. }) => {
+                        diagnostics.push(mitm_policy_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            MITM_POLICY_HTTP_EVENT_BODY_REWRITE_SKIPPED_CODE,
+                            format!("body rewrite skipped: {reason}"),
+                        ));
+                        None
+                    }
+                    Err(error) => {
+                        // An engine that saw an error is not pooled again.
+                        keep_engine = false;
+                        diagnostics.push(mitm_policy_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            MITM_POLICY_HTTP_EVENT_BODY_REWRITE_SKIPPED_CODE,
+                            format!("body rewrite skipped: {}", error.code),
+                        ));
+                        None
+                    }
+                },
             }
-            (rewritten && !chain.truncated && chained_body.as_bytes() != http_event.body.as_slice())
-                .then(|| HttpBodyMutation {
-                    body: chained_body.into_bytes(),
-                    truncated: false,
-                })
         } else {
             None
         };
         let script_dispatch = domain_script_dispatch_from_policy(&plan.script);
-        engine.keep();
+        if keep_engine {
+            engine.keep();
+        }
 
         Ok(HttpMitmOutcome {
             action,
@@ -1078,11 +1281,7 @@ impl MitmPluginService for AnixOpsMitmPluginService {
                     http_event.request_id
                 )),
             }],
-            diagnostics: vec![mitm_policy_diagnostic(
-                DiagnosticSeverity::Info,
-                MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_CODE,
-                MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_MESSAGE,
-            )],
+            diagnostics,
         })
     }
 
@@ -1206,13 +1405,176 @@ fn http_status_or(status_code: i32, default: u16) -> u16 {
     status_code.try_into().unwrap_or(default)
 }
 
+/// The body as text the core can rewrite: UTF-8 without NUL bytes. The core
+/// reads C strings, so anything else is never handed to it.
+fn text_body(body: &[u8]) -> Option<&str> {
+    std::str::from_utf8(body)
+        .ok()
+        .filter(|text| !text.contains('\0'))
+}
+
+/// The header mutations of `plan`, in rule order, for a message that carries
+/// `headers`.
+///
+/// The plan comes from the core without header values, so a regex rule in it
+/// holds only its replacement template. Each one is evaluated here against
+/// every current value of its header, after the rules before it, the way the
+/// core's own header-list application does. A header whose values change is
+/// deleted and added back value by value, so with several `Set-Cookie`
+/// headers only the matching one changes. A value the core cannot rewrite is
+/// left as it is, with a warning.
+fn header_mutations_from_plan(
+    engine: &AnixOpsMitmPolicyEngine,
+    url: &str,
+    phase: MitmPolicyPhase,
+    plan: &MitmPolicyRewritePlan,
+    headers: &[MetadataEntry],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<HttpHeaderMutation> {
+    let mut working = headers.to_vec();
+    let mut mutations = Vec::new();
+    let mut skipped = false;
+    for rewrite in &plan.header_rewrites {
+        if rewrite.operation != MitmPolicyHeaderOperation::ReplaceRegex {
+            let mutation = domain_header_mutation_from_policy(rewrite);
+            apply_header_mutation(&mut working, &mutation);
+            mutations.push(mutation);
+            continue;
+        }
+        let mut changed = false;
+        for header in working
+            .iter_mut()
+            .filter(|header| header.key.eq_ignore_ascii_case(&rewrite.header_name))
+        {
+            match regex_header_value(engine, url, phase, rewrite, &header.value) {
+                RegexHeaderValue::Rewritten(value) => {
+                    if value != header.value {
+                        header.value = value;
+                        changed = true;
+                    }
+                }
+                RegexHeaderValue::Unchanged => {}
+                RegexHeaderValue::Skipped => skipped = true,
+            }
+        }
+        if !changed {
+            continue;
+        }
+        // Deleted and added back: the data plane appends what is added, so
+        // the working copy moves the header to the end as well.
+        let (same, others): (Vec<MetadataEntry>, Vec<MetadataEntry>) = std::mem::take(&mut working)
+            .into_iter()
+            .partition(|header| header.key.eq_ignore_ascii_case(&rewrite.header_name));
+        working = others;
+        mutations.push(HttpHeaderMutation {
+            operation: HttpHeaderMutationOperation::Delete,
+            name: rewrite.header_name.clone(),
+            value: None,
+        });
+        mutations.extend(same.iter().map(|header| HttpHeaderMutation {
+            operation: HttpHeaderMutationOperation::Add,
+            name: header.key.clone(),
+            value: Some(header.value.clone()),
+        }));
+        working.extend(same);
+    }
+    if skipped {
+        diagnostics.push(mitm_policy_diagnostic(
+            DiagnosticSeverity::Warning,
+            MITM_POLICY_HTTP_EVENT_HEADER_REGEX_SKIPPED_CODE,
+            "a header-replace-regex rule left a header value unchanged: the rewritten value exceeds the policy core's value capacity or the value could not be read",
+        ));
+    }
+    if plan.header_rewrite_truncated {
+        diagnostics.push(mitm_policy_diagnostic(
+            DiagnosticSeverity::Warning,
+            MITM_POLICY_HTTP_EVENT_HEADER_REWRITES_CAPPED_CODE,
+            format!(
+                "more than {cap} header rules match; only the first {cap} applied",
+                cap = sys::ANIXOPS_PLAN_HEADER_CAP
+            ),
+        ));
+    }
+    mutations
+}
+
+enum RegexHeaderValue {
+    Rewritten(String),
+    Unchanged,
+    /// The core could not rewrite the value; it stays as it is.
+    Skipped,
+}
+
+/// Runs the regex rule `rewrite` on one current `value` of its header.
+fn regex_header_value(
+    engine: &AnixOpsMitmPolicyEngine,
+    url: &str,
+    phase: MitmPolicyPhase,
+    rewrite: &MitmPolicyHeaderRewriteResult,
+    value: &str,
+) -> RegexHeaderValue {
+    let Ok(start_index) = usize::try_from(rewrite.rule_index) else {
+        return RegexHeaderValue::Skipped;
+    };
+    match engine.evaluate_named_header(url, phase, start_index, &rewrite.header_name, value) {
+        Ok(result)
+            if result.rule_index == rewrite.rule_index
+                && result.operation == MitmPolicyHeaderOperation::ReplaceRegex =>
+        {
+            match result.message.as_str() {
+                CORE_HEADER_REWRITTEN => RegexHeaderValue::Rewritten(result.value),
+                CORE_HEADER_REGEX_NOT_MATCHED => RegexHeaderValue::Unchanged,
+                // "header value truncated": `result.value` is cut short.
+                _ => RegexHeaderValue::Skipped,
+            }
+        }
+        _ => RegexHeaderValue::Skipped,
+    }
+}
+
+/// Applies `mutation` to `headers` the way the data plane does
+/// (`engine-native`'s plain HTTP header mutation), so later rules see what
+/// earlier ones left.
+fn apply_header_mutation(headers: &mut Vec<MetadataEntry>, mutation: &HttpHeaderMutation) {
+    let name = mutation.name.as_str();
+    match (mutation.operation, mutation.value.as_ref()) {
+        (HttpHeaderMutationOperation::Delete, _) => {
+            headers.retain(|header| !header.key.eq_ignore_ascii_case(name))
+        }
+        (_, None) => {}
+        (HttpHeaderMutationOperation::Add, Some(value)) => headers.push(MetadataEntry {
+            key: mutation.name.clone(),
+            value: value.clone(),
+        }),
+        (HttpHeaderMutationOperation::Replace, Some(value)) => {
+            for header in headers
+                .iter_mut()
+                .filter(|header| header.key.eq_ignore_ascii_case(name))
+            {
+                header.value = value.clone();
+            }
+        }
+        (HttpHeaderMutationOperation::Set, Some(value)) => {
+            headers.retain(|header| !header.key.eq_ignore_ascii_case(name));
+            headers.push(MetadataEntry {
+                key: mutation.name.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+}
+
+/// A header rewrite without a regex as a domain mutation. Regex rewrites go
+/// through [`header_mutations_from_plan`], which has the header's values.
 fn domain_header_mutation_from_policy(
     rewrite: &MitmPolicyHeaderRewriteResult,
 ) -> HttpHeaderMutation {
     HttpHeaderMutation {
         operation: match rewrite.operation {
             MitmPolicyHeaderOperation::Add => HttpHeaderMutationOperation::Add,
-            MitmPolicyHeaderOperation::Replace => HttpHeaderMutationOperation::Replace,
+            MitmPolicyHeaderOperation::Replace | MitmPolicyHeaderOperation::ReplaceRegex => {
+                HttpHeaderMutationOperation::Replace
+            }
             MitmPolicyHeaderOperation::Delete => HttpHeaderMutationOperation::Delete,
             MitmPolicyHeaderOperation::Set => HttpHeaderMutationOperation::Set,
         },
@@ -1299,10 +1661,10 @@ fn header_operation_from_sys(action: sys::AnixOpsRewriteAction) -> MitmPolicyHea
             MitmPolicyHeaderOperation::Add
         }
         sys::AnixOpsRewriteAction::HeaderReplace
-        | sys::AnixOpsRewriteAction::HeaderReplaceRegex
-        | sys::AnixOpsRewriteAction::ResponseHeaderReplace
+        | sys::AnixOpsRewriteAction::ResponseHeaderReplace => MitmPolicyHeaderOperation::Replace,
+        sys::AnixOpsRewriteAction::HeaderReplaceRegex
         | sys::AnixOpsRewriteAction::ResponseHeaderReplaceRegex => {
-            MitmPolicyHeaderOperation::Replace
+            MitmPolicyHeaderOperation::ReplaceRegex
         }
         sys::AnixOpsRewriteAction::HeaderDel | sys::AnixOpsRewriteAction::ResponseHeaderDel => {
             MitmPolicyHeaderOperation::Delete
@@ -1362,7 +1724,7 @@ fn script_dispatch_from_sys(result: &sys::AnixOpsScriptResult) -> MitmPolicyScri
         matched_pattern: ffi_string(&result.matched_pattern),
         script_path: ffi_string(&result.script_path),
         tag: ffi_string(&result.tag),
-        argument: ffi_string(&result.argument),
+        argument: loon_syntax::decode_core_argument(&ffi_string(&result.argument)),
         message: ffi_string(&result.message),
         binary_body_mode: result.binary_body_mode != 0,
     }

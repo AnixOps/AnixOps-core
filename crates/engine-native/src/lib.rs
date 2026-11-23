@@ -306,6 +306,11 @@ pub const ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_FAILED_CODE: &str =
     "engine.native.runtime.http_script_failed";
 pub const ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_URL_MUTATION_BLOCKED_CODE: &str =
     "engine.native.runtime.http_script_url_mutation_blocked";
+/// A script without `requires-body=true` returned a body. It never read the
+/// body, and the data plane may already be streaming it, so the body it
+/// returned is ignored.
+pub const ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE: &str =
+    "engine.native.runtime.http_script_body_ignored";
 pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_HTTPS_REQUEST_REWRITE_PREVIEW_READY_CODE: &str =
     "engine.native.runtime.http_proxy_https_request_rewrite_preview_ready";
 pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_HTTPS_REQUEST_REWRITE_PREVIEW_DEFERRED_CODE: &str =
@@ -1432,6 +1437,7 @@ fn apply_script_dispatch_to_plain_http_rewrite_report(
         headers: report.headers.clone(),
         body: report.body.clone(),
     };
+    let requires_body = dispatch.requires_body;
     let execution = script_executor.execute(dispatch, &script_message);
     report.diagnostics.extend(execution.diagnostics.clone());
     if !execution.executed {
@@ -1478,8 +1484,17 @@ fn apply_script_dispatch_to_plain_http_rewrite_report(
         report.applied = true;
     }
     if let Some(body) = execution.body {
-        report.body = body;
-        report.applied = true;
+        if requires_body {
+            report.body = body;
+            report.applied = true;
+        } else {
+            report.diagnostics.push(engine_diagnostic(
+                DiagnosticSeverity::Warning,
+                ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE,
+                "native HTTP script runtime ignored a body returned by a script without requires-body",
+                SOURCE_ENGINE_NATIVE_MITM,
+            ));
+        }
     }
     if let Some(status_code) = execution.status_code {
         report.final_status_code = Some(status_code);

@@ -344,6 +344,9 @@ impl MitmEngine {
                 HeaderValue::from(report.body.len()),
             );
         }
+        if stream_request {
+            keep_streamed_body_headers(&mut headers, &parts.headers);
+        }
         if !stream_response {
             // Rules read the response body as sent, so ask for it
             // uncompressed.
@@ -472,6 +475,7 @@ impl MitmEngine {
             *head.status_mut() = status(report.final_status_code, parts.status);
             *head.headers_mut() = header_map(&from_metadata(&report.headers));
             strip_connection_headers(head.headers_mut());
+            keep_streamed_body_headers(head.headers_mut(), &parts.headers);
             if let Some(recording) = recording.as_deref_mut() {
                 recording.exchange.status = Some(head.status().as_u16());
                 recording.exchange.response_headers = header_list(head.headers());
@@ -893,6 +897,18 @@ fn upstream_headers(headers: &HeaderMap) -> HeaderMap {
     let mut headers = headers.clone();
     strip_connection_headers(&mut headers);
     headers
+}
+
+/// A body relayed frame by frame goes on exactly as `original` sized and
+/// encoded it, so those headers stay the original's whatever a rule or a
+/// script without `requires-body` did to the head.
+fn keep_streamed_body_headers(headers: &mut HeaderMap, original: &HeaderMap) {
+    for name in [http::header::CONTENT_LENGTH, http::header::CONTENT_ENCODING] {
+        headers.remove(&name);
+        for value in original.get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
 }
 
 fn strip_connection_headers(headers: &mut HeaderMap) {

@@ -93,9 +93,80 @@ pub(crate) fn attributes(text: &str) -> Vec<(String, String)> {
     attributes
 }
 
+/// Marks a script argument the importer resolved and encoded with
+/// [`encode_core_argument`].
+const CORE_ARGUMENT_MARK: char = '\u{E002}';
+/// Stand-ins for `{` and `}` inside an encoded argument.
+const CORE_ARGUMENT_OPEN: char = '\u{E000}';
+const CORE_ARGUMENT_CLOSE: char = '\u{E001}';
+
+/// A script argument the importer already resolved, written so the policy
+/// core hands it back unchanged.
+///
+/// At dispatch the core reads a script's `argument=` as a template once
+/// more: every `{name}` becomes the value of a declared argument, or nothing,
+/// and a value that starts with `[` becomes a `name=value&...` list. A
+/// resolved argument that still holds braces (JSON, an undeclared name) or
+/// starts with `[` would be mangled, so it travels with its braces replaced
+/// by private-use characters behind a mark, and [`decode_core_argument`]
+/// restores it when the dispatch leaves the core. An argument with none of
+/// that, or one that already holds the private-use characters, is returned
+/// as it is.
+pub(crate) fn encode_core_argument(argument: &str) -> String {
+    let needs_encoding = argument.contains(['{', '}']) || argument.trim_start().starts_with('[');
+    if !needs_encoding
+        || argument.contains([CORE_ARGUMENT_MARK, CORE_ARGUMENT_OPEN, CORE_ARGUMENT_CLOSE])
+    {
+        return argument.to_string();
+    }
+    let mut encoded = String::with_capacity(argument.len() + 8);
+    encoded.push(CORE_ARGUMENT_MARK);
+    encoded.extend(argument.chars().map(|ch| match ch {
+        '{' => CORE_ARGUMENT_OPEN,
+        '}' => CORE_ARGUMENT_CLOSE,
+        other => other,
+    }));
+    encoded
+}
+
+/// The script argument [`encode_core_argument`] wrote; any other argument is
+/// returned as it is.
+pub(crate) fn decode_core_argument(argument: &str) -> String {
+    match argument.strip_prefix(CORE_ARGUMENT_MARK) {
+        Some(encoded) => encoded
+            .chars()
+            .map(|ch| match ch {
+                CORE_ARGUMENT_OPEN => '{',
+                CORE_ARGUMENT_CLOSE => '}',
+                other => other,
+            })
+            .collect(),
+        None => argument.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_core_arguments_round_trip() {
+        for argument in [
+            r#"{"captionLang":"zh","lyricLang":"off"}"#,
+            r#"{"a":{"b":1}}"#,
+            "[1,2]",
+            "{undeclared}",
+            "HideAds=true&Mode=strict",
+            "",
+        ] {
+            let encoded = encode_core_argument(argument);
+            assert!(!encoded.contains(['{', '}']), "{encoded}");
+            assert!(!encoded.trim_start().starts_with('['), "{encoded}");
+            assert_eq!(decode_core_argument(&encoded), argument);
+        }
+        assert_eq!(encode_core_argument("a=1&b=2"), "a=1&b=2");
+        assert_eq!(decode_core_argument("plain"), "plain");
+    }
 
     #[test]
     fn quoted_tokens_round_trip() {

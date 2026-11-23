@@ -44,7 +44,7 @@ use crate::loon_map_local::{
     inline_remote_data, map_local_pattern_accepted, parse_map_local_line, pattern_source_len,
     remote_data_url,
 };
-use crate::loon_syntax::{attributes, quote, tokens};
+use crate::loon_syntax::{attributes, encode_core_argument, quote, tokens};
 use crate::{AnixOpsMitmPolicyEngine, MitmPolicyRuleDiagnosticStatus};
 use config_core::routing::{
     parse_rule_line, PolicyTarget, RejectKind, RoutingModel, RoutingRule, RuleLine,
@@ -622,6 +622,9 @@ pub fn import_loon_plugin_with_resources(
         ..Parser::default()
     };
     let module_arguments = module_argument_defaults(text);
+    // Script lines resolve `{name}` with the declared defaults, wherever in
+    // the plugin `[Argument]` stands.
+    parser.declare_arguments(text);
     let mut section = Section::Preamble;
     let mut section_name = String::new();
     for (index, raw_line) in text.lines().enumerate() {
@@ -781,6 +784,9 @@ struct Parser<'a> {
     /// Lines appended after the plugin: section, line, original line number.
     appended: Vec<(&'static str, String, usize)>,
     scheduled: Vec<LoonScheduledScript>,
+    /// Every argument was declared up front by [`Parser::declare_arguments`],
+    /// so the lines that declare one are only graded.
+    arguments_declared: bool,
 }
 
 impl Parser<'_> {
@@ -828,7 +834,7 @@ impl Parser<'_> {
             "homepage" => self.metadata.homepage = value.or(self.metadata.homepage.take()),
             "icon" => self.metadata.icon = value.or(self.metadata.icon.take()),
             "category" => self.metadata.category = value.or(self.metadata.category.take()),
-            "arguments" => {
+            "arguments" if !self.arguments_declared => {
                 for (name, default) in parse_module_arguments(&value.unwrap_or_default()) {
                     self.add_argument(&name, &default);
                 }
@@ -867,12 +873,49 @@ impl Parser<'_> {
         }
     }
 
+    /// Declares every `#!arguments` and `[Argument]` default of the plugin, in
+    /// plugin order (a name declared twice keeps the last default, as the
+    /// core does), before any line that uses them is read.
+    fn declare_arguments(&mut self, text: &str) {
+        let mut in_arguments = false;
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if let Some(meta) = line.strip_prefix("#!") {
+                if let Some((key, value)) = meta.split_once('=') {
+                    if key.trim().eq_ignore_ascii_case("arguments") {
+                        for (name, default) in parse_module_arguments(value.trim()) {
+                            self.add_argument(&name, &default);
+                        }
+                    }
+                }
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                in_arguments = Section::parse(&line[1..line.len() - 1]) == Section::Argument;
+                continue;
+            }
+            if !in_arguments
+                || line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with(';')
+                || line.starts_with("//")
+            {
+                continue;
+            }
+            if let Some((name, spec)) = line.split_once('=') {
+                self.add_argument(name, &argument_default(spec));
+            }
+        }
+        self.arguments_declared = true;
+    }
+
     fn argument_line(&mut self, line: usize, section: &str, text: &str) {
         // `Name = kind,default[,tag=...]`
         let status = match text.split_once('=') {
             Some((name, spec)) => {
-                let default = spec.split(',').nth(1).unwrap_or("");
-                self.add_argument(name, default);
+                if !self.arguments_declared {
+                    self.add_argument(name, &argument_default(spec));
+                }
                 LoonLineStatus::Ignored
             }
             None => LoonLineStatus::Unsupported,
@@ -1185,14 +1228,24 @@ impl Parser<'_> {
         if matches!(first.as_str(), "http-request" | "http-response")
             && text.to_ascii_lowercase().contains("script-path=")
         {
-            self.replaced.insert(line, format!("# {text}"));
+            let commented = format!("# {text}");
             let before = self.lines.len();
             self.script_line(line, section, text);
-            if self.lines[before..]
-                .iter()
-                .all(|report| report.status != LoonLineStatus::Unsupported)
-            {
-                self.appended.push(("Script", text.to_string(), line));
+            // `script_line` leaves the line the core should read (with its
+            // arguments resolved) in `replaced`; it moves to `[Script]` and
+            // is commented out here.
+            let core_line = self
+                .replaced
+                .insert(line, commented.clone())
+                .filter(|core_line| *core_line != commented)
+                .unwrap_or_else(|| text.to_string());
+            if self.lines[before..].iter().all(|report| {
+                !matches!(
+                    report.status,
+                    LoonLineStatus::Unsupported | LoonLineStatus::Ignored
+                )
+            }) {
+                self.appended.push(("Script", core_line, line));
             }
             return;
         }
@@ -1739,6 +1792,29 @@ impl Parser<'_> {
             );
             return;
         }
+        // The core reads `enable=` and `argument=` as written and does not
+        // know the plugin's `[Argument]` (the merged policy has none), so
+        // both are resolved here.
+        let current = self
+            .replaced
+            .get(&line)
+            .cloned()
+            .unwrap_or_else(|| text.to_string());
+        let (resolved, switch) = self.resolve_script_line(&current);
+        if switch == ScriptSwitch::Off {
+            self.replaced.insert(line, format!("# {current}"));
+            self.push(
+                line,
+                section,
+                LoonLineStatus::Ignored,
+                LoonLineHandler::ScriptRuntime,
+                "script.disabled",
+            );
+            return;
+        }
+        if resolved != current {
+            self.replaced.insert(line, resolved);
+        }
         if let Some(path) = attributes(text)
             .into_iter()
             .find(|(key, _)| key == "script-path" || key == "script_path")
@@ -1746,6 +1822,21 @@ impl Parser<'_> {
             .filter(|path| !path.is_empty())
         {
             self.remote_resource(line, &path, LoonRemoteResourceKind::Script);
+        }
+        if switch == ScriptSwitch::Unresolved {
+            if response {
+                self.has_response_actions = true;
+            } else {
+                self.has_request_actions = true;
+            }
+            self.push(
+                line,
+                section,
+                LoonLineStatus::Partial,
+                LoonLineHandler::ScriptRuntime,
+                "script.enable_unresolved",
+            );
+            return;
         }
         if response {
             self.has_response_actions = true;
@@ -1900,7 +1991,7 @@ impl Parser<'_> {
         };
         if value("enabled")
             .or_else(|| value("enable"))
-            .is_some_and(|enabled| matches!(enabled.as_str(), "false" | "0"))
+            .is_some_and(|enabled| switch_is_off(&self.resolve_arguments(&enabled)))
         {
             return Ok(None);
         }
@@ -1940,26 +2031,40 @@ impl Parser<'_> {
     }
 
     /// Loon argument templates: `[{a},{b}]` becomes `a=x&b=y`; `{a}` and
-    /// `{{{a}}}` elsewhere become the declared default.
+    /// `{{{a}}}` elsewhere become the declared default. A name the plugin
+    /// does not declare stays as written, so JSON and other text with braces
+    /// passes through unchanged, and a bracketed value is a list only when
+    /// every item in it is a `{name}`.
     fn resolve_arguments(&self, template: &str) -> String {
-        let value = |name: &str| {
+        let declared = |name: &str| {
             self.metadata
                 .arguments
                 .iter()
                 .find(|(declared, _)| declared == name.trim())
                 .map(|(_, value)| value.clone())
-                .unwrap_or_default()
         };
         let trimmed = template.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            return trimmed[1..trimmed.len() - 1]
+        if let Some(items) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            let names = items
                 .split(',')
-                .filter_map(|item| {
-                    let name = item.trim().strip_prefix('{')?.strip_suffix('}')?;
-                    Some(format!("{name}={}", value(name)))
+                .map(|item| {
+                    item.trim()
+                        .strip_prefix('{')
+                        .and_then(|item| item.strip_suffix('}'))
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty() && !name.contains(['{', '}']))
                 })
-                .collect::<Vec<_>>()
-                .join("&");
+                .collect::<Option<Vec<_>>>();
+            if let Some(names) = names {
+                return names
+                    .iter()
+                    .map(|name| format!("{name}={}", declared(name).unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join("&");
+            }
         }
         let mut out = String::new();
         let mut rest = template;
@@ -1970,10 +2075,14 @@ impl Parser<'_> {
             } else {
                 ("{", "}")
             };
-            match rest[start + open.len()..].find(close) {
+            let inner = &rest[start + open.len()..];
+            match inner.find(close) {
                 Some(end) => {
-                    out.push_str(&value(&rest[start + open.len()..start + open.len() + end]));
-                    rest = &rest[start + open.len() + end + close.len()..];
+                    match declared(&inner[..end]) {
+                        Some(value) => out.push_str(&value),
+                        None => out.push_str(&rest[start..start + open.len() + end + close.len()]),
+                    }
+                    rest = &inner[end + close.len()..];
                 }
                 None => {
                     out.push_str(&rest[start..]);
@@ -1983,6 +2092,45 @@ impl Parser<'_> {
         }
         out.push_str(rest);
         out
+    }
+
+    /// An HTTP script line with `enable=` (or `enabled=`) and `argument=`
+    /// resolved against the plugin's arguments, and whether the script runs.
+    ///
+    /// The core reads `enable` as a plain boolean, so `enable={Switch}`
+    /// would always turn the script off; it is resolved here and written as
+    /// `true` unless it is off (`false`, `0`, `no`, `off`), when the line
+    /// leaves the core. `argument` is resolved and then encoded
+    /// ([`encode_core_argument`]) so the core hands it to the script as is.
+    fn resolve_script_line(&self, text: &str) -> (String, ScriptSwitch) {
+        let mut line = text.to_string();
+        let mut switch = ScriptSwitch::On;
+        for key in ["enable", "enabled"] {
+            let Some(span) = core_attribute_span(&line, key) else {
+                continue;
+            };
+            let value = unquote_core_value(&line[span.clone()]);
+            let resolved = self.resolve_arguments(&value);
+            switch = if switch_is_off(&resolved) {
+                ScriptSwitch::Off
+            } else if resolved.contains('{') {
+                ScriptSwitch::Unresolved
+            } else {
+                ScriptSwitch::On
+            };
+            if switch != ScriptSwitch::Off && !switch_is_on(&value) {
+                line.replace_range(span, "true");
+            }
+            break;
+        }
+        if let Some(span) = core_attribute_span(&line, "argument") {
+            let value = unquote_core_value(&line[span.clone()]);
+            let encoded = encode_core_argument(&self.resolve_arguments(&value));
+            if encoded != value {
+                line.replace_range(span, &quote_core_attribute(&encoded));
+            }
+        }
+        (line, switch)
     }
 
     /// Loads the plugin into the policy core and downgrades lines it owns but
@@ -2735,6 +2883,204 @@ fn loon_conditional_script(text: &str) -> Option<String> {
         let _ = write!(line, ", requires-body=true");
     }
     Some(line)
+}
+
+/// Whether an HTTP script runs, from its `enable=` attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptSwitch {
+    On,
+    Off,
+    /// `enable` names an argument the plugin does not declare; the script
+    /// runs.
+    Unresolved,
+}
+
+/// `false`, `0`, `no` or `off`: the plugin turns the script off.
+fn switch_is_off(value: &str) -> bool {
+    let value = value.trim();
+    ["false", "0", "no", "off"]
+        .iter()
+        .any(|off| value.eq_ignore_ascii_case(off))
+}
+
+/// A value the core itself reads as on.
+fn switch_is_on(value: &str) -> bool {
+    let value = value.trim();
+    value == "1"
+        || ["true", "yes", "on"]
+            .iter()
+            .any(|on| value.eq_ignore_ascii_case(on))
+}
+
+/// The default of an `[Argument]` line's `kind,default,...` spec. A quoted
+/// default may hold commas, as the core reads it.
+fn argument_default(spec: &str) -> String {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = spec.chars();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(open) if ch == open => {
+                quote = None;
+                field.push(ch);
+            }
+            Some(_) if ch == '\\' => {
+                field.push(ch);
+                if let Some(escaped) = chars.next() {
+                    field.push(escaped);
+                }
+            }
+            Some(_) => field.push(ch),
+            None if matches!(ch, '"' | '\'') => {
+                quote = Some(ch);
+                field.push(ch);
+            }
+            None if ch == ',' => {
+                fields.push(std::mem::take(&mut field));
+                if fields.len() == 2 {
+                    break;
+                }
+            }
+            None => field.push(ch),
+        }
+    }
+    if fields.len() < 2 {
+        fields.push(field);
+    }
+    fields
+        .get(1)
+        .map(String::as_str)
+        .map(unquote_core_value)
+        .unwrap_or_default()
+}
+
+/// Byte range of the value of attribute `key` in an HTTP script line, read
+/// the way the core reads attributes: the key stands after a space or a
+/// comma, outside quotes; an unquoted value runs to the next comma outside
+/// brackets and quotes. The range covers the quotes of a quoted value.
+fn core_attribute_span(line: &str, key: &str) -> Option<std::ops::Range<usize>> {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(open) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == open {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'"' | b'\'') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        let at_boundary = index == 0 || matches!(bytes[index - 1], b' ' | b'\t' | b',');
+        let key_end = index + key.len();
+        if at_boundary
+            && key_end <= bytes.len()
+            && bytes[index..key_end].eq_ignore_ascii_case(key.as_bytes())
+        {
+            let mut cursor = key_end;
+            while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\t') {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'=' {
+                cursor += 1;
+                while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\t') {
+                    cursor += 1;
+                }
+                return Some(cursor..core_value_end(bytes, cursor));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// End of the attribute value starting at `start` (see [`core_attribute_span`]).
+fn core_value_end(bytes: &[u8], start: usize) -> usize {
+    let mut index = start;
+    let mut quote: Option<u8> = None;
+    let mut depth = 0usize;
+    if index < bytes.len() && matches!(bytes[index], b'"' | b'\'') {
+        let open = bytes[index];
+        index += 1;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' => index += 2,
+                byte if byte == open => return index + 1,
+                _ => index += 1,
+            }
+        }
+        return bytes.len();
+    }
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(open) if byte == open => quote = None,
+            Some(_) if byte == b'\\' => index += 1,
+            Some(_) => {}
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'[' | b'(' | b'{' => depth += 1,
+                b']' | b')' | b'}' if depth > 0 => depth -= 1,
+                b',' if depth == 0 => break,
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    let mut end = index.min(bytes.len());
+    while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    end
+}
+
+/// An attribute value as the core reads it: surrounding quotes removed, and
+/// inside them a backslash keeps the character after it.
+fn unquote_core_value(raw: &str) -> String {
+    let value = raw.trim();
+    let quoted = value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')));
+    if !quoted {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value[1..value.len() - 1].chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(escaped) => out.push(escaped),
+                None => out.push(ch),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// A value written back into an HTTP script line so that
+/// [`core_attribute_span`] and [`unquote_core_value`], like the core, read it
+/// back unchanged.
+fn quote_core_attribute(value: &str) -> String {
+    if !value.is_empty()
+        && !value.contains([
+            ' ', '\t', ',', '"', '\'', '\\', '[', ']', '(', ')', '{', '}',
+        ])
+    {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// An attribute value as [`attributes`] reads it back.
