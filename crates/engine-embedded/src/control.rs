@@ -89,7 +89,13 @@
 //! time out. It works with or without plugin scripts. It also forgets every
 //! policy group health check result, which says nothing about the new
 //! network: a group is checked again as soon as a connection goes through
-//! it (see [`crate::routing`]).
+//! it (see [`crate::routing`]). A running WireGuard node moves its session to
+//! a new UDP socket and counts as one reset.
+//!
+//! A whole-device WireGuard tunnel (a config whose single `outbound` is
+//! `wireguard`) has no flows: it answers `reset_network` by moving to a new
+//! UDP socket (`reset` is 1 while the tunnel runs, `closed` is 0) and accepts
+//! `set_network` without effect; every other command is refused.
 //!
 //! `set_network` tells subnet groups which network the device is on. The
 //! client sends it whenever the network changes, before `reset_network`, so
@@ -762,10 +768,46 @@ pub fn handle_with_interceptor(
         .map_err(|_| RuntimeError::new(RuntimeErrorCode::InternalError, "control answer failed"))
 }
 
+/// Answers a request to a whole-device WireGuard tunnel, which has no flows
+/// to control. `reset_network` moves the running tunnel to a new UDP socket
+/// ([`crate::wireguard::PathControl::reset`]): `reset` is 1 when a tunnel
+/// runs, `closed` and `health_forgotten` are 0. `set_network` is checked and
+/// changes nothing (`"changed": false`). Every other command is refused.
+#[cfg(feature = "wireguard")]
+pub(crate) fn handle_wireguard(
+    paths: &crate::wireguard::PathControl,
+    request: &[u8],
+) -> Result<Vec<u8>, RuntimeError> {
+    if request.is_empty() || request.len() > MAX_REQUEST_LEN {
+        return Err(invalid("control request size is out of range"));
+    }
+    let request: ControlRequest = serde_json::from_slice(request)
+        .map_err(|_| invalid("control request is not a known command"))?;
+    let answer = match request {
+        ControlRequest::ResetNetwork { .. } => {
+            json!({ "reset": paths.reset(), "closed": 0, "health_forgotten": 0 })
+        }
+        ControlRequest::SetNetwork {
+            kind,
+            ssid,
+            bssid,
+            router,
+            addresses,
+            radio,
+        } => {
+            network_context(kind, ssid, bssid, router, addresses, radio)?;
+            json!({ "changed": false })
+        }
+        _ => return Err(unavailable()),
+    };
+    serde_json::to_vec(&answer)
+        .map_err(|_| RuntimeError::new(RuntimeErrorCode::InternalError, "control answer failed"))
+}
+
 /// The answer for runtimes without flows to control, such as a WireGuard
 /// tunnel.
 #[cfg(feature = "wireguard")]
-pub(crate) fn unavailable() -> RuntimeError {
+fn unavailable() -> RuntimeError {
     invalid("this tunnel has no runtime controls")
 }
 

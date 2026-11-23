@@ -16,7 +16,8 @@
 //! without UDP drops those datagrams; QUIC (UDP 443) is also answered with
 //! ICMP port unreachable so it falls back to TCP at once. A WireGuard
 //! tunnel (`Tunnel::start_wireguard`) skips the stack and seals packets
-//! straight to its peer.
+//! straight to its peer, on a UDP socket that moves to a new one when the
+//! network changes (see the `wireguard` module).
 
 use std::collections::HashMap;
 use std::io;
@@ -48,7 +49,7 @@ use crate::first_payload::{ServerFirst, Wait};
 use crate::routing::FlowSource;
 use crate::sniff;
 #[cfg(feature = "wireguard")]
-use crate::wireguard::{self, WireGuardSettings};
+use crate::wireguard::{self, PathControl, WireGuardSettings};
 
 /// Receives every IP packet the stack emits. Called on a tunnel thread, one
 /// call at a time.
@@ -422,15 +423,17 @@ impl Tunnel {
     }
 
     /// Starts a WireGuard tunnel to one peer. Resolving the endpoint and
-    /// binding the UDP socket happen before this returns.
+    /// binding the UDP socket happen before this returns; `paths` moves the
+    /// running tunnel to a new socket after a network change.
     #[cfg(feature = "wireguard")]
     pub fn start_wireguard(
         settings: WireGuardSettings,
+        paths: Arc<PathControl>,
         sink: impl PacketWriter,
     ) -> io::Result<Self> {
         let sink: PacketSink = Box::new(move |packet: &[u8]| sink.write(packet));
         Self::launch(1, move |packet_rx, stats| {
-            wireguard::spawn_tasks(settings, sink, packet_rx, stats)
+            wireguard::spawn_tasks(settings, paths, sink, packet_rx, stats)
         })
     }
 

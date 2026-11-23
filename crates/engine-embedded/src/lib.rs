@@ -33,6 +33,7 @@
 //! - `wireguard` (feature `wireguard`): with a single `outbound`, an IP-level
 //!   tunnel that bypasses the TCP/IP stack and seals packets straight to one
 //!   peer; in `routing.outbounds`, a node like any other (`outbound-wireguard`).
+//!   Both move to a new UDP socket on `reset_network`.
 //! - `mitm` (feature `mitm`): HTTPS decryption for the policy's MITM host
 //!   list, offered every new TCP flow through [`tunnel::FlowInterceptor`].
 //!
@@ -180,11 +181,12 @@ pub struct RuntimeStatus {
 }
 
 /// What carries the traffic: a TCP outbound behind the userspace stack, or a
-/// WireGuard peer that takes IP packets directly.
+/// WireGuard peer that takes IP packets directly, with the handle that moves
+/// its running tunnel to a new UDP socket.
 enum Engine {
     Stack(Arc<Dispatcher>),
     #[cfg(feature = "wireguard")]
-    WireGuard(WireGuardSettings),
+    WireGuard(WireGuardSettings, Arc<wireguard::PathControl>),
 }
 
 pub struct EmbeddedRuntime {
@@ -248,7 +250,7 @@ impl EmbeddedRuntime {
                     Engine::Stack(Arc::new(dispatcher))
                 }
                 #[cfg(feature = "wireguard")]
-                TunnelMode::WireGuard(settings) => Engine::WireGuard(settings),
+                TunnelMode::WireGuard(settings) => Engine::WireGuard(settings, Arc::default()),
             },
         };
         if let (Some(interceptor), Engine::Stack(dispatcher)) = (&interceptor, &engine) {
@@ -306,7 +308,9 @@ impl EmbeddedRuntime {
                 sink,
             ),
             #[cfg(feature = "wireguard")]
-            Engine::WireGuard(wireguard) => Tunnel::start_wireguard(wireguard.clone(), sink),
+            Engine::WireGuard(wireguard, paths) => {
+                Tunnel::start_wireguard(wireguard.clone(), paths.clone(), sink)
+            }
         };
         match started {
             Ok(tunnel) => {
@@ -371,7 +375,7 @@ impl EmbeddedRuntime {
             outbound: match &self.engine {
                 Engine::Stack(dispatcher) => dispatcher.protocol(),
                 #[cfg(feature = "wireguard")]
-                Engine::WireGuard(_) => wireguard::PROTOCOL,
+                Engine::WireGuard(..) => wireguard::PROTOCOL,
             },
             state: self.state,
             last_error: self.last_error.map(RuntimeErrorCode::as_str),
@@ -382,13 +386,15 @@ impl EmbeddedRuntime {
             fake_ip: match &self.engine {
                 Engine::Stack(dispatcher) => dispatcher.fake_ip().map(|pool| pool.stats()),
                 #[cfg(feature = "wireguard")]
-                Engine::WireGuard(_) => None,
+                Engine::WireGuard(..) => None,
             },
         }
     }
 
     /// Answers one [`control`] request, such as the connection list. A
-    /// WireGuard tunnel has no flows to control and rejects every request.
+    /// WireGuard tunnel has no flows to control: it answers `reset_network`
+    /// (moving to a new UDP socket) and `set_network`, and rejects every
+    /// other request.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
         match &self.engine {
             Engine::Stack(dispatcher) => {
@@ -398,10 +404,7 @@ impl EmbeddedRuntime {
                 control::handle_with_interceptor(dispatcher, self.interceptor.as_deref(), request)
             }
             #[cfg(feature = "wireguard")]
-            Engine::WireGuard(_) => {
-                let _ = request;
-                Err(control::unavailable())
-            }
+            Engine::WireGuard(_, paths) => control::handle_wireguard(paths, request),
         }
     }
 

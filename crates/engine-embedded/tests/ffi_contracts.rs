@@ -142,6 +142,37 @@ fn wireguard_can_be_a_routed_node() {
     unsafe { networkcore_ios_runtime_free_handle(handle) };
 }
 
+/// A whole-device WireGuard tunnel answers the client's network change
+/// requests with the fields it decodes, and refuses flow commands.
+#[cfg(feature = "wireguard")]
+#[test]
+fn whole_device_wireguard_answers_network_changes() {
+    let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    let config = format!(
+        r#"{{"schema_version":1,"profile_id":"p","outbound":{{"type":"wireguard","private_key":"{key}","peer_public_key":"{key}","server":"192.0.2.1","port":51820}}}}"#
+    );
+    let (code, handle) = init(&config);
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+
+    // Before the tunnel starts there is no socket to move.
+    let (code, answer) = control(handle, r#"{"cmd":"reset_network"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    let answer = answer.unwrap();
+    assert_eq!(answer["reset"], 0);
+    assert_eq!(answer["closed"], 0);
+
+    let (code, answer) = control(handle, r#"{"cmd":"set_network","type":"wifi"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_OK);
+    assert_eq!(answer.unwrap()["changed"], false);
+    let (code, _) = control(handle, r#"{"cmd":"set_network","type":"satellite"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+
+    let (code, answer) = control(handle, r#"{"cmd":"connections"}"#);
+    assert_eq!(code, NETWORKCORE_IOS_ERR_INVALID_ARGUMENT);
+    assert!(answer.is_none());
+    unsafe { networkcore_ios_runtime_free_handle(handle) };
+}
+
 #[cfg(feature = "shadowsocks")]
 #[test]
 fn shadowsocks_config_is_accepted_and_status_hides_the_key() {

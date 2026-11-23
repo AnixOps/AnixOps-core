@@ -126,6 +126,14 @@ struct 必须采用 C-compatible layout，字段必须固定大小、对齐和 o
 | `capture_h2_frames` | `id`，可选 `since` | `{"h2_frames": {"seen", "dropped", "frames": […]} \| null}`：解密 `h2` 连接两条链路的帧头时间线（最近 512 帧） |
 | `export_capture` | `format`（`pcapng` \| `har`），可选 `id` | `{"format", "file_name", "content_type", "size", "data_base64"}` |
 
+整机 WireGuard 隧道（配置只有一个 `wireguard` 出站）没有连接可管理，只接受两条命令：`reset_network` 让运行中的隧道在后台重新解析端点、
+换到一个新建并经保护器处理的 UDP socket，并立即发起新握手（会话密钥保留，对端随新源地址漫游），应答
+`{"reset": 1, "closed": 0, "health_forgotten": 0}`（隧道未运行时 `reset` 为 0）；`set_network` 只做校验并应答 `{"changed": false}`。
+其他命令返回 `NETWORKCORE_IOS_ERR_INVALID_ARGUMENT`。路由配置里的 WireGuard 节点在 `reset_network` 时同样换 socket，运行中计为一次
+reset。`networkcore_ios_set_bound_interface` 换了网卡时，运行中的 WireGuard 隧道和节点也会换到新网卡上的 socket，与 `reset_network`
+到达的先后无关；发包遇到源地址或路由失效的错误、握手持续无应答时，内核也会自己换 socket，规则见
+`crates/outbound-wireguard/src/path.rs`。
+
 模式：`rule` 按配置的规则与策略组；`global` 全部发往 `routing.global`（策略组 id、节点 id 或 `DIRECT`，缺省为第一个策略组，
 没有策略组时为第一个节点），单出站配置走该出站；`direct` 全部直连。启动模式取配置顶层的 `mode`（缺省 `rule`）。运行时切换的模式和
 select 组选择只保留到 runtime 停止，客户端应把它们写回 profile（`mode`、select 组的 `default`）供下次启动使用。

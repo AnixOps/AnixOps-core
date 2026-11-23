@@ -853,6 +853,51 @@ fn reset_network_reaches_every_routed_node_and_direct() {
     });
 }
 
+/// A routed WireGuard node moves its running session to a new UDP socket on
+/// `reset_network` and counts as one reset; an idle node has nothing to
+/// move.
+#[cfg(feature = "wireguard")]
+#[test]
+fn reset_network_moves_a_running_wireguard_node() {
+    runtime().block_on(async {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let config: outbound_wireguard::WireGuardConfig =
+            serde_json::from_value(serde_json::json!({
+                "server": "127.0.0.1",
+                "port": 9,
+                "private_key": key,
+                "peer_public_key": key,
+                "local_address": ["10.7.0.2/32"],
+                "allowed_ips": ["10.7.0.0/24"],
+            }))
+            .unwrap();
+        let settings = config.validate().ok().unwrap();
+        let wireguard = Arc::new(outbound_wireguard::WireGuardOutbound::new(settings));
+        let direct = Pooled::new();
+        let nodes = BTreeMap::from([("wg".to_string(), wireguard.clone() as Arc<dyn TcpOutbound>)]);
+        let spec = RoutingSpec {
+            rules: vec![
+                "IP-CIDR,10.7.0.0/24,wg".to_string(),
+                "FINAL,DIRECT".to_string(),
+            ],
+            groups: Vec::new(),
+        };
+        let routed = RoutedOutbound::new(&spec, direct.clone(), nodes).unwrap();
+        let dispatcher = Dispatcher::routed(Arc::new(routed));
+
+        // Only DIRECT counts while the node has no session.
+        let answer = control_json(&dispatcher, r#"{"cmd":"reset_network"}"#);
+        assert_eq!(answer["reset"], 1);
+
+        // The first flow starts the session.
+        let flow = wireguard.open_udp(&ip("10.7.0.1:53")).await.unwrap();
+        let answer = control_json(&dispatcher, r#"{"cmd":"reset_network"}"#);
+        assert_eq!(answer["reset"], 2);
+        assert_eq!(direct.resets(), 2);
+        drop(flow);
+    });
+}
+
 #[test]
 fn rules_reload_in_place_without_dropping_open_connections() {
     runtime().block_on(async {

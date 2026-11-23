@@ -6,11 +6,13 @@
 //! flows open inside that stack, so a WireGuard node can sit in rules and
 //! policy groups beside every other outbound; the platform's routes are never
 //! touched. The whole-device WireGuard tunnel of `engine-embedded` is a
-//! separate mode and does not use this crate.
+//! separate mode that only shares [`path`] with this crate.
 //!
 //! - [`config`]: the `"type": "wireguard"` settings.
 //! - [`allowed`]: AllowedIPs, applied in both directions (cryptokey routing).
 //! - [`dns`]: A/AAAA lookups through the tunnel's DNS servers.
+//! - [`path`]: the UDP socket to the peer, which moves to a new one when the
+//!   network changes.
 //! - [`WireGuardOutbound`]: the outbound.
 
 pub mod allowed;
@@ -18,6 +20,7 @@ pub mod config;
 pub mod dns;
 mod node;
 mod outbound;
+pub mod path;
 
 pub use allowed::{AllowedIps, IpNet};
 pub use config::{decode_key, WireGuardConfig, WireGuardSettings};

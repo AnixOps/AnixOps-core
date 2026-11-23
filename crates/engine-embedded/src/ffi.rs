@@ -725,6 +725,11 @@ pub unsafe extern "C" fn networkcore_ios_decode_body(
 /// [`crate::protect::set_socket_protector`]. Uses `IP_BOUND_IF` /
 /// `IPV6_BOUND_IF`, so a non-zero index returns
 /// `NETWORKCORE_IOS_ERR_INVALID_ARGUMENT` on other platforms.
+///
+/// A socket keeps the interface it was pinned to; a new index moves
+/// [`crate::protect::path_generation`], so a running WireGuard tunnel or node
+/// moves its UDP socket to the new interface even when this call comes after
+/// the client's `reset_network`.
 #[no_mangle]
 pub extern "C" fn networkcore_ios_set_bound_interface(ipv4_index: u32, ipv6_index: u32) -> i32 {
     guarded(|| bound_interface::set(ipv4_index, ipv6_index))
@@ -752,9 +757,16 @@ mod bound_interface {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn install(ipv4_index: u32, ipv6_index: u32) -> i32 {
         use std::sync::Arc;
-        IPV4.store(ipv4_index, Ordering::SeqCst);
-        IPV6.store(ipv6_index, Ordering::SeqCst);
-        if !INSTALLED.swap(true, Ordering::SeqCst) {
+        let v4_moved = IPV4.swap(ipv4_index, Ordering::SeqCst) != ipv4_index;
+        let v6_moved = IPV6.swap(ipv6_index, Ordering::SeqCst) != ipv6_index;
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            // The protector stays and reads the new indices; sockets made
+            // before keep the old interface, so long-lived ones move.
+            if v4_moved || v6_moved {
+                crate::protect::path_changed();
+            }
+        } else {
+            // Installing the protector moves the path generation too.
             crate::protect::set_socket_protector(Some(Arc::new(
                 |socket: crate::protect::RawSocketHandle, target: std::net::SocketAddr| {
                     let index = if target.is_ipv4() {
