@@ -196,7 +196,9 @@ fn reflect_udp(packet: &mut [u8]) -> bool {
 /// A UDP relay in front of one hub port that gives each client address its
 /// own upstream socket, like a NAT mapping, so the hub sees a client that
 /// moved as a new address. `cut` drops the paths of every client address
-/// seen so far, in both directions, like a network the device left.
+/// seen so far, in both directions, like a network the device left. A twin
+/// copy lives in `crates/engine-embedded/tests/wireguard_packets.rs`; keep
+/// them in sync.
 struct Relay {
     port: u16,
     state: Arc<Mutex<RelayState>>,

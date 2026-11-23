@@ -131,13 +131,19 @@ fn is_initiation(datagram: &[u8]) -> bool {
 }
 
 /// Errors that mean the socket's path is gone rather than that the peer
-/// refused: the source address left the device (`EADDRNOTAVAIL`), there is
-/// no route or no network (`ENETUNREACH`, `EHOSTUNREACH`, `ENETDOWN`), or
-/// the system tore the socket down (`EPIPE`, `ENOTCONN`).
+/// refused: the source address left the device (`EADDRNOTAVAIL`; on Linux
+/// and Android a connected IPv4 socket keeps the source chosen at `connect`
+/// and its sends then fail with `EINVAL`, as the route lookup cannot use
+/// it), there is no route or no network (`ENETUNREACH`, `EHOSTUNREACH`,
+/// `ENETDOWN`), or the system tore the socket down (`EPIPE`, `ENOTCONN`).
+/// On a connected UDP socket with a valid buffer `EINVAL` has no other
+/// cause worth keeping the socket for, and a false positive costs one
+/// paced move.
 fn is_path_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::InvalidInput
             | io::ErrorKind::NetworkUnreachable
             | io::ErrorKind::HostUnreachable
             | io::ErrorKind::NetworkDown
@@ -391,6 +397,9 @@ impl Path {
                 self.endpoint = endpoint;
                 self.protected = protect::socket_protector_installed();
                 self.broken = false;
+                // `stall_after` stays doubled: it relaxes only when the peer
+                // answers (`heard`), so a peer that stays silent across moves
+                // is not retried every 20 s.
                 self.unanswered_since = None;
                 self.recv_paused_until = None;
                 Received::Rebound
@@ -464,6 +473,7 @@ mod tests {
 
         for kind in [
             io::ErrorKind::AddrNotAvailable,
+            io::ErrorKind::InvalidInput,
             io::ErrorKind::NetworkUnreachable,
             io::ErrorKind::HostUnreachable,
             io::ErrorKind::NetworkDown,

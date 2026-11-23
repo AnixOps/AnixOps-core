@@ -122,7 +122,8 @@ fn start_peer(preshared: Option<[u8; 32]>) -> u16 {
 /// A UDP relay in front of the peer that gives each client address its own
 /// upstream socket, like a NAT mapping, so the peer sees a client that moved
 /// as a new address. `cut` drops the paths of every client address seen so
-/// far, in both directions, like a network the device left.
+/// far, in both directions, like a network the device left. A twin copy
+/// lives in `crates/outbound-wireguard/tests/loopback.rs`; keep them in sync.
 struct Relay {
     port: u16,
     state: Arc<Mutex<RelayState>>,
