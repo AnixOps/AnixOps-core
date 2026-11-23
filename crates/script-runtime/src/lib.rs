@@ -327,15 +327,42 @@ impl ScriptOutcome {
     }
 }
 
+/// Redirects a `$httpClient` request follows at most before the last
+/// redirect is handed to the script as it is.
+pub const SCRIPT_HTTP_CLIENT_MAX_REDIRECTS: usize = 5;
+
 /// Request a script made through `$httpClient`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptHttpClientRequest {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// Text, or a byte string (one char per byte) when `body_binary`.
     pub body: Option<String>,
-    /// Never longer than the time left in the dispatch.
+    /// The script passed the body as bytes (`Uint8Array`, `ArrayBuffer`,
+    /// Quantumult X `bodyBytes`); send [`Self::body_bytes`].
+    pub body_binary: bool,
+    /// Surge `binary-mode`: the client returns the answer's body as a byte
+    /// string ([`binary_body_string`]) and the script gets a `Uint8Array`.
+    /// Otherwise the body is UTF-8 text.
+    pub binary_response: bool,
+    /// Follow redirects, up to [`SCRIPT_HTTP_CLIENT_MAX_REDIRECTS`]. On
+    /// unless the script set Surge `auto-redirect: false` or Quantumult X
+    /// `opts.redirection: false`.
+    pub follow_redirects: bool,
+    /// Never longer than the time left in the dispatch; redirects share it.
     pub timeout: Duration,
+}
+
+impl ScriptHttpClientRequest {
+    /// The body as it goes on the wire.
+    pub fn body_bytes(&self) -> Vec<u8> {
+        match self.body.as_deref() {
+            None => Vec::new(),
+            Some(body) if self.body_binary => binary_body_bytes(body).unwrap_or_default(),
+            Some(body) => body.as_bytes().to_vec(),
+        }
+    }
 }
 
 /// Network access for `$httpClient`. Implementations decide which hosts and

@@ -498,10 +498,19 @@ fn parse_http_request(payload: &str) -> Result<ScriptHttpClientRequest, String> 
             .map_err(|_| "networkcore: invalid $httpClient headers".to_string())?,
         None => Vec::new(),
     };
+    let flag = |name: &str| value.get(name).and_then(Value::as_bool);
+    let body_binary = flag("bodyBinary").unwrap_or(false);
     let body = value
         .get("body")
         .and_then(Value::as_str)
         .map(str::to_string);
+    if body_binary
+        && body
+            .as_deref()
+            .is_some_and(|body| body.chars().any(|ch| u32::from(ch) > 0xff))
+    {
+        return Err("networkcore: invalid $httpClient body".to_string());
+    }
     let timeout_ms = value
         .get("timeout")
         .and_then(Value::as_f64)
@@ -513,6 +522,9 @@ fn parse_http_request(payload: &str) -> Result<ScriptHttpClientRequest, String> 
         url: url.to_string(),
         headers,
         body,
+        body_binary,
+        binary_response: flag("binaryMode").unwrap_or(false),
+        follow_redirects: flag("followRedirects").unwrap_or(true),
         // Zero means "the rest of the dispatch budget"; the driver caps it.
         timeout: Duration::from_millis(timeout_ms as u64),
     })

@@ -239,21 +239,83 @@
 
   var callbacks = {};
 
-  function request(method, options, callback) {
+  function isOn(value) {
+    return value === true || value === "true" || value === 1;
+  }
+
+  function isOff(value) {
+    return value === false || value === "false" || value === 0;
+  }
+
+  // Text from a UTF-8 byte string; a byte that starts no valid sequence
+  // becomes U+FFFD.
+  function utf8Text(bytes) {
+    try {
+      return decodeURIComponent(escape(bytes));
+    } catch (error) {
+      // Decoded sequence by sequence below.
+    }
+    var parts = [];
+    for (var i = 0; i < bytes.length;) {
+      var lead = bytes.charCodeAt(i);
+      var size = lead < 0x80 ? 1
+        : lead >= 0xc2 && lead < 0xe0 ? 2
+        : lead >= 0xe0 && lead < 0xf0 ? 3
+        : lead >= 0xf0 && lead < 0xf5 ? 4 : 0;
+      var decoded = null;
+      if (size > 0 && i + size <= bytes.length) {
+        try {
+          decoded = decodeURIComponent(escape(bytes.substr(i, size)));
+        } catch (error) {
+          decoded = null;
+        }
+      }
+      if (decoded === null) {
+        parts.push("\ufffd");
+        i += 1;
+      } else {
+        parts.push(decoded);
+        i += size;
+      }
+    }
+    return parts.join("");
+  }
+
+  // `mode` says what the callback's body is: "text", "bytes" (a
+  // Uint8Array, Surge `binary-mode`) or "raw" (the byte string itself).
+  function request(method, options, callback, mode) {
     var opts = typeof options === "string" ? { url: options } : options || {};
+    var nested = opts.opts && typeof opts.opts === "object" ? opts.opts : {};
     var body = opts.body;
-    if (body !== undefined && body !== null && typeof body !== "string") {
+    if ((body === undefined || body === null) && opts.bodyBytes !== undefined) {
+      body = opts.bodyBytes;
+    }
+    var bodyBinary = false;
+    var bytes = body === undefined || body === null ? null : asBytes(body);
+    if (bytes) {
+      body = byteStringFromBytes(bytes);
+      bodyBinary = true;
+    } else if (body !== undefined && body !== null && typeof body !== "string") {
       body = JSON.stringify(body);
+    }
+    if (mode === undefined) {
+      mode = isOn(opts["binary-mode"]) || isOn(nested["binary-mode"]) ? "bytes" : "text";
     }
     var id = Number(call("http.request", JSON.stringify({
       method: method,
       url: text(opts.url),
       headers: opts.headers || {},
       body: body === undefined || body === null ? null : body,
+      bodyBinary: bodyBinary,
+      binaryMode: mode !== "text",
+      // Surge, Loon and Stash `auto-redirect`; Quantumult X and Env.js
+      // `opts.redirection`. Redirects are followed unless one says no.
+      followRedirects: !(isOff(opts["auto-redirect"]) || isOff(opts.redirection)
+        || isOff(nested.redirection)),
       timeout: Number(opts.timeout) || 0
     })));
     if (typeof callback === "function") {
-      callbacks[id] = callback;
+      callbacks[id] = { callback: callback, mode: mode };
     }
   }
 
@@ -274,18 +336,22 @@
         fetch: function (options) {
           var opts = typeof options === "string" ? { url: options } : options || {};
           return new Promise(function (resolve, reject) {
-            request(text(opts.method || "GET").toUpperCase(), opts, function (error, response, body) {
+            // The answer comes as bytes: `body` is its UTF-8 text and
+            // `bodyBytes` an ArrayBuffer of it.
+            request(text(opts.method || "GET").toUpperCase(), opts, function (error, response, raw) {
               if (error !== null && error !== undefined) {
                 reject({ error: String(error) });
               } else {
+                var bytes = typeof raw === "string" ? raw : "";
                 resolve({
                   statusCode: response.status,
                   status: response.status,
                   headers: response.headers,
-                  body: body
+                  body: utf8Text(bytes),
+                  bodyBytes: bytesFromByteString(bytes).buffer
                 });
               }
-            });
+            }, "raw");
           });
         }
       });
@@ -307,18 +373,22 @@
         return;
       }
       if (event.kind === "http") {
-        var callback = callbacks[event.id];
+        var entry = callbacks[event.id];
         delete callbacks[event.id];
-        if (!callback) {
+        if (!entry) {
           return;
         }
         if (event.error !== null && event.error !== undefined) {
-          callback(event.error, null, null);
+          entry.callback(event.error, null, null);
         } else {
-          callback(
+          var data = event.body;
+          if (entry.mode === "bytes" && typeof data === "string") {
+            data = bytesFromByteString(data);
+          }
+          entry.callback(
             null,
             { status: event.status, statusCode: event.status, headers: event.headers },
-            event.body
+            data
           );
         }
       }

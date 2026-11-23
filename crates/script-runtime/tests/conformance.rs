@@ -6,15 +6,56 @@
 #![cfg(feature = "quickjs")]
 
 use script_runtime::{
-    MemoryScriptStore, QuickJsScriptRuntime, ScriptFailure, ScriptInvocation, ScriptLimits,
-    ScriptMutation, ScriptOutcome, ScriptPhase, ScriptRequest, ScriptResponse, ScriptRuleRequest,
-    ScriptRunStatus, ScriptStore,
+    binary_body_string, MemoryScriptStore, QuickJsScriptRuntime, ScriptFailure, ScriptHttpClient,
+    ScriptHttpClientRequest, ScriptInvocation, ScriptLimits, ScriptMutation, ScriptOutcome,
+    ScriptPhase, ScriptRequest, ScriptResponse, ScriptRuleRequest, ScriptRunStatus, ScriptStore,
+    SCRIPT_HTTP_CLIENT_DISABLED_MESSAGE,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// `$httpClient` for the fixtures: `https://stub.example.test/bytes`
+/// answers four bytes that are not UTF-8, `/echo` describes the request it
+/// got; every other URL fails as a disabled client does.
+struct StubHttpClient;
+
+const STUB_BYTES: [u8; 4] = [0x00, 0x01, 0x80, 0xff];
+
+impl ScriptHttpClient for StubHttpClient {
+    fn execute(&self, request: &ScriptHttpClientRequest) -> Result<ScriptResponse, String> {
+        let body = match request.url.as_str() {
+            "https://stub.example.test/bytes" => STUB_BYTES.to_vec(),
+            "https://stub.example.test/echo" => format!(
+                "{}|follow={}|binary={}|body={}",
+                request.method,
+                request.follow_redirects,
+                request.binary_response,
+                request
+                    .body_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+            .into_bytes(),
+            _ => return Err(SCRIPT_HTTP_CLIENT_DISABLED_MESSAGE.to_string()),
+        };
+        Ok(ScriptResponse {
+            status: 200,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body: Some(if request.binary_response {
+                binary_body_string(&body)
+            } else {
+                String::from_utf8_lossy(&body).into_owned()
+            }),
+        })
+    }
+}
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance")
@@ -281,8 +322,7 @@ fn run_suite(capabilities: &[&str], run: &EngineRunner) -> Vec<String> {
 #[test]
 fn quickjs_passes_shared_conformance_fixtures() {
     let skipped = run_suite(&["heap-limit"], &|store, script, invocation, limits| {
-        QuickJsScriptRuntime::new(store, Arc::new(script_runtime::DisabledScriptHttpClient))
-            .run(script, invocation, limits)
+        QuickJsScriptRuntime::new(store, Arc::new(StubHttpClient)).run(script, invocation, limits)
     });
     assert!(skipped.is_empty(), "QuickJS skipped {skipped:?}");
 }
@@ -295,8 +335,7 @@ mod javascriptcore {
     #[test]
     fn javascriptcore_passes_shared_conformance_fixtures() {
         let skipped = run_suite(&[], &|store, script, invocation, limits| {
-            JscScriptRuntime::new(store, Arc::new(script_runtime::DisabledScriptHttpClient))
-                .run(script, invocation, limits)
+            JscScriptRuntime::new(store, Arc::new(StubHttpClient)).run(script, invocation, limits)
         });
         assert_eq!(
             skipped,
