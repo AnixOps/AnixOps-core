@@ -247,6 +247,56 @@ fn quickjs_response_script_reads_the_request_it_answers() {
 }
 
 #[test]
+fn quickjs_header_script_keeps_every_set_cookie_field() {
+    let dir = temp_dir("set-cookie");
+    let script = dir.join("strip-csp.js");
+    std::fs::write(
+        &script,
+        "var headers = $response.headers; delete headers['Content-Security-Policy'];\
+         $done({ headers: headers });",
+    )
+    .unwrap();
+    let hook = hook(executor(&script, None), 1000);
+    let mut response = message(HttpMitmPhase::Response, "{}");
+    let entry = |key: &str, value: &str| MetadataEntry {
+        key: key.to_string(),
+        value: value.to_string(),
+    };
+    response.headers = vec![
+        entry("Set-Cookie", "sid=1; Path=/; HttpOnly"),
+        entry("Content-Security-Policy", "default-src 'self'"),
+        entry(
+            "Set-Cookie",
+            "theme=dark; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
+        ),
+        entry("Set-Cookie", "lang=en"),
+    ];
+
+    let report = hook.plan_plain_http(&response);
+
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+    let cookies = report
+        .headers
+        .iter()
+        .filter(|header| header.key == "Set-Cookie")
+        .map(|header| header.value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cookies,
+        [
+            "sid=1; Path=/; HttpOnly",
+            "theme=dark; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
+            "lang=en"
+        ]
+    );
+    assert!(!report
+        .headers
+        .iter()
+        .any(|header| header.key == "Content-Security-Policy"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn quickjs_binary_body_mode_passes_bytes_both_ways() {
     let dir = temp_dir("binary");
     let script = dir.join("binary.js");

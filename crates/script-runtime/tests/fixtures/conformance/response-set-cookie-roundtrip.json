@@ -1,0 +1,25 @@
+{
+  "invocation": {
+    "phase": "response",
+    "request": { "url": "https://api.example.test/login", "method": "POST" },
+    "response": {
+      "status": 200,
+      "headers": [
+        ["Set-Cookie", "sid=1; Path=/; HttpOnly"],
+        ["Content-Security-Policy", "default-src 'self'"],
+        ["Set-Cookie", "theme=dark; Expires=Wed, 21 Oct 2026 07:28:00 GMT"],
+        ["Set-Cookie", "lang=en"]
+      ]
+    }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": {
+      "headers": [
+        ["Set-Cookie", "sid=1; Path=/; HttpOnly"],
+        ["Set-Cookie", "theme=dark; Expires=Wed, 21 Oct 2026 07:28:00 GMT"],
+        ["Set-Cookie", "lang=en"]
+      ]
+    }
+  }
+}

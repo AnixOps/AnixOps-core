@@ -61,20 +61,35 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance")
 }
 
+/// A header list: an object (`{"name": "value"}`) or, to repeat a name, an
+/// array of pairs (`[["Set-Cookie", "a=1"], ["Set-Cookie", "b=2"]]`).
 fn headers(value: Option<&Value>) -> Vec<(String, String)> {
-    value
-        .and_then(Value::as_object)
-        .map(|object| {
-            object
-                .iter()
-                .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+    match value {
+        Some(Value::Object(object)) => object
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_string()))
+            .collect(),
+        Some(Value::Array(pairs)) => pairs
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].as_str().unwrap().to_string(),
+                    pair[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
-fn header_map(headers: &[(String, String)]) -> BTreeMap<String, String> {
-    headers.iter().cloned().collect()
+/// Headers compared regardless of order between names; repeated names
+/// keep every field, in their order.
+fn header_map(headers: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut map = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        map.entry(name.clone()).or_default().push(value.clone());
+    }
+    map
 }
 
 fn text(value: Option<&Value>) -> Option<String> {

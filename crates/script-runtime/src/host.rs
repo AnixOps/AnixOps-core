@@ -42,6 +42,10 @@ pub(crate) struct HostResults {
 pub struct ScriptHost {
     context_json: String,
     phase: ScriptPhase,
+    /// The header list of the message the script may change (the request
+    /// in the request phase, the response in the response phase), to give
+    /// fields joined for the script back as they were.
+    phase_headers: Vec<(String, String)>,
     binary_body: bool,
     default_store_key: String,
     max_output_bytes: usize,
@@ -65,6 +69,15 @@ impl ScriptHost {
         Self {
             context_json: context_json(invocation),
             phase: invocation.phase,
+            phase_headers: match invocation.phase {
+                ScriptPhase::Request => invocation.request.headers.clone(),
+                ScriptPhase::Response => invocation
+                    .response
+                    .as_ref()
+                    .map(|response| response.headers.clone())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            },
             binary_body: invocation.binary_body,
             default_store_key: format!("networkcore.script.{}", invocation.script_name),
             max_output_bytes: limits.max_output_bytes,
@@ -87,12 +100,15 @@ impl ScriptHost {
             "context" => Some(self.context_json.clone()),
             "done" => {
                 if self.done.is_none() {
-                    self.done = Some(parse_done(
-                        self.phase,
-                        payload,
-                        self.max_output_bytes,
-                        self.binary_body,
-                    ));
+                    let mut done =
+                        parse_done(self.phase, payload, self.max_output_bytes, self.binary_body);
+                    if let Ok(mutation) = done.as_mut() {
+                        if let Some(headers) = mutation.headers.take() {
+                            mutation.headers =
+                                Some(restore_joined_headers(&self.phase_headers, headers));
+                        }
+                    }
+                    self.done = Some(done);
                 }
                 None
             }
@@ -308,11 +324,7 @@ pub(crate) fn headers_object(headers: &[(String, String)]) -> Value {
     for (name, value) in headers {
         match object.get_mut(name) {
             Some(Value::String(existing)) => {
-                existing.push_str(if name.eq_ignore_ascii_case("cookie") {
-                    "; "
-                } else {
-                    ", "
-                });
+                existing.push_str(header_join_separator(name));
                 existing.push_str(value);
             }
             _ => {
@@ -321,6 +333,50 @@ pub(crate) fn headers_object(headers: &[(String, String)]) -> Value {
         }
     }
     Value::Object(object)
+}
+
+/// What [`headers_object`] puts between repeated fields of `name`.
+fn header_join_separator(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("cookie") {
+        "; "
+    } else {
+        ", "
+    }
+}
+
+/// Gives back the fields [`headers_object`] joined for a script, for the
+/// header list the script returns with `$done({headers})`. A name that
+/// `original` holds more than once, returned with exactly the joined value
+/// (the script did not change it), becomes the original fields again, in
+/// their order: several `Set-Cookie` fields cannot be joined into one
+/// (their `Expires` dates hold commas), so a script that only removes
+/// another header must not merge them. A value the script changed stays
+/// one field; names the script removed stay removed.
+pub fn restore_joined_headers(
+    original: &[(String, String)],
+    returned: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut restored = Vec::with_capacity(returned.len());
+    for (name, value) in returned {
+        let mut fields = original.iter().filter(|(field, _)| *field == name);
+        let first = fields.next();
+        let joined = first.and_then(|(_, first)| {
+            let mut joined = first.clone();
+            let mut repeated = false;
+            for (_, next) in fields {
+                repeated = true;
+                joined.push_str(header_join_separator(&name));
+                joined.push_str(next);
+            }
+            repeated.then_some(joined)
+        });
+        if joined.as_deref() == Some(value.as_str()) {
+            restored.extend(original.iter().filter(|(field, _)| *field == name).cloned());
+        } else {
+            restored.push((name, value));
+        }
+    }
+    restored
 }
 
 fn present<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
@@ -674,6 +730,95 @@ mod tests {
         // No method is a GET.
         let request = parse_http_request(r#"{"url":"https://example.test/"}"#).unwrap();
         assert_eq!(request.method, "GET");
+    }
+
+    #[test]
+    fn unchanged_repeated_fields_come_back_as_they_were() {
+        let pairs = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let original = pairs(&[
+            ("Set-Cookie", "a=1; Path=/"),
+            ("Content-Security-Policy", "default-src 'self'"),
+            ("Set-Cookie", "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("Set-Cookie", "c=3"),
+            ("Vary", "Accept"),
+        ]);
+        let object = headers_object(&original);
+        // The script deletes one header and hands the rest back unchanged.
+        let mut returned = parse_headers(&object).unwrap();
+        returned.retain(|(name, _)| name != "Content-Security-Policy");
+        let restored = restore_joined_headers(&original, returned);
+        let cookies = restored
+            .iter()
+            .filter(|(name, _)| name == "Set-Cookie")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cookies,
+            [
+                "a=1; Path=/",
+                "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
+                "c=3"
+            ]
+        );
+        assert!(restored.contains(&("Vary".to_string(), "Accept".to_string())));
+        assert!(!restored
+            .iter()
+            .any(|(name, _)| name == "Content-Security-Policy"));
+
+        // A changed value stays one field; a removed name stays removed.
+        let restored = restore_joined_headers(
+            &original,
+            pairs(&[("Set-Cookie", "only=1"), ("Vary", "Accept")]),
+        );
+        assert_eq!(
+            restored,
+            pairs(&[("Set-Cookie", "only=1"), ("Vary", "Accept")])
+        );
+        let restored = restore_joined_headers(&original, pairs(&[("Vary", "Accept")]));
+        assert_eq!(restored, pairs(&[("Vary", "Accept")]));
+    }
+
+    #[test]
+    fn done_headers_keep_unchanged_set_cookie_fields() {
+        let store: Arc<dyn ScriptStore> = Arc::new(crate::MemoryScriptStore::new());
+        let invocation = ScriptInvocation {
+            phase: ScriptPhase::Response,
+            script_name: "test".to_string(),
+            argument: String::new(),
+            request: crate::ScriptRequest {
+                url: "https://example.test/".to_string(),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                body: None,
+            },
+            response: Some(ScriptResponse {
+                status: 200,
+                headers: vec![
+                    ("Set-Cookie".to_string(), "a=1".to_string()),
+                    ("Set-Cookie".to_string(), "b=2".to_string()),
+                ],
+                body: None,
+            }),
+            binary_body: false,
+            body_is_bytes: false,
+            event: None,
+            rule: None,
+        };
+        let mut host = ScriptHost::new(&invocation, &ScriptLimits::default(), store);
+        host.call("done", r#"{"headers":{"Set-Cookie":"a=1, b=2","X":"1"}}"#);
+        let mutation = host.take_results().done.unwrap().unwrap();
+        assert_eq!(
+            mutation.headers.unwrap(),
+            vec![
+                ("Set-Cookie".to_string(), "a=1".to_string()),
+                ("Set-Cookie".to_string(), "b=2".to_string()),
+                ("X".to_string(), "1".to_string()),
+            ]
+        );
     }
 
     #[test]

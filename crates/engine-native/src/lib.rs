@@ -1074,7 +1074,7 @@ impl NativeNodeScriptExecutor {
         };
         let headers = match result.headers {
             Some(headers) => match script_headers_from_map(headers) {
-                Some(headers) => Some(headers),
+                Some(headers) => Some(restore_joined_script_headers(&message.headers, headers)),
                 None => {
                     return script_execution_failed(
                         "native HTTP script runtime returned invalid headers",
@@ -1584,6 +1584,26 @@ fn script_headers_to_map(headers: &[MetadataEntry]) -> BTreeMap<String, String> 
         }
     }
     values
+}
+
+/// The fields [`script_headers_to_map`] joined, given back where the
+/// script returned them unchanged (see
+/// [`script_runtime::restore_joined_headers`]), so several `Set-Cookie`
+/// fields are not merged into one.
+fn restore_joined_script_headers(
+    original: &[MetadataEntry],
+    returned: Vec<MetadataEntry>,
+) -> Vec<MetadataEntry> {
+    let pairs = |entries: Vec<MetadataEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect::<Vec<_>>()
+    };
+    script_runtime::restore_joined_headers(&pairs(original.to_vec()), pairs(returned))
+        .into_iter()
+        .map(|(key, value)| MetadataEntry { key, value })
+        .collect()
 }
 
 fn script_headers_from_map(headers: BTreeMap<String, String>) -> Option<Vec<MetadataEntry>> {

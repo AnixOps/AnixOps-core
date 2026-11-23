@@ -1,0 +1,25 @@
+{
+  "invocation": {
+    "phase": "request",
+    "request": {
+      "url": "https://api.example.test/",
+      "method": "GET",
+      "headers": [
+        ["cookie", "a=1"],
+        ["accept", "*/*"],
+        ["cookie", "b=2"]
+      ]
+    }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": {
+      "headers": [
+        ["cookie", "a=1"],
+        ["cookie", "b=2"],
+        ["accept", "*/*"],
+        ["X-Cookie-Seen", "a=1; b=2"]
+      ]
+    }
+  }
+}
