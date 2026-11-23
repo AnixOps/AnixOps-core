@@ -447,15 +447,18 @@ mod tests {
         other[0] ^= 0x80;
 
         let pinned = check(true, &[leaf], &[], &certs.root);
-        assert_eq!(verify(&pinned, &[certs.leaf.clone()]), None);
-        assert_eq!(verify(&pinned, &[certs.self_signed.clone()]), PIN_MISMATCH);
+        assert_eq!(verify(&pinned, std::slice::from_ref(&certs.leaf)), None);
+        assert_eq!(
+            verify(&pinned, std::slice::from_ref(&certs.self_signed)),
+            PIN_MISMATCH
+        );
         // One of several pins is enough.
         let several = check(true, &[other, leaf], &[], &certs.root);
-        assert_eq!(verify(&several, &[certs.leaf.clone()]), None);
+        assert_eq!(verify(&several, std::slice::from_ref(&certs.leaf)), None);
         assert_eq!(
             verify(
                 &check(true, &[other], &[], &certs.root),
-                &[certs.leaf.clone()]
+                std::slice::from_ref(&certs.leaf)
             ),
             PIN_MISMATCH
         );
@@ -481,15 +484,27 @@ mod tests {
         other[31] ^= 1;
 
         let pinned = check(true, &[], &[public_key], &certs.root);
-        assert_eq!(verify(&pinned, &[certs.leaf.clone()]), None);
-        assert_eq!(verify(&pinned, &[certs.self_signed.clone()]), PIN_MISMATCH);
+        assert_eq!(verify(&pinned, std::slice::from_ref(&certs.leaf)), None);
+        assert_eq!(
+            verify(&pinned, std::slice::from_ref(&certs.self_signed)),
+            PIN_MISMATCH
+        );
         // The certificate's digest is not its key's.
         let swapped = check(true, &[], &[sha256(&certs.leaf)], &certs.root);
-        assert_eq!(verify(&swapped, &[certs.leaf.clone()]), PIN_MISMATCH);
+        assert_eq!(
+            verify(&swapped, std::slice::from_ref(&certs.leaf)),
+            PIN_MISMATCH
+        );
         // Either list can match.
         let both = check(true, &[sha256(&certs.self_signed)], &[other], &certs.root);
-        assert_eq!(verify(&both, &[certs.self_signed.clone()]), None);
-        assert_eq!(verify(&both, &[certs.leaf.clone()]), PIN_MISMATCH);
+        assert_eq!(
+            verify(&both, std::slice::from_ref(&certs.self_signed)),
+            None
+        );
+        assert_eq!(
+            verify(&both, std::slice::from_ref(&certs.leaf)),
+            PIN_MISMATCH
+        );
         // A leaf that does not parse fails instead of matching nothing quietly.
         let garbage = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
         assert!(verify(&pinned, &[garbage]).is_some());
@@ -499,8 +514,11 @@ mod tests {
     fn insecure_without_pins_accepts_any_certificate() {
         let certs = certificates();
         let unverified = check(true, &[], &[], &certs.root);
-        assert_eq!(verify(&unverified, &[certs.self_signed.clone()]), None);
-        assert_eq!(verify(&unverified, &[certs.leaf.clone()]), None);
+        assert_eq!(
+            verify(&unverified, std::slice::from_ref(&certs.self_signed)),
+            None
+        );
+        assert_eq!(verify(&unverified, std::slice::from_ref(&certs.leaf)), None);
     }
 
     #[test]
@@ -511,29 +529,29 @@ mod tests {
         other[7] ^= 1;
 
         let verified = check(false, &[], &[], &certs.root);
-        assert_eq!(verify(&verified, &[certs.leaf.clone()]), None);
+        assert_eq!(verify(&verified, std::slice::from_ref(&certs.leaf)), None);
         assert_eq!(
-            verify(&verified, &[certs.self_signed.clone()]),
+            verify(&verified, std::slice::from_ref(&certs.self_signed)),
             Some(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer
             ))
         );
 
         let pinned = check(false, &[leaf], &[], &certs.root);
-        assert_eq!(verify(&pinned, &[certs.leaf.clone()]), None);
+        assert_eq!(verify(&pinned, std::slice::from_ref(&certs.leaf)), None);
         let public_key = check(false, &[], &[sha256(&certs.leaf_public_key)], &certs.root);
-        assert_eq!(verify(&public_key, &[certs.leaf.clone()]), None);
+        assert_eq!(verify(&public_key, std::slice::from_ref(&certs.leaf)), None);
         assert_eq!(
             verify(
                 &check(false, &[other], &[], &certs.root),
-                &[certs.leaf.clone()]
+                std::slice::from_ref(&certs.leaf)
             ),
             PIN_MISMATCH
         );
         // A pinned certificate still has to be trusted without `insecure`.
         let self_signed = check(false, &[sha256(&certs.self_signed)], &[], &certs.root);
         assert_eq!(
-            verify(&self_signed, &[certs.self_signed.clone()]),
+            verify(&self_signed, std::slice::from_ref(&certs.self_signed)),
             Some(rustls::Error::InvalidCertificate(
                 CertificateError::UnknownIssuer
             ))
