@@ -133,7 +133,8 @@ pub fn find_node<'a>(nodes: &'a [NodeDescriptor], id: &str) -> Option<&'a NodeDe
 /// did, under [`NODE_METADATA_LEGACY_ID`].
 ///
 /// Runs before `via` names are turned into node ids, since that step reads
-/// the final ids.
+/// the final ids. Meant to run once, on the readers' provisional ids; a node
+/// that already records a previous id keeps that entry.
 pub(crate) fn assign_subscription_node_ids(nodes: &mut [NodeDescriptor]) {
     let legacy = legacy_ids(nodes);
     let endpoints = endpoint_hashes(nodes);
@@ -193,6 +194,10 @@ pub(crate) fn assign_subscription_node_ids(nodes: &mut [NodeDescriptor]) {
     }
 
     for ((node, id), legacy) in nodes.iter_mut().zip(ids).zip(legacy) {
+        // A node that already records its previous id keeps it: its current
+        // id is no longer the reader's provisional one, so recomputing would
+        // record the stable id instead.
+        let legacy = legacy_node_id(node).map(str::to_string).unwrap_or(legacy);
         node.metadata
             .retain(|entry| entry.key != NODE_METADATA_LEGACY_ID);
         node.metadata.push(MetadataEntry {
@@ -447,12 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn reassigning_keeps_one_legacy_entry() {
+    fn reassigning_keeps_the_original_legacy_entry() {
         let mut nodes = vec![shadowsocks("clash-ss-hk", "HK", "hk-secret")];
         assign_subscription_node_ids(&mut nodes);
         let id = nodes[0].id.clone();
         assign_subscription_node_ids(&mut nodes);
         assert_eq!(nodes[0].id, id);
+        assert_eq!(legacy_node_id(&nodes[0]), Some("clash-ss-hk"));
         assert_eq!(
             nodes[0]
                 .metadata

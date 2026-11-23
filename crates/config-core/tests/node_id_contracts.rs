@@ -5,7 +5,8 @@
 use base64::Engine as _;
 use config_core::{node_id, CoreSubscriptionService};
 use control_domain::{
-    NodeDescriptor, RawSubscription, SubscriptionDocument, SubscriptionService, NODE_METADATA_VIA,
+    NodeDescriptor, RawSubscription, SubscriptionDocument, SubscriptionService,
+    NODE_METADATA_LEGACY_ID, NODE_METADATA_VIA,
 };
 
 /// One Shadowsocks entry: name, server, password.
@@ -271,14 +272,26 @@ fn previous_ids_are_kept_for_migrating_saved_selections() {
 fn current_ids_win_over_previous_ones() {
     let mut nodes: Vec<NodeDescriptor> =
         parse(&clash(&[("HK", "hk.example.test", "hk-secret")])).nodes;
+    assert_eq!(node_id::legacy_node_id(&nodes[0]), Some("clash-ss-hk"));
     let mut other = nodes[0].clone();
     other.name = "Other".to_string();
-    other.id = node_id::legacy_node_id(&nodes[0]).unwrap().to_string();
-    nodes.insert(0, other);
-    // `nodes[1]` still carries that id as its previous one; the node whose
-    // current id it is wins.
+    other.id = "clash-ss-hk".to_string();
+    other
+        .metadata
+        .retain(|entry| entry.key != NODE_METADATA_LEGACY_ID);
+    assert_ne!(other.id, nodes[0].id);
+    // "HK" comes first and has "clash-ss-hk" as its previous id; "Other",
+    // second, has it as its current id. Looking up previous ids first would
+    // return "HK"; the current id must win.
+    nodes.push(other);
     let found = node_id::find_node(&nodes, "clash-ss-hk").unwrap();
     assert_eq!(found.name, "Other");
+    // HK is still found by its own current id.
+    let hk_id = nodes[0].id.clone();
+    assert_eq!(
+        node_id::find_node(&nodes, &hk_id).map(|node| node.name.as_str()),
+        Some("HK")
+    );
 }
 
 #[test]

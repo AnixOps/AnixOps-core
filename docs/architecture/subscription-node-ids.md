@@ -27,9 +27,15 @@
 性质：
 
 - 名字和位置不参与，所以重排、插入、删除、改名都不改变其他节点的 id；同名的不同节点 id 不同。
-- 同一台服务器从任一格式导入得到相同的 id。
+- 同一台 Shadowsocks 服务器从任一格式导入得到相同的 id（合同测试覆盖）。带 TLS 的协议（Trojan、VLESS、VMess 等）不保证跨格式相同：各读取器填 `tls.server_name` 的方式不同，分享链接和 sing-box 在没写 SNI 时回落到主机名，其他格式可能留空，于是端点哈希不同。同一订阅刷新前后格式不变，稳定性不受影响。
 - 单独占一个主机和端口的节点，机场轮换密码或 UUID 后 id 不变；更换服务器地址、端口、传输或 SNI 会得到新 id，客户端按“节点已不在订阅中”处理。
 - id 只含 `[a-z0-9-]`，长度不超过约 80 个字符，满足引擎出站 id 规则（1–128 个 `[A-Za-z0-9._-]`），并给 iOS 联动组的 `s{序号}.` 前缀留了余量。
+
+已知限制：
+
+- REALITY 公钥与 short id、VLESS `flow`、Hysteria2 端口跳跃范围（`server_ports`）不参与端点哈希，也不算凭据。同一主机和端口上只在这些字段上不同的条目会落到重复后缀，编号按出现顺序给出，又会依赖位置。这种订阅很少见；若要纳入，需要连同 `id_format_is_pinned` 一起设计迁移。
+- id 不再带格式或名字前缀，同一台服务器出现在两份订阅里会得到同一个 id。control-runtime 的 `runtime.subscription.node_id_duplicate` 检查会拒绝这样的组合；客户端目前给其他来源的 id 加前缀，实际影响小，合并多份订阅时仍需自行加前缀。
+- `assign_subscription_node_ids` 只应在读取器给出临时 id 后运行一次；已经带 `subscription.legacy_id` 的节点保留原有旧 id，不会被稳定 id 覆盖。
 
 ### 为什么凭据只在需要时参与
 
@@ -42,7 +48,7 @@
 每个订阅节点在元数据 `subscription.legacy_id`（`control_domain::NODE_METADATA_LEGACY_ID`）里带着按旧规则算出的 id；node-import 的 `ImportedNode.legacy_id` 把它交给客户端。
 
 - `config_core::node_id::find_node(nodes, id)`：先按当前 id 找，找不到再按旧 id 找。
-- `engine_embedded::nodes::single_node_envelope` 已改用它，返回的节点带新 id，调用方应保存新 id。
+- `engine_embedded::nodes::single_node_envelope` 已改用它，返回的节点带新 id，调用方应保存新 id。它对任何内容都会回落到旧 id，包括刷新后的内容；刷新后调用方须先自行确认保存的 id 是否是当前 id，只经旧 id 匹配到的结果只能当作猜测。
 
 旧 id 本身依赖位置，所以**只有对生成旧 id 时的同一份订阅内容**按旧 id 查找才准确。客户端应在升级后第一次加载**本地已保存的订阅内容**时（刷新之前）把保存的旧 id 换成新 id 并写回；刷新后的新内容不要再用旧 id 查找，查不到就按“节点已不在订阅中”处理。旧 id 查找保留一个版本（1.0.x），之后移除。
 

@@ -30,13 +30,19 @@ pub fn outbound_for_node(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     Ok(outbound)
 }
 
-/// Envelope with one outbound for the selected node, and that node. The
-/// selection is looked up by node id, or by the id the node had before
-/// stable node ids ([`config_core::node_id::find_node`]); callers should save
-/// the returned node's id. Without a
-/// selection it uses the first node this build can run, so one unsupported
-/// node at the top of a subscription does not stop the rest from running; if
-/// none can run, the first node's reason is returned.
+/// Envelope with one outbound for the selected node, and that node.
+///
+/// The selection is looked up by node id, or else by the id the node had
+/// before stable node ids ([`config_core::node_id::find_node`]); callers
+/// should save the returned node's id. The previous id is only reliable for
+/// the subscription content it was assigned from, so after a subscription
+/// refresh a caller migrating saved selections should first check whether
+/// the saved id is a current id of the refreshed nodes, and treat a match
+/// found only through a previous id as a best-effort guess.
+///
+/// Without a selection it uses the first node this build can run, so one
+/// unsupported node at the top of a subscription does not stop the rest
+/// from running; if none can run, the first node's reason is returned.
 pub fn single_node_envelope(
     profile_id: &str,
     nodes: &[NodeDescriptor],
