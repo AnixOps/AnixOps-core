@@ -79,6 +79,7 @@
 ## Windows
 
 - [Windows CLI Artifact Source Release Contract](architecture/windows-cli-artifact-source-release-contract.md)
+- [Windows Platform Integration](architecture/windows-platform-integration.md)：托管文件、登录任务、系统代理与 TUN DNS 的写入规则
 
 ## iOS/macOS 运行时
 

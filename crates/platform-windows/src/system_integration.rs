@@ -156,6 +156,79 @@ fn owned_startup_task_names(csv: &str) -> Vec<String> {
     names
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+/// `schtasks /Query /XML` output as text: UTF-16 (with or without a byte
+/// order mark) or UTF-8, whichever it is.
+fn decode_task_xml(bytes: &[u8]) -> String {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || (bytes.len() >= 2 && bytes[1] == 0);
+    if utf16 {
+        let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes))
+            .into_owned()
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Every text value of `<tag>...</tag>` in `xml`, unescaped and trimmed.
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else {
+            break;
+        };
+        values.push(xml_unescape(after[..end].trim()));
+        rest = &after[end + close.len()..];
+    }
+    values
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Whether a registered logon task (its exported XML) still is the one
+/// [`startup_task_xml`] defined: one action that runs `executable` with
+/// `--start-after-login`, as the user's interactive token at the highest
+/// available level, and no principal that is SYSTEM, a service account or a
+/// group.
+fn startup_task_matches(xml: &str, executable: &str) -> bool {
+    let commands = xml_values(xml, "Command");
+    let privileged = |user: &String| {
+        let user = user.to_ascii_uppercase();
+        matches!(user.as_str(), "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
+            || user.ends_with("SYSTEM")
+            || user.ends_with("LOCAL SERVICE")
+            || user.ends_with("NETWORK SERVICE")
+    };
+    commands.len() == 1
+        && commands[0]
+            .trim_matches('"')
+            .eq_ignore_ascii_case(executable)
+        && xml.matches("<Exec>").count() == 1
+        && xml_values(xml, "Arguments") == ["--start-after-login"]
+        && xml_values(xml, "RunLevel") == ["HighestAvailable"]
+        && xml_values(xml, "LogonType") == ["InteractiveToken"]
+        && !xml_values(xml, "UserId").iter().any(privileged)
+        && xml_values(xml, "GroupId").is_empty()
+}
+
 #[cfg(test)]
 mod startup_task_tests {
     use super::*;
@@ -171,6 +244,47 @@ mod startup_task_tests {
             2
         );
         assert!(xml.contains("<Arguments>--start-after-login</Arguments>"));
+    }
+
+    #[test]
+    fn registered_task_must_match_the_definition() {
+        let executable = r"C:\Program Files\AnixOps Net\anixops-net.exe";
+        let xml = startup_task_xml("S-1-5-21-1-2-3-1001", executable);
+        assert!(startup_task_matches(&xml, executable));
+        // Read back as schtasks prints it: UTF-16 with a byte order mark,
+        // or plain UTF-8.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in xml.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert!(startup_task_matches(&decode_task_xml(&utf16), executable));
+        assert!(startup_task_matches(
+            &decode_task_xml(xml.as_bytes()),
+            executable
+        ));
+
+        let other = r"C:\Users\Public\evil.exe";
+        assert!(!startup_task_matches(
+            &xml.replace(executable, other),
+            executable
+        ));
+        assert!(!startup_task_matches(
+            &xml.replace("S-1-5-21-1-2-3-1001", "S-1-5-18"),
+            executable
+        ));
+        assert!(!startup_task_matches(
+            &xml.replace("InteractiveToken", "ServiceAccount"),
+            executable
+        ));
+        assert!(!startup_task_matches(
+            &xml.replace("--start-after-login", "--evil"),
+            executable
+        ));
+        let second_action = xml.replace(
+            "</Exec>",
+            "</Exec>\n    <Exec><Command>C:\\evil.exe</Command></Exec>",
+        );
+        assert!(!startup_task_matches(&second_action, executable));
     }
 
     #[test]
@@ -788,17 +902,48 @@ mod native {
     /// and Windows silently skips such programs in the Run key, so the logon
     /// task replaces the legacy Run entry (which is removed when owned).
     pub fn enable_current_user_startup(executable: &Path) -> DomainResult<()> {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+
         let command = startup_task_command_path(executable)?;
         let sid = current_user_sid()?;
         let xml = startup_task_xml(&sid, &command);
-        let xml_path =
-            std::env::temp_dir().join(format!("anixops-net-startup-{}.xml", std::process::id()));
         let mut bytes = vec![0xFF, 0xFE];
         for unit in xml.encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
-        fs::write(&xml_path, bytes)
-            .map_err(|_| startup_error("the startup task definition could not be written"))?;
+        // The definition runs elevated at every logon, so it is written
+        // where only SYSTEM and Administrators can write (never the user's
+        // %TEMP%, which every process of the user can change), under a
+        // random name created exclusively, and held open without write
+        // sharing until schtasks has read it.
+        let (xml_path, mut file) = crate::managed_files::create_managed_temporary_file(
+            &startup_task_directory(),
+            "startup-task",
+            "xml",
+        )
+        .map_err(|_| startup_error("the startup task definition could not be created"))?;
+        let written = file.write_all(&bytes).and_then(|_| file.sync_all());
+        drop(file);
+        let held = written.and_then(|_| {
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&xml_path)
+        });
+        let held = match held {
+            Ok(held) => held,
+            Err(_) => {
+                let _ = fs::remove_file(&xml_path);
+                return Err(startup_error(
+                    "the startup task definition could not be written",
+                ));
+            }
+        };
         let name = startup_task_name(&sid);
         let created = run_schtasks(&[
             OsStr::new("/Create"),
@@ -808,9 +953,37 @@ mod native {
             xml_path.as_os_str(),
             OsStr::new("/F"),
         ]);
+        drop(held);
         let _ = fs::remove_file(&xml_path);
         created?;
+        // Read the registered task back: it must run this executable, as
+        // the signed-in user's interactive token, and nothing else.
+        let registered = schtasks_output(&[
+            OsStr::new("/Query"),
+            OsStr::new("/TN"),
+            OsStr::new(&name),
+            OsStr::new("/XML"),
+        ]);
+        let verified = registered
+            .as_ref()
+            .is_ok_and(|output| startup_task_matches(&decode_task_xml(output), &command));
+        if !verified {
+            let _ = run_schtasks(&[
+                OsStr::new("/Delete"),
+                OsStr::new("/TN"),
+                OsStr::new(&name),
+                OsStr::new("/F"),
+            ]);
+            return Err(startup_error(
+                "the registered startup task did not match its definition and was removed",
+            ));
+        }
         remove_owned_legacy_run_entry(executable)
+    }
+
+    /// Protected folder for the logon task definition while schtasks reads it.
+    fn startup_task_directory() -> PathBuf {
+        crate::managed::windows_managed_data_directory().join("tmp")
     }
 
     pub fn disable_current_user_startup(executable: &Path) -> DomainResult<()> {

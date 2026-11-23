@@ -1,10 +1,10 @@
 use platform_windows::managed::{
-    read_managed_config, WindowsDriverPackageConfig, WindowsManagedConfig,
-    WindowsManagedEmbeddedConfig, WindowsManagedNativeMitmConfig,
-    WindowsManagedNativeMitmScriptRuntimeConfig, WindowsManagedState, WindowsProxySettings,
-    WindowsProxySnapshot, WindowsSystemProxyOwner, WINDOWS_MANAGED_CONFIG_INVALID_CODE,
-    WINDOWS_MANAGED_CONFIG_SCHEMA_VERSION, WINDOWS_MANAGED_EMBEDDED_CONFIG_INVALID_CODE,
-    WINDOWS_MANAGED_STATE_SCHEMA_VERSION,
+    read_managed_config, validate_managed_file_references, windows_managed_data_directory,
+    WindowsDriverPackageConfig, WindowsManagedConfig, WindowsManagedEmbeddedConfig,
+    WindowsManagedNativeMitmConfig, WindowsManagedNativeMitmScriptRuntimeConfig,
+    WindowsManagedState, WindowsProxySettings, WindowsProxySnapshot, WindowsSystemProxyOwner,
+    WINDOWS_MANAGED_CONFIG_INVALID_CODE, WINDOWS_MANAGED_CONFIG_SCHEMA_VERSION,
+    WINDOWS_MANAGED_EMBEDDED_CONFIG_INVALID_CODE, WINDOWS_MANAGED_STATE_SCHEMA_VERSION,
 };
 use platform_windows::system_integration::{WindowsServiceState, NETWORKCORE_WINDOWS_SERVICE_NAME};
 use std::collections::BTreeMap;
@@ -264,4 +264,45 @@ fn windows_service_contract_uses_stable_scm_identity() {
         serde_json::to_string(&WindowsServiceState::Running).expect("service state serializes"),
         "\"running\""
     );
+}
+
+#[test]
+fn managed_configuration_may_only_name_files_in_the_managed_directory() {
+    let inside = windows_managed_data_directory()
+        .join("embedded")
+        .join("envelope.json");
+    let mut config = WindowsManagedConfig {
+        schema_version: WINDOWS_MANAGED_CONFIG_SCHEMA_VERSION,
+        system_proxy: None,
+        system_proxy_owner: WindowsSystemProxyOwner::Desktop,
+        root_certificate_path: None,
+        driver_package: None,
+        native_mitm: None,
+        embedded: Some(WindowsManagedEmbeddedConfig {
+            enabled: true,
+            envelope_path: inside,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 7890,
+        }),
+    };
+    validate_managed_file_references(&config).expect("an envelope in the managed directory");
+    for outside in [
+        std::env::temp_dir().join("envelope.json"),
+        windows_managed_data_directory()
+            .join("..")
+            .join("..")
+            .join("Users")
+            .join("envelope.json"),
+    ] {
+        config.embedded.as_mut().unwrap().envelope_path = outside;
+        assert_eq!(
+            validate_managed_file_references(&config)
+                .expect_err("an envelope elsewhere is refused")
+                .code,
+            WINDOWS_MANAGED_CONFIG_INVALID_CODE
+        );
+    }
+    // A disabled engine names nothing that is loaded.
+    config.embedded.as_mut().unwrap().enabled = false;
+    validate_managed_file_references(&config).expect("disabled engine");
 }
