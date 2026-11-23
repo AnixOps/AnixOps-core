@@ -499,7 +499,7 @@ fn shadowsocks(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         .ok_or("shadowsocks password is missing")?;
     // Without its plugin the server would only see bytes it drops.
     if metadata(node, NODE_METADATA_SHADOWSOCKS_PLUGIN).is_some() {
-        return Err("shadowsocks plugins (obfs, v2ray-plugin, shadow-tls) are not implemented yet");
+        return Err("shadowsocks plugins (obfs, websocket, shadow-tls) are not implemented yet");
     }
     if !matches!(
         method,

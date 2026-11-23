@@ -1554,7 +1554,7 @@ trojan=b.example.test:443, password=trojan-secret, over-tls=true, tag=QX Trojan
 #[test]
 fn shadowsocks_nodes_with_plugins_are_unsupported_in_every_format() {
     const REASON: &str =
-        "shadowsocks plugins (obfs, v2ray-plugin, shadow-tls) are not implemented yet";
+        "shadowsocks plugins (obfs, websocket, shadow-tls) are not implemented yet";
     let check = |text: &str, unsupported: &[&str], runnable: &[&str]| {
         let report = import_text(text).unwrap_or_else(|_| panic!("{text}"));
         let names: Vec<_> = report

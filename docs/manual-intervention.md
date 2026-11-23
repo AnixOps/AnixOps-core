@@ -376,6 +376,16 @@ run URL 和状态，以 `task_state: pending_ci`、`next_action: resume_after_ci
 
 如果 GitHub CLI 不可用，可在 GitHub 网页端进入 `Actions`，选择 `CI`，手动触发 `workflow_dispatch`。
 
+## 客户端跟进：订阅导入保留 TLS/传输层参数（fix/k2-import-tls-fields）
+
+客户端按 git rev 固定内核，以下事项需在 AnixOps/anixops-net 的客户端 PR 中完成，内核无法代做：
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- Windows/Linux Tauri 应用（`apps/windows-gui/src/gui/tauri_ui.rs` 选单节点处）：按 `profile_node_id` 过滤已保存选择时同时要求 `outbound_for_node(node).is_ok()`，已保存的节点现在变为不支持时回落到 `single_node_envelope(.., None)`（内核已改为取第一个可运行节点），而不是整份配置失败。
+- iOS：`TunnelNodeImport.swift` 保留更具体的 `unsupportedPlugin` 提示。
+- 发布说明提示用户刷新订阅或重新导入：已保存的出站是旧导入结果，不会自动更新。
+- Surge `sni=off` 目前仍按服务器名发送 SNI（读取器文档注释已说明），是否改为报不支持待定。
+
 ## 后续预计人工事项
 
 iOS/macOS（Apple Developer、App Store Connect、TestFlight、App Review）与 Windows 代码签名相关的人工事项随客户端在 AnixOps/anixops-net 跟踪。

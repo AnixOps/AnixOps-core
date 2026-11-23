@@ -461,6 +461,44 @@ fn unsupported_nodes_are_reported_without_secrets() {
     }
 }
 
+fn ss_with_plugin() -> NodeDescriptor {
+    node(
+        "ss-obfs",
+        Protocol::Shadowsocks,
+        &[
+            ("shadowsocks.method", "chacha20-ietf-poly1305"),
+            ("shadowsocks.password", "plain-password"),
+            ("shadowsocks.plugin", "obfs-local"),
+        ],
+    )
+}
+
+/// Without a selection the first node this build can run is used, so an
+/// unsupported node at the top of a subscription does not fail the profile.
+#[test]
+fn unselected_envelope_skips_nodes_that_cannot_run() {
+    let unsupported = ss_with_plugin();
+    let reason = outbound_for_node(&unsupported).unwrap_err();
+
+    let (envelope, chosen) =
+        single_node_envelope("p", &[unsupported.clone(), trojan()], None).unwrap();
+    assert_eq!(chosen.id, "trojan");
+    assert_eq!(builds(&envelope), "trojan");
+
+    // When nothing can run, the first node's reason is reported.
+    assert_eq!(
+        single_node_envelope("p", std::slice::from_ref(&unsupported), None).unwrap_err(),
+        reason
+    );
+    assert!(single_node_envelope("p", &[], None).is_err());
+
+    // An explicit selection is honoured even when it cannot run.
+    assert_eq!(
+        single_node_envelope("p", &[unsupported, trojan()], Some("ss-obfs")).unwrap_err(),
+        reason
+    );
+}
+
 #[test]
 fn selected_node_and_routing_envelopes() {
     let nodes = [ss2022(), vless_reality(), trojan()];
