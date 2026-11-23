@@ -454,6 +454,8 @@ impl MitmEngine {
                 status_code: None,
                 headers: to_metadata(&request_headers),
                 body: body_for_plan,
+                request_headers: Vec::new(),
+                request_body: None,
             })
             .await?;
 
