@@ -114,6 +114,14 @@
 
 ### Fixed
 
+- HTTPS 解密的脚本与拒绝应答（script-runtime、engine-native、engine-embedded、mitm-policy，mitm-scripts-04/08/09/13/15/16）：
+  - `reject-dict`、`reject-array`、`reject-img`（`reject-tinygif`）、`reject-video` 此前与 `reject` 一样只回空正文，依赖 `{}` / `[]` / 图片解码的应用解析失败或反复重试。现在分别回 `200` 的 `application/json; charset=utf-8` `{}` / `[]`、1x1 `image/gif` 与空的 `video/mp4`（`HttpMitmAction::Respond`）；`reject`、`reject-200`、`reject-<状态码>` 仍无正文。`MitmPolicyRewriteResult` 新增 `reject_body`（`MitmPolicyRejectBody`），kind 仍为 `Reject`。HTTP/1 本地应答遇到 HEAD 时保留 Content-Length、不写正文。
+  - `http-response` 脚本此前看不到对应请求：`$request.headers` 是响应头、`$request.body` 为空。`NativePlainHttpMessage` 新增 `request_headers`、`request_body`，HTTP/1 与 HTTP/2 数据面在响应阶段带上已发送的请求头与（已缓冲时的）请求正文，QuickJS 与 Node 执行器据此构造 `$request`。HTTP/2 按 RFC 9113 §8.2.3 拆开的多条 `cookie` 字段，交给脚本与规则时按 `; ` 合并为一条，转发到源站时再拆开。
+  - Quantumult X 正文脚本在文本模式下同时提供 `body` 与 `bodyBytes`（惰性、不可枚举），`$done({bodyBytes})` 在文本模式下生效；非 UTF-8 正文在脚本读 `bodyBytes` 时以字节传入。
+  - `$httpClient` / `$task.fetch` 跟随重定向（最多 5 跳，共用一次超时；303 与 POST 的 301/302 改为 GET；`Authorization`、`Cookie` 与脚本设置的 `Host` 只发往同源），`auto-redirect: false` / `opts.redirection: false` 关闭；支持 `binary-mode` 应答与 `bodyBytes` 字节请求体。
+  - 持久化存储（`$persistentStore` / `$prefs`）文件损坏时不再让脚本执行器无法启动：原文件改名为 `.corrupt` 备份、以空存储继续（`ScriptStoreRecovery` 回报，`persistent_store_recovery()` 可读）；写入先写临时文件并 `fsync`，再替换原文件（Windows 上对共享冲突重试），内容未变不写盘。
+  - 测试：mitm-policy 拒绝变体契约（含 Loon、Quantumult X、Surge 与 `[Rule]` 写法），engine-embedded 端到端 GET / HEAD 与响应脚本读取请求头、HTTP/2 Cookie 合并，engine-native QuickJS 响应脚本读请求、存储隔离，script-runtime 一致性用例（重定向、binary-mode、`bodyBytes` 双视图、存储损坏）。
+- HTTPS 解密不再为每个主机或每条消息重新编译整份策略（mitm-policy、engine-embedded，mitm-scripts-07/11）：此前每个新的 TLS/QUIC 主机在连接路径上都要新建引擎并加载整份合并策略（上限 8 MiB，编译全部正则），iOS/Android 单线程隧道在此期间停顿；判定缓存满 512 条整表清空；Map Local 与 header-block 每个请求重新扫描策略并新建引擎，引擎池只留 2 个空闲引擎。现在策略按修订（长度与文本哈希）编译一次：主机名判定为最近 2 个修订各保留一个引擎，Map Local、header-block 的匹配与改写引擎和 jq 规则按最近 4 个修订缓存，引擎池空闲上限 4 且优先丢弃已替换策略的引擎；判定缓存改为两代，满时只丢较旧一代。判定与规划结果不变（对照测试 `tests/policy_cache_contracts.rs`）。
 - HTTPS 解密的改写计划不再失效或误用（mitm-anixops-sys、mitm-policy、engine-native、engine-embedded，mitm-scripts-02/03/05/06/12/14）：
   - Rust 的 `AnixOpsRewriteAction` 缺少 C 的 `ANIXOPS_REWRITE_URL_REWRITE_200 = 28`，`<pattern> <url> 200` 规则命中时读到未声明的枚举值（未定义行为）。现补齐该值，按“不改写、照常放行”处理；插件导入时 `200` 改写行评为不支持并注释掉，不再让内核在它处停止查找而遮住同一 URL 后面的拒绝或重定向；新增单元测试解析 C header，任一 enum 或缓冲区容量与 Rust 不一致即失败。
   - `header-replace-regex` 在生产路径上写入未展开的替换模板（计划构建时传入空的 header 值）。现在逐个 header 值按规则顺序求值，只替换命中的值（多个 `Set-Cookie` 只改命中的那个）；值超出内核容量时保持原值并给出警告。
