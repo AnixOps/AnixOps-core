@@ -1996,3 +1996,68 @@ fn sip002_links_with_a_slash_and_encoded_keys_import_decoded() {
     assert_eq!(trojan.port, 443);
     assert_eq!(trojan.outbound["server_name"], "edge.example.test");
 }
+
+#[test]
+fn a_long_via_chain_behind_a_missing_node_is_dropped_in_one_pass() {
+    // Each link connects through the next; the last one through a name that
+    // is not in the list. Re-scanning the list per dropped node was cubic and
+    // froze the importer on a subscription like this.
+    const COUNT: usize = 20_000;
+    let mut text = String::new();
+    for index in 0..COUNT {
+        let via = if index + 1 == COUNT {
+            "missing".to_string()
+        } else {
+            format!("n{}", index + 1)
+        };
+        text.push_str(&format!(
+            "trojan://pw@198.51.100.20:443?security=tls&sni=land.example&via={via}#n{index}\n"
+        ));
+    }
+    let report = import_text(&text).unwrap();
+    assert!(report.nodes.is_empty());
+    assert_eq!(report.unsupported.len(), COUNT);
+    // The tail fails on its own; the rest follow in their original order.
+    let last = COUNT - 1;
+    assert_eq!(report.unsupported[0].name, format!("n{last}"));
+    assert_eq!(
+        report.unsupported[0].reason,
+        "it connects through an outbound that is not one of the imported nodes"
+    );
+    for (position, node) in report.unsupported[1..].iter().enumerate() {
+        assert_eq!(node.name, format!("n{position}"));
+        assert_eq!(node.reason, "it connects through a node that cannot run");
+    }
+}
+
+#[test]
+fn via_chains_keep_runnable_nodes_and_cycles_of_runnable_nodes() {
+    let text = "\
+trojan://pw@198.51.100.20:443?security=tls&via=B#A\n\
+trojan://pw@198.51.100.21:443?security=tls&via=A#B\n\
+trojan://pw@198.51.100.22:443?security=tls#Exit\n\
+trojan://pw@198.51.100.23:443?security=tls&via=Exit#Front\n\
+trojan://pw@198.51.100.24:443?security=tls&via=Gone#Middle\n\
+trojan://pw@198.51.100.25:443?security=tls&via=Middle#Outer\n\
+trojan://pw@198.51.100.26:443?security=tls&via=Outer#Outermost\n";
+    let report = import_text(text).unwrap();
+    let kept: Vec<_> = report.nodes.iter().map(|node| node.name.as_str()).collect();
+    // A cycle of runnable nodes is the engine's to reject, as before.
+    assert_eq!(kept, ["A", "B", "Exit", "Front"]);
+    let dropped: Vec<_> = report
+        .unsupported
+        .iter()
+        .map(|node| (node.name.as_str(), node.reason))
+        .collect();
+    assert_eq!(
+        dropped,
+        [
+            (
+                "Middle",
+                "it connects through an outbound that is not one of the imported nodes"
+            ),
+            ("Outer", "it connects through a node that cannot run"),
+            ("Outermost", "it connects through a node that cannot run"),
+        ]
+    );
+}
