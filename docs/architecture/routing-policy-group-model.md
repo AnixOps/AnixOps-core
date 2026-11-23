@@ -159,7 +159,7 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 | 策略 | 包隧道 TCP | 包隧道 UDP | 本地代理（HTTP/SOCKS5） | HTTPS 解密的主机 |
 | --- | --- | --- | --- | --- |
 | `REJECT`、`REJECT-NO-DROP` | 读完首包后关闭 | 丢弃；443 端口回 ICMP 端口不可达，QUIC 立即退回 TCP | 回 502 / SOCKS5 一般失败 | 解密后关闭 |
-| `REJECT-DROP` | 不回任何数据也不关闭，保持到应用自己关闭或 60 秒；同时保持的被拒连接最多为 `max_tcp_connections` 的 1/8，超出即关闭 | 丢弃，不回 ICMP | 不回应，保持到客户端关闭或 60 秒（进程内最多 256 条，超出按 `REJECT` 回复） | 同 `REJECT`（解密的连接不保持） |
+| `REJECT-DROP` | 不回任何数据也不关闭，保持到应用自己关闭或 60 秒；同时保持的被拒连接最多为 `max_tcp_connections` 的 1/8，超出即关闭；连接数满额时，保持超过 30 秒的被拒连接与其他空闲连接一样可被新连接替换 | 丢弃，不回 ICMP | 不回应，保持到客户端关闭或 60 秒（进程内最多 256 条，超出按 `REJECT` 回复） | 同 `REJECT`（解密的连接不保持） |
 | `REJECT-TINYGIF` | 明文 HTTP 请求回 `200`、`image/gif` 的 1x1 GIF 并关闭；其他按 `REJECT` | 同 `REJECT` | 明文 HTTP 代理请求回 GIF；CONNECT/SOCKS5 按 `REJECT` | 解密后第一个请求回 GIF 并关闭 |
 
 防重试风暴：同一主机（域名，没有域名时为地址）30 秒内被普通 `REJECT` 拒绝超过 10 次，之后的拒绝按 `REJECT-DROP` 应答，直到该主机最近 30 秒内的拒绝不超过 10 次；被升级的拒绝本身也计数，持续猛打的客户端会一直被静默。`REJECT-NO-DROP` 永不升级。计数只针对用户流量（包隧道、本地代理、解密连接的路由），DNS 服务器路由和状态查询不计。最多跟踪 1024 个主机，满时先清掉 30 秒内没有被拒的主机，再清最早被拒的。连接列表的 `outbound`/`chain` 显示实际应答（风暴中为 `REJECT-DROP`），`error` 仍为 `rejected`。

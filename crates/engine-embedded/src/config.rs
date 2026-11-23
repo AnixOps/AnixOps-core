@@ -651,13 +651,20 @@ impl DnsRuleConfig {
     }
 }
 
-/// Resource limits sized for the ~50 MB Network Extension budget.
+/// Resource limits. The connection and flow defaults depend on the
+/// platform: on iOS they stay within the ~50 MB Network Extension budget,
+/// elsewhere they are higher (see [`crate::tunnel::DEFAULT_MAX_TCP_CONNECTIONS`]
+/// and [`crate::tunnel::DEFAULT_MAX_UDP_FLOWS`]).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
+    /// TCP connections relayed at once by the tunnel, and the connection cap
+    /// of the system proxy. At the limit the connection idle longest (30 s
+    /// at least) makes room for a new one.
     #[serde(default = "default_max_tcp_connections")]
     pub max_tcp_connections: usize,
-    /// UDP flows open at once (DNS excluded).
+    /// UDP flows open at once (DNS excluded). At the limit idle flows make
+    /// room for new ones.
     #[serde(default = "default_max_udp_flows")]
     pub max_udp_flows: usize,
     #[serde(default = "default_max_dns_in_flight")]
@@ -703,7 +710,7 @@ fn default_dns_timeout_ms() -> u64 {
 }
 
 fn default_max_tcp_connections() -> usize {
-    128
+    crate::tunnel::DEFAULT_MAX_TCP_CONNECTIONS
 }
 
 fn default_max_udp_flows() -> usize {

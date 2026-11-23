@@ -23,7 +23,8 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 - 抓包门槛（I3/I4）：隧道进程打开 TUN 后，设备被移进 network namespace `capbench`，客户端（curl、raw TCP 读取）在里面跑，隧道自己的出站留在宿主。解密成功率用生产上游 TLS 客户端（webpki 根）；吞吐与内存用本地源站。`--diagnose` 额外跑最小预算和 glibc `mmap_threshold=32768` 对照，用来区分预算内数据和堆碎片，不设门槛。
 
 - 规则决策走 `RoutingModel::decide_indexed`：DOMAIN 与 DOMAIN-SUFFIX 规则用哈希表查找，其余规则按顺序尝试，结果与逐条 `decide` 完全一致（`crates/config-core/tests/rule_index_contracts.rs`）。基准里 10% 的查询不命中任何规则，是最坏情况（走完全部非域名规则、解析一次域名、落到 FINAL）。
-- UDP 流上限由配置 `limits.max_udp_flows` 决定（默认 256，iOS 内存预算不变）；测 10 万流时基准自行调高。
+- UDP 流上限由配置 `limits.max_udp_flows` 决定（默认 iOS 256，iOS 内存预算不变；Android 与桌面 4096）；测 10 万流时基准自行调高。表满时先清掉已结束的流，再一次性关闭一批（上限的 1/16）空闲至少 15 s 的流，空闲最久的先关；没有空闲流时，占用超过表 1/4 的应用套接字让出它最不活跃的流；都不行才丢弃新流，并在 250 ms 内不再扫描，所以满表时不是每个数据报都遍历全表。关闭的流计入 `udp_evicted`，丢弃计入 `udp_dropped`。
+- TCP 连接上限由 `limits.max_tcp_connections` 决定（默认 iOS 128、Android 512、桌面 1024，系统代理用同一个值）。满额时新连接关闭最久没有载荷、且空闲至少 30 s 的连接并接替它（`tcp_evicted`），只有所有连接都在活跃时才拒绝（`tcp_rejected`）。`tunnel_bench`、`capture_bench` 显式设置上限，门槛不受默认值变化影响。
 - 隧道线程：配置 `limits.worker_threads`（0 = 按平台默认）。iOS、Android 恒为 1 个线程（current-thread runtime，iOS 网络扩展有硬内存上限；这两个平台的构建不含 tokio 多线程调度器）；macOS、Windows、Linux 默认每个 CPU 一个工作线程，最多 4 个，上限 16。用户态 TCP/IP 栈仍是一个任务，多线程分摊的是各条流的转发、加解密和出站 I/O。`tunnel_bench` 的 `run`、`scale`、`soak` 默认跟产品一样按平台取值，所以 F2、F3、F7 门槛测的是桌面默认的多线程运行时；`capture_bench`（I3/I4/F8）固定 1 线程，与此前结果可比。
 - 长稳的 RSS 斜率是去掉前 15% 采样后的最小二乘斜率，每 60 s 采样一次；完整曲线在 job summary 和 artifact `tunnel-soak` 里。
 - 24 h 长稳需要自托管 runner，准备步骤见 [manual-intervention.md](manual-intervention.md)。
