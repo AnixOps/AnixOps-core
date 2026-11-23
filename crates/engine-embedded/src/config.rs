@@ -655,6 +655,9 @@ impl DnsRuleConfig {
 /// platform: on iOS they stay within the ~50 MB Network Extension budget,
 /// elsewhere they are higher (see [`crate::tunnel::DEFAULT_MAX_TCP_CONNECTIONS`]
 /// and [`crate::tunnel::DEFAULT_MAX_UDP_FLOWS`]).
+/// On Linux, Android, macOS and iOS both connection caps, configured or
+/// default, are lowered to the process's file-descriptor budget after the
+/// soft open-file limit is raised to the hard one.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {

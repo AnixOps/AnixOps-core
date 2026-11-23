@@ -150,6 +150,7 @@ impl SystemProxy {
             https_decryption: self.https_decryption,
             accepted: self.stats.accepted.load(Ordering::Relaxed),
             rejected: self.stats.rejected.load(Ordering::Relaxed),
+            accept_errors: self.stats.accept_errors.load(Ordering::Relaxed),
             active: self.stats.active.load(Ordering::Relaxed),
         }
     }
@@ -198,6 +199,9 @@ pub struct SystemProxyStatus {
     pub accepted: u64,
     pub rejected: u64,
     pub active: u64,
+    /// Failed accepts the listener survived (a client that reset before
+    /// it was accepted, or descriptors or memory running short).
+    pub accept_errors: u64,
 }
 
 /// Where a runtime keeps its listener; stopping the runtime stops it.

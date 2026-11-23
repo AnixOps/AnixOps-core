@@ -57,6 +57,7 @@ pub mod dns_policy;
 pub mod dns_quic;
 pub mod dns_resolver;
 pub mod fake_ip;
+pub(crate) mod fd_budget;
 #[cfg(feature = "local-proxy")]
 pub mod fetch;
 pub mod ffi;
@@ -458,7 +459,7 @@ impl EmbeddedRuntime {
                 as_interceptor(decrypting()?),
                 system_proxy::SystemProxyOptions {
                     port,
-                    max_connections: self.config.limits.max_tcp_connections,
+                    max_connections: fd_budget::connection_limits(&self.config.limits).0,
                 },
             )
         });
@@ -501,11 +502,14 @@ pub(crate) fn tunnel_settings(config: &RuntimeConfig) -> Result<TunnelSettings, 
     let dns = DnsPolicy::from_config(&config.dns)
         .map_err(|message| RuntimeError::new(RuntimeErrorCode::ConfigRejected, message))?;
     let limits = &config.limits;
+    // Lowered to the descriptor budget, so idle connections make room
+    // before the process runs out of file descriptors.
+    let (max_tcp_connections, max_udp_flows) = fd_budget::connection_limits(limits);
     Ok(TunnelSettings {
         mtu: config.mtu,
         tcp_window_bytes: limits.tcp_window_bytes,
-        max_tcp_connections: limits.max_tcp_connections,
-        max_udp_flows: limits.max_udp_flows,
+        max_tcp_connections,
+        max_udp_flows,
         tcp_evict_idle: tunnel::DEFAULT_TCP_EVICT_IDLE,
         udp_evict_idle: tunnel::DEFAULT_UDP_EVICT_IDLE,
         max_dns_in_flight: limits.max_dns_in_flight,

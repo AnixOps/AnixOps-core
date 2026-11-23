@@ -192,6 +192,8 @@ const DNS_PORT: u16 = 53;
 /// and relay buffers, so iOS keeps 128 inside the ~50 MB Network Extension
 /// limit; Android gets 512 and desktop (macOS, Windows, Linux TUN and the
 /// system proxy) 1024, where a browser with many tabs alone opens hundreds.
+/// The runtime lowers this and [`DEFAULT_MAX_UDP_FLOWS`] to the process's
+/// file-descriptor budget where that is smaller (see `fd_budget`).
 #[cfg(target_os = "ios")]
 pub const DEFAULT_MAX_TCP_CONNECTIONS: usize = 128;
 #[cfg(target_os = "android")]
@@ -216,6 +218,10 @@ const UDP_EVICT_BATCH: usize = 16;
 /// The share of a full UDP table one app socket may keep when another
 /// needs room, as 1/this.
 const UDP_SOURCE_SHARE: usize = 4;
+/// The least an app socket's flow must have been idle to go for another
+/// socket's new flow (at most [`TunnelSettings::udp_evict_idle`]), so a
+/// game or call exchanging datagrams right now keeps its NAT mapping.
+const UDP_SOURCE_MIN_IDLE: Duration = Duration::from_secs(2);
 /// After a pass over a full UDP table found nothing to close, new flows are
 /// dropped without another pass for this long.
 const UDP_RESCAN_AFTER: Duration = Duration::from_millis(250);
@@ -242,7 +248,8 @@ pub struct TunnelSettings {
     /// not count. When all are taken, flows that ended and then those idle
     /// for at least [`Self::udp_evict_idle`] make room, longest idle first;
     /// failing that, an app socket holding more than a quarter of the table
-    /// gives up its least active flow; failing that, the datagram of the new
+    /// gives up its least active flow (idle for 2 s at least); failing
+    /// that, the datagram of the new
     /// flow is dropped.
     pub max_udp_flows: usize,
     /// How long a TCP connection must have carried no payload either way
@@ -1081,8 +1088,9 @@ impl UdpFlows {
     /// Frees room in the full table for a new flow from `src`, in one pass:
     /// flows that ended go; then up to a batch of those idle longest, idle
     /// for at least `udp_evict_idle`; when none is idle, the least active
-    /// flows of the app socket holding the most, if that is more than its
-    /// share (a quarter; the new flow counts for its own socket), so one
+    /// flows of the app socket holding the most, idle for at least
+    /// [`UDP_SOURCE_MIN_IDLE`], if that is more than its share (a quarter;
+    /// the new flow counts for its own socket), so one
     /// app fanning out to many peers cannot starve the others. Closing a
     /// flow drops its sender, and its task ends once the queued datagrams
     /// are gone. Returns `false` when nothing could go; new flows are then
@@ -1125,11 +1133,13 @@ impl UdpFlows {
                 .filter(|&(_, flows)| flows > share)
                 .max_by_key(|&(_, flows)| flows);
             if let Some((hog, flows)) = hog {
+                let min_idle = UDP_SOURCE_MIN_IDLE.min(settings.udp_evict_idle);
                 let own: Vec<_> = self
                     .map
                     .iter()
                     .filter(|(key, _)| key.0 == hog)
                     .map(|(key, flow)| (flow.idle(now), *key))
+                    .filter(|&(quiet, _)| quiet >= min_idle)
                     .collect();
                 victims = longest_idle(own, batch.min(flows - share));
             }
@@ -2103,12 +2113,13 @@ mod tests {
         let settings = udp_settings(4);
         let stats = TunnelStats::default();
         let mut flows = UdpFlows::default();
-        // One socket talks to four peers at once, all of them active.
+        // One socket talks to four peers, none idle long enough to go for
+        // the idle rule (15 s) but past the socket's minimum.
         let fan: Vec<_> = (7001..7005)
             .map(|port| open(&mut flows, app(6881), peer(port)))
             .collect();
         for flow in &fan {
-            active_after(&flow.0.activity, Duration::from_secs(60));
+            active_after(&flow.0.activity, Duration::from_secs(55));
         }
         let now = tokio::time::Instant::now() + Duration::from_secs(60);
 
@@ -2116,6 +2127,25 @@ mod tests {
         assert_eq!(fan.iter().filter(|flow| is_closed(flow)).count(), 1);
         assert_eq!(flows.map.len(), 3);
         assert_eq!(stats.snapshot().udp_evicted, 1);
+    }
+
+    #[test]
+    fn a_fanning_out_app_keeps_flows_that_carried_data_just_now() {
+        let settings = udp_settings(4);
+        let stats = TunnelStats::default();
+        let mut flows = UdpFlows::default();
+        let fan: Vec<_> = (7001..7005)
+            .map(|port| open(&mut flows, app(6881), peer(port)))
+            .collect();
+        for flow in &fan {
+            active_after(&flow.0.activity, Duration::from_secs(59));
+        }
+        let now = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        // Each was active within the last second: none goes.
+        assert!(!flows.make_room(app(5000), now, &settings, &stats));
+        assert!(fan.iter().all(|flow| !is_closed(flow)));
+        assert_eq!(stats.snapshot().udp_evicted, 0);
     }
 
     #[test]
