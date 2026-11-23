@@ -368,9 +368,9 @@ iWAN 的"加密"不提供保密性或认证：
 - 会话惰性建立：没有任何连接满 60 秒后发 CLOSE 释放会话。
 - 重连（§5 重置）后，若分配的隧道地址和有效 MTU 都没变，保留私有栈和现有连接；否则换新栈，已有连接全部以错误结束（上层按普通断线处理）。
 - 多个 iWAN 节点互相独立，可以和其他协议的节点一起放进策略组，按规则、手动选择或测速选择。节点测速可直接用 §6.4 的 ECHO RTT。
-- 资源：iOS Network Extension 内存很紧，私有栈的 TCP 收发缓冲区要设上限（`tcp_buffer_bytes`，默认每连接每方向 64 KiB），且只在有连接时创建栈。
+- 资源：iOS Network Extension 内存很紧，私有栈的 TCP 收发缓冲区要设上限，且只在有连接时创建栈。默认发送缓冲每连接 64 KiB；接收缓冲决定单连接窗口（单连接下载约为 接收缓冲 / RTT），按平台取默认值：iOS 64 KiB（NE 内存预算约 50 MB、最多 128 条连接），Android 256 KiB，macOS / Windows / Linux 512 KiB。私有栈没有拥塞控制，所以发送缓冲不随之放大。配置了 `tcp_buffer_bytes` 时收发两个方向都用该值（与此前含义相同）。
 - 不支持的流量：ICMP（ping）等非 TCP/UDP 流量不经过逐连接出站，因此不会走 iWAN 节点。
-- 配置字段：`server`（域名或 IPv4）、`port`、`username`、`password`（由 Keychain 注入，与其他协议一致）、`mtu`（默认 1400，46–1600）、`encrypt`（bool，默认 false）、`pipe_id`（默认 0）、`pipe_idx`（默认 0）、`dns`（可选，最多 2 个 IPv4，设置后覆盖下发的 DNS）、`tcp_buffer_bytes`（可选，每连接每方向的 TCP 缓冲，默认 65536，范围 4096–1048576）。
+- 配置字段：`server`（域名或 IPv4）、`port`、`username`、`password`（由 Keychain 注入，与其他协议一致）、`mtu`（默认 1400，46–1600）、`encrypt`（bool，默认 false）、`pipe_id`（默认 0）、`pipe_idx`（默认 0）、`dns`（可选，最多 2 个 IPv4，设置后覆盖下发的 DNS）、`tcp_buffer_bytes`（可选，每连接每方向的 TCP 缓冲，范围 4096–1048576；不设时接收缓冲按平台默认、发送缓冲 65536，见上文“资源”）。
 - 节点导入（anixops-net）和 UI 在内核合并后另行进行。
 
 ## 12. 服务端（`inbound-iwan`，节点内核 anixcore）

@@ -7,7 +7,7 @@
 //! exists while a session is up; if a reconnect hands out another address,
 //! the stack is replaced and its connections fail.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -184,6 +184,76 @@ impl Stack {
     }
 }
 
+/// The port after `port` in the local range, wrapping from 65535 to
+/// [`FIRST_LOCAL_PORT`].
+fn following_port(port: u16) -> u16 {
+    if port == u16::MAX {
+        FIRST_LOCAL_PORT
+    } else {
+        port + 1
+    }
+}
+
+/// The first local port from `next` on, wrapping once through the whole
+/// range, for which `used` is false; `None` when every port is used.
+fn pick_port(next: u16, used: impl Fn(u16) -> bool) -> Option<u16> {
+    let span = u32::from(u16::MAX - FIRST_LOCAL_PORT) + 1;
+    let mut port = next.max(FIRST_LOCAL_PORT);
+    for _ in 0..span {
+        if !used(port) {
+            return Some(port);
+        }
+        port = following_port(port);
+    }
+    None
+}
+
+/// The local ports the sockets of `sockets` hold: bound UDP sockets, and
+/// TCP sockets connected or listening. Inbound packets go to the first
+/// socket whose port matches, so a new socket must not reuse one of them.
+fn ports_in_use(sockets: &SocketSet<'static>) -> HashSet<u16> {
+    let mut used = HashSet::new();
+    for (_, socket) in sockets.iter() {
+        if let Some(socket) = udp::Socket::downcast(socket) {
+            let port = socket.endpoint().port;
+            if port != 0 {
+                used.insert(port);
+            }
+        } else if let Some(socket) = tcp::Socket::downcast(socket) {
+            if let Some(local) = socket.local_endpoint() {
+                used.insert(local.port);
+            }
+            let listening = socket.listen_endpoint().port;
+            if listening != 0 {
+                used.insert(listening);
+            }
+        }
+    }
+    used
+}
+
+/// The next free local port of `sockets` from `*next` on; `*next` moves
+/// past it. The counter wraps, and long-lived sockets (a call, a game) may
+/// still hold a port it comes back to.
+fn allocate_port(next: &mut u16, sockets: &SocketSet<'static>, name: &str) -> io::Result<u16> {
+    let used = ports_in_use(sockets);
+    let port = pick_port(*next, |port| used.contains(&port)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{name} has no free local port"),
+        )
+    })?;
+    *next = following_port(port);
+    Ok(port)
+}
+
+/// Whether a UDP socket of `sockets` is bound to `port`.
+fn udp_port_bound(sockets: &SocketSet<'static>, port: u16) -> bool {
+    sockets.iter().any(|(_, socket)| {
+        udp::Socket::downcast(socket).is_some_and(|socket| socket.endpoint().port == port)
+    })
+}
+
 struct Core {
     client: Client,
     running: bool,
@@ -208,14 +278,13 @@ impl Core {
         self.stack.as_mut().ok_or_else(reset)
     }
 
-    fn next_port(&mut self) -> u16 {
-        let port = self.next_port;
-        self.next_port = if port == u16::MAX {
-            FIRST_LOCAL_PORT
-        } else {
-            port + 1
-        };
-        port
+    /// A local port no socket of the stack `generation` holds.
+    fn next_port(&mut self, generation: u64) -> io::Result<u16> {
+        if self.generation != generation {
+            return Err(reset());
+        }
+        let stack = self.stack.as_ref().ok_or_else(reset)?;
+        allocate_port(&mut self.next_port, &stack.sockets, "iwan")
     }
 
     fn stop(&mut self, settings: &IwanSettings) {
@@ -268,6 +337,14 @@ impl Node {
     /// The last ECHO round trip in microseconds, 0 before the first one.
     pub(crate) fn rtt_us(&self) -> u32 {
         self.rtt_us.load(Ordering::Relaxed)
+    }
+
+    /// The receive and send buffer sizes of a new TCP socket.
+    fn tcp_buffers(&self) -> (usize, usize) {
+        (
+            self.settings.tcp_receive_buffer_bytes as usize,
+            self.settings.tcp_send_buffer_bytes as usize,
+        )
     }
 
     fn lock(&self) -> MutexGuard<'_, Core> {
@@ -384,11 +461,11 @@ impl Node {
         generation: u64,
         remote: SocketAddrV4,
     ) -> io::Result<SocketHandle> {
-        let buffer = self.settings.tcp_buffer_bytes as usize;
+        let (receive, send) = self.tcp_buffers();
         let mut core = self.lock();
-        let port = core.next_port();
+        let port = core.next_port(generation)?;
         let stack = core.stack_for(generation)?;
-        let mut socket = new_tcp_socket(buffer);
+        let mut socket = new_tcp_socket(receive, send);
         socket
             .connect(stack.iface.context(), remote, port)
             .map_err(|_| {
@@ -402,10 +479,10 @@ impl Node {
 
     /// Listens for one TCP connection on `port` in the stack `generation`.
     pub(crate) fn listen_tcp(&self, generation: u64, port: u16) -> io::Result<SocketHandle> {
-        let buffer = self.settings.tcp_buffer_bytes as usize;
+        let (receive, send) = self.tcp_buffers();
         let mut core = self.lock();
         let stack = core.stack_for(generation)?;
-        let mut socket = new_tcp_socket(buffer);
+        let mut socket = new_tcp_socket(receive, send);
         socket
             .listen(port)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "iwan cannot listen there"))?;
@@ -418,9 +495,15 @@ impl Node {
         let mut core = self.lock();
         let port = match port {
             Some(port) => port,
-            None => core.next_port(),
+            None => core.next_port(generation)?,
         };
         let stack = core.stack_for(generation)?;
+        if udp_port_bound(&stack.sockets, port) {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "iwan udp port is unavailable",
+            ));
+        }
         let buffer = || {
             udp::PacketBuffer::new(
                 vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
@@ -809,10 +892,12 @@ async fn resolve_server(settings: &IwanSettings) -> Option<SocketAddr> {
     addresses.into_iter().find(SocketAddr::is_ipv4)
 }
 
-fn new_tcp_socket(buffer: usize) -> tcp::Socket<'static> {
+/// A TCP socket with `receive` and `send` bytes of buffer. The receive
+/// buffer sets the window (and its scale) for the socket's life.
+fn new_tcp_socket(receive: usize, send: usize) -> tcp::Socket<'static> {
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0u8; buffer]),
-        tcp::SocketBuffer::new(vec![0u8; buffer]),
+        tcp::SocketBuffer::new(vec![0u8; receive]),
+        tcp::SocketBuffer::new(vec![0u8; send]),
     );
     socket.set_nagle_enabled(false);
     socket.set_keep_alive(Some(SmolDuration::from_secs(30)));
@@ -906,5 +991,61 @@ impl UdpHandle {
 impl Drop for UdpHandle {
     fn drop(&mut self) {
         self.node.release_udp(self.handle, self.generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bound_udp(port: u16) -> udp::Socket<'static> {
+        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 1], vec![0u8; 64]);
+        let mut socket = udp::Socket::new(buffer(), buffer());
+        socket.bind(port).unwrap();
+        socket
+    }
+
+    #[test]
+    fn local_ports_skip_sockets_still_open() {
+        let mut sockets: SocketSet<'static> = SocketSet::new(Vec::new());
+        sockets.add(bound_udp(50000));
+        let mut next = 50000;
+        // A long-lived flow still holds the port the counter came back to.
+        assert_eq!(allocate_port(&mut next, &sockets, "test").unwrap(), 50001);
+        assert_eq!(next, 50002);
+
+        let mut listening = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        );
+        listening.listen(50002).unwrap();
+        sockets.add(listening);
+        assert_eq!(allocate_port(&mut next, &sockets, "test").unwrap(), 50003);
+
+        // Wrapping from 65535 skips a port held at the start of the range.
+        sockets.add(bound_udp(FIRST_LOCAL_PORT));
+        let mut next = u16::MAX;
+        assert_eq!(
+            allocate_port(&mut next, &sockets, "test").unwrap(),
+            u16::MAX
+        );
+        assert_eq!(
+            allocate_port(&mut next, &sockets, "test").unwrap(),
+            FIRST_LOCAL_PORT + 1
+        );
+        assert!(udp_port_bound(&sockets, 50000));
+        assert!(!udp_port_bound(&sockets, 50002));
+    }
+
+    #[test]
+    fn a_full_port_range_is_an_error_not_a_reuse() {
+        assert_eq!(pick_port(60000, |port| port < 60010), Some(60010));
+        assert_eq!(
+            pick_port(u16::MAX, |port| port == u16::MAX),
+            Some(FIRST_LOCAL_PORT)
+        );
+        assert_eq!(pick_port(FIRST_LOCAL_PORT, |_| true), None);
+        // A counter below the range starts at its beginning.
+        assert_eq!(pick_port(1, |_| false), Some(FIRST_LOCAL_PORT));
     }
 }

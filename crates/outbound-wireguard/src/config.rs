@@ -34,7 +34,27 @@ pub const DEFAULT_MTU: u16 = 1420;
 /// IPv6 needs 1280; 576 is the IPv4 floor for a v4-only node.
 pub const MIN_MTU: u16 = 576;
 pub const MAX_MTU: u16 = 9000;
+/// Default send buffer of each private-stack TCP connection, and the
+/// receive buffer an explicit `tcp_buffer_bytes` replaces both with.
 pub const DEFAULT_TCP_BUFFER: u32 = 64 * 1024;
+/// Default receive buffer of each private-stack TCP connection. It bounds
+/// the window one connection advertises, so one connection's download is at
+/// most this much per round trip: 64 KiB is about 3.5 Mbit/s at 150 ms.
+/// Desktop systems take 512 KiB (about 28 Mbit/s at 150 ms); Android 256
+/// KiB; iOS keeps 64 KiB, as the Network Extension's memory budget
+/// (about 50 MB, up to 128 connections) cannot hold more. The send buffer
+/// stays at [`DEFAULT_TCP_BUFFER`]: the private stack runs no congestion
+/// control, and a larger one would only send larger bursts.
+#[cfg(target_os = "ios")]
+pub const DEFAULT_TCP_RECEIVE_BUFFER: u32 = 64 * 1024;
+/// Default receive buffer of each private-stack TCP connection (see the
+/// iOS value for the trade-off).
+#[cfg(target_os = "android")]
+pub const DEFAULT_TCP_RECEIVE_BUFFER: u32 = 256 * 1024;
+/// Default receive buffer of each private-stack TCP connection (see the
+/// iOS value for the trade-off).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub const DEFAULT_TCP_RECEIVE_BUFFER: u32 = 512 * 1024;
 pub const MIN_TCP_BUFFER: u32 = 4 * 1024;
 pub const MAX_TCP_BUFFER: u32 = 1024 * 1024;
 const MAX_ADDRESSES: usize = 16;
@@ -70,16 +90,15 @@ pub struct WireGuardConfig {
     /// use as a client id; zero in plain WireGuard.
     #[serde(default)]
     pub reserved: Option<[u8; 3]>,
-    #[serde(default = "default_tcp_buffer")]
-    pub tcp_buffer_bytes: u32,
+    /// The TCP send and receive buffer of every connection, both
+    /// directions, as before receive and send had defaults of their own.
+    /// Absent: [`DEFAULT_TCP_RECEIVE_BUFFER`] and [`DEFAULT_TCP_BUFFER`].
+    #[serde(default)]
+    pub tcp_buffer_bytes: Option<u32>,
 }
 
 fn default_mtu() -> u16 {
     DEFAULT_MTU
-}
-
-fn default_tcp_buffer() -> u32 {
-    DEFAULT_TCP_BUFFER
 }
 
 /// Validated settings. Holds key material, so it has no `Debug`.
@@ -98,7 +117,10 @@ pub struct WireGuardSettings {
     pub mtu: u16,
     pub persistent_keepalive_secs: Option<u16>,
     pub reserved: Option<[u8; 3]>,
-    pub tcp_buffer_bytes: u32,
+    /// Receive buffer of each private-stack TCP connection.
+    pub tcp_receive_buffer_bytes: u32,
+    /// Send buffer of each private-stack TCP connection.
+    pub tcp_send_buffer_bytes: u32,
 }
 
 impl WireGuardConfig {
@@ -195,9 +217,13 @@ impl WireGuardConfig {
         if local_v6.is_some() && self.mtu < 1280 {
             return Err("wireguard mtu must be at least 1280 with an IPv6 address");
         }
-        if !(MIN_TCP_BUFFER..=MAX_TCP_BUFFER).contains(&self.tcp_buffer_bytes) {
-            return Err("wireguard tcp_buffer_bytes is out of range");
-        }
+        let (tcp_receive_buffer_bytes, tcp_send_buffer_bytes) = match self.tcp_buffer_bytes {
+            Some(bytes) if !(MIN_TCP_BUFFER..=MAX_TCP_BUFFER).contains(&bytes) => {
+                return Err("wireguard tcp_buffer_bytes is out of range");
+            }
+            Some(bytes) => (bytes, bytes),
+            None => (DEFAULT_TCP_RECEIVE_BUFFER, DEFAULT_TCP_BUFFER),
+        };
         Ok(WireGuardSettings {
             server: server
                 .trim_start_matches('[')
@@ -214,7 +240,8 @@ impl WireGuardConfig {
             mtu: self.mtu,
             persistent_keepalive_secs: self.persistent_keepalive_secs.filter(|secs| *secs > 0),
             reserved: self.reserved.filter(|bytes| *bytes != [0; 3]),
-            tcp_buffer_bytes: self.tcp_buffer_bytes,
+            tcp_receive_buffer_bytes,
+            tcp_send_buffer_bytes,
         })
     }
 }
@@ -260,6 +287,27 @@ mod tests {
             .allowed_ips
             .contains("2001:db8::1".parse().unwrap()));
         assert!(settings.reserved.is_none());
+        assert_eq!(
+            settings.tcp_receive_buffer_bytes,
+            DEFAULT_TCP_RECEIVE_BUFFER
+        );
+        assert_eq!(settings.tcp_send_buffer_bytes, DEFAULT_TCP_BUFFER);
+    }
+
+    #[test]
+    fn tcp_buffers_default_by_platform_and_an_explicit_size_sets_both() {
+        #[cfg(target_os = "ios")]
+        assert_eq!(DEFAULT_TCP_RECEIVE_BUFFER, 64 * 1024);
+        #[cfg(target_os = "android")]
+        assert_eq!(DEFAULT_TCP_RECEIVE_BUFFER, 256 * 1024);
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        assert_eq!(DEFAULT_TCP_RECEIVE_BUFFER, 512 * 1024);
+        assert!((MIN_TCP_BUFFER..=MAX_TCP_BUFFER).contains(&DEFAULT_TCP_RECEIVE_BUFFER));
+        let explicit = config(serde_json::json!({"tcp_buffer_bytes": 16384}))
+            .ok()
+            .unwrap();
+        assert_eq!(explicit.tcp_receive_buffer_bytes, 16384);
+        assert_eq!(explicit.tcp_send_buffer_bytes, 16384);
     }
 
     #[test]

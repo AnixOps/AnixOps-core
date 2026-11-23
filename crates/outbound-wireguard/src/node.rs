@@ -13,7 +13,7 @@
 //! refuses connections to other addresses, and packets that come out of the
 //! tunnel with a source outside it are dropped before the stack sees them.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -201,15 +201,80 @@ struct Core {
 }
 
 impl Core {
-    fn next_port(&mut self) -> u16 {
-        let port = self.next_port;
-        self.next_port = if port == u16::MAX {
-            FIRST_LOCAL_PORT
-        } else {
-            port + 1
-        };
-        port
+    /// A local port no socket of the stack holds.
+    fn next_port(&mut self) -> io::Result<u16> {
+        allocate_port(&mut self.next_port, &self.stack.sockets, "wireguard")
     }
+}
+
+/// The port after `port` in the local range, wrapping from 65535 to
+/// [`FIRST_LOCAL_PORT`].
+fn following_port(port: u16) -> u16 {
+    if port == u16::MAX {
+        FIRST_LOCAL_PORT
+    } else {
+        port + 1
+    }
+}
+
+/// Whether a UDP socket of `sockets` is bound to `port`.
+fn udp_port_bound(sockets: &SocketSet<'static>, port: u16) -> bool {
+    sockets.iter().any(|(_, socket)| {
+        udp::Socket::downcast(socket).is_some_and(|socket| socket.endpoint().port == port)
+    })
+}
+
+/// The first local port from `next` on, wrapping once through the whole
+/// range, for which `used` is false; `None` when every port is used.
+fn pick_port(next: u16, used: impl Fn(u16) -> bool) -> Option<u16> {
+    let span = u32::from(u16::MAX - FIRST_LOCAL_PORT) + 1;
+    let mut port = next.max(FIRST_LOCAL_PORT);
+    for _ in 0..span {
+        if !used(port) {
+            return Some(port);
+        }
+        port = following_port(port);
+    }
+    None
+}
+
+/// The local ports the sockets of `sockets` hold: bound UDP sockets, and
+/// TCP sockets connected or listening. Inbound packets go to the first
+/// socket whose port matches, so a new socket must not reuse one of them.
+fn ports_in_use(sockets: &SocketSet<'static>) -> HashSet<u16> {
+    let mut used = HashSet::new();
+    for (_, socket) in sockets.iter() {
+        if let Some(socket) = udp::Socket::downcast(socket) {
+            let port = socket.endpoint().port;
+            if port != 0 {
+                used.insert(port);
+            }
+        } else if let Some(socket) = tcp::Socket::downcast(socket) {
+            if let Some(local) = socket.local_endpoint() {
+                used.insert(local.port);
+            }
+            let listening = socket.listen_endpoint().port;
+            if listening != 0 {
+                used.insert(listening);
+            }
+        }
+    }
+    used
+}
+
+/// The next free local port of `sockets` from `*next` on; `*next` moves
+/// past it. The counter wraps, and long-lived sockets (a call, a game) may
+/// still hold a port it comes back to.
+fn allocate_port(next: &mut u16, sockets: &SocketSet<'static>, name: &str) -> io::Result<u16> {
+    let used = ports_in_use(sockets);
+    let port = pick_port(*next, |port| used.contains(&port)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{name} has no free local port"),
+        )
+    })?;
+    *next = following_port(port);
+    Ok(port)
 }
 
 pub(crate) struct Node {
@@ -256,6 +321,14 @@ impl Node {
 
     pub(crate) fn settings(&self) -> &WireGuardSettings {
         &self.settings
+    }
+
+    /// The receive and send buffer sizes of a new TCP socket.
+    fn tcp_buffers(&self) -> (usize, usize) {
+        (
+            self.settings.tcp_receive_buffer_bytes as usize,
+            self.settings.tcp_send_buffer_bytes as usize,
+        )
     }
 
     fn lock(&self) -> MutexGuard<'_, Core> {
@@ -338,10 +411,10 @@ impl Node {
 
     /// Starts a TCP connection to `remote`.
     pub(crate) fn open_tcp(&self, remote: SocketAddr) -> io::Result<SocketHandle> {
-        let buffer = self.settings.tcp_buffer_bytes as usize;
+        let (receive, send) = self.tcp_buffers();
         let mut core = self.lock();
-        let port = core.next_port();
-        let mut socket = new_tcp_socket(buffer);
+        let port = core.next_port()?;
+        let mut socket = new_tcp_socket(receive, send);
         socket
             .connect(core.stack.iface.context(), endpoint(remote), port)
             .map_err(|_| {
@@ -355,9 +428,9 @@ impl Node {
 
     /// Listens for one TCP connection on `port`.
     pub(crate) fn listen_tcp(&self, port: u16) -> io::Result<SocketHandle> {
-        let buffer = self.settings.tcp_buffer_bytes as usize;
+        let (receive, send) = self.tcp_buffers();
         let mut core = self.lock();
-        let mut socket = new_tcp_socket(buffer);
+        let mut socket = new_tcp_socket(receive, send);
         socket.listen(port).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "wireguard cannot listen there")
         })?;
@@ -368,8 +441,14 @@ impl Node {
     pub(crate) fn open_udp(&self, port: Option<u16>) -> io::Result<SocketHandle> {
         let mut core = self.lock();
         let port = match port {
+            Some(port) if udp_port_bound(&core.stack.sockets, port) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "wireguard udp port is unavailable",
+                ))
+            }
             Some(port) => port,
-            None => core.next_port(),
+            None => core.next_port()?,
         };
         let buffer = || {
             udp::PacketBuffer::new(
@@ -497,8 +576,9 @@ impl Node {
 
     /// Seals the stack's outgoing packets and runs the timers when due.
     /// Returns the datagrams to send, how long the driver may sleep, and
-    /// whether it should stop.
-    fn poll(&self, run: u64, timers_due: bool) -> Poll {
+    /// whether it should stop. `buffer` is the driver's work buffer
+    /// ([`DATAGRAM_BYTES`]), reused for every call.
+    fn poll(&self, run: u64, timers_due: bool, buffer: &mut [u8]) -> Poll {
         let now = Instant::now();
         let timestamp = self.now();
         let reserved = self.settings.reserved;
@@ -514,16 +594,13 @@ impl Node {
             .iface
             .poll(timestamp, &mut stack.device, &mut stack.sockets);
         stack.sweep(now);
-        let mut buffer = vec![0u8; DATAGRAM_BYTES];
         while let Some(packet) = stack.device.tx.pop_front() {
-            if let TunnResult::WriteToNetwork(datagram) =
-                core.tunn.encapsulate(&packet, &mut buffer)
-            {
+            if let TunnResult::WriteToNetwork(datagram) = core.tunn.encapsulate(&packet, buffer) {
                 datagrams.push(seal(datagram, reserved));
             }
         }
         if timers_due {
-            if let TunnResult::WriteToNetwork(datagram) = core.tunn.update_timers(&mut buffer) {
+            if let TunnResult::WriteToNetwork(datagram) = core.tunn.update_timers(buffer) {
                 datagrams.push(seal(datagram, reserved));
             }
         }
@@ -551,20 +628,26 @@ impl Node {
     /// Opens one datagram from the peer. Packets go to the stack when their
     /// source is inside AllowedIPs; replies (handshake responses, packets
     /// queued behind the handshake) are returned to send, with whether the
-    /// datagram was a message the peer authenticated.
-    fn receive(&self, datagram: &mut [u8], peer: IpAddr) -> (Vec<Vec<u8>>, bool) {
+    /// datagram was a message the peer authenticated. `buffer` is the
+    /// driver's work buffer ([`DATAGRAM_BYTES`], never smaller: boringtun
+    /// panics when a message does not fit), apart from `datagram`.
+    fn receive(
+        &self,
+        datagram: &mut [u8],
+        peer: IpAddr,
+        buffer: &mut [u8],
+    ) -> (Vec<Vec<u8>>, bool) {
         let reserved = self.settings.reserved;
         if reserved.is_some() && datagram.len() >= 4 {
             datagram[1..4].fill(0);
         }
         let mut replies = Vec::new();
-        let mut buffer = vec![0u8; DATAGRAM_BYTES];
         let mut core = self.lock();
         let core = &mut *core;
         let mut input: &[u8] = datagram;
         let mut heard = false;
         loop {
-            let result = core.tunn.decapsulate(Some(peer), input, &mut buffer);
+            let result = core.tunn.decapsulate(Some(peer), input, buffer);
             if !input.is_empty() && !matches!(result, TunnResult::Err(_)) {
                 // Only the first call carries the datagram; the rest drain.
                 heard = true;
@@ -706,6 +789,10 @@ async fn drive(node: Arc<Node>, run: u64) {
     };
     let mut replies: Vec<Vec<u8>> = node.initiation(false).into_iter().collect();
     let mut datagram = vec![0u8; DATAGRAM_BYTES];
+    // Output of boringtun for every poll and received datagram, allocated
+    // once per driver run (it ends after a minute idle) instead of once per
+    // packet. Sealing and delivery copy out of it.
+    let mut work = vec![0u8; DATAGRAM_BYTES];
     let mut next_tick = Instant::now() + TIMER_TICK;
     loop {
         for reply in replies.drain(..) {
@@ -716,7 +803,7 @@ async fn drive(node: Arc<Node>, run: u64) {
         if timers_due {
             next_tick = now + TIMER_TICK;
         }
-        let poll = node.poll(run, timers_due);
+        let poll = node.poll(run, timers_due, &mut work);
         for sealed in &poll.datagrams {
             let _ = path.send(sealed).await;
         }
@@ -736,7 +823,7 @@ async fn drive(node: Arc<Node>, run: u64) {
             received = path.recv(&mut datagram) => match received {
                 Received::Datagram(len) => {
                     let peer = path.endpoint().ip();
-                    let (sealed, heard) = node.receive(&mut datagram[..len], peer);
+                    let (sealed, heard) = node.receive(&mut datagram[..len], peer, &mut work);
                     if heard {
                         path.heard();
                     }
@@ -761,10 +848,12 @@ fn endpoint(address: SocketAddr) -> IpEndpoint {
     IpEndpoint::new(ip, address.port())
 }
 
-fn new_tcp_socket(buffer: usize) -> tcp::Socket<'static> {
+/// A TCP socket with `receive` and `send` bytes of buffer. The receive
+/// buffer sets the window (and its scale) for the socket's life.
+fn new_tcp_socket(receive: usize, send: usize) -> tcp::Socket<'static> {
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0u8; buffer]),
-        tcp::SocketBuffer::new(vec![0u8; buffer]),
+        tcp::SocketBuffer::new(vec![0u8; receive]),
+        tcp::SocketBuffer::new(vec![0u8; send]),
     );
     socket.set_nagle_enabled(false);
     socket.set_keep_alive(Some(SmolDuration::from_secs(30)));
@@ -878,5 +967,89 @@ mod tests {
         assert_eq!(seal(&message, None), message);
         assert_eq!(seal(&message, Some([1, 2, 3])), [4, 1, 2, 3, 9, 9]);
         assert_eq!(seal(&[4, 0], Some([1, 2, 3])), [4, 0]);
+    }
+
+    fn test_node() -> Arc<Node> {
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let config: crate::config::WireGuardConfig = serde_json::from_value(serde_json::json!({
+            "server": "192.0.2.1",
+            "port": 51820,
+            "private_key": key,
+            "peer_public_key": key,
+            "local_address": ["10.7.0.2/32"],
+        }))
+        .ok()
+        .unwrap();
+        Node::new(config.validate().ok().unwrap())
+    }
+
+    /// The work buffer is the driver's, reused for every datagram; it must
+    /// stay large enough for anything a peer (or anyone) sends, since
+    /// boringtun panics when a message does not fit.
+    #[test]
+    fn the_shared_work_buffer_takes_the_largest_datagram() {
+        let node = test_node();
+        let mut work = vec![0u8; DATAGRAM_BYTES];
+        for len in [65_507usize, 1_500, 32] {
+            let mut garbage = vec![0x5au8; len];
+            garbage[..4].copy_from_slice(&[4, 0, 0, 0]);
+            let (replies, heard) =
+                node.receive(&mut garbage, "192.0.2.1".parse().unwrap(), &mut work);
+            assert!(replies.is_empty(), "{len}");
+            assert!(!heard, "{len}");
+        }
+        // Not running: polling stops without touching the session.
+        assert!(node.poll(0, true, &mut work).stop);
+    }
+
+    fn bound_udp(port: u16) -> udp::Socket<'static> {
+        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 1], vec![0u8; 64]);
+        let mut socket = udp::Socket::new(buffer(), buffer());
+        socket.bind(port).unwrap();
+        socket
+    }
+
+    #[test]
+    fn local_ports_skip_sockets_still_open() {
+        let mut sockets: SocketSet<'static> = SocketSet::new(Vec::new());
+        sockets.add(bound_udp(50000));
+        let mut next = 50000;
+        // A long-lived flow still holds the port the counter came back to.
+        assert_eq!(allocate_port(&mut next, &sockets, "test").unwrap(), 50001);
+        assert_eq!(next, 50002);
+
+        let mut listening = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+            tcp::SocketBuffer::new(vec![0u8; 64]),
+        );
+        listening.listen(50002).unwrap();
+        sockets.add(listening);
+        assert_eq!(allocate_port(&mut next, &sockets, "test").unwrap(), 50003);
+
+        // Wrapping from 65535 skips a port held at the start of the range.
+        sockets.add(bound_udp(FIRST_LOCAL_PORT));
+        let mut next = u16::MAX;
+        assert_eq!(
+            allocate_port(&mut next, &sockets, "test").unwrap(),
+            u16::MAX
+        );
+        assert_eq!(
+            allocate_port(&mut next, &sockets, "test").unwrap(),
+            FIRST_LOCAL_PORT + 1
+        );
+        assert!(udp_port_bound(&sockets, 50000));
+        assert!(!udp_port_bound(&sockets, 50002));
+    }
+
+    #[test]
+    fn a_full_port_range_is_an_error_not_a_reuse() {
+        assert_eq!(pick_port(60000, |port| port < 60010), Some(60010));
+        assert_eq!(
+            pick_port(u16::MAX, |port| port == u16::MAX),
+            Some(FIRST_LOCAL_PORT)
+        );
+        assert_eq!(pick_port(FIRST_LOCAL_PORT, |_| true), None);
+        // A counter below the range starts at its beginning.
+        assert_eq!(pick_port(1, |_| false), Some(FIRST_LOCAL_PORT));
     }
 }
