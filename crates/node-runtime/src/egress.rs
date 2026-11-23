@@ -27,7 +27,9 @@
 //! 2. for an address target, the TLS SNI or HTTP `Host` of the first bytes
 //!    the client sends (waiting at most [`SNIFF_WAIT`] for them);
 //! 3. the name a DNS answer relayed through the node mapped the address to
-//!    ([`DomainCache`]).
+//!    ([`DomainCache`]); only a reply to a query the same UDP session sent
+//!    through the node (same server, transaction id and question) is
+//!    recorded.
 //!
 //! UDP datagrams use 1 and 3.
 //!
@@ -71,7 +73,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::direct::CidrSet;
-use crate::domains::{normalize, DomainCache};
+use crate::domains::{normalize, DomainCache, PendingQueries};
 
 /// The default relay protocol; an empty `protocol` means it.
 pub const RELAY_PROTOCOL: &str = "shadowsocks";
@@ -770,6 +772,7 @@ impl UdpOutbound for Router {
             Ok(Arc::new(RoutedUdp {
                 direct,
                 egress: self.egress.clone(),
+                pending: Arc::new(Mutex::new(PendingQueries::default())),
                 flows: Mutex::new(HashMap::new()),
                 replies,
                 receiver: tokio::sync::Mutex::new(receiver),
@@ -787,10 +790,13 @@ struct RoutedFlow {
 }
 
 /// A client's UDP session: direct datagrams on one socket, routed ones on
-/// a relay flow per target. DNS replies are recorded on the way back.
+/// a relay flow per target. DNS replies to the session's own queries are
+/// recorded on the way back.
 struct RoutedUdp {
     direct: Arc<dyn UdpSession>,
     egress: Arc<Egress>,
+    /// DNS queries this session relayed and still waits for.
+    pending: Arc<Mutex<PendingQueries>>,
     flows: Mutex<HashMap<TargetAddr, RoutedFlow>>,
     replies: mpsc::Sender<Reply>,
     receiver: tokio::sync::Mutex<mpsc::Receiver<Reply>>,
@@ -813,10 +819,11 @@ impl RoutedUdp {
         let (send, mut recv) = (flow.send, flow.recv);
         let replies = self.replies.clone();
         let egress = self.egress.clone();
+        let pending = self.pending.clone();
         let reader = tokio::spawn(async move {
             while let Ok(payload) = recv.recv().await {
                 if source.port() == 53 {
-                    egress.domains.record_response(&payload);
+                    record_reply(&egress, &pending, &payload, source);
                 }
                 if replies.send((payload, source)).await.is_err() {
                     return;
@@ -842,6 +849,23 @@ impl RoutedUdp {
     }
 }
 
+/// Records a DNS reply from `source` when it answers a query the session
+/// relayed.
+fn record_reply(
+    egress: &Egress,
+    pending: &Mutex<PendingQueries>,
+    message: &[u8],
+    source: SocketAddr,
+) {
+    let answered = pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take_reply(message, source, Instant::now());
+    if answered {
+        egress.domains.record_response(message);
+    }
+}
+
 /// The source a routed flow's replies are reported from: the target
 /// itself, or the first address its name resolves to.
 async fn reply_source(target: &TargetAddr) -> SocketAddr {
@@ -863,6 +887,16 @@ impl UdpSession for RoutedUdp {
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
+            if target.port() == 53 {
+                let server = match target {
+                    TargetAddr::Ip(address) => Some(*address),
+                    TargetAddr::Domain(..) => None,
+                };
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_query(payload, server, Instant::now());
+            }
             let table = self.egress.table();
             let blocks = self.egress.block_rules();
             let host = match target {
@@ -902,7 +936,7 @@ impl UdpSession for RoutedUdp {
                 Got::Direct(received) => {
                     let (n, source) = received?;
                     if source.port() == 53 {
-                        self.egress.domains.record_response(&buf[..n]);
+                        record_reply(&self.egress, &self.pending, &buf[..n], source);
                     }
                     Ok((n, source))
                 }
@@ -1094,6 +1128,51 @@ mod tests {
             );
         }
         assert!(compile(&EgressConfig::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn records_only_dns_replies_to_the_sessions_own_queries() {
+        fn message(flags: [u8; 2], answers: u8) -> Vec<u8> {
+            let mut message = vec![0x42, 0x42, flags[0], flags[1], 0, 1, 0, answers, 0, 0, 0, 0];
+            for label in ["route", "a", "test"] {
+                message.push(label.len() as u8);
+                message.extend_from_slice(label.as_bytes());
+            }
+            message.extend_from_slice(&[0, 0, 1, 0, 1]);
+            if answers > 0 {
+                message.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                message.extend_from_slice(&[203, 0, 113, 9]);
+            }
+            message
+        }
+        let query = message([0x01, 0x00], 0);
+        let reply = message([0x81, 0x80], 1);
+        let server: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let mapped: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let egress = Egress::new();
+        let pending = Mutex::new(PendingQueries::default());
+
+        // A reply nobody asked for (or a spoofed one) is not recorded.
+        record_reply(&egress, &pending, &reply, server);
+        assert!(egress.domains().lookup(mapped).is_none());
+
+        pending
+            .lock()
+            .unwrap()
+            .note_query(&query, Some(server), Instant::now());
+        // From another address it is still not the answer.
+        record_reply(
+            &egress,
+            &pending,
+            &reply,
+            "198.51.100.1:53".parse().unwrap(),
+        );
+        assert!(egress.domains().lookup(mapped).is_none());
+        record_reply(&egress, &pending, &reply, server);
+        assert_eq!(
+            egress.domains().lookup(mapped).as_deref(),
+            Some("route.a.test")
+        );
     }
 
     #[tokio::test]

@@ -2,24 +2,93 @@
 //!
 //! A client that resolves names itself (or a layer-3 inbound such as iWAN)
 //! asks the node for an IP address, so domain egress routes need the name
-//! the address came from. Every DNS answer relayed through the node (UDP
-//! replies from port 53) is recorded here; an inbound with its own resolver
-//! records its answers with [`DomainCache::record`].
+//! the address came from. A DNS answer relayed through the node (UDP replies
+//! from port 53) is recorded here only when it answers a query the same
+//! session sent through the node: same server, transaction id and question
+//! ([`PendingQueries`]); unsolicited or spoofed replies are ignored, and one
+//! reply records at most [`MAX_ANSWERS_PER_RESPONSE`] addresses. An inbound
+//! with its own resolver records its answers with [`DomainCache::record`].
+//!
+//! The map is bounded; when full, the entry recorded longest ago goes first,
+//! in O(1) (amortised), so a flood of answers cannot stall the lookups that
+//! share its lock.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Entries kept at most; the oldest-expiring go first when full.
+/// Entries kept at most; the one recorded longest ago goes first when full.
 const MAX_ENTRIES: usize = 65_536;
 /// Clients keep answers a little past their TTL; a short TTL still gets this.
 const MIN_TTL: Duration = Duration::from_secs(60);
 const MAX_TTL: Duration = Duration::from_secs(6 * 3600);
+/// Addresses one DNS reply may record; a real answer has a handful, a
+/// reply built to flood the map has thousands.
+pub(crate) const MAX_ANSWERS_PER_RESPONSE: usize = 16;
+/// Queries one UDP session may have outstanding for recording.
+const MAX_PENDING_QUERIES: usize = 64;
+/// How long a relayed query waits for the reply that may be recorded.
+const PENDING_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct Entry {
+    domain: String,
+    expires: Instant,
+    /// Which insertion this is, to tell a live entry from a superseded one
+    /// in the eviction queue.
+    generation: u64,
+}
+
+#[derive(Default)]
+struct Entries {
+    map: HashMap<IpAddr, Entry>,
+    /// Insertion order, oldest first; an item whose generation no longer
+    /// matches the map was overwritten or removed and is skipped.
+    order: VecDeque<(IpAddr, u64)>,
+    next_generation: u64,
+}
+
+impl Entries {
+    fn insert(&mut self, ip: IpAddr, domain: String, expires: Instant) {
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.map.insert(
+            ip,
+            Entry {
+                domain,
+                expires,
+                generation,
+            },
+        );
+        self.order.push_back((ip, generation));
+        while self.map.len() > MAX_ENTRIES {
+            let Some((oldest, generation)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .map
+                .get(&oldest)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                self.map.remove(&oldest);
+            }
+        }
+        // Overwrites leave superseded items behind; drop them once they
+        // outnumber the live ones, which keeps the queue bounded at an
+        // amortised O(1) per insertion.
+        if self.order.len() > 2 * MAX_ENTRIES {
+            let map = &self.map;
+            self.order.retain(|(ip, generation)| {
+                map.get(ip)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct DomainCache {
-    entries: Mutex<HashMap<IpAddr, (String, Instant)>>,
+    entries: Mutex<Entries>,
 }
 
 impl DomainCache {
@@ -34,31 +103,17 @@ impl DomainCache {
         };
         let ip = ip.to_canonical();
         let expires = Instant::now() + ttl.clamp(MIN_TTL, MAX_TTL);
-        let mut entries = self.lock();
-        if entries.len() >= MAX_ENTRIES && !entries.contains_key(&ip) {
-            let now = Instant::now();
-            entries.retain(|_, (_, expires)| *expires > now);
-            if entries.len() >= MAX_ENTRIES {
-                if let Some(oldest) = entries
-                    .iter()
-                    .min_by_key(|(_, (_, expires))| *expires)
-                    .map(|(ip, _)| *ip)
-                {
-                    entries.remove(&oldest);
-                }
-            }
-        }
-        entries.insert(ip, (domain, expires));
+        self.lock().insert(ip, domain, expires);
     }
 
     /// The domain `ip` was last resolved from, while its answer is fresh.
     pub fn lookup(&self, ip: IpAddr) -> Option<String> {
         let ip = ip.to_canonical();
         let mut entries = self.lock();
-        match entries.get(&ip) {
-            Some((domain, expires)) if *expires > Instant::now() => Some(domain.clone()),
+        match entries.map.get(&ip) {
+            Some(entry) if entry.expires > Instant::now() => Some(entry.domain.clone()),
             Some(_) => {
-                entries.remove(&ip);
+                entries.map.remove(&ip);
                 None
             }
             None => None,
@@ -67,26 +122,107 @@ impl DomainCache {
 
     /// Records the A and AAAA answers of a DNS response under the name the
     /// client asked for (not a CNAME target), so a rule for the name the
-    /// user typed matches. Anything that is not a response is ignored.
+    /// user typed matches; at most [`MAX_ANSWERS_PER_RESPONSE`] of them.
+    /// Anything that is not a response is ignored. The caller must have
+    /// matched the response to a query it relayed ([`PendingQueries`]);
+    /// this does not check where the response came from.
     pub fn record_response(&self, message: &[u8]) {
-        for (ip, domain, ttl) in answers(message).unwrap_or_default() {
+        for (ip, domain, ttl) in answers(message)
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_ANSWERS_PER_RESPONSE)
+        {
             self.record(ip, &domain, ttl);
         }
     }
 
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().map.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().map.is_empty()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, (String, Instant)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// The DNS queries one UDP session relayed and still waits for, so only a
+/// reply to one of them (same server, transaction id and question) is
+/// recorded in the [`DomainCache`]. A reply is accepted once.
+#[derive(Default)]
+pub(crate) struct PendingQueries {
+    /// `(transaction id, question name)` to the server the query went to
+    /// (`None` when the target was a name the direct outbound resolves)
+    /// and when the wait ends.
+    entries: HashMap<(u16, String), (Option<SocketAddr>, Instant)>,
+}
+
+impl PendingQueries {
+    /// Notes a query `message` sent to `server`; anything that is not a
+    /// single-question query is ignored.
+    pub(crate) fn note_query(&mut self, message: &[u8], server: Option<SocketAddr>, now: Instant) {
+        let Some((id, false, name)) = question(message) else {
+            return;
+        };
+        if self.entries.len() >= MAX_PENDING_QUERIES {
+            self.entries.retain(|_, (_, deadline)| *deadline > now);
+            if self.entries.len() >= MAX_PENDING_QUERIES {
+                return;
+            }
+        }
+        let server = server.map(canonical);
+        self.entries
+            .insert((id, name), (server, now + PENDING_QUERY_TIMEOUT));
+    }
+
+    /// Whether `message` from `source` answers a noted query; the query is
+    /// forgotten when it does.
+    pub(crate) fn take_reply(&mut self, message: &[u8], source: SocketAddr, now: Instant) -> bool {
+        let Some((id, true, name)) = question(message) else {
+            return false;
+        };
+        let key = (id, name);
+        let Some(&(server, deadline)) = self.entries.get(&key) else {
+            return false;
+        };
+        if deadline <= now {
+            self.entries.remove(&key);
+            return false;
+        }
+        if server.is_some_and(|server| server != canonical(source)) {
+            return false;
+        }
+        self.entries.remove(&key);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn canonical(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(address.ip().to_canonical(), address.port())
+}
+
+/// `(transaction id, is a response, normalised question name)` of a DNS
+/// message with exactly one question.
+fn question(message: &[u8]) -> Option<(u16, bool, String)> {
+    let header = message.get(..12)?;
+    let id = u16::from_be_bytes([header[0], header[1]]);
+    let flags = u16::from_be_bytes([header[2], header[3]]);
+    let questions = u16::from_be_bytes([header[4], header[5]]);
+    if questions != 1 {
+        return None;
+    }
+    let (name, _) = read_name(message, 12)?;
+    Some((id, flags & 0x8000 != 0, normalize(&name)?))
 }
 
 /// A host name as routes match it: lowercase, without the final dot; `None`
@@ -253,6 +389,105 @@ mod tests {
         let mut message = vec![0, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
         message.extend_from_slice(&[0xc0, 12]);
         assert!(answers(&message).is_none());
+    }
+
+    /// A query for `name` with transaction id `id`.
+    fn query(id: u16, name_: &str) -> Vec<u8> {
+        let mut message = id.to_be_bytes().to_vec();
+        message.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        name(&mut message, name_);
+        message.extend_from_slice(&[0, 1, 0, 1]);
+        message
+    }
+
+    #[test]
+    fn records_only_replies_to_relayed_queries() {
+        let now = Instant::now();
+        let server: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let mut pending = PendingQueries::default();
+        let reply = response("chat.example.test"); // id 0x1234
+                                                   // Unsolicited: nothing was asked.
+        assert!(!pending.take_reply(&reply, server, now));
+        pending.note_query(&query(0x1234, "Chat.Example.test"), Some(server), now);
+        // Another server, another id or another question do not match.
+        let other: SocketAddr = "198.51.100.53:53".parse().unwrap();
+        assert!(!pending.take_reply(&reply, other, now));
+        let mut wrong_id = reply.clone();
+        wrong_id[1] = 0x35;
+        assert!(!pending.take_reply(&wrong_id, server, now));
+        assert!(!pending.take_reply(&response("other.example.test"), server, now));
+        // The real reply matches once, from the IPv4-mapped form too.
+        let mapped: SocketAddr = "[::ffff:192.0.2.53]:53".parse().unwrap();
+        assert!(pending.take_reply(&reply, mapped, now));
+        assert!(!pending.take_reply(&reply, server, now));
+        assert_eq!(pending.len(), 0);
+        // A late reply is not recorded.
+        pending.note_query(&query(0x1234, "chat.example.test"), Some(server), now);
+        assert!(!pending.take_reply(&reply, server, now + PENDING_QUERY_TIMEOUT));
+        // A query to a name target matches a reply from wherever it went.
+        pending.note_query(&query(0x1234, "chat.example.test"), None, now);
+        assert!(pending.take_reply(&reply, other, now));
+        // A response is not a query.
+        pending.note_query(&reply, Some(server), now);
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn pending_queries_are_bounded() {
+        let now = Instant::now();
+        let server: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let mut pending = PendingQueries::default();
+        for id in 0..(MAX_PENDING_QUERIES as u16 + 20) {
+            pending.note_query(&query(id, "a.example.test"), Some(server), now);
+        }
+        assert_eq!(pending.len(), MAX_PENDING_QUERIES);
+        // Expired queries make room.
+        let later = now + PENDING_QUERY_TIMEOUT + Duration::from_secs(1);
+        pending.note_query(&query(9999, "b.example.test"), Some(server), later);
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn one_reply_records_a_bounded_number_of_addresses() {
+        let mut message = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0x01, 0x00, 0, 0, 0, 0];
+        name(&mut message, "flood.example.test");
+        message.extend_from_slice(&[0, 1, 0, 1]);
+        for index in 0..256u16 {
+            message.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0x0e, 0x10, 0, 4]);
+            message.extend_from_slice(&[10, 9, (index >> 8) as u8, index as u8]);
+        }
+        let cache = DomainCache::new();
+        cache.record_response(&message);
+        assert_eq!(cache.len(), MAX_ANSWERS_PER_RESPONSE);
+    }
+
+    #[test]
+    fn evicts_the_oldest_entry_in_constant_time_when_full() {
+        let cache = DomainCache::new();
+        let ttl = Duration::from_secs(3600);
+        let address = |index: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + index));
+        for index in 0..MAX_ENTRIES as u32 {
+            cache.record(address(index), "full.example.test", ttl);
+        }
+        assert_eq!(cache.len(), MAX_ENTRIES);
+        // Overwriting an entry refreshes it without growing the map.
+        cache.record(address(0), "again.example.test", ttl);
+        assert_eq!(cache.len(), MAX_ENTRIES);
+        let started = Instant::now();
+        for index in 0..MAX_ENTRIES as u32 {
+            cache.record(address(MAX_ENTRIES as u32 + index), "new.example.test", ttl);
+        }
+        // Two full-table scans per insertion would take minutes here.
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(cache.len(), MAX_ENTRIES);
+        // The entries recorded first went first.
+        assert!(cache.lookup(address(1)).is_none());
+        assert_eq!(
+            cache.lookup(address(2 * MAX_ENTRIES as u32 - 1)).as_deref(),
+            Some("new.example.test")
+        );
+        let entries = cache.lock();
+        assert!(entries.order.len() <= 2 * MAX_ENTRIES);
     }
 
     #[test]
