@@ -69,14 +69,46 @@ impl WindowsSystemProxyOwner {
     }
 }
 
+/// The current user's system proxy as it was before an apply, and what the
+/// apply wrote, so a restore puts back only what still holds this
+/// client's value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsProxySnapshot {
+    /// The WinINet LAN values `ProxyEnable`, `ProxyServer`, `ProxyOverride`.
     pub enabled: bool,
     pub server: String,
     pub bypass: String,
+    /// The machine-wide WinHTTP proxy as it was.
     pub winhttp_access_type: u32,
     pub winhttp_server: String,
     pub winhttp_bypass: String,
+    /// Whether the apply left WinHTTP alone (every snapshot taken since
+    /// 1.0). Older snapshots lack it (`false`): their apply also set WinHTTP
+    /// to the applied proxy, which a restore undoes only while WinHTTP still
+    /// holds exactly that value.
+    #[serde(default)]
+    pub winhttp_untouched: bool,
+    /// The proxy the apply wrote; `None` in snapshots taken before 1.0.
+    #[serde(default)]
+    pub applied: Option<WindowsProxySettings>,
+    /// Every WinINet connection's own settings as they were: the LAN and
+    /// each dial-up / VPN (RAS) entry, including the automatic
+    /// configuration script and automatic detection. Empty in snapshots
+    /// taken before 1.0, whose restore only puts back the LAN values above.
+    #[serde(default)]
+    pub connections: Vec<WindowsConnectionProxySnapshot>,
+}
+
+/// One WinINet connection's proxy settings (`INTERNET_PER_CONN_*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsConnectionProxySnapshot {
+    /// The dial-up / VPN entry name; `None` is the LAN connection.
+    pub connection: Option<String>,
+    /// `PROXY_TYPE_*` flags (direct, proxy, configuration script, detect).
+    pub flags: u32,
+    pub server: String,
+    pub bypass: String,
+    pub auto_config_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

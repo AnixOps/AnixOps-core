@@ -24,6 +24,8 @@ Current status:
 
 `managed` owns the schema-versioned ProgramData configuration and state records.
 `system_integration` calls SCM, WinINet/WinHTTP, CryptoAPI, and NewDev directly
+(the system proxy is applied per WinINet connection; the machine-wide WinHTTP
+proxy is only read, see `docs/architecture/windows-platform-integration.md`)
 and exposes apply, status, rollback, and uninstall operations.
 
 The installed default configuration is intentionally inert: all optional

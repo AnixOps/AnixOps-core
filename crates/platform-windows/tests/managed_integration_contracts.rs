@@ -1,10 +1,11 @@
 use platform_windows::managed::{
     read_managed_config, validate_managed_file_references, windows_managed_data_directory,
-    WindowsDriverPackageConfig, WindowsManagedConfig, WindowsManagedEmbeddedConfig,
-    WindowsManagedNativeMitmConfig, WindowsManagedNativeMitmScriptRuntimeConfig,
-    WindowsManagedState, WindowsProxySettings, WindowsProxySnapshot, WindowsSystemProxyOwner,
-    WINDOWS_MANAGED_CONFIG_INVALID_CODE, WINDOWS_MANAGED_CONFIG_SCHEMA_VERSION,
-    WINDOWS_MANAGED_EMBEDDED_CONFIG_INVALID_CODE, WINDOWS_MANAGED_STATE_SCHEMA_VERSION,
+    WindowsConnectionProxySnapshot, WindowsDriverPackageConfig, WindowsManagedConfig,
+    WindowsManagedEmbeddedConfig, WindowsManagedNativeMitmConfig,
+    WindowsManagedNativeMitmScriptRuntimeConfig, WindowsManagedState, WindowsProxySettings,
+    WindowsProxySnapshot, WindowsSystemProxyOwner, WINDOWS_MANAGED_CONFIG_INVALID_CODE,
+    WINDOWS_MANAGED_CONFIG_SCHEMA_VERSION, WINDOWS_MANAGED_EMBEDDED_CONFIG_INVALID_CODE,
+    WINDOWS_MANAGED_STATE_SCHEMA_VERSION,
 };
 use platform_windows::system_integration::{WindowsServiceState, NETWORKCORE_WINDOWS_SERVICE_NAME};
 use std::collections::BTreeMap;
@@ -121,6 +122,19 @@ fn managed_state_retains_rollback_material_for_system_mutations() {
             winhttp_access_type: 1,
             winhttp_server: String::new(),
             winhttp_bypass: String::new(),
+            winhttp_untouched: true,
+            applied: Some(WindowsProxySettings {
+                enabled: true,
+                server: "127.0.0.1:7890".to_string(),
+                bypass: "<local>".to_string(),
+            }),
+            connections: vec![WindowsConnectionProxySnapshot {
+                connection: None,
+                flags: 0x1 | 0x4,
+                server: String::new(),
+                bypass: String::new(),
+                auto_config_url: "http://wpad.example/proxy.pac".to_string(),
+            }],
         }),
         certificate_sha1: Some("00112233445566778899AABBCCDDEEFF00112233".to_string()),
         driver_inf_path: Some(PathBuf::from(r"C:\driver\netcore.inf")),
@@ -140,6 +154,14 @@ fn managed_state_retains_rollback_material_for_system_mutations() {
     assert_eq!(json["last_transition"], "running");
     assert!(json.get("tunnel_running").is_none());
     assert!(json["proxy_snapshot"].is_object());
+    assert_eq!(json["proxy_snapshot"]["winhttp_untouched"], true);
+    assert_eq!(
+        json["proxy_snapshot"]["connections"][0]["auto_config_url"],
+        "http://wpad.example/proxy.pac"
+    );
+    let restored: WindowsManagedState =
+        serde_json::from_value(json.clone()).expect("managed state deserializes");
+    assert_eq!(restored.proxy_snapshot, state.proxy_snapshot);
     assert_eq!(json["native_mitm_listener"], "127.0.0.1:7890");
     assert!(json["last_error"].is_null());
 }

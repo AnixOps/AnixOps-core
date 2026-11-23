@@ -6,6 +6,7 @@
 
 ### Security
 
+- Windows 系统代理不再改机器级 WinHTTP，并完整保存与恢复 WinINet（platform-windows `system_integration`）：此前 `apply_system_proxy` 把机器级 WinHTTP 代理也设成本机端口，客户端崩溃或被结束后 Windows Update、Defender、证书吊销检查等系统服务一直指向不存在的端口，且该设置在“设置”里看不到；WinINet 只保存 `ProxyEnable`/`ProxyServer`/`ProxyOverride` 三个值，开着自动配置脚本（PAC）或自动检测的网络里浏览器根本不走代理，恢复后 PAC 也不会回来，拨号 / VPN 连接各自的代理从未处理。现在应用只写当前用户的 WinINet：LAN 与每个 RAS 条目分别记录标志、服务器、例外列表与 PAC 地址，写入代理并关闭 PAC 与自动检测；恢复时只写回仍保持写入值的连接，用户之后改过的不覆盖；WinHTTP 只读不写。`WindowsProxySnapshot` 新增 `winhttp_untouched`、`applied`、`connections`（均带默认值，旧快照照常读取）；旧快照恢复 WinHTTP 前核对它仍是当时写入的值，“原值”本身是残留时改为无代理。新增 `read_winhttp_proxy`、`restore_winhttp_proxy_if_unchanged`、`read_current_user_connection_proxies`、`read_current_user_effective_proxy` 与 `WindowsEffectiveProxy::routes_through`，客户端可据此清理旧版本残留、在 PAC 或组策略让流量绕过代理时提示改用 TUN。说明见 `docs/architecture/windows-platform-integration.md`「系统代理」。
 - 节点的地址到域名映射不再能被伪造的 DNS 回包污染（node-runtime `domains`、`egress`）：此前经节点转发、源端口为 53 的任何 UDP 回包都会写进所有用户共享的映射，既不核对本会话是否发过对应查询，也不限制条数；满载后每插入一条都要在全局锁下两次全表扫描。现在每个 UDP 会话记录自己转发的查询（服务器地址、事务 ID、问题名，最多 64 个、10 秒超时），只有与之匹配的回包才被记录且只接受一次；一个回包最多记录 16 个地址；映射满载时按写入先后淘汰，均摊 O(1)。测试：未请求、来源不符、事务 ID 或问题名不符、超时的回包都不入表，单个回包的记录上限，满载插入耗时与淘汰顺序。
 - 直连 UDP 每个会话对同一域名和端口只解析一次（node-runtime `direct`）：此前每个数据报都调用一次系统解析，阻塞线程池被占满，轮换 A 记录还会让同一个 QUIC 流发往不同服务器。现在会话内第一次解析的地址一直沿用（每会话最多 1024 个目标，先进先出淘汰），解析失败记 5 秒；私有地址过滤和 `block_cidrs` 仍对每个数据报检查。
 - Linux 信任证书只安装 CERTIFICATE 块（platform-linux `trust`）：此前只拒绝 `BEGIN PRIVATE KEY`，RSA / EC / ENCRYPTED 私钥与证书合并的 PEM 会以 0644 写入系统信任目录和快照。现在出现任何其他 PEM 块整体拒绝，信任文件显式 0644、快照 0600。
