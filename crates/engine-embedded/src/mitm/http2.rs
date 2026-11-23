@@ -1239,4 +1239,40 @@ mod tests {
         assert_eq!(body.size, MAX_HTTP_BODY_BYTES as u64 + 10);
         assert!(Tap::new(false).into_body().is_none());
     }
+
+    #[test]
+    fn held_bodies_share_the_connections_budget_and_give_it_back() {
+        let budget = BodyBudget::new(100);
+        let left = || budget.left.load(Ordering::Acquire);
+        let mut first = Held::new(&budget);
+        assert!(first.grow(60));
+        {
+            let mut second = Held::new(&budget);
+            assert!(second.grow(30));
+            // A piece that does not fit takes nothing.
+            assert!(!second.grow(11));
+            assert_eq!(left(), 10);
+            assert!(second.grow(10));
+            assert!(!first.grow(1));
+            assert_eq!((first.bytes, second.bytes, left()), (60, 40, 0));
+        }
+        // The second stream ended: exactly what it held is back.
+        assert_eq!(left(), 40);
+        assert!(!first.grow(41));
+        assert!(first.grow(40));
+        assert_eq!(left(), 0);
+        drop(first);
+        assert_eq!(left(), 100);
+    }
+
+    #[test]
+    fn streams_the_relay_fails_are_reset_as_internal_errors_unless_never_sent() {
+        let never_sent = not_sent(h2::Error::from(Reason::REFUSED_STREAM));
+        assert_eq!(reset_reason(&never_sent), (Reason::REFUSED_STREAM, true));
+        // Made here, not by the origin: neither a remote reset nor GOAWAY.
+        let local = io::Error::other(h2::Error::from(Reason::CANCEL));
+        assert_eq!(reset_reason(&local), (Reason::INTERNAL_ERROR, false));
+        let broken = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert_eq!(reset_reason(&broken), (Reason::INTERNAL_ERROR, false));
+    }
 }

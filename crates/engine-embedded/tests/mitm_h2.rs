@@ -12,7 +12,7 @@ use bytes::Bytes;
 use engine_embedded::config::MitmConfig;
 use engine_embedded::connections::Dispatcher;
 use engine_embedded::control;
-use engine_embedded::mitm::MitmEngine;
+use engine_embedded::mitm::{MitmEngine, MAX_BODY_BYTES};
 use engine_embedded::tunnel::{FlowInterceptor, InterceptedFlow};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -748,4 +748,220 @@ async fn an_origin_going_away_finishes_its_streams_and_sends_the_app_away_too() 
         .await
         .expect("the relay ended")
         .unwrap();
+}
+
+/// Bytes of each upload in the body budget test: two fit the relay's
+/// per-connection budget for held bodies (`MAX_HELD_BODY_BYTES`, twice
+/// `MAX_BODY_BYTES`), a third does not, and each alone is under the limit.
+const UPLOAD: usize = MAX_BODY_BYTES * 7 / 10;
+
+/// An HTTP/2 origin that reports each request (`<path> <body length>
+/// <secret|masked|->`) once its body is in, and answers the same text only
+/// after `barrier` saw every request, so all of them are in flight at once.
+struct BarrierOrigin {
+    acceptor: tokio_rustls::TlsAcceptor,
+    requests: mpsc::UnboundedSender<String>,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+impl TcpOutbound for BarrierOrigin {
+    fn protocol(&self) -> &'static str {
+        "test-barrier-origin"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move {
+            let (near, far) = tokio::io::duplex(256 * 1024);
+            let acceptor = self.acceptor.clone();
+            let requests = self.requests.clone();
+            let barrier = self.barrier.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(far).await else {
+                    return;
+                };
+                let Ok(mut connection) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    let requests = requests.clone();
+                    let barrier = barrier.clone();
+                    tokio::spawn(async move {
+                        let (parts, mut body) = request.into_parts();
+                        let data = read_body(&mut body).await;
+                        let has = |needle: &[u8]| data.windows(needle.len()).any(|w| w == needle);
+                        let mark = if has(b"secret") {
+                            "secret"
+                        } else if has(b"masked") {
+                            "masked"
+                        } else {
+                            "-"
+                        };
+                        let text = format!("{} {} {mark}", parts.uri.path(), data.len());
+                        requests.send(text.clone()).unwrap();
+                        barrier.wait().await;
+                        let response = Response::builder()
+                            .status(200)
+                            .header("content-type", "text/plain")
+                            .body(())
+                            .unwrap();
+                        let mut send = respond.send_response(response, false).unwrap();
+                        send.send_data(Bytes::from(text), true).unwrap();
+                    });
+                }
+            });
+            Ok(Box::new(near) as BoxStream)
+        })
+    }
+}
+
+/// Posts `body` as text and reads the answer.
+async fn post_text(client: &h2::client::SendRequest<Bytes>, url: &str, body: Vec<u8>) -> Answer {
+    let mut client = client.clone().ready().await.unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri(url)
+        .header("content-type", "text/plain")
+        .body(())
+        .unwrap();
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+    stream.send_data(Bytes::from(body), true).unwrap();
+    let (parts, mut received) = response.await.unwrap().into_parts();
+    let data = read_body(&mut received).await;
+    Answer {
+        status: parts.status,
+        body: String::from_utf8(data).unwrap(),
+        trailers: None,
+    }
+}
+
+#[tokio::test]
+async fn streams_past_the_connections_body_budget_are_relayed_unchanged() {
+    let device_root = root("NetworkCore Test Device Root");
+    let origin_root = root("NetworkCore Test Origin Root");
+    let mut config = mitm_config(&device_root);
+    config.plugins.push(
+        "#!name = Body\n[Body Rewrite]\nhttp-request ^https://api\\.example\\.test/up/ secret masked\n"
+            .to_string(),
+    );
+    let engine = Arc::new(
+        MitmEngine::new(&config)
+            .unwrap()
+            .with_upstream_config(trusting(&origin_root.certificate, &[b"http/1.1"])),
+    );
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let origin = BarrierOrigin {
+        acceptor: H2Origin::new(&origin_root, requests_tx.clone()).acceptor,
+        requests: requests_tx,
+        barrier: Arc::new(tokio::sync::Barrier::new(3)),
+    };
+    let dispatcher = Arc::new(Dispatcher::single(Arc::new(origin)));
+    control_json(&dispatcher, r#"{"cmd":"set_capture","enabled":true}"#);
+    let target: SocketAddr = "192.0.2.33:443".parse().unwrap();
+
+    let mut upload = b"token=secret&pad=".to_vec();
+    upload.resize(UPLOAD, b'a');
+    let (app, mut tunnel_side) = tokio::io::duplex(256 * 1024);
+    let client = tokio::spawn({
+        let config = trusting(&device_root.certificate, &[b"h2", b"http/1.1"]);
+        async move {
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let tls = connector
+                .connect(ServerName::try_from(HOST).unwrap(), app)
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+            let (client, connection) = h2::client::handshake(tls).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            // One upload after another reaches the origin, each still open
+            // (the origin answers none before all three arrived), so the
+            // first two hold their bodies for the rule all along.
+            let mut answers = Vec::new();
+            for (name, mark) in [("a", "masked"), ("b", "masked"), ("c", "secret")] {
+                let client = client.clone();
+                let url = format!("https://{HOST}/up/{name}");
+                let body = upload.clone();
+                answers.push((
+                    name,
+                    mark,
+                    tokio::spawn(async move { post_text(&client, &url, body).await }),
+                ));
+                // The first two were rewritten; the third found no room
+                // left in the budget and went on whole and unchanged.
+                assert_eq!(
+                    requests.recv().await.unwrap(),
+                    format!("/up/{name} {UPLOAD} {mark}")
+                );
+            }
+            for (name, mark, answer) in answers {
+                let answer = answer.await.unwrap();
+                assert_eq!(answer.status, StatusCode::OK, "{name}");
+                assert_eq!(answer.body, format!("/up/{name} {UPLOAD} {mark}"));
+            }
+        }
+    });
+
+    let mut first = vec![0u8; 4096];
+    let n = tunnel_side.read(&mut first).await.unwrap();
+    first.truncate(n);
+    let host = engine.claim(&first, target).expect("intercepted");
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let dispatcher = dispatcher.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    dispatcher.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), client)
+        .await
+        .expect("client finished")
+        .unwrap();
+
+    // Capture says which upload skipped the rules, and why.
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        let listed = control_json(
+            &dispatcher,
+            r#"{"cmd":"capture_requests","filter":"version:h2"}"#,
+        );
+        rows = listed["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row["url"].as_str().is_some_and(|url| url.contains("/up/")))
+            .collect();
+        if rows.len() == 3 && rows.iter().all(|row| row["status"] == 200) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let row = |name: &str| {
+        rows.iter()
+            .find(|row| row["url"] == format!("https://{HOST}/up/{name}"))
+            .unwrap_or_else(|| panic!("{name}: {rows:?}"))
+    };
+    for name in ["a", "b"] {
+        assert_eq!(row(name)["rules_skipped"], false, "{rows:?}");
+        assert!(row(name)["note"].is_null(), "{rows:?}");
+    }
+    assert_eq!(row("c")["note"], "busy", "{rows:?}");
+    assert_eq!(row("c")["rules_skipped"], true, "{rows:?}");
+    server.abort();
 }
