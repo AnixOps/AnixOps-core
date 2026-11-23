@@ -94,13 +94,27 @@ pub const PLUGIN_ID: &str = "networkcore.ios.mitm";
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Plugin texts handed to one tunnel, in total.
 const MAX_POLICY_BYTES: usize = 8 * 1024 * 1024;
-/// QuickJS heap per script dispatch; the extension's whole budget is ~50 MB.
-/// A large script gets more (6 bytes per source byte plus 4 MiB, at most
-/// 32 MiB), so a script of a few MiB parses.
+/// QuickJS heap per script dispatch. A large script gets more (6 bytes per
+/// source byte plus 4 MiB), up to the whole [`SCRIPT_MEMORY_BUDGET_BYTES`],
+/// so a script of a few MiB parses.
+#[cfg(not(target_os = "ios"))]
 pub const SCRIPT_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
-/// Heap limits of the dispatches running at once, in total: four ordinary
+/// QuickJS heap per script dispatch on iOS, where the Network Extension's
+/// whole memory limit is about 50 MB and the tunnel, its buffers and
+/// capture need their share.
+#[cfg(target_os = "ios")]
+pub const SCRIPT_MEMORY_LIMIT_BYTES: usize = 6 * 1024 * 1024;
+/// Memory of the dispatches running at once, in total: each holds its heap
+/// limit plus four times its body
+/// (`engine_native::QUICKJS_BODY_COPIES_PER_DISPATCH`). Four ordinary
 /// scripts side by side, or one script of a few MiB alone.
+#[cfg(not(target_os = "ios"))]
 pub const SCRIPT_MEMORY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// The iOS total: two ordinary scripts with small bodies side by side, or
+/// one with a body near [`MAX_BODY_BYTES`]; a script's heap never exceeds
+/// it, so a script above about 2 MiB of source may not parse on iOS.
+#[cfg(target_os = "ios")]
+pub const SCRIPT_MEMORY_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// Upper bound for a script's own `timeout`.
 pub const SCRIPT_MAX_TIMEOUT_MS: usize = 3_000;
 const LEAF_CACHE_ENTRIES: usize = 64;

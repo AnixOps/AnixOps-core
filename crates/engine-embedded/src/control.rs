@@ -25,6 +25,7 @@
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
 //! | `network_changed` | | `{"scheduled": network-change script count}` |
+//! | `memory_pressure` | optional `level` (`normal` \| `warning` \| `critical`) | `{"level", "skipped_runs"}`: the iOS extension forwards the system's memory pressure. `warning` drops the cached script sources and bytecode and runs HTTP scripts one at a time; `critical` also stops new script runs (messages pass unchanged, scheduled runs are skipped and counted in `skipped_runs`) until `normal` or `warning` |
 //! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped, "first_wait_forgotten": destinations no longer connected without the first-payload wait, "dns_flushed": DNS answers and resolved addresses dropped, "dns_connections_dropped": kept upstream DNS connections dropped}` |
 //! | `set_network` | optional `type` (`wifi` \| `wired` \| `cellular`), `ssid`, `bssid`, `router`, `addresses` (IPs of the default interface), `radio` (cellular radio technology such as `LTE` or `NR`) | `{"changed": bool}`: the network subnet groups and `SUBNET` / `CELLULAR-RADIO` rules match; all fields absent means unknown |
 //! | `devices` | | `{"devices": {ip: name}}` |
@@ -193,6 +194,10 @@ enum ControlRequest {
     Scripts,
     ScriptNotifications,
     NetworkChanged,
+    MemoryPressure {
+        #[serde(default)]
+        level: Option<String>,
+    },
     ResetNetwork {
         #[serde(default = "default_true")]
         close_connections: bool,
@@ -306,7 +311,14 @@ pub enum ScriptControl {
     Scripts,
     Notifications,
     NetworkChanged,
-    Run { tag: String },
+    Run {
+        tag: String,
+    },
+    /// Sets the scripts' memory pressure level (`normal`, `warning` or
+    /// `critical`) when given; answers the level in force.
+    MemoryPressure {
+        level: Option<String>,
+    },
 }
 
 /// A cron, network-change or generic plugin script.
@@ -548,6 +560,18 @@ pub fn handle_with_interceptor(
             Ok(script(interceptor, ScriptControl::Notifications)?)
         }
         ControlRequest::NetworkChanged => Ok(script(interceptor, ScriptControl::NetworkChanged)?),
+        ControlRequest::MemoryPressure { level } => {
+            if level
+                .as_deref()
+                .is_some_and(|level| !matches!(level, "normal" | "warning" | "critical"))
+            {
+                return Err(invalid("level must be normal, warning or critical"));
+            }
+            Ok(script(
+                interceptor,
+                ScriptControl::MemoryPressure { level },
+            )?)
+        }
         ControlRequest::SetNetwork {
             kind,
             ssid,

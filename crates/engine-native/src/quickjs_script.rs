@@ -23,6 +23,7 @@ use script_runtime::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -42,8 +43,73 @@ pub const QUICKJS_MAX_PENDING_NOTIFICATIONS: usize = 64;
 /// Longest run a scheduled script may ask for.
 pub const QUICKJS_MAX_SCHEDULED_TIMEOUT_SECS: u32 = 300;
 /// Verified script sources kept in memory between dispatches, in total.
-/// Past it a script is read and hashed on every dispatch, as before.
+/// Past it a script is read and hashed on every dispatch, as before. iOS
+/// keeps less: the Network Extension's whole memory limit is about 50 MB.
+#[cfg(not(target_os = "ios"))]
 pub const QUICKJS_SOURCE_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(target_os = "ios")]
+pub const QUICKJS_SOURCE_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Copies of a message body a dispatch holds besides the QuickJS heap (the
+/// body string, the JSON context the script reads, the `$done` output and
+/// the parsed result), counted against the memory budget with the heap.
+pub const QUICKJS_BODY_COPIES_PER_DISPATCH: usize = 4;
+
+/// How hard the host's memory is pressed, as the platform reports it (the
+/// iOS Network Extension's memory pressure source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptMemoryPressure {
+    /// Scripts run as configured.
+    Normal,
+    /// Caches are dropped and HTTP script dispatches run one at a time.
+    Warning,
+    /// Caches are dropped and no new script runs: HTTP messages pass
+    /// unchanged, as when a script is deferred, and scheduled runs are
+    /// skipped, until the pressure is back to normal or a warning.
+    Critical,
+}
+
+impl ScriptMemoryPressure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn parse(level: &str) -> Option<Self> {
+        match level {
+            "normal" => Some(Self::Normal),
+            "warning" => Some(Self::Warning),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Warning,
+            2 => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Warning => 1,
+            Self::Critical => 2,
+        }
+    }
+}
+
+/// Memory pressure state shared by every clone of an executor.
+#[derive(Debug, Default)]
+struct PressureState {
+    level: AtomicU8,
+    /// Dispatches and scheduled runs skipped under critical pressure.
+    skipped: AtomicU64,
+}
 
 /// What a scheduled, event or generic script run is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +165,7 @@ pub struct NativeQuickJsScriptExecutor {
     /// Sources that matched their pinned hash, by script URL, so a dispatch
     /// does not read and hash a script of up to 4 MiB on every request.
     sources: Arc<Mutex<SourceCache>>,
+    pressure: Arc<PressureState>,
 }
 
 /// Verified sources with the file metadata they were read under. A file
@@ -189,12 +256,15 @@ impl NativeQuickJsScriptExecutor {
             notifications: Arc::default(),
             budget: None,
             sources: Arc::default(),
+            pressure: Arc::default(),
         })
     }
 
-    /// Caps the heap limits of the dispatches that run at once at `bytes`;
-    /// a dispatch that does not fit waits for others to finish. Without it
-    /// dispatches run side by side, each within its own limit.
+    /// Caps the memory of the dispatches that run at once at `bytes`: each
+    /// holds its heap limit plus [`QUICKJS_BODY_COPIES_PER_DISPATCH`] times
+    /// its body, and no heap limit exceeds `bytes`. A dispatch that does not
+    /// fit waits for others to finish. Without it dispatches run side by
+    /// side, each within its own limit.
     pub fn with_memory_budget(mut self, bytes: usize) -> Self {
         self.budget = (bytes > 0).then(|| Arc::new(MemoryBudget::new(bytes)));
         self
@@ -209,6 +279,50 @@ impl NativeQuickJsScriptExecutor {
 
     pub fn config(&self) -> &NativeQuickJsScriptRuntimeConfig {
         &self.config
+    }
+
+    /// Tells the executor how hard the host's memory is pressed. A warning
+    /// or critical level drops the cached script sources and bytecode (they
+    /// are read and compiled again when needed); see [`ScriptMemoryPressure`]
+    /// for what each level does to new runs. Runs already going finish.
+    pub fn set_memory_pressure(&self, level: ScriptMemoryPressure) {
+        self.pressure.level.store(level.to_u8(), Ordering::Release);
+        if level != ScriptMemoryPressure::Normal {
+            if let Ok(mut sources) = self.sources.lock() {
+                *sources = SourceCache::default();
+            }
+            self.runtime.clear_bytecode_cache();
+        }
+    }
+
+    /// The current memory pressure level and how many script runs it
+    /// skipped since the executor was built.
+    pub fn memory_pressure(&self) -> (ScriptMemoryPressure, u64) {
+        (
+            ScriptMemoryPressure::from_u8(self.pressure.level.load(Ordering::Acquire)),
+            self.pressure.skipped.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `true`, counting the skip, when critical pressure stops a new run.
+    fn skipped_for_pressure(&self) -> bool {
+        let critical = self.memory_pressure().0 == ScriptMemoryPressure::Critical;
+        if critical {
+            self.pressure.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        critical
+    }
+
+    /// Holds the memory a run needs: `heap` plus the body copies, all of
+    /// the budget under a warning so runs go one at a time.
+    fn reserve(&self, heap: usize, body_bytes: usize) -> Option<BudgetGrant> {
+        let budget = self.budget.as_ref()?;
+        let bytes = if self.memory_pressure().0 == ScriptMemoryPressure::Warning {
+            budget.total
+        } else {
+            heap.saturating_add(body_bytes.saturating_mul(QUICKJS_BODY_COPIES_PER_DISPATCH))
+        };
+        Some(budget.acquire(bytes))
     }
 
     pub fn script_asset_hashes(&self) -> &BTreeMap<String, String> {
@@ -242,10 +356,28 @@ impl NativeQuickJsScriptExecutor {
                 "native HTTP script dispatch body exceeds the max-size limit",
             );
         }
+        if self.skipped_for_pressure() {
+            return script_execution_deferred(
+                "native HTTP script dispatch skipped while memory is critically low",
+            );
+        }
         let source = match self.script_source(&dispatch.script_path) {
             Ok(source) => source,
             Err(reason) => return script_execution_deferred(reason),
         };
+        // Held from before the body is copied for the script until the run
+        // is over, so the copies count against the budget too.
+        let memory_limit_bytes = self.memory_limit(source.len());
+        let body_bytes = if dispatch.requires_body {
+            message.body.len()
+                + message
+                    .request_body
+                    .as_ref()
+                    .map_or(0, |body| body.len().min(max_body_bytes))
+        } else {
+            0
+        };
+        let _grant = self.reserve(memory_limit_bytes, body_bytes);
         // Outside binary-body-mode a body that is not UTF-8 still reaches a
         // script that reads Quantumult X `bodyBytes` (protobuf, images), as
         // bytes only; other text scripts cannot use it and are deferred.
@@ -329,18 +461,12 @@ impl NativeQuickJsScriptExecutor {
         let timeout_ms = bounded_script_timeout(dispatch.timeout_ms, self.config.max_timeout_ms);
         let limits = ScriptLimits {
             timeout: Duration::from_millis(timeout_ms as u64),
-            memory_limit_bytes: self.memory_limit(source.len()),
+            memory_limit_bytes,
             max_body_bytes,
             ..ScriptLimits::default()
         };
 
-        let outcome = {
-            let _grant = self
-                .budget
-                .as_ref()
-                .map(|budget| budget.acquire(limits.memory_limit_bytes));
-            self.runtime.run(&source, &invocation, &limits)
-        };
+        let outcome = self.runtime.run(&source, &invocation, &limits);
         self.queue_notifications(&outcome.notifications);
         if let ScriptRunStatus::Failed(failure) = &outcome.status {
             return NativeHttpScriptExecutionReport {
@@ -421,6 +547,14 @@ impl NativeQuickJsScriptExecutor {
     /// Runs a cron, event or generic script. Blocks for up to the run's
     /// timeout, so async callers run it on a blocking thread.
     pub fn execute_scheduled(&self, run: &NativeScheduledScriptRun) -> NativeScheduledScriptReport {
+        if self.skipped_for_pressure() {
+            return NativeScheduledScriptReport {
+                executed: false,
+                status: "memory_pressure".to_string(),
+                notifications: Vec::new(),
+                logs: Vec::new(),
+            };
+        }
         let source = match self.script_source(&run.script_url) {
             Ok(source) => source,
             Err(reason) => {
@@ -452,10 +586,7 @@ impl NativeQuickJsScriptExecutor {
             ..ScriptLimits::default()
         };
         let outcome = {
-            let _grant = self
-                .budget
-                .as_ref()
-                .map(|budget| budget.acquire(limits.memory_limit_bytes));
+            let _grant = self.reserve(limits.memory_limit_bytes, 0);
             self.runtime.run(&source, &invocation, &limits)
         };
         self.queue_notifications(&outcome.notifications);
@@ -473,14 +604,25 @@ impl NativeQuickJsScriptExecutor {
     }
 
     /// The configured heap limit, raised for a large script so it can be
-    /// parsed at all, up to [`QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES`].
+    /// parsed at all, up to [`QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES`], and
+    /// never past the memory budget: the heap QuickJS enforces is the one
+    /// the budget accounts for.
     fn memory_limit(&self, source_len: usize) -> usize {
         let configured = if self.config.memory_limit_bytes == 0 {
             QUICKJS_DEFAULT_MEMORY_LIMIT_BYTES
         } else {
             self.config.memory_limit_bytes
         };
-        scaled_memory_limit(configured, source_len)
+        let limit = scaled_memory_limit(configured, source_len);
+        match &self.budget {
+            Some(budget) => limit.min(budget.total),
+            None => limit,
+        }
+    }
+
+    /// The heap limit a dispatch of a script of `source_len` bytes gets.
+    pub fn dispatch_memory_limit(&self, source_len: usize) -> usize {
+        self.memory_limit(source_len)
     }
 
     fn queue_notifications(&self, notifications: &[ScriptNotification]) {
