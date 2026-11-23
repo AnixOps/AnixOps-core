@@ -2265,3 +2265,137 @@ fn empty_rewrite_plan() -> sys::AnixOpsRewritePlan {
         script: empty_script_result(),
     }
 }
+
+#[cfg(test)]
+mod engine_pool_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The pool is shared by the whole test binary; these tests run one at
+    /// a time so the idle budget of one does not evict the other's engine.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A policy rejecting `/ads`, padded with comment lines tagged `tag` to
+    /// at least `min_bytes`.
+    fn policy(tag: &str, min_bytes: usize) -> String {
+        let plugin = loon_plugin::import_loon_plugin(concat!(
+            "#!name = Pool\n",
+            "[Rewrite]\n",
+            "^https://a\\.example\\.test/ads reject\n",
+        ))
+        .expect("plugin should import");
+        let mut source = loon_plugin::merged_plugin_source("Pool", &[&plugin]);
+        source.push_str(&format!("\n# engine pool test {tag}"));
+        let mut line = 0usize;
+        while source.len() < min_bytes {
+            source.push_str(&format!("\n# {tag} padding line {line:08}"));
+            line += 1;
+        }
+        source.push('\n');
+        source
+    }
+
+    fn live(source: &str) -> usize {
+        lock_engine_pool().live(PolicyFingerprint::of(source))
+    }
+
+    #[test]
+    fn acquire_at_the_limit_reuses_the_returned_engine() {
+        let _serial = serial();
+        let source = policy("reuse", 3 * 1024 * 1024);
+        assert_eq!(engines_per_revision(PolicyFingerprint::of(&source)), 1);
+
+        let loads_before = policy_loads_on_this_thread();
+        let mut first = EngineLease::acquire(&source, WhenAtLimit::Wait)
+            .expect("policy loads")
+            .expect("Wait always answers an engine");
+        assert_eq!(policy_loads_on_this_thread(), loads_before + 1);
+        assert_eq!(live(&source), 1);
+        assert!(
+            EngineLease::acquire(&source, WhenAtLimit::GiveUp)
+                .expect("acquire answers")
+                .is_none(),
+            "the revision's only engine is leased"
+        );
+
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let before = policy_loads_on_this_thread();
+                let mut second = EngineLease::acquire(&source, WhenAtLimit::Wait)
+                    .expect("policy loads")
+                    .expect("Wait always answers an engine");
+                second.keep();
+                policy_loads_on_this_thread() - before
+            });
+            // Give the waiter time to block on the full revision; if it has
+            // not yet, it finds the returned engine idle instead.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            first.keep();
+            drop(first);
+            assert_eq!(
+                waiter.join().expect("waiter finishes"),
+                0,
+                "the waiter loaded the policy instead of reusing the engine"
+            );
+        });
+        assert_eq!(live(&source), 1);
+
+        release_compiled_policy(&source);
+        assert_eq!(live(&source), 0);
+    }
+
+    #[test]
+    fn engines_of_a_revision_never_exceed_the_limit() {
+        let _serial = serial();
+        const THREADS: usize = 8;
+        // A large policy is loaded again after each lease ended without
+        // keep, so it plans fewer rounds.
+        for (tag, min_bytes, rounds) in [("small", 0, 16), ("large", 3 * 1024 * 1024, 4)] {
+            let source = policy(tag, min_bytes);
+            let limit = engines_per_revision(PolicyFingerprint::of(&source));
+            let peak = AtomicUsize::new(0);
+            let loads: u64 = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..THREADS)
+                    .map(|index| {
+                        let (source, peak) = (&source, &peak);
+                        scope.spawn(move || {
+                            let before = policy_loads_on_this_thread();
+                            for round in 0..rounds {
+                                let mut lease = EngineLease::acquire(source, WhenAtLimit::Wait)
+                                    .expect("policy loads")
+                                    .expect("Wait always answers an engine");
+                                peak.fetch_max(live(source), Ordering::Relaxed);
+                                std::thread::yield_now();
+                                // Some leases end without keep, as on an
+                                // error; their place is freed for a waiter.
+                                if (index + round) % 5 != 0 {
+                                    lease.keep();
+                                }
+                            }
+                            policy_loads_on_this_thread() - before
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("worker finishes"))
+                    .sum()
+            });
+            let peak = peak.into_inner();
+            assert!(
+                (1..=limit).contains(&peak),
+                "{tag}: {peak} engines live, limit {limit}"
+            );
+            assert!(loads >= 1, "{tag}: nothing loaded");
+            assert!(live(&source) <= limit);
+            release_compiled_policy(&source);
+            assert_eq!(live(&source), 0, "{tag}: release leaves no engine counted");
+        }
+    }
+}
