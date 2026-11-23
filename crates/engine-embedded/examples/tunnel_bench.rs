@@ -6,9 +6,19 @@
 //! ```
 //!
 //! `tunnel_bench run` starts two child processes of itself: `server` (data
-//! source/sink, plus a Shadowsocks-2022 server in front of it) and `tunnel`
-//! (the TUN device and one [`Tunnel`]). Only the tunnel process is measured
-//! for CPU, wakeups and memory, so the numbers are what the extension costs.
+//! source/sink, plus one in-process server per protocol in front of it) and
+//! `tunnel` (the TUN device and one [`Tunnel`] whose outbound is the client of
+//! that protocol, built from the same JSON settings as in the product). Only
+//! the tunnel process is measured for CPU, wakeups and memory, so the numbers
+//! are what the extension costs.
+//!
+//! Outbounds (`--outbound`): `redirect` (no protocol: the tunnel's own cost),
+//! `ss2022` (Shadowsocks 2022, AES-128-GCM), `trojan` (TLS), `vless` (TLS),
+//! `vless-reality` (REALITY, default fingerprint), `vmess`
+//! (AES-128-GCM), `socks5`, `http` (HTTP CONNECT) and `wireguard` (the
+//! routable WireGuard outbound with its own userspace stack, against a
+//! boringtun peer that ends the flows in a second [`Tunnel`]). TLS servers use
+//! a self-signed certificate that the client pins by SHA-256.
 //!
 //! The TUN device must already exist and belong to the current user, e.g.
 //!
@@ -19,7 +29,7 @@
 //! cargo run --release -p engine-embedded --example tunnel_bench -- run --tun ncb0 --json out.json
 //! ```
 //!
-//! Options of `run`: `--tun NAME`, `--outbound redirect|ss2022`, `--seconds N`
+//! Options of `run`: `--tun NAME`, `--outbound NAME` (see above), `--seconds N`
 //! (per throughput test), `--window-kib N`, `--max-conns N`, `--conns N`
 //! (memory test), `--connects N` (latency test), `--workers N` (tunnel
 //! worker threads; 0 or absent is the platform default, as in the product),
@@ -68,20 +78,29 @@ mod linux {
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::RawFd;
     use std::process::{Child, Command, Stdio};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use base64::Engine as _;
+    use boringtun::noise::{Tunn, TunnResult};
+    use boringtun::x25519::{PublicKey, StaticSecret};
     use engine_embedded::dns_policy::DnsPolicy;
+    use engine_embedded::protocols::default_registry;
     use engine_embedded::shadowsocks::{Method, Ss2022Outbound};
     use engine_embedded::tunnel::{default_worker_threads, PacketSink, Tunnel, TunnelSettings};
+    use engine_inbound::registry::InboundFactory;
     use engine_inbound::server::{serve, InboundStats, ServeSettings};
+    use engine_inbound::StreamInbound;
     use engine_outbound::{
         BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpDialer, TcpOutbound,
         UdpFlow,
     };
+    use inbound_mixed::{MixedSettings, MixedStats};
     use inbound_shadowsocks::Ss2022Inbound;
+    use inbound_trojan::TrojanInboundFactory;
+    use inbound_vless::VlessInboundFactory;
+    use inbound_vmess::VmessInboundFactory;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -89,6 +108,34 @@ mod linux {
     const TARGET: &str = "198.18.0.2:5201";
     const CHUNK: usize = 64 * 1024;
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    /// Every outbound `--outbound` accepts, in the order the scale job runs
+    /// them.
+    const OUTBOUNDS: [&str; 9] = [
+        "redirect",
+        "ss2022",
+        "trojan",
+        "vless",
+        "vless-reality",
+        "vmess",
+        "socks5",
+        "http",
+        "wireguard",
+    ];
+    /// Name in the self-signed certificate of the TLS servers.
+    const TLS_NAME: &str = "bench.test";
+    const PASSWORD: &str = "tunnel-bench";
+    const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    /// REALITY: server key, short id and the server name the client sends.
+    const REALITY_KEY: [u8; 32] = [0x61; 32];
+    const REALITY_SHORT_ID: &str = "0123456789abcdef";
+    const REALITY_NAME: &str = "www.example.com";
+    /// WireGuard: client and peer keys, the client's tunnel address and the
+    /// MTU on both sides.
+    const WG_CLIENT_KEY: [u8; 32] = [7; 32];
+    const WG_PEER_KEY: [u8; 32] = [9; 32];
+    const WG_ADDRESS: &str = "10.7.0.2/32";
+    const WG_MTU: u16 = 1420;
 
     type Args = HashMap<String, String>;
 
@@ -109,7 +156,7 @@ mod linux {
             "server" => server_child(),
             "tunnel" => tunnel_child(&args),
             _ => Err(io::Error::other(
-                "usage: tunnel_bench run|scale --tun NAME [--outbound redirect|ss2022] [--json PATH] \
+                "usage: tunnel_bench run|scale --tun NAME [--outbound NAME] [--json PATH] \
                  | tunnel_bench udp-sessions --flows N [--json PATH]",
             )),
         }
@@ -170,13 +217,19 @@ mod linux {
     // ---- server process -------------------------------------------------
 
     fn server_child() -> io::Result<()> {
+        // Bound before the runtime: the WireGuard peer's tunnel needs the
+        // sink's port and starts its own runtime.
+        let sink = TcpListener::bind("127.0.0.1:0")?;
+        sink.set_nonblocking(true)?;
+        let sink_addr = sink.local_addr()?;
+        let wireguard_port = wireguard_peer(sink_addr)?;
+        let (certificate, private_key, pin) = self_signed()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            let sink_addr = sink.local_addr()?;
+            let sink = tokio::net::TcpListener::from_std(sink)?;
             tokio::spawn(async move {
                 while let Ok((stream, _)) = sink.accept().await {
                     tokio::spawn(async move {
@@ -184,29 +237,217 @@ mod linux {
                     });
                 }
             });
-            let ss = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            let ss_port = ss.local_addr()?.port();
-            let inbound = Arc::new(Ss2022Inbound::new(
+            let redirect: Arc<dyn TcpOutbound> = Arc::new(Redirect(sink_addr));
+            let tls = json!({"certificate": certificate, "key": private_key});
+            let user = |key: &str, value: &str| json!([{"name": "bench", key: value}]);
+            let ss: Arc<dyn StreamInbound> = Arc::new(Ss2022Inbound::new(
                 inbound_shadowsocks::Method::Aes128Gcm,
                 &key(),
                 false,
             )?);
-            tokio::spawn(serve(
-                ss,
-                inbound,
-                Arc::new(Redirect(sink_addr)),
-                // The default cap (4096) is below the scale test's count.
-                ServeSettings {
+            let built = |factory: &dyn InboundFactory,
+                         settings: Value|
+             -> io::Result<Arc<dyn StreamInbound>> {
+                let settings = settings
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("inbound settings are not an object"))?;
+                factory
+                    .build(&settings)
+                    .map_err(|err| io::Error::other(format!("{}: {err}", factory.type_name())))
+            };
+            let inbounds = [
+                ("ss", ss),
+                (
+                    "trojan",
+                    built(
+                        &TrojanInboundFactory,
+                        json!({"users": user("password", PASSWORD), "tls": tls}),
+                    )?,
+                ),
+                (
+                    "vless",
+                    built(
+                        &VlessInboundFactory,
+                        json!({"users": user("uuid", UUID), "tls": tls}),
+                    )?,
+                ),
+                (
+                    "reality",
+                    built(
+                        &VlessInboundFactory,
+                        json!({
+                            "users": user("uuid", UUID),
+                            "reality": {
+                                "private_key": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .encode(REALITY_KEY),
+                                "short_ids": [REALITY_SHORT_ID],
+                                "server_names": [REALITY_NAME],
+                                // Only clients that fail authentication go
+                                // there; the bench has none.
+                                "handshake": {"server": "127.0.0.1", "server_port": sink_addr.port()},
+                            }
+                        }),
+                    )?,
+                ),
+                (
+                    "vmess",
+                    built(&VmessInboundFactory, json!({"users": user("uuid", UUID)}))?,
+                ),
+            ];
+            let mut ports = vec![format!("sink={}", sink_addr.port())];
+            for (name, inbound) in inbounds {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                ports.push(format!("{name}={}", listener.local_addr()?.port()));
+                tokio::spawn(serve(
+                    listener,
+                    inbound,
+                    redirect.clone(),
+                    // The default cap (4096) is below the scale test's count.
+                    ServeSettings {
+                        max_connections: 1 << 20,
+                        ..ServeSettings::default()
+                    },
+                    Arc::new(InboundStats::default()),
+                ));
+            }
+            // SOCKS5 and HTTP CONNECT share one listener, as in the product.
+            let mixed = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            ports.push(format!("mixed={}", mixed.local_addr()?.port()));
+            tokio::spawn(inbound_mixed::serve(
+                mixed,
+                redirect.clone(),
+                MixedSettings {
                     max_connections: 1 << 20,
-                    ..ServeSettings::default()
+                    ..MixedSettings::default()
                 },
-                Arc::new(InboundStats::default()),
+                Arc::new(MixedStats::default()),
             ));
-            println!("READY {} {}", sink_addr.port(), ss_port);
+            ports.push(format!("wireguard={wireguard_port}"));
+            ports.push(format!("pin={pin}"));
+            println!("READY {}", ports.join(" "));
             io::stdout().flush()?;
             std::future::pending::<()>().await;
             Ok::<(), io::Error>(())
         })
+    }
+
+    /// A self-signed certificate for [`TLS_NAME`]: PEM certificate, PEM key
+    /// and the certificate's SHA-256 in hex, which the clients pin.
+    fn self_signed() -> io::Result<(String, String, String)> {
+        let key = rcgen::KeyPair::generate().map_err(io::Error::other)?;
+        let certificate = rcgen::CertificateParams::new(vec![TLS_NAME.to_string()])
+            .map_err(io::Error::other)?
+            .self_signed(&key)
+            .map_err(io::Error::other)?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, certificate.der());
+        let pin = digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok((certificate.pem(), key.serialize_pem(), pin))
+    }
+
+    fn wireguard_public(private: [u8; 32]) -> [u8; 32] {
+        PublicKey::from(&StaticSecret::from(private)).to_bytes()
+    }
+
+    /// The WireGuard server: a boringtun peer on a UDP port whose decrypted
+    /// packets go to a second [`Tunnel`], which ends every TCP flow and
+    /// relays it to `sink`. Returns the UDP port.
+    fn wireguard_peer(sink: SocketAddr) -> io::Result<u16> {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let port = socket.local_addr()?.port();
+        // The noise session and the client's address, shared by the receive
+        // loop, the timers and the tunnel's packet sink.
+        let state = Arc::new(Mutex::new((
+            Tunn::new(
+                StaticSecret::from(WG_PEER_KEY),
+                PublicKey::from(wireguard_public(WG_CLIENT_KEY)),
+                None,
+                None,
+                1,
+                None,
+            ),
+            None::<SocketAddr>,
+        )));
+        let sender = socket.try_clone()?;
+        let sealer = state.clone();
+        let sink_packets: PacketSink = Box::new(move |packet: &[u8]| {
+            let mut sealed = vec![0u8; packet.len() + 148];
+            let mut state = sealer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(peer) = state.1 else {
+                return;
+            };
+            if let TunnResult::WriteToNetwork(datagram) = state.0.encapsulate(packet, &mut sealed) {
+                let _ = sender.send_to(datagram, peer);
+            }
+        });
+        let settings = tunnel_settings(WG_MTU, 64 * 1024, 1 << 16, 2);
+        let tunnel = Arc::new(Tunnel::start(
+            settings,
+            Arc::new(Redirect(sink)),
+            sink_packets,
+        )?);
+
+        let receiver = socket.try_clone()?;
+        let opened = state.clone();
+        thread::Builder::new()
+            .name("wg-peer".into())
+            .spawn(move || {
+                let mut datagram = vec![0u8; 65_536];
+                let mut out = vec![0u8; 65_536 + 148];
+                while let Ok((len, from)) = receiver.recv_from(&mut datagram) {
+                    let mut input = &datagram[..len];
+                    let mut state = opened
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.1 = Some(from);
+                    loop {
+                        let packet = match state.0.decapsulate(Some(from.ip()), input, &mut out) {
+                            // A handshake answer, then packets queued before
+                            // it: repeat with no input until done.
+                            TunnResult::WriteToNetwork(reply) => {
+                                let _ = receiver.send_to(reply, from);
+                                input = &[];
+                                continue;
+                            }
+                            TunnResult::WriteToTunnelV4(packet, _)
+                            | TunnResult::WriteToTunnelV6(packet, _) => packet.to_vec(),
+                            _ => Vec::new(),
+                        };
+                        // The tunnel may answer through the sink, which
+                        // takes the lock.
+                        drop(state);
+                        if !packet.is_empty() {
+                            tunnel.input_packet(&packet);
+                        }
+                        break;
+                    }
+                }
+            })?;
+        let ticker = state;
+        thread::Builder::new()
+            .name("wg-timers".into())
+            .spawn(move || {
+                let mut out = vec![0u8; 65_536 + 148];
+                loop {
+                    thread::sleep(Duration::from_millis(250));
+                    let mut state = ticker
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let peer = state.1;
+                    if let (TunnResult::WriteToNetwork(datagram), Some(peer)) =
+                        (state.0.update_timers(&mut out), peer)
+                    {
+                        let _ = socket.send_to(datagram, peer);
+                    }
+                }
+            })?;
+        Ok(port)
     }
 
     /// One command byte, then: `D` streams data until the peer leaves, `U`
@@ -246,26 +487,13 @@ mod linux {
 
     // ---- tunnel process -------------------------------------------------
 
-    fn tunnel_child(args: &Args) -> io::Result<()> {
-        let sink_port = num(args, "sink", 0)? as u16;
-        let ss_port = num(args, "ss", 0)? as u16;
-        let fd = open_tun(arg(args, "tun", "ncb0"))?;
-        let outbound: Arc<dyn TcpOutbound> = match arg(args, "outbound", "redirect") {
-            "redirect" => Arc::new(Redirect(SocketAddr::from(([127, 0, 0, 1], sink_port)))),
-            "ss2022" => Arc::new(Ss2022Outbound::new(
-                "127.0.0.1",
-                ss_port,
-                Method::Aes128Gcm,
-                &key(),
-                Arc::new(TcpDialer),
-            )?),
-            other => return Err(io::Error::other(format!("unknown outbound {other}"))),
-        };
-        let settings = TunnelSettings {
-            mtu: num(args, "mtu", 1500)? as u16,
-            tcp_window_bytes: (num(args, "window-kib", 64)? * 1024) as u32,
-            max_tcp_connections: num(args, "max-conns", 128)? as usize,
-            max_udp_flows: num(args, "max-udp-flows", 256)? as usize,
+    /// The tunnel settings of the product for a bench tunnel.
+    fn tunnel_settings(mtu: u16, window: u32, max_conns: usize, workers: usize) -> TunnelSettings {
+        TunnelSettings {
+            mtu,
+            tcp_window_bytes: window,
+            max_tcp_connections: max_conns,
+            max_udp_flows: 256,
             tcp_evict_idle: engine_embedded::tunnel::DEFAULT_TCP_EVICT_IDLE,
             udp_evict_idle: engine_embedded::tunnel::DEFAULT_UDP_EVICT_IDLE,
             max_dns_in_flight: 32,
@@ -275,8 +503,130 @@ mod linux {
                 SocketAddr::from(([127, 0, 0, 1], 53)),
                 Duration::from_secs(5),
             )),
-            worker_threads: workers(args)?,
+            worker_threads: workers,
+        }
+    }
+
+    /// The outbound named by `--outbound`, aimed at the server process whose
+    /// ports (and certificate pin) arrive as `--sink`, `--ss`, `--trojan`, ...
+    fn bench_outbound(args: &Args) -> io::Result<Arc<dyn TcpOutbound>> {
+        let port = |key: &str| -> io::Result<u16> {
+            match num(args, key, 0)? {
+                0 => Err(io::Error::other(format!(
+                    "the server reported no --{key} port"
+                ))),
+                port => u16::try_from(port).map_err(io::Error::other),
+            }
         };
+        let tls = || {
+            json!({
+                "server_name": TLS_NAME,
+                "insecure": true,
+                "pinned_certificate_sha256": [arg(args, "pin", "")],
+            })
+        };
+        let (kind, settings) = match arg(args, "outbound", "redirect") {
+            "redirect" => {
+                return Ok(Arc::new(Redirect(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    port("sink")?,
+                )))))
+            }
+            "ss2022" => {
+                return Ok(Arc::new(Ss2022Outbound::new(
+                    "127.0.0.1",
+                    port("ss")?,
+                    Method::Aes128Gcm,
+                    &key(),
+                    Arc::new(TcpDialer),
+                )?))
+            }
+            // WebPKI cannot vouch for the self-signed certificate; the pin
+            // checks it instead.
+            "trojan" => (
+                "trojan",
+                json!({
+                    "server": "127.0.0.1",
+                    "port": port("trojan")?,
+                    "password": PASSWORD,
+                    "server_name": TLS_NAME,
+                    "insecure": true,
+                    "pinned_certificate_sha256": [arg(args, "pin", "")],
+                }),
+            ),
+            "vless" => (
+                "vless",
+                json!({"server": "127.0.0.1", "port": port("vless")?, "uuid": UUID, "tls": tls()}),
+            ),
+            "vless-reality" => (
+                "vless",
+                json!({
+                    "server": "127.0.0.1",
+                    "port": port("reality")?,
+                    "uuid": UUID,
+                    "reality": {
+                        "server_name": REALITY_NAME,
+                        "public_key": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(wireguard_public(REALITY_KEY)),
+                        "short_id": REALITY_SHORT_ID,
+                    },
+                }),
+            ),
+            "vmess" => (
+                "vmess",
+                json!({
+                    "server": "127.0.0.1",
+                    "port": port("vmess")?,
+                    "uuid": UUID,
+                    "security": "aes-128-gcm",
+                }),
+            ),
+            "socks5" => (
+                "socks",
+                json!({"server": "127.0.0.1", "port": port("mixed")?}),
+            ),
+            "http" => (
+                "http",
+                json!({"server": "127.0.0.1", "port": port("mixed")?}),
+            ),
+            "wireguard" => (
+                "wireguard",
+                json!({
+                    "server": "127.0.0.1",
+                    "port": port("wireguard")?,
+                    "private_key": base64::engine::general_purpose::STANDARD.encode(WG_CLIENT_KEY),
+                    "peer_public_key": base64::engine::general_purpose::STANDARD
+                        .encode(wireguard_public(WG_PEER_KEY)),
+                    "local_address": [WG_ADDRESS],
+                    "mtu": WG_MTU,
+                }),
+            ),
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown outbound {other}; one of {}",
+                    OUTBOUNDS.join(", ")
+                )))
+            }
+        };
+        let settings = settings
+            .as_object()
+            .cloned()
+            .ok_or_else(|| io::Error::other("outbound settings are not an object"))?;
+        default_registry()
+            .build(kind, &settings, Arc::new(TcpDialer))
+            .map_err(|err| io::Error::other(format!("{kind} outbound: {err}")))
+    }
+
+    fn tunnel_child(args: &Args) -> io::Result<()> {
+        let fd = open_tun(arg(args, "tun", "ncb0"))?;
+        let outbound = bench_outbound(args)?;
+        let mut settings = tunnel_settings(
+            num(args, "mtu", 1500)? as u16,
+            (num(args, "window-kib", 64)? * 1024) as u32,
+            num(args, "max-conns", 128)? as usize,
+            workers(args)?,
+        );
+        settings.max_udp_flows = num(args, "max-udp-flows", 256)? as usize;
         let sink: PacketSink = Box::new(move |packet: &[u8]| {
             // SAFETY: `fd` stays open for the life of the process.
             let _ = unsafe { libc::write(fd, packet.as_ptr().cast(), packet.len()) };
@@ -450,16 +800,17 @@ mod linux {
     fn start(args: &Args) -> io::Result<(Children, f64)> {
         let outbound = arg(args, "outbound", "redirect").to_string();
         let (server, ports) = spawn_child(&["server"])?;
-        let (sink, ss) = (ports[0].clone(), ports[1].clone());
-        let mut tunnel_args = vec![
-            "tunnel",
-            "--sink",
-            sink.as_str(),
-            "--ss",
-            ss.as_str(),
-            "--outbound",
-            outbound.as_str(),
-        ];
+        // The server reports `name=value` words: its ports and the pin.
+        let reported: Vec<(String, String)> = ports
+            .iter()
+            .filter_map(|word| word.split_once('='))
+            .map(|(key, value)| (format!("--{key}"), value.to_string()))
+            .collect();
+        let mut tunnel_args = vec!["tunnel", "--outbound", outbound.as_str()];
+        for (key, value) in &reported {
+            tunnel_args.push(key.as_str());
+            tunnel_args.push(value.as_str());
+        }
         let forwarded: Vec<(String, String)> = ["tun", "window-kib", "max-conns", "mtu", "workers"]
             .iter()
             .filter_map(|key| {

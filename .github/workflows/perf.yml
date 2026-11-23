@@ -11,6 +11,10 @@ name: Tunnel perf
 # - scale: 5000 connections open at once through the tunnel, every one
 #   established and echoing; 100 000 UDP flows open at once with the
 #   process RSS under 300 MiB (tunnel_bench scale / udp-sessions).
+#   Pull requests run the connection gate with outbounds `redirect` (the
+#   tunnel's own cost) and `ss2022`; a manual run with scale_outbounds=all
+#   also covers Trojan, VLESS (TLS and REALITY), VMess, SOCKS5, HTTP and
+#   WireGuard against in-process servers, with the same gate.
 
 on:
   pull_request:
@@ -45,6 +49,10 @@ on:
         description: "Rule decision gate: p99 of one decision in microseconds"
         type: string
         default: "50"
+      scale_outbounds:
+        description: "Scale gate outbounds: space-separated names, or all (redirect ss2022 trojan vless vless-reality vmess socks5 http wireguard)"
+        type: string
+        default: "redirect ss2022"
       concurrent:
         description: "Scale gate: TCP connections open at once"
         type: string
@@ -151,6 +159,7 @@ jobs:
       CONCURRENT: ${{ inputs.concurrent || '5000' }}
       UDP_FLOWS: ${{ inputs.udp_flows || '100000' }}
       MAX_UDP_RSS_MB: ${{ inputs.max_udp_rss_mb || '300' }}
+      SCALE_OUTBOUNDS: ${{ inputs.scale_outbounds || 'redirect ss2022' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -177,6 +186,9 @@ jobs:
           sudo ip tuntap add dev ncb0 mode tun user "$(id -u)"
           sudo ip addr add 198.18.0.1/16 dev ncb0
           sudo ip link set ncb0 mtu 1500 up
+          # Each outbound leaves its client ports in TIME_WAIT; with every
+          # outbound in one job, 5000 per run would exhaust the default range.
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65000" net.ipv4.tcp_tw_reuse=1
           nproc
           ulimit -n
 
@@ -196,13 +208,30 @@ jobs:
           # Client, tunnel and server each hold one socket per connection.
           ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
           mkdir -p results
-          for outbound in redirect ss2022; do
+          outbounds="${SCALE_OUTBOUNDS}"
+          if [ "${outbounds}" = "all" ]; then
+            outbounds="redirect ss2022 trojan vless vless-reality vmess socks5 http wireguard"
+          fi
+          # Every outbound runs; the step fails at the end if any missed.
+          failed=""
+          for outbound in ${outbounds}; do
             echo "::group::${outbound}"
-            target/release/examples/tunnel_bench scale --tun ncb0 --outbound "${outbound}" \
+            report="results/scale-${outbound}.json"
+            if ! target/release/examples/tunnel_bench scale --tun ncb0 --outbound "${outbound}" \
               --concurrent "${CONCURRENT}" --max-conns "$((CONCURRENT + 256))" \
-              --json "results/scale-${outbound}.json"
+              --json "${report}"; then
+              failed="${failed} ${outbound}"
+              if [ ! -f "${report}" ]; then
+                printf '{"outbound": "%s", "concurrent": %s, "pass": false, "failures": ["tunnel_bench exited without a report"]}\n' \
+                  "${outbound}" "${CONCURRENT}" > "${report}"
+              fi
+            fi
             echo "::endgroup::"
           done
+          if [ -n "${failed}" ]; then
+            echo "::error::scale gate missed for:${failed}"
+            exit 1
+          fi
 
       - name: Summary
         if: always()
