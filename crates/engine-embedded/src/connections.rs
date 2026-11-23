@@ -1340,7 +1340,35 @@ impl Dispatcher {
             dispatcher: self,
             host,
             http,
-            source,
+            origin: FlowOrigin {
+                process: None,
+                source,
+                lan_peer: None,
+            },
+            requested: None,
+        }
+    }
+
+    /// [`Self::with_origin_request`] for a flow a proxy listener's client
+    /// asked for as `requested` (a name or an address), for the decrypting
+    /// listeners ([`crate::local_proxy`]): the connection and every
+    /// per-request route go to `requested`, not to the placeholder address
+    /// the interceptor holds for a name; `host`, read from the flow, names
+    /// only an address target; `origin` also carries the client's process
+    /// label, for `PROCESS-NAME` rules.
+    pub fn with_requested_target<'a>(
+        &'a self,
+        requested: &'a TargetAddr,
+        host: &'a str,
+        http: Option<&'a HttpRequestHead>,
+        origin: FlowOrigin<'a>,
+    ) -> HostedDispatcher<'a> {
+        HostedDispatcher {
+            dispatcher: self,
+            host,
+            http,
+            origin,
+            requested: Some(requested),
         }
     }
 }
@@ -1375,20 +1403,34 @@ pub struct FlowOrigin<'a> {
     pub lan_peer: Option<LanPeer>,
 }
 
-/// See [`Dispatcher::with_host`].
+/// See [`Dispatcher::with_host`] and [`Dispatcher::with_requested_target`].
+/// The packet tunnel and the proxy listeners hand the interceptor this same
+/// view, so a decrypted connection is routed request by request the same
+/// way whichever way it came in.
 pub struct HostedDispatcher<'a> {
     dispatcher: &'a Dispatcher,
     host: &'a str,
     http: Option<&'a HttpRequestHead>,
-    source: FlowSource,
+    origin: FlowOrigin<'a>,
+    /// What a proxy listener's client asked for, which replaces the target
+    /// the interceptor passes in.
+    requested: Option<&'a TargetAddr>,
 }
 
 impl HostedDispatcher<'_> {
-    fn origin(&self) -> FlowOrigin<'static> {
-        FlowOrigin {
-            process: None,
-            source: self.source,
-            lan_peer: None,
+    /// The target and host a connection for the interceptor's `target` is
+    /// routed and opened with. The connection, its route and every
+    /// request's route must use the same pair, or a request routed like
+    /// its connection would look like a switch to another outbound.
+    fn flow<'b>(&'b self, target: &'b TargetAddr) -> (&'b TargetAddr, Option<&'b str>) {
+        match self.requested {
+            // A name the client asked for is routed by itself; an address
+            // by the host the interceptor read from the flow.
+            Some(requested) => (
+                requested,
+                matches!(requested, TargetAddr::Ip(_)).then_some(self.host),
+            ),
+            None => (target, Some(self.host)),
         }
     }
 }
@@ -1403,26 +1445,23 @@ impl TcpOutbound for HostedDispatcher<'_> {
     }
 
     fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
-        let origin = FlowOrigin {
-            process: None,
-            source: self.source,
-            lan_peer: None,
-        };
+        let (target, host) = self.flow(target);
         Box::pin(
             self.dispatcher
-                .connect_origin_flow(target, Some(self.host), origin, self.http),
+                .connect_origin_flow(target, host, self.origin, self.http),
         )
     }
 
     fn open_udp<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
-        let origin = FlowOrigin {
-            process: None,
-            source: self.source,
-            lan_peer: None,
-        };
+        // The LAN share does not answer UDP ASSOCIATE, and the UDP path
+        // has no `crate::lan_guard` check: a LAN device's flow gets none.
+        if self.origin.lan_peer.is_some() {
+            return Box::pin(async { Err(lan_guard::refused()) });
+        }
+        let (target, host) = self.flow(target);
         Box::pin(
             self.dispatcher
-                .open_origin_udp_flow(target, Some(self.host), origin),
+                .open_origin_udp_flow(target, host, self.origin),
         )
     }
 }
@@ -1436,12 +1475,11 @@ impl RequestRouter for HostedDispatcher<'_> {
         target: &'a TargetAddr,
         request: Option<&'a HttpRequestHead>,
     ) -> BoxFuture<'a, Option<String>> {
-        Box::pin(self.dispatcher.request_route(
-            target,
-            Some(self.host),
-            self.origin(),
-            request.or(self.http),
-        ))
+        let (target, host) = self.flow(target);
+        Box::pin(
+            self.dispatcher
+                .request_route(target, host, self.origin, request.or(self.http)),
+        )
     }
 
     fn connect_request<'a>(
@@ -1449,12 +1487,11 @@ impl RequestRouter for HostedDispatcher<'_> {
         target: &'a TargetAddr,
         request: &'a HttpRequestHead,
     ) -> BoxFuture<'a, io::Result<BoxStream>> {
-        Box::pin(self.dispatcher.connect_origin_flow(
-            target,
-            Some(self.host),
-            self.origin(),
-            Some(request),
-        ))
+        let (target, host) = self.flow(target);
+        Box::pin(
+            self.dispatcher
+                .connect_origin_flow(target, host, self.origin, Some(request)),
+        )
     }
 }
 

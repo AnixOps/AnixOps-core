@@ -46,16 +46,16 @@ use std::time::Duration;
 use base64::Engine as _;
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr};
 use inbound_mixed::{
-    ClientAddrs, ClientConnector, ClientInterceptor, ClientPages, Credentials, MixedSettings,
-    MixedStats, PageRequest, PageResponse, PeerFilter,
+    ClientAddrs, ClientConnector, ClientPages, Credentials, MixedSettings, MixedStats, PageRequest,
+    PageResponse, PeerFilter,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::connections::{Dispatcher, FlowOrigin};
+use crate::connections::Dispatcher;
 use crate::control::MAX_REQUEST_LEN;
 use crate::lan_guard::LanPeer;
-use crate::local_proxy::{Decrypting, LanDecrypting};
+use crate::local_proxy::{ClientProcess, Decrypting};
 use crate::{RuntimeError, RuntimeErrorCode};
 
 /// The made-up host name the setup page answers to through the proxy.
@@ -124,12 +124,12 @@ impl LanShare {
             .map_err(|_| resource("lan share listener could not start"))?
             .port();
         let block_private_networks = options.block_private_networks;
-        // Decrypted connections of other devices are marked like the others.
+        // Decrypted connections of other devices are named and marked like
+        // the others, each request routed on its own included.
         let interceptor = decrypting.map(|decrypting| {
-            Arc::new(LanDecrypting {
-                decrypting,
+            decrypting.for_clients(ClientProcess::LanDevice {
                 block_private_networks,
-            }) as Arc<dyn ClientInterceptor>
+            })
         });
         let https_decryption = interceptor.is_some();
         let certificate = certificate_der.map(|der| Arc::new(Certificate::new(der)));
@@ -402,10 +402,20 @@ pub(crate) fn lan_peer(client: ClientAddrs, block_private_networks: bool) -> Opt
 }
 
 /// Routes a phone's connections, named by the phone's address and kept away
-/// from this computer itself (see [`crate::lan_guard`]).
+/// from this computer itself (see [`crate::lan_guard`]), passing the head of
+/// a plain HTTP request to `USER-AGENT` and `URL-REGEX` rules as the
+/// computer's own local proxy does.
 struct LanClients {
     dispatcher: Arc<Dispatcher>,
     block_private_networks: bool,
+}
+
+impl LanClients {
+    fn process(&self) -> ClientProcess {
+        ClientProcess::LanDevice {
+            block_private_networks: self.block_private_networks,
+        }
+    }
 }
 
 impl ClientConnector for LanClients {
@@ -414,17 +424,22 @@ impl ClientConnector for LanClients {
         client: ClientAddrs,
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, io::Result<BoxStream>> {
-        Box::pin(async move {
-            let label = device_label(client.peer.ip());
-            let origin = FlowOrigin {
-                process: Some(&label),
-                source: crate::local_proxy::client_source(client),
-                lan_peer: lan_peer(client, self.block_private_networks),
-            };
-            self.dispatcher
-                .connect_origin_flow(target, None, origin, None)
-                .await
-        })
+        Box::pin(
+            self.process()
+                .connect(&self.dispatcher, client, target, &[]),
+        )
+    }
+
+    fn connect_client_with_first<'a>(
+        &'a self,
+        client: ClientAddrs,
+        target: &'a TargetAddr,
+        first: &'a [u8],
+    ) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(
+            self.process()
+                .connect(&self.dispatcher, client, target, first),
+        )
     }
 
     // No `open_client_udp`: the share does not answer UDP ASSOCIATE

@@ -119,3 +119,70 @@ fn replay_proxy_needs_its_credentials_and_names_its_connections() {
     proxy.stop();
     assert!(TcpStream::connect(again).is_err());
 }
+
+/// Answers every request with `200` and the request line it got.
+fn http_server() -> SocketAddr {
+    let listener = TcpListener::bind(loopback()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{line}",
+                    line.len()
+                );
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn plain_http_rules_see_replayed_requests() {
+    // Plain HTTP to `blocked.test/ad` and from the `BadAgent` user agent is
+    // refused; everything else goes through the node.
+    const ROUTED: &[u8] = br#"{"schema_version":1,"profile_id":"desktop","routing":{"outbounds":{"node":{"type":"direct"}},"rules":["OR,((URL-REGEX,\"^http://blocked\\.test/ad\"),(USER-AGENT,BadAgent*)),REJECT","FINAL,node"]}}"#;
+    let mut proxy = LocalProxy::start(ROUTED, loopback(), MixedSettings::default()).unwrap();
+    let status = control(&proxy, r#"{"cmd":"start_replay_proxy","decrypt":false}"#);
+    let replay = replay_addr(&status);
+    let origin = http_server();
+    let get = |host: &str, agent: &str| {
+        let mut stream = TcpStream::connect(replay).unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        write!(
+            stream,
+            "GET http://{origin}/ad HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            basic(&status)
+        )
+        .unwrap();
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        String::from_utf8_lossy(&answer).into_owned()
+    };
+
+    let allowed = get("allowed.test", "curl/8");
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    let by_url = get("blocked.test", "curl/8");
+    assert!(by_url.starts_with("HTTP/1.1 502"), "URL-REGEX: {by_url}");
+    let by_agent = get("allowed.test", "BadAgent/1.0");
+    assert!(
+        by_agent.starts_with("HTTP/1.1 502"),
+        "USER-AGENT: {by_agent}"
+    );
+    proxy.stop();
+}

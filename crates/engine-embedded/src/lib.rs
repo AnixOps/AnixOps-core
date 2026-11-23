@@ -419,12 +419,18 @@ impl EmbeddedRuntime {
         dispatcher: &Arc<Dispatcher>,
         request: &[u8],
     ) -> Option<Result<Vec<u8>, RuntimeError>> {
-        let decrypting = || -> Result<Option<Arc<local_proxy::Decrypting>>, RuntimeError> {
+        // Each listener names its decrypted connections as its connector
+        // names the others, for `PROCESS-NAME` rules and the list.
+        let decrypting = |process: local_proxy::ClientProcess| -> Result<
+            Option<Arc<local_proxy::Decrypting>>,
+            RuntimeError,
+        > {
             Ok(match &self.interceptor {
                 Some(interceptor) => Some(Arc::new(local_proxy::Decrypting::new(
                     dispatcher.clone(),
                     interceptor.clone(),
                     tunnel_settings(&self.config)?,
+                    process,
                 ))),
                 None => None,
             })
@@ -440,7 +446,9 @@ impl EmbeddedRuntime {
                 ));
             }
             let interceptor = if decrypt {
-                as_interceptor(decrypting()?)
+                as_interceptor(decrypting(local_proxy::ClientProcess::Named(
+                    replay_proxy::PROCESS_NAME,
+                ))?)
             } else {
                 None
             };
@@ -456,7 +464,7 @@ impl EmbeddedRuntime {
         let system = self.system_proxy.control(request, |port| {
             system_proxy::SystemProxy::start(
                 dispatcher.clone(),
-                as_interceptor(decrypting()?),
+                as_interceptor(decrypting(local_proxy::ClientProcess::Local)?),
                 system_proxy::SystemProxyOptions {
                     port,
                     max_connections: fd_budget::connection_limits(&self.config.limits).0,
@@ -475,7 +483,11 @@ impl EmbeddedRuntime {
             }
             lan_share::LanShare::start(
                 dispatcher.clone(),
-                decrypting()?,
+                // The share marks its devices' decrypted flows for
+                // `crate::lan_guard` (`Decrypting::for_clients`).
+                decrypting(local_proxy::ClientProcess::LanDevice {
+                    block_private_networks: options.block_private_networks,
+                })?,
                 self.config.mitm_ca_certificate_der(),
                 options,
             )
