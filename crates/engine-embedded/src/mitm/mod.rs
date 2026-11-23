@@ -775,11 +775,18 @@ impl MitmEngine {
                     report.body.len(),
                     close,
                 );
+                // A HEAD answer keeps the Content-Length a GET would get
+                // and carries no body (RFC 9110 9.3.2).
+                let body: &[u8] = if method.eq_ignore_ascii_case("HEAD") {
+                    &[]
+                } else {
+                    &report.body
+                };
                 if let Some(recording) = &mut recording {
-                    recording.response(&response, &report.body, Some("answered_locally"));
+                    recording.response(&response, body, Some("answered_locally"));
                 }
                 client.write_all(&response.encode()).await?;
-                client.write_all(&report.body).await?;
+                client.write_all(body).await?;
                 if close {
                     return Ok(());
                 }

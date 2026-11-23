@@ -155,6 +155,50 @@ pub enum MitmPolicyHeaderOperation {
     ReplaceRegex,
 }
 
+/// What a reject rule answers with. Plugins pick a variant so the app can
+/// parse the answer: `reject-dict` and `reject-array` exist so a config or
+/// list request still yields valid (empty) JSON, `reject-img` so an image
+/// slot still gets an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MitmPolicyRejectBody {
+    /// No body: `reject`, `reject-200`, `reject-<status>`, and every action
+    /// that is not a reject.
+    Empty,
+    /// `reject-img` / `reject-tinygif`: a 1x1 transparent GIF.
+    TinyGif,
+    /// `reject-video`: an empty `video/mp4` body.
+    Video,
+    /// `reject-dict`: the JSON object `{}`.
+    JsonObject,
+    /// `reject-array`: the JSON array `[]`.
+    JsonArray,
+}
+
+impl MitmPolicyRejectBody {
+    fn from_sys(action: sys::AnixOpsRewriteAction) -> Self {
+        match action {
+            sys::AnixOpsRewriteAction::RejectImg => Self::TinyGif,
+            sys::AnixOpsRewriteAction::RejectVideo => Self::Video,
+            sys::AnixOpsRewriteAction::RejectDict => Self::JsonObject,
+            sys::AnixOpsRewriteAction::RejectArray => Self::JsonArray,
+            _ => Self::Empty,
+        }
+    }
+
+    /// The `Content-Type` and body of the answer; `None` for no body.
+    pub fn content(self) -> Option<(&'static str, &'static [u8])> {
+        let json = "application/json; charset=utf-8";
+        let content: (&'static str, &'static [u8]) = match self {
+            Self::Empty => return None,
+            Self::TinyGif => ("image/gif", loon_map_local::TINY_GIF.as_slice()),
+            Self::Video => ("video/mp4", b"".as_slice()),
+            Self::JsonObject => (json, b"{}".as_slice()),
+            Self::JsonArray => (json, b"[]".as_slice()),
+        };
+        Some(content)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MitmPolicyRewriteResult {
     pub action: MitmPolicyRewriteAction,
@@ -163,6 +207,8 @@ pub struct MitmPolicyRewriteResult {
     pub matched_pattern: String,
     pub value: String,
     pub message: String,
+    /// For [`MitmPolicyRewriteAction::Reject`], the answer's body.
+    pub reject_body: MitmPolicyRejectBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1390,8 +1436,20 @@ fn domain_action_from_policy_rewrite(rewrite: &MitmPolicyRewriteResult) -> HttpM
             status_code: http_status_or(rewrite.status_code, 302),
             location: rewrite.value.clone(),
         },
-        MitmPolicyRewriteAction::Reject => HttpMitmAction::Reject {
-            status_code: http_status_or(rewrite.status_code, 403),
+        // `reject-dict`, `reject-array`, `reject-img` and `reject-video`
+        // answer with a body the app can parse; the others with none.
+        MitmPolicyRewriteAction::Reject => match rewrite.reject_body.content() {
+            Some((content_type, body)) => HttpMitmAction::Respond {
+                status_code: http_status_or(rewrite.status_code, 200),
+                headers: vec![MetadataEntry {
+                    key: "Content-Type".to_string(),
+                    value: content_type.to_string(),
+                }],
+                body: body.to_vec(),
+            },
+            None => HttpMitmAction::Reject {
+                status_code: http_status_or(rewrite.status_code, 403),
+            },
         },
         _ => HttpMitmAction::Continue,
     }
@@ -1621,6 +1679,7 @@ fn rewrite_result_from_sys(result: &sys::AnixOpsRewriteResult) -> MitmPolicyRewr
         matched_pattern: ffi_string(&result.matched_pattern),
         value: ffi_string(&result.value),
         message: ffi_string(&result.message),
+        reject_body: MitmPolicyRejectBody::from_sys(result.action),
     }
 }
 

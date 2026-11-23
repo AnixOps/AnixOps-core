@@ -145,6 +145,12 @@ the body to the core, so a body the core cannot read never fails the plan:
 - URL reject, redirect and header rules apply to every message. A
   `URL_REWRITE_200` rule (`<pattern> <url> 200`) is not a redirect; the
   message continues unchanged.
+- `reject`, `reject-200` and `reject-<status>` answer with no body
+  (`HttpMitmAction::Reject`). `reject-dict` and `reject-array` answer `200`
+  with `application/json; charset=utf-8` `{}` / `[]`, `reject-img` (and
+  `reject-tinygif`) with a 1x1 `image/gif`, and `reject-video` with an empty
+  `video/mp4` body (`HttpMitmAction::Respond`), so an app reading the answer
+  still parses it. `MitmPolicyRewriteResult::reject_body` names the variant.
 - `header-replace-regex` rules are evaluated against every current value of
   their header, after the rules before them, and replace the header value by
   value (the header is deleted and added back, so it moves to the end). With

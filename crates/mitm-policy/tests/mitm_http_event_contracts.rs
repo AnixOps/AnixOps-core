@@ -12,7 +12,7 @@ use control_domain::{
 use mitm_policy::loon_plugin::{import_loon_plugin, merged_plugin_source};
 use mitm_policy::{
     user_plugin_package, AnixOpsMitmPluginService, AnixOpsMitmPolicyEngine,
-    MitmPolicyBodyChainOutcome, MitmPolicyPhase, MitmPolicyRewriteAction,
+    MitmPolicyBodyChainOutcome, MitmPolicyPhase, MitmPolicyRejectBody, MitmPolicyRewriteAction,
     MITM_POLICY_HTTP_EVENT_BINARY_BODY_SKIPPED_CODE,
     MITM_POLICY_HTTP_EVENT_BODY_REWRITE_RECORDS_CAPPED_CODE,
     MITM_POLICY_HTTP_EVENT_BODY_REWRITE_SKIPPED_CODE,
@@ -650,5 +650,138 @@ fn the_engine_reports_whole_and_skipped_body_chains() {
             assert!(!records_capped);
         }
         other => panic!("the chain should apply whole: {other:?}"),
+    }
+}
+
+fn content_type(headers: &[MetadataEntry]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|header| header.key.eq_ignore_ascii_case("Content-Type"))
+        .map(|header| header.value.as_str())
+}
+
+/// mitm-scripts-04: `reject-dict`, `reject-array`, `reject-img` and
+/// `reject-video` answer with a body the app can parse (`{}`, `[]`, a 1x1
+/// GIF, an empty video), not an empty 200 that breaks its JSON or image
+/// decoder. `reject`, `reject-200` and `reject-<status>` stay bodiless.
+#[test]
+fn reject_variants_answer_with_the_body_their_name_promises() {
+    let source = concat!(
+        "[Rewrite]\n",
+        "^https://r\\.example\\.test/plain reject\n",
+        "^https://r\\.example\\.test/ok reject-200\n",
+        "^https://r\\.example\\.test/img reject-img\n",
+        "^https://r\\.example\\.test/gif reject-tinygif\n",
+        "^https://r\\.example\\.test/video reject-video\n",
+        "^https://r\\.example\\.test/dict reject-dict\n",
+        "^https://r\\.example\\.test/array reject-array\n",
+        "\n[MITM]\nhostname = r.example.test\n",
+    );
+    let (service, instance) = load(source);
+    let action = |path: &str| {
+        plan_request(
+            &service,
+            &instance,
+            &format!("https://r.example.test/{path}"),
+        )
+        .action
+    };
+
+    assert!(
+        matches!(action("plain"), HttpMitmAction::Reject { .. }),
+        "{:?}",
+        action("plain")
+    );
+    assert_eq!(action("ok"), HttpMitmAction::Reject { status_code: 200 });
+
+    for (path, expected_type, expected_body) in [
+        ("dict", "application/json; charset=utf-8", b"{}".to_vec()),
+        ("array", "application/json; charset=utf-8", b"[]".to_vec()),
+        ("video", "video/mp4", Vec::new()),
+    ] {
+        let HttpMitmAction::Respond {
+            status_code,
+            headers,
+            body,
+        } = action(path)
+        else {
+            panic!("{path}: {:?}", action(path));
+        };
+        assert_eq!(status_code, 200, "{path}");
+        assert_eq!(content_type(&headers), Some(expected_type), "{path}");
+        assert_eq!(body, expected_body, "{path}");
+    }
+    for path in ["img", "gif"] {
+        let HttpMitmAction::Respond {
+            status_code,
+            headers,
+            body,
+        } = action(path)
+        else {
+            panic!("{path}: {:?}", action(path));
+        };
+        assert_eq!(status_code, 200, "{path}");
+        assert_eq!(content_type(&headers), Some("image/gif"), "{path}");
+        assert_eq!(body.len(), 43, "{path}");
+        assert!(body.starts_with(b"GIF89a"), "{path}");
+    }
+
+    // The rewrite result keeps the kind, so `== Reject` checks still hold.
+    let mut engine = AnixOpsMitmPolicyEngine::new().expect("policy engine should allocate");
+    engine.load_config(source).expect("rules should load");
+    let dict = engine
+        .evaluate_url_rewrite("https://r.example.test/dict", MitmPolicyPhase::Request)
+        .expect("rewrite should evaluate");
+    assert_eq!(dict.action, MitmPolicyRewriteAction::Reject);
+    assert_eq!(dict.reject_body, MitmPolicyRejectBody::JsonObject);
+    let plain = engine
+        .evaluate_url_rewrite("https://r.example.test/plain", MitmPolicyPhase::Request)
+        .expect("rewrite should evaluate");
+    assert_eq!(plain.reject_body, MitmPolicyRejectBody::Empty);
+}
+
+/// The same answers for the other spellings plugins ship: Quantumult X
+/// `url reject-dict`, Surge `- reject-array` and a `[Rule]` line
+/// `URL-REGEX,...,REJECT-DICT`.
+#[test]
+fn imported_reject_variants_answer_with_their_bodies() {
+    let plugin = import_loon_plugin(concat!(
+        "#!name = Reject bodies\n",
+        "[Rule]\n",
+        "URL-REGEX,^https?://r\\.example\\.test/rule,REJECT-DICT\n",
+        "[URL Rewrite]\n",
+        "^https?://r\\.example\\.test/surge - reject-array\n",
+        "[rewrite_local]\n",
+        "^https?:\\/\\/r\\.example\\.test\\/qx url reject-dict\n",
+        "[MITM]\n",
+        "hostname = r.example.test\n",
+    ))
+    .expect("plugin should import");
+    let (service, instance) = load(&merged_plugin_source("Reject bodies", &[&plugin]));
+    for (path, expected) in [
+        ("rule", b"{}".to_vec()),
+        ("surge", b"[]".to_vec()),
+        ("qx", b"{}".to_vec()),
+    ] {
+        let outcome = plan_request(
+            &service,
+            &instance,
+            &format!("https://r.example.test/{path}"),
+        );
+        let HttpMitmAction::Respond {
+            status_code,
+            headers,
+            body,
+        } = outcome.action
+        else {
+            panic!("{path}: {:?}", outcome.action);
+        };
+        assert_eq!(status_code, 200, "{path}");
+        assert_eq!(
+            content_type(&headers),
+            Some("application/json; charset=utf-8"),
+            "{path}"
+        );
+        assert_eq!(body, expected, "{path}");
     }
 }

@@ -417,6 +417,107 @@ async fn rewrites_plain_http_without_a_mitm_hostname() {
     server.abort();
 }
 
+/// mitm-scripts-04: `reject-dict` and `reject-img` answer with a body the
+/// app parses (`{}`, a 1x1 GIF); a HEAD answer keeps the length and sends no
+/// body, so the connection stays in step.
+#[tokio::test]
+async fn reject_variants_answer_with_parseable_bodies() {
+    let device_root = root("NetworkCore Test Device Root");
+    let mut config = mitm_config(&device_root);
+    config.plugins.push(
+        "#!name = Bodies\n[Rewrite]\n\
+         ^http://plain\\.example\\.test/dict reject-dict\n\
+         ^http://plain\\.example\\.test/img reject-img\n"
+            .to_string(),
+    );
+    let engine = Arc::new(MitmEngine::new(&config).unwrap());
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(PlainOrigin {
+        requests: requests_tx,
+        body: b"plain origin".to_vec(),
+        extra_headers: "",
+    });
+    let target: SocketAddr = "192.0.2.20:80".parse().unwrap();
+    let first = b"GET /dict HTTP/1.1\r\nHost: plain.example.test\r\n\r\n".to_vec();
+    let host = engine
+        .claim(&first, target)
+        .expect("plain HTTP is relayed through the rewrite hook");
+
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let origin = origin.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    origin.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    let header = |head: &str, name: &str| -> Option<String> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    };
+
+    let (head, body) = tokio::time::timeout(Duration::from_secs(10), read_response(&mut app))
+        .await
+        .expect("answered in time");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        header(&head, "Content-Type").as_deref(),
+        Some("application/json; charset=utf-8"),
+        "{head}"
+    );
+    assert_eq!(body, "{}");
+
+    app.write_all(b"GET /img HTTP/1.1\r\nHost: plain.example.test\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, body) = tokio::time::timeout(Duration::from_secs(10), read_response(&mut app))
+        .await
+        .expect("answered in time");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(header(&head, "Content-Type").as_deref(), Some("image/gif"));
+    assert_eq!(header(&head, "Content-Length").as_deref(), Some("43"));
+    assert!(body.starts_with("GIF89a"), "{body:?}");
+
+    // HEAD: the GET's length, no body; the connection closes after it.
+    app.write_all(b"HEAD /dict HTTP/1.1\r\nHost: plain.example.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), app.read_to_end(&mut rest))
+        .await
+        .expect("closed in time")
+        .unwrap();
+    let end = rest
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&rest[..end]).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(header(&head, "Content-Length").as_deref(), Some("2"));
+    assert!(rest[end + 4..].is_empty(), "a HEAD answer has no body");
+
+    assert!(requests.try_recv().is_err(), "every answer stayed local");
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_body_rule_reads_a_body_the_origin_compressed_anyway() {
     use std::io::Write;
