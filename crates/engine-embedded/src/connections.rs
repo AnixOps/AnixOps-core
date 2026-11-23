@@ -62,7 +62,8 @@ pub enum Mode {
     /// Every flow to the global target of a routing config (its outbound for
     /// a config with one outbound).
     Global,
-    /// Every flow direct.
+    /// Every flow direct, and every DNS server asked directly (the tunnel's
+    /// queries and the names of Fake-IP flows alike), `proxy` ones included.
     Direct,
 }
 
@@ -733,13 +734,17 @@ impl Dispatcher {
         }
     }
 
-    /// The target to hand `outbound` for a Fake-IP flow: a DIRECT flow gets
-    /// the address the `dns` section gives, so the name never goes to the
-    /// system resolver (which may answer from the tunnel's own fake range).
+    /// The target to hand `outbound` for a Fake-IP flow routed in `mode`: a
+    /// DIRECT flow gets the address the `dns` section gives, so the name
+    /// never goes to the system resolver (which may answer from the tunnel's
+    /// own fake range). In the direct mode every DNS server is asked
+    /// directly ([`DomainResolver::resolve_direct`]), so the flow does not
+    /// depend on a node.
     async fn direct_target(
         &self,
         target: &TargetAddr,
         outbound: &dyn TcpOutbound,
+        mode: Mode,
     ) -> io::Result<Option<TargetAddr>> {
         let (TargetAddr::Domain(name, port), Some(resolver)) = (target, &self.resolver) else {
             return Ok(None);
@@ -747,7 +752,11 @@ impl Dispatcher {
         if outbound.protocol() != direct::PROTOCOL {
             return Ok(None);
         }
-        let address = resolver.resolve(name).await?;
+        let address = if mode == Mode::Direct {
+            resolver.resolve_direct(name).await?
+        } else {
+            resolver.resolve(name).await?
+        };
         if self
             .fake_ip
             .as_ref()
@@ -905,10 +914,13 @@ impl Dispatcher {
         }
     }
 
-    /// Picks the outbound for one flow and records the decision. Returns
-    /// the route too, so a failed connect can ask its groups to retest.
+    /// Picks the outbound for one flow in `mode` and records the decision.
+    /// Returns the route too, so a failed connect can ask its groups to
+    /// retest.
+    #[allow(clippy::too_many_arguments)]
     async fn route(
         &self,
+        mode: Mode,
         target: &TargetAddr,
         host: Option<&str>,
         origin: FlowOrigin<'_>,
@@ -916,7 +928,7 @@ impl Dispatcher {
         http: Option<&HttpRequestHead>,
         guard: &ConnectionGuard,
     ) -> io::Result<(Arc<dyn TcpOutbound>, RouteInfo)> {
-        let (route, outbound) = match (self.mode(), &self.routed) {
+        let (route, outbound) = match (mode, &self.routed) {
             (Mode::Direct, _) => (direct_route(), Some(self.direct.clone())),
             (Mode::Global, Some(routed)) => routed.route_global_flow().await,
             (Mode::Rule, Some(routed)) => {
@@ -1075,6 +1087,9 @@ impl Dispatcher {
         http: Option<&HttpRequestHead>,
     ) -> io::Result<BoxStream> {
         let process = origin.process;
+        // One mode for the whole flow: a `set_mode` meanwhile cannot route
+        // it in one mode and resolve its name in another.
+        let mode = self.mode();
         let unfaked = self.unfake(target, host)?;
         let (target, host) = match &unfaked {
             Some(named) => (named, None),
@@ -1097,10 +1112,10 @@ impl Dispatcher {
             None => (target, host),
         };
         let (outbound, route) = self
-            .route(target, host, origin, RouteNetwork::Tcp, http, &guard)
+            .route(mode, target, host, origin, RouteNetwork::Tcp, http, &guard)
             .await?;
         let resolved = if unfaked.is_some() {
-            self.direct_target(target, &*outbound).await?
+            self.direct_target(target, &*outbound, mode).await?
         } else {
             None
         };
@@ -1163,6 +1178,8 @@ impl Dispatcher {
         host: Option<&str>,
         origin: FlowOrigin<'_>,
     ) -> io::Result<UdpFlow> {
+        // One mode for the whole flow, as for TCP.
+        let mode = self.mode();
         let unfaked = self.unfake(target, host)?;
         let (target, host) = match &unfaked {
             Some(named) => (named, None),
@@ -1192,10 +1209,10 @@ impl Dispatcher {
         // UDP failures do not retest: a node without UDP relay still passes
         // the (TCP) health check, so a retest would only cost a dial.
         let (outbound, _) = self
-            .route(target, host, origin, RouteNetwork::Udp, None, &guard)
+            .route(mode, target, host, origin, RouteNetwork::Udp, None, &guard)
             .await?;
         let resolved = if unfaked.is_some() {
-            self.direct_target(target, &*outbound).await?
+            self.direct_target(target, &*outbound, mode).await?
         } else {
             None
         };

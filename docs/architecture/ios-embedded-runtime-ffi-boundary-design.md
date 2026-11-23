@@ -135,7 +135,7 @@ reset。`networkcore_ios_set_bound_interface` 换了网卡时，运行中的 Wir
 `crates/outbound-wireguard/src/path.rs`。
 
 模式：`rule` 按配置的规则与策略组；`global` 全部发往 `routing.global`（策略组 id、节点 id 或 `DIRECT`，缺省为第一个策略组，
-没有策略组时为第一个节点），单出站配置走该出站；`direct` 全部直连。启动模式取配置顶层的 `mode`（缺省 `rule`）。运行时切换的模式和
+没有策略组时为第一个节点），单出站配置走该出站；`direct` 全部直连，DNS 也不经节点（隧道的查询与 Fake-IP 直连连接的解析都直连各上游，`via: proxy` 的也一样，见 `embedded-dns.md`「直连模式不经节点」）。启动模式取配置顶层的 `mode`（缺省 `rule`）。运行时切换的模式和
 select 组选择只保留到 runtime 停止，客户端应把它们写回 profile（`mode`、select 组的 `default`）供下次启动使用。
 
 屏蔽 QUIC：配置顶层 `block_quic`（缺省 `false`）或运行时 `set_block_quic` 打开后，所有模式（含 `direct`）下发往 UDP 443

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::RuntimeConfig;
+use crate::connections::Mode;
 
 /// The routed outbound a single-node profile gets when a mode adds rules.
 pub const PROXY_OUTBOUND: &str = "proxy";
@@ -17,7 +18,9 @@ pub const PROXY_OUTBOUND: &str = "proxy";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
-    /// Everything direct.
+    /// Everything direct: the engine starts in its direct mode
+    /// ([`Mode::Direct`]), where every flow and every DNS query goes
+    /// direct, whatever the rules say.
     Direct,
     /// The subscription's own rules and policy groups; a single-node profile
     /// sends everything through its node.
@@ -40,8 +43,9 @@ impl RoutingMode {
     }
 }
 
-/// The envelope `profile` runs with in `mode`: rule mode keeps the profile,
-/// direct mode replaces its rules with `FINAL,DIRECT`.
+/// The envelope `profile` runs with in `mode`: rule mode keeps the profile;
+/// direct mode starts the engine in its direct mode (top-level `"mode":
+/// "direct"`) and replaces the rules with `FINAL,DIRECT`.
 pub fn envelope_for_mode(profile: &str, mode: RoutingMode) -> Result<String, String> {
     if mode == RoutingMode::Rule {
         validate(profile)?;
@@ -62,6 +66,10 @@ pub fn envelope_for_mode(profile: &str, mode: RoutingMode) -> Result<String, Str
     routing_object.insert("rules".to_string(), json!(["FINAL,DIRECT"]));
     routing_object.insert("rule_sets".to_string(), json!({}));
     object.insert("routing".to_string(), routing);
+    // The rules alone are not enough: in the rule mode a `proxy` DNS server
+    // (the default 1.1.1.1:53 among them) never goes DIRECT because a rule
+    // says so, and would still be asked through a node.
+    object.insert("mode".to_string(), json!(Mode::Direct));
     let rendered = envelope.to_string();
     validate(&rendered)?;
     Ok(rendered)

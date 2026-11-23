@@ -343,6 +343,14 @@ type Latencies = BTreeMap<String, BTreeMap<String, u32>>;
 /// Looks up a domain for IP rules that allow resolution.
 pub trait DomainResolver: Send + Sync {
     fn resolve<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>>;
+
+    /// [`Self::resolve`] for the direct mode, where nothing goes through a
+    /// node: a resolver that reaches `proxy` DNS servers through the proxy
+    /// asks every server directly instead. The default is [`Self::resolve`],
+    /// for resolvers that never use the proxy.
+    fn resolve_direct<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>> {
+        self.resolve(domain)
+    }
 }
 
 /// The operating system resolver (`getaddrinfo`), first address returned.
@@ -942,7 +950,8 @@ impl RoutedOutbound {
         &self.direct
     }
 
-    /// The resolver of IP rules, also used for Fake-IP flows that go DIRECT.
+    /// The resolver of IP rules, also used for Fake-IP flows that go DIRECT
+    /// ([`DomainResolver::resolve_direct`] in the direct mode).
     pub fn resolver(&self) -> &Arc<dyn DomainResolver> {
         &self.resolver
     }
@@ -1079,7 +1088,8 @@ impl RoutedOutbound {
     /// that sends the server DIRECT (`FINAL,DIRECT` of a list-based config, a
     /// GeoIP rule for a domestic resolver) or REJECT never makes a proxied
     /// query go out in the clear, and a server name is never resolved here.
-    /// `None` when the global target rejects.
+    /// `None` when the global target rejects. This is the rule mode's
+    /// choice: the direct mode reaches every server directly and never asks.
     pub fn dns_outbound(&self, server: &TargetAddr) -> Option<Arc<dyn TcpOutbound>> {
         self.dns_outbound_as(server, None)
     }

@@ -1,5 +1,7 @@
 //! Routing modes and policy group choices over imported profiles.
 
+use engine_embedded::config::RuntimeConfig;
+use engine_embedded::connections::Mode;
 use engine_embedded::profile::{
     envelope_for_mode, groups, selected_node, set_group_default, switch_group_for_node,
     RoutingMode, PROXY_OUTBOUND,
@@ -62,16 +64,37 @@ fn rule_mode_keeps_the_profile_and_direct_mode_replaces_its_rules() {
     assert_eq!(render(&profile, RoutingMode::Rule), profile);
 
     let direct = render(&profile, RoutingMode::Direct);
+    assert_eq!(direct["mode"], "direct");
     assert_eq!(direct["routing"]["rules"], json!(["FINAL,DIRECT"]));
     assert_eq!(direct["routing"]["rule_sets"], json!({}));
     assert_eq!(direct["routing"]["groups"], profile["routing"]["groups"]);
 
     let single_direct = render(&single(), RoutingMode::Direct);
     assert!(single_direct.get("outbound").is_none());
+    assert_eq!(single_direct["mode"], "direct");
     assert_eq!(single_direct["routing"]["rules"], json!(["FINAL,DIRECT"]));
     assert!(single_direct["routing"]["outbounds"][PROXY_OUTBOUND].is_object());
 
     assert!(envelope_for_mode("[]", RoutingMode::Direct).is_err());
+}
+
+#[test]
+fn the_direct_envelope_starts_the_engine_in_its_direct_mode() {
+    // `FINAL,DIRECT` alone runs in the rule mode, where a `proxy` DNS server
+    // still goes through a node; the direct mode sends nothing through one.
+    let engine_mode = |profile: &Value, mode: RoutingMode| -> Mode {
+        let envelope = envelope_for_mode(&profile.to_string(), mode).unwrap();
+        RuntimeConfig::from_json(envelope.as_bytes()).unwrap().mode
+    };
+    for profile in [routed(), single()] {
+        assert_eq!(engine_mode(&profile, RoutingMode::Direct), Mode::Direct);
+        assert_eq!(engine_mode(&profile, RoutingMode::Rule), Mode::Rule);
+    }
+
+    // A mode the profile carries gives way to the direct one.
+    let mut global = routed();
+    global["mode"] = json!("global");
+    assert_eq!(engine_mode(&global, RoutingMode::Direct), Mode::Direct);
 }
 
 #[test]
