@@ -62,7 +62,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -693,16 +693,26 @@ pub struct CaptureStore {
     inner: Mutex<Inner>,
     /// Where `save_capture` writes sessions, once the client set it.
     storage: Mutex<Option<storage::Storage>>,
+    /// The session id of this store's own capture ([`Self::run_session`]).
+    run_session: String,
 }
 
 impl Default for CaptureStore {
     fn default() -> Self {
+        let now = unix_millis();
         Self {
             enabled: AtomicBool::new(false),
             max_total_bytes: AtomicUsize::new(DEFAULT_MAX_TOTAL_BYTES),
             next_seq: AtomicU64::new(1),
             inner: Mutex::default(),
             storage: Mutex::default(),
+            // Should the system refuse randomness, a count still keeps the
+            // stores of one process apart.
+            run_session: storage::new_session_id(now).unwrap_or_else(|| {
+                static STORES: AtomicU32 = AtomicU32::new(0);
+                let count = STORES.fetch_add(1, Ordering::Relaxed);
+                format!("{now}-{:08x}", std::process::id() ^ count.rotate_left(16))
+            }),
         }
     }
 }
@@ -720,6 +730,11 @@ pub struct CaptureStatus {
     /// Exchanges whose bodies were let go of for the budget since the
     /// last clear (their rows stay, bodies marked truncated).
     pub dropped_bodies: u64,
+    /// The session id this capture is saved under by `save_capture` with
+    /// `run`, and copied under by `copy_capture` without `session`: one id
+    /// per engine run, so the app's copies and the tunnel's save on stop
+    /// are the same session.
+    pub run_session: String,
 }
 
 impl CaptureStore {
@@ -755,7 +770,13 @@ impl CaptureStore {
             connections: inner.connections.len(),
             dropped_exchanges: inner.dropped_exchanges,
             dropped_bodies: inner.dropped_bodies,
+            run_session: self.run_session.clone(),
         }
+    }
+
+    /// The session id of what this store captures in this run.
+    pub fn run_session(&self) -> &str {
+        &self.run_session
     }
 
     /// Starts capturing a new connection when capture is on; `true` when it
@@ -1149,8 +1170,14 @@ impl CaptureStore {
         Ok(answer)
     }
 
-    /// Seals what the store holds into a new session: `{"session": {...}}`.
-    pub fn save_session(&self, name: Option<&str>) -> Result<Value, storage::StorageError> {
+    /// Seals what the store holds into a new session, or with `run` into
+    /// the run's own session ([`Self::run_session`], replaced each time):
+    /// `{"session": {...}}`.
+    pub fn save_session(
+        &self,
+        name: Option<&str>,
+        run: bool,
+    ) -> Result<Value, storage::StorageError> {
         let storage = lock(&self.storage);
         let storage = storage
             .as_ref()
@@ -1158,7 +1185,8 @@ impl CaptureStore {
         let now = unix_millis();
         storage.purge(now);
         let inner = lock(&self.inner);
-        let session = storage.save(&inner, name, now)?;
+        let id = run.then_some(self.run_session.as_str());
+        let session = storage.save(&inner, name, now, id)?;
         Ok(json!({ "session": session }))
     }
 
@@ -1176,8 +1204,14 @@ impl CaptureStore {
     /// and `dropped_before_seq` covers all earlier rows. Its connections
     /// get new ids from [`LOADED_ID_BASE`] up, in their saved order, so no
     /// live connection (whose ids count from 1 again in every tunnel run)
-    /// shares one and writes into them.
-    pub fn load_session(&self, id: &str) -> Result<CaptureStatus, storage::StorageError> {
+    /// shares one and writes into them; with `keep_ids` (the capture
+    /// viewer, where nothing is live) they keep the ids they were saved
+    /// with, so a connection the app showed live is found again.
+    pub fn load_session(
+        &self,
+        id: &str,
+        keep_ids: bool,
+    ) -> Result<CaptureStatus, storage::StorageError> {
         let loaded = {
             let storage = lock(&self.storage);
             storage
@@ -1192,11 +1226,16 @@ impl CaptureStore {
             let mut connections = loaded
                 .into_iter()
                 .enumerate()
-                .map(|(rank, (_, mut captured))| {
+                .map(|(rank, (saved_id, mut captured))| {
                     captured.loaded = true;
                     captured.http_base = 0;
                     inner.used += captured.memory;
-                    (LOADED_ID_BASE + rank as u64, captured)
+                    let id = if keep_ids {
+                        saved_id
+                    } else {
+                        LOADED_ID_BASE + rank as u64
+                    };
+                    (id, captured)
                 })
                 .collect::<Vec<_>>();
             let mut order = connections
@@ -1231,13 +1270,31 @@ impl CaptureStore {
     /// for a client to keep in a store of its own (see
     /// [`storage::Storage::reseal`]):
     /// `{"session", "file_name", "size", "data_base64"}`.
-    pub fn copy_session(&self, id: &str, key: &[u8]) -> Result<Vec<u8>, storage::StorageError> {
-        let file = {
-            let storage = lock(&self.storage);
-            storage
-                .as_ref()
-                .ok_or(storage::StorageError::NotConfigured)?
-                .reseal(id, key)?
+    /// Without `id`, what the store holds now is sealed as
+    /// [`Self::run_session`] named `name`, with no storage needed: the app
+    /// keeps a copy while the tunnel runs, which the tunnel's own save on
+    /// stop (`save_capture` with `run`) later replaces.
+    pub fn copy_session(
+        &self,
+        id: Option<&str>,
+        key: &[u8],
+        name: Option<&str>,
+    ) -> Result<Vec<u8>, storage::StorageError> {
+        let (id, file) = match id {
+            Some(id) => {
+                let storage = lock(&self.storage);
+                let file = storage
+                    .as_ref()
+                    .ok_or(storage::StorageError::NotConfigured)?
+                    .reseal(id, key)?;
+                (id, file)
+            }
+            None => {
+                let key = storage::sealing_key(key)?;
+                let inner = lock(&self.inner);
+                let sealed = storage::seal_inner(&key, &inner, name, unix_millis())?;
+                (self.run_session.as_str(), sealed.file)
+            }
         };
         let head = json!({
             "session": id,
@@ -3069,7 +3126,7 @@ mod tests {
         filed(&store, 12, "GET", "https://saved.test/1", 200);
         filed(&store, 12, "GET", "https://saved.test/2", 200);
         store.end(12, 5);
-        let saved = store.save_session(Some("yesterday")).unwrap();
+        let saved = store.save_session(Some("yesterday"), false).unwrap();
         let session = saved["session"]["session"].as_str().unwrap().to_string();
         store.clear();
 
@@ -3079,7 +3136,7 @@ mod tests {
         let live = store
             .open_exchange(12, HttpExchange::new("POST", "https://live.test/x", &[]))
             .unwrap();
-        store.load_session(&session).unwrap();
+        store.load_session(&session, false).unwrap();
         let mut finished = HttpExchange::new("POST", "https://live.test/x", &[]);
         finished.status = Some(201);
         store.update_exchange(12, live, &finished);
@@ -3107,6 +3164,95 @@ mod tests {
         assert_eq!(store.status().connections, 2);
         assert_accounted(&store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_run_session_is_one_id_for_live_copies_and_the_save_on_stop() {
+        use base64::Engine as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "anixops-capture-run-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        let app_dir = dir.with_extension("app");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&app_dir);
+        let tunnel = store(MAX_TOTAL_BYTES_LIMIT);
+        let run = tunnel.run_session().to_string();
+        assert!(storage::saved_at(&run).is_some(), "{run}");
+        assert_ne!(CaptureStore::default().run_session(), run);
+        assert_eq!(tunnel.status().run_session, run);
+        decrypted(&tunnel, 7);
+        filed(&tunnel, 7, "GET", "https://run.test/1", 200);
+
+        // The app's copy while the tunnel runs: no tunnel storage needed.
+        let app_key = [5u8; storage::KEY_LEN];
+        let copy: Value = serde_json::from_slice(
+            &tunnel
+                .copy_session(None, &app_key, Some("断开时自动保存"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(copy["session"], run.as_str());
+        let file = base64::engine::general_purpose::STANDARD
+            .decode(copy["data_base64"].as_str().unwrap())
+            .unwrap();
+        let viewer = CaptureStore::default();
+        viewer
+            .set_storage(app_dir.to_str().unwrap(), &app_key, None)
+            .unwrap();
+        viewer.import_session(&run, &file).unwrap();
+        viewer.load_session(&run, true).unwrap();
+        // The live id: the app finds the connection it showed.
+        assert_eq!(
+            viewer.connection_json(7).unwrap()["http"][0]["url"],
+            "https://run.test/1"
+        );
+        assert!(viewer.connection_json(LOADED_ID_BASE).is_none());
+
+        // More comes in; the tunnel saves the run on stop, under the same id.
+        filed(&tunnel, 7, "GET", "https://run.test/2", 200);
+        tunnel
+            .set_storage(dir.to_str().unwrap(), &[6u8; storage::KEY_LEN], None)
+            .unwrap();
+        let saved = tunnel.save_session(Some("断开时自动保存"), true).unwrap();
+        assert_eq!(saved["session"]["session"], run.as_str());
+        let again = tunnel.save_session(None, true).unwrap();
+        assert_eq!(again["session"]["session"], run.as_str());
+        assert_eq!(
+            tunnel.sessions().unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // Its copy replaces the app's earlier one.
+        let copy: Value =
+            serde_json::from_slice(&tunnel.copy_session(Some(&run), &app_key, None).unwrap())
+                .unwrap();
+        let file = base64::engine::general_purpose::STANDARD
+            .decode(copy["data_base64"].as_str().unwrap())
+            .unwrap();
+        viewer.import_session(&run, &file).unwrap();
+        assert_eq!(
+            viewer.sessions().unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        viewer.load_session(&run, true).unwrap();
+        assert_eq!(
+            viewer.connection_json(7).unwrap()["http"][1]["url"],
+            "https://run.test/2"
+        );
+        let listed = viewer.connections_json();
+        assert_eq!(listed["closed"][0]["id"], 7);
+        assert_eq!(listed["closed"][0]["captured"], true);
+        assert!(listed["closed"][0]["ended_at_ms"].is_u64());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&app_dir);
     }
 
     fn head_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {

@@ -132,45 +132,35 @@ impl Storage {
         purged
     }
 
-    /// Seals `inner` into a new session file; its listing entry.
+    /// Seals `inner` into a session file; its listing entry. The file is
+    /// session `id` when given (it replaces a session of that id: the
+    /// engine's own run, see [`super::CaptureStore::run_session`]), else a
+    /// new one.
     pub(super) fn save(
         &self,
         inner: &Inner,
         name: Option<&str>,
         now_ms: u64,
+        id: Option<&str>,
     ) -> Result<Value, StorageError> {
-        let random = SystemRandom::new();
-        let mut tag = [0u8; 4];
-        random
-            .fill(&mut tag)
-            .map_err(|_| StorageError::WriteFailed)?;
-        let id = format!("{now_ms}-{}", hex(&tag));
-        let requests: usize = inner.connections.values().map(|c| c.http.len()).sum();
-        let name: String = name
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or("")
-            .chars()
-            .take(MAX_NAME_CHARS)
-            .collect();
-        let meta = json!({
-            "name": name,
-            "saved_at_ms": now_ms,
-            "connections": inner.connections.len(),
-            "requests": requests,
-        });
-        let meta = serde_json::to_vec(&meta).map_err(|_| StorageError::WriteFailed)?;
-        let file = sealed_file(&self.key, meta, encode(inner))?;
-        let path = self.write(&id, &file)?;
+        let id = match id {
+            Some(id) => {
+                self.path(id)?;
+                id.to_string()
+            }
+            None => new_session_id(now_ms).ok_or(StorageError::WriteFailed)?,
+        };
+        let sealed = seal_inner(&self.key, inner, name, now_ms)?;
+        let path = self.write(&id, &sealed.file)?;
         Ok(self.entry(
             &id,
             &path,
             Some(meta_value(
                 &id,
                 now_ms,
-                &name,
-                inner.connections.len(),
-                requests,
+                &sealed.name,
+                sealed.connections,
+                sealed.requests,
             )),
         ))
     }
@@ -349,8 +339,55 @@ impl Storage {
     }
 }
 
+/// A new session id `<now_ms>-<8 random hex>`.
+pub(super) fn new_session_id(now_ms: u64) -> Option<String> {
+    let mut tag = [0u8; 4];
+    SystemRandom::new().fill(&mut tag).ok()?;
+    Some(format!("{now_ms}-{}", hex(&tag)))
+}
+
+/// What [`seal_inner`] made.
+pub(super) struct Sealed {
+    pub name: String,
+    pub connections: usize,
+    pub requests: usize,
+    pub file: Vec<u8>,
+}
+
+/// `inner` as a whole session file sealed with `key`, named `name` (cut to
+/// [`MAX_NAME_CHARS`]) and dated `now_ms`.
+pub(super) fn seal_inner(
+    key: &LessSafeKey,
+    inner: &Inner,
+    name: Option<&str>,
+    now_ms: u64,
+) -> Result<Sealed, StorageError> {
+    let requests: usize = inner.connections.values().map(|c| c.http.len()).sum();
+    let name: String = name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let meta = json!({
+        "name": name,
+        "saved_at_ms": now_ms,
+        "connections": inner.connections.len(),
+        "requests": requests,
+    });
+    let meta = serde_json::to_vec(&meta).map_err(|_| StorageError::WriteFailed)?;
+    let file = sealed_file(key, meta, encode(inner))?;
+    Ok(Sealed {
+        name,
+        connections: inner.connections.len(),
+        requests,
+        file,
+    })
+}
+
 /// The AEAD key of 32 raw bytes.
-fn sealing_key(key: &[u8]) -> Result<LessSafeKey, StorageError> {
+pub(super) fn sealing_key(key: &[u8]) -> Result<LessSafeKey, StorageError> {
     if key.len() != KEY_LEN {
         return Err(StorageError::InvalidKey);
     }
@@ -421,7 +458,7 @@ fn session_id(path: &Path) -> Option<String> {
 }
 
 /// The save time in a session id `<ms>-<8 hex>`.
-fn saved_at(id: &str) -> Option<u64> {
+pub(super) fn saved_at(id: &str) -> Option<u64> {
     let (millis, tag) = id.split_once('-')?;
     let valid = tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit());
     if !valid || millis.is_empty() || !millis.bytes().all(|b| b.is_ascii_digit()) {
@@ -973,7 +1010,7 @@ mod tests {
         let entry = {
             let inner = super::super::lock(&store.inner);
             storage
-                .save(&inner, Some(" morning run "), 1_000_000)
+                .save(&inner, Some(" morning run "), 1_000_000, None)
                 .unwrap()
         };
         let id = entry["session"].as_str().unwrap().to_string();
@@ -1034,7 +1071,9 @@ mod tests {
         let now = super::super::unix_millis();
         let id = {
             let inner = super::super::lock(&store.inner);
-            tunnel.save(&inner, Some("on disconnect"), now).unwrap()["session"]
+            tunnel
+                .save(&inner, Some("on disconnect"), now, None)
+                .unwrap()["session"]
                 .as_str()
                 .unwrap()
                 .to_string()
@@ -1090,8 +1129,10 @@ mod tests {
         let store = sample_store();
         {
             let inner = super::super::lock(&store.inner);
-            storage.save(&inner, None, 1_000).unwrap();
-            storage.save(&inner, None, 1_000 + 6 * DAY_MS).unwrap();
+            storage.save(&inner, None, 1_000, None).unwrap();
+            storage
+                .save(&inner, None, 1_000 + 6 * DAY_MS, None)
+                .unwrap();
         }
         fs::write(dir.join("notes.txt"), b"keep").unwrap();
         assert_eq!(storage.purge(1_000 + 7 * DAY_MS + 1), 1);
