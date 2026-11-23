@@ -29,15 +29,16 @@ use control_domain::{
     NODE_METADATA_IWAN_PASSWORD, NODE_METADATA_IWAN_USERNAME, NODE_METADATA_MIERU_PASSWORD,
     NODE_METADATA_MIERU_PORT_RANGE, NODE_METADATA_MIERU_TRANSPORT, NODE_METADATA_MIERU_USERNAME,
     NODE_METADATA_MULTIPLEX, NODE_METADATA_PATH, NODE_METADATA_SHADOWSOCKS_METHOD,
-    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SNELL_MODE, NODE_METADATA_SNELL_OBFS,
-    NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI, NODE_METADATA_SNELL_PSK,
-    NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_SNELL_VERSION,
-    NODE_METADATA_TLS_ALPN, NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
-    NODE_METADATA_TLS_CERTIFICATE_SHA256, NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE,
-    NODE_METADATA_TLS_REALITY_PUBLIC_KEY, NODE_METADATA_TLS_REALITY_SHORT_ID,
-    NODE_METADATA_TLS_SERVER_NAME, NODE_METADATA_TLS_UTLS_FINGERPRINT,
-    NODE_METADATA_TROJAN_PASSWORD, NODE_METADATA_TUIC_CONGESTION_CONTROL,
-    NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID, NODE_METADATA_V2RAY_TRANSPORT_EXTRA,
+    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SHADOWSOCKS_PLUGIN, NODE_METADATA_SNELL_MODE,
+    NODE_METADATA_SNELL_OBFS, NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI,
+    NODE_METADATA_SNELL_PSK, NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY,
+    NODE_METADATA_SNELL_VERSION, NODE_METADATA_TLS_ALPN,
+    NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
+    NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+    NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
+    NODE_METADATA_TLS_UTLS_FINGERPRINT, NODE_METADATA_TROJAN_PASSWORD,
+    NODE_METADATA_TUIC_CONGESTION_CONTROL, NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID,
+    NODE_METADATA_UNSUPPORTED_OPTION, NODE_METADATA_V2RAY_TRANSPORT_EXTRA,
     NODE_METADATA_V2RAY_TRANSPORT_HOST, NODE_METADATA_V2RAY_TRANSPORT_MODE,
     NODE_METADATA_V2RAY_TRANSPORT_PATH, NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME,
     NODE_METADATA_V2RAY_TRANSPORT_TYPE, NODE_METADATA_VIA, NODE_METADATA_VIA_UNRESOLVED,
@@ -46,7 +47,9 @@ use control_domain::{
     NODE_METADATA_WIREGUARD_ALLOWED_IPS, NODE_METADATA_WIREGUARD_LOCAL_ADDRESS,
     NODE_METADATA_WIREGUARD_MTU, NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
     NODE_METADATA_WIREGUARD_PRE_SHARED_KEY, NODE_METADATA_WIREGUARD_PRIVATE_KEY,
-    NODE_METADATA_WIREGUARD_RESERVED,
+    NODE_METADATA_WIREGUARD_RESERVED, NODE_UNSUPPORTED_OPTION_ECH,
+    NODE_UNSUPPORTED_OPTION_HTTP_OBFS, NODE_UNSUPPORTED_OPTION_TRANSPORT,
+    NODE_UNSUPPORTED_OPTION_XHTTP,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -62,6 +65,9 @@ pub type Unsupported = &'static str;
 pub fn outbound_json(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     if metadata(node, NODE_METADATA_VIA_UNRESOLVED).is_some() {
         return Err("it connects through an outbound that is not one of the imported nodes");
+    }
+    if let Some(option) = metadata(node, NODE_METADATA_UNSUPPORTED_OPTION) {
+        return Err(unsupported_option_reason(option));
     }
     let mut outbound = match &node.protocol {
         Protocol::Shadowsocks => shadowsocks(node),
@@ -107,6 +113,24 @@ pub fn outbound_json(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         }
     }
     Ok(outbound)
+}
+
+/// Why a node whose source names an option no node field carries
+/// ([`NODE_METADATA_UNSUPPORTED_OPTION`]) cannot run.
+fn unsupported_option_reason(option: &str) -> Unsupported {
+    match option {
+        NODE_UNSUPPORTED_OPTION_HTTP_OBFS => {
+            "http header obfuscation transports are not implemented yet"
+        }
+        NODE_UNSUPPORTED_OPTION_TRANSPORT => {
+            "transports other than tcp, ws, grpc and xhttp are not implemented yet"
+        }
+        NODE_UNSUPPORTED_OPTION_ECH => "encrypted client hello (ECH) is not implemented yet",
+        NODE_UNSUPPORTED_OPTION_XHTTP => {
+            "xhttp options other than path, host, mode and headers are not implemented yet"
+        }
+        _ => "an option of this node is not implemented yet",
+    }
 }
 
 /// Largest subscription text [`import_text`] accepts.
@@ -473,6 +497,10 @@ fn shadowsocks(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         metadata(node, NODE_METADATA_SHADOWSOCKS_METHOD).ok_or("shadowsocks method is missing")?;
     let password = metadata(node, NODE_METADATA_SHADOWSOCKS_PASSWORD)
         .ok_or("shadowsocks password is missing")?;
+    // Without its plugin the server would only see bytes it drops.
+    if metadata(node, NODE_METADATA_SHADOWSOCKS_PLUGIN).is_some() {
+        return Err("shadowsocks plugins (obfs, v2ray-plugin, shadow-tls) are not implemented yet");
+    }
     if !matches!(
         method,
         "2022-blake3-aes-128-gcm"
@@ -574,6 +602,9 @@ fn vmess(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         None | Some("0")
     ) {
         return Err("vmess alterId other than 0 (legacy headers) is not supported");
+    }
+    if metadata(node, NODE_METADATA_TLS_REALITY_PUBLIC_KEY).is_some() {
+        return Err("vmess over REALITY is not supported");
     }
     let transport = v2ray_transport(node)?;
     Ok(json!({
@@ -1044,6 +1075,11 @@ fn trojan(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     let transport = v2ray_transport(node)?;
     if metadata(node, NODE_METADATA_TLS_ENABLED) == Some("false") {
         return Err("trojan without tls is not supported");
+    }
+    // Running it as plain TLS would only reach the REALITY server's cover
+    // site.
+    if metadata(node, NODE_METADATA_TLS_REALITY_PUBLIC_KEY).is_some() {
+        return Err("trojan over REALITY is not implemented yet");
     }
     let pins = certificate_pins(node)?;
     let mut outbound = json!({

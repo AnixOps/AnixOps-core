@@ -28,24 +28,28 @@ use control_domain::{
     NODE_METADATA_MIERU_MULTIPLEXING, NODE_METADATA_MIERU_PASSWORD, NODE_METADATA_MIERU_PORT_RANGE,
     NODE_METADATA_MIERU_TRAFFIC_PATTERN, NODE_METADATA_MIERU_TRANSPORT,
     NODE_METADATA_MIERU_USERNAME, NODE_METADATA_MULTIPLEX, NODE_METADATA_PATH,
-    NODE_METADATA_SHADOWSOCKS_METHOD, NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SNELL_MODE,
-    NODE_METADATA_SNELL_OBFS, NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI,
-    NODE_METADATA_SNELL_PSK, NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY,
-    NODE_METADATA_SNELL_VERSION, NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
+    NODE_METADATA_SHADOWSOCKS_METHOD, NODE_METADATA_SHADOWSOCKS_PASSWORD,
+    NODE_METADATA_SHADOWSOCKS_PLUGIN, NODE_METADATA_SNELL_MODE, NODE_METADATA_SNELL_OBFS,
+    NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI, NODE_METADATA_SNELL_PSK,
+    NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_SNELL_VERSION,
+    NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
     NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
     NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
     NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
     NODE_METADATA_TLS_UTLS_FINGERPRINT, NODE_METADATA_TROJAN_PASSWORD,
     NODE_METADATA_TUIC_CONGESTION_CONTROL, NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID,
-    NODE_METADATA_V2RAY_TRANSPORT_EXTRA, NODE_METADATA_V2RAY_TRANSPORT_HOST,
-    NODE_METADATA_V2RAY_TRANSPORT_MODE, NODE_METADATA_V2RAY_TRANSPORT_PATH,
-    NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME, NODE_METADATA_V2RAY_TRANSPORT_TYPE,
-    NODE_METADATA_VIA, NODE_METADATA_VIA_UNRESOLVED, NODE_METADATA_VLESS_ENCRYPTION,
-    NODE_METADATA_VLESS_FLOW, NODE_METADATA_VLESS_UUID, NODE_METADATA_VMESS_ALTER_ID,
-    NODE_METADATA_VMESS_SECURITY, NODE_METADATA_VMESS_UUID, NODE_METADATA_WIREGUARD_ALLOWED_IPS,
-    NODE_METADATA_WIREGUARD_LOCAL_ADDRESS, NODE_METADATA_WIREGUARD_MTU,
-    NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY, NODE_METADATA_WIREGUARD_PRE_SHARED_KEY,
-    NODE_METADATA_WIREGUARD_PRIVATE_KEY, NODE_METADATA_WIREGUARD_RESERVED,
+    NODE_METADATA_UNSUPPORTED_OPTION, NODE_METADATA_V2RAY_TRANSPORT_EXTRA,
+    NODE_METADATA_V2RAY_TRANSPORT_HOST, NODE_METADATA_V2RAY_TRANSPORT_MODE,
+    NODE_METADATA_V2RAY_TRANSPORT_PATH, NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME,
+    NODE_METADATA_V2RAY_TRANSPORT_TYPE, NODE_METADATA_VIA, NODE_METADATA_VIA_UNRESOLVED,
+    NODE_METADATA_VLESS_ENCRYPTION, NODE_METADATA_VLESS_FLOW, NODE_METADATA_VLESS_UUID,
+    NODE_METADATA_VMESS_ALTER_ID, NODE_METADATA_VMESS_SECURITY, NODE_METADATA_VMESS_UUID,
+    NODE_METADATA_WIREGUARD_ALLOWED_IPS, NODE_METADATA_WIREGUARD_LOCAL_ADDRESS,
+    NODE_METADATA_WIREGUARD_MTU, NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
+    NODE_METADATA_WIREGUARD_PRE_SHARED_KEY, NODE_METADATA_WIREGUARD_PRIVATE_KEY,
+    NODE_METADATA_WIREGUARD_RESERVED, NODE_UNSUPPORTED_OPTION_ECH,
+    NODE_UNSUPPORTED_OPTION_HTTP_OBFS, NODE_UNSUPPORTED_OPTION_TRANSPORT,
+    NODE_UNSUPPORTED_OPTION_XHTTP,
 };
 use routing::{NetworkRuleSpec, PolicyGroupSpec, RoutingModel, RoutingSpec};
 use serde::Deserialize;
@@ -223,6 +227,46 @@ struct RawClashProxy {
     /// Certificate pin (mihomo): SHA-256 of the server's certificate in hex.
     /// The uTLS fingerprint is `client-fingerprint`.
     fingerprint: Option<RawClashScalar>,
+    /// TLS, REALITY and transport options of vmess, vless and trojan.
+    #[serde(flatten)]
+    stream: RawClashStreamOptions,
+    /// VLESS flow (`xtls-rprx-vision`).
+    flow: Option<serde_json::Value>,
+    #[serde(rename = "alterId", alias = "alter-id")]
+    alter_id: Option<serde_json::Value>,
+    /// Shadowsocks SIP003 plugin (`obfs`, `v2ray-plugin`, `shadow-tls`, ...);
+    /// its `plugin-opts` are not read, they can hold passwords.
+    plugin: Option<serde_json::Value>,
+}
+
+/// TLS, REALITY and transport options of a Clash vmess, vless or trojan
+/// proxy. YAML gives booleans, lists and maps here, so they are kept as JSON
+/// values (see [`clash_stream_options`]) and a value of an unexpected shape
+/// is reported for this proxy instead of failing the entry's whole read.
+#[derive(Debug, Default, Deserialize)]
+struct RawClashStreamOptions {
+    tls: Option<serde_json::Value>,
+    servername: Option<serde_json::Value>,
+    sni: Option<serde_json::Value>,
+    #[serde(rename = "skip-cert-verify")]
+    skip_cert_verify: Option<serde_json::Value>,
+    alpn: Option<serde_json::Value>,
+    /// uTLS fingerprint name (`chrome`, `safari`, ...).
+    #[serde(rename = "client-fingerprint")]
+    client_fingerprint: Option<serde_json::Value>,
+    network: Option<serde_json::Value>,
+    #[serde(rename = "ws-opts")]
+    ws_opts: Option<serde_json::Value>,
+    #[serde(rename = "grpc-opts")]
+    grpc_opts: Option<serde_json::Value>,
+    #[serde(rename = "h2-opts")]
+    h2_opts: Option<serde_json::Value>,
+    #[serde(rename = "xhttp-opts")]
+    xhttp_opts: Option<serde_json::Value>,
+    #[serde(rename = "reality-opts")]
+    reality_opts: Option<serde_json::Value>,
+    #[serde(rename = "ech-opts")]
+    ech_opts: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +309,9 @@ struct RawSingBoxOutbound {
     username: Option<RawSingBoxScalar>,
     mtu: Option<RawSingBoxScalar>,
     encrypt: Option<bool>,
+    /// Shadowsocks SIP003 plugin (`obfs-local`, `v2ray-plugin`); its
+    /// `plugin_opts` are not read, they can hold passwords.
+    plugin: Option<RawSingBoxScalar>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1085,20 +1132,20 @@ fn parse_clash_proxy(mut raw: RawClashProxy, source_id: &str) -> DomainResult<No
                 raw.password,
                 "clash shadowsocks password cannot be empty",
             )?;
-            (
-                Protocol::Shadowsocks,
-                "ss",
-                vec![
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
-                        value: method,
-                    },
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
-                        value: password,
-                    },
-                ],
-            )
+            let mut metadata = vec![
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
+                    value: method,
+                },
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
+                    value: password,
+                },
+            ];
+            metadata.extend(shadowsocks_plugin_entry(clash_option_text(
+                raw.plugin.as_ref(),
+            )));
+            (Protocol::Shadowsocks, "ss", metadata)
         }
         "trojan" => {
             let password =
@@ -1128,18 +1175,28 @@ fn parse_clash_proxy(mut raw: RawClashProxy, source_id: &str) -> DomainResult<No
                     value: encryption,
                 });
             }
+            if let Some(flow) = clash_option_text(raw.flow.as_ref()) {
+                metadata.push(MetadataEntry {
+                    key: NODE_METADATA_VLESS_FLOW.to_string(),
+                    value: flow,
+                });
+            }
             (Protocol::Vless, "vless", metadata)
         }
         "vmess" => {
             let uuid = required_clash_scalar_field(raw.uuid, "clash vmess uuid cannot be empty")?;
-            (
-                Protocol::Vmess,
-                "vmess",
-                vec![MetadataEntry {
-                    key: NODE_METADATA_VMESS_UUID.to_string(),
-                    value: uuid,
-                }],
-            )
+            let mut metadata = vec![MetadataEntry {
+                key: NODE_METADATA_VMESS_UUID.to_string(),
+                value: uuid,
+            }];
+            metadata.extend(proxy_vmess_security(text(raw.cipher)));
+            if let Some(alter_id) = clash_option_text(raw.alter_id.as_ref()) {
+                metadata.push(MetadataEntry {
+                    key: NODE_METADATA_VMESS_ALTER_ID.to_string(),
+                    value: alter_id,
+                });
+            }
+            (Protocol::Vmess, "vmess", metadata)
         }
         "snell" => {
             let psk = required_clash_scalar_field(raw.psk, "clash snell psk cannot be empty")?;
@@ -1212,6 +1269,13 @@ fn parse_clash_proxy(mut raw: RawClashProxy, source_id: &str) -> DomainResult<No
         Protocol::Trojan | Protocol::Vless | Protocol::Vmess
     ) {
         metadata.extend(proxy_line_pin_metadata(text(raw.fingerprint.take()), None));
+        clash_stream_options(&raw.stream)?.append_to(
+            &mut metadata,
+            &host,
+            protocol == Protocol::Trojan,
+            SUBSCRIPTION_CLASH_YAML_INVALID_CODE,
+            "clash proxy",
+        )?;
     }
     metadata.extend(multiplex_metadata(raw.smux.as_ref()));
     let name_id = sanitize_identifier(&name);
@@ -1444,6 +1508,7 @@ fn parse_sing_box_outbound(
         username,
         mtu,
         encrypt,
+        plugin,
     } = raw;
     let protocol =
         required_sing_box_scalar_field(protocol, "sing-box outbound type cannot be empty")?;
@@ -1469,20 +1534,20 @@ fn parse_sing_box_outbound(
                 password,
                 "sing-box shadowsocks password cannot be empty",
             )?;
-            (
-                Protocol::Shadowsocks,
-                "ss",
-                vec![
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
-                        value: method,
-                    },
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
-                        value: password,
-                    },
-                ],
-            )
+            let mut metadata = vec![
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
+                    value: method,
+                },
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
+                    value: password,
+                },
+            ];
+            metadata.extend(shadowsocks_plugin_entry(optional_sing_box_scalar_field(
+                plugin,
+            )));
+            (Protocol::Shadowsocks, "ss", metadata)
         }
         "trojan" => {
             let password = required_sing_box_scalar_field(
@@ -2118,20 +2183,23 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
                 &["password"],
                 "quantumult x shadowsocks password cannot be empty",
             )?;
-            (
-                Protocol::Shadowsocks,
-                "ss",
-                vec![
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
-                        value: method,
-                    },
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
-                        value: password,
-                    },
-                ],
-            )
+            let mut metadata = vec![
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
+                    value: method,
+                },
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
+                    value: password,
+                },
+            ];
+            metadata.extend(shadowsocks_plugin_entry(
+                options
+                    .get("obfs")
+                    .map(String::as_str)
+                    .map(obfs_plugin_name),
+            ));
+            (Protocol::Shadowsocks, "ss", metadata)
         }
         "trojan" => {
             let password = required_quantumult_x_proxy_option(
@@ -2154,14 +2222,17 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
                 &["password", "uuid"],
                 "quantumult x vless uuid cannot be empty",
             )?;
-            (
-                Protocol::Vless,
-                "vless",
-                vec![MetadataEntry {
-                    key: NODE_METADATA_VLESS_UUID.to_string(),
-                    value: uuid,
-                }],
-            )
+            let mut metadata = vec![MetadataEntry {
+                key: NODE_METADATA_VLESS_UUID.to_string(),
+                value: uuid,
+            }];
+            if let Some(flow) = optional_quantumult_x_proxy_option(&options, &["vless_flow"]) {
+                metadata.push(MetadataEntry {
+                    key: NODE_METADATA_VLESS_FLOW.to_string(),
+                    value: flow,
+                });
+            }
+            (Protocol::Vless, "vless", metadata)
         }
         "vmess" => {
             let uuid = required_quantumult_x_proxy_option(
@@ -2169,14 +2240,15 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
                 &["password", "uuid", "username"],
                 "quantumult x vmess uuid cannot be empty",
             )?;
-            (
-                Protocol::Vmess,
-                "vmess",
-                vec![MetadataEntry {
-                    key: NODE_METADATA_VMESS_UUID.to_string(),
-                    value: uuid,
-                }],
-            )
+            let mut metadata = vec![MetadataEntry {
+                key: NODE_METADATA_VMESS_UUID.to_string(),
+                value: uuid,
+            }];
+            metadata.extend(proxy_vmess_security(optional_quantumult_x_proxy_option(
+                &options,
+                &["method"],
+            )));
+            (Protocol::Vmess, "vmess", metadata)
         }
         "direct" | "reject" | "http" | "https" | "socks" | "socks5" | "ssr" | "shadowsocksr"
         | "hysteria" | "hysteria2" | "tuic" | "wireguard" => {
@@ -2200,6 +2272,13 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
             optional_quantumult_x_proxy_option(&options, &["tls_cert_sha256"]),
             optional_quantumult_x_proxy_option(&options, &["tls_pubkey_sha256"]),
         ));
+        quantumult_x_stream_options(&options)?.append_to(
+            &mut metadata,
+            &host,
+            protocol == Protocol::Trojan,
+            SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_INVALID_CODE,
+            "quantumult x proxy",
+        )?;
     }
 
     let name = optional_quantumult_x_proxy_option(&options, &["tag"]).unwrap_or_else(|| {
@@ -2239,6 +2318,76 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
         ],
         metadata,
     })
+}
+
+/// The share-link settings of a Quantumult X vmess, vless or trojan line:
+/// `obfs=over-tls|wss|ws` with `obfs-host` and `obfs-uri`, `over-tls`,
+/// `tls-host`, `tls-verification`, `reality-base64-pubkey` and
+/// `reality-hex-shortid`. `obfs=http` (HTTP/1.1 header obfuscation) and
+/// other `obfs` values make the node unsupported.
+fn quantumult_x_stream_options(
+    options: &BTreeMap<String, String>,
+) -> DomainResult<ProxyStreamOptions> {
+    let code = SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_INVALID_CODE;
+    let mut stream = ProxyStreamOptions::default();
+    let mut tls = proxy_line_boolean(options.get("over_tls"), code, "quantumult x over-tls")?;
+    match options
+        .get("obfs")
+        .map(String::as_str)
+        .map(normalized_token)
+        .as_deref()
+    {
+        None | Some("" | "none") => {}
+        Some("over_tls") => tls = Some(true),
+        Some("wss") => {
+            tls = Some(true);
+            stream.set_transport("ws");
+        }
+        Some(other) => stream.set_transport(other),
+    }
+    let obfs_host = options.get("obfs_host").cloned();
+    if stream.query.get("type").map(String::as_str) == Some("ws") {
+        stream.set("path", options.get("obfs_uri").cloned());
+        stream.set("host", obfs_host.clone());
+    }
+    let reality = options.get("reality_base64_pubkey").cloned();
+    if reality.is_some() {
+        stream.set("security", Some("reality".to_string()));
+        stream.set("pbk", reality);
+        stream.set("sid", options.get("reality_hex_shortid").cloned());
+    } else if let Some(tls) = tls {
+        let security = if tls { "tls" } else { "none" };
+        stream.set("security", Some(security.to_string()));
+    }
+    // `tls-host` names the server; without it the `obfs-host` of a TLS
+    // `obfs` does.
+    stream.set("sni", options.get("tls_host").cloned());
+    if matches!(
+        stream.query.get("security").map(String::as_str),
+        Some("tls" | "reality")
+    ) {
+        stream.set_default("sni", obfs_host);
+    }
+    if let Some(verify) = proxy_line_boolean(
+        options.get("tls_verification"),
+        code,
+        "quantumult x tls-verification",
+    )? {
+        stream.set("insecure", Some((!verify).to_string()));
+    }
+    Ok(stream)
+}
+
+/// The SIP003 plugin a Shadowsocks `obfs=` option stands for: simple-obfs
+/// for `http` and `tls`, v2ray-plugin for `ws` and `wss`. `none` is no
+/// plugin.
+fn obfs_plugin_name(obfs: &str) -> String {
+    match normalized_token(obfs).as_str() {
+        "" | "none" => String::new(),
+        "http" | "tls" => "obfs-local".to_string(),
+        "ws" | "wss" | "websocket" => "v2ray-plugin".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn collect_quantumult_x_proxy_options(parts: &[String]) -> DomainResult<BTreeMap<String, String>> {
@@ -2450,20 +2599,20 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
                 required_loon_proxy_part(&parts, 3, "loon shadowsocks method cannot be empty")?;
             let password =
                 required_loon_proxy_part(&parts, 4, "loon shadowsocks password cannot be empty")?;
-            (
-                Protocol::Shadowsocks,
-                "ss",
-                vec![
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
-                        value: method,
-                    },
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
-                        value: password,
-                    },
-                ],
-            )
+            let mut metadata = vec![
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
+                    value: method,
+                },
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
+                    value: password,
+                },
+            ];
+            metadata.extend(shadowsocks_plugin_entry(loon_shadowsocks_plugin(
+                parts.get(5..).unwrap_or_default(),
+            )));
+            (Protocol::Shadowsocks, "ss", metadata)
         }
         "trojan" => {
             if is_surge_style_proxy_definition(&parts) {
@@ -2485,28 +2634,39 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
                 return Ok(None);
             }
             let uuid = required_loon_proxy_part(&parts, 3, "loon vless uuid cannot be empty")?;
-            (
-                Protocol::Vless,
-                "vless",
-                vec![MetadataEntry {
-                    key: NODE_METADATA_VLESS_UUID.to_string(),
-                    value: uuid,
-                }],
-            )
+            let mut metadata = vec![MetadataEntry {
+                key: NODE_METADATA_VLESS_UUID.to_string(),
+                value: uuid,
+            }];
+            if let Some(flow) = loon_proxy_option(parts.get(4..).unwrap_or_default(), "flow") {
+                metadata.push(MetadataEntry {
+                    key: NODE_METADATA_VLESS_FLOW.to_string(),
+                    value: flow,
+                });
+            }
+            (Protocol::Vless, "vless", metadata)
         }
         "vmess" => {
             if is_surge_style_proxy_definition(&parts) {
                 return Ok(None);
             }
             let uuid = required_loon_proxy_part(&parts, 4, "loon vmess uuid cannot be empty")?;
-            (
-                Protocol::Vmess,
-                "vmess",
-                vec![MetadataEntry {
-                    key: NODE_METADATA_VMESS_UUID.to_string(),
-                    value: uuid,
-                }],
-            )
+            let mut metadata = vec![MetadataEntry {
+                key: NODE_METADATA_VMESS_UUID.to_string(),
+                value: uuid,
+            }];
+            // The cipher comes before the uuid.
+            metadata.extend(proxy_vmess_security(
+                parts.get(3).cloned().map(strip_loon_quotes),
+            ));
+            if let Some(alter_id) = loon_proxy_option(parts.get(5..).unwrap_or_default(), "alterid")
+            {
+                metadata.push(MetadataEntry {
+                    key: NODE_METADATA_VMESS_ALTER_ID.to_string(),
+                    value: alter_id,
+                });
+            }
+            (Protocol::Vmess, "vmess", metadata)
         }
         "direct" | "reject" | "http" | "https" | "socks" | "socks5" | "ssr" | "shadowsocksr"
         | "hysteria" | "hysteria2" | "tuic" | "wireguard" => {
@@ -2529,6 +2689,13 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
             loon_proxy_option(options, "tls_cert_sha256"),
             loon_proxy_option(options, "tls_pubkey_sha256"),
         ));
+        loon_stream_options(options)?.append_to(
+            &mut metadata,
+            &host,
+            protocol == Protocol::Trojan,
+            SUBSCRIPTION_LOON_PROXY_LINE_INVALID_CODE,
+            "loon proxy",
+        )?;
     }
 
     let name_id = sanitize_identifier(&name);
@@ -2570,6 +2737,72 @@ fn loon_proxy_option(options: &[String], key: &str) -> Option<String> {
             .then(|| strip_loon_quotes(value.to_string()))
             .filter(|value| !value.is_empty())
     })
+}
+
+/// The share-link settings of a Loon vmess, vless or trojan line from its
+/// options: `over-tls`, `tls-name`/`sni`, `skip-cert-verify`, `alpn`,
+/// `transport` with `path` and `host` (ws) or `grpc-service-name` (grpc),
+/// and REALITY's `public-key` and `short-id`. `transport=http` (HTTP/1.1
+/// header obfuscation) and unknown transports make the node unsupported.
+fn loon_stream_options(options: &[String]) -> DomainResult<ProxyStreamOptions> {
+    let code = SUBSCRIPTION_LOON_PROXY_LINE_INVALID_CODE;
+    let option = |key: &str| loon_proxy_option(options, key);
+    let mut stream = ProxyStreamOptions::default();
+    let public_key = option("public_key");
+    if public_key.is_some() {
+        stream.set("security", Some("reality".to_string()));
+        stream.set("pbk", public_key);
+        stream.set("sid", option("short_id"));
+    } else if let Some(tls) =
+        proxy_line_boolean(option("over_tls").as_ref(), code, "loon over-tls")?
+    {
+        let security = if tls { "tls" } else { "none" };
+        stream.set("security", Some(security.to_string()));
+    }
+    stream.set("sni", option("sni").or_else(|| option("tls_name")));
+    if let Some(insecure) = proxy_line_boolean(
+        option("skip_cert_verify").as_ref(),
+        code,
+        "loon skip-cert-verify",
+    )? {
+        stream.set("insecure", Some(insecure.to_string()));
+    }
+    stream.set("alpn", option("alpn"));
+    if let Some(transport) = option("transport") {
+        stream.set_transport(&transport);
+        match stream.query.get("type").map(String::as_str) {
+            Some("ws") => {
+                stream.set("path", option("path"));
+                stream.set("host", option("host"));
+            }
+            Some("grpc") => stream.set(
+                "servicename",
+                option("grpc_service_name").or_else(|| option("service_name")),
+            ),
+            _ => {}
+        }
+    }
+    Ok(stream)
+}
+
+/// The SIP003 plugin of a Loon Shadowsocks line from the fields after its
+/// password: `obfs-name=http|tls` (or `obfs=`), a positional `http`/`tls`
+/// as older lines write it, or ShadowTLS (`shadow-tls-password=`).
+fn loon_shadowsocks_plugin(options: &[String]) -> Option<String> {
+    if let Some(obfs) =
+        loon_proxy_option(options, "obfs_name").or_else(|| loon_proxy_option(options, "obfs"))
+    {
+        return Some(obfs_plugin_name(&obfs));
+    }
+    if loon_proxy_option(options, "shadow_tls_password").is_some() {
+        return Some("shadow-tls".to_string());
+    }
+    options
+        .iter()
+        .map(|field| field.trim())
+        .find(|field| !field.is_empty() && !is_proxy_line_option(field))
+        .filter(|field| matches!(normalized_token(field).as_str(), "http" | "tls"))
+        .map(obfs_plugin_name)
 }
 
 /// Whether a `type, server, port, ...` definition is in Surge's style, where
@@ -2746,20 +2979,30 @@ fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescr
                 &["password"],
                 "surge shadowsocks password cannot be empty",
             )?;
-            (
-                Protocol::Shadowsocks,
-                "ss",
-                vec![
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
-                        value: method,
-                    },
-                    MetadataEntry {
-                        key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
-                        value: password,
-                    },
-                ],
-            )
+            let mut metadata = vec![
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_METHOD.to_string(),
+                    value: method,
+                },
+                MetadataEntry {
+                    key: NODE_METADATA_SHADOWSOCKS_PASSWORD.to_string(),
+                    value: password,
+                },
+            ];
+            // simple-obfs (`obfs=http|tls`) or ShadowTLS
+            // (`shadow-tls-password=`).
+            let plugin = match options
+                .get("obfs")
+                .map(String::as_str)
+                .map(obfs_plugin_name)
+            {
+                Some(name) if !name.is_empty() => Some(name),
+                _ => options
+                    .contains_key("shadow_tls_password")
+                    .then(|| "shadow-tls".to_string()),
+            };
+            metadata.extend(shadowsocks_plugin_entry(plugin));
+            (Protocol::Shadowsocks, "ss", metadata)
         }
         "trojan" => {
             let password = required_surge_proxy_option(
@@ -2782,14 +3025,12 @@ fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescr
                 &["username", "uuid"],
                 "surge vmess username cannot be empty",
             )?;
-            (
-                Protocol::Vmess,
-                "vmess",
-                vec![MetadataEntry {
-                    key: NODE_METADATA_VMESS_UUID.to_string(),
-                    value: uuid,
-                }],
-            )
+            let mut metadata = vec![MetadataEntry {
+                key: NODE_METADATA_VMESS_UUID.to_string(),
+                value: uuid,
+            }];
+            metadata.extend(proxy_vmess_security(options.get("encrypt_method").cloned()));
+            (Protocol::Vmess, "vmess", metadata)
         }
         "snell" => {
             let psk =
@@ -2822,6 +3063,13 @@ fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescr
             options.get("server_cert_fingerprint_sha256").cloned(),
             None,
         ));
+        surge_stream_options(&options)?.append_to(
+            &mut metadata,
+            &host,
+            protocol == Protocol::Trojan,
+            SUBSCRIPTION_SURGE_PROXY_LINE_INVALID_CODE,
+            "surge proxy",
+        )?;
     }
 
     let name_id = sanitize_identifier(&name);
@@ -2852,6 +3100,45 @@ fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescr
         ],
         metadata,
     })
+}
+
+/// The share-link settings of a Surge vmess or trojan line: `tls`, `sni`,
+/// `skip-cert-verify`, and `ws` with `ws-path` and the `Host` of
+/// `ws-headers`. `sni=off` (no SNI) is not carried; the node then sends the
+/// server name.
+fn surge_stream_options(options: &BTreeMap<String, String>) -> DomainResult<ProxyStreamOptions> {
+    let code = SUBSCRIPTION_SURGE_PROXY_LINE_INVALID_CODE;
+    let mut stream = ProxyStreamOptions::default();
+    if let Some(tls) = proxy_line_boolean(options.get("tls"), code, "surge tls")? {
+        let security = if tls { "tls" } else { "none" };
+        stream.set("security", Some(security.to_string()));
+    }
+    stream.set(
+        "sni",
+        options
+            .get("sni")
+            .filter(|sni| !sni.trim().eq_ignore_ascii_case("off"))
+            .cloned(),
+    );
+    if let Some(insecure) = proxy_line_boolean(
+        options.get("skip_cert_verify"),
+        code,
+        "surge skip-cert-verify",
+    )? {
+        stream.set("insecure", Some(insecure.to_string()));
+    }
+    if proxy_line_boolean(options.get("ws"), code, "surge ws")? == Some(true) {
+        stream.set_transport("ws");
+        stream.set("path", options.get("ws_path").cloned());
+        stream.set(
+            "host",
+            options
+                .get("ws_headers")
+                .map(String::as_str)
+                .and_then(surge_ws_host_header),
+        );
+    }
+    Ok(stream)
 }
 
 /// Snell node options shared by the Surge and Clash parsers.
@@ -3578,7 +3865,23 @@ fn parse_shadowsocks_link(link: &str) -> DomainResult<NodeDescriptor> {
     let name = fragment
         .and_then(|fragment| percent_decode(fragment).ok())
         .filter(|name| !name.trim().is_empty());
-    let (main_without_query, _) = split_once_optional(without_fragment, '?');
+    let (main_without_query, query) = split_once_optional(without_fragment, '?');
+    // SIP003 `plugin=<name>;<options>`; only the name is kept, the options
+    // can hold passwords. Other query fields (`outline=1`, ...) do not
+    // change the connection and are not read.
+    let plugin = shadowsocks_plugin_entry(
+        query
+            .into_iter()
+            .flat_map(|query| query.split('&'))
+            .find_map(|entry| {
+                let (key, value) = entry.split_once('=')?;
+                key.trim().eq_ignore_ascii_case("plugin").then(|| {
+                    let value = percent_decode(value).unwrap_or_else(|_| value.to_string());
+                    let (name, _) = split_once_optional(&value, ';');
+                    name.to_string()
+                })
+            }),
+    );
 
     let decoded_main = if main_without_query.contains('@') {
         main_without_query.to_string()
@@ -3614,6 +3917,8 @@ fn parse_shadowsocks_link(link: &str) -> DomainResult<NodeDescriptor> {
         SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
         "shadowsocks password cannot be empty",
     )?;
+    // SIP002 puts a `/` between the port and the query (`@host:8388/?plugin=`).
+    let host_port = host_port.strip_suffix('/').unwrap_or(host_port);
     let (host, port) = parse_host_port_for(
         host_port,
         SUBSCRIPTION_SHADOWSOCKS_LINK_INVALID_CODE,
@@ -3647,7 +3952,10 @@ fn parse_shadowsocks_link(link: &str) -> DomainResult<NodeDescriptor> {
                 key: NODE_METADATA_SOURCE_FORMAT.to_string(),
                 value: "ss-url".to_string(),
             },
-        ],
+        ]
+        .into_iter()
+        .chain(plugin)
+        .collect(),
     })
 }
 
@@ -4461,6 +4769,307 @@ fn proxy_line_pin_metadata(certificate: Option<String>, public_key: Option<Strin
         &certificate.into_iter().collect::<Vec<_>>(),
         &public_key.into_iter().collect::<Vec<_>>(),
     )
+}
+
+/// The TLS, REALITY and transport settings of a Clash, Surge, Loon or
+/// Quantumult X proxy, spelled as the fields of the equivalent share link
+/// (`security`, `sni`, `insecure`, `alpn`, `fp`, `pbk`, `sid`, `type`,
+/// `host`, `path`, `servicename`, `mode`, `extra`), so
+/// [`append_v2ray_share_link_metadata`] writes the same node metadata a share
+/// link for that node would, and the node imports as the same outbound.
+///
+/// `unsupported` is an option the format names that no share-link field can
+/// carry (one of the `NODE_UNSUPPORTED_OPTION_*` codes). It is written as
+/// [`NODE_METADATA_UNSUPPORTED_OPTION`], so the importer reports the node as
+/// unsupported instead of running it without that option.
+#[derive(Default)]
+struct ProxyStreamOptions {
+    query: BTreeMap<String, String>,
+    unsupported: Option<&'static str>,
+}
+
+impl ProxyStreamOptions {
+    /// Sets share-link field `key` to `value` when it is not empty.
+    fn set(&mut self, key: &str, value: Option<String>) {
+        if let Some(value) = value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            self.query.insert(key.to_string(), value);
+        }
+    }
+
+    /// Sets share-link field `key` when it is not set yet.
+    fn set_default(&mut self, key: &str, value: Option<String>) {
+        if !self.query.contains_key(key) {
+            self.set(key, value);
+        }
+    }
+
+    /// Records the first option that cannot be carried.
+    fn unsupported(&mut self, code: &'static str) {
+        self.unsupported.get_or_insert(code);
+    }
+
+    /// Sets `type` from a transport name: `ws`, `grpc`, `h2` and `xhttp`
+    /// as share links spell them; an HTTP/1.1 header obfuscation or a name
+    /// no reader knows makes the node unsupported.
+    fn set_transport(&mut self, name: &str) {
+        match normalized_token(name).as_str() {
+            "" | "tcp" | "none" => {}
+            "ws" | "websocket" => self.set("type", Some("ws".to_string())),
+            "grpc" => self.set("type", Some("grpc".to_string())),
+            "h2" => self.set("type", Some("h2".to_string())),
+            "httpupgrade" | "http_upgrade" => self.set("type", Some("httpupgrade".to_string())),
+            "xhttp" | "splithttp" => self.set("type", Some("xhttp".to_string())),
+            "http" => self.unsupported(NODE_UNSUPPORTED_OPTION_HTTP_OBFS),
+            _ => self.unsupported(NODE_UNSUPPORTED_OPTION_TRANSPORT),
+        }
+    }
+
+    /// Writes the settings to `metadata`. `default_tls_enabled` is whether
+    /// the protocol runs TLS when the source does not say (trojan).
+    fn append_to(
+        self,
+        metadata: &mut Metadata,
+        host: &str,
+        default_tls_enabled: bool,
+        code: &'static str,
+        protocol_name: &'static str,
+    ) -> DomainResult<()> {
+        append_v2ray_share_link_metadata(
+            metadata,
+            &self.query,
+            host,
+            default_tls_enabled,
+            code,
+            protocol_name,
+        )?;
+        if let Some(option) = self.unsupported {
+            metadata.push(MetadataEntry {
+                key: NODE_METADATA_UNSUPPORTED_OPTION.to_string(),
+                value: option.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A boolean option of a proxy line (`true`, `false`, `1`, `0`), as the
+/// share-link `security`/`insecure` spelling.
+fn proxy_line_boolean(
+    value: Option<&String>,
+    code: &'static str,
+    field_name: &'static str,
+) -> DomainResult<Option<bool>> {
+    value
+        .map(|value| parse_share_link_boolean(value, code, field_name))
+        .transpose()
+}
+
+/// The `Host` header of a Surge `ws-headers` value (`Host:cdn.example|K:v`).
+fn surge_ws_host_header(headers: &str) -> Option<String> {
+    headers.split('|').find_map(|header| {
+        let (name, value) = header.split_once(':')?;
+        name.trim()
+            .trim_matches('"')
+            .eq_ignore_ascii_case("host")
+            .then(|| value.trim().trim_matches('"').trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// The metadata entry naming a Shadowsocks plugin, unless `name` is empty or
+/// `none`.
+fn shadowsocks_plugin_entry(name: Option<String>) -> Option<MetadataEntry> {
+    let name = name?.trim().to_string();
+    (!name.is_empty() && !name.eq_ignore_ascii_case("none")).then(|| MetadataEntry {
+        key: NODE_METADATA_SHADOWSOCKS_PLUGIN.to_string(),
+        value: name,
+    })
+}
+
+/// The VMess security a Clash, Surge, Loon or Quantumult X proxy names, for
+/// [`NODE_METADATA_VMESS_SECURITY`]. `none` and `zero` are left out: the
+/// client picks the VMess security and servers take any, so such a node runs
+/// with the default (`auto`) rather than being refused.
+fn proxy_vmess_security(value: Option<String>) -> Option<MetadataEntry> {
+    let value = value?.trim().to_ascii_lowercase();
+    (!value.is_empty() && value != "none" && value != "zero").then(|| MetadataEntry {
+        key: NODE_METADATA_VMESS_SECURITY.to_string(),
+        value,
+    })
+}
+
+/// A Clash scalar option as text: a string trimmed, a number or boolean as
+/// YAML read it; `None` when empty, absent or not a scalar.
+fn clash_option_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let text = match value? {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// A Clash boolean option: a YAML boolean, or `true`/`false`/`1`/`0`.
+fn clash_option_bool(
+    value: Option<&serde_json::Value>,
+    message: &'static str,
+) -> DomainResult<Option<bool>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(serde_json::Value::Number(number)) => match number.as_u64() {
+            Some(0) => Ok(Some(false)),
+            Some(1) => Ok(Some(true)),
+            _ => Err(domain_error(SUBSCRIPTION_CLASH_YAML_INVALID_CODE, message)),
+        },
+        Some(serde_json::Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(None),
+            "true" | "1" => Ok(Some(true)),
+            "false" | "0" => Ok(Some(false)),
+            _ => Err(domain_error(SUBSCRIPTION_CLASH_YAML_INVALID_CODE, message)),
+        },
+        Some(_) => Err(domain_error(SUBSCRIPTION_CLASH_YAML_INVALID_CODE, message)),
+    }
+}
+
+/// A Clash list option (`alpn: [h2, http/1.1]`, `host: [a, b]`) as a
+/// comma-separated list; a single string counts as a list of one.
+fn clash_option_list(value: Option<&serde_json::Value>) -> Option<String> {
+    let values: Vec<String> = match value? {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(|value| clash_option_text(Some(value)))
+            .collect(),
+        other => clash_option_text(Some(other))
+            .map(|text| {
+                text.split(',')
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    (!values.is_empty()).then(|| values.join(","))
+}
+
+/// The value of map `object`'s key `name`, ignoring ASCII case (HTTP header
+/// names such as `Host`).
+fn clash_map_entry<'a>(
+    object: Option<&'a serde_json::Value>,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    object?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
+/// The share-link settings of a Clash vmess, vless or trojan proxy:
+/// `tls`, `servername`/`sni`, `skip-cert-verify`, `alpn`,
+/// `client-fingerprint`, `reality-opts`, `network` with `ws-opts`,
+/// `grpc-opts`, `h2-opts` or `xhttp-opts`, and `ech-opts`.
+fn clash_stream_options(raw: &RawClashStreamOptions) -> DomainResult<ProxyStreamOptions> {
+    let mut options = ProxyStreamOptions::default();
+    let tls = clash_option_bool(raw.tls.as_ref(), "clash proxy tls must be true or false")?;
+    match raw.reality_opts.as_ref().filter(|value| !value.is_null()) {
+        // REALITY is TLS; mihomo also wants `tls: true` beside it.
+        Some(reality) => {
+            options.set("security", Some("reality".to_string()));
+            options.set("pbk", clash_option_text(reality.get("public-key")));
+            options.set("sid", clash_option_text(reality.get("short-id")));
+        }
+        None => {
+            if let Some(tls) = tls {
+                let security = if tls { "tls" } else { "none" };
+                options.set("security", Some(security.to_string()));
+            }
+        }
+    }
+    options.set(
+        "sni",
+        clash_option_text(raw.servername.as_ref()).or_else(|| clash_option_text(raw.sni.as_ref())),
+    );
+    if let Some(insecure) = clash_option_bool(
+        raw.skip_cert_verify.as_ref(),
+        "clash proxy skip-cert-verify must be true or false",
+    )? {
+        options.set("insecure", Some(insecure.to_string()));
+    }
+    options.set("alpn", clash_option_list(raw.alpn.as_ref()));
+    options.set("fp", clash_option_text(raw.client_fingerprint.as_ref()));
+    if let Some(ech) = raw.ech_opts.as_ref().filter(|value| !value.is_null()) {
+        let enabled = clash_option_bool(
+            ech.get("enable"),
+            "clash proxy ech-opts enable must be true or false",
+        )?;
+        if enabled.unwrap_or(false) {
+            options.unsupported(NODE_UNSUPPORTED_OPTION_ECH);
+        }
+    }
+
+    let network = clash_option_text(raw.network.as_ref()).unwrap_or_default();
+    match normalized_token(&network).as_str() {
+        "ws" | "websocket" => {
+            let ws = raw.ws_opts.as_ref();
+            let upgrade = clash_option_bool(
+                ws.and_then(|ws| ws.get("v2ray-http-upgrade")),
+                "clash proxy ws-opts v2ray-http-upgrade must be true or false",
+            )?;
+            options.set_transport(if upgrade.unwrap_or(false) {
+                "httpupgrade"
+            } else {
+                "ws"
+            });
+            options.set("path", clash_option_text(ws.and_then(|ws| ws.get("path"))));
+            options.set(
+                "host",
+                clash_option_text(clash_map_entry(ws.and_then(|ws| ws.get("headers")), "host")),
+            );
+        }
+        "grpc" => {
+            options.set_transport("grpc");
+            options.set(
+                "servicename",
+                clash_option_text(
+                    raw.grpc_opts
+                        .as_ref()
+                        .and_then(|grpc| grpc.get("grpc-service-name")),
+                ),
+            );
+        }
+        "h2" => {
+            let h2 = raw.h2_opts.as_ref();
+            options.set_transport("h2");
+            options.set("host", clash_option_list(h2.and_then(|h2| h2.get("host"))));
+            options.set("path", clash_option_text(h2.and_then(|h2| h2.get("path"))));
+        }
+        "xhttp" => {
+            options.set_transport("xhttp");
+            if let Some(xhttp) = raw.xhttp_opts.as_ref().and_then(|value| value.as_object()) {
+                for (key, value) in xhttp {
+                    match key.as_str() {
+                        "path" => options.set("path", clash_option_text(Some(value))),
+                        "host" => options.set("host", clash_option_text(Some(value))),
+                        "mode" => options.set("mode", clash_option_text(Some(value))),
+                        "headers" if value.is_object() => options.set(
+                            "extra",
+                            Some(serde_json::json!({ "headers": value }).to_string()),
+                        ),
+                        "headers" if value.is_null() => {}
+                        _ => options.unsupported(NODE_UNSUPPORTED_OPTION_XHTTP),
+                    }
+                }
+            }
+        }
+        // `http` is HTTP/1.1 header obfuscation in Clash, not h2.
+        other => options.set_transport(other),
+    }
+    Ok(options)
 }
 
 fn append_v2ray_share_link_metadata(

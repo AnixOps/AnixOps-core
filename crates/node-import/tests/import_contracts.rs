@@ -1295,3 +1295,356 @@ fn a_list_of_only_bad_entries_is_still_rejected() {
         Err(ImportError::Unrecognized)
     );
 }
+
+/// The share links the TLS and transport fixtures below stand for.
+fn vmess_ws_link(security: &str, alpn: Option<&str>) -> String {
+    let mut vmess = serde_json::json!({
+        "v": "2", "ps": "VMess WS", "add": "vmess.example.test", "port": "443",
+        "id": "00000000-0000-0000-0000-000000000005", "aid": "0", "scy": security,
+        "net": "ws", "type": "none", "host": "cdn.example.test", "path": "/v",
+        "tls": "tls", "sni": "cdn.example.test"
+    });
+    if let Some(alpn) = alpn {
+        vmess["alpn"] = serde_json::json!(alpn);
+    }
+    format!("vmess://{}", base64_standard(vmess.to_string().as_bytes()))
+}
+
+const REALITY_LINK: &str = "vless://00000000-0000-0000-0000-000000000002@vless.example.test:443?encryption=none&security=reality&sni=www.example.com&pbk=PUBLICKEY&sid=ab12&flow=xtls-rprx-vision&type=tcp#Reality";
+
+/// Imports `config` and `links` and checks that every node of `config`
+/// became the same outbound as the share link in the same place.
+fn assert_same_outbounds_as_links(config: &str, links: &[String]) {
+    let config = import_text(config).unwrap();
+    assert!(config.unsupported.is_empty(), "{:?}", config.unsupported);
+    assert!(config.skipped.is_empty(), "{:?}", config.skipped);
+    let links = import_text(&links.join("\n")).unwrap();
+    assert!(links.unsupported.is_empty(), "{:?}", links.unsupported);
+    assert_eq!(config.nodes.len(), links.nodes.len());
+    for (node, link) in config.nodes.iter().zip(&links.nodes) {
+        assert_eq!(node.outbound, link.outbound, "{}", node.name);
+        // A node that asked for TLS or REALITY never runs without it.
+        if node.protocol == "vless" || node.protocol == "vmess" {
+            assert!(
+                !node.outbound["tls"].is_null() || !node.outbound["reality"].is_null(),
+                "{}",
+                node.name
+            );
+        }
+    }
+}
+
+/// Clash keeps `tls`, `servername`/`sni`, `skip-cert-verify`, `alpn`,
+/// `client-fingerprint`, `reality-opts`, `flow`, `alterId`, `cipher` and
+/// `network` with its options, so each proxy imports as the same outbound
+/// as its share link; before, the VLESS ones became plaintext TCP.
+#[test]
+fn clash_tls_and_transport_options_import_like_share_links() {
+    let clash = r#"
+proxies:
+  - name: VMess WS
+    type: vmess
+    server: vmess.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000005
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: cdn.example.test
+    alpn:
+      - h2
+    network: ws
+    ws-opts:
+      path: /v
+      headers:
+        Host: cdn.example.test
+  - name: Reality
+    type: vless
+    server: vless.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000002
+    tls: true
+    servername: www.example.com
+    flow: xtls-rprx-vision
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: PUBLICKEY
+      short-id: ab12
+  - name: VLESS gRPC
+    type: vless
+    server: vless.example.test
+    port: 8443
+    uuid: 00000000-0000-0000-0000-000000000003
+    tls: true
+    servername: grpc.example.test
+    network: grpc
+    grpc-opts:
+      grpc-service-name: tunnel
+  - name: Trojan WS
+    type: trojan
+    server: example.com
+    port: 443
+    password: trojan-secret
+    sni: edge.example.com
+    skip-cert-verify: true
+    alpn: [h2, http/1.1]
+    network: ws
+    ws-opts: {path: /ws, headers: {Host: cdn.example.com}}
+"#;
+    assert_same_outbounds_as_links(
+        clash,
+        &[
+            vmess_ws_link("auto", Some("h2")),
+            REALITY_LINK.replace("&flow", "&fp=chrome&flow"),
+            "vless://00000000-0000-0000-0000-000000000003@vless.example.test:8443?encryption=none&security=tls&sni=grpc.example.test&type=grpc&serviceName=tunnel#VLESS%20gRPC".to_string(),
+            "trojan://trojan-secret@example.com:443?sni=edge.example.com&allowInsecure=1&alpn=h2,http/1.1&type=ws&path=%2Fws&host=cdn.example.com#Trojan%20WS".to_string(),
+        ],
+    );
+    let report = import_text(clash).unwrap();
+    let vless = &report.nodes[2].outbound;
+    assert_eq!(vless["tls"]["server_name"], "grpc.example.test");
+    assert_eq!(vless["transport"]["type"], "grpc");
+    assert_eq!(
+        report.nodes[1].outbound["reality"]["public_key"],
+        "PUBLICKEY"
+    );
+    assert_eq!(report.nodes[3].outbound["insecure"], true);
+}
+
+#[test]
+fn surge_tls_and_websocket_options_import_like_share_links() {
+    let surge = "\
+[Proxy]
+VMess WS = vmess, vmess.example.test, 443, username=00000000-0000-0000-0000-000000000005, encrypt-method=aes-128-gcm, tls=true, sni=cdn.example.test, ws=true, ws-path=/v, ws-headers=Host:cdn.example.test
+Trojan WS = trojan, example.com, 443, password=trojan-secret, sni=edge.example.com, skip-cert-verify=true, ws=true, ws-path=/ws, ws-headers=Host:cdn.example.com|User-Agent:test
+";
+    assert_same_outbounds_as_links(
+        surge,
+        &[
+            vmess_ws_link("aes-128-gcm", None),
+            "trojan://trojan-secret@example.com:443?sni=edge.example.com&allowInsecure=1&type=ws&path=%2Fws&host=cdn.example.com#Trojan%20WS".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn loon_tls_reality_and_transport_options_import_like_share_links() {
+    let loon = r#"
+[Proxy]
+VMess WS = vmess, vmess.example.test, 443, aes-128-gcm, "00000000-0000-0000-0000-000000000005", transport=ws, path=/v, host=cdn.example.test, over-tls=true, sni=cdn.example.test, alterId=0
+Reality = VLESS, vless.example.test, 443, "00000000-0000-0000-0000-000000000002", transport=tcp, over-tls=true, sni=www.example.com, flow=xtls-rprx-vision, public-key=PUBLICKEY, short-id=ab12
+Trojan WS = trojan, example.com, 443, "trojan-secret", over-tls=true, tls-name=edge.example.com, skip-cert-verify=true, transport=ws, path=/ws, host=cdn.example.com, alpn=h2
+"#;
+    assert_same_outbounds_as_links(
+        loon,
+        &[
+            vmess_ws_link("aes-128-gcm", None),
+            REALITY_LINK.to_string(),
+            "trojan://trojan-secret@example.com:443?sni=edge.example.com&allowInsecure=1&alpn=h2&type=ws&path=%2Fws&host=cdn.example.com#Trojan%20WS".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn quantumult_x_obfs_tls_and_reality_options_import_like_share_links() {
+    let quantumult_x = "\
+[server_local]
+vmess=vmess.example.test:443, method=chacha20-poly1305, password=00000000-0000-0000-0000-000000000005, obfs=wss, obfs-host=cdn.example.test, obfs-uri=/v, tag=VMess WS
+vless=vless.example.test:443, method=none, password=00000000-0000-0000-0000-000000000002, obfs=over-tls, obfs-host=www.example.com, reality-base64-pubkey=PUBLICKEY, reality-hex-shortid=ab12, vless-flow=xtls-rprx-vision, tag=Reality
+trojan=example.com:443, password=trojan-secret, over-tls=true, tls-host=edge.example.com, tls-verification=false, tag=Trojan
+";
+    assert_same_outbounds_as_links(
+        quantumult_x,
+        &[
+            vmess_ws_link("chacha20-poly1305", None),
+            REALITY_LINK.to_string(),
+            "trojan://trojan-secret@example.com:443?sni=edge.example.com&allowInsecure=1#Trojan"
+                .to_string(),
+        ],
+    );
+}
+
+/// Options no outbound field carries make the node unsupported with a fixed
+/// reason, never a node that connects differently; the other nodes of the
+/// same file still import.
+#[test]
+fn options_the_engine_cannot_carry_make_the_node_unsupported() {
+    let clash = r#"
+proxies:
+  - name: HTTP obfs
+    type: vless
+    server: a.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000002
+    tls: true
+    network: http
+  - name: ECH
+    type: vmess
+    server: b.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000005
+    cipher: auto
+    tls: true
+    ech-opts:
+      enable: true
+  - name: H2
+    type: vmess
+    server: c.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000005
+    tls: true
+    network: h2
+    h2-opts: {host: [c.example.test], path: /h2}
+  - name: Plain
+    type: vless
+    server: d.example.test
+    port: 80
+    uuid: 00000000-0000-0000-0000-000000000004
+"#;
+    let report = import_text(clash).unwrap();
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(report.nodes.len(), 1);
+    assert_eq!(report.nodes[0].name, "Plain");
+    // Plaintext because the source says so: no `tls`, no REALITY.
+    assert!(report.nodes[0].outbound["tls"].is_null());
+    let reasons: Vec<_> = report
+        .unsupported
+        .iter()
+        .map(|node| (node.name.as_str(), node.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (
+                "HTTP obfs",
+                "http header obfuscation transports are not implemented yet"
+            ),
+            ("ECH", "encrypted client hello (ECH) is not implemented yet"),
+            (
+                "H2",
+                "transports other than tcp, ws, grpc and xhttp are not implemented yet"
+            ),
+        ]
+    );
+
+    let lines = "\
+[server_local]
+vmess=a.example.test:443, method=aes-128-gcm, password=00000000-0000-0000-0000-000000000005, obfs=http, obfs-host=a.example.test, tag=QX HTTP
+trojan=b.example.test:443, password=trojan-secret, over-tls=true, tag=QX Trojan
+";
+    let report = import_text(lines).unwrap();
+    assert_eq!(report.nodes.len(), 1);
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(report.unsupported[0].name, "QX HTTP");
+
+    // REALITY on trojan or vmess is not run as plain TLS.
+    let report = import_text(
+        "trojan://trojan-secret@example.com:443?security=reality&sni=www.example.com&pbk=PUBLICKEY#TR",
+    )
+    .unwrap();
+    assert_eq!(
+        report.unsupported[0].reason,
+        "trojan over REALITY is not implemented yet"
+    );
+}
+
+/// Shadowsocks plugins are not implemented, so a node that needs one is
+/// reported unsupported in every format instead of running as plain
+/// Shadowsocks; its plugin options never reach the report.
+#[test]
+fn shadowsocks_nodes_with_plugins_are_unsupported_in_every_format() {
+    const REASON: &str =
+        "shadowsocks plugins (obfs, v2ray-plugin, shadow-tls) are not implemented yet";
+    let check = |text: &str, unsupported: &[&str], runnable: &[&str]| {
+        let report = import_text(text).unwrap_or_else(|_| panic!("{text}"));
+        let names: Vec<_> = report
+            .unsupported
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(names, unsupported, "{text}");
+        assert!(report.unsupported.iter().all(|node| node.reason == REASON));
+        let names: Vec<_> = report.nodes.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(names, runnable, "{text}");
+        let json = serde_json::to_string(&report.unsupported).unwrap();
+        assert!(!json.contains("password"), "{json}");
+        assert!(!json.contains("bing.com"), "{json}");
+    };
+    // SIP002 with and without the `/` before the query, and a query that
+    // names no plugin.
+    check(
+        "\
+ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dbing.com#Obfs
+ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:8389?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3Dbing.com#V2ray
+ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:8390/?outline=1#Outline
+",
+        &["Obfs", "V2ray"],
+        &["Outline"],
+    );
+    check(
+        r#"
+proxies:
+  - name: Obfs
+    type: ss
+    server: 82.47.34.99
+    port: 8388
+    cipher: aes-256-gcm
+    password: password
+    plugin: obfs
+    plugin-opts: {mode: http, host: bing.com}
+  - name: ShadowTLS
+    type: ss
+    server: 82.47.34.99
+    port: 8389
+    cipher: aes-256-gcm
+    password: password
+    plugin: shadow-tls
+    plugin-opts: {host: bing.com, password: shadow-tls-password, version: 3}
+  - name: Plain
+    type: ss
+    server: 82.47.34.99
+    port: 8390
+    cipher: aes-256-gcm
+    password: password
+    plugin: ""
+"#,
+        &["Obfs", "ShadowTLS"],
+        &["Plain"],
+    );
+    check(
+        r#"{"outbounds": [
+  {"type": "shadowsocks", "tag": "Obfs", "server": "82.47.34.99", "server_port": 8388, "method": "aes-256-gcm", "password": "password", "plugin": "obfs-local", "plugin_opts": "obfs=http;obfs-host=bing.com"},
+  {"type": "shadowsocks", "tag": "Plain", "server": "82.47.34.99", "server_port": 8390, "method": "aes-256-gcm", "password": "password"}
+]}"#,
+        &["Obfs"],
+        &["Plain"],
+    );
+    check(
+        "\
+[Proxy]
+Obfs = ss, 82.47.34.99, 8388, encrypt-method=aes-256-gcm, password=password, obfs=http, obfs-host=bing.com
+ShadowTLS = ss, 82.47.34.99, 8389, encrypt-method=aes-256-gcm, password=password, shadow-tls-password=shadow-tls-password, shadow-tls-sni=bing.com
+Plain = ss, 82.47.34.99, 8390, encrypt-method=aes-256-gcm, password=password
+",
+        &["Obfs", "ShadowTLS"],
+        &["Plain"],
+    );
+    check(
+        r#"
+[Proxy]
+Obfs = Shadowsocks, 82.47.34.99, 8388, aes-256-gcm, "password", obfs-name=http, obfs-host=bing.com
+Plain = Shadowsocks, 82.47.34.99, 8390, aes-256-gcm, "password"
+"#,
+        &["Obfs"],
+        &["Plain"],
+    );
+    check(
+        "\
+[server_local]
+shadowsocks=82.47.34.99:8388, method=aes-256-gcm, password=password, obfs=wss, obfs-host=bing.com, tag=Obfs
+shadowsocks=82.47.34.99:8390, method=aes-256-gcm, password=password, tag=Plain
+",
+        &["Obfs"],
+        &["Plain"],
+    );
+}

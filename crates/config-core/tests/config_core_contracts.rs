@@ -2421,3 +2421,269 @@ fn link_list_skips_malformed_links_of_known_schemes() {
         );
     }
 }
+
+/// The value of metadata `key`, if any.
+fn metadata_value<'a>(metadata: &'a [MetadataEntry], key: &str) -> Option<&'a str> {
+    metadata
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.value.as_str())
+}
+
+/// Clash YAML booleans, lists and maps under `tls`, `skip-cert-verify`,
+/// `alpn`, `ws-opts` and `reality-opts` are read, not a reason to drop the
+/// proxy or the whole file, and land in the share-link metadata keys.
+#[test]
+fn clash_tls_reality_and_transport_options_reach_the_metadata() {
+    let nodes = import_nodes(
+        "clash-tls",
+        r#"
+proxies:
+  - name: VLESS WS
+    type: vless
+    server: a.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000002
+    tls: true
+    servername: cdn.example.test
+    skip-cert-verify: true
+    alpn: [h2, http/1.1]
+    network: ws
+    ws-opts:
+      path: /ray
+      headers: {Host: cdn.example.test}
+  - name: Reality
+    type: vless
+    server: b.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000003
+    tls: true
+    servername: www.example.com
+    flow: xtls-rprx-vision
+    client-fingerprint: safari
+    reality-opts: {public-key: PUBLICKEY, short-id: "0123"}
+  - name: VMess gRPC
+    type: vmess
+    server: c.example.test
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000005
+    alterId: 0
+    cipher: aes-128-gcm
+    tls: "true"
+    network: grpc
+    grpc-opts: {grpc-service-name: tunnel}
+  - name: Plain
+    type: vless
+    server: d.example.test
+    port: 80
+    uuid: 00000000-0000-0000-0000-000000000004
+"#
+        .to_string(),
+    );
+    assert_eq!(nodes.len(), 4);
+    let ws = &nodes[0].metadata;
+    assert_metadata(ws, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(ws, NODE_METADATA_TLS_SERVER_NAME, "cdn.example.test");
+    assert_metadata(ws, NODE_METADATA_TLS_INSECURE, "true");
+    assert_metadata(ws, NODE_METADATA_TLS_ALPN, "h2,http/1.1");
+    assert_metadata(ws, NODE_METADATA_V2RAY_TRANSPORT_TYPE, "ws");
+    assert_metadata(ws, NODE_METADATA_V2RAY_TRANSPORT_PATH, "/ray");
+    assert_metadata(ws, NODE_METADATA_V2RAY_TRANSPORT_HOST, "cdn.example.test");
+
+    let reality = &nodes[1].metadata;
+    assert_metadata(reality, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(reality, NODE_METADATA_TLS_SERVER_NAME, "www.example.com");
+    assert_metadata(reality, NODE_METADATA_TLS_REALITY_PUBLIC_KEY, "PUBLICKEY");
+    // A quoted short id keeps its leading zero.
+    assert_metadata(reality, NODE_METADATA_TLS_REALITY_SHORT_ID, "0123");
+    assert_metadata(reality, NODE_METADATA_TLS_UTLS_FINGERPRINT, "safari");
+    assert_metadata(reality, NODE_METADATA_VLESS_FLOW, "xtls-rprx-vision");
+
+    let grpc = &nodes[2].metadata;
+    assert_metadata(grpc, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(grpc, NODE_METADATA_TLS_SERVER_NAME, "c.example.test");
+    assert_metadata(grpc, NODE_METADATA_V2RAY_TRANSPORT_TYPE, "grpc");
+    assert_metadata(grpc, NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME, "tunnel");
+    assert_metadata(grpc, NODE_METADATA_VMESS_ALTER_ID, "0");
+    assert_metadata(grpc, NODE_METADATA_VMESS_SECURITY, "aes-128-gcm");
+
+    // No TLS asked for: written as off, not left out.
+    assert_metadata(&nodes[3].metadata, NODE_METADATA_TLS_ENABLED, "false");
+    assert_no_metadata(&nodes[3].metadata, NODE_METADATA_V2RAY_TRANSPORT_TYPE);
+}
+
+#[test]
+fn proxy_line_tls_and_transport_options_reach_the_metadata() {
+    let surge = import_nodes(
+        "surge-tls",
+        "\
+[Proxy]
+VMess = vmess, a.example.test, 443, username=00000000-0000-0000-0000-000000000005, tls=true, sni=cdn.example.test, skip-cert-verify=1, ws=true, ws-path=/v, ws-headers=Host:cdn.example.test|X-Edge:1
+Trojan = trojan, b.example.test, 443, password=trojan-password, sni=edge.example.test
+"
+        .to_string(),
+    );
+    assert_metadata(&surge[0].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &surge[0].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "cdn.example.test",
+    );
+    assert_metadata(&surge[0].metadata, NODE_METADATA_TLS_INSECURE, "true");
+    assert_metadata(&surge[0].metadata, NODE_METADATA_V2RAY_TRANSPORT_PATH, "/v");
+    assert_metadata(
+        &surge[0].metadata,
+        NODE_METADATA_V2RAY_TRANSPORT_HOST,
+        "cdn.example.test",
+    );
+    assert_metadata(&surge[1].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &surge[1].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "edge.example.test",
+    );
+
+    let loon = import_nodes(
+        "loon-tls",
+        r#"
+[Proxy]
+Reality = VLESS, a.example.test, 443, "00000000-0000-0000-0000-000000000002", transport=tcp, over-tls=true, sni=www.example.com, flow=xtls-rprx-vision, public-key=PUBLICKEY, short-id=ab12
+VMess = vmess, b.example.test, 443, auto, "00000000-0000-0000-0000-000000000005", transport=ws, path=/v, host=cdn.example.test, over-tls=true, tls-name=cdn.example.test
+"#
+        .to_string(),
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+        "PUBLICKEY",
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_TLS_REALITY_SHORT_ID,
+        "ab12",
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "www.example.com",
+    );
+    assert_metadata(
+        &loon[0].metadata,
+        NODE_METADATA_VLESS_FLOW,
+        "xtls-rprx-vision",
+    );
+    assert_metadata(&loon[1].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &loon[1].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "cdn.example.test",
+    );
+    assert_metadata(&loon[1].metadata, NODE_METADATA_V2RAY_TRANSPORT_TYPE, "ws");
+    assert_metadata(&loon[1].metadata, NODE_METADATA_VMESS_SECURITY, "auto");
+
+    let quantumult_x = import_nodes(
+        "quantumult-x-tls",
+        "\
+[server_local]
+vless=a.example.test:443, method=none, password=00000000-0000-0000-0000-000000000002, obfs=over-tls, obfs-host=www.example.com, reality-base64-pubkey=PUBLICKEY, reality-hex-shortid=ab12, vless-flow=xtls-rprx-vision, tag=Reality
+vmess=b.example.test:443, method=none, password=00000000-0000-0000-0000-000000000005, obfs=ws, obfs-uri=/v, obfs-host=cdn.example.test, tag=WS
+"
+        .to_string(),
+    );
+    assert_metadata(&quantumult_x[0].metadata, NODE_METADATA_TLS_ENABLED, "true");
+    assert_metadata(
+        &quantumult_x[0].metadata,
+        NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+        "PUBLICKEY",
+    );
+    assert_metadata(
+        &quantumult_x[0].metadata,
+        NODE_METADATA_TLS_SERVER_NAME,
+        "www.example.com",
+    );
+    // `obfs=ws` is WebSocket without TLS; VMess `none` runs as `auto`.
+    assert_metadata(
+        &quantumult_x[1].metadata,
+        NODE_METADATA_TLS_ENABLED,
+        "false",
+    );
+    assert_metadata(
+        &quantumult_x[1].metadata,
+        NODE_METADATA_V2RAY_TRANSPORT_TYPE,
+        "ws",
+    );
+    assert_metadata(
+        &quantumult_x[1].metadata,
+        NODE_METADATA_V2RAY_TRANSPORT_HOST,
+        "cdn.example.test",
+    );
+    assert_no_metadata(&quantumult_x[1].metadata, NODE_METADATA_VMESS_SECURITY);
+}
+
+/// Shadowsocks plugins are recorded by name in every format, without their
+/// options, and options no node field carries are marked instead of dropped.
+#[test]
+fn shadowsocks_plugins_and_uncarried_options_are_recorded() {
+    use control_domain::{
+        NODE_METADATA_SHADOWSOCKS_PLUGIN, NODE_METADATA_UNSUPPORTED_OPTION,
+        NODE_UNSUPPORTED_OPTION_HTTP_OBFS, NODE_UNSUPPORTED_OPTION_TRANSPORT,
+    };
+    let plugin = |content: &str| {
+        let nodes = import_nodes("ss-plugin", content.to_string());
+        nodes
+            .iter()
+            .map(|node| {
+                metadata_value(&node.metadata, NODE_METADATA_SHADOWSOCKS_PLUGIN).map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        plugin(
+            "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dbing.com#A\n\
+             ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:8389#B\n"
+        ),
+        [Some("obfs-local".to_string()), None]
+    );
+    assert_eq!(
+        plugin(
+            "proxies:\n  - {name: A, type: ss, server: h.example.test, port: 1, cipher: aes-256-gcm, password: p, plugin: v2ray-plugin, plugin-opts: {mode: websocket}}\n"
+        ),
+        [Some("v2ray-plugin".to_string())]
+    );
+    assert_eq!(
+        plugin("[Proxy]\nA = ss, h.example.test, 1, encrypt-method=aes-256-gcm, password=p, obfs=tls, obfs-host=bing.com\n"),
+        [Some("obfs-local".to_string())]
+    );
+    assert_eq!(
+        plugin("[Proxy]\nA = Shadowsocks, h.example.test, 1, aes-256-gcm, \"p\", obfs-name=http, obfs-host=bing.com\n"),
+        [Some("obfs-local".to_string())]
+    );
+    assert_eq!(
+        plugin("[server_local]\nshadowsocks=h.example.test:1, method=aes-256-gcm, password=p, obfs=wss, tag=A\n"),
+        [Some("v2ray-plugin".to_string())]
+    );
+    for node in import_nodes("ss-plugin", "proxies:\n  - {name: A, type: ss, server: h.example.test, port: 1, cipher: aes-256-gcm, password: p, plugin: shadow-tls, plugin-opts: {password: tls-secret}}\n".to_string()) {
+        let entries = format!("{:?}", node.metadata);
+        assert!(!entries.contains("tls-secret"), "{entries}");
+    }
+
+    let nodes = import_nodes(
+        "uncarried",
+        "\
+proxies:
+  - {name: HTTP, type: vmess, server: a.example.test, port: 80, uuid: 00000000-0000-0000-0000-000000000005, network: http}
+  - {name: KCP, type: vmess, server: b.example.test, port: 80, uuid: 00000000-0000-0000-0000-000000000005, network: kcp}
+"
+        .to_string(),
+    );
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_UNSUPPORTED_OPTION,
+        NODE_UNSUPPORTED_OPTION_HTTP_OBFS,
+    );
+    assert_metadata(
+        &nodes[1].metadata,
+        NODE_METADATA_UNSUPPORTED_OPTION,
+        NODE_UNSUPPORTED_OPTION_TRANSPORT,
+    );
+}

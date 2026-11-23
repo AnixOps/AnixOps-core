@@ -127,6 +127,10 @@ pub mod maintenance;
 
 pub const NODE_METADATA_SHADOWSOCKS_METHOD: &str = "shadowsocks.method";
 pub const NODE_METADATA_SHADOWSOCKS_PASSWORD: &str = "shadowsocks.password";
+/// The SIP003 plugin a Shadowsocks node needs (`obfs-local`, `v2ray-plugin`,
+/// `shadow-tls`, ...), by name only: its options can hold passwords. The
+/// engine implements no plugin, so such a node cannot run.
+pub const NODE_METADATA_SHADOWSOCKS_PLUGIN: &str = "shadowsocks.plugin";
 pub const NODE_METADATA_TROJAN_PASSWORD: &str = "trojan.password";
 pub const NODE_METADATA_VLESS_UUID: &str = "vless.uuid";
 pub const NODE_METADATA_VMESS_UUID: &str = "vmess.uuid";
@@ -195,6 +199,21 @@ pub const NODE_PATH_TRUNK: &str = "trunk";
 /// The subscription's name for that node when it could not be resolved to
 /// an imported node; such a node cannot run.
 pub const NODE_METADATA_VIA_UNRESOLVED: &str = "proxy.via_unresolved";
+/// An option of the node's source the parser recognized but no node field
+/// can carry, as one of the `NODE_UNSUPPORTED_OPTION_*` codes. Running the
+/// node without it would connect differently from what the source asks
+/// (without its TLS, through another transport), so such a node cannot run.
+pub const NODE_METADATA_UNSUPPORTED_OPTION: &str = "proxy.unsupported_option";
+/// Clash `network: http`, Loon `transport=http`, Quantumult X `obfs=http`:
+/// HTTP/1.1 request header obfuscation.
+pub const NODE_UNSUPPORTED_OPTION_HTTP_OBFS: &str = "http-obfs";
+/// A transport (`network`, `transport=`, `obfs=`) no reader knows.
+pub const NODE_UNSUPPORTED_OPTION_TRANSPORT: &str = "transport";
+/// Encrypted Client Hello turned on (Clash `ech-opts`).
+pub const NODE_UNSUPPORTED_OPTION_ECH: &str = "ech";
+/// XHTTP settings other than path, host, mode and headers (Clash
+/// `xhttp-opts`).
+pub const NODE_UNSUPPORTED_OPTION_XHTTP: &str = "xhttp-option";
 pub const NODE_METADATA_WIREGUARD_PRIVATE_KEY: &str = "wireguard.private_key";
 pub const NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY: &str = "wireguard.peer_public_key";
 pub const NODE_METADATA_WIREGUARD_LOCAL_ADDRESS: &str = "wireguard.local_address";
