@@ -29,11 +29,11 @@ use control_domain::{
     NODE_METADATA_MIERU_MULTIPLEXING, NODE_METADATA_MIERU_PASSWORD, NODE_METADATA_MIERU_PORT_RANGE,
     NODE_METADATA_MIERU_TRAFFIC_PATTERN, NODE_METADATA_MIERU_TRANSPORT,
     NODE_METADATA_MIERU_USERNAME, NODE_METADATA_MULTIPLEX, NODE_METADATA_PATH,
-    NODE_METADATA_SHADOWSOCKS_METHOD, NODE_METADATA_SHADOWSOCKS_PASSWORD,
-    NODE_METADATA_SHADOWSOCKS_PLUGIN, NODE_METADATA_SNELL_MODE, NODE_METADATA_SNELL_OBFS,
-    NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI, NODE_METADATA_SNELL_PSK,
-    NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_SNELL_VERSION,
-    NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
+    NODE_METADATA_PROXY_PASSWORD, NODE_METADATA_PROXY_USERNAME, NODE_METADATA_SHADOWSOCKS_METHOD,
+    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SHADOWSOCKS_PLUGIN, NODE_METADATA_SNELL_MODE,
+    NODE_METADATA_SNELL_OBFS, NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI,
+    NODE_METADATA_SNELL_PSK, NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY,
+    NODE_METADATA_SNELL_VERSION, NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
     NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
     NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
     NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
@@ -49,8 +49,8 @@ use control_domain::{
     NODE_METADATA_WIREGUARD_MTU, NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
     NODE_METADATA_WIREGUARD_PRE_SHARED_KEY, NODE_METADATA_WIREGUARD_PRIVATE_KEY,
     NODE_METADATA_WIREGUARD_RESERVED, NODE_UNSUPPORTED_OPTION_ECH,
-    NODE_UNSUPPORTED_OPTION_HTTP_OBFS, NODE_UNSUPPORTED_OPTION_TRANSPORT,
-    NODE_UNSUPPORTED_OPTION_XHTTP,
+    NODE_UNSUPPORTED_OPTION_HTTP_OBFS, NODE_UNSUPPORTED_OPTION_HTTP_PROXY_HEADERS,
+    NODE_UNSUPPORTED_OPTION_TRANSPORT, NODE_UNSUPPORTED_OPTION_XHTTP,
 };
 use routing::{NetworkRuleSpec, PolicyGroupSpec, RoutingModel, RoutingSpec};
 use serde::Deserialize;
@@ -102,6 +102,8 @@ pub const SUBSCRIPTION_ANX_LINK_INVALID_CODE: &str = "subscription.core.anx_link
 pub const SUBSCRIPTION_WIREGUARD_LINK_INVALID_CODE: &str =
     "subscription.core.wireguard_link_invalid";
 pub const SUBSCRIPTION_MIERU_LINK_INVALID_CODE: &str = "subscription.core.mieru_link_invalid";
+pub const SUBSCRIPTION_HTTP_LINK_INVALID_CODE: &str = "subscription.core.http_link_invalid";
+pub const SUBSCRIPTION_SOCKS_LINK_INVALID_CODE: &str = "subscription.core.socks_link_invalid";
 pub const SUBSCRIPTION_CLASH_YAML_INVALID_CODE: &str = "subscription.core.clash_yaml_invalid";
 pub const SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE: &str =
     "subscription.core.clash_yaml_unsupported";
@@ -238,6 +240,9 @@ struct RawClashProxy {
     /// Shadowsocks SIP003 plugin (`obfs`, `v2ray-plugin`, `shadow-tls`, ...);
     /// its `plugin-opts` are not read, they can hold passwords.
     plugin: Option<serde_json::Value>,
+    /// Extra request headers of an `http` proxy, which the engine does not
+    /// send; read only to tell whether there are any.
+    headers: Option<serde_json::Value>,
 }
 
 /// TLS, REALITY and transport options of a Clash vmess, vless or trojan
@@ -313,6 +318,12 @@ struct RawSingBoxOutbound {
     /// Shadowsocks SIP003 plugin (`obfs-local`, `v2ray-plugin`); its
     /// `plugin_opts` are not read, they can hold passwords.
     plugin: Option<RawSingBoxScalar>,
+    /// SOCKS version of a `socks` outbound (`4`, `4a`, `5`).
+    version: Option<serde_json::Value>,
+    /// Request path and extra headers of an `http` outbound, which the
+    /// engine does not send; read only to tell whether there are any.
+    path: Option<serde_json::Value>,
+    headers: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1236,10 +1247,45 @@ fn parse_clash_proxy(mut raw: RawClashProxy, source_id: &str) -> DomainResult<No
             }
             (Protocol::Mieru, "mieru", metadata)
         }
+        "http" | "socks5" => {
+            let (protocol, tag) = if protocol_token == "http" {
+                (Protocol::Http, "http")
+            } else {
+                (Protocol::Socks, "socks")
+            };
+            let tls = clash_option_bool(
+                raw.stream.tls.as_ref(),
+                "clash proxy tls must be true or false",
+            )?
+            .unwrap_or(false);
+            let insecure = clash_option_bool(
+                raw.stream.skip_cert_verify.as_ref(),
+                "clash proxy skip-cert-verify must be true or false",
+            )?
+            .unwrap_or(false);
+            let headers = raw
+                .headers
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|headers| !headers.is_empty());
+            let fields = PlainProxyFields {
+                username: text(raw.username.take()),
+                password: text(raw.password.take()),
+                tls,
+                server_name: clash_option_text(raw.stream.sni.as_ref())
+                    .or_else(|| clash_option_text(raw.stream.servername.as_ref())),
+                insecure,
+                certificate_sha256: text(raw.fingerprint.take()),
+                public_key_sha256: None,
+                unsupported: (headers && protocol == Protocol::Http)
+                    .then_some(NODE_UNSUPPORTED_OPTION_HTTP_PROXY_HEADERS),
+            };
+            (protocol, tag, plain_proxy_metadata(fields, &host))
+        }
         _ => {
             return Err(domain_error(
                 SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE,
-                "clash proxy type must be ss, trojan, vless, vmess, snell, or mieru",
+                "clash proxy type must be ss, trojan, vless, vmess, snell, mieru, http, or socks5",
             ));
         }
     };
@@ -1489,6 +1535,9 @@ fn parse_sing_box_outbound(
         mtu,
         encrypt,
         plugin,
+        version,
+        path: http_path,
+        headers: http_headers,
     } = raw;
     let protocol =
         required_sing_box_scalar_field(protocol, "sing-box outbound type cannot be empty")?;
@@ -1649,10 +1698,48 @@ fn parse_sing_box_outbound(
             }
             (Protocol::Iwan, "iwan", metadata)
         }
+        "http" => {
+            let path = clash_option_text(http_path.as_ref()).is_some_and(|path| path != "/");
+            let headers = http_headers
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|headers| !headers.is_empty());
+            let mut metadata = plain_proxy_metadata(
+                PlainProxyFields {
+                    username: optional_sing_box_scalar_field(username),
+                    password: optional_sing_box_scalar_field(password),
+                    unsupported: (path || headers)
+                        .then_some(NODE_UNSUPPORTED_OPTION_HTTP_PROXY_HEADERS),
+                    ..PlainProxyFields::default()
+                },
+                &host,
+            );
+            metadata.extend(sing_box_v2ray_tls_metadata(tls, &host, false)?);
+            (Protocol::Http, "http", metadata)
+        }
+        "socks" => {
+            if let Some(version) = clash_option_text(version.as_ref()) {
+                if version != "5" {
+                    return Err(domain_error(
+                        SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
+                        "sing-box socks outbound version must be 5 for catalog import",
+                    ));
+                }
+            }
+            let metadata = plain_proxy_metadata(
+                PlainProxyFields {
+                    username: optional_sing_box_scalar_field(username),
+                    password: optional_sing_box_scalar_field(password),
+                    ..PlainProxyFields::default()
+                },
+                &host,
+            );
+            (Protocol::Socks, "socks", metadata)
+        }
         _ => {
             return Err(domain_error(
                 SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
-                "sing-box outbound type must be shadowsocks, trojan, vless, vmess, hysteria2, tuic, or iwan for catalog import",
+                "sing-box outbound type must be shadowsocks, trojan, vless, vmess, hysteria2, tuic, iwan, http, or socks for catalog import",
             ));
         }
     };
@@ -2152,6 +2239,19 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
     let options = collect_quantumult_x_proxy_options(&parts[1..])?;
 
     let (protocol, protocol_tag, mut metadata) = match protocol_token.as_str() {
+        "http" | "https" | "socks5" | "socks" => {
+            let (protocol, tag, tls) = plain_proxy_kind(&protocol_token).ok_or_else(|| {
+                domain_error(
+                    SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_UNSUPPORTED_CODE,
+                    "quantumult x proxy type is not http or socks5",
+                )
+            })?;
+            (
+                protocol,
+                tag,
+                quantumult_x_plain_proxy_metadata(&options, tls, &host)?,
+            )
+        }
         "ss" | "shadowsocks" => {
             let method = required_quantumult_x_proxy_option(
                 &options,
@@ -2230,17 +2330,10 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
             )));
             (Protocol::Vmess, "vmess", metadata)
         }
-        "direct" | "reject" | "http" | "https" | "socks" | "socks5" | "ssr" | "shadowsocksr"
-        | "hysteria" | "hysteria2" | "tuic" | "wireguard" => {
-            return Err(domain_error(
-                SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_UNSUPPORTED_CODE,
-                "quantumult x proxy type must be shadowsocks, trojan, vless, or vmess for catalog import",
-            ));
-        }
         _ => {
             return Err(domain_error(
                 SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_UNSUPPORTED_CODE,
-                "quantumult x proxy type must be shadowsocks, trojan, vless, or vmess for catalog import",
+                "quantumult x proxy type must be shadowsocks, trojan, vless, vmess, http, or socks5 for catalog import",
             ));
         }
     };
@@ -2298,6 +2391,38 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
         ],
         metadata,
     })
+}
+
+/// The metadata of a Quantumult X `http=` or `socks5=` line from its
+/// options: `username`, `password`, `over-tls`, `tls-host`,
+/// `tls-verification`, `tls-cert-sha256` and `tls-pubkey-sha256`.
+fn quantumult_x_plain_proxy_metadata(
+    options: &BTreeMap<String, String>,
+    tls: bool,
+    host: &str,
+) -> DomainResult<Metadata> {
+    let code = SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_INVALID_CODE;
+    let tls =
+        proxy_line_boolean(options.get("over_tls"), code, "quantumult x over-tls")?.unwrap_or(tls);
+    let verify = proxy_line_boolean(
+        options.get("tls_verification"),
+        code,
+        "quantumult x tls-verification",
+    )?;
+    let option = |key: &str| optional_quantumult_x_proxy_option(options, &[key]);
+    Ok(plain_proxy_metadata(
+        PlainProxyFields {
+            username: option("username"),
+            password: option("password"),
+            tls,
+            server_name: option("tls_host"),
+            insecure: verify == Some(false),
+            certificate_sha256: option("tls_cert_sha256"),
+            public_key_sha256: option("tls_pubkey_sha256"),
+            unsupported: None,
+        },
+        host,
+    ))
 }
 
 /// The share-link settings of a Quantumult X vmess, vless or trojan line:
@@ -2485,6 +2610,16 @@ fn parse_loon_proxy_line_subscription(
         }
     }
 
+    // HTTP and SOCKS5 lines read the same in Surge (`http, host, port, user,
+    // pass`); they alone do not make the section Loon's, so a Surge section
+    // with such lines still goes to the Surge reader, which reads them too.
+    if !nodes.is_empty()
+        && nodes
+            .iter()
+            .all(|node| matches!(node.protocol, Protocol::Http | Protocol::Socks))
+    {
+        return Ok(None);
+    }
     if nodes.is_empty() {
         // Every line was in Loon's positional style yet none could be
         // imported: report the first one's error rather than letting the
@@ -2648,11 +2783,17 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
             }
             (Protocol::Vmess, "vmess", metadata)
         }
-        "direct" | "reject" | "http" | "https" | "socks" | "socks5" | "ssr" | "shadowsocksr"
-        | "hysteria" | "hysteria2" | "tuic" | "wireguard" => {
+        "http" | "https" | "socks5" | "socks" | "socks5_tls" => proxy_line_plain_proxy(
+            &protocol_token,
+            parts.get(3..).unwrap_or_default(),
+            &host,
+            SUBSCRIPTION_LOON_PROXY_LINE_INVALID_CODE,
+        )?,
+        "direct" | "reject" | "ssr" | "shadowsocksr" | "hysteria" | "hysteria2" | "tuic"
+        | "wireguard" => {
             return Err(domain_error(
                 SUBSCRIPTION_LOON_PROXY_LINE_UNSUPPORTED_CODE,
-                "loon proxy type must be shadowsocks, trojan, vless, or vmess for catalog import",
+                "loon proxy type must be shadowsocks, trojan, vless, vmess, http, https, or socks5 for catalog import",
             ));
         }
         _ => return Ok(None),
@@ -2945,9 +3086,20 @@ fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescr
         SUBSCRIPTION_SURGE_PROXY_LINE_INVALID_CODE,
         "surge proxy port must be between 1 and 65535",
     )?;
-    let options = collect_surge_proxy_options(&parts[3..])?;
+    // HTTP and SOCKS5 lines may give the user and password positionally.
+    let options = if plain_proxy_kind(&protocol_token).is_some() {
+        BTreeMap::new()
+    } else {
+        collect_surge_proxy_options(&parts[3..])?
+    };
 
     let (protocol, protocol_tag, mut metadata) = match protocol_token.as_str() {
+        "http" | "https" | "socks5" | "socks" | "socks5_tls" => proxy_line_plain_proxy(
+            &protocol_token,
+            &parts[3..],
+            &host,
+            SUBSCRIPTION_SURGE_PROXY_LINE_INVALID_CODE,
+        )?,
         "ss" | "shadowsocks" => {
             let method = required_surge_proxy_option(
                 &options,
@@ -3034,7 +3186,7 @@ fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescr
         _ => {
             return Err(domain_error(
                 SUBSCRIPTION_SURGE_PROXY_LINE_UNSUPPORTED_CODE,
-                "surge proxy type must be ss, trojan, vmess, or snell for catalog import",
+                "surge proxy type must be ss, trojan, vmess, snell, http, https, socks5, or socks5-tls for catalog import",
             ));
         }
     };
@@ -3300,10 +3452,215 @@ fn share_link_parser(line: &str) -> Option<fn(&str) -> DomainResult<NodeDescript
         parse_iwan_link
     } else if line.starts_with("anx://") {
         parse_anx_link
+    } else if line.starts_with("socks5://")
+        || line.starts_with("socks5h://")
+        || line.starts_with("socks://")
+        || is_http_proxy_link(line)
+    {
+        parse_plain_proxy_link
     } else {
         return None;
     };
     Some(parser)
+}
+
+/// Whether an `http://` or `https://` line is an HTTP proxy link rather than
+/// a web address (a subscription or rule list URL): an explicit port, no
+/// path, no query besides the link's own fields, and credentials or a
+/// `#name`. Other such lines are skipped like lines of unknown schemes.
+fn is_http_proxy_link(line: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix("http://")
+        .or_else(|| line.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (without_fragment, fragment) = split_once_optional(rest, '#');
+    let (authority, query) = split_once_optional(without_fragment, '?');
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo), host_port),
+        None => (None, authority),
+    };
+    let (host_port, path) = split_once_optional(host_port, '/');
+    let has_port = host_port.rsplit_once(':').is_some_and(|(host, port)| {
+        !host.is_empty() && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    let own_query = query.is_none_or(|query| {
+        query
+            .split('&')
+            .filter(|entry| !entry.is_empty())
+            .all(|entry| {
+                let key = entry.split_once('=').map_or(entry, |(key, _)| key);
+                HTTP_PROXY_LINK_FIELDS
+                    .iter()
+                    .any(|field| key.eq_ignore_ascii_case(field))
+            })
+    });
+    let named = fragment.is_some_and(|fragment| !fragment.trim().is_empty());
+    has_port
+        && path.is_none_or(str::is_empty)
+        && own_query
+        && (userinfo.is_some_and(|userinfo| !userinfo.is_empty()) || named)
+}
+
+/// The query fields an HTTP proxy link may carry: the TLS server name and
+/// certificate check of `https://`, and the AnixOps `via`.
+const HTTP_PROXY_LINK_FIELDS: [&str; 6] = [
+    "sni",
+    "peer",
+    "insecure",
+    "allowinsecure",
+    "skip-cert-verify",
+    "via",
+];
+
+/// Parses an HTTP or SOCKS5 proxy link: `http://`, `https://` (HTTP over
+/// TLS, with `sni` and `insecure`), `socks5://`, `socks5h://` and
+/// `socks://`, as `scheme://[user[:password]@]host:port[#name]`. The user
+/// and password are percent-decoded; a `socks://` link (v2rayN) may instead
+/// carry them base64-encoded as `user:password`.
+fn parse_plain_proxy_link(link: &str) -> DomainResult<NodeDescriptor> {
+    let (scheme, payload) = link.split_once("://").unwrap_or(("", link));
+    let scheme = scheme.to_ascii_lowercase();
+    let (protocol, tag, tls, code, protocol_name) = match scheme.as_str() {
+        "http" => (
+            Protocol::Http,
+            "http",
+            false,
+            SUBSCRIPTION_HTTP_LINK_INVALID_CODE,
+            "http proxy",
+        ),
+        "https" => (
+            Protocol::Http,
+            "http",
+            true,
+            SUBSCRIPTION_HTTP_LINK_INVALID_CODE,
+            "http proxy",
+        ),
+        "socks" | "socks5" | "socks5h" => (
+            Protocol::Socks,
+            "socks",
+            false,
+            SUBSCRIPTION_SOCKS_LINK_INVALID_CODE,
+            "socks",
+        ),
+        _ => {
+            return Err(domain_error(
+                SUBSCRIPTION_LINK_UNSUPPORTED_CODE,
+                "proxy link must start with http://, https://, socks5:// or socks://",
+            ))
+        }
+    };
+    let (without_fragment, fragment) = split_once_optional(payload, '#');
+    let name = fragment
+        .map(percent_decode)
+        .transpose()
+        .map_err(|_| {
+            domain_error(
+                code,
+                format!("{protocol_name} link name is not valid percent encoding"),
+            )
+        })?
+        .filter(|name| !name.trim().is_empty());
+    let (authority, query) = split_once_optional(without_fragment, '?');
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo), host_port),
+        None => (None, authority),
+    };
+    let host_port = strip_share_link_path(host_port);
+    let (host, port) = parse_host_port_for(host_port, code, protocol_name)?;
+    let (username, password) = match userinfo {
+        Some(userinfo) => {
+            plain_proxy_link_credentials(userinfo, scheme == "socks", code, protocol_name)?
+        }
+        None => (None, None),
+    };
+    let query = parse_share_link_query(query, code, protocol_name)?;
+    let server_name = ["sni", "peer"]
+        .iter()
+        .find_map(|key| query.get(*key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let insecure = ["insecure", "allowinsecure", "skip-cert-verify"]
+        .iter()
+        .find_map(|key| query.get(*key))
+        .map(|value| parse_share_link_boolean(value, code, "TLS insecure"))
+        .transpose()?
+        .unwrap_or(false);
+    let mut metadata = plain_proxy_metadata(
+        PlainProxyFields {
+            username,
+            password,
+            tls,
+            server_name,
+            insecure,
+            ..PlainProxyFields::default()
+        },
+        &host,
+    );
+    metadata.push(MetadataEntry {
+        key: NODE_METADATA_SOURCE_FORMAT.to_string(),
+        value: format!("{tag}-url"),
+    });
+    let host_id = sanitize_identifier(&host);
+    let host_id = if host_id.is_empty() {
+        "host".to_string()
+    } else {
+        host_id
+    };
+    let id = format!("{tag}-{host_id}-{port}");
+    let name = name.unwrap_or_else(|| id.clone());
+    Ok(NodeDescriptor {
+        id,
+        name,
+        protocol,
+        endpoint: Endpoint { host, port },
+        tags: vec!["subscription".to_string(), tag.to_string()],
+        metadata,
+    })
+}
+
+/// The user and password of a proxy link's `user[:password]`, each
+/// percent-decoded. With `base64_userinfo` (a `socks://` link), userinfo
+/// without `:` that decodes as base64 to `user:password` is read that way.
+fn plain_proxy_link_credentials(
+    userinfo: &str,
+    base64_userinfo: bool,
+    code: &'static str,
+    protocol_name: &'static str,
+) -> DomainResult<(Option<String>, Option<String>)> {
+    let invalid = || {
+        domain_error(
+            code,
+            format!("{protocol_name} link credentials are not valid percent encoding"),
+        )
+    };
+    let encoded = base64_userinfo
+        .then(|| percent_decode(userinfo).ok())
+        .flatten()
+        .filter(|userinfo| !userinfo.contains(':'))
+        .and_then(|userinfo| decode_base64_text(&userinfo))
+        .filter(|decoded| decoded.contains(':'));
+    let (username, password) = match encoded {
+        Some(decoded) => {
+            let (username, password) = split_once_optional(&decoded, ':');
+            (username.to_string(), password.map(str::to_string))
+        }
+        None => {
+            let (username, password) = split_once_optional(userinfo, ':');
+            (
+                percent_decode(username).map_err(|_| invalid())?,
+                password
+                    .map(percent_decode)
+                    .transpose()
+                    .map_err(|_| invalid())?,
+            )
+        }
+    };
+    Ok((
+        Some(username).filter(|username| !username.is_empty()),
+        password.filter(|password| !password.is_empty()),
+    ))
 }
 
 /// The AnixOps subscription line that marks the next link's path
@@ -4848,6 +5205,158 @@ fn proxy_line_pin_metadata(certificate: Option<String>, public_key: Option<Strin
         &certificate.into_iter().collect::<Vec<_>>(),
         &public_key.into_iter().collect::<Vec<_>>(),
     )
+}
+
+/// The settings of an HTTP or SOCKS5 proxy node, however its format spells
+/// them.
+#[derive(Default)]
+struct PlainProxyFields {
+    username: Option<String>,
+    password: Option<String>,
+    /// An HTTPS proxy (HTTP over TLS), or SOCKS5 over TLS, which the node
+    /// import reports as unsupported rather than running it in the clear.
+    tls: bool,
+    /// The TLS server name; the server address when not set.
+    server_name: Option<String>,
+    insecure: bool,
+    certificate_sha256: Option<String>,
+    public_key_sha256: Option<String>,
+    /// An option the node needs that no node field carries (one of the
+    /// `NODE_UNSUPPORTED_OPTION_*` codes).
+    unsupported: Option<&'static str>,
+}
+
+/// The node metadata of an HTTP or SOCKS5 proxy: its credentials
+/// ([`NODE_METADATA_PROXY_USERNAME`], [`NODE_METADATA_PROXY_PASSWORD`]) and,
+/// over TLS, the TLS entries every other protocol uses.
+fn plain_proxy_metadata(fields: PlainProxyFields, host: &str) -> Metadata {
+    let mut metadata = Vec::new();
+    for (key, value) in [
+        (NODE_METADATA_PROXY_USERNAME, fields.username),
+        (NODE_METADATA_PROXY_PASSWORD, fields.password),
+    ] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            metadata.push(MetadataEntry {
+                key: key.to_string(),
+                value,
+            });
+        }
+    }
+    if fields.tls {
+        metadata.push(MetadataEntry {
+            key: NODE_METADATA_TLS_ENABLED.to_string(),
+            value: "true".to_string(),
+        });
+        metadata.push(MetadataEntry {
+            key: NODE_METADATA_TLS_SERVER_NAME.to_string(),
+            value: fields
+                .server_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| host.to_string()),
+        });
+        metadata.push(MetadataEntry {
+            key: NODE_METADATA_TLS_INSECURE.to_string(),
+            value: fields.insecure.to_string(),
+        });
+    }
+    metadata.extend(proxy_line_pin_metadata(
+        fields.certificate_sha256,
+        fields.public_key_sha256,
+    ));
+    if let Some(option) = fields.unsupported {
+        metadata.push(MetadataEntry {
+            key: NODE_METADATA_UNSUPPORTED_OPTION.to_string(),
+            value: option.to_string(),
+        });
+    }
+    metadata
+}
+
+/// The protocol, reader tag and TLS of a Surge, Loon or Quantumult X proxy
+/// type that is an HTTP or SOCKS5 proxy (as [`normalized_token`] spells
+/// it): `http`, `https`, `socks5`, `socks` and Surge's `socks5-tls`.
+fn plain_proxy_kind(token: &str) -> Option<(Protocol, &'static str, bool)> {
+    match token {
+        "http" => Some((Protocol::Http, "http", false)),
+        "https" => Some((Protocol::Http, "http", true)),
+        "socks5" | "socks" => Some((Protocol::Socks, "socks", false)),
+        "socks5_tls" => Some((Protocol::Socks, "socks", true)),
+        _ => None,
+    }
+}
+
+/// The protocol, reader tag and metadata of a Surge or Loon HTTP or SOCKS5
+/// proxy line of type `token` from the fields after its port.
+fn proxy_line_plain_proxy(
+    token: &str,
+    fields: &[String],
+    host: &str,
+    code: &'static str,
+) -> DomainResult<(Protocol, &'static str, Metadata)> {
+    let (protocol, tag, tls) = plain_proxy_kind(token)
+        .ok_or_else(|| domain_error(code, "proxy type is not http, https or socks5"))?;
+    let fields = proxy_line_plain_proxy_fields(fields, tls, code)?;
+    Ok((protocol, tag, plain_proxy_metadata(fields, host)))
+}
+
+/// The fields after the port of a Surge or Loon HTTP or SOCKS5 proxy line:
+/// the user and password, positional (`user, "password"`) or as
+/// `username=` and `password=`, then the options: `tls=`/`over-tls=`,
+/// `sni=`/`tls-name=`, `skip-cert-verify=`, and the pins
+/// `server-cert-fingerprint-sha256=` (Surge), `tls-cert-sha256=` and
+/// `tls-pubkey-sha256=` (Loon). Other options (`udp-relay`, `tfo`, ...)
+/// change nothing here and are ignored.
+fn proxy_line_plain_proxy_fields(
+    fields: &[String],
+    tls: bool,
+    code: &'static str,
+) -> DomainResult<PlainProxyFields> {
+    let mut proxy = PlainProxyFields {
+        tls,
+        ..PlainProxyFields::default()
+    };
+    let mut positional = Vec::new();
+    let mut options = BTreeMap::new();
+    for field in fields.iter().map(|field| field.trim()) {
+        if options.is_empty() && positional.len() < 2 && !is_proxy_line_option(field) {
+            positional.push(strip_loon_quotes(field.to_string()));
+            continue;
+        }
+        if let Some((key, value)) = field.split_once('=') {
+            options.insert(normalized_token(key), strip_loon_quotes(value.to_string()));
+        }
+    }
+    let mut positional = positional.into_iter();
+    proxy.username = positional
+        .next()
+        .or_else(|| options.get("username").cloned());
+    proxy.password = positional
+        .next()
+        .or_else(|| options.get("password").cloned());
+    if let Some(enabled) = proxy_line_boolean(
+        options.get("tls").or_else(|| options.get("over_tls")),
+        code,
+        "proxy tls",
+    )? {
+        proxy.tls = enabled;
+    }
+    proxy.server_name = options
+        .get("sni")
+        .or_else(|| options.get("tls_name"))
+        .filter(|sni| !sni.trim().eq_ignore_ascii_case("off"))
+        .cloned();
+    proxy.insecure = proxy_line_boolean(
+        options.get("skip_cert_verify"),
+        code,
+        "proxy skip-cert-verify",
+    )?
+    .unwrap_or(false);
+    proxy.certificate_sha256 = options
+        .get("server_cert_fingerprint_sha256")
+        .or_else(|| options.get("tls_cert_sha256"))
+        .cloned();
+    proxy.public_key_sha256 = options.get("tls_pubkey_sha256").cloned();
+    Ok(proxy)
 }
 
 /// The TLS, REALITY and transport settings of a Clash, Surge, Loon or

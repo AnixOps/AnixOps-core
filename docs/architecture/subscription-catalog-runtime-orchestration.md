@@ -93,8 +93,33 @@ no system DNS/TUN mutation, no daemon/control socket.
 - 第一方 TOML 格式保持严格，任一条目错误整体失败。
 
 `node-import::import_text` 把这些警告作为报告顶层的 `skipped`（`[{code, message}]`，最多 32 条）与
-`skipped_count`（总数）输出，没有跳过时两个键都不输出。跳过的条目没有成为节点，不像 `unsupported` 那样关闭
-`routing`；引用它们的规则和组成员按 `routing_warnings` 的既有方式跳过并告警。
+`skipped_count`（总数）输出，没有跳过时两个键都不输出。跳过的条目没有成为节点；引用它们的规则和组成员按
+`routing_warnings` 的既有方式跳过并告警。`unsupported` 里的节点（读出来了但本构建不能运行）同样只从规则与
+策略组里去掉，不再关闭整份 `routing`，见 `routing-policy-group-model.md`「引擎出站上限与不能运行的节点」。
+
+## HTTP 与 SOCKS5 代理节点
+
+各格式的 HTTP / HTTPS 与 SOCKS5 代理条目都导入为节点（`Protocol::Http`、`Protocol::Socks`），用户名和密码存入
+`proxy.username`、`proxy.password`，HTTPS 的 TLS 设置用其他协议共用的 `tls.*` 键（服务器名缺省为服务器地址）：
+
+- 链接：`http://[user[:pass]@]host:port[#name]`、`https://...`（可带 `sni`/`peer`、`insecure`/`allowInsecure`/
+  `skip-cert-verify`）、`socks5://`、`socks5h://`、`socks://`（v2rayN 把 `user:pass` 整体 base64 放在 userinfo
+  里，也接受）。用户名和密码百分号解码。`http(s)://` 行只有在写明端口、没有路径、查询参数只有上面这些字段（以及
+  `via`），并且带凭据或 `#名称` 时才算代理链接；订阅地址、规则列表这类网址照旧按不认识的行静默跳过。
+- Clash：`type: http`（`username`、`password`、`tls`、`sni`/`servername`、`skip-cert-verify`、`fingerprint`）与
+  `type: socks5`。HTTP 的 `headers` 非空时节点报不支持（引擎不发送额外请求头），不会去掉它们运行。
+- Surge / Loon：`http`、`https`、`socks5`、`socks5-tls`，用户名和密码可以按位置写（`user, "pass"`），也可以写
+  `username=`、`password=`；选项 `tls`/`over-tls`、`sni`/`tls-name`、`skip-cert-verify` 与证书固定照常读取。
+  一个 `[Proxy]` 段只有 HTTP/SOCKS5 行时不算 Loon 写法，交给 Surge 解析器（两者写法相同）。
+- Quantumult X：`http=`、`https=`、`socks5=`（`username`、`password`、`over-tls`、`tls-host`、`tls-verification`、
+  `tls-cert-sha256`、`tls-pubkey-sha256`）。
+- sing-box：`type: http`（`username`、`password`、`tls`；`path` 不是 `/` 或带 `headers` 时报不支持）与
+  `type: socks`（只接受 `version` 为 5 或不写）。
+
+node-import 生成 `outbound-http`（`"tls": true` 时带 `server_name`、`insecure` 与证书固定）与 `outbound-socks`
+出站。SOCKS5 over TLS（Surge `socks5-tls`、Quantumult X `socks5` + `over-tls`）报不支持（`socks over tls is not
+supported`），不会以明文运行；只有密码没有用户名、HTTP 用户名含 `:`、SOCKS5 用户名或密码超过 255 字节等同样报
+不支持，原因不含凭据。
 
 ## 分享链接写法
 

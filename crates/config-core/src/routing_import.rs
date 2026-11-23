@@ -62,6 +62,25 @@ const HEALTH_CHECK_OPTIONS: [&str; 4] = ["url", "interval", "tolerance", "evalua
 const BALANCE_OPTIONS: [&str; 2] = ["strategy", "algorithm"];
 /// Longest node name filter accepted.
 const MAX_FILTER_LEN: usize = 1024;
+/// Most policy groups a payload may declare. Well above the embedded
+/// engine's 64, since groups of unsupported types or without importable
+/// members are skipped first; a payload with more is not imported, so a
+/// hostile payload cannot make the import slow.
+pub const MAX_SOURCE_POLICY_GROUPS: usize = 512;
+/// Most members one policy group may list, its name filter included; a
+/// group with more is skipped.
+pub const MAX_SOURCE_GROUP_MEMBERS: usize = 4096;
+/// Most group members of all policy groups together, name filters
+/// included; a payload with more is not imported.
+pub const MAX_SOURCE_GROUP_MEMBERSHIPS: usize = 65_536;
+/// Most rule lines (Loon `[Remote Rule]` lines included) a payload may
+/// have; a payload with more is not imported.
+pub const MAX_SOURCE_RULES: usize = 65_536;
+/// Longest rule line, in bytes; a longer line is skipped.
+pub const MAX_SOURCE_RULE_LEN: usize = 64 * 1024;
+/// Most warnings one import keeps; one more line says how many were left
+/// out.
+pub const MAX_IMPORT_WARNINGS: usize = 1024;
 
 /// Routing found in a subscription payload, with import diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +131,49 @@ pub fn import_subscription_routing(content: &str, nodes: &[NodeDescriptor]) -> I
             diagnostics: Vec::new(),
         };
     };
+    if let Some(reason) = oversized_source(&source) {
+        return ImportedRouting {
+            routing: None,
+            spec: None,
+            rule_sets: Vec::new(),
+            diagnostics: vec![Diagnostic::new(
+                DiagnosticSeverity::Warning,
+                ROUTING_IMPORT_INVALID_CODE,
+                format!(
+                    "{} rules were not imported and routing falls back to one node: {reason}",
+                    source.format
+                ),
+                Some(SOURCE_ROUTING_IMPORT.to_string()),
+            )],
+        };
+    }
     build_routing(source, nodes)
+}
+
+/// Why `source` is too large to import, checked before any work that grows
+/// with its size: fixed wording with counts and limits.
+fn oversized_source(source: &RoutingSource) -> Option<String> {
+    let rules = source.rules.len() + source.remote_rules.len();
+    if rules > MAX_SOURCE_RULES {
+        return Some(format!("{rules} rules, more than {MAX_SOURCE_RULES}"));
+    }
+    if source.groups.len() > MAX_SOURCE_POLICY_GROUPS {
+        return Some(format!(
+            "{} policy groups, more than {MAX_SOURCE_POLICY_GROUPS}",
+            source.groups.len()
+        ));
+    }
+    let memberships = source
+        .groups
+        .iter()
+        .map(|group| group.members.len())
+        .sum::<usize>();
+    if memberships > MAX_SOURCE_GROUP_MEMBERSHIPS {
+        return Some(format!(
+            "{memberships} policy group members, more than {MAX_SOURCE_GROUP_MEMBERSHIPS}"
+        ));
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -514,7 +575,20 @@ fn group_kind(group: &SourceGroup) -> Option<GroupKind> {
 /// clients apply filters to external lists or providers, which are not
 /// imported, so a filter on a group without members picks from every node;
 /// a filter on a group with members and without `include-all` is ignored.
-fn expand_filters(importer: &mut Importer, groups: &mut [SourceGroup], nodes: &[NodeDescriptor]) {
+///
+/// A group stops taking nodes once it has more than
+/// [`MAX_SOURCE_GROUP_MEMBERS`] (it is then skipped), and expansion stops
+/// once all groups together have more than [`MAX_SOURCE_GROUP_MEMBERSHIPS`]:
+/// the result is then `false` and the payload is not imported.
+fn expand_filters(
+    importer: &mut Importer,
+    groups: &mut [SourceGroup],
+    nodes: &[NodeDescriptor],
+) -> bool {
+    let mut memberships = groups
+        .iter()
+        .map(|group| group.members.len())
+        .sum::<usize>();
     for group in groups.iter_mut() {
         let include_all = [
             take_option(&mut group.options, "include-all"),
@@ -554,7 +628,18 @@ fn expand_filters(importer: &mut Importer, groups: &mut [SourceGroup], nodes: &[
             );
             continue;
         };
+        let mut listed = group
+            .members
+            .iter()
+            .map(|member| member.trim().to_string())
+            .collect::<BTreeSet<_>>();
         for node in nodes {
+            if group.members.len() > MAX_SOURCE_GROUP_MEMBERS {
+                break;
+            }
+            if memberships > MAX_SOURCE_GROUP_MEMBERSHIPS {
+                return false;
+            }
             let name = node.name.trim();
             let kept = keep
                 .as_ref()
@@ -562,11 +647,13 @@ fn expand_filters(importer: &mut Importer, groups: &mut [SourceGroup], nodes: &[
             let dropped = drop
                 .as_ref()
                 .is_some_and(|patterns| matches_any(patterns, name));
-            if kept && !dropped && !group.members.iter().any(|member| member.trim() == name) {
+            if kept && !dropped && listed.insert(name.to_string()) {
                 group.members.push(name.to_string());
+                memberships += 1;
             }
         }
     }
+    memberships <= MAX_SOURCE_GROUP_MEMBERSHIPS
 }
 
 fn take_option(options: &mut BTreeMap<String, String>, key: &str) -> Option<String> {
@@ -617,17 +704,41 @@ struct Importer<'a> {
     /// Proxy names that stand for a built-in policy ([`RoutingSource::aliases`]).
     aliases: BTreeMap<String, &'static str>,
     diagnostics: Vec<Diagnostic>,
+    /// Warnings past [`MAX_IMPORT_WARNINGS`], counted instead of kept.
+    omitted_warnings: usize,
 }
 
 impl Importer<'_> {
     fn warn(&mut self, code: &'static str, message: String) {
-        self.diagnostics.push(Diagnostic::new(
-            DiagnosticSeverity::Warning,
-            code,
-            message,
-            Some(SOURCE_ROUTING_IMPORT.to_string()),
-        ));
+        if self.diagnostics.len() >= MAX_IMPORT_WARNINGS {
+            self.omitted_warnings += 1;
+            return;
+        }
+        self.diagnostics.push(warning(code, message));
     }
+
+    /// The diagnostics, with a line counting the warnings left out.
+    fn finish(mut self) -> Vec<Diagnostic> {
+        if self.omitted_warnings > 0 {
+            self.diagnostics.push(warning(
+                ROUTING_IMPORT_RULE_SKIPPED_CODE,
+                format!(
+                    "{} more import warnings were left out",
+                    self.omitted_warnings
+                ),
+            ));
+        }
+        self.diagnostics
+    }
+}
+
+fn warning(code: &'static str, message: String) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticSeverity::Warning,
+        code,
+        message,
+        Some(SOURCE_ROUTING_IMPORT.to_string()),
+    )
 }
 
 fn build_routing(source: RoutingSource, nodes: &[NodeDescriptor]) -> ImportedRouting {
@@ -641,6 +752,7 @@ fn build_routing(source: RoutingSource, nodes: &[NodeDescriptor]) -> ImportedRou
         nodes_by_name,
         aliases: source.aliases,
         diagnostics: Vec::new(),
+        omitted_warnings: 0,
     };
     for name in source.alias_options_ignored {
         if let Some(policy) = importer.aliases.get(&name).copied() {
@@ -652,7 +764,22 @@ fn build_routing(source: RoutingSource, nodes: &[NodeDescriptor]) -> ImportedRou
     }
 
     let mut source_groups = source.groups;
-    expand_filters(&mut importer, &mut source_groups, nodes);
+    if !expand_filters(&mut importer, &mut source_groups, nodes) {
+        let mut diagnostics = importer.finish();
+        diagnostics.push(warning(
+            ROUTING_IMPORT_INVALID_CODE,
+            format!(
+                "{} rules were not imported and routing falls back to one node: policy groups and their name filters name more than {MAX_SOURCE_GROUP_MEMBERSHIPS} members",
+                source.format
+            ),
+        ));
+        return ImportedRouting {
+            routing: None,
+            spec: None,
+            rule_sets: Vec::new(),
+            diagnostics,
+        };
+    }
     let groups = import_groups(&mut importer, source_groups);
     let group_ids = groups
         .iter()
@@ -692,22 +819,25 @@ fn build_routing(source: RoutingSource, nodes: &[NodeDescriptor]) -> ImportedRou
                 routing: Some(model),
                 spec: Some(spec),
                 rule_sets: rule_sets.sets,
-                diagnostics: importer.diagnostics,
+                diagnostics: importer.finish(),
             }
         }
         Err(error) => {
-            importer.warn(
+            // Always kept, past the warning limit too: it says why there is
+            // no routing at all.
+            let mut diagnostics = importer.finish();
+            diagnostics.push(warning(
                 ROUTING_IMPORT_INVALID_CODE,
                 format!(
                     "{} rules were not imported and routing falls back to one node: {}",
                     source.format, error.message
                 ),
-            );
+            ));
             ImportedRouting {
                 routing: None,
                 spec: None,
                 rule_sets: Vec::new(),
-                diagnostics: importer.diagnostics,
+                diagnostics,
             }
         }
     }
@@ -715,10 +845,25 @@ fn build_routing(source: RoutingSource, nodes: &[NodeDescriptor]) -> ImportedRou
 
 /// Keeps supported groups and members. Groups that end up empty are dropped,
 /// which can empty groups that referenced them, so this repeats until stable.
+///
+/// Each round drops every group that has no member left to resolve, then
+/// looks again only at the members that named a dropped group, so the work
+/// grows with the number of members rather than with groups times rounds
+/// (a long chain of groups whose last one is empty).
 fn import_groups(importer: &mut Importer, groups: Vec<SourceGroup>) -> Vec<PolicyGroupSpec> {
     let mut candidates = Vec::new();
     for group in groups {
         if group.name.is_empty() {
+            continue;
+        }
+        if group.members.len() > MAX_SOURCE_GROUP_MEMBERS {
+            importer.warn(
+                ROUTING_IMPORT_GROUP_SKIPPED_CODE,
+                format!(
+                    "policy group {} was skipped: it has more than {MAX_SOURCE_GROUP_MEMBERS} members",
+                    group.name
+                ),
+            );
             continue;
         }
         match group_kind(&group) {
@@ -737,40 +882,79 @@ fn import_groups(importer: &mut Importer, groups: Vec<SourceGroup>) -> Vec<Polic
         .iter()
         .map(|(group, kind)| (group.name.clone(), *kind))
         .collect::<BTreeMap<_, _>>();
-    loop {
-        let emptied = candidates
+    // The members that decide whether a group stays: a subnet group stands
+    // or falls with its default, any other group with its members.
+    let deciding = candidates
+        .iter()
+        .map(|(group, kind)| {
+            if *kind == GroupKind::Subnet {
+                group.default.iter().map(String::as_str).collect::<Vec<_>>()
+            } else {
+                group.members.iter().map(String::as_str).collect()
+            }
+        })
+        .collect::<Vec<_>>();
+    // Whether each deciding member resolves, how many do per group, and the
+    // (group, member) positions whose member names a group, by that name:
+    // only dropping that group can change them.
+    let mut resolved = Vec::with_capacity(candidates.len());
+    let mut counts = Vec::with_capacity(candidates.len());
+    let mut dependents: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
+    for (index, members) in deciding.iter().enumerate() {
+        let kind = candidates[index].1;
+        let flags = members
             .iter()
-            .filter(|(group, kind)| {
-                let resolves = |member: &str| {
-                    resolve_member(
-                        &importer.nodes_by_name,
-                        &importer.aliases,
-                        &kept,
-                        *kind,
-                        member,
-                    )
-                    .is_ok()
-                };
-                kept.contains_key(&group.name)
-                    && if *kind == GroupKind::Subnet {
-                        // A subnet group stands or falls with its default.
-                        !group.default.as_deref().is_some_and(resolves)
-                    } else {
-                        !group.members.iter().any(|member| resolves(member))
-                    }
-            })
-            .map(|(group, _)| group.name.clone())
+            .map(|member| member_resolves(importer, &kept, kind, member))
             .collect::<Vec<_>>();
-        if emptied.is_empty() {
-            break;
+        for (position, member) in members.iter().enumerate() {
+            if kept.contains_key(member.trim()) {
+                dependents
+                    .entry(member.trim())
+                    .or_default()
+                    .push((index, position));
+            }
         }
-        for name in emptied {
-            kept.remove(&name);
+        counts.push(flags.iter().filter(|flag| **flag).count());
+        resolved.push(flags);
+    }
+
+    let mut round = (0..candidates.len())
+        .filter(|index| counts[*index] == 0)
+        .collect::<Vec<_>>();
+    while !round.is_empty() {
+        // Decided on the groups kept when the round starts, in group order.
+        let emptied = round
+            .iter()
+            .map(|index| candidates[*index].0.name.clone())
+            .filter(|name| kept.contains_key(name))
+            .collect::<Vec<_>>();
+        for name in &emptied {
+            kept.remove(name);
             importer.warn(
                 ROUTING_IMPORT_GROUP_SKIPPED_CODE,
                 format!("policy group {name} was skipped: none of its members can be imported"),
             );
         }
+        let mut affected = BTreeSet::new();
+        for name in &emptied {
+            for (index, position) in dependents.remove(name.as_str()).unwrap_or_default() {
+                let kind = candidates[index].1;
+                let now = member_resolves(importer, &kept, kind, deciding[index][position]);
+                if now != resolved[index][position] {
+                    resolved[index][position] = now;
+                    if now {
+                        counts[index] += 1;
+                    } else {
+                        counts[index] -= 1;
+                    }
+                }
+                affected.insert(index);
+            }
+        }
+        round = affected
+            .into_iter()
+            .filter(|index| counts[*index] == 0 && kept.contains_key(&candidates[*index].0.name))
+            .collect();
     }
 
     let mut specs = Vec::new();
@@ -919,6 +1103,24 @@ fn import_subnet_group(
     })
 }
 
+/// Whether `member` of a group of `kind` resolves while the groups in
+/// `kept` are kept.
+fn member_resolves(
+    importer: &Importer,
+    kept: &BTreeMap<String, GroupKind>,
+    kind: GroupKind,
+    member: &str,
+) -> bool {
+    resolve_member(
+        &importer.nodes_by_name,
+        &importer.aliases,
+        kept,
+        kind,
+        member,
+    )
+    .is_ok()
+}
+
 fn resolve_member(
     nodes_by_name: &BTreeMap<&str, &str>,
     aliases: &BTreeMap<String, &'static str>,
@@ -963,6 +1165,13 @@ fn import_rules(
     let mut imported = Vec::new();
     let mut skipped = BTreeMap::<String, usize>::new();
     for (index, line) in rules.iter().enumerate() {
+        if line.len() > MAX_SOURCE_RULE_LEN {
+            importer.warn(
+                ROUTING_IMPORT_RULE_SKIPPED_CODE,
+                format!("rule {index} was skipped: it is longer than {MAX_SOURCE_RULE_LEN} bytes"),
+            );
+            continue;
+        }
         let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
         let kind = parts[0].to_ascii_uppercase();
         if kind == "FINAL" || kind == "MATCH" {
@@ -1047,6 +1256,18 @@ fn import_plain_rule(
         .iter()
         .any(|option| option.eq_ignore_ascii_case("no-resolve"))
         && matches!(kind, "IP-CIDR" | "IP-CIDR6" | "GEOIP" | "IP-ASN");
+    if kind == "GEOIP" && is_private_geoip(parts[1]) {
+        // Clash's `GEOIP,LAN` and mihomo's `GEOIP,private` are the
+        // private networks, which the engine's built-in `LAN` set holds.
+        // Named literally so a rule provider called `LAN` is not taken.
+        let rewritten = format!(
+            "RULE-SET,{LAN_RULE_SET},{target}{}",
+            if no_resolve { ",no-resolve" } else { "" }
+        );
+        return parse_rule_line(&rewritten)
+            .map(|_| rewritten)
+            .map_err(|error| error.message);
+    }
     let rewritten = format!(
         "{kind},{},{target}{}",
         parts[1],
@@ -1162,46 +1383,62 @@ fn split_logical_body(text: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Whether a `GEOIP` value names the private networks rather than a
+/// country: Clash's `LAN` or mihomo's `private`, in any case.
+fn is_private_geoip(value: &str) -> bool {
+    let value = strip_quotes(value.trim());
+    value.eq_ignore_ascii_case("LAN") || value.eq_ignore_ascii_case("PRIVATE")
+}
+
 /// Replaces `(RULE-SET,<list>` and `(DOMAIN-SET,<list>` inside a logical
-/// rule with `(RULE-SET,<id>`.
+/// rule with `(RULE-SET,<id>`, and `(GEOIP,LAN` or `(GEOIP,private` with
+/// the built-in `(RULE-SET,LAN` as top-level rules do. One pass over the
+/// body, so a rule with many references stays linear in its length.
 fn rewrite_rule_set_references(
     importer: &Importer,
     group_ids: &BTreeSet<String>,
     rule_sets: &mut RuleSetCollector,
     body: &str,
 ) -> Result<String, String> {
-    const PREFIXES: [&str; 2] = ["(RULE-SET,", "(DOMAIN-SET,"];
+    const PREFIXES: [&str; 3] = ["(RULE-SET,", "(DOMAIN-SET,", "(GEOIP,"];
+    // ASCII uppercasing keeps byte offsets.
+    let upper = body.to_ascii_uppercase();
     let mut rewritten = String::with_capacity(body.len());
-    let mut rest = body;
-    loop {
-        // ASCII uppercasing keeps byte offsets.
-        let upper = rest.to_ascii_uppercase();
-        let found = PREFIXES
+    // `body[..copied]` is already in `rewritten`.
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(offset) = upper[search..].find('(') {
+        let start = search + offset;
+        search = start + 1;
+        let Some(&prefix) = PREFIXES
             .iter()
-            .filter_map(|prefix| upper.find(prefix).map(|start| (start, *prefix)))
-            .min();
-        let Some((start, prefix)) = found else {
-            rewritten.push_str(rest);
-            return Ok(rewritten);
+            .find(|prefix| upper[start..].starts_with(**prefix))
+        else {
+            continue;
         };
         let value_start = start + prefix.len();
-        let value_end = rest[value_start..]
+        let value_end = body[value_start..]
             .find([',', ')'])
             .map(|offset| value_start + offset)
             .ok_or_else(|| "logical rule needs balanced parentheses".to_string())?;
-        let kind = &prefix[1..prefix.len() - 1];
-        let id = rule_sets.reference(
-            importer,
-            group_ids,
-            kind,
-            &rest[value_start..value_end],
-            &[],
-        )?;
-        rewritten.push_str(&rest[..start]);
+        let value = &body[value_start..value_end];
+        let id = if prefix == "(GEOIP," {
+            if !is_private_geoip(value) {
+                continue;
+            }
+            LAN_RULE_SET.to_string()
+        } else {
+            let kind = &prefix[1..prefix.len() - 1];
+            rule_sets.reference(importer, group_ids, kind, value, &[])?
+        };
+        rewritten.push_str(&body[copied..start]);
         rewritten.push_str("(RULE-SET,");
         rewritten.push_str(&id);
-        rest = &rest[value_end..];
+        copied = value_end;
+        search = value_end;
     }
+    rewritten.push_str(&body[copied..]);
+    Ok(rewritten)
 }
 
 /// The rule sets referenced by imported rules, one per distinct list.

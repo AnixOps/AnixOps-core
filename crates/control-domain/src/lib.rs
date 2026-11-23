@@ -166,6 +166,11 @@ pub const NODE_METADATA_SNELL_OBFS_HOST: &str = "snell.obfs_host";
 pub const NODE_METADATA_SNELL_OBFS_URI: &str = "snell.obfs_uri";
 pub const NODE_METADATA_SNELL_REUSE: &str = "snell.reuse";
 pub const NODE_METADATA_SNELL_USER_KEY: &str = "snell.user_key";
+/// Username of an HTTP or SOCKS5 proxy node. The node runs over TLS (an
+/// HTTPS proxy) when [`NODE_METADATA_TLS_ENABLED`] is `true`.
+pub const NODE_METADATA_PROXY_USERNAME: &str = "proxy.username";
+/// Password of an HTTP or SOCKS5 proxy node.
+pub const NODE_METADATA_PROXY_PASSWORD: &str = "proxy.password";
 pub const NODE_METADATA_IWAN_USERNAME: &str = "iwan.username";
 pub const NODE_METADATA_IWAN_PASSWORD: &str = "iwan.password";
 pub const NODE_METADATA_IWAN_MTU: &str = "iwan.mtu";
@@ -214,6 +219,9 @@ pub const NODE_UNSUPPORTED_OPTION_ECH: &str = "ech";
 /// XHTTP settings other than path, host, mode and headers (Clash
 /// `xhttp-opts`).
 pub const NODE_UNSUPPORTED_OPTION_XHTTP: &str = "xhttp-option";
+/// Extra request headers or a request path of an HTTP proxy node (Clash
+/// `headers`, sing-box `headers` and `path`).
+pub const NODE_UNSUPPORTED_OPTION_HTTP_PROXY_HEADERS: &str = "http-proxy-headers";
 pub const NODE_METADATA_WIREGUARD_PRIVATE_KEY: &str = "wireguard.private_key";
 pub const NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY: &str = "wireguard.peer_public_key";
 pub const NODE_METADATA_WIREGUARD_LOCAL_ADDRESS: &str = "wireguard.local_address";

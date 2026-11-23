@@ -345,3 +345,36 @@ fn chained_node_ids_survive_renaming_the_node_they_connect_through() {
         .map(|entry| entry.value.clone());
     assert_eq!(via, Some(land(&first, "Line").id));
 }
+
+#[test]
+fn http_proxies_on_one_server_differ_by_user_and_keep_ids_across_formats() {
+    let document = parse(
+        "http://alice:a-secret@proxy.example.test:8080#Alice\n\
+         http://bob:b-secret@proxy.example.test:8080#Bob\n\
+         http://alice:a-secret@proxy.example.test:8080#Alice%20copy\n",
+    );
+    let ids = document
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    // The user and password tell the first two apart, not their order.
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(ids[1], format!("{}-2", ids[0]));
+    assert_eq!(ids[2], format!("{}-2", ids[0]));
+    for id in &ids {
+        assert!(!id.contains("secret"), "{id}");
+        assert!(!id.contains("alice") && !id.contains("bob"), "{id}");
+        assert_outbound_id(id);
+    }
+
+    // The same proxies from Clash get the same ids.
+    let clash = parse(
+        "proxies:\n\
+         \x20 - { name: Alice, type: http, server: proxy.example.test, port: 8080, username: alice, password: a-secret }\n\
+         \x20 - { name: Bob, type: http, server: proxy.example.test, port: 8080, username: bob, password: b-secret }\n",
+    );
+    assert_eq!(clash.nodes[0].id, ids[0]);
+    assert_eq!(clash.nodes[1].id, ids[1]);
+}

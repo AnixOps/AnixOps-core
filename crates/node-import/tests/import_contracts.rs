@@ -103,11 +103,339 @@ fn clash_rules_and_groups_come_with_the_nodes() {
     let text = serde_json::to_string(&routing).unwrap();
     assert!(!text.contains("secret"), "{text}");
 
-    // Links carry no rules, and a subscription with an unsupported node offers none.
-    assert!(import_text(LINKS).unwrap().routing.is_none());
+    // Links carry no rules: no routing and nothing to warn about.
+    let links = import_text(LINKS).unwrap();
+    assert!(links.routing.is_none());
+    assert!(links.routed_node_ids.is_none());
+    assert!(links.routing_warnings.is_empty());
+}
+
+#[test]
+fn a_node_that_cannot_run_is_left_out_of_the_rules_not_the_whole_routing() {
     let with_unsupported = CLASH.replace("cipher: aes-256-gcm", "cipher: rc4-md5");
     let report = import_text(&with_unsupported).unwrap();
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(report.unsupported[0].name, "HK");
+    let jp = report.nodes[0].id.clone();
+    assert_eq!(report.nodes[0].name, "JP");
+    let routing = report
+        .routing
+        .clone()
+        .expect("the node that runs keeps the subscription's rules");
+    assert_eq!(report.routed_node_ids, Some(vec![jp.clone()]));
+    let groups = routing["groups"].as_array().unwrap();
+    assert_eq!(groups[0]["id"], "Proxy");
+    assert_eq!(groups[0]["members"], serde_json::json!(["Auto", "DIRECT"]));
+    assert_eq!(groups[1]["id"], "Auto");
+    assert_eq!(groups[1]["members"], serde_json::json!([jp]));
+    let rules: Vec<_> = routing["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| rule.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        rules,
+        [
+            "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
+            format!("DOMAIN,jp.example.org,{jp}"),
+            "FINAL,Proxy".to_string(),
+        ]
+    );
+    // Every drop is said, the summary first, and no credential is.
+    assert_eq!(
+        report.routing_warnings[0],
+        "1 node that cannot run was left out of the subscription's rules and policy groups"
+    );
+    let warnings = report.routing_warnings.join("\n");
+    assert!(
+        warnings.contains("policy group Proxy member HK was skipped"),
+        "{warnings}"
+    );
+    assert!(
+        warnings.contains("policy group Auto member HK was skipped"),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("secret"), "{warnings}");
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["routed_node_ids"], serde_json::json!([jp]));
+
+    // A rule naming the node that cannot run is skipped, not the others.
+    let text = with_unsupported.replace(
+        "  - MATCH,Proxy",
+        "  - DOMAIN,hk.example.org,HK\n  - MATCH,Proxy",
+    );
+    let report = import_text(&text).unwrap();
+    assert!(report.routing.is_some());
+    let warnings = report.routing_warnings.join("\n");
+    assert!(
+        warnings.contains("rule 2 was skipped: target HK was not imported"),
+        "{warnings}"
+    );
+
+    // When no node can run, the rules are not used and the warnings say why.
+    let none_run = with_unsupported.replace(
+        "    type: trojan\n    server: jp.example.com\n    port: 443\n    password: jp-secret\n",
+        "    type: ss\n    server: jp.example.com\n    port: 443\n    cipher: rc4-md5\n    password: jp-secret\n",
+    );
+    let report = import_text(&none_run).unwrap();
+    assert!(report.nodes.is_empty());
     assert!(report.routing.is_none());
+    assert!(report.routed_node_ids.is_none());
+    assert_eq!(
+        report.routing_warnings[0],
+        "2 nodes that cannot run were left out of the subscription's rules and policy groups"
+    );
+    assert!(
+        report
+            .routing_warnings
+            .iter()
+            .any(|warning| warning.contains("routing falls back to one node")
+                || warning.starts_with("subscription rules and policy groups were not used: ")),
+        "{:?}",
+        report.routing_warnings
+    );
+}
+
+/// A Clash profile with `count` Shadowsocks nodes `N0`.., a `Proxy` group
+/// of `members` of them and DIRECT, and a rule for `N<count - 1>`.
+fn many_node_clash(count: usize, members: usize) -> String {
+    let mut text = String::from("proxies:\n");
+    for index in 0..count {
+        text.push_str(&format!(
+            "  - {{ name: N{index}, type: ss, server: 192.0.2.1, port: {}, cipher: aes-256-gcm, password: pw-{index} }}\n",
+            10_000 + index
+        ));
+    }
+    text.push_str("proxy-groups:\n  - name: Proxy\n    type: select\n    proxies:\n");
+    for index in 0..members {
+        text.push_str(&format!("      - N{index}\n"));
+    }
+    text.push_str("      - DIRECT\n");
+    text.push_str(&format!(
+        "rules:\n  - DOMAIN,last.example.org,N{}\n  - MATCH,Proxy\n",
+        count - 1
+    ));
+    text
+}
+
+#[test]
+fn subscriptions_with_more_nodes_than_outbounds_route_the_named_ones() {
+    let report = import_text(&many_node_clash(100, 3)).unwrap();
+    assert_eq!(report.nodes.len(), 100);
+    assert!(report.routing.is_some(), "{:?}", report.routing_warnings);
+    let id = |name: &str| {
+        report
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id
+            .clone()
+    };
+    let mut expected = vec![id("N0"), id("N1"), id("N2"), id("N99")];
+    let mut routed = report.routed_node_ids.clone().unwrap();
+    expected.sort();
+    routed.sort();
+    assert_eq!(routed, expected);
+    assert!(
+        report.routing_warnings.is_empty(),
+        "{:?}",
+        report.routing_warnings
+    );
+
+    // At most 64 nodes: every one is routed, named or not.
+    let report = import_text(&many_node_clash(64, 1)).unwrap();
+    assert_eq!(report.routed_node_ids.as_ref().map(Vec::len), Some(64));
+
+    // Naming more nodes than fit (with room left for global mode's node)
+    // leaves the rules out, and says so.
+    let limit = node_import::MAX_ROUTED_OUTBOUNDS - node_import::MAX_VIA_CHAIN;
+    let report = import_text(&many_node_clash(100, limit)).unwrap();
+    assert!(report.routing.is_none());
+    assert!(report.routed_node_ids.is_none());
+    assert_eq!(
+        report.routing_warnings[0],
+        format!(
+            "subscription rules and policy groups were not used: 100 nodes can run and the rules and policy groups name {} of them, more than {limit}",
+            limit + 1
+        )
+    );
+}
+
+#[test]
+fn http_and_socks5_links_import_as_proxy_outbounds() {
+    let report = import_text(concat!(
+        "http://user:p%40ss@proxy.example.test:8080#HTTP\n",
+        "https://user:pass@proxy.example.test:8443?sni=edge.example.test#HTTPS\n",
+        "https://proxy.example.test:443?insecure=1#Open%20HTTPS\n",
+        "socks5://user:pass@socks.example.test:1080#SOCKS\n",
+        "socks://dXNlcjpwYXNz@socks.example.test:1081#SOCKS%20B64\n",
+        "socks5h://socks.example.test:1082#No%20Auth\n",
+    ))
+    .unwrap();
+    assert!(report.unsupported.is_empty(), "{:?}", report.unsupported);
+    let outbound = |name: &str| {
+        report
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .outbound
+            .clone()
+    };
+    assert_eq!(
+        outbound("HTTP"),
+        serde_json::json!({
+            "type": "http", "server": "proxy.example.test", "port": 8080,
+            "tls": false, "username": "user", "password": "p@ss"
+        })
+    );
+    assert_eq!(
+        outbound("HTTPS"),
+        serde_json::json!({
+            "type": "http", "server": "proxy.example.test", "port": 8443,
+            "tls": true, "username": "user", "password": "pass",
+            "server_name": "edge.example.test", "insecure": false
+        })
+    );
+    assert_eq!(
+        outbound("Open HTTPS"),
+        serde_json::json!({
+            "type": "http", "server": "proxy.example.test", "port": 443,
+            "tls": true, "server_name": "proxy.example.test", "insecure": true
+        })
+    );
+    let socks = serde_json::json!({
+        "type": "socks", "server": "socks.example.test", "port": 1080,
+        "username": "user", "password": "pass"
+    });
+    assert_eq!(outbound("SOCKS"), socks);
+    let mut base64 = socks.clone();
+    base64["port"] = serde_json::json!(1081);
+    assert_eq!(outbound("SOCKS B64"), base64);
+    assert_eq!(
+        outbound("No Auth"),
+        serde_json::json!({"type": "socks", "server": "socks.example.test", "port": 1082})
+    );
+
+    // A web address is not a proxy link: no port, a path, or other query
+    // fields.
+    for line in [
+        "https://example.com/sub?token=x#Sub",
+        "http://example.com:8080/path#Path",
+        "https://example.com:443?token=x#Token",
+    ] {
+        let text = format!("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:11111#HK\n{line}\n");
+        let report = import_text(&text).unwrap();
+        assert_eq!(report.nodes.len(), 1, "{line}");
+    }
+}
+
+#[test]
+fn http_and_socks5_proxies_import_from_every_format() {
+    let expected_http = serde_json::json!({
+        "type": "http", "server": "proxy.example.test", "port": 8443,
+        "tls": true, "username": "user", "password": "pass",
+        "server_name": "edge.example.test", "insecure": true
+    });
+    let expected_socks = serde_json::json!({
+        "type": "socks", "server": "socks.example.test", "port": 1080,
+        "username": "user", "password": "pass"
+    });
+    let check = |format: &str, text: &str| {
+        let report = import_text(text).unwrap_or_else(|error| panic!("{format}: {error:?}"));
+        assert!(
+            report.unsupported.is_empty(),
+            "{format}: {:?}",
+            report.unsupported
+        );
+        let outbounds: Vec<_> = report
+            .nodes
+            .iter()
+            .map(|node| node.outbound.clone())
+            .collect();
+        // Loon's profile has one more node, so the reader is Loon's.
+        assert_eq!(
+            outbounds[..2],
+            [expected_http.clone(), expected_socks.clone()],
+            "{format}"
+        );
+    };
+    check(
+        "clash",
+        r#"
+proxies:
+  - { name: H, type: http, server: proxy.example.test, port: 8443, username: user, password: pass, tls: true, sni: edge.example.test, skip-cert-verify: true }
+  - { name: S, type: socks5, server: socks.example.test, port: 1080, username: user, password: pass }
+"#,
+    );
+    check(
+        "surge",
+        "[Proxy]\nH = https, proxy.example.test, 8443, user, pass, sni=edge.example.test, skip-cert-verify=true\nS = socks5, socks.example.test, 1080, user, pass\n",
+    );
+    check(
+        "loon",
+        "[Proxy]\nH = https,proxy.example.test,8443,user,\"pass\",sni=edge.example.test,skip-cert-verify=true\nS = socks5,socks.example.test,1080,user,\"pass\"\nT = trojan,trojan.example.test,443,\"trojan-pass\",over-tls=true,tls-name=trojan.example.test\n",
+    );
+    check(
+        "quantumult x",
+        "[server_local]\nhttp=proxy.example.test:8443, username=user, password=pass, over-tls=true, tls-host=edge.example.test, tls-verification=false, tag=H\nsocks5=socks.example.test:1080, username=user, password=pass, tag=S\n",
+    );
+    check(
+        "sing-box",
+        r#"{"outbounds": [
+  {"type": "http", "tag": "H", "server": "proxy.example.test", "server_port": 8443,
+   "username": "user", "password": "pass",
+   "tls": {"enabled": true, "server_name": "edge.example.test", "insecure": true}},
+  {"type": "socks", "tag": "S", "server": "socks.example.test", "server_port": 1080,
+   "version": "5", "username": "user", "password": "pass"}
+]}"#,
+    );
+}
+
+#[test]
+fn http_and_socks5_nodes_the_engine_cannot_carry_are_reported() {
+    let report = import_text(concat!(
+        "[Proxy]\n",
+        "TLS SOCKS = socks5-tls, socks.example.test, 1080, user, pass\n",
+        "Only Pass = socks5, socks.example.test, 1081, password=secret-pass\n",
+        "Colon = http, proxy.example.test, 8080, us:er, secret-pass\n",
+    ))
+    .unwrap();
+    let reasons: Vec<_> = report
+        .unsupported
+        .iter()
+        .map(|node| (node.name.as_str(), node.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            ("TLS SOCKS", "socks over tls is not supported"),
+            (
+                "Only Pass",
+                "socks username and password must be set together"
+            ),
+            ("Colon", "http proxy username cannot contain ':'"),
+        ]
+    );
+    let text = serde_json::to_string(&report).unwrap();
+    assert!(!text.contains("secret"), "{text}");
+
+    // Extra headers of a Clash http proxy are not sent, so the node is
+    // reported rather than run without them.
+    let report = import_text(
+        r#"
+proxies:
+  - { name: H, type: http, server: proxy.example.test, port: 8080, headers: { X-Token: secret-token } }
+"#,
+    )
+    .unwrap();
+    assert_eq!(report.unsupported.len(), 1);
+    assert_eq!(
+        report.unsupported[0].reason,
+        "extra headers or a request path of an http proxy are not implemented yet"
+    );
 }
 
 #[test]

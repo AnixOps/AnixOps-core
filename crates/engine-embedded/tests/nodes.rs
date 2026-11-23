@@ -729,3 +729,168 @@ fn certificate_pins_reach_the_built_outbounds() {
         assert_eq!(message, format!("{protocol} certificate pins are invalid"));
     }
 }
+
+/// The nodes of subscription `text` as the client keeps them.
+fn subscription_nodes(text: &str) -> Vec<NodeDescriptor> {
+    use control_domain::{SubscriptionService, SubscriptionSource};
+    let service = config_core::CoreSubscriptionService::new();
+    let source = SubscriptionSource {
+        id: "p".to_string(),
+        location: format!("inline:{text}"),
+    };
+    let document = service
+        .fetch(&source)
+        .and_then(|raw| service.parse(&raw))
+        .unwrap();
+    service.normalize(&document).unwrap().nodes
+}
+
+const SUBSCRIPTION: &str = r#"
+proxies:
+  - { name: HK, type: ss, server: 192.0.2.1, port: 8388, cipher: rc4-md5, password: hk-secret }
+  - { name: JP, type: trojan, server: jp.example.test, port: 443, password: jp-secret, sni: jp.example.test }
+  - { name: Web, type: http, server: proxy.example.test, port: 8443, username: user, password: http-secret, tls: true }
+  - { name: Socks, type: socks5, server: socks.example.test, port: 1080, username: user, password: socks-secret }
+proxy-groups:
+  - { name: Proxy, type: select, proxies: [HK, JP, Web, DIRECT] }
+rules:
+  - DOMAIN,hk.example.org,HK
+  - DOMAIN,socks.example.org,Socks
+  - MATCH,Proxy
+"#;
+
+#[cfg(all(feature = "http", feature = "socks"))]
+#[test]
+fn http_and_socks_nodes_become_registry_outbounds() {
+    let nodes = subscription_nodes(SUBSCRIPTION);
+    for (name, protocol) in [("Web", "http"), ("Socks", "socks")] {
+        let node = nodes.iter().find(|node| node.name == name).unwrap();
+        let (envelope, chosen) =
+            single_node_envelope("p", std::slice::from_ref(node), None).unwrap();
+        assert_eq!(chosen.id, node.id);
+        assert_eq!(builds(&envelope), protocol, "{name}");
+    }
+}
+
+#[cfg(all(feature = "http", feature = "socks"))]
+#[test]
+fn subscription_routing_leaves_out_only_the_nodes_that_cannot_run() {
+    use engine_embedded::nodes::subscription_routing_envelope;
+
+    let nodes = subscription_nodes(SUBSCRIPTION);
+    let id = |name: &str| {
+        nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id
+            .clone()
+    };
+    let routing = subscription_routing_envelope("p", SUBSCRIPTION, &nodes, &nodes, None);
+    let envelope = routing
+        .envelope
+        .clone()
+        .expect("the nodes that run keep the rules");
+    assert_eq!(builds(&envelope), "routed");
+    let json: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+    let mut outbounds = json["routing"]["outbounds"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    outbounds.sort();
+    let mut expected = vec![id("JP"), id("Web"), id("Socks")];
+    expected.sort();
+    assert_eq!(outbounds, expected);
+    assert_eq!(
+        json["routing"]["groups"][0]["members"],
+        serde_json::json!([id("JP"), id("Web"), "DIRECT"])
+    );
+    assert_eq!(
+        json["routing"]["rules"],
+        serde_json::json!([
+            format!("DOMAIN,socks.example.org,{}", id("Socks")),
+            "FINAL,Proxy"
+        ])
+    );
+    assert_eq!(
+        routing.warnings[0],
+        "1 node that cannot run was left out of the subscription's rules and policy groups"
+    );
+    let warnings = routing.warnings.join("\n");
+    assert!(
+        warnings.contains("policy group Proxy member HK was skipped"),
+        "{warnings}"
+    );
+    assert!(
+        warnings.contains("rule 0 was skipped: target HK was not imported"),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("secret"), "{warnings}");
+
+    // The user's edits decide what runs: a node edited into one that cannot
+    // run is left out too.
+    let mut edited = nodes.clone();
+    let socks = edited.iter_mut().find(|node| node.name == "Socks").unwrap();
+    socks.metadata.retain(|entry| entry.key != "proxy.username");
+    let routing = subscription_routing_envelope("p", SUBSCRIPTION, &nodes, &edited, None);
+    let json: serde_json::Value =
+        serde_json::from_str(routing.envelope.as_deref().unwrap()).unwrap();
+    assert!(json["routing"]["outbounds"]
+        .get(id("Socks").as_str())
+        .is_none());
+    assert_eq!(
+        routing.warnings[0],
+        "2 nodes that cannot run were left out of the subscription's rules and policy groups"
+    );
+}
+
+#[test]
+fn subscription_routing_beyond_the_outbound_limit_carries_the_named_and_selected_nodes() {
+    use engine_embedded::nodes::subscription_routing_envelope;
+
+    let mut text = String::from("proxies:\n");
+    for index in 0..100 {
+        text.push_str(&format!(
+            "  - {{ name: N{index}, type: ss, server: 192.0.2.1, port: {}, cipher: aes-256-gcm, password: pw-{index} }}\n",
+            10_000 + index
+        ));
+    }
+    text.push_str("proxy-groups:\n  - { name: Proxy, type: select, proxies: [N0, N1, DIRECT] }\n");
+    text.push_str("rules:\n  - DOMAIN,last.example.org,N99\n  - MATCH,Proxy\n");
+    let nodes = subscription_nodes(&text);
+    assert_eq!(nodes.len(), 100);
+    let id = |name: &str| {
+        nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap()
+            .id
+            .clone()
+    };
+
+    let routing =
+        subscription_routing_envelope("p", &text, &nodes, &nodes, Some(id("N50").as_str()));
+    let envelope = routing.envelope.expect("the named nodes fit");
+    assert_eq!(builds(&envelope), "routed");
+    let json: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+    let mut outbounds = json["routing"]["outbounds"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    outbounds.sort();
+    let mut expected = vec![id("N0"), id("N1"), id("N99"), id("N50")];
+    expected.sort();
+    assert_eq!(outbounds, expected);
+    assert!(routing.warnings.is_empty(), "{:?}", routing.warnings);
+
+    // A subscription without rules has no routing and nothing to say.
+    let plain = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:11111#HK\n";
+    let plain_nodes = subscription_nodes(plain);
+    let routing = subscription_routing_envelope("p", plain, &plain_nodes, &plain_nodes, None);
+    assert!(routing.envelope.is_none());
+    assert!(routing.warnings.is_empty());
+}

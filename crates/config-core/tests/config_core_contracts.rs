@@ -2077,12 +2077,10 @@ proxies:
     server: hy2.example.test
     port: 443
     password: hy2-secret
-  - name: Socks
-    type: socks5
-    server: socks.example.test
-    port: 1080
-    username: user
-    password: socks-secret
+  - name: WG
+    type: wireguard
+    server: wg.example.test
+    port: 51820
   - name: Bad Port
     type: trojan
     server: bad.example.test
@@ -2125,7 +2123,7 @@ proxies:
     assert!(
         skipped[1]
             .1
-            .starts_with("clash proxy 4 (Socks, type socks5) was skipped: "),
+            .starts_with("clash proxy 4 (WG, type wireguard) was skipped: "),
         "{skipped:?}"
     );
     assert!(
@@ -2373,7 +2371,7 @@ fn sing_box_outbounds_skip_unsupported_and_malformed_entries() {
     {"type": "shadowsocks", "tag": "ss-out", "server": "82.47.34.99", "server_port": 11111,
      "method": "aes-256-gcm", "password": "ss-secret"},
     {"type": "socks", "tag": "socks-out", "server": "socks.example.test", "server_port": 1080,
-     "password": "socks-secret"},
+     "version": "4", "password": "socks-secret"},
     {"type": "shadowtls", "tag": "stls-out", "server": "stls.example.test", "server_port": 443,
      "password": "stls-secret"},
     {"type": "trojan", "tag": "odd-out", "server": "odd.example.test", "server_port": [443],
@@ -2422,7 +2420,7 @@ fn quantumult_x_server_local_skips_unsupported_lines() {
         r#"
 [server_local]
 shadowsocks=82.47.34.99:11111, method=aes-256-gcm, password=ss-secret, tag=HK
-http=http.example.test:80, username=user, password=http-secret, tag=HTTP Node
+hysteria2=hy2.example.test:443, password=hy2-secret, tag=HY2 Node
 "#,
     );
 
@@ -2435,9 +2433,9 @@ http=http.example.test:80, username=user, password=http-secret, tag=HTTP Node
         config_core::SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_UNSUPPORTED_CODE
     );
     assert!(
-        skipped[0]
-            .1
-            .starts_with("quantumult x server_local line 2 (HTTP Node, type http) was skipped: "),
+        skipped[0].1.starts_with(
+            "quantumult x server_local line 2 (HY2 Node, type hysteria2) was skipped: "
+        ),
         "{skipped:?}"
     );
 }

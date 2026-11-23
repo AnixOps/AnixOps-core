@@ -40,9 +40,10 @@ use control_domain::{
     NODE_METADATA_HYSTERIA2_OBFS_PASSWORD, NODE_METADATA_HYSTERIA2_PASSWORD,
     NODE_METADATA_IWAN_PASSWORD, NODE_METADATA_IWAN_USERNAME, NODE_METADATA_LEGACY_ID,
     NODE_METADATA_MIERU_PASSWORD, NODE_METADATA_MIERU_TRANSPORT, NODE_METADATA_MIERU_USERNAME,
-    NODE_METADATA_SHADOWSOCKS_METHOD, NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SNELL_PSK,
-    NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_TLS_SERVER_NAME, NODE_METADATA_TROJAN_PASSWORD,
-    NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID, NODE_METADATA_V2RAY_TRANSPORT_HOST,
+    NODE_METADATA_PROXY_PASSWORD, NODE_METADATA_PROXY_USERNAME, NODE_METADATA_SHADOWSOCKS_METHOD,
+    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SNELL_PSK, NODE_METADATA_SNELL_USER_KEY,
+    NODE_METADATA_TLS_SERVER_NAME, NODE_METADATA_TROJAN_PASSWORD, NODE_METADATA_TUIC_PASSWORD,
+    NODE_METADATA_TUIC_UUID, NODE_METADATA_V2RAY_TRANSPORT_HOST,
     NODE_METADATA_V2RAY_TRANSPORT_PATH, NODE_METADATA_V2RAY_TRANSPORT_SERVICE_NAME,
     NODE_METADATA_V2RAY_TRANSPORT_TYPE, NODE_METADATA_VIA_UNRESOLVED, NODE_METADATA_VLESS_UUID,
     NODE_METADATA_VMESS_UUID, NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
@@ -103,6 +104,12 @@ pub const CREDENTIAL_KEYS: &[&str] = &[
     NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
     NODE_METADATA_WIREGUARD_PRE_SHARED_KEY,
 ];
+
+/// Credential fields added after [`CREDENTIAL_KEYS`] was fixed (HTTP and
+/// SOCKS5 proxies), hashed into the credential suffix only when the node
+/// has them, so the ids of every other node stay as they were.
+pub const LATER_CREDENTIAL_KEYS: &[&str] =
+    &[NODE_METADATA_PROXY_USERNAME, NODE_METADATA_PROXY_PASSWORD];
 
 /// The id `node` had in releases before stable ids (the entry's name made
 /// ASCII plus a position-dependent suffix), if it was read from a
@@ -309,6 +316,12 @@ fn credential_hash(node: &NodeDescriptor, endpoint: &[u8; 32]) -> String {
     for key in CREDENTIAL_KEYS {
         hash_field(&mut context, key);
         hash_field(&mut context, metadata_value(node, key).unwrap_or_default());
+    }
+    for key in LATER_CREDENTIAL_KEYS {
+        if let Some(value) = metadata_value(node, key) {
+            hash_field(&mut context, key);
+            hash_field(&mut context, value);
+        }
     }
     lowercase_hex(context.finish().as_ref())[..CREDENTIAL_HASH_HEX].to_string()
 }
