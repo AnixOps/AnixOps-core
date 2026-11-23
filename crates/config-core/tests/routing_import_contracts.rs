@@ -870,9 +870,7 @@ fn built_in_policy_aliases_route_as_their_policy_and_skipped_proxies_are_left_ou
         "{messages:?}"
     );
     assert!(
-        messages
-            .iter()
-            .any(|message| *message == "proxy Home options were ignored: it routes as DIRECT"),
+        messages.contains(&"proxy Home options were ignored: it routes as DIRECT"),
         "{messages:?}"
     );
     assert!(diagnostic_codes(&imported)
