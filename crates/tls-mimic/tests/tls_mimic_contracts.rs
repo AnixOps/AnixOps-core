@@ -1,6 +1,6 @@
 use tls_mimic::cert::{parse_leaf, verify_signature, OID_ED25519};
 use tls_mimic::crypto::RecordCipher;
-use tls_mimic::fingerprint::{build_from_spec, is_grease};
+use tls_mimic::fingerprint::{build_from_spec, is_grease, Code, Extension, HybridX25519};
 use tls_mimic::{
     build_client_hello, CipherSuite, ClientHelloSpec, Fingerprint, HashAlg, SESSION_ID_OFFSET,
 };
@@ -127,6 +127,23 @@ fn extension(hello: &Hello, ext_type: u16) -> Option<&[u8]> {
         .map(|(_, data)| data.as_slice())
 }
 
+/// The entries of a key_share extension body: group and key exchange data.
+fn parse_key_shares(data: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let mut pos = 2;
+    let mut shares = Vec::new();
+    while pos < data.len() {
+        let group = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        shares.push((group, data[pos + 4..pos + 4 + len].to_vec()));
+        pos += 4 + len;
+    }
+    shares
+}
+
+fn key_shares(hello: &Hello) -> Vec<(u16, Vec<u8>)> {
+    parse_key_shares(extension(hello, 0x0033).expect("key_share present"))
+}
+
 #[test]
 fn chrome_client_hello_has_browser_shape() {
     let built = build_client_hello(Fingerprint::Chrome, "www.example.com", None).unwrap();
@@ -149,10 +166,22 @@ fn chrome_client_hello_has_browser_shape() {
     assert_eq!(hello.extensions.len(), 19);
     // Chrome 157 stable sends 0xca34; Edge 157 does not.
     assert!(extension(&hello, 0xca34).is_some());
-    let edge = build_client_hello(Fingerprint::Edge, "www.example.com", None).unwrap();
-    let edge = parse_hello(&edge.message);
+    let edge_built = build_client_hello(Fingerprint::Edge, "www.example.com", None).unwrap();
+    let edge = parse_hello(&edge_built.message);
     assert_eq!(edge.extensions.len(), 18);
     assert!(extension(&edge, 0xca34).is_none());
+    // Edge, like Chrome, gives the hybrid share an X25519 key of its own.
+    let edge_shares = key_shares(&edge);
+    assert_eq!(edge_shares[1].0, 0x11ec);
+    assert_eq!(
+        edge_shares[2],
+        (0x001d, edge_built.secrets.x25519_public().to_vec())
+    );
+    assert_eq!(
+        edge_shares[1].1[1184..],
+        edge_built.secrets.hybrid_x25519_public().unwrap()
+    );
+    assert_ne!(&edge_shares[1].1[1184..], edge_shares[2].1.as_slice());
 
     let sni = extension(&hello, 0x0000).expect("SNI present");
     assert_eq!(&sni[5..], b"www.example.com");
@@ -178,21 +207,21 @@ fn chrome_client_hello_has_browser_shape() {
     );
 
     let shares = extension(&hello, 0x0033).unwrap();
-    let mut pos = 2;
-    let mut groups = Vec::new();
-    while pos < shares.len() {
-        let group = u16::from_be_bytes([shares[pos], shares[pos + 1]]);
-        let len = u16::from_be_bytes([shares[pos + 2], shares[pos + 3]]) as usize;
-        groups.push((group, shares[pos + 4..pos + 4 + len].to_vec()));
-        pos += 4 + len;
-    }
+    let groups = key_shares(&hello);
     assert_eq!(groups.len(), 3);
     assert!(is_grease(groups[0].0) && groups[0].1 == [0]);
     assert_eq!(groups[1].0, 0x11ec);
     assert_eq!(groups[1].1.len(), 1216);
     assert_eq!(groups[2].0, 0x001d);
     assert_eq!(groups[2].1.len(), 32);
-    assert_eq!(&groups[1].1[1184..], groups[2].1.as_slice());
+    // Chrome gives the hybrid share an X25519 key of its own: a hybrid share
+    // that ends with the standalone X25519 key is not what Chrome sends.
+    assert_eq!(groups[2].1, built.secrets.x25519_public());
+    assert_eq!(
+        groups[1].1[1184..],
+        built.secrets.hybrid_x25519_public().unwrap()
+    );
+    assert_ne!(&groups[1].1[1184..], groups[2].1.as_slice());
 
     let supported_groups = extension(&hello, 0x000a).unwrap();
     assert_eq!(
@@ -222,6 +251,7 @@ fn chrome_permutes_extensions_and_omits_sni_for_ip_literals() {
     assert!(extension(&hello, 0x0000).is_none());
     let shares = extension(&hello, 0x0033).unwrap();
     assert_eq!(shares.len(), 2 + 5 + 36);
+    assert_eq!(built.secrets.hybrid_x25519_public(), None);
 }
 
 #[test]
@@ -262,7 +292,8 @@ fn fingerprint_names_resolve() {
 }
 
 /// Everything in a ClientHello that does not change from one connection to
-/// the next: GREASE values become `G`, key shares keep group and length only.
+/// the next: GREASE values become `G`, key shares keep group and length, and
+/// whether the X25519MLKEM768 share ends with the X25519 share's key.
 fn shape(hello: &Hello) -> Vec<String> {
     let code = |value: u16| {
         if is_grease(value) {
@@ -285,15 +316,26 @@ fn shape(hello: &Hello) -> Vec<String> {
             0x000d => codes(&data[2..]),
             0x002b => codes(&data[1..]),
             0x0033 => {
-                let mut pos = 2;
-                let mut shares = Vec::new();
-                while pos < data.len() {
-                    let group = u16::from_be_bytes([data[pos], data[pos + 1]]);
-                    let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
-                    shares.push(format!("{}:{len}", code(group)));
-                    pos += 4 + len;
+                let shares = parse_key_shares(data);
+                let mut body = shares
+                    .iter()
+                    .map(|(group, share)| format!("{}:{}", code(*group), share.len()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let find = |wanted: u16| {
+                    shares
+                        .iter()
+                        .find(|(group, _)| *group == wanted)
+                        .map(|(_, share)| share.as_slice())
+                };
+                if let (Some(hybrid), Some(x25519)) = (find(0x11ec), find(0x001d)) {
+                    body.push_str(if hybrid.ends_with(x25519) {
+                        " hybrid-x25519:shared"
+                    } else {
+                        " hybrid-x25519:separate"
+                    });
                 }
-                shares.join(",")
+                body
             }
             _ => plain(data),
         };
@@ -320,6 +362,14 @@ fn safari_client_hello_matches_the_captured_one() {
     let record = hex(SAFARI_CAPTURE.trim());
     assert_eq!(&record[..3], &[0x16, 0x03, 0x01]);
     let captured = parse_hello(&record[5..]);
+    // Safari's hybrid share has an X25519 key of its own.
+    let captured_shares = key_shares(&captured);
+    assert_eq!(captured_shares[1].0, 0x11ec);
+    assert_eq!(captured_shares[2].0, 0x001d);
+    assert_ne!(
+        &captured_shares[1].1[1184..],
+        captured_shares[2].1.as_slice()
+    );
 
     for _ in 0..4 {
         let built = build_client_hello(Fingerprint::Safari, "localhost", None).unwrap();
@@ -327,12 +377,37 @@ fn safari_client_hello_matches_the_captured_one() {
         assert_eq!(shape(&ours), shape(&captured));
         assert_eq!(built.message.len(), record.len() - 5);
 
-        // The hybrid share ends with the same X25519 key as the standalone one.
+        // The standalone share carries the key REALITY derives its auth key
+        // from; the hybrid share ends with a different one, as in Safari.
         let shares = extension(&ours, 0x0033).unwrap();
         assert_eq!(&shares[shares.len() - 32..], &built.secrets.x25519_public());
         assert_eq!(
             &shares[11 + 1184..11 + 1216],
+            &built.secrets.hybrid_x25519_public().unwrap()
+        );
+        assert_ne!(
+            &shares[11 + 1184..11 + 1216],
             &built.secrets.x25519_public()
+        );
+    }
+}
+
+/// Firefox uses the key of its X25519 share for the X25519 half of its
+/// X25519MLKEM768 share as well (as captured), so its profiles say
+/// `"hybrid_x25519": "shared"`.
+#[test]
+fn firefox_reuses_its_x25519_key_in_the_hybrid_share() {
+    for fingerprint in [Fingerprint::Firefox, Fingerprint::FirefoxEsr] {
+        let built = build_client_hello(fingerprint, "www.example.com", None).unwrap();
+        let shares = key_shares(&parse_hello(&built.message));
+        let groups: Vec<u16> = shares.iter().map(|(group, _)| *group).collect();
+        assert_eq!(groups, [0x11ec, 0x001d, 0x0017], "{}", fingerprint.name());
+        assert_eq!(shares[0].1.len(), 1216);
+        assert_eq!(shares[1].1, built.secrets.x25519_public());
+        assert_eq!(shares[0].1[1184..], shares[1].1[..]);
+        assert_eq!(
+            built.secrets.hybrid_x25519_public(),
+            Some(built.secrets.x25519_public())
         );
     }
 }
@@ -473,6 +548,110 @@ fn profile_json_is_strict() {
     assert!(with("\"id\": \"0x1234\"", "\"id\": \"0x0010\"").is_err());
     assert!(ClientHelloSpec::from_json("[]").is_err());
     assert!(ClientHelloSpec::from_json(&" ".repeat(300 * 1024)).is_err());
+}
+
+fn key_share_of(spec: &ClientHelloSpec) -> (Vec<Code>, HybridX25519) {
+    spec.extensions
+        .iter()
+        .find_map(|extension| match extension {
+            Extension::KeyShare {
+                groups,
+                hybrid_x25519,
+            } => Some((groups.clone(), *hybrid_x25519)),
+            _ => None,
+        })
+        .expect("key_share")
+}
+
+#[test]
+fn profile_json_says_whether_the_hybrid_share_reuses_the_x25519_key() {
+    // Only the Firefox profiles reuse the key; the default, a key of its own,
+    // is left out of the JSON so those profiles stay readable by older builds.
+    for fingerprint in Fingerprint::ALL {
+        let spec = fingerprint.builtin_spec().unwrap();
+        let expected = match fingerprint {
+            Fingerprint::Firefox | Fingerprint::FirefoxEsr => HybridX25519::Shared,
+            _ => HybridX25519::Separate,
+        };
+        assert_eq!(key_share_of(&spec).1, expected, "{}", fingerprint.name());
+        assert_eq!(
+            spec.to_json().contains("hybrid_x25519"),
+            expected == HybridX25519::Shared,
+            "{}",
+            fingerprint.name()
+        );
+    }
+
+    let with_hybrid = |key_share: &str| {
+        let text = SMALL_PROFILE
+            .replacen(
+                "\"groups\": [\"grease\", \"0x001d\", \"0x0017\"]",
+                "\"groups\": [\"grease\", \"0x11ec\", \"0x001d\", \"0x0017\"]",
+                1,
+            )
+            .replacen(
+                "{ \"type\": \"key_share\", \"groups\": [\"grease\", \"0x001d\"] }",
+                key_share,
+                1,
+            );
+        assert!(text.contains("\"0x11ec\", \"0x001d\", \"0x0017\"") && text.contains(key_share));
+        ClientHelloSpec::from_json(&text)
+    };
+    let separate = with_hybrid(
+        "{ \"type\": \"key_share\", \"groups\": [\"grease\", \"0x11ec\", \"0x001d\"] }",
+    )
+    .unwrap();
+    let explicit = with_hybrid(
+        "{ \"type\": \"key_share\", \"groups\": [\"grease\", \"0x11ec\", \"0x001d\"], \"hybrid_x25519\": \"separate\" }",
+    )
+    .unwrap();
+    let shared = with_hybrid(
+        "{ \"type\": \"key_share\", \"groups\": [\"grease\", \"0x11ec\", \"0x001d\"], \"hybrid_x25519\": \"shared\" }",
+    )
+    .unwrap();
+    assert_eq!(separate, explicit);
+    assert_eq!(key_share_of(&separate).1, HybridX25519::Separate);
+    assert_eq!(key_share_of(&shared).1, HybridX25519::Shared);
+    assert_eq!(
+        ClientHelloSpec::from_json(&shared.to_json()).unwrap(),
+        shared
+    );
+    assert!(!separate.to_json().contains("hybrid_x25519"));
+
+    // The setting decides what goes on the wire.
+    for (spec, reused) in [(&separate, false), (&shared, true)] {
+        let built = build_from_spec(spec, "example.com", None).unwrap();
+        let shares = key_shares(&parse_hello(&built.message));
+        assert_eq!(shares[1].0, 0x11ec);
+        assert_eq!(shares[2], (0x001d, built.secrets.x25519_public().to_vec()));
+        assert_eq!(
+            shares[1].1[1184..],
+            built.secrets.hybrid_x25519_public().unwrap()
+        );
+        assert_eq!(shares[1].1.ends_with(&shares[2].1), reused);
+    }
+
+    // Unknown values, and sharing with a hybrid share the profile does not
+    // offer, are errors.
+    for bad in ["\"same\"", "true", "1"] {
+        assert!(with_hybrid(&format!(
+            "{{ \"type\": \"key_share\", \"groups\": [\"grease\", \"0x11ec\", \"0x001d\"], \"hybrid_x25519\": {bad} }}"
+        ))
+        .is_err());
+    }
+    assert!(ClientHelloSpec::from_json(&SMALL_PROFILE.replacen(
+        "{ \"type\": \"key_share\", \"groups\": [\"grease\", \"0x001d\"] }",
+        "{ \"type\": \"key_share\", \"groups\": [\"grease\", \"0x001d\"], \"hybrid_x25519\": \"shared\" }",
+        1,
+    ))
+    .is_err());
+    // It belongs to key_share only.
+    assert!(ClientHelloSpec::from_json(&SMALL_PROFILE.replacen(
+        "{ \"type\": \"supported_groups\", \"groups\": [\"grease\", \"0x001d\", \"0x0017\"] }",
+        "{ \"type\": \"supported_groups\", \"groups\": [\"grease\", \"0x001d\", \"0x0017\"], \"hybrid_x25519\": \"separate\" }",
+        1,
+    ))
+    .is_err());
 }
 
 #[test]

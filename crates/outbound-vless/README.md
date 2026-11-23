@@ -6,7 +6,10 @@ XTLS Vision (`xtls-rprx-vision`).
 
 - **REALITY client** (`reality`): the ClientHello comes from `tls-mimic`; the
   session id carries the AES-256-GCM sealed version, timestamp and short id
-  under `HKDF-SHA256(X25519(ephemeral, server key), random[..20], "REALITY")`.
+  under `HKDF-SHA256(X25519(ephemeral, server key), random[..20], "REALITY")`,
+  where `ephemeral` is the key of the standalone X25519 key share, the one
+  REALITY servers read first (the X25519MLKEM768 share has a key of its own
+  except in the Firefox fingerprints).
   The server must answer with an Ed25519 certificate whose signature equals
   `HMAC-SHA512(auth_key, public_key)`; anything else (for example the real
   camouflage site) fails the connection with `PermissionDenied` before any

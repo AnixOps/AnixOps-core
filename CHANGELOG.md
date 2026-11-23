@@ -193,6 +193,8 @@
 
 ### Fixed
 
+- `tls-mimic`：Chrome、Edge、Safari 指纹的 `X25519MLKEM768` 混合 key share 改用自己的 X25519 密钥。此前 `KeyShareSecrets` 只有一把 X25519 密钥，混合份额末 32 字节与独立 `X25519` 份额是同一个公钥；而 `tests/data` 里真实 Chrome 157、Edge 157、Safari（macOS 与 iOS 模拟器）的两个份额各用一把密钥，只有 Firefox / Firefox ESR 复用。被动观察者看单个 ClientHello、比较两段字节即可零误报地认出默认指纹（`auto`：苹果平台 Safari、其余 Chrome）下的 REALITY 与 ANX 连接。指纹数据的 `key_share` 新增 `"hybrid_x25519": "separate" | "shared"`（缺省 `separate`，写出时省略），只有 `firefox`、`firefox-esr` 写 `shared`；`shared` 而没有 `X25519MLKEM768` 份额的指纹校验不通过。新增 `ja::Hello::hybrid_x25519` 从首包读出这一关系，`ja::spec_from_hello` 据此生成指纹，浏览器比对测试（含每周的 `browser-fingerprints` workflow）把它与 JA4 / JA3N / JA3 一起比较并列入报告。服务端选中 `X25519MLKEM768` 时，握手改用混合份额自己的 X25519 私钥（新 `KeyShareSecrets::hybrid_x25519_shared` / `hybrid_x25519_public`）；REALITY 的 auth key 与 ANX 外衣经 `HelloContext::x25519_shared` 仍取独立 `X25519` 份额，REALITY / ANX 服务端本就优先读它，互通不变。测试：合同测试改正把复用固定下来的断言（Chrome / Edge / Safari 断言两段不同，Firefox / Firefox ESR 断言相同），与 Safari 抓包的形态比较纳入这一关系；`tls_mimic::server` 内部把密钥交换拆成可替换的一步（对外行为不变，仍只选 X25519），新增服务端选 `X25519MLKEM768` 的完整握手与会话恢复测试（Chrome、Safari、Firefox）；`REALITY interop (Linux)` 新增 Safari 与 Firefox 指纹连 Xray-core / sing-box。指纹包兼容：带 `hybrid_x25519` 的指纹包会被此前的版本整包拒绝（保留原状态）；为旧版本写的 Firefox 指纹（没有这个键）在新版本上按 `separate` 生成，含 Firefox 指纹的包需按接收方版本分别下发。
+
 - `mitm_anixops` 子模块升级到 distribution release `v1.4.7`（`ee95223`）：Node 脚本运行器在 Windows 上替换持久化存储文件时，遇到 `EPERM`、`EACCES` 或 `EBUSY`（文件仍被其他进程占用）会短暂重试。`engine-native` 的 `controlled_tls_connect_session_bounds_persistent_exchanges_over_live_sockets` 在 Windows 上偶发未改写请求体，根因是测试给脚本的 1 秒超时短于 Windows runner 上 Node 冷启动的时间：脚本超时改为 5 秒，测试套接字超时相应放宽到 15 秒。
 
 ## v0.2.0 - 2026-10-26

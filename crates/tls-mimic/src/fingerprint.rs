@@ -24,7 +24,9 @@ pub const GROUP_SECP256R1: u16 = 0x0017;
 pub const GROUP_SECP384R1: u16 = 0x0018;
 pub const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 
-const MLKEM768_ENCAPSULATION_KEY_LEN: usize = 1184;
+/// Length of the ML-KEM-768 encapsulation key that starts an X25519MLKEM768
+/// client key share; the X25519 public key follows it.
+pub(crate) const MLKEM768_ENCAPSULATION_KEY_LEN: usize = 1184;
 
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_STATUS_REQUEST: u16 = 0x0005;
@@ -52,10 +54,10 @@ pub const SESSION_ID_OFFSET: usize = 39;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Fingerprint {
     /// Current desktop Chrome: GREASE, permuted extensions, X25519MLKEM768 +
-    /// X25519 key shares, ECH GREASE, the new ALPS code point, a GREASE
-    /// signature scheme followed by ML-DSA-44/65/87 at the front of
-    /// signature_algorithms, and the 0xca34 extension (captured from Chrome
-    /// 157.0.8103.78).
+    /// X25519 key shares with an X25519 key each, ECH GREASE, the new ALPS
+    /// code point, a GREASE signature scheme followed by ML-DSA-44/65/87 at
+    /// the front of signature_algorithms, and the 0xca34 extension (captured
+    /// from Chrome 157.0.8103.78).
     #[default]
     Chrome,
     /// The same Chrome shape without the post-quantum hybrid group, for
@@ -63,15 +65,16 @@ pub enum Fingerprint {
     ChromeNoPq,
     /// Safari and every other client of Apple's network stack (NSURLSession)
     /// on iOS and macOS: fixed extension order, X25519MLKEM768 + X25519 key
-    /// shares, zlib certificate compression, no ALPS, no ECH GREASE. Captured
-    /// from Safari 26.6.2 on macOS 26.7.2.
+    /// shares with an X25519 key each, zlib certificate compression, no
+    /// ALPS, no ECH GREASE. Captured from Safari 26.6.2 on macOS 26.7.2.
     Safari,
     /// Desktop Edge: the Chrome shape without the 0xca34 extension (captured
     /// from Edge 157).
     Edge,
     /// Desktop Firefox: no GREASE, fixed extension order, X25519MLKEM768 +
-    /// X25519 + P-256 key shares, delegated_credentials, record_size_limit,
-    /// ECH GREASE (captured from Firefox 160).
+    /// X25519 + P-256 key shares (the hybrid share reuses the X25519 share's
+    /// key), delegated_credentials, record_size_limit, ECH GREASE (captured
+    /// from Firefox 160).
     Firefox,
     /// Firefox ESR: the Firefox shape plus one more CBC suite and the FFDHE
     /// groups (captured from Firefox 153 ESR).
@@ -281,6 +284,21 @@ pub enum Code {
     Value(u16),
 }
 
+/// Where the X25519 half of an X25519MLKEM768 key share gets its key.
+/// Browsers differ here, and anyone who sees a ClientHello can compare the
+/// end of the hybrid share with the X25519 share, so a profile says what its
+/// browser does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HybridX25519 {
+    /// A key of its own, independent of the standalone X25519 share
+    /// (Chrome, Edge, Safari).
+    #[default]
+    Separate,
+    /// The standalone X25519 share's key: the hybrid share ends with the
+    /// same 32 bytes as the X25519 share (Firefox).
+    Shared,
+}
+
 /// ClientHello extensions in the order a fingerprint lists them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Extension {
@@ -299,7 +317,11 @@ pub enum Extension {
     StatusRequest,
     SignatureAlgorithms(Vec<Code>),
     SignedCertificateTimestamp,
-    KeyShare(Vec<Code>),
+    /// One key share per group, in this order.
+    KeyShare {
+        groups: Vec<Code>,
+        hybrid_x25519: HybridX25519,
+    },
     PskKeyExchangeModes(Vec<u8>),
     SupportedVersions(Vec<Code>),
     /// Certificate compression algorithms (1 zlib, 2 brotli, 3 zstd).
@@ -340,7 +362,7 @@ impl Extension {
             Extension::StatusRequest => EXT_STATUS_REQUEST,
             Extension::SignatureAlgorithms(_) => EXT_SIGNATURE_ALGORITHMS,
             Extension::SignedCertificateTimestamp => EXT_SCT,
-            Extension::KeyShare(_) => EXT_KEY_SHARE,
+            Extension::KeyShare { .. } => EXT_KEY_SHARE,
             Extension::PskKeyExchangeModes(_) => EXT_PSK_KEY_EXCHANGE_MODES,
             Extension::SupportedVersions(_) => EXT_SUPPORTED_VERSIONS,
             Extension::CompressCertificate(_) => EXT_COMPRESS_CERTIFICATE,
@@ -381,19 +403,25 @@ impl ClientHelloSpec {
         })
     }
 
-    fn key_share_groups(&self) -> &[Code] {
+    /// The key_share groups and where its hybrid share gets the X25519 key;
+    /// no groups when the spec has no key_share.
+    fn key_share(&self) -> (&[Code], HybridX25519) {
         self.extensions
             .iter()
             .find_map(|extension| match extension {
-                Extension::KeyShare(groups) => Some(groups.as_slice()),
+                Extension::KeyShare {
+                    groups,
+                    hybrid_x25519,
+                } => Some((groups.as_slice(), *hybrid_x25519)),
                 _ => None,
             })
-            .unwrap_or(&[])
+            .unwrap_or_default()
     }
 
     /// Checks that this client can send the spec and finish a handshake that
     /// starts with it: a TLS 1.3 offer with a suite and an X25519 key share
-    /// this crate implements, and no extension listed twice.
+    /// this crate implements, no extension listed twice, and a key_share that
+    /// only shares its X25519 key with an X25519MLKEM768 share it offers.
     pub fn validate(&self) -> io::Result<()> {
         if self.cipher_suites.is_empty() {
             return Err(invalid_data("fingerprint lists no cipher suites"));
@@ -440,9 +468,16 @@ impl ClientHelloSpec {
         if !has_signature_algorithms {
             return Err(invalid_data("fingerprint lists no signature algorithms"));
         }
-        let shares = self.key_share_groups();
+        let (shares, hybrid_x25519) = self.key_share();
         if !shares.contains(&Code::Value(GROUP_X25519)) {
             return Err(invalid_data("fingerprint has no X25519 key share"));
+        }
+        if hybrid_x25519 == HybridX25519::Shared
+            && !shares.contains(&Code::Value(GROUP_X25519_MLKEM768))
+        {
+            return Err(invalid_data(
+                "fingerprint shares its X25519 key with an X25519MLKEM768 key share it does not offer",
+            ));
         }
         for share in shares {
             match share {
@@ -473,6 +508,10 @@ impl ClientHelloSpec {
 
 /// Ephemeral key material behind the key_share extension.
 pub struct KeyShareSecrets {
+    /// The key of the standalone X25519 share. What a protocol hides in the
+    /// ClientHello is keyed from this one ([`crate::HelloContext::x25519_shared`]):
+    /// REALITY-style servers read that share before the X25519 half of the
+    /// hybrid share, and every profile has it.
     pub(crate) x25519: StaticSecret,
     pub(crate) mlkem768: Option<MlKemShare>,
     /// The P-256 share (Firefox offers one); ring consumes the key in the
@@ -485,20 +524,31 @@ pub(crate) struct P256Share {
     pub(crate) public: Vec<u8>,
 }
 
+/// The X25519MLKEM768 share: an ML-KEM-768 key pair and the key of its
+/// X25519 half.
 pub(crate) struct MlKemShare {
     pub(crate) decapsulation: <MlKem768 as KemCore>::DecapsulationKey,
     pub(crate) encapsulation: Vec<u8>,
+    /// The X25519 half's own key ([`HybridX25519::Separate`]); `None` when it
+    /// is the standalone share's key ([`HybridX25519::Shared`]).
+    pub(crate) x25519: Option<StaticSecret>,
 }
 
 impl KeyShareSecrets {
-    fn generate(with_mlkem: bool, with_p256: bool) -> io::Result<Self> {
+    /// `mlkem` is `Some` when the profile offers an X25519MLKEM768 share and
+    /// says where that share's X25519 key comes from.
+    fn generate(mlkem: Option<HybridX25519>, with_p256: bool) -> io::Result<Self> {
         let mut rng = rand_core::OsRng;
         let x25519 = StaticSecret::random_from_rng(rng);
-        let mlkem768 = with_mlkem.then(|| {
+        let mlkem768 = mlkem.map(|hybrid_x25519| {
             let (decapsulation, encapsulation) = MlKem768::generate(&mut rng);
             MlKemShare {
                 decapsulation,
                 encapsulation: encapsulation.as_bytes().as_slice().to_vec(),
+                x25519: match hybrid_x25519 {
+                    HybridX25519::Separate => Some(StaticSecret::random_from_rng(rng)),
+                    HybridX25519::Shared => None,
+                },
             }
         });
         let secp256r1 = if with_p256 {
@@ -546,23 +596,52 @@ impl KeyShareSecrets {
         .map_err(|_| invalid_data("invalid P-256 key share"))
     }
 
+    /// The public key of the standalone X25519 share.
     pub fn x25519_public(&self) -> [u8; 32] {
         PublicKey::from(&self.x25519).to_bytes()
     }
 
-    /// X25519 with the client's ephemeral key. Fails on an all-zero output.
+    /// X25519 with the standalone share's key. Fails on an all-zero output.
     pub fn x25519_shared(&self, peer_public: &[u8; 32]) -> io::Result<[u8; 32]> {
-        let shared = self
-            .x25519
-            .diffie_hellman(&PublicKey::from(*peer_public))
-            .to_bytes();
-        if shared.iter().all(|byte| *byte == 0) {
-            return Err(invalid_data(
-                "X25519 produced a non-contributory shared secret",
-            ));
-        }
-        Ok(shared)
+        x25519_agree(&self.x25519, peer_public)
     }
+
+    /// The public key at the end of the X25519MLKEM768 share, `None` when
+    /// there is no such share. It equals [`KeyShareSecrets::x25519_public`]
+    /// only for a profile that shares the key ([`HybridX25519::Shared`]).
+    pub fn hybrid_x25519_public(&self) -> Option<[u8; 32]> {
+        self.hybrid_x25519_key()
+            .map(|key| PublicKey::from(key).to_bytes())
+    }
+
+    /// X25519 with the key of the X25519MLKEM768 share's X25519 half, for a
+    /// server that selected that group. Fails on an all-zero output.
+    pub fn hybrid_x25519_shared(&self, peer_public: &[u8; 32]) -> io::Result<[u8; 32]> {
+        let key = self
+            .hybrid_x25519_key()
+            .ok_or_else(|| invalid_data("server selected X25519MLKEM768 without an offer"))?;
+        x25519_agree(key, peer_public)
+    }
+
+    /// The key of the X25519MLKEM768 share's X25519 half: its own, or the
+    /// standalone share's when the profile shares it.
+    fn hybrid_x25519_key(&self) -> Option<&StaticSecret> {
+        let share = self.mlkem768.as_ref()?;
+        Some(share.x25519.as_ref().unwrap_or(&self.x25519))
+    }
+}
+
+/// X25519 between `secret` and `peer_public`. Fails on an all-zero output.
+fn x25519_agree(secret: &StaticSecret, peer_public: &[u8; 32]) -> io::Result<[u8; 32]> {
+    let shared = secret
+        .diffie_hellman(&PublicKey::from(*peer_public))
+        .to_bytes();
+    if shared.iter().all(|byte| *byte == 0) {
+        return Err(invalid_data(
+            "X25519 produced a non-contributory shared secret",
+        ));
+    }
+    Ok(shared)
 }
 
 /// An encoded ClientHello plus the secrets needed to finish the handshake.
@@ -660,13 +739,10 @@ pub fn build_from_spec_with_psk(
         .transpose()?;
     let psk_binders_len = psk.map_or(0, |psk| psk.binder_len + 3);
     let grease = GreaseValues::generate()?;
-    let with_mlkem = spec
-        .key_share_groups()
-        .contains(&Code::Value(GROUP_X25519_MLKEM768));
-    let with_p256 = spec
-        .key_share_groups()
-        .contains(&Code::Value(GROUP_SECP256R1));
-    let secrets = KeyShareSecrets::generate(with_mlkem, with_p256)?;
+    let (groups, hybrid_x25519) = spec.key_share();
+    let with_mlkem = groups.contains(&Code::Value(GROUP_X25519_MLKEM768));
+    let with_p256 = groups.contains(&Code::Value(GROUP_SECP256R1));
+    let secrets = KeyShareSecrets::generate(with_mlkem.then_some(hybrid_x25519), with_p256)?;
     let alpn: Vec<Vec<u8>> = alpn
         .map(|protocols| protocols.to_vec())
         .unwrap_or_else(|| spec.default_alpn.clone());
@@ -885,7 +961,7 @@ fn encode_extension(
             put_u16(&mut out, (schemes.len() * 2) as u16);
             put_codes(&mut out, schemes, grease.signature);
         }
-        Extension::KeyShare(groups) => {
+        Extension::KeyShare { groups, .. } => {
             let mut shares = Vec::new();
             for group in groups {
                 let (id, data): (u16, Vec<u8>) = match group {
@@ -906,9 +982,14 @@ fn encode_extension(
                         if share.encapsulation.len() != MLKEM768_ENCAPSULATION_KEY_LEN {
                             return Err(invalid_data("unexpected ML-KEM-768 key length"));
                         }
+                        // The X25519 half: a key of its own unless the
+                        // profile reuses the standalone share's key.
+                        let x25519 = secrets
+                            .hybrid_x25519_public()
+                            .ok_or_else(|| invalid_data("missing ML-KEM key"))?;
                         let mut data = Vec::with_capacity(MLKEM768_ENCAPSULATION_KEY_LEN + 32);
                         data.extend_from_slice(&share.encapsulation);
-                        data.extend_from_slice(&secrets.x25519_public());
+                        data.extend_from_slice(&x25519);
                         (GROUP_X25519_MLKEM768, data)
                     }
                     Code::Value(_) => {

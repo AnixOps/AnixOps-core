@@ -15,7 +15,7 @@
     "status_request",
     { "type": "raw", "body": "00080403050306030203", "id": "0x0022" },
     "signed_certificate_timestamp",
-    { "type": "key_share", "groups": ["0x11ec", "0x001d", "0x0017"] },
+    { "type": "key_share", "groups": ["0x11ec", "0x001d", "0x0017"], "hybrid_x25519": "shared" },
     { "type": "supported_versions", "versions": ["0x0304", "0x0303"] },
     { "type": "signature_algorithms", "schemes": ["0x0403", "0x0503", "0x0603", "0x0804", "0x0805", "0x0806", "0x0401", "0x0501", "0x0601", "0x0203", "0x0201"] },
     { "type": "psk_key_exchange_modes", "modes": [1] },

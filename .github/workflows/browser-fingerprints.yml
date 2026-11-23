@@ -2,8 +2,10 @@ name: Browser fingerprints
 
 # Captures the first ClientHello of current browsers and checks that every
 # tls-mimic fingerprint has the same JA4 and JA3 (JA3N for browsers that
-# permute their extensions) as its target. Runs when tls-mimic changes, every
-# week (a browser release that moves its fingerprint fails it), and by hand.
+# permute their extensions) as its target, and reuses its X25519 key in the
+# X25519MLKEM768 key share exactly when the browser does (which JA3 and JA4
+# do not see). Runs when tls-mimic changes, every week (a browser release
+# that moves its fingerprint fails it), and by hand.
 # A capture without a profile, or one that differs, prints a profile derived
 # from it (tls_mimic::ja::spec_from_hello) in the test output. The captures
 # are uploaded as an artifact so they can be committed under

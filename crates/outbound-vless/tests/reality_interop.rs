@@ -175,6 +175,39 @@ async fn plain_http_through_each_reality_server() {
     .await;
 }
 
+/// Safari's shape (an X25519 key of its own in the X25519MLKEM768 share, the
+/// default on Apple platforms) and Firefox's (one key for both shares)
+/// against every server; Chrome's is the default of the other tests. The
+/// REALITY auth key comes from the standalone X25519 share either way, and
+/// a server that selects X25519MLKEM768 gets the hybrid share's own key.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "needs the REALITY interop CI environment"]
+async fn plain_http_through_each_reality_server_with_both_hybrid_key_shapes() {
+    for_each_server(|server| async move {
+        for fingerprint in [Fingerprint::Safari, Fingerprint::Firefox] {
+            let mut config = server.config.clone();
+            config.reality.fingerprint = fingerprint;
+            let outbound = VlessRealityOutbound::new(config, Arc::new(TcpDialer));
+            let mut stream = outbound
+                .connect(&target("NC_HTTP_TARGET"))
+                .await
+                .map_err(|error| format!("{}: connect failed: {error}", fingerprint.name()))?;
+            let body = http_get(&mut stream)
+                .await
+                .map_err(|error| format!("{}: HTTP failed: {error}", fingerprint.name()))?;
+            if body != expected_payload() {
+                return Err(format!(
+                    "{}: payload mismatch ({} bytes)",
+                    fingerprint.name(),
+                    body.len()
+                ));
+            }
+        }
+        Ok("plain HTTP ok with safari and firefox".to_owned())
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "needs the REALITY interop CI environment"]
 async fn inner_tls13_through_each_reality_server_uses_vision_direct_copy() {
