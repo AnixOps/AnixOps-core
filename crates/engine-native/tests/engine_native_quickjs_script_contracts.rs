@@ -496,27 +496,39 @@ fn a_script_of_a_few_mib_runs_under_a_small_configured_heap() {
         format!("var s = \"{filler}\";\n$done({{ body: String(s.length) }});"),
     )
     .unwrap();
-    let mut script_assets = BTreeMap::new();
-    script_assets.insert(SCRIPT_URL.to_string(), script.display().to_string());
-    let executor = NativeQuickJsScriptExecutor::new(NativeQuickJsScriptRuntimeConfig {
-        script_assets,
-        persistent_store_path: None,
-        max_timeout_ms: 5000,
-        max_body_bytes: 4096,
-        memory_limit_bytes: 8 * MIB,
-    })
-    .unwrap()
-    // Smaller than the dispatch's limit: it still runs, alone.
-    .with_memory_budget(MIB);
-    let hook = hook(executor, 5000);
+    let executor = |budget: usize| {
+        let mut script_assets = BTreeMap::new();
+        script_assets.insert(SCRIPT_URL.to_string(), script.display().to_string());
+        NativeQuickJsScriptExecutor::new(NativeQuickJsScriptRuntimeConfig {
+            script_assets,
+            persistent_store_path: None,
+            max_timeout_ms: 5000,
+            max_body_bytes: 4096,
+            memory_limit_bytes: 8 * MIB,
+        })
+        .unwrap()
+        .with_memory_budget(budget)
+    };
 
-    let report = hook.plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
-
+    // The heap grows past the configured 8 MiB to fit the source, within
+    // the budget.
+    let roomy = executor(32 * MIB);
+    assert_eq!(roomy.dispatch_memory_limit(3 * MIB), 22 * MIB);
+    let report = hook(roomy, 5000).plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
     assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
     assert_eq!(
         String::from_utf8(report.body).unwrap(),
         (3 * MIB).to_string()
     );
+
+    // The budget caps the heap QuickJS enforces, so a script that needs more
+    // fails cleanly and the message passes unchanged.
+    let tight = executor(MIB);
+    assert_eq!(tight.dispatch_memory_limit(3 * MIB), MIB);
+    let report = hook(tight, 5000).plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
+    assert!(!report.script_dispatch_executed, "{:?}", report.diagnostics);
+    assert!(report.script_dispatch_failed);
+    assert_eq!(String::from_utf8(report.body).unwrap(), "{}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
