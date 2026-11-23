@@ -48,7 +48,7 @@ use crate::dns::{self, OutboundFailure};
 use crate::dns_cache::{CacheKey, DnsCache, DnsPools, Lookup, Waiter};
 use crate::dns_policy::{DnsPolicy, Plan};
 use crate::fake_ip::FakeAnswer;
-use crate::first_payload::{ServerFirst, Wait};
+use crate::first_payload::Wait;
 use crate::routing::FlowSource;
 use crate::sniff;
 #[cfg(feature = "wireguard")]
@@ -178,9 +178,11 @@ const INPUT_QUEUE_PACKETS: usize = 512;
 /// How long a new flow waits for the application's first bytes, so they can
 /// travel inside the proxy request header.
 const FIRST_PAYLOAD_WAIT: Duration = Duration::from_millis(100);
-/// The same for HTTP and HTTPS (client-first protocols): under load the
-/// request or ClientHello can come later than [`FIRST_PAYLOAD_WAIT`], and a
-/// flow without its first bytes misses HTTPS decryption and rewrites.
+/// The same for client-first ports such as HTTP and HTTPS
+/// ([`crate::first_payload::CLIENT_FIRST_PORTS`]): under load the request
+/// or ClientHello can come later than [`FIRST_PAYLOAD_WAIT`], and a flow
+/// without its first bytes misses HTTPS decryption, rewrites and the rules
+/// on its host name.
 const FIRST_PAYLOAD_CLIENT_FIRST_WAIT: Duration = Duration::from_secs(1);
 const FIRST_PAYLOAD_MAX: usize = 4096;
 /// Largest TLS record that is read whole as the first payload.
@@ -385,7 +387,8 @@ pub struct TunnelStatsSnapshot {
     pub quic_mitm_fallback: u64,
     /// TCP flows that connected without waiting for the application's first
     /// bytes: a server-first port, or a destination that stayed silent
-    /// before (see [`crate::first_payload`]); counted in `tcp_total` too.
+    /// twice in a row before (see [`crate::first_payload`]); counted in
+    /// `tcp_total` too.
     pub tcp_first_wait_skipped: u64,
     /// UDP packets from the apps whose UDP header did not parse (cut short,
     /// or a length that disagrees with the packet); each one is dropped and
@@ -689,7 +692,6 @@ fn spawn_tasks(
     // never starves real flows; past that a dropped flow just closes.
     let tcp_shared = Arc::new(TcpShared {
         drop_holds: Semaphore::new((settings.max_tcp_connections / 8).max(1)),
-        server_first: ServerFirst::default(),
         live: LiveTcp::default(),
     });
     let tcp_dispatcher = dispatcher.clone();
@@ -717,6 +719,8 @@ fn spawn_tasks(
                             none_idle_at = Some(now);
                         }
                         bump(&tcp_stats.tcp_rejected);
+                        // Refused: a RST, as from a full listen queue.
+                        stream.abort();
                         drop(stream);
                         continue;
                     }
@@ -736,6 +740,7 @@ fn spawn_tasks(
                             Ok(Ok(permit)) => permit,
                             _ => {
                                 bump(&stats.tcp_rejected);
+                                stream.abort();
                                 return;
                             }
                         }
@@ -949,6 +954,18 @@ struct DnsExchange {
     pool: Arc<DnsPools>,
 }
 
+/// The in-flight slot of a DNS exchange, freed when dropped while set; the
+/// queries waiting on it get no answer and ask again.
+struct InFlight(Option<(Arc<std::sync::Mutex<DnsCache>>, CacheKey)>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some((state, key)) = self.0.take() {
+            state.lock().unwrap_or_else(|e| e.into_inner()).finish(&key);
+        }
+    }
+}
+
 fn spawn_dns_exchange(job: DnsExchange) {
     tokio::spawn(async move {
         let DnsExchange {
@@ -980,8 +997,13 @@ fn spawn_dns_exchange(job: DnsExchange) {
                 None => Some(dispatcher.direct().clone()),
             }
         };
+        // Frees the in-flight slot should the exchange end without an
+        // answer (a panic, or the task dropped): queries for the same name
+        // would otherwise wait on it until the tunnel stops.
+        let mut in_flight = InFlight(key.as_ref().map(|key| (state.clone(), key.clone())));
         let result =
             crate::dns_client::resolve(&policy, server, &payload, &outbound_for, &pool).await;
+        in_flight.0 = None;
         let waiters = match &key {
             Some(key) => {
                 let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1532,8 +1554,6 @@ async fn read_first_payload(inbound: &mut (impl AsyncRead + Unpin), wait: Wait) 
 struct TcpShared {
     /// Hold slots for REJECT-DROP flows (see [`answer_rejected`]).
     drop_holds: Semaphore,
-    /// Destinations that do not get the first-payload wait.
-    server_first: ServerFirst,
     /// The connections that hold a permit, for closing the idle one.
     live: LiveTcp,
 }
@@ -1740,21 +1760,36 @@ async fn handle_tcp(
         in_port: None,
         port: Some(inbound_app.port()),
     };
-    let server_first = &shared.server_first;
+    // Every way out of this function that is not a clean end (an outbound
+    // that failed or timed out, a relay that broke, the idle timeout, the
+    // connection closed from the list or to make room) resets the app's
+    // side: a FIN would tell the app the server finished, and a response
+    // that ends with the connection would be taken as whole.
+    let mut reset = ResetOnDrop(Some(inbound.abort_handle()));
+    let server_first = dispatcher.server_first();
     let wait = server_first.wait(target);
     if wait == Wait::Skip {
         bump(&stats.tcp_first_wait_skipped);
     }
     let Some(first) = read_first_payload(&mut inbound, wait).await else {
+        // The app closed first.
+        reset.disarm();
         return;
     };
-    if first.is_empty() && wait == Wait::Sniff {
-        // Silent for the whole wait: a server-first protocol, most likely.
-        server_first.learn(target);
+    if wait == Wait::Sniff {
+        if first.is_empty() {
+            // Silent for the whole wait: a server-first protocol, most
+            // likely, once it happens again.
+            server_first.learn(target);
+        } else {
+            server_first.heard(target);
+        }
     }
 
     if let Some(interceptor) = interceptor {
         if let Some(host) = interceptor.claim(&first, target) {
+            // The interceptor closes the flows it serves itself.
+            reset.disarm();
             bump(&stats.mitm_flows);
             let http = sniff::http_request_head(&first);
             let outbound = dispatcher.with_origin_request(&host, http.as_ref(), source);
@@ -1790,6 +1825,8 @@ async fn handle_tcp(
             bump(&stats.tcp_connect_failed);
             record(&stats.tcp_last_failure, OutboundFailure::connect(&err));
             if let Some(action) = rejection(&err) {
+                // A rule's answer, not a failure: it closes as before.
+                reset.disarm();
                 answer_rejected(inbound, action, http.is_some(), &shared.drop_holds).await;
             }
             return;
@@ -1830,10 +1867,14 @@ async fn handle_tcp(
     loop {
         tokio::select! {
             result = &mut copy => {
-                // Resets are routine; only a reply the outbound rejects is worth reporting.
-                if let Err(err) = result {
-                    if err.kind() == io::ErrorKind::InvalidData {
-                        record(&stats.tcp_last_failure, OutboundFailure::ReplyRejected);
+                match result {
+                    // Both sides finished and the app has our FIN.
+                    Ok(_) => reset.disarm(),
+                    // Resets are routine; only a reply the outbound rejects is worth reporting.
+                    Err(err) => {
+                        if err.kind() == io::ErrorKind::InvalidData {
+                            record(&stats.tcp_last_failure, OutboundFailure::ReplyRejected);
+                        }
                     }
                 }
                 break;
@@ -1845,6 +1886,25 @@ async fn handle_tcp(
                 }
                 wait = settings.idle_timeout - idle;
             }
+        }
+    }
+}
+
+/// Resets a tunnel flow's connection to the app when dropped, unless the
+/// flow ended cleanly ([`ResetOnDrop::disarm`]). Dropping the stream alone
+/// closes with a FIN after what was written.
+struct ResetOnDrop(Option<netstack_smoltcp::TcpAbortHandle>);
+
+impl ResetOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
         }
     }
 }

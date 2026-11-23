@@ -134,10 +134,13 @@ impl LocalProxy {
                     let health_checks = async move {
                         match routed {
                             Some(routed) => {
-                                tokio::join!(
-                                    routed.clone().run_health_checks(),
-                                    routed.run_rule_set_updates()
-                                );
+                                // Each on its own task, so a panic in one (in
+                                // a rule set download, say) neither stops the
+                                // other nor, ending this future, the proxy.
+                                let checks = tokio::spawn(routed.clone().run_health_checks());
+                                let rule_sets = tokio::spawn(routed.run_rule_set_updates());
+                                let _ = tokio::join!(checks, rule_sets);
+                                std::future::pending::<()>().await
                             }
                             None => std::future::pending().await,
                         }

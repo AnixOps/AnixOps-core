@@ -31,5 +31,22 @@ Changes against 0.2.4 are listed here; measure each one with the
   first of them ended it, and ignored IPv6 fragments. Fragments of other
   protocols are dropped, as smoltcp drops them.
 - `packet.rs`: an IPv4 header shorter than 20 bytes is refused.
+- `tcp.rs`: sockets are made by the socket loop, one per (app, destination)
+  pair: a SYN the app sends again before the SYN-ACK (or of a connection the
+  loop already has) reaches the socket that took the first one. Upstream
+  made a socket and a `TcpStream` for every SYN, so each retransmitted SYN
+  opened a second stream that never got data, and left a socket in LISTEN
+  that took the next connection to the same destination from any source.
+  A `TcpStream` goes out once its socket left LISTEN, with the endpoints
+  smoltcp connected it to (a socket in LISTEN takes a SYN from any source);
+  a socket smoltcp puts back into LISTEN (a RST in SYN-RECEIVED) is removed
+  and its stream ends; a socket whose SYN smoltcp refused is removed after
+  2 s once no frame is queued.
+- `tcp.rs`: `TcpStream::abort` and `TcpAbortHandle` reset the connection
+  (smoltcp sends a RST), where dropping the stream closes it with a FIN.
+  After the stream is dropped the socket discards what the app still sends,
+  so the window stays open and the app's FIN arrives (upstream kept the
+  bytes until the window was zero, and the socket stayed until the app gave
+  up), and is reset 60 s after the drop if it is still open.
 - `stats.rs` (new): `StackStats` counts what the above drop or rebuild;
   `StackBuilder::stats` shares one set with the caller.

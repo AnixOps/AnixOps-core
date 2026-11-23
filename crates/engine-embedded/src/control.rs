@@ -25,7 +25,7 @@
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
 //! | `network_changed` | | `{"scheduled": network-change script count}` |
-//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped}` |
+//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped, "first_wait_forgotten": destinations no longer connected without the first-payload wait}` |
 //! | `set_network` | optional `type` (`wifi` \| `wired` \| `cellular`), `ssid`, `bssid`, `router`, `addresses` (IPs of the default interface), `radio` (cellular radio technology such as `LTE` or `NR`) | `{"changed": bool}`: the network subnet groups and `SUBNET` / `CELLULAR-RADIO` rules match; all fields absent means unknown |
 //! | `devices` | | `{"devices": {ip: name}}` |
 //! | `set_devices` | `devices` (`{ip: name}`, at most 256) | `{"changed": bool}`: the names `DEVICE-NAME` rules match, replacing the earlier ones |
@@ -89,7 +89,9 @@
 //! time out. It works with or without plugin scripts. It also forgets every
 //! policy group health check result, which says nothing about the new
 //! network: a group is checked again as soon as a connection goes through
-//! it (see [`crate::routing`]). A running WireGuard node moves its session to
+//! it (see [`crate::routing`]), and every destination the packet tunnel
+//! learned to connect without waiting for the app's first bytes (see
+//! [`crate::first_payload`]). A running WireGuard node moves its session to
 //! a new UDP socket and counts as one reset.
 //!
 //! A whole-device WireGuard tunnel (a config whose single `outbound` is
@@ -577,12 +579,21 @@ pub fn handle_with_interceptor(
                 .routed_outbound()
                 .map_or(0, |routed| routed.forget_health());
             let reset = dispatcher.reset_sessions();
+            // What stayed silent on the old network says nothing about the
+            // new one (another path, another middlebox, another server
+            // behind the address): every destination is sniffed again.
+            let first_wait_forgotten = dispatcher.server_first().clear();
             let closed = if close_connections {
                 tracker.close_all()
             } else {
                 0
             };
-            Ok(json!({ "reset": reset, "closed": closed, "health_forgotten": health_forgotten }))
+            Ok(json!({
+                "reset": reset,
+                "closed": closed,
+                "health_forgotten": health_forgotten,
+                "first_wait_forgotten": first_wait_forgotten,
+            }))
         }
         ControlRequest::RunScript { tag } => Ok(script(interceptor, ScriptControl::Run { tag })?),
         ControlRequest::MitmHosts => Ok(mitm_hosts(interceptor, false)),
@@ -771,8 +782,9 @@ pub fn handle_with_interceptor(
 /// Answers a request to a whole-device WireGuard tunnel, which has no flows
 /// to control. `reset_network` moves the running tunnel to a new UDP socket
 /// ([`crate::wireguard::PathControl::reset`]): `reset` is 1 when a tunnel
-/// runs, `closed` and `health_forgotten` are 0. `set_network` is checked and
-/// changes nothing (`"changed": false`). Every other command is refused.
+/// runs, `closed`, `health_forgotten` and `first_wait_forgotten` are 0.
+/// `set_network` is checked and changes nothing (`"changed": false`). Every
+/// other command is refused.
 #[cfg(feature = "wireguard")]
 pub(crate) fn handle_wireguard(
     paths: &crate::wireguard::PathControl,
@@ -785,7 +797,12 @@ pub(crate) fn handle_wireguard(
         .map_err(|_| invalid("control request is not a known command"))?;
     let answer = match request {
         ControlRequest::ResetNetwork { .. } => {
-            json!({ "reset": paths.reset(), "closed": 0, "health_forgotten": 0 })
+            json!({
+                "reset": paths.reset(),
+                "closed": 0,
+                "health_forgotten": 0,
+                "first_wait_forgotten": 0,
+            })
         }
         ControlRequest::SetNetwork {
             kind,

@@ -335,10 +335,11 @@ impl EmbeddedRuntime {
     fn health_checks(&self) -> Option<engine_outbound::BoxFuture<'static, ()>> {
         let routed = self.routed.clone()?;
         Some(Box::pin(async move {
-            tokio::join!(
-                routed.clone().run_health_checks(),
-                routed.run_rule_set_updates()
-            );
+            // Each on its own task, so a panic in one (in a rule set
+            // download, say) does not stop the other.
+            let checks = tokio::spawn(routed.clone().run_health_checks());
+            let rule_sets = tokio::spawn(routed.run_rule_set_updates());
+            let _ = tokio::join!(checks, rule_sets);
         }))
     }
 

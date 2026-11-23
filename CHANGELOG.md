@@ -114,6 +114,13 @@
 
 ### Fixed
 
+- 包隧道 TCP 稳健性（netstack-smoltcp、engine-embedded，ee-dataplane-05 / perf-resource-07 / ee-dataplane-06 / ee-dataplane-10）：
+  - 重传的 SYN 不再多开一条连接：用户态协议栈此前对每个 SYN 都新建 socket 并立刻交出 `TcpStream`，应用在 SYN-ACK 前重传的 SYN 会多出一条永远收不到数据的流（占一个连接许可、按 IP 建出站、还会把目的地址误学成服务端先发言），并留下一个 LISTEN 状态的 socket，接走之后发往同一目的地址的连接（新连接的数据走旧流，域名规则与嗅探失效）。现在 socket 由协议栈循环按（应用地址, 目的地址）建立，已有的连接直接处理重传的 SYN；`TcpStream` 等 socket 离开 LISTEN 后才交出，地址取 smoltcp 实际连上的两端；在 SYN-RECEIVED 被应用 RST、退回 LISTEN 的 socket 立即移除并结束其流；SYN 被 smoltcp 拒收（如校验和错）的 socket 在队列排空 2 秒后移除。
+  - 出错的连接以 RST 结束：出站连不上或超时、首包写失败、转发出错、空闲超时、在连接列表关闭、`reset_network`、满额时被替换的空闲连接，以及满额被拒的新连接，此前都只丢掉流、给应用发 FIN，以连接关闭为结束标志的响应（HTTP/1.0、无 Content-Length 的下载）会被当成完整。现在这些情况发 RST（新增 `TcpStream::abort`、`TcpAbortHandle`）；两边都正常结束的连接、应用先关闭的连接、`REJECT` 系列的应答和 HTTPS 解密接管的连接照旧以 FIN 关闭。
+  - 流被丢弃后的 socket 不再卡在零窗口：此前应用继续发送的数据填满缓冲后窗口归零，应用的 FIN 进不来，keep-alive 又让连接一直存活，每个约 160 KiB 且不受连接上限约束。现在丢弃后收到的数据直接丢弃、窗口保持打开，丢弃 60 秒后仍未关闭的 socket 发 RST 回收。
+  - 服务端先发言的学习更保守：此前 80/443 以外的端口只要一次 100 ms 内没等到首包就把目的地址记 30 分钟，期间该地址的连接都不嗅探 SNI / Host（域名规则、`USER-AGENT`、`URL-REGEX` 与明文 HTTP 改写失效）。现在同一目的地址 10 分钟内连续两次静默才记住，中间应用先发数据即重新计数；465、853、993、995、2053、2083、2087、2096、5223、5228、8080、8443 与 80/443 一样等首包（最多 1 s）且从不记入；学到的地址移到分发器上，`reset_network` 时清空，应答新增 `first_wait_forgotten`。
+- HTTP/1 chunked 解码不再因超大块长度溢出 panic（engine-embedded `http1`，ee-dataplane-08）：块长度为 `ffffffffffffffff` 时 `size + 2` 回绕后越界切片，DoH 交换任务 panic 后同名查询的 in-flight 表项永不释放（该域名本次会话再也解析不出），规则集下载 panic 会连带停掉同一 `join!` 里的健康检查，桌面本地代理整个线程退出。现在块长度只接受 1 到 16 位十六进制（拒绝 `+`、空值），先按剩余上限检查再计算，块尾必须是 CRLF；DoH 交换以 drop guard 保证 in-flight 表项释放；健康检查与规则集更新各自在独立任务里运行。
+
 - HTTPS 解密的脚本与拒绝应答（script-runtime、engine-native、engine-embedded、mitm-policy，mitm-scripts-04/08/09/13/15/16）：
   - `reject-dict`、`reject-array`、`reject-img`（`reject-tinygif`）、`reject-video` 此前与 `reject` 一样只回空正文，依赖 `{}` / `[]` / 图片解码的应用解析失败或反复重试。现在分别回 `200` 的 `application/json; charset=utf-8` `{}` / `[]`、1x1 `image/gif` 与空的 `video/mp4`（`HttpMitmAction::Respond`）；`reject`、`reject-200`、`reject-<状态码>` 仍无正文。`MitmPolicyRewriteResult` 新增 `reject_body`（`MitmPolicyRejectBody`），kind 仍为 `Reject`。HTTP/1 本地应答遇到 HEAD 时保留 Content-Length、不写正文。可见变化：linux-cli 对这些变体报告的动作名由 `reject` 变为 `respond`；engine-native 的 SOCKS5 CONNECT 预检查只对无正文的拒绝断开连接，命中 `reject-dict` 等变体的目标不再在 CONNECT 阶段被拒绝，连接照常建立；只有该连接被解密时，其中的请求才得到上述本地应答。
   - `http-response` 脚本此前看不到对应请求：`$request.headers` 是响应头、`$request.body` 为空。`NativePlainHttpMessage` 新增 `request_headers`、`request_body`，HTTP/1 与 HTTP/2 数据面在响应阶段带上已发送的请求头与（已缓冲时的）请求正文，QuickJS 与 Node 执行器据此构造 `$request`。HTTP/2 按 RFC 9113 §8.2.3 拆开的多条 `cookie` 字段，交给脚本与规则时按 `; ` 合并为一条，转发到源站时再拆开。

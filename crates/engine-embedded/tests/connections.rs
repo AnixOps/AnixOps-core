@@ -805,6 +805,28 @@ fn reset_network_twenty_times_leaks_nothing() {
     });
 }
 
+/// `reset_network` forgets the destinations the packet tunnel learned to
+/// connect without waiting for the app's first bytes.
+#[test]
+fn reset_network_forgets_server_first_destinations() {
+    use engine_embedded::first_payload::{Wait, LEARN_AFTER};
+
+    runtime().block_on(async {
+        let dispatcher = Dispatcher::single(Arc::new(Echo("test-echo")));
+        let target: SocketAddr = "192.0.2.7:2525".parse().unwrap();
+        for _ in 0..LEARN_AFTER {
+            dispatcher.server_first().learn(target);
+        }
+        assert_eq!(dispatcher.server_first().wait(target), Wait::Skip);
+        let answer = control_json(
+            &dispatcher,
+            r#"{"cmd":"reset_network","close_connections":false}"#,
+        );
+        assert_eq!(answer["first_wait_forgotten"], 1);
+        assert_eq!(dispatcher.server_first().wait(target), Wait::Sniff);
+    });
+}
+
 #[test]
 fn reset_network_can_keep_open_connections() {
     runtime().block_on(async {

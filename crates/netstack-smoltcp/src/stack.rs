@@ -355,7 +355,7 @@ mod tcp_window_tests {
     // The configurable TCP window must (a) default to the historical ~320 KiB so
     // existing callers are behavior-identical, and (b) carry an override verbatim
     // into the builder fields that the socket-creation path
-    // (`TcpListener::new` → `create` → `handle_packet`) reads. Those fields are
+    // (`TcpListener::new` → `create` → `handle_socket`) reads. Those fields are
     // the only input to the per-socket `SocketBuffer` sizing, so asserting them
     // is asserting the window smoltcp will allocate.
     #[test]

@@ -37,6 +37,7 @@ use crate::capture::{self, CaptureStore, Direction};
 use crate::config::DnsVia;
 use crate::direct::{self, DirectOutbound};
 use crate::fake_ip::FakeIpPool;
+use crate::first_payload::ServerFirst;
 use crate::lan_guard::{self, LanPeer};
 use crate::routing::{DomainResolver, FlowSource, RouteInfo, RoutedOutbound};
 
@@ -660,6 +661,9 @@ pub struct Dispatcher {
     /// `block_quic`: refuse UDP flows to [`QUIC_PORT`]; see
     /// [`Dispatcher::set_block_quic`].
     block_quic: AtomicBool,
+    /// Destinations whose packet tunnel flows connect without waiting for
+    /// the app's first bytes; forgotten on `reset_network`.
+    server_first: Arc<ServerFirst>,
 }
 
 /// The port QUIC (HTTP/3) runs on: `block_quic` refuses UDP flows to it.
@@ -686,6 +690,7 @@ impl Dispatcher {
             fake_ip: None,
             resolver: None,
             block_quic: AtomicBool::new(false),
+            server_first: Arc::default(),
         }
     }
 
@@ -702,6 +707,7 @@ impl Dispatcher {
             redirects: Arc::default(),
             fake_ip: None,
             block_quic: AtomicBool::new(false),
+            server_first: Arc::default(),
         }
     }
 
@@ -711,6 +717,12 @@ impl Dispatcher {
     pub fn with_fake_ip(mut self, pool: Option<Arc<FakeIpPool>>) -> Self {
         self.fake_ip = pool;
         self
+    }
+
+    /// What the packet tunnel learned about destinations that stay silent
+    /// until the server speaks; see [`crate::first_payload`].
+    pub fn server_first(&self) -> &ServerFirst {
+        &self.server_first
     }
 
     /// The Fake-IP table, when it is on.
