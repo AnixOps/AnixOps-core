@@ -58,7 +58,12 @@ GitHub Actions 完整 E2E/security 验证前仍保持 `tls-decryption-blocked`�
   未声明关闭时使用 `Content-Length` framing 保持下一次交换边界。
 - `CONNECT` target 在 HTTP listener 中会先生成 `NativeTlsMitmFoundationReport`，再经既有
   SOCKS outbound CONNECT primitive 建立 tunnel；成功后写标准空 body `200 Connection Established`
-  response。未配置 CA material 时继续进行有限 TCP relay；配置 material 时进入受控 TLS path。
+  response。未配置 CA material 时继续进行有限 TCP relay；配置 material 时只有 CONNECT host 命中用户插件
+  `[MITM]` hostname 列表（`NativeHttpMitmPluginHook::intercepts_tls_host`，含通配与 `-` 排除；与客户端数据面
+  同一判定）才进入受控 TLS path，其余 host 不等待 ClientHello、原样 relay，并记
+  `engine.native.runtime.http_proxy_tls_mitm_hostname_bypassed`。命中列表但无法终止（无 SNI、SNI 与 authority
+  不一致如 ECH 外层名、非 TLS、leaf 签发或 TLS 配置失败）时，因 ClientHello 只被 peek，连接在握手开始前
+  原样 relay（`engine.native.runtime.http_proxy_tls_mitm_passthrough`），不再直接关闭。
 - `CONNECT` relay 前会通过 `observe_explicit_http_connect_tls_client_hello` 对已到达 bytes 做
   bounded `peek`，生成 `NativeTlsClientHelloObservationReport`；可观察 TLS record/handshake
   version 和 SNI hostname，但不消费 client bytes，也不终止 TLS。未启用 CA material 的 pass-through

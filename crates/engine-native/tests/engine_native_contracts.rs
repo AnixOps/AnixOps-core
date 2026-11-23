@@ -1,3 +1,4 @@
+use control_domain::MitmHostnameDecision;
 use control_domain::{
     AuditDecision, AuditEvent, ConfigSnapshot, Diagnostic, DiagnosticSeverity, DomainResult,
     Endpoint, GrantedPermissions, HookPoint, HttpBodyMutation, HttpEvent, HttpHeaderMutation,
@@ -152,6 +153,10 @@ use engine_native::{
     ENGINE_NATIVE_START_LIFECYCLE_FAILED_CODE, ENGINE_NATIVE_START_RUNNING_CODE,
     ENGINE_NATIVE_START_RUNTIME_ASSEMBLY_READY_CODE, ENGINE_NATIVE_START_RUNTIME_UNAVAILABLE_CODE,
     ENGINE_NATIVE_START_SERVICE_RUNTIME_OWNER_MISSING_CODE,
+};
+use engine_native::{
+    NativeTlsMitmCaMaterial, ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_HOSTNAME_BYPASSED_CODE,
+    ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_PASSTHROUGH_CODE,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
@@ -5392,6 +5397,237 @@ impl MitmPluginService for RejectingMitmPluginService {
     fn audit(&self, plugin_result: &PluginResult) -> Vec<AuditEvent> {
         plugin_result.audits.clone()
     }
+}
+
+/// A plugin whose `[MITM]` hostname list holds `intercept.test` alone;
+/// every HTTP message continues unchanged.
+struct HostnameListMitmPluginService;
+
+impl MitmPluginService for HostnameListMitmPluginService {
+    fn validate_manifest(&self, _plugin_manifest: &PluginManifest) -> Vec<Diagnostic> {
+        Vec::new()
+    }
+
+    fn load(
+        &self,
+        plugin_package: &PluginPackage,
+        _granted_permissions: &GrantedPermissions,
+    ) -> DomainResult<PluginInstance> {
+        Ok(PluginInstance {
+            manifest: plugin_package.manifest.clone(),
+            loaded_source: None,
+        })
+    }
+
+    fn handle_http_event(
+        &self,
+        _plugin_instance: &PluginInstance,
+        _http_event: &HttpEvent,
+    ) -> DomainResult<PluginResult> {
+        Ok(PluginResult {
+            audits: Vec::new(),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    fn handle_http_mitm_event(
+        &self,
+        _plugin_instance: &PluginInstance,
+        _http_event: &HttpMitmEvent,
+    ) -> DomainResult<HttpMitmOutcome> {
+        Ok(HttpMitmOutcome {
+            action: HttpMitmAction::Continue,
+            header_mutations: Vec::new(),
+            body_mutation: None,
+            script_dispatch: None,
+            audits: Vec::new(),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    fn evaluate_mitm_hostname(
+        &self,
+        _plugin_instance: &PluginInstance,
+        hostname: &str,
+        _is_quic: bool,
+    ) -> DomainResult<MitmHostnameDecision> {
+        Ok(if hostname == "intercept.test" {
+            MitmHostnameDecision::Intercept
+        } else {
+            MitmHostnameDecision::Bypass
+        })
+    }
+
+    fn audit(&self, plugin_result: &PluginResult) -> Vec<AuditEvent> {
+        plugin_result.audits.clone()
+    }
+}
+
+/// Sends `CONNECT <host>:443` and then `payload` through an HTTP listener
+/// that has MITM CA material and [`HostnameListMitmPluginService`]. The
+/// SOCKS outbound records what reached it after its CONNECT and answers
+/// `origin-reply`. Returns what the client read after the CONNECT answer,
+/// what the outbound received, and the accept loop's diagnostics.
+fn connect_through_http_proxy_with_ca(
+    host: &str,
+    payload: &[u8],
+) -> (Vec<u8>, Vec<u8>, Vec<Diagnostic>) {
+    let outbound_listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("test outbound listener should bind");
+    let outbound_port = outbound_listener
+        .local_addr()
+        .expect("test outbound listener should have a local address")
+        .port();
+    let frame_len = 4 + 1 + host.len() + 2;
+    let payload_len = payload.len();
+    let outbound_worker = thread::spawn(move || {
+        let (mut outbound_stream, _) = outbound_listener
+            .accept()
+            .expect("the proxy should connect to the SOCKS outbound");
+        outbound_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("outbound stream should accept a read timeout");
+        let mut frame = vec![0_u8; frame_len];
+        outbound_stream
+            .read_exact(&mut frame)
+            .expect("outbound should receive the SOCKS5 CONNECT request frame");
+        outbound_stream
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xbb])
+            .expect("outbound should answer the SOCKS5 CONNECT");
+        let mut received = vec![0_u8; payload_len];
+        outbound_stream
+            .read_exact(&mut received)
+            .expect("outbound should receive the client's bytes unchanged");
+        outbound_stream
+            .write_all(b"origin-reply")
+            .expect("outbound should answer the client");
+        outbound_stream
+            .shutdown(Shutdown::Write)
+            .expect("outbound should close its write side");
+        received
+    });
+    let (port, bound_listener) = bind_http_loopback_listener_with_retry(
+        "mitm-hostname-scope-http",
+        ListenerRoute::DefaultAction(RouteAction::Proxy {
+            node_id: "node-1".to_string(),
+        }),
+    );
+    let outbound = NativeOutboundHandlerHandle::from_node(&NodeDescriptor {
+        endpoint: Endpoint {
+            host: "127.0.0.1".to_string(),
+            port: outbound_port,
+        },
+        ..node()
+    })
+    .expect("socks outbound handler handle should be representable");
+    let plugin_instance = PluginInstance {
+        manifest: PluginManifest {
+            id: "networkcore.hostname-scope".to_string(),
+            version: "0.1.0".to_string(),
+            permissions: vec![
+                PluginPermission::ReadRequest,
+                PluginPermission::ModifyRequest,
+            ],
+            hooks: vec![HookPoint::Request],
+        },
+        loaded_source: None,
+    };
+    let http_mitm_hook =
+        NativeHttpMitmPluginHook::new(plugin_instance, Arc::new(HostnameListMitmPluginService));
+    let accept_loop =
+        NativeLoopbackTcpAcceptLoopHandle::start_with_http_mitm_hook_and_tls_mitm_ca_material(
+            bound_listener,
+            outbound,
+            Some(http_mitm_hook),
+            Some(NativeTlsMitmCaMaterial::new(
+                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n",
+                "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n",
+            )),
+        )
+        .expect("accept loop should start with a hook and CA material");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .expect("the HTTP listener should accept the client");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("test client should support a read timeout");
+    stream
+        .write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes())
+        .expect("test client should send CONNECT");
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream
+            .read_exact(&mut byte)
+            .expect("test client should read the CONNECT answer");
+        head.push(byte[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    stream
+        .write_all(payload)
+        .expect("test client should send its first bytes");
+    stream
+        .shutdown(Shutdown::Write)
+        .expect("test client should close its write side");
+    let mut client_received = Vec::new();
+    stream
+        .read_to_end(&mut client_received)
+        .expect("test client should read the relayed answer");
+    let outbound_received = outbound_worker
+        .join()
+        .expect("outbound worker should finish");
+    wait_until_relayed_count(&accept_loop, 1);
+    drop(stream);
+    let report = accept_loop.shutdown();
+    (client_received, outbound_received, report.diagnostics)
+}
+
+#[test]
+fn http_proxy_connect_outside_the_mitm_hostname_list_is_relayed_without_decryption() {
+    // A TLS record header and some bytes, as a ClientHello would start.
+    let payload = b"\x16\x03\x01\x00\x05hello".to_vec();
+    let (client_received, outbound_received, diagnostics) =
+        connect_through_http_proxy_with_ca("bank.example.test", &payload);
+    assert_eq!(outbound_received, payload);
+    assert_eq!(client_received, b"origin-reply");
+    assert_diagnostic(
+        &diagnostics,
+        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_HOSTNAME_BYPASSED_CODE,
+    );
+    assert_no_diagnostic(
+        &diagnostics,
+        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_TERMINATION_PLAN_READY_CODE,
+    );
+    assert_no_diagnostic(
+        &diagnostics,
+        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_PASSTHROUGH_CODE,
+    );
+}
+
+#[test]
+fn http_proxy_connect_that_cannot_be_terminated_is_relayed_instead_of_closed() {
+    // A listed host, but the client speaks something other than TLS.
+    let payload = b"SSH-2.0-OpenSSH_9.6\r\n".to_vec();
+    let (client_received, outbound_received, diagnostics) =
+        connect_through_http_proxy_with_ca("intercept.test", &payload);
+    assert_eq!(outbound_received, payload);
+    assert_eq!(client_received, b"origin-reply");
+    assert_diagnostic(
+        &diagnostics,
+        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_PASSTHROUGH_CODE,
+    );
+    assert_no_diagnostic(
+        &diagnostics,
+        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_HOSTNAME_BYPASSED_CODE,
+    );
+    assert_no_diagnostic(
+        &diagnostics,
+        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_TERMINATION_PLAN_READY_CODE,
+    );
 }
 
 fn wait_until_accept_count(

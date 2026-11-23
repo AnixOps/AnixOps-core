@@ -176,7 +176,10 @@ The native `ListenerKind::Http` explicit proxy parses real `http://` HTTP/1.x tr
 supports an explicit `CONNECT` pass-through tunnel that can bounded-peek the TLS ClientHello/SNI.
 
 **Controlled HTTPS (`v0.1.2-alpha.3`).** `start --enable-https-mitm --mitm-ca-cert <ca.pem> --mitm-ca-key <ca.key> --confirm`
-issues an authority-bound leaf, decrypts up to four bounded HTTP/1.1 request/response exchanges per TLS session,
+decrypts only CONNECT hosts in the plugin's `[MITM]` `hostname` list (wildcards and `-` exclusions as in the clients;
+a plugin without one decrypts nothing) and relays every other host untouched. A listed host that cannot be terminated
+(no SNI or another one, such as an ECH outer name, not TLS, no leaf) is relayed untouched too instead of being closed.
+For a listed host it issues an authority-bound leaf, decrypts up to four bounded HTTP/1.1 request/response exchanges per TLS session,
 forwards upstream with web-PKI validation, and applies the plugin hook in both phases. The session closes on HTTP close
 semantics, terminal rewrite, parse failure, or the exchange budget.
 

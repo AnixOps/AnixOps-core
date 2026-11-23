@@ -44,10 +44,10 @@ pub use quickjs_script::scaled_memory_limit;
 #[cfg(feature = "quickjs")]
 pub use quickjs_script::{
     NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig, NativeScheduledScriptKind,
-    NativeScheduledScriptReport, NativeScheduledScriptRun,
-    ScriptMemoryPressure, ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE,
-    QUICKJS_BODY_COPIES_PER_DISPATCH, QUICKJS_MAX_PENDING_NOTIFICATIONS,
-    QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES, QUICKJS_MAX_SCHEDULED_TIMEOUT_SECS,
+    NativeScheduledScriptReport, NativeScheduledScriptRun, ScriptMemoryPressure,
+    ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE, QUICKJS_BODY_COPIES_PER_DISPATCH,
+    QUICKJS_MAX_PENDING_NOTIFICATIONS, QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES,
+    QUICKJS_MAX_SCHEDULED_TIMEOUT_SECS,
 };
 /// Types an embedder needs to give scripts network access
 /// ([`NativeQuickJsScriptExecutor::with_http_client`]).
@@ -361,6 +361,15 @@ pub const ENGINE_NATIVE_RUNTIME_UDP_MITM_ALLOWED_CODE: &str =
     "engine.native.runtime.udp_mitm_allowed";
 pub const ENGINE_NATIVE_RUNTIME_UDP_MITM_POLICY_FAILED_CODE: &str =
     "engine.native.runtime.udp_mitm_policy_failed";
+/// An explicit proxy CONNECT to a host outside the plugin's `[MITM]`
+/// hostname list was relayed without decryption.
+pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_HOSTNAME_BYPASSED_CODE: &str =
+    "engine.native.runtime.http_proxy_tls_mitm_hostname_bypassed";
+/// An explicit proxy CONNECT to a `[MITM]` host could not be terminated
+/// (no or another SNI, not TLS, no leaf certificate) and was relayed
+/// without decryption instead of being closed.
+pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_PASSTHROUGH_CODE: &str =
+    "engine.native.runtime.http_proxy_tls_mitm_passthrough";
 
 /// UDP port that carries HTTP/3 over QUIC.
 pub const QUIC_HTTPS_UDP_PORT: u16 = 443;
@@ -1262,6 +1271,23 @@ impl NativeHttpMitmPluginHook {
 
     pub fn script_executor_enabled(&self) -> bool {
         self.script_executor.is_some()
+    }
+
+    /// Whether TLS to `host` is decrypted: the plugin's `[MITM]` hostname
+    /// list (wildcards and `-` exclusions included) intercepts it. A host
+    /// outside the list, and a list that cannot be evaluated, is not
+    /// decrypted.
+    pub fn intercepts_tls_host(&self, host: &str) -> bool {
+        let hostname = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        matches!(
+            self.plugin_service
+                .evaluate_mitm_hostname(&self.plugin_instance, &hostname, false),
+            Ok(MitmHostnameDecision::Intercept)
+        )
     }
 
     /// `node` or `quickjs-ng` when a script executor is configured.
@@ -7517,6 +7543,22 @@ fn forward_http_connect_tunnel_via_socks_outbound(
                         );
                         diagnostics.extend(connect_response.diagnostics);
                         if tunnel_established {
+                            // Only `[MITM]` hosts are decrypted, as on the
+                            // other data planes; the rest are relayed.
+                            let tls_mitm_ca_material = tls_mitm_ca_material.filter(|_| {
+                                let intercept = http_mitm_hook.is_some_and(|hook| {
+                                    hook.intercepts_tls_host(&request.target_host)
+                                });
+                                if !intercept {
+                                    diagnostics.push(engine_diagnostic(
+                                        DiagnosticSeverity::Info,
+                                        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_HOSTNAME_BYPASSED_CODE,
+                                        "native explicit HTTP proxy relayed CONNECT to a host outside the MITM hostname list",
+                                        SOURCE_ENGINE_NATIVE_MITM,
+                                    ));
+                                }
+                                intercept
+                            });
                             let wait_for_complete_client_hello = tls_mitm_ca_material.is_some();
                             let client_hello_report =
                                 observe_http_connect_tls_client_hello_from_stream(
@@ -7542,43 +7584,44 @@ fn forward_http_connect_tunnel_via_socks_outbound(
                                         tls_mitm_ca_material.private_key_pem(),
                                     );
                                 diagnostics.extend(leaf_certificate_report.diagnostics.clone());
-                                let Some(leaf_certificate_material) =
-                                    leaf_certificate_report.material.as_ref()
-                                else {
-                                    let _ = outbound_stream.shutdown(Shutdown::Both);
-                                    return (false, diagnostics);
-                                };
-                                let downstream_config_report =
-                                    build_controlled_tls_termination_server_config(
-                                        leaf_certificate_material,
-                                    );
-                                diagnostics.extend(downstream_config_report.diagnostics.clone());
-                                let Some(downstream_server_config) =
-                                    downstream_config_report.server_config
-                                else {
-                                    let _ = outbound_stream.shutdown(Shutdown::Both);
-                                    return (false, diagnostics);
-                                };
-                                let upstream_config_report =
-                                    build_controlled_tls_upstream_client_config();
-                                diagnostics.extend(upstream_config_report.diagnostics.clone());
-                                let Some(upstream_client_config) =
-                                    upstream_config_report.client_config
-                                else {
-                                    let _ = outbound_stream.shutdown(Shutdown::Both);
-                                    return (false, diagnostics);
-                                };
-                                let (exchange_completed, exchange_diagnostics) =
-                                    run_controlled_tls_connect_http_exchange(
-                                        client_stream,
-                                        outbound_stream,
-                                        request,
-                                        downstream_server_config,
-                                        upstream_client_config,
-                                        http_mitm_hook,
-                                    );
-                                diagnostics.extend(exchange_diagnostics);
-                                return (exchange_completed, diagnostics);
+                                // The ClientHello was only peeked at, so until
+                                // the handshake starts the connection can still
+                                // be relayed as it is: a host that cannot be
+                                // terminated (no SNI or another one, ECH's
+                                // outer name, not TLS, no leaf) passes through
+                                // instead of being closed.
+                                let configs =
+                                    leaf_certificate_report.material.as_ref().and_then(|leaf| {
+                                        let downstream =
+                                            build_controlled_tls_termination_server_config(leaf);
+                                        diagnostics.extend(downstream.diagnostics.clone());
+                                        let downstream = downstream.server_config?;
+                                        let upstream =
+                                            build_controlled_tls_upstream_client_config();
+                                        diagnostics.extend(upstream.diagnostics.clone());
+                                        Some((downstream, upstream.client_config?))
+                                    });
+                                if let Some((downstream_server_config, upstream_client_config)) =
+                                    configs
+                                {
+                                    let (exchange_completed, exchange_diagnostics) =
+                                        run_controlled_tls_connect_http_exchange(
+                                            client_stream,
+                                            outbound_stream,
+                                            request,
+                                            downstream_server_config,
+                                            upstream_client_config,
+                                            http_mitm_hook,
+                                        );
+                                    diagnostics.extend(exchange_diagnostics);
+                                    return (exchange_completed, diagnostics);
+                                }
+                                diagnostics.push(engine_diagnostic(
+                                    DiagnosticSeverity::Warning,
+                                    ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_PASSTHROUGH_CODE,
+                                    "native explicit HTTP proxy relayed a CONNECT it could not terminate without decryption",
+                                    SOURCE_ENGINE_NATIVE_MITM,
+                                ));
                             }
                             let relay_report = relay_socks5_outbound_connect_tcp_streams(
                                 client_stream,
