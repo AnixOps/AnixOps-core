@@ -216,7 +216,7 @@ fn mask_ip(address: IpAddr, prefix_len: u8) -> IpAddr {
 /// Values of a `PROTOCOL` rule. `QUIC` is UDP to port 443, `HTTPS` TCP to
 /// port 443 and `HTTP` TCP to port 80, as far as routing can tell before
 /// the first bytes. `STUN` is UDP to a STUN/TURN port (3478, 3479, 5349 and
-/// 19302-19309). As in Surge, `DOH` and `DOQ` match the engine's own
+/// 19302-19309). Following the common rule syntax, `DOH` and `DOQ` match the engine's own
 /// DNS-over-HTTPS and DNS-over-QUIC queries to a proxied server
 /// ([`RouteQuery::dns`]), so a rule can pick the proxy they go through;
 /// an app's connections never match them.
@@ -392,8 +392,8 @@ pub enum RuleMatcher {
     /// `DEVICE-NAME`. Unnamed devices never match.
     DeviceName(String),
     /// Upper-case radio access technology of the cellular network the
-    /// device is on (`LTE`, `NR`, `NRNSA`, `WCDMA` and the like), as Surge
-    /// `CELLULAR-RADIO`. It never matches off cellular or while the client
+    /// device is on (`LTE`, `NR`, `NRNSA`, `WCDMA` and the like), as the
+    /// common rule syntax's `CELLULAR-RADIO`. It never matches off cellular or while the client
     /// has not reported the radio ([`NetworkContext::radio`]).
     CellularRadio(String),
     /// Transport of the connection, as Surge `PROTOCOL`.
@@ -438,7 +438,8 @@ impl RuleMatcher {
     /// holds networks or rules that match one
     /// ([`RoutingEnvironment::rule_set_needs_address`]), or a logical rule
     /// containing either. A domain-only connection is resolved before such a
-    /// rule unless the rule says `no-resolve`, as Surge does.
+    /// rule unless the rule says `no-resolve`, as the common rule syntax
+    /// defines it.
     pub fn wants_address(&self, environment: &dyn RoutingEnvironment) -> bool {
         match self {
             Self::IpCidr(_) | Self::GeoIp(_) | Self::IpAsn(_) => true,

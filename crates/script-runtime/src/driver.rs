@@ -121,7 +121,7 @@ fn dispatch<E: JsEngineContext + ?Sized>(
 }
 
 /// Maps the run result and the host state to an outcome. A valid `$done`
-/// wins over a later error, as in Loon, where `$done` ends the dispatch.
+/// wins over a later error, as plugin scripts expect: `$done` ends the dispatch.
 pub fn finish_outcome(result: Result<(), JsEngineError>, host: &mut ScriptHost) -> ScriptOutcome {
     let results = host.take_results();
     let (status, mutation) = match (results.done, result) {

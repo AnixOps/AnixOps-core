@@ -325,7 +325,7 @@ pub trait TcpOutbound: Send + Sync {
 }
 
 /// Picks an outbound per HTTP request inside one decrypted connection,
-/// as Surge does after MITM, instead of once per connection from its host.
+/// after MITM, instead of once per connection from its host.
 pub trait RequestRouter: Send + Sync {
     /// Where a request to `target` goes: an outbound name (a node id,
     /// `DIRECT` or `REJECT`). `request` is the request's URL and

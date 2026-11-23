@@ -43,7 +43,7 @@ P4 backlog buckets：
 | M0 | ✅ `v0.2.0` 正式版已发布（2026-10-26，`a636b89`，`v0.2.0-rc.2` 真机验收通过） |
 | M1 | iOS 内部 TestFlight：自研 Rust 嵌入式引擎 `engine-embedded`（M1a Shadowsocks-2022，M1b VLESS + REALITY/Vision） |
 | M2 | 统一内核 v0.3：FFI C ABI、Process/Embedded 引擎抽象、规则与策略组模型、桌面 TUN、WireGuard |
-| M3 | MITM 与插件 v0.4：HTTP/2 MITM、QUIC reject、Loon 插件高频子集、脚本运行时 |
+| M3 | MITM 与插件 v0.4：HTTP/2 MITM、QUIC reject、常见插件格式的高频子集、脚本运行时 |
 | M4 | iOS MITM 与插件：CA 信任状态、JavaScriptCore |
 | M5 | macOS（System Extension、Developer ID）与 App Store |
 | M6 | 1.0 |
