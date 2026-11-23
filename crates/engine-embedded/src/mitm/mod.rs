@@ -1093,12 +1093,11 @@ impl MitmEngine {
             }
 
             let mut response_headers = response.headers.clone();
-            // A coded body may decode to up to MAX_BODY_BYTES for rules.
-            let reservation = if response.header("Content-Encoding").is_some() {
-                MAX_BODY_BYTES
-            } else {
-                body_reservation(framing)
-            };
+            let reservation = response_body_reservation(
+                no_body,
+                response.header("Content-Encoding").is_some(),
+                framing,
+            );
             let mut response_held = http2::Held::new(&self.held_bodies);
             if !response_held.grow(reservation) {
                 // No room to hold the body: it is relayed as it is.
@@ -1594,12 +1593,6 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// A response body a rule reads, decoded when the origin sent it with a
-/// `Content-Encoding` although the request asked for `identity`, so rules
-/// and scripts see the text; the header goes and the body is sent on
-/// decoded (the caller sets its length). A body that does not decode whole
-/// within [`MAX_BODY_BYTES`] and the extension's window limit is left as it
-/// came, with its header.
 /// Bytes an HTTP/1.1 exchange takes from the engine's body budget before
 /// it reads a body framed by `framing` for rules: its announced length, or
 /// the most a held body grows to when no length is announced.
@@ -1610,6 +1603,27 @@ fn body_reservation(framing: Framing) -> usize {
     }
 }
 
+/// Bytes a response takes from the engine's body budget before rules read
+/// its body. A response that carries no body (`HEAD`, `204`, `304`) takes
+/// nothing, even when it names a `Content-Encoding`; a coded body may
+/// decode to up to [`MAX_BODY_BYTES`], so it takes that much; any other
+/// body takes what [`body_reservation`] gives for its framing.
+fn response_body_reservation(no_body: bool, coded: bool, framing: Framing) -> usize {
+    if no_body {
+        0
+    } else if coded {
+        MAX_BODY_BYTES
+    } else {
+        body_reservation(framing)
+    }
+}
+
+/// A response body a rule reads, decoded when the origin sent it with a
+/// `Content-Encoding` although the request asked for `identity`, so rules
+/// and scripts see the text; the header goes and the body is sent on
+/// decoded (the caller sets its length). A body that does not decode whole
+/// within [`MAX_BODY_BYTES`] and the extension's window limit is left as it
+/// came, with its header.
 fn decoded_for_rules(headers: &mut Vec<(String, String)>, body: Vec<u8>) -> Vec<u8> {
     use crate::capture::decode::{codings, decode_body, DecodeLimits};
 
@@ -1821,5 +1835,35 @@ mod tests {
         );
         let last = format!("host-{}.example.test", DECISION_CACHE_ENTRIES * 4 - 1);
         assert_eq!(cache.get(&last), Some(false));
+    }
+
+    /// A response with no body (HEAD, 204, 304) takes nothing from the
+    /// engine's body budget, even when it names a Content-Encoding, so it
+    /// never goes busy for bytes it does not carry.
+    #[test]
+    fn bodiless_responses_reserve_no_body_budget() {
+        for framing in [Framing::Length(0), Framing::Chunked, Framing::UntilClose] {
+            assert_eq!(response_body_reservation(true, true, framing), 0);
+            assert_eq!(response_body_reservation(true, false, framing), 0);
+        }
+        assert_eq!(
+            response_body_reservation(false, true, Framing::Length(10)),
+            MAX_BODY_BYTES
+        );
+        assert_eq!(
+            response_body_reservation(false, false, Framing::Length(10)),
+            10
+        );
+        assert_eq!(
+            response_body_reservation(false, false, Framing::Length(MAX_BODY_BYTES * 2)),
+            MAX_BODY_BYTES
+        );
+        assert_eq!(
+            response_body_reservation(false, false, Framing::Chunked),
+            MAX_BODY_BYTES
+        );
+        let budget = http2::BodyBudget::new(0);
+        let mut held = http2::Held::new(&budget);
+        assert!(held.grow(response_body_reservation(true, true, Framing::Length(0))));
     }
 }
