@@ -150,6 +150,7 @@ CI job `Routing equivalence (sing-box)` 下载最新 sing-box 正式版和 `geoi
 - `engine_embedded::routing::RoutedOutbound` 对每个连接调用 `decide`，`DIRECT` 走直连出站，`REJECT` 系列直接失败（按下文「REJECT 系列」应答），节点走对应出站。select 组先用运行时 `select` 控制命令的选择，再用 `default` 或第一个成员；url-test/fallback/load-balance/round-robin 使用 `run_health_checks` 的测速结果，round-robin 的计数在 `RoutedOutbound` 内。
 - 策略组自愈（`RoutedOutbound`，详见 `routing.rs` 模块文档「Self-healing groups」）：
   - 连接经测速组的成员建立失败（`Dispatcher` 调 `report_failure`，被规则拒绝的 `PermissionDenied` 不算）时立即只重测这个成员，同一成员 10 秒内最多一次；重测失败即去掉它的结果，下一条连接换成员，重测通过则保持不变，所以目标站点拒连不会把组推离好节点，也不会因一个坏站点去拨全组节点。UDP 失败不触发（不带 UDP 中继的节点照样能通过 TCP 测速）。
+  - 每轮测速按（成员, 测速 URL）去重：同一节点出现在多个测速 URL 相同的组里只探测一次，结果分给所有这些组；同时进行的探测最多 `MAX_CONCURRENT_PROBES` = 16 个，有连接在等的组（连接请求的组、`evaluate_before_use` 组、失败重测的成员）排在最前；某个组的成员测完即结算该组，不等整轮结束。等待名额的时间不计入延迟。切网后（`forget_health`）本轮还没开始的探测不再拨号。
   - `reset_network` 同时调用 `forget_health`：清空全部延迟、url-test 当前成员与失败冷却；切网前开始的测速结果作废。之后有连接经过某个还没有结果的测速组时立即测它（不等间隔）。
   - `evaluate_before_use`：组没有结果时（首次使用、切网后）连接等待该组测完（最多 6 秒）再选成员，而不是先走可能已失效的第一个成员；测速循环没有运行（无 `local-proxy`）时不等待。
   - `subnet` 组的网络来自控制命令 `set_network`（`type`、`ssid`、`bssid`、`router`、`addresses`），客户端在网络变化时先发 `set_network` 再发 `reset_network`。Wi-Fi 名与 BSSID 只留在内核内存里，不进日志、列表和导出。

@@ -29,7 +29,13 @@
 //! group is measured again only when a flow went through it since the last
 //! round. A phone in a pocket then stops dialing every member of every
 //! url-test group every few minutes; each dial through a node keeps that
-//! node's session (and the radio) awake for minutes after it.
+//! node's session (and the radio) awake for minutes after it. Within a
+//! round a member listed by several groups with the same check URL is
+//! probed once and every group takes the result, and at most
+//! [`MAX_CONCURRENT_PROBES`] probes run at once (the groups a connection
+//! waits on first), so a subscription that lists 150 nodes in five groups
+//! does not open hundreds of handshakes at once and inflate every latency.
+//! Each group settles as soon as its own members are measured.
 //!
 //! ## Self-healing groups
 //!
@@ -1707,7 +1713,7 @@ impl RoutedOutbound {
             } else {
                 BTreeSet::new()
             };
-            let (epoch, groups, members) = {
+            let (epoch, groups, members, asked) = {
                 let mut health = self.lock_health();
                 let mut groups: Vec<(&config_core::routing::PolicyGroup, String)> = Vec::new();
                 if scheduled {
@@ -1736,56 +1742,167 @@ impl RoutedOutbound {
                             Some((group_id, member, check.url.clone()))
                         })
                         .collect();
-                (health.epoch, groups, members)
+                (health.epoch, groups, members, pending)
             };
             if scheduled {
                 next_round = tokio::time::Instant::now() + interval;
             }
             first = false;
 
-            let mut jobs: Vec<(String, PolicyTarget, String)> = Vec::new();
-            for (group, url) in &groups {
-                for member in &group.members {
-                    jobs.push((group.id.clone(), member.clone(), url.clone()));
-                }
-            }
-            for (group_id, member, url) in members {
-                let target = table
-                    .model
-                    .group(&group_id)
-                    .and_then(|group| group.members.iter().find(|m| m.name() == member))
-                    .cloned();
-                if let Some(target) = target {
-                    jobs.push((group_id, target, url));
-                }
-            }
-            let mut probes = tokio::task::JoinSet::new();
-            for (group_id, member, url) in jobs {
-                let outbound = match &member {
+            // One probe per (member, URL), however many groups list the
+            // member, and at most MAX_CONCURRENT_PROBES at once: a large
+            // subscription lists the same nodes in several url-test and
+            // fallback groups, and hundreds of handshakes at once inflate
+            // every measured latency (and the network extension's memory).
+            // A group settles as soon as its own members are measured; the
+            // groups a connection waits on (asked for, `evaluate_before_use`,
+            // a failed member) go first.
+            let mut jobs: BTreeMap<(String, String), ProbeJob> = BTreeMap::new();
+            let mut rounds: BTreeMap<String, GroupRound> = BTreeMap::new();
+            let mut add = |group_id: &str, member: &PolicyTarget, url: &str, urgent: bool| {
+                let outbound = match member {
                     PolicyTarget::Node(id) => self.nodes.get(id).cloned(),
                     PolicyTarget::Direct => Some(self.direct.clone()),
                     PolicyTarget::Reject(_) | PolicyTarget::Group(_) => None,
                 };
-                let Some(outbound) = outbound else { continue };
-                let name = member.name().to_string();
-                probes.spawn(async move {
-                    let latency = crate::delay::probe(&*outbound, &url, PROBE_TIMEOUT)
-                        .await
-                        .ok()
-                        .map(|elapsed| u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
-                    (group_id, name, latency)
-                });
-            }
-            let mut results = Vec::new();
-            while let Some(result) = probes.join_next().await {
-                if let Ok(result) = result {
-                    results.push(result);
+                let Some(outbound) = outbound else { return };
+                rounds.entry(group_id.to_string()).or_default().remaining += 1;
+                let job = jobs
+                    .entry((member.name().to_string(), url.to_string()))
+                    .or_insert_with(|| ProbeJob {
+                        outbound,
+                        groups: Vec::new(),
+                        urgent: false,
+                    });
+                job.groups.push(group_id.to_string());
+                job.urgent |= urgent;
+            };
+            for (group, url) in &groups {
+                let urgent = group.evaluate_before_use || asked.contains(&group.id);
+                for member in &group.members {
+                    add(&group.id, member, url, urgent);
                 }
             }
-            let group_ids: Vec<String> = groups.iter().map(|(group, _)| group.id.clone()).collect();
-            self.finish_round(epoch, &group_ids, results);
+            for (group_id, member, url) in &members {
+                let target = table
+                    .model
+                    .group(group_id)
+                    .and_then(|group| group.members.iter().find(|m| m.name() == member.as_str()));
+                if let Some(target) = target {
+                    add(group_id, target, url, true);
+                }
+            }
+            for (group, _) in &groups {
+                rounds.entry(group.id.clone()).or_default().whole = true;
+            }
+            for (group_id, _, _) in &members {
+                rounds.entry(group_id.clone()).or_default();
+            }
+
+            // Groups with nothing to measure are done at once.
+            let empty: Vec<String> = rounds
+                .iter()
+                .filter(|(_, round)| round.remaining == 0)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for group_id in empty {
+                if let Some(round) = rounds.remove(&group_id) {
+                    self.finish_group(epoch, &group_id, round);
+                }
+            }
+
+            let mut queue: Vec<((String, String), ProbeJob)> = jobs.into_iter().collect();
+            queue.sort_by_key(|(_, job)| !job.urgent);
+            let mut queue = queue.into_iter();
+            let mut probes = tokio::task::JoinSet::new();
+            let mut stale = false;
+            loop {
+                while !stale && probes.len() < MAX_CONCURRENT_PROBES {
+                    // After a network change the rest would record nothing:
+                    // do not dial them.
+                    if self.lock_health().epoch != epoch {
+                        stale = true;
+                        break;
+                    }
+                    let Some(((name, url), job)) = queue.next() else {
+                        break;
+                    };
+                    let ProbeJob {
+                        outbound, groups, ..
+                    } = job;
+                    probes.spawn(async move {
+                        // Timed from here: the wait for a slot is not latency.
+                        let latency = crate::delay::probe(&*outbound, &url, PROBE_TIMEOUT)
+                            .await
+                            .ok()
+                            .map(|elapsed| u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
+                        (name, groups, latency)
+                    });
+                }
+                let Some(joined) = probes.join_next().await else {
+                    break;
+                };
+                let Ok((name, groups, latency)) = joined else {
+                    continue;
+                };
+                for group_id in groups {
+                    let Some(round) = rounds.get_mut(&group_id) else {
+                        continue;
+                    };
+                    round
+                        .results
+                        .push((group_id.clone(), name.clone(), latency));
+                    round.remaining = round.remaining.saturating_sub(1);
+                    if round.remaining == 0 {
+                        if let Some(round) = rounds.remove(&group_id) {
+                            self.finish_group(epoch, &group_id, round);
+                        }
+                    }
+                }
+            }
+            // A network change stopped the round, or a probe task failed:
+            // the groups still open finish with what came in (after a
+            // network change, nothing is recorded).
+            for (group_id, round) in std::mem::take(&mut rounds) {
+                self.finish_group(epoch, &group_id, round);
+            }
         }
     }
+
+    /// Ends one group's part of a round: [`Self::finish_round`] with its
+    /// results, marking it checked when the whole group was measured.
+    #[cfg(feature = "local-proxy")]
+    fn finish_group(&self, epoch: u64, group_id: &str, round: GroupRound) {
+        let whole = [group_id.to_string()];
+        let groups: &[String] = if round.whole { &whole } else { &[] };
+        self.finish_round(epoch, groups, round.results);
+    }
+}
+
+/// Health check probes run at once at most, over every group.
+pub const MAX_CONCURRENT_PROBES: usize = 16;
+
+/// One health check probe of a round: a member through its outbound, to
+/// one URL, whose result every group in `groups` takes.
+#[cfg(feature = "local-proxy")]
+struct ProbeJob {
+    outbound: Arc<dyn TcpOutbound>,
+    /// The groups that take the result, a group once per listing.
+    groups: Vec<String>,
+    /// A group a connection may be waiting on takes it: probe first.
+    urgent: bool,
+}
+
+/// One group's part of a round.
+#[cfg(feature = "local-proxy")]
+#[derive(Default)]
+struct GroupRound {
+    /// The whole group is measured (else only members a failed connection
+    /// asked for).
+    whole: bool,
+    /// Probes still to come for this group.
+    remaining: usize,
+    results: Vec<(String, String, Option<u32>)>,
 }
 
 /// The health-checked groups to measure this round: all of them in the

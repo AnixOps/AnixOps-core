@@ -403,3 +403,145 @@ fn set_network_and_reset_network_drive_the_groups() {
     let answer = control_json(&dispatcher, r#"{"cmd":"reset_network"}"#);
     assert_eq!(answer["health_forgotten"], 0);
 }
+
+/// A node that answers health checks after `delay`, counting the dials and
+/// the most it was asked for at once (over every node sharing `gauge`).
+struct Slow {
+    delay: Duration,
+    dials: AtomicUsize,
+    gauge: Arc<Gauge>,
+}
+
+#[derive(Default)]
+struct Gauge {
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl TcpOutbound for Slow {
+    fn protocol(&self) -> &'static str {
+        "test-node"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let now = self.gauge.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.gauge.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.gauge.now.fetch_sub(1, Ordering::SeqCst);
+            let (client, mut server) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let mut request = [0u8; 1024];
+                let _ = server.read(&mut request).await;
+                let _ = server
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+            Ok(Box::new(client) as BoxStream)
+        })
+    }
+}
+
+fn slow_nodes(count: usize, gauge: &Arc<Gauge>) -> BTreeMap<String, Arc<Slow>> {
+    (0..count)
+        .map(|index| {
+            (
+                format!("n{index}"),
+                Arc::new(Slow {
+                    delay: Duration::from_millis(30),
+                    dials: AtomicUsize::new(0),
+                    gauge: gauge.clone(),
+                }),
+            )
+        })
+        .collect()
+}
+
+fn group_of(id: &str, members: &[&str], url: &str) -> PolicyGroupSpec {
+    PolicyGroupSpec {
+        id: id.to_string(),
+        kind: "url-test".to_string(),
+        members: members.iter().map(|member| member.to_string()).collect(),
+        url: Some(url.to_string()),
+        ..PolicyGroupSpec::default()
+    }
+}
+
+fn routed_over(
+    nodes: &BTreeMap<String, Arc<Slow>>,
+    groups: Vec<PolicyGroupSpec>,
+) -> Arc<RoutedOutbound> {
+    let outbounds = nodes
+        .iter()
+        .map(|(id, node)| (id.clone(), node.clone() as Arc<dyn TcpOutbound>))
+        .collect();
+    let spec = RoutingSpec {
+        rules: vec![format!("FINAL,{}", groups[0].id)],
+        groups,
+    };
+    Arc::new(RoutedOutbound::new(&spec, Node::alive(), outbounds).expect("spec should validate"))
+}
+
+#[tokio::test]
+async fn a_node_in_several_groups_is_probed_once_per_url() {
+    let gauge = Arc::new(Gauge::default());
+    let nodes = slow_nodes(2, &gauge);
+    let routed = routed_over(
+        &nodes,
+        vec![
+            group_of("Auto", &["n0", "n1"], PROBE_URL),
+            group_of("HK", &["n0"], PROBE_URL),
+            group_of("Fallback", &["n1", "n0"], PROBE_URL),
+            group_of("Other", &["n0"], "http://other.test/generate_204"),
+        ],
+    );
+    let checks = tokio::spawn(routed.clone().run_health_checks());
+    eventually(|| {
+        ["Auto", "HK", "Fallback", "Other"]
+            .iter()
+            .all(|group| routed.group_checked(group))
+    })
+    .await;
+    // n0: once for the three groups sharing a URL, once for the other URL.
+    assert_eq!(nodes["n0"].dials.load(Ordering::SeqCst), 2);
+    assert_eq!(nodes["n1"].dials.load(Ordering::SeqCst), 1);
+    // Every group took the shared result.
+    for group in routed.groups() {
+        for member in &group.members {
+            assert!(
+                member.latency_ms.is_some(),
+                "{} {} has no latency",
+                group.id,
+                member.name
+            );
+        }
+    }
+    checks.abort();
+}
+
+#[tokio::test]
+async fn health_checks_run_a_bounded_number_of_probes_at_once() {
+    let gauge = Arc::new(Gauge::default());
+    let nodes = slow_nodes(100, &gauge);
+    let ids: Vec<String> = nodes.keys().cloned().collect();
+    let members: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let routed = routed_over(
+        &nodes,
+        vec![
+            group_of("Auto", &members, PROBE_URL),
+            group_of("Fallback", &members, PROBE_URL),
+        ],
+    );
+    let checks = tokio::spawn(routed.clone().run_health_checks());
+    eventually(|| routed.group_checked("Auto") && routed.group_checked("Fallback")).await;
+    let peak = gauge.peak.load(Ordering::SeqCst);
+    assert!(
+        peak <= engine_embedded::routing::MAX_CONCURRENT_PROBES,
+        "{peak} probes at once"
+    );
+    for node in nodes.values() {
+        assert_eq!(node.dials.load(Ordering::SeqCst), 1);
+    }
+    checks.abort();
+}
