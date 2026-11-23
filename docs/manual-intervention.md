@@ -407,6 +407,19 @@ run URL 和状态，以 `task_state: pending_ci`、`next_action: resume_after_ci
 - 客户端测试：刷新时在列表开头插入节点、重排、改名后所选节点和策略组选择不变；旧 id 迁移测试。
 - 发布说明提示：节点 id 格式改变；更换服务器地址、端口、传输或 SNI 的节点会被当作新节点。
 
+## 客户端跟进：Windows 托管文件、系统代理与 TUN DNS（fix/k5-platform）
+
+客户端（AnixOps/anixops-net）按 git rev 固定 platform-windows，以下事项必须在客户端 PR 中完成：
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- `WindowsProxySnapshot` 新增 `winhttp_untouched`、`applied`、`connections`：客户端里手写该结构体的地方（如 `startup.rs` 的字面量）要补上字段；已保存的旧快照照常反序列化。
+- 托管文件：客户端读取 envelope、插件等托管目录下的文件改用 `platform_windows::managed_files::read_managed_file`；HTTPS 解密插件库（`write_library` 等）及其他“写 `.tmp` 再改名”的写入改用 `write_managed_file_atomic`；启动时对用到的托管子目录调用 `ensure_managed_directory`。托管配置里引用的 envelope、根证书与私钥路径必须在 `%ProgramData%\AnixOps` 内，否则 `read_managed_config` / `write_managed_config` 报错。
+- 系统代理：连接改用 `WindowsSystemIntegration::apply_system_proxy` / `restore_system_proxy`（按连接保存与恢复，含 PAC、自动检测与拨号/VPN 条目），不再调用 `apply_winhttp_proxy`；`apply_current_user_system_proxy` 只处理 LAN 平铺值，保留给旧路径。断开、恢复与 `uninstall --purge` 时对旧版本留下的 WinHTTP 残留调用 `restore_winhttp_proxy_if_unchanged`（只在仍是旧版写入的值时恢复，残留清为无代理）。
+- 连接后用 `read_current_user_effective_proxy` 与 `WindowsEffectiveProxy::routes_through` 判断浏览器是否真的经过本地代理；为假（自动配置脚本、自动检测或组策略 `per_machine_policy`）时提示用户并建议改用 TUN 模式。提示文案进三端字符串目录（简中、繁中、英文），不要把“已验证”状态建立在注册表值上。
+- TUN：`WindowsTunSettings` 新增 `dns6`、`block_outside_dns`（客户端用 `..Default::default()` 无需改动）；连接后读取 `WindowsTun::outside_dns_blocked()`，为假时显示 `outside_dns_block_error()` 的提示（文案进三端字符串目录）。
+- Tauri 退出（`RunEvent::Exit` / 关机）时先恢复系统代理、关闭 TUN，再退出进程；WFP 过滤器在进程退出时由系统移除，WinINet 设置不会自动恢复。
+- 发布说明提示：Windows 连接不再修改机器级 WinHTTP 代理；TUN 模式下显式查询局域网 DNS（如 `nslookup name 192.168.1.1`）会被阻止。
+
 ## 后续预计人工事项
 
 iOS/macOS（Apple Developer、App Store Connect、TestFlight、App Review）与 Windows 代码签名相关的人工事项随客户端在 AnixOps/anixops-net 跟踪。
