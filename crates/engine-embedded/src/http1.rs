@@ -11,9 +11,13 @@ pub enum FetchError {
     ConnectFailed,
     /// The answer was not HTTP/1.x or its framing was broken.
     BadResponse,
-    /// An answer other than 200.
+    /// An answer other than 200 (a redirect without a `Location` included).
     Status,
     TooLarge,
+    /// A download followed more redirects than it may.
+    TooManyRedirects,
+    /// A download over `https` was redirected to `http`.
+    InsecureRedirect,
 }
 
 impl FetchError {
@@ -25,11 +29,15 @@ impl FetchError {
             Self::BadResponse => "bad_response",
             Self::Status => "http_status",
             Self::TooLarge => "too_large",
+            Self::TooManyRedirects => "too_many_redirects",
+            Self::InsecureRedirect => "redirect_insecure",
         }
     }
 }
 
-/// The body of a complete HTTP/1.x `200` response.
+/// The body of a complete HTTP/1.x `200` response. Every other status,
+/// redirects included, is [`FetchError::Status`]: DNS over HTTPS never
+/// follows one; rule set downloads (`fetch`) follow them before this.
 pub fn parse_response(raw: &[u8], max_bytes: usize) -> Result<Vec<u8>, FetchError> {
     let head_end = raw
         .windows(4)
