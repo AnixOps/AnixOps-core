@@ -1,5 +1,5 @@
 {
-  "note": "Firefox ESR 153 (captured from Firefox 153.7.0esr on Linux, 2026-11-13): the Firefox shape plus the 0xc00a cipher suite and the ffdhe2048/ffdhe3072 groups.",
+  "note": "Firefox ESR 153 (captured from Firefox 153.7.0esr on Linux, 2026-11-13): the Firefox shape plus the 0xc00a cipher suite and the ffdhe2048/ffdhe3072 groups; its ECH GREASE payload uses the earlier inner rounding (239 bytes where Firefox 160 sends 240).",
   "cipher_suites": [
     "0x1301", "0x1303", "0x1302", "0xc02b", "0xc02f", "0xcca9", "0xcca8", "0xc02c",
     "0xc030", "0xc00a", "0xc013", "0xc014", "0x009c", "0x009d", "0x002f", "0x0035"
@@ -21,7 +21,11 @@
     { "type": "psk_key_exchange_modes", "modes": [1] },
     { "type": "raw", "body": "4001", "id": "0x001c" },
     { "type": "compress_certificate", "algorithms": ["0x0001", "0x0002", "0x0003"] },
-    "ech_grease"
+    {
+      "type": "ech_grease",
+      "inner_padding": { "max_name_len": 100, "rounding": "legacy" },
+      "aeads": ["0x0001", "0x0003"]
+    }
   ],
   "permute_extensions": false,
   "alpn": ["h2", "http/1.1"]

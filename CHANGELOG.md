@@ -14,6 +14,12 @@
   - `trojan`、`vless` / `vmess` 的 `tls`、`hysteria2`、`tuic` 与 `http`（`"tls": true`）出站接受这两个列表，值不是摘要时构建失败（`<类型> certificate pins are invalid`）；`http` 不开 TLS 却带固定也构建失败。REALITY 不受影响。说明见 `crates/engine-embedded/README.md`「Server certificates」。
   - 客户端已保存的出站 JSON 是旧导入的结果，不带固定；重新导入订阅后才会带上。
   - 测试：transport-tls 单元测试（带 / 不带 `insecure` 时固定命中与不命中、只认叶子证书、公钥固定、证书解析失败、摘要解析、警告去重）与真实 TLS 握手测试；Hysteria2、TUIC 进程内服务端验证固定命中时能连、不命中时服务端收不到密码或 UUID，工厂接受与拒绝固定；HTTP 工厂；config-core 各格式的解析；node-import 导入、旧数据兼容、拒绝与分享链接往返。
+- tls-mimic 的 ECH GREASE 与真实浏览器一致（`fingerprint`、`profile`、`ja`）：
+  - 封装密钥 `enc` 此前是 32 个随机字节，约一半连接最高位为 1、其余又约一半落在扭曲曲线上，真实浏览器（真实 X25519 密钥对）不可能这样发，单条 ClientHello 就能被看出伪造。现在每条连接生成新的 X25519 密钥对，`enc` 是规范的曲线上公钥，且不复用 key_share 的密钥。
+  - Firefox / Firefox ESR 此前沿用 Chrome 的负载长度（从 144、176、208、240 中随机取，AEAD 恒为 AES-128-GCM），约 3/4 的连接与同版本 Firefox 不一致，ESR 每条都不一致（真实为 239）。`ech_grease` 现在是 profile 数据（`EchGreaseShape`）：`payload_lengths` 随机取长度（Chrome、Edge，裸 `"ech_grease"` 即此形态，旧 profile 与 bundle 不受影响），或 `inner_padding`（`max_name_len`、`rounding`：`rfc9849` / `legacy`）按浏览器会加密的 ClientHelloInner 计算长度（服务器名补到 100 字节、按 32 取整、加 16 字节标签，续连时计入 pre_shared_key）；`aeads` 每条连接随机取一个。内置 Firefox 用 `rfc9849` 并在 AES-128-GCM 与 ChaCha20-Poly1305 间随机，ESR 用 `legacy`；首连且服务器名不超过 100 字节时分别恒为 240、239，与 `tests/data` 抓包一致。
+  - 带新键的 profile 会被不认识这些键的旧版本整包拒绝（与 `hybrid_x25519` 相同）；下发 Firefox profile 的 bundle 需按客户端版本制作。
+  - `ja` 新增 `Hello::ech_outer`、`is_x25519_public_key`、`ech_grease_from_hello`；`spec_from_hello` 从抓包推出 ECH 的负载长度规则与 AEAD。抓包对照（`browser_fingerprints`）新增：ECH 的 AEAD 与负载长度须是 profile 规则对该 ClientHello 能产生的值、我们的 `enc` 须是 X25519 公钥、长度不含随机成分的 profile（Firefox、Safari）整条 ClientHello 长度须与浏览器相等。
+  - 测试：各带 ECH 的指纹多次生成 `enc` 均为曲线上的规范公钥且互不相同；Chromium 系长度与 AEAD；Firefox / ESR 服务器名 1–100 字节、长名字与续连时的长度和 AEAD 分布；JSON 解析、往返与非法取值；曲线判定的已知点与抓包；从抓包推出的规则与内置 profile 一致。
 
 ### Added
 
