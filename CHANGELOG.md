@@ -99,6 +99,10 @@
 - CI：删除 Repository policy 里约 1,600 行内联断言（逐句检查文档和源码字符串是否存在，不验证行为），`policy-fast` 里与 `verify-repository-policy.sh fast` 重复的内联步骤，重复运行 workspace 已有测试且每次冷编译的 `maintenance-contracts` job，以及 `rust-build-test` 在 test 之后多余的 `cargo build`。`ci.yml` 从 2,772 行减到约 1,080 行；iOS 源码/签名材料的检查移入策略脚本。
 - 删除 `crates/platform-ios`：工作区内没有任何 crate 依赖它，iOS 的 FFI 边界在 `engine-embedded`/`node-import`。workspace member、`Cargo.lock` 条目、CI 的文件存在性检查和文档引用一并去掉。
 
+### Fixed
+
+- XHTTP 走 HTTP/3 不再绕过 `via` 与宿主拨号器（transport-xhttp、transport-quic、engine-outbound）：VLESS、VMess、Trojan 出站在 TLS ALPN 恰好为 `h3` 时，QUIC 此前总是自己用系统解析器解析服务器、开受保护的 UDP 套接字直连，节点写的 `via` 被静默忽略，落地机看到用户真实 IP，本地网络能看到 SNI 与 DNS 查询。现在 QUIC 连接经出站的拨号器建立（新 `QuicConnector::connect_through`）：只有系统拨号器（新 `Dialer::is_system`，仅 `TcpDialer` 为真）才自己开套接字，其他拨号器的数据报走 `Dialer::open_datagram`，服务器域名交给前置节点或宿主拨号器解析；前置节点不转发 UDP 时连接报 `Unsupported`，不回退直连。
+
 ### Added
 
 - MITM 插件兼容（Loon / Surge / Quantumult X）：插件导入器识别 Quantumult X 的 `[rewrite_local]`/`[mitm]`（含注释段头 `#[rewrite_local]` 与无段头 snippet），`<url> url script-*` 转为 `[Script]` 行、`url response-body` 转为 url-first body 改写；Surge `[URL Rewrite]` 的 `<url> <replacement> <type>` 与带阶段前缀的 `[Header Rewrite]` 转为核心语法；QX `echo-response`、header 整块正则、`[task_local]` 判为不支持且不交给核心，`[Panel]` 忽略（#161）。脚本运行时新增 Quantumult X API：`$prefs`、`$notify`、`$response.statusCode`，以及只给 QX 专用脚本（用到 `$task` 且不出现 `$loon`）的 `$task.fetch`，避免 Env.js 一类跨端脚本误走 QX 分支。

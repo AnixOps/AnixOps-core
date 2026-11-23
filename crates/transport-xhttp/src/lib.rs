@@ -16,7 +16,8 @@
 //! [`XhttpConnector`] dials (and runs TLS) itself, because `packet-up` over
 //! HTTP/1.1 needs a second connection for the uploads. Over HTTP/2 every
 //! proxied stream uses its own connection, as over HTTP/3 (QUIC, see
-//! [`Security::Quic`]). [`server::XhttpServer`] is the server side (HTTP/1.1
+//! [`Security::Quic`]; its datagrams go through the same dialer, so a `via`
+//! chain carries HTTP/3 too). [`server::XhttpServer`] is the server side (HTTP/1.1
 //! and HTTP/2).
 
 mod h1;
@@ -106,7 +107,10 @@ pub enum Security {
     Tls(TlsConnector),
     /// Another handshake, such as REALITY; HTTP runs as `https`.
     Custom(Arc<dyn Handshake>),
-    /// QUIC for HTTP/3; the dialer is not used.
+    /// QUIC for HTTP/3. Its datagrams go through the dialer unless that is
+    /// the system dialer, which leaves QUIC a socket of its own (see
+    /// [`QuicConnector::connect_through`]); a dialer without UDP fails the
+    /// session instead of letting it connect directly.
     Quic(Arc<QuicConnector>),
 }
 
@@ -326,7 +330,7 @@ impl XhttpConnector {
                 let Security::Quic(quic) = &inner.security else {
                     return Err(invalid("xhttp over http/3 needs quic"));
                 };
-                let mut sender = http3::connect(quic).await?;
+                let mut sender = http3::connect(quic, inner.dialer.as_ref()).await?;
                 match inner.mode {
                     Mode::StreamOne => {
                         let request =

@@ -1,6 +1,7 @@
 //! XHTTP under TLS with ALPN `h3`: the engine's XHTTP client over HTTP/3
 //! against the QUIC side of a toy inbound, and over HTTP/2 against its TCP
-//! side on the same port number.
+//! side on the same port number; and over HTTP/3 through a `via` that
+//! relays its datagrams.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,7 +9,9 @@ use std::time::Duration;
 
 use engine_inbound::server::{serve, InboundStats, ServeSettings};
 use engine_inbound::{Accepted, Rejected, StreamInbound, UserStore};
-use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpDialer, TcpOutbound};
+use engine_outbound::{
+    BoxFuture, BoxStream, Dialer, OutboundDialer, TargetAddr, TcpDialer, TcpOutbound, UdpFlow,
+};
 use inbound_transport::{wrap_all, TlsServerSettings, TransportSettings};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -115,25 +118,92 @@ fn tls(alpn: &[&str]) -> TlsSettings {
     }
 }
 
-async fn round_trip(port: u16, mode: Mode, security: Security, version: HttpVersion) {
+/// A `via` without TCP that relays UDP to the loopback inbound whatever
+/// target it is asked for, and records the targets.
+struct UdpRelay {
+    port: u16,
+    asked: std::sync::Mutex<Vec<TargetAddr>>,
+}
+
+impl TcpOutbound for UdpRelay {
+    fn protocol(&self) -> &'static str {
+        "relay"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, std::io::Result<BoxStream>> {
+        Box::pin(async { Err(std::io::Error::other("the relay carries no tcp")) })
+    }
+
+    fn open_udp<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, std::io::Result<UdpFlow>> {
+        self.asked.lock().unwrap().push(target.clone());
+        Box::pin(async move { TcpDialer.open_datagram("127.0.0.1", self.port).await })
+    }
+}
+
+/// The QUIC side of an inbound with ALPN `h3`, on a loopback port.
+async fn http3_server() -> u16 {
+    let inbound = inbound(&["h3"]).await;
+    let (_listener, port, socket) = tcp_and_udp_on_one_loopback_port().await;
+    let quic = inbound.packet().expect("alpn h3 gives xhttp a quic side");
+    tokio::spawn(quic.serve(
+        socket,
+        Arc::new(Direct),
+        None,
+        ServeSettings::default(),
+        Arc::new(InboundStats::default()),
+    ));
+    port
+}
+
+fn connector(
+    server: &str,
+    port: u16,
+    mode: Mode,
+    security: Security,
+    version: HttpVersion,
+    dialer: Arc<dyn Dialer>,
+) -> XhttpConnector {
     let settings = XhttpSettings {
         path: "/xh".into(),
         mode,
         sc_min_posts_interval_ms: Range::fixed(1),
         ..XhttpSettings::default()
     };
-    let connector = XhttpConnector::new(
+    XhttpConnector::new(
         &settings,
         XhttpTarget {
-            server: "127.0.0.1".into(),
+            server: server.into(),
             port,
             default_host: SERVER_NAME.into(),
             security,
             version,
-            dialer: Arc::new(TcpDialer),
+            dialer,
         },
     )
-    .unwrap();
+    .unwrap()
+}
+
+async fn round_trip(port: u16, mode: Mode, security: Security, version: HttpVersion) {
+    round_trip_through(
+        "127.0.0.1",
+        port,
+        mode,
+        security,
+        version,
+        Arc::new(TcpDialer),
+    )
+    .await;
+}
+
+async fn round_trip_through(
+    server: &str,
+    port: u16,
+    mode: Mode,
+    security: Security,
+    version: HttpVersion,
+    dialer: Arc<dyn Dialer>,
+) {
+    let connector = connector(server, port, mode, security, version, dialer);
     let stream = tokio::time::timeout(TIMEOUT, connector.connect())
         .await
         .unwrap_or_else(|_| panic!("{mode:?} {version:?} did not connect"))
@@ -185,6 +255,53 @@ async fn alpn_h3_serves_http3_beside_http2() {
     // The TCP side offers `h2` and `http/1.1`, as without `h3`.
     let security = Security::Tls(TlsConnector::new(&tls(&["h2"])).unwrap());
     round_trip(port, Mode::StreamUp, security, HttpVersion::Http2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http3_runs_through_a_via_that_resolves_the_server() {
+    let port = http3_server().await;
+    // No resolver knows this name: only the `via` may look it up, and it
+    // sends the datagrams to the inbound.
+    let server = "xhttp-server.invalid";
+    let relay = Arc::new(UdpRelay {
+        port,
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    for mode in [Mode::PacketUp, Mode::StreamUp, Mode::StreamOne] {
+        let security = Security::quic(server, port, &tls(&[])).unwrap();
+        let dialer = Arc::new(OutboundDialer(relay.clone()));
+        round_trip_through(server, port, mode, security, HttpVersion::Http3, dialer).await;
+    }
+    let asked = relay.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 3, "one quic connection per session");
+    assert!(asked
+        .iter()
+        .all(|target| *target == TargetAddr::Domain(server.into(), port)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http3_through_a_via_without_udp_fails_instead_of_connecting_directly() {
+    // The server answers on loopback, so a direct connection would succeed.
+    let port = http3_server().await;
+    let security = Security::quic("127.0.0.1", port, &tls(&[])).unwrap();
+    // `Direct` here carries TCP only.
+    let dialer = Arc::new(OutboundDialer(Arc::new(Direct)));
+    let connector = connector(
+        "127.0.0.1",
+        port,
+        Mode::PacketUp,
+        security,
+        HttpVersion::Http3,
+        dialer,
+    );
+    let error = match tokio::time::timeout(TIMEOUT, connector.connect())
+        .await
+        .expect("a via without udp fails at once")
+    {
+        Ok(_) => panic!("http/3 bypassed the via"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error}");
 }
 
 #[tokio::test]

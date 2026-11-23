@@ -57,6 +57,7 @@ App ──iWAN──▶ Panabit 入口（国内）══IPLC══▶ Panabit NA
 - 指向的节点必须存在，链不能成环，链长（包括节点自身）最多 4 层。
 - 单出站模式里 `via` 写节点 id 会被拒绝，因为那里没有其他节点。
 - 协议工厂通过 `OutboundFactory::supports_via()` 声明能否经由前置节点。自己开 UDP 套接字的协议（`hysteria2`、`tuic`、`iwan`）返回 `false`，写了 `via` 会被拒绝，避免流量绕过前置节点直接发出。`wireguard` 本来就不能当路由节点。
+- XHTTP 走 HTTP/3（`vless`、`vmess`、`trojan` 的 TLS ALPN 恰好为 `h3`）可以写 `via`：QUIC 数据报经前置节点的 `open_udp` 发出，服务器域名交给前置节点解析，见下文「实现」。前置节点不转发 UDP（比如 `http`）时，这条连接直接报错（`Unsupported`，信息含 "no udp path to the quic server"），不会改为直连落地机。
 - 前置节点本身可以是任何 TCP 出站，包括 `iwan`。
 - 错误信息只带节点 id，不回显凭据。
 
@@ -66,6 +67,9 @@ App ──iWAN──▶ Panabit 入口（国内）══IPLC══▶ Panabit NA
   - `Dialer::open_datagram(host, port) -> UdpFlow`：协议发往服务器的 UDP 走这里。默认实现与原来一样，是一个已 `connect` 的系统 UDP 套接字，所以 NE 替换的拨号器行为不变。
   - `OutboundDialer(Arc<dyn TcpOutbound>)`：`dial` 调用前置节点的 `connect`，`open_datagram` 调用前置节点的 `open_udp`。主机名原样交给前置节点，经由 iWAN 时由隧道 DNS 解析。
   - `OutboundFactory::supports_via()` 默认返回 `true`。
+  - `Dialer::is_system()`：只有 `TcpDialer` 返回 `true`。需要自己开 UDP 套接字的传输（QUIC）只在系统拨号器下自己开受保护的套接字并用系统解析器解析服务器；其他拨号器（`OutboundDialer`、宿主注入的带自有解析器或绑定网卡的拨号器）一律经 `open_datagram`，服务器名交给拨号器解析。
+- `transport-quic`：`QuicConnector::connect_through(dialer)` 按上一条选择 `connect()`（自有套接字）或 `connect_over(open_datagram(...))`（在 `UdpFlow` 上跑 quinn）；拿不到 UDP 通路时报错，不回退到自有套接字。带 Salamander 的连接不能经其他拨号器（`connect_over` 不做混淆），直接报 `Unsupported`。
+- `transport-xhttp`：HTTP/3 用 `connect_through(拨号器)` 建 QUIC 连接，所以 `via` 和宿主拨号器对 HTTP/3 同样生效。每条代理流一条 QUIC 连接，经由前置节点时每条流各占前置节点的一个 UDP 会话；前置节点是 VLESS、VMess、Trojan 时 UDP 跑在 TCP 里，QUIC 能通但有队头阻塞，吞吐不如直连。
 - `outbound-shadowsocks`：UDP（SIP004 和 2022）改为通过 `Dialer::open_datagram` 发送。`outbound-socks` 的 UDP ASSOCIATE 中继也走 `open_datagram`。
 - `engine-embedded`：
   - `OutboundConfig` 增加 `via` 字段。
@@ -75,7 +79,7 @@ App ──iWAN──▶ Panabit 入口（国内）══IPLC══▶ Panabit NA
 
 ## 以后再做
 
-- QUIC 类协议（`hysteria2`、`tuic`）经由前置节点：需要 quinn 自定义套接字跑在 `UdpFlow` 上。
+- QUIC 类协议（`hysteria2`、`tuic`）经由前置节点：quinn 跑在 `UdpFlow` 上已由 `QuicConnector::connect_through` 提供（XHTTP 的 HTTP/3 已在用），这两个协议还要改用它，并处理 Hysteria2 的 Salamander 与端口跳跃。
 - `via` 指向策略组，比如在多条 iWAN 线路之间选择。
 - 导入：Clash `dialer-proxy`、Surge `underlying-proxy` 映射为 `via`。面板订阅给落地节点写上前置节点。
 
