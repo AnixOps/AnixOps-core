@@ -458,7 +458,7 @@ pub fn handle_with_interceptor(
     let tracker = dispatcher.tracker();
     let request = match capture_command(tracker.capture(), request, CaptureHost::Engine) {
         Ok(answer) => return answer,
-        Err(other) => other,
+        Err(other) => *other,
     };
     let answer = match request {
         ControlRequest::Traffic => serde_json::to_value(tracker.traffic()),
@@ -719,12 +719,13 @@ enum CaptureHost {
 }
 
 /// Answers the capture commands, which the engine and the capture viewer
-/// share; any other request comes back as `Err` for the caller to answer.
+/// share; any other request comes back as `Err` for the caller to answer
+/// (boxed: `ControlRequest` is large).
 fn capture_command(
     store: &capture::CaptureStore,
     request: ControlRequest,
     host: CaptureHost,
-) -> Result<Result<Vec<u8>, RuntimeError>, ControlRequest> {
+) -> Result<Result<Vec<u8>, RuntimeError>, Box<ControlRequest>> {
     let answer = match request {
         ControlRequest::Capture => json_value(store.status()),
         ControlRequest::SetCapture {
@@ -839,7 +840,7 @@ fn capture_command(
                 "error": { "code": "invalid_filter", "at": error.at },
             })),
         },
-        other => return Err(other),
+        other => return Err(Box::new(other)),
     };
     Ok(answer.and_then(|answer| {
         serde_json::to_vec(&answer).map_err(|_| {
@@ -869,9 +870,11 @@ pub fn handle_capture_viewer(
         .map_err(|_| invalid("control request is not a known command"))?;
     let answer = match capture_command(store, request, CaptureHost::Viewer) {
         Ok(answer) => return answer,
-        Err(ControlRequest::Connections) => store.connections_json(),
-        Err(ControlRequest::Traffic) => store.connections_json()["traffic"].clone(),
-        Err(_) => return Err(invalid("the capture viewer only answers capture commands")),
+        Err(other) => match *other {
+            ControlRequest::Connections => store.connections_json(),
+            ControlRequest::Traffic => store.connections_json()["traffic"].clone(),
+            _ => return Err(invalid("the capture viewer only answers capture commands")),
+        },
     };
     serde_json::to_vec(&answer)
         .map_err(|_| RuntimeError::new(RuntimeErrorCode::InternalError, "control answer failed"))
