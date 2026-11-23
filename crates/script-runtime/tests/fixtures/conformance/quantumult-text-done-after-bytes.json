@@ -1,0 +1,11 @@
+{
+  "invocation": {
+    "phase": "response",
+    "request": { "url": "https://api.example.test/", "method": "GET" },
+    "response": { "status": 200, "headers": { "Content-Type": "text/plain" }, "body": "abc" }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "status": 200, "headers": { "Content-Type": "text/plain" }, "body": "ABC3" }
+  }
+}

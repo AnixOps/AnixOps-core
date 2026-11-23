@@ -114,6 +114,10 @@ fn invocation(value: &Value) -> ScriptInvocation {
             .get("binaryBody")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        body_is_bytes: value
+            .get("bodyIsBytes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         event: text(value.get("event")),
         rule: value.get("rule").map(|rule| ScriptRuleRequest {
             hostname: text(rule.get("hostname")),
@@ -168,6 +172,10 @@ fn expected_mutation(value: Option<&Value>) -> ScriptMutation {
         body: text(object.get("body")),
         response: object.get("response").map(response),
         matched: object.get("matched").and_then(Value::as_bool),
+        binary_bodies: object
+            .get("binaryBodies")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -186,6 +194,7 @@ fn assert_mutation_eq(case: &str, actual: &ScriptMutation, expected: &ScriptMuta
                 )
             }),
             mutation.matched,
+            mutation.binary_bodies,
         )
     };
     assert_eq!(normalize(actual), normalize(expected), "{case}: mutation");
@@ -359,6 +368,7 @@ mod javascriptcore {
             },
             response: None,
             binary_body: false,
+            body_is_bytes: false,
             event: None,
             rule: None,
         };
@@ -553,6 +563,7 @@ fn concurrent_dispatches_share_only_the_store() {
                     },
                     response: None,
                     binary_body: false,
+                    body_is_bytes: false,
                     event: None,
                     rule: None,
                 };

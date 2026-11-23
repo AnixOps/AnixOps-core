@@ -271,6 +271,45 @@ fn quickjs_binary_body_mode_passes_bytes_both_ways() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Quantumult X scripts read `bodyBytes` without binary-body-mode: a body
+/// that is not UTF-8 reaches them as bytes, and `$done({bodyBytes})` writes
+/// bytes back. A text script that never reads `bodyBytes` is still deferred
+/// on such a body.
+#[test]
+fn quickjs_quantumult_body_bytes_work_without_binary_mode() {
+    let dir = temp_dir("quantumult-bytes");
+    let script = dir.join("protobuf.js");
+    std::fs::write(
+        &script,
+        "var view = new Uint8Array($response.bodyBytes);\
+         var out = new Uint8Array(view.length + 1); out.set(view); out[view.length] = 0x00;\
+         $done({ bodyBytes: out.buffer });",
+    )
+    .unwrap();
+    let hook = hook_with(executor(&script, None), 1000, false);
+    let mut response = message(HttpMitmPhase::Response, "");
+    response.body = vec![0x08, 0x96, 0x01, 0xc3];
+
+    let report = hook.plan_plain_http(&response);
+
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+    assert_eq!(report.body, vec![0x08, 0x96, 0x01, 0xc3, 0x00]);
+
+    // Text bodies keep their text view and gain the bytes.
+    let text = hook.plan_plain_http(&message(HttpMitmPhase::Response, "é"));
+    assert!(text.script_dispatch_executed, "{:?}", text.diagnostics);
+    assert_eq!(text.body, vec![0xc3, 0xa9, 0x00]);
+
+    let plain = dir.join("text.js");
+    std::fs::write(&plain, "$done({ body: $response.body + '!' });").unwrap();
+    let hook = hook_with(executor(&plain, None), 1000, false);
+    let report = hook.plan_plain_http(&response);
+    assert!(!report.script_dispatch_executed);
+    assert!(report.script_dispatch_deferred, "{:?}", report.diagnostics);
+    assert_eq!(report.body, vec![0x08, 0x96, 0x01, 0xc3]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A script without `requires-body` never read the body, and the data plane
 /// streams such bodies, so a body it returns is not applied.
 #[test]

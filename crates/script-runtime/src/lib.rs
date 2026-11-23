@@ -133,6 +133,11 @@ pub struct ScriptInvocation {
     /// are then byte strings, one char (U+0000 to U+00FF) per byte; convert
     /// with [`binary_body_string`] and [`binary_body_bytes`].
     pub binary_body: bool,
+    /// Text mode only: the phase's body (the request body in the request
+    /// phase, the response body in the response phase) is not UTF-8 and is
+    /// passed as a byte string. The script then gets it only as Quantumult X
+    /// `bodyBytes`, with no text `body`.
+    pub body_is_bytes: bool,
     /// Event name for [`ScriptPhase::Event`] (`$event.name`), such as
     /// `network-changed`.
     pub event: Option<String>,
@@ -156,6 +161,7 @@ impl ScriptInvocation {
             request: ScriptRequest::default(),
             response: None,
             binary_body: false,
+            body_is_bytes: false,
             event,
             rule: None,
         }
@@ -170,13 +176,22 @@ impl ScriptInvocation {
         allow(dead_code)
     )]
     pub(crate) fn body_exceeds(&self, max_bytes: usize) -> bool {
-        let len = |body: Option<&str>| match body {
+        // A byte string holds one char per byte; text is counted in UTF-8.
+        let len = |body: Option<&str>, bytes: bool| match body {
             None => 0,
-            Some(body) if self.binary_body => body.chars().count(),
+            Some(body) if bytes => body.chars().count(),
             Some(body) => body.len(),
         };
-        len(self.request.body.as_deref()) > max_bytes
-            || len(self.response.as_ref().and_then(|r| r.body.as_deref())) > max_bytes
+        let phase_bytes =
+            |phase: ScriptPhase| self.binary_body || (self.body_is_bytes && self.phase == phase);
+        len(
+            self.request.body.as_deref(),
+            phase_bytes(ScriptPhase::Request),
+        ) > max_bytes
+            || len(
+                self.response.as_ref().and_then(|r| r.body.as_deref()),
+                phase_bytes(ScriptPhase::Response),
+            ) > max_bytes
     }
 }
 
@@ -234,6 +249,11 @@ pub struct ScriptMutation {
     /// Whether the connection matches (rule phase): `true` only when the
     /// script passed `matched: true`.
     pub matched: Option<bool>,
+    /// Outside binary-body-mode, `body` and `response.body` are byte strings
+    /// rather than text, because the script returned Quantumult X
+    /// `bodyBytes`. In binary-body-mode bodies are always byte strings and
+    /// this stays `false`.
+    pub binary_bodies: bool,
 }
 
 impl ScriptMutation {

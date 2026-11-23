@@ -237,30 +237,36 @@ impl NativeQuickJsScriptExecutor {
             (rule, 0) => rule,
             (rule, runtime) => rule.min(runtime),
         };
-        let body = if dispatch.requires_body {
-            if message.body.len() > max_body_bytes {
-                return script_execution_deferred(
-                    "native HTTP script dispatch body exceeds the max-size limit",
-                );
-            }
-            if dispatch.binary_body_mode {
-                Some(binary_body_string(&message.body))
-            } else {
-                match std::str::from_utf8(&message.body) {
-                    Ok(body) => Some(body.to_string()),
-                    Err(_) => {
-                        return script_execution_deferred(
-                            "native HTTP script dispatch requires a UTF-8 buffered body",
-                        )
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        if dispatch.requires_body && message.body.len() > max_body_bytes {
+            return script_execution_deferred(
+                "native HTTP script dispatch body exceeds the max-size limit",
+            );
+        }
         let source = match self.script_source(&dispatch.script_path) {
             Ok(source) => source,
             Err(reason) => return script_execution_deferred(reason),
+        };
+        // Outside binary-body-mode a body that is not UTF-8 still reaches a
+        // script that reads Quantumult X `bodyBytes` (protobuf, images), as
+        // bytes only; other text scripts cannot use it and are deferred.
+        let mut body_is_bytes = false;
+        let body = if !dispatch.requires_body {
+            None
+        } else if dispatch.binary_body_mode {
+            Some(binary_body_string(&message.body))
+        } else {
+            match std::str::from_utf8(&message.body) {
+                Ok(body) => Some(body.to_string()),
+                Err(_) if source.contains("bodyBytes") => {
+                    body_is_bytes = true;
+                    Some(binary_body_string(&message.body))
+                }
+                Err(_) => {
+                    return script_execution_deferred(
+                        "native HTTP script dispatch requires a UTF-8 buffered body",
+                    )
+                }
+            }
         };
 
         let headers = message
@@ -316,6 +322,7 @@ impl NativeQuickJsScriptExecutor {
             request,
             response,
             binary_body: dispatch.binary_body_mode,
+            body_is_bytes,
             event: None,
             rule: None,
         };
@@ -354,6 +361,9 @@ impl NativeQuickJsScriptExecutor {
         }
 
         let mutation = outcome.applied_mutation().cloned().unwrap_or_default();
+        // Quantumult X `bodyBytes` makes the bodies byte strings outside
+        // binary-body-mode too.
+        let binary_bodies = dispatch.binary_body_mode || mutation.binary_bodies;
         let to_entries = |headers: Vec<(String, String)>| {
             headers
                 .into_iter()
@@ -362,7 +372,7 @@ impl NativeQuickJsScriptExecutor {
         };
         // The host only accepts byte strings for binary `$done` bodies.
         let to_bytes = |body: String| {
-            if dispatch.binary_body_mode {
+            if binary_bodies {
                 binary_body_bytes(&body).unwrap_or_default()
             } else {
                 body.into_bytes()

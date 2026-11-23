@@ -67,9 +67,59 @@
     }
   }
 
-  // `$done` bodies in binary mode: bytes as they are, text as UTF-8.
+  // Quantumult X reads `bodyBytes`, an ArrayBuffer, next to the text
+  // `body` without any binary mode. It is made only when a script reads it,
+  // so a text script pays nothing for it. Assigning it replaces it.
+  function defineBodyBytes(message, makeBytes) {
+    Object.defineProperty(message, "bodyBytes", {
+      configurable: true,
+      enumerable: false,
+      get: function () {
+        var value = makeBytes();
+        Object.defineProperty(message, "bodyBytes", {
+          value: value,
+          writable: true,
+          configurable: true,
+          enumerable: false
+        });
+        return value;
+      },
+      set: function (value) {
+        Object.defineProperty(message, "bodyBytes", {
+          value: value,
+          writable: true,
+          configurable: true,
+          enumerable: true
+        });
+      }
+    });
+  }
+
+  // Text mode: `body` is the text and `bodyBytes` its UTF-8 bytes. A body
+  // that is not UTF-8 reaches a script that reads `bodyBytes` as bytes only
+  // (`bodyIsBytes`), with no text `body`.
+  function exposeTextBody(message, phaseMessage) {
+    if (binaryBody || !message || typeof message.body !== "string") {
+      return;
+    }
+    var body = message.body;
+    if (phaseMessage && context.bodyIsBytes === true) {
+      delete message.body;
+      defineBodyBytes(message, function () {
+        return bytesFromByteString(body).buffer;
+      });
+    } else {
+      defineBodyBytes(message, function () {
+        return bytesFromByteString(unescape(encodeURIComponent(body))).buffer;
+      });
+    }
+  }
+
+  // `$done` bodies. Binary mode: bytes as they are, text as UTF-8. Text
+  // mode: Quantumult X `bodyBytes` wins over `body` and goes to the host as
+  // a byte string.
   function doneBody(message) {
-    if (!binaryBody || !message || typeof message !== "object") {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
       return message;
     }
     var copy = {};
@@ -77,6 +127,18 @@
       if (Object.prototype.hasOwnProperty.call(message, key)) {
         copy[key] = message[key];
       }
+    }
+    if (!binaryBody) {
+      if (copy.bodyBytes !== undefined && copy.bodyBytes !== null) {
+        var given = asBytes(copy.bodyBytes);
+        if (given) {
+          copy.bodyBytes = byteStringFromBytes(given);
+          delete copy.body;
+        } else {
+          delete copy.bodyBytes;
+        }
+      }
+      return copy;
     }
     var body = copy.body !== undefined && copy.body !== null ? copy.body : copy.bodyBytes;
     delete copy.bodyBytes;
@@ -96,6 +158,8 @@
 
   exposeBinaryBody(context.request);
   exposeBinaryBody(context.response);
+  exposeTextBody(context.request, context.phase === "request");
+  exposeTextBody(context.response, context.phase === "response");
 
   if (context.request) {
     define("$request", context.request);
@@ -123,7 +187,7 @@
     var payload;
     try {
       var result = doneBody(value === undefined || value === null ? {} : value);
-      if (binaryBody && result && typeof result === "object" && result.response) {
+      if (result && typeof result === "object" && result.response) {
         result.response = doneBody(result.response);
       }
       payload = JSON.stringify(result);

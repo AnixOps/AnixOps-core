@@ -265,6 +265,7 @@ fn context_json(invocation: &ScriptInvocation) -> String {
     context.insert("argument".into(), json!(invocation.argument));
     context.insert("environment".into(), json!(SCRIPT_ENVIRONMENT));
     context.insert("binaryBody".into(), json!(invocation.binary_body));
+    context.insert("bodyIsBytes".into(), json!(invocation.body_is_bytes));
     // Scripts that both capture cookies and check in tell the two apart by
     // whether `$request` exists, so a scheduled run must not have one.
     if invocation.phase.is_http() {
@@ -355,9 +356,9 @@ fn parse_done(
     if let Some(headers) = present(&object, "headers") {
         mutation.headers = Some(parse_headers(headers)?);
     }
-    if let Some(body) = present(&object, "body") {
-        mutation.body = Some(parse_body(body, max_output_bytes, binary)?);
-    }
+    let (body, mut bytes_given) = parse_message_body(&object, max_output_bytes, binary)?;
+    mutation.body = body;
+    let mut response_bytes = false;
     match phase {
         ScriptPhase::Request => {
             if let Some(url) = present(&object, "url") {
@@ -370,14 +371,19 @@ fn parse_done(
                 mutation.url = Some(url.to_string());
             }
             if let Some(response) = present(&object, "response") {
-                mutation.response = Some(parse_response(response, max_output_bytes, binary)?);
+                let (response, bytes) = parse_response(response, max_output_bytes, binary)?;
+                mutation.response = Some(response);
+                response_bytes = bytes;
             } else if present(&object, "status").is_some() {
                 // Quantumult X `script-echo-response`: `$done` gets the
                 // response itself (`{status: "HTTP/1.1 200 OK", headers, body}`).
                 let response = Value::Object(object.clone());
-                mutation.response = Some(parse_response(&response, max_output_bytes, binary)?);
+                let (response, bytes) = parse_response(&response, max_output_bytes, binary)?;
+                mutation.response = Some(response);
+                response_bytes = bytes;
                 mutation.headers = None;
                 mutation.body = None;
+                bytes_given = false;
             }
         }
         ScriptPhase::Response => {
@@ -387,14 +393,55 @@ fn parse_done(
         }
         ScriptPhase::Cron | ScriptPhase::Event | ScriptPhase::Generic | ScriptPhase::Rule => {}
     }
+    if !binary && (bytes_given || response_bytes) {
+        // Quantumult X `bodyBytes` outside binary-body-mode: every body of
+        // the mutation becomes a byte string, text as its UTF-8 bytes.
+        if !bytes_given {
+            if let Some(body) = mutation.body.as_mut() {
+                *body = crate::binary_body_string(body.as_bytes());
+            }
+        }
+        if !response_bytes {
+            if let Some(body) = mutation
+                .response
+                .as_mut()
+                .and_then(|response| response.body.as_mut())
+            {
+                *body = crate::binary_body_string(body.as_bytes());
+            }
+        }
+        mutation.binary_bodies = true;
+    }
     Ok(mutation)
 }
 
+/// A message's `body`, or outside binary-body-mode its Quantumult X
+/// `bodyBytes` (a byte string from the prelude), which wins over `body` as
+/// in Quantumult X. Returns whether the body is a byte string from
+/// `bodyBytes`.
+fn parse_message_body(
+    object: &Map<String, Value>,
+    max_output_bytes: usize,
+    binary: bool,
+) -> Result<(Option<String>, bool), String> {
+    if !binary {
+        if let Some(bytes) = present(object, "bodyBytes") {
+            return Ok((Some(parse_body(bytes, max_output_bytes, true)?), true));
+        }
+    }
+    match present(object, "body") {
+        Some(body) => Ok((Some(parse_body(body, max_output_bytes, binary)?), false)),
+        None => Ok((None, false)),
+    }
+}
+
+/// The response a request script answers with, and whether its body is a
+/// byte string from `bodyBytes`.
 fn parse_response(
     value: &Value,
     max_output_bytes: usize,
     binary: bool,
-) -> Result<ScriptResponse, String> {
+) -> Result<(ScriptResponse, bool), String> {
     let Value::Object(object) = value else {
         return Err("$done response must be an object".to_string());
     };
@@ -406,15 +453,15 @@ fn parse_response(
         Some(headers) => parse_headers(headers)?,
         None => Vec::new(),
     };
-    let body = match present(object, "body") {
-        Some(body) => Some(parse_body(body, max_output_bytes, binary)?),
-        None => None,
-    };
-    Ok(ScriptResponse {
-        status,
-        headers,
-        body,
-    })
+    let (body, bytes) = parse_message_body(object, max_output_bytes, binary)?;
+    Ok((
+        ScriptResponse {
+            status,
+            headers,
+            body,
+        },
+        bytes,
+    ))
 }
 
 /// Accepts a number or a status line such as `HTTP/1.1 404 Not Found`.
@@ -544,6 +591,55 @@ pub(crate) fn truncate_utf8(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quantumult_body_bytes_outside_binary_mode_are_byte_strings() {
+        // `bodyBytes` wins over `body`; the prelude sends it as a byte string.
+        let mutation = parse_done(
+            ScriptPhase::Response,
+            r#"{"body":"ignored","bodyBytes":"\u0000\u00ff"}"#,
+            1024,
+            false,
+        )
+        .expect("bytes parse");
+        assert_eq!(mutation.body.as_deref(), Some("\u{0}\u{ff}"));
+        assert!(mutation.binary_bodies);
+
+        // Text alone stays text.
+        let mutation =
+            parse_done(ScriptPhase::Response, r#"{"body":"é"}"#, 1024, false).expect("text parses");
+        assert_eq!(mutation.body.as_deref(), Some("é"));
+        assert!(!mutation.binary_bodies);
+
+        // An echo response with bytes; a char above U+00FF is no byte.
+        let mutation = parse_done(
+            ScriptPhase::Request,
+            r#"{"status":200,"bodyBytes":"\u0001"}"#,
+            1024,
+            false,
+        )
+        .expect("echo bytes parse");
+        assert_eq!(
+            mutation
+                .response
+                .and_then(|response| response.body)
+                .as_deref(),
+            Some("\u{1}")
+        );
+        assert!(mutation.binary_bodies);
+        assert!(parse_done(ScriptPhase::Response, r#"{"bodyBytes":"é€"}"#, 1024, false).is_err());
+
+        // A text body next to a byte-string response becomes its UTF-8 bytes.
+        let mutation = parse_done(
+            ScriptPhase::Request,
+            r#"{"body":"é","response":{"bodyBytes":"\u0002"}}"#,
+            1024,
+            false,
+        )
+        .expect("mixed parse");
+        assert_eq!(mutation.body.as_deref(), Some("\u{c3}\u{a9}"));
+        assert!(mutation.binary_bodies);
+    }
 
     #[test]
     fn split_cookie_fields_join_as_one_cookie_list() {
