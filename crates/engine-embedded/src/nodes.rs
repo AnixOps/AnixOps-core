@@ -30,7 +30,10 @@ pub fn outbound_for_node(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     Ok(outbound)
 }
 
-/// Envelope with one outbound for the selected node, and that node. Without a
+/// Envelope with one outbound for the selected node, and that node. The
+/// selection is looked up by node id, or by the id the node had before
+/// stable node ids ([`config_core::node_id::find_node`]); callers should save
+/// the returned node's id. Without a
 /// selection it uses the first node this build can run, so one unsupported
 /// node at the top of a subscription does not stop the rest from running; if
 /// none can run, the first node's reason is returned.
@@ -41,9 +44,9 @@ pub fn single_node_envelope(
 ) -> Result<(String, NodeDescriptor), Unsupported> {
     let (node, outbound) = match selected_node_id {
         Some(id) => {
-            let node = nodes
-                .iter()
-                .find(|node| node.id == id)
+            // A selection saved before stable node ids still finds its node
+            // by the previous id; the returned node carries the current id.
+            let node = config_core::node_id::find_node(nodes, id)
                 .ok_or("the selected node is not in the subscription")?;
             (node, outbound_for_node(node)?)
         }

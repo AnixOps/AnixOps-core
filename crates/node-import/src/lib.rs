@@ -202,7 +202,16 @@ fn is_zero(value: &usize) -> bool {
 /// A node the engine can run. `outbound` holds its credentials.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImportedNode {
+    /// Stable node id: the same server keeps it when the subscription
+    /// reorders, adds, removes or renames entries
+    /// (`docs/architecture/subscription-node-ids.md`).
     pub id: String,
+    /// The id earlier releases gave this node (name plus position), so a
+    /// client can move a selection it saved under that id to [`Self::id`].
+    /// Only reliable for the subscription content the client saved it with.
+    /// Left out for nodes that never had another id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_id: Option<String>,
     pub name: String,
     /// The outbound `type`.
     pub protocol: String,
@@ -430,6 +439,7 @@ pub fn report(nodes: &[NodeDescriptor]) -> ImportReport {
         match outbound_json(node) {
             Ok(outbound) => report.nodes.push(ImportedNode {
                 id: node.id.clone(),
+                legacy_id: config_core::node_id::legacy_node_id(node).map(str::to_string),
                 name: node.name.clone(),
                 protocol: outbound["type"].as_str().unwrap_or_default().to_string(),
                 server: node.endpoint.host.clone(),

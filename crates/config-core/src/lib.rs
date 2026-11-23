@@ -4,6 +4,7 @@
 //! It performs no file I/O, network access, platform probing, or engine work.
 
 pub mod certificate_pin;
+pub mod node_id;
 pub mod redirect;
 pub mod routing;
 pub mod routing_import;
@@ -928,27 +929,6 @@ fn is_entry_kind(kind: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Adds `node` to `nodes`, renaming its id with a `-<n>` suffix when an
-/// earlier node took it.
-fn push_unique_node(
-    nodes: &mut Vec<NodeDescriptor>,
-    seen_ids: &mut BTreeSet<String>,
-    mut node: NodeDescriptor,
-) {
-    if !seen_ids.insert(node.id.clone()) {
-        let base_id = node.id.clone();
-        let mut suffix = seen_ids.len() + 1;
-        loop {
-            node.id = format!("{base_id}-{suffix}");
-            if seen_ids.insert(node.id.clone()) {
-                break;
-            }
-            suffix += 1;
-        }
-    }
-    nodes.push(node);
-}
-
 /// The built-in policy a proxy entry of type `kind` stands for: `DIRECT`,
 /// or `REJECT` and its variants (as [`routing::RejectKind`] names them).
 /// Surge, Loon, Quantumult X and Clash list these beside their nodes (Surge's
@@ -1029,7 +1009,6 @@ fn parse_clash_yaml_subscription(
     }
 
     let mut nodes = Vec::new();
-    let mut seen_ids = BTreeSet::new();
     let mut skipped = SkippedEntries::new("clash proxy");
     // Whether any entry reads as a Clash proxy; when none does, the text is
     // not a Clash document and the next format gets it.
@@ -1064,7 +1043,7 @@ fn parse_clash_yaml_subscription(
         };
         readable = true;
         match parse_clash_proxy(raw, source_id) {
-            Ok(node) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Ok(node) => nodes.push(node),
             Err(error) => skipped.skip(index, name.as_deref(), kind.as_deref(), error),
         }
     }
@@ -1072,6 +1051,7 @@ fn parse_clash_yaml_subscription(
         return Ok(None);
     }
 
+    node_id::assign_subscription_node_ids(&mut nodes);
     skipped
         .finish(nodes, || {
             domain_error(
@@ -1399,7 +1379,6 @@ fn parse_sing_box_json_subscription(
     }
 
     let mut nodes = Vec::new();
-    let mut seen_ids = BTreeSet::new();
     let mut skipped = SkippedEntries::new("sing-box outbound");
     // Whether any entry reads as an outbound; when none does, the text is
     // not a sing-box document and the next format gets it.
@@ -1437,7 +1416,7 @@ fn parse_sing_box_json_subscription(
         };
         readable = true;
         match parse_sing_box_outbound(outbound, source_id) {
-            Ok(Some(node)) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Ok(Some(node)) => nodes.push(node),
             Ok(None) => {}
             Err(error) => skipped.skip(index, tag.as_deref(), kind.as_deref(), error),
         }
@@ -1445,6 +1424,7 @@ fn parse_sing_box_json_subscription(
     if !readable {
         return Ok(None);
     }
+    node_id::assign_subscription_node_ids(&mut nodes);
     resolve_vias(&mut nodes);
 
     skipped
@@ -2111,7 +2091,6 @@ fn parse_quantumult_x_proxy_line_subscription(
     }
 
     let mut nodes = Vec::new();
-    let mut seen_ids = BTreeSet::new();
     let mut skipped = SkippedEntries::new("quantumult x server_local line");
     for (index, line) in proxy_lines.iter().enumerate() {
         let kind = line.split_once('=').map(|(kind, _)| kind.trim());
@@ -2119,7 +2098,7 @@ fn parse_quantumult_x_proxy_line_subscription(
             continue;
         }
         match parse_quantumult_x_proxy_line(line, source_id) {
-            Ok(node) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Ok(node) => nodes.push(node),
             Err(error) => {
                 let tag = quantumult_x_proxy_line_tag(line);
                 skipped.skip(index, tag.as_deref(), kind, error);
@@ -2127,6 +2106,7 @@ fn parse_quantumult_x_proxy_line_subscription(
         }
     }
 
+    node_id::assign_subscription_node_ids(&mut nodes);
     skipped
         .finish(nodes, || {
             domain_error(
@@ -2486,7 +2466,6 @@ fn parse_loon_proxy_line_subscription(
     }
 
     let mut nodes = Vec::new();
-    let mut seen_ids = BTreeSet::new();
     let mut skipped = SkippedEntries::new("loon proxy line");
     // Lines in another style (Surge's `key=value` options) or of a type the
     // Loon reader does not know: when no line reads as a Loon node, the
@@ -2497,7 +2476,7 @@ fn parse_loon_proxy_line_subscription(
             continue;
         }
         match parse_loon_proxy_line(line, source_id) {
-            Ok(Some(node)) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Ok(Some(node)) => nodes.push(node),
             Ok(None) => other_style.push(index),
             Err(error) => {
                 let (name, kind) = proxy_line_name_and_kind(line);
@@ -2530,6 +2509,7 @@ fn parse_loon_proxy_line_subscription(
         );
     }
 
+    node_id::assign_subscription_node_ids(&mut nodes);
     skipped
         .finish(nodes, || {
             domain_error(
@@ -2900,14 +2880,13 @@ fn parse_surge_proxy_line_subscription(
     }
 
     let mut nodes = Vec::new();
-    let mut seen_ids = BTreeSet::new();
     let mut skipped = SkippedEntries::new("surge proxy line");
     for (index, line) in proxy_lines.iter().enumerate() {
         if proxy_line_builtin_policy(line).is_some() {
             continue;
         }
         match parse_surge_proxy_line(line, source_id) {
-            Ok(node) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Ok(node) => nodes.push(node),
             Err(error) => {
                 let (name, kind) = proxy_line_name_and_kind(line);
                 skipped.skip(index, name, kind, error);
@@ -2915,6 +2894,7 @@ fn parse_surge_proxy_line_subscription(
         }
     }
 
+    node_id::assign_subscription_node_ids(&mut nodes);
     skipped
         .finish(nodes, || {
             domain_error(
@@ -3238,7 +3218,6 @@ fn required_surge_proxy_option(
 
 fn parse_proxy_link_lines(source_id: &str, content: &str) -> DomainResult<SubscriptionDocument> {
     let mut nodes = Vec::new();
-    let mut seen_ids = BTreeSet::new();
     let mut skipped = SkippedEntries::new("share link");
     // An AnixOps `#anixops:path=<kind>` line describes the link after it.
     let mut path: Option<String> = None;
@@ -3285,8 +3264,9 @@ fn parse_proxy_link_lines(source_id: &str, content: &str) -> DomainResult<Subscr
             key: "subscription.source_id".to_string(),
             value: source_id.to_string(),
         });
-        push_unique_node(&mut nodes, &mut seen_ids, node);
+        nodes.push(node);
     }
+    node_id::assign_subscription_node_ids(&mut nodes);
     resolve_vias(&mut nodes);
 
     skipped.finish(nodes, || {

@@ -393,6 +393,19 @@ run URL 和状态，以 `task_state: pending_ci`、`next_action: resume_after_ci
 - iOS/Android 若有各自的分享链接解析器（如 Swift `ShadowsocksNodeLink`），应与内核保持一致：接受 `host:port/?query`、Hysteria2 省略端口为 443、SIP002 明文 userinfo 百分号解码。
 - node-import 的 hysteria2 出站目前不读 `hysteria2.server_ports`，端口跳跃列表只作为元数据保留，节点使用连接端口。
 
+## 客户端跟进：订阅节点稳定 id（fix/k2-node-id）
+
+订阅节点的 id 改为与名称、位置无关的稳定 id（规则见 `docs/architecture/subscription-node-ids.md`），升级内核后所有订阅节点的 id 都会变。客户端（AnixOps/anixops-net）按 git rev 固定内核，以下事项必须在客户端 PR 中完成，否则升级后第一次加载就会丢失用户的选择：
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- 迁移（必须，保留一个版本即 1.0.x）：升级后第一次加载**本地已保存的订阅内容**时（刷新之前），对保存的旧 id 用 `config_core::node_id::find_node`（或 node-import 报告里的 `ImportedNode.legacy_id`）找到节点，把新 id 写回。旧 id 依赖位置，刷新后的新内容不要再按旧 id 查找。要迁移的位置：
+  - client-core：`state.selected_node`、`group_choices`、按 id 保存的 NodeEdits（`changed`/`removed`）。
+  - Windows/Linux Tauri：`profile_node_id`、`embedded/profile.json` 里的策略组默认值、`embedded_nodes` 缓存、`node-edits.json`、`profile_node_catalog`。`single_node_envelope` 已按旧 id 回退并返回带新 id 的节点，调用方要把返回节点的 id 写回 `profile_node_id`。
+  - iOS/macOS：`NodeLibrary.selectedID`、`groupSelections`、联动组 default、保存的 `nodes[].id`、延迟缓存的键。iOS 保存的是导入报告而非原文时，可按 `legacy_id`，或按名称 + server + port 与保存的节点匹配。
+- 刷新后的兜底（建议）：所选 id 不在新节点列表里时回退默认节点并提示用户“所选节点已不在订阅中，已改用 X”，不要静默切换；提示文案进三端字符串目录（简中、繁中、英文）。
+- 客户端测试：刷新时在列表开头插入节点、重排、改名后所选节点和策略组选择不变；旧 id 迁移测试。
+- 发布说明提示：节点 id 格式改变；更换服务器地址、端口、传输或 SNI 的节点会被当作新节点。
+
 ## 后续预计人工事项
 
 iOS/macOS（Apple Developer、App Store Connect、TestFlight、App Review）与 Windows 代码签名相关的人工事项随客户端在 AnixOps/anixops-net 跟踪。

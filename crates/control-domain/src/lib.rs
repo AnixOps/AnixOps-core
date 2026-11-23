@@ -255,6 +255,11 @@ pub const NODE_METADATA_V2RAY_TRANSPORT_MODE: &str = "v2ray.transport.mode";
 /// XHTTP `extra` settings as the share link carries them (JSON text).
 pub const NODE_METADATA_V2RAY_TRANSPORT_EXTRA: &str = "v2ray.transport.extra";
 pub const NODE_METADATA_SOURCE_FORMAT: &str = "subscription.source_format";
+/// The id a subscription node had in releases before stable node ids
+/// (its name made ASCII plus a position-dependent suffix). Clients look a
+/// saved selection up by it once, on the subscription content they stored,
+/// and then save the node's current id; see `config_core::node_id`.
+pub const NODE_METADATA_LEGACY_ID: &str = "subscription.legacy_id";
 
 /// Operating system capability target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

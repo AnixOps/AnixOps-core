@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use config_core::{
-    parse_config_document, CoreConfigurationService, CoreSubscriptionService,
+    node_id, parse_config_document, CoreConfigurationService, CoreSubscriptionService,
     CONFIG_LISTENER_BIND_PORT_INVALID_CODE, CONFIG_LISTENER_NETWORK_UNSUPPORTED_CODE,
     CONFIG_LISTENER_ROUTE_CONFLICT_CODE, CONFIG_LISTENER_ROUTE_MISSING_CODE,
     CONFIG_MIGRATION_UNSUPPORTED_CODE, CONFIG_NODE_HOST_EMPTY_CODE, CONFIG_NODE_PORT_INVALID_CODE,
@@ -12,12 +12,13 @@ use config_core::{
 };
 use control_domain::{
     ConfigurationService, Diagnostic, ListenerKind, ListenerNetwork, ListenerRoute, MetadataEntry,
-    OperatingSystem, PlatformCapabilities, Protocol, RawSubscription, RouteAction, SchemaVersion,
-    SubscriptionService, SubscriptionSource, NODE_METADATA_HYSTERIA2_OBFS_MAX_PACKET_SIZE,
-    NODE_METADATA_HYSTERIA2_OBFS_MIN_PACKET_SIZE, NODE_METADATA_HYSTERIA2_OBFS_PASSWORD,
-    NODE_METADATA_HYSTERIA2_OBFS_TYPE, NODE_METADATA_HYSTERIA2_PASSWORD,
-    NODE_METADATA_HYSTERIA2_SERVER_PORTS, NODE_METADATA_SHADOWSOCKS_METHOD,
-    NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
+    NodeDescriptor, OperatingSystem, PlatformCapabilities, Protocol, RawSubscription, RouteAction,
+    SchemaVersion, SubscriptionService, SubscriptionSource,
+    NODE_METADATA_HYSTERIA2_OBFS_MAX_PACKET_SIZE, NODE_METADATA_HYSTERIA2_OBFS_MIN_PACKET_SIZE,
+    NODE_METADATA_HYSTERIA2_OBFS_PASSWORD, NODE_METADATA_HYSTERIA2_OBFS_TYPE,
+    NODE_METADATA_HYSTERIA2_PASSWORD, NODE_METADATA_HYSTERIA2_SERVER_PORTS,
+    NODE_METADATA_SHADOWSOCKS_METHOD, NODE_METADATA_SHADOWSOCKS_PASSWORD,
+    NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
     NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
     NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
     NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
@@ -155,7 +156,7 @@ fn parses_single_shadowsocks_url_subscription_into_node_catalog() {
 
     assert_eq!(catalog.nodes.len(), 1);
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "ss-82-47-34-99-11111");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "ss-82-47-34-99-11111");
     assert_eq!(node.name, "香港");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -203,7 +204,7 @@ fn parses_single_trojan_url_subscription_into_node_catalog() {
 
     assert_eq!(catalog.nodes.len(), 1);
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "trojan-example-com-443");
+    assert_stable_id(node, "trojan-example-com-443", "trojan-example-com-443");
     assert_eq!(node.name, "HK Trojan");
     assert_eq!(node.protocol, Protocol::Trojan);
     assert_eq!(node.endpoint.host, "example.com");
@@ -238,7 +239,7 @@ fn parses_single_vless_url_subscription_into_node_catalog() {
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "vless-example-net-443");
+    assert_stable_id(node, "vless-example-net-443", "vless-example-net-443");
     assert_eq!(node.name, "US VLESS");
     assert_eq!(node.protocol, Protocol::Vless);
     assert_eq!(node.endpoint.host, "example.net");
@@ -282,7 +283,11 @@ fn parses_single_vmess_url_subscription_into_node_catalog() {
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "vmess-edge-example-net-443");
+    assert_stable_id(
+        node,
+        "vmess-edge-example-net-443",
+        "vmess-edge-example-net-443",
+    );
     assert_eq!(node.name, "JP VMess");
     assert_eq!(node.protocol, Protocol::Vmess);
     assert_eq!(node.endpoint.host, "edge.example.net");
@@ -486,7 +491,7 @@ rules: []
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "clash-ss-hk-clash");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "clash-ss-hk-clash");
     assert_eq!(node.name, "HK Clash");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -550,7 +555,7 @@ fn parses_sing_box_json_subscription_into_node_catalog() {
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "sing-box-ss-hk-sing-box");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "sing-box-ss-hk-sing-box");
     assert_eq!(node.name, "HK sing-box");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -598,7 +603,11 @@ fn parses_hysteria2_and_tuic_share_links_with_quic_tls_options() {
 
     assert_eq!(catalog.nodes.len(), 2);
     let hysteria2 = &catalog.nodes[0];
-    assert_eq!(hysteria2.id, "hysteria2-edge-example-test-443");
+    assert_stable_id(
+        hysteria2,
+        "hysteria2-edge-example-test-443",
+        "hysteria2-edge-example-test-443",
+    );
     assert_eq!(hysteria2.name, "Hysteria 2");
     assert_eq!(hysteria2.protocol, Protocol::Hysteria2);
     assert_eq!(hysteria2.endpoint.host, "edge.example.test");
@@ -666,7 +675,11 @@ fn parses_hysteria2_and_tuic_share_links_with_quic_tls_options() {
     );
 
     let tuic = &catalog.nodes[1];
-    assert_eq!(tuic.id, "tuic-tuic-example-test-443");
+    assert_stable_id(
+        tuic,
+        "tuic-tuic-example-test-443",
+        "tuic-tuic-example-test-443",
+    );
     assert_eq!(tuic.name, "TUIC Node");
     assert_eq!(tuic.protocol, Protocol::Tuic);
     assert_metadata(
@@ -870,7 +883,11 @@ fn parses_hysteria2_and_tuic_sing_box_outbounds_into_node_catalog() {
 
     assert_eq!(catalog.nodes.len(), 2);
     let hysteria2 = &catalog.nodes[0];
-    assert_eq!(hysteria2.id, "sing-box-hysteria2-hysteria2-json");
+    assert_stable_id(
+        hysteria2,
+        "hysteria2-hy2-example-test-3000",
+        "sing-box-hysteria2-hysteria2-json",
+    );
     assert_eq!(hysteria2.endpoint.port, 3000);
     assert_eq!(hysteria2.protocol, Protocol::Hysteria2);
     assert_metadata(
@@ -897,7 +914,11 @@ fn parses_hysteria2_and_tuic_sing_box_outbounds_into_node_catalog() {
     );
 
     let tuic = &catalog.nodes[1];
-    assert_eq!(tuic.id, "sing-box-tuic-tuic-json");
+    assert_stable_id(
+        tuic,
+        "tuic-tuic-example-test-443",
+        "sing-box-tuic-tuic-json",
+    );
     assert_eq!(tuic.protocol, Protocol::Tuic);
     assert_metadata(
         &tuic.metadata,
@@ -1042,7 +1063,11 @@ static=Proxy, HK Quantumult X
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "quantumult-x-ss-hk-quantumult-x");
+    assert_stable_id(
+        node,
+        "ss-82-47-34-99-11111",
+        "quantumult-x-ss-hk-quantumult-x",
+    );
     assert_eq!(node.name, "HK Quantumult X");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -1106,7 +1131,7 @@ Proxy = select, HK Loon
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "loon-ss-hk-loon");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "loon-ss-hk-loon");
     assert_eq!(node.name, "HK Loon");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -1166,7 +1191,7 @@ Proxy = select, HK Surge
     assert_eq!(catalog.nodes.len(), 1);
     assert!(catalog.rules.is_empty());
     let node = &catalog.nodes[0];
-    assert_eq!(node.id, "surge-ss-hk-surge");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "surge-ss-hk-surge");
     assert_eq!(node.name, "HK Surge");
     assert_eq!(node.protocol, Protocol::Shadowsocks);
     assert_eq!(node.endpoint.host, "82.47.34.99");
@@ -1969,6 +1994,24 @@ fn assert_diagnostic(diagnostics: &[Diagnostic], code: &str) {
     );
 }
 
+/// Asserts that `node` has the stable id `{prefix}-{endpoint hash}` and that
+/// releases before stable ids called it `legacy`.
+fn assert_stable_id(node: &NodeDescriptor, prefix: &str, legacy: &str) {
+    let hash = node
+        .id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .unwrap_or_else(|| panic!("{} should start with {prefix}-", node.id));
+    assert_eq!(hash.len(), node_id::ENDPOINT_HASH_HEX, "{}", node.id);
+    assert!(
+        hash.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{}",
+        node.id
+    );
+    assert_eq!(node_id::legacy_node_id(node), Some(legacy));
+}
+
 fn assert_metadata(metadata: &[MetadataEntry], key: &str, value: &str) {
     assert!(
         metadata
@@ -2146,7 +2189,7 @@ Bad = trojan, bad.example.test, 99999, password=trojan-secret
     // The Surge reader took the section, not the Loon one.
     assert_eq!(document.nodes.len(), 1);
     let node = &document.nodes[0];
-    assert_eq!(node.id, "surge-ss-hk");
+    assert_stable_id(node, "ss-82-47-34-99-11111", "surge-ss-hk");
     assert_metadata(
         &node.metadata,
         NODE_METADATA_SOURCE_FORMAT,
@@ -2208,14 +2251,25 @@ V1 = vmess, v1.example.test, 443, username=00000000-0000-0000-0000-000000000001
         "{:?}",
         document.diagnostics
     );
-    let ids = document
+    let names = document
         .nodes
         .iter()
-        .map(|node| node.id.as_str())
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["T1", "T2", "V1"]);
+    let legacy_ids = document
+        .nodes
+        .iter()
+        .map(|node| node_id::legacy_node_id(node).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
-        ids,
+        legacy_ids,
         ["surge-trojan-t1", "surge-trojan-t2", "surge-vmess-v1"]
+    );
+    assert_stable_id(
+        &document.nodes[0],
+        "trojan-t1-example-test-443",
+        "surge-trojan-t1",
     );
     assert_metadata(
         &document.nodes[0].metadata,

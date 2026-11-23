@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use config_core::routing::{PolicyGroupSpec, RoutingSpec};
 use config_core::routing_import::ImportedRuleSet;
-use control_domain::{Endpoint, MetadataEntry, NodeDescriptor, Protocol};
+use control_domain::{Endpoint, MetadataEntry, NodeDescriptor, Protocol, NODE_METADATA_LEGACY_ID};
 use engine_embedded::config::RuntimeConfig;
 use engine_embedded::nodes::{
     outbound_for_node, routing_envelope, routing_envelope_with_sets, single_node_envelope,
@@ -497,6 +497,31 @@ fn unselected_envelope_skips_nodes_that_cannot_run() {
         single_node_envelope("p", &[unsupported, trojan()], Some("ss-obfs")).unwrap_err(),
         reason
     );
+}
+
+/// A selection saved before stable node ids names the node by its previous
+/// id; it still finds the node, which carries its current id to save.
+#[test]
+fn selection_saved_under_the_previous_id_finds_its_node() {
+    let mut chosen_before = trojan();
+    chosen_before.id = "trojan-edge-example-com-443-0123456789".to_string();
+    chosen_before.metadata.push(MetadataEntry {
+        key: NODE_METADATA_LEGACY_ID.to_string(),
+        value: "clash-trojan-01-2".to_string(),
+    });
+    let mut other = ss2022();
+    other.metadata.push(MetadataEntry {
+        key: NODE_METADATA_LEGACY_ID.to_string(),
+        value: "clash-ss-01".to_string(),
+    });
+    let nodes = [other, chosen_before];
+    let (envelope, chosen) = single_node_envelope("p", &nodes, Some("clash-trojan-01-2")).unwrap();
+    assert_eq!(chosen.id, "trojan-edge-example-com-443-0123456789");
+    assert_eq!(builds(&envelope), "trojan");
+    let (_, chosen) =
+        single_node_envelope("p", &nodes, Some("trojan-edge-example-com-443-0123456789")).unwrap();
+    assert_eq!(chosen.name, "trojan");
+    assert!(single_node_envelope("p", &nodes, Some("clash-trojan-01-3")).is_err());
 }
 
 #[test]
