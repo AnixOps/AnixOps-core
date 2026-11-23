@@ -44,11 +44,7 @@ pub async fn fetch(
                         return Err(FetchError::TooManyRedirects);
                     }
                     redirects += 1;
-                    let next = resolve_location(&url, &location).ok_or(FetchError::BadResponse)?;
-                    if url.tls && !next.tls {
-                        return Err(FetchError::InsecureRedirect);
-                    }
-                    url = next;
+                    url = next_hop(&url, &location)?;
                 }
             }
         }
@@ -144,6 +140,16 @@ fn redirect_location(raw: &[u8]) -> Option<String> {
         .find(|(name, _)| name.trim().eq_ignore_ascii_case("location"))
         .map(|(_, value)| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Where a redirect from `url` to `location` goes: never from `https` to
+/// `http`.
+fn next_hop(url: &ProbeUrl, location: &str) -> Result<ProbeUrl, FetchError> {
+    let next = resolve_location(url, location).ok_or(FetchError::BadResponse)?;
+    if url.tls && !next.tls {
+        return Err(FetchError::InsecureRedirect);
+    }
+    Ok(next)
 }
 
 /// `location` read against the URL `base` it came from: an absolute
@@ -283,6 +289,29 @@ mod tests {
         ] {
             assert!(resolved(from, location).is_none(), "{location}");
         }
+    }
+
+    #[test]
+    fn redirects_never_leave_https_for_http() {
+        let secure = base("https://example.com/list");
+        assert_eq!(
+            next_hop(&secure, "http://example.com/list"),
+            Err(FetchError::InsecureRedirect)
+        );
+        assert_eq!(
+            next_hop(&secure, "//cdn.example/list").map(|url| url.tls),
+            Ok(true)
+        );
+        assert_eq!(
+            next_hop(&secure, "ftp://example.com/list"),
+            Err(FetchError::BadResponse)
+        );
+        // Plain HTTP may move up to HTTPS.
+        let plain = base("http://example.com/list");
+        assert_eq!(
+            next_hop(&plain, "https://example.com/list").map(|url| url.tls),
+            Ok(true)
+        );
     }
 
     #[test]
