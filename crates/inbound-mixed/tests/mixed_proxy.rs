@@ -645,7 +645,19 @@ async fn socks5_udp_associate_relays_to_ip_and_domain_targets() {
         udp_packet(&ipv4, echo.port(), b"again")
     );
     assert_eq!(stats.udp_associations.load(Ordering::Relaxed), 1);
-    assert!(stats.bytes_down.load(Ordering::Relaxed) >= 24);
+    // The relay counts a reply after sending it, so the last reply can
+    // arrive before its bytes are counted.
+    let counted = tokio::time::timeout(Duration::from_secs(2), async {
+        while stats.bytes_down.load(Ordering::Relaxed) < 24 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        counted.is_ok(),
+        "{}",
+        stats.bytes_down.load(Ordering::Relaxed)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
