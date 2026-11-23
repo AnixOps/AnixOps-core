@@ -4292,7 +4292,7 @@ where
     for _ in 0..=HTTP_PROXY_MAX_INTERIM_RESPONSES {
         let head = match read_plain_http_proxy_response_head(reader) {
             Ok(head) => head,
-            Err(report) => return (report, interim),
+            Err(report) => return (*report, interim),
         };
         if (100..200).contains(&head.status_code) {
             // A protocol switch cannot be relayed as HTTP/1.1 messages.
@@ -4345,52 +4345,54 @@ struct NativePlainHttpProxyResponseHead {
 
 fn read_plain_http_proxy_response_head<R>(
     reader: &mut R,
-) -> Result<NativePlainHttpProxyResponseHead, NativePlainHttpProxyResponseReadReport>
+) -> Result<NativePlainHttpProxyResponseHead, Box<NativePlainHttpProxyResponseReadReport>>
 where
     R: Read,
 {
     let Some(raw) = read_http_header_bytes(reader) else {
-        return Err(NativePlainHttpProxyResponseReadReport {
+        return Err(Box::new(NativePlainHttpProxyResponseReadReport {
             response: None,
             diagnostics: vec![runtime_warning(
                 ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
                 "native plain HTTP proxy upstream response could not be read",
             )],
-        });
+        }));
     };
     let Ok(header_text) = std::str::from_utf8(&raw) else {
-        return Err(NativePlainHttpProxyResponseReadReport {
+        return Err(Box::new(NativePlainHttpProxyResponseReadReport {
             response: None,
             diagnostics: vec![runtime_warning(
                 ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
                 "native plain HTTP proxy upstream response header must be valid UTF-8",
             )],
-        });
+        }));
     };
     let Some((status_line, headers)) = parse_http_start_line_and_headers(header_text) else {
-        return Err(NativePlainHttpProxyResponseReadReport {
+        return Err(Box::new(NativePlainHttpProxyResponseReadReport {
             response: None,
             diagnostics: vec![runtime_warning(
                 ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
                 "native plain HTTP proxy upstream response header is invalid",
             )],
-        });
+        }));
     };
     let mut status_parts = status_line.splitn(3, ' ');
     let Some(version) = status_parts.next() else {
-        return Err(plain_http_proxy_response_read_failed());
+        return Err(Box::new(plain_http_proxy_response_read_failed()));
     };
     let Some(status_code) = status_parts
         .next()
         .and_then(|value| value.parse::<u16>().ok())
     else {
-        return Err(plain_http_proxy_response_read_failed());
+        return Err(Box::new(plain_http_proxy_response_read_failed()));
     };
     if !version.starts_with("HTTP/") {
-        return Err(plain_http_proxy_response_read_failed());
+        return Err(Box::new(plain_http_proxy_response_read_failed()));
     }
     if version != "HTTP/1.0" && version != "HTTP/1.1" {
-        return Err(plain_http_proxy_response_http_version_unsupported());
+        return Err(Box::new(
+            plain_http_proxy_response_http_version_unsupported(),
+        ));
     }
     let version = version.to_string();
     let reason_phrase = status_parts.next().unwrap_or("").to_string();

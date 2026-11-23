@@ -372,9 +372,13 @@ pub fn first_address(response: &[u8], question: &Question) -> Option<(IpAddr, Du
         .map(|address| (address, ttl))
 }
 
-/// A copy of `response` with the QR bit clear, so the question parser takes it.
+/// A copy of the start of `response` with the QR bit clear, so the question
+/// parser takes it. Only the header and the question matter, and the parser
+/// refuses messages longer than a query may be, so a long answer is cut to
+/// that length first (the question always fits inside it).
 fn as_query(response: &[u8]) -> Vec<u8> {
-    let mut query = response.to_vec();
+    let end = response.len().min(crate::dns::MAX_QUERY_LEN);
+    let mut query = response[..end].to_vec();
     query[2] &= 0x07;
     query[3] = 0;
     query
