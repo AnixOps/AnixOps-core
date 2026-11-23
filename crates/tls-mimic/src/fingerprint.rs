@@ -454,8 +454,10 @@ pub fn ech_inner_len<'a>(
                 versions += body
                     .get(1..)
                     .unwrap_or_default()
-                    .chunks_exact(2)
-                    .filter(|pair| is_grease(u16::from_be_bytes([pair[0], pair[1]])))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .filter(|pair| is_grease(u16::from_be_bytes(**pair)))
                     .count();
             }
             EXT_ECH
