@@ -298,13 +298,20 @@ fn context_json(invocation: &ScriptInvocation) -> String {
     Value::Object(context).to_string()
 }
 
-/// Header lists become plain objects; repeated names are joined with ", ".
+/// Header lists become plain objects; repeated names are joined with ", ",
+/// except `Cookie`, whose fields (HTTP/2 clients split it, RFC 9113
+/// section 8.2.3) are joined with "; " so the value stays one valid cookie
+/// list a script can read and hand back.
 pub(crate) fn headers_object(headers: &[(String, String)]) -> Value {
     let mut object = Map::new();
     for (name, value) in headers {
         match object.get_mut(name) {
             Some(Value::String(existing)) => {
-                existing.push_str(", ");
+                existing.push_str(if name.eq_ignore_ascii_case("cookie") {
+                    "; "
+                } else {
+                    ", "
+                });
                 existing.push_str(value);
             }
             _ => {
@@ -525,6 +532,26 @@ pub(crate) fn truncate_utf8(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_cookie_fields_join_as_one_cookie_list() {
+        let pairs = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let object = headers_object(&pairs(&[
+            ("cookie", "a=1"),
+            ("accept", "x"),
+            ("cookie", "b=2"),
+            ("accept", "y"),
+            ("Cookie", "c=3"),
+            ("Cookie", "d=4"),
+        ]));
+        assert_eq!(object["cookie"], "a=1; b=2");
+        assert_eq!(object["Cookie"], "c=3; d=4");
+        assert_eq!(object["accept"], "x, y");
+    }
 
     #[test]
     fn request_done_with_a_status_is_a_quantumult_echo_response() {

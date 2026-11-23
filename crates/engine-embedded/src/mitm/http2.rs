@@ -40,7 +40,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use control_domain::HttpMitmPhase;
+use control_domain::{HttpMitmPhase, MetadataEntry};
 use engine_native::NativePlainHttpMessage;
 use futures::stream::{FuturesUnordered, StreamExt};
 use h2::client::SendRequest;
@@ -377,10 +377,13 @@ impl MitmEngine {
             .to_string();
         let url = format!("https://{authority}{path}");
         let is_head = parts.method == Method::HEAD;
+        // Rules and scripts see one `cookie` field, as in HTTP/1.1; the
+        // capture keeps the fields as they came.
         let mut request_headers = vec![("host".to_string(), authority.to_string())];
-        request_headers.extend(header_list(&parts.headers));
+        request_headers.extend(plan_header_list(&parts.headers));
         let mut recording = capture.map(|capture| {
-            let mut recording = Recording::new(capture, &method, &url, &request_headers[1..]);
+            let mut recording =
+                Recording::new(capture, &method, &url, &header_list(&parts.headers));
             recording.exchange.http_version = HTTP_2;
             recording.publish();
             recording
@@ -482,6 +485,7 @@ impl MitmEngine {
             .to_string();
         let mut headers = header_map(&from_metadata(&report.headers));
         strip_connection_headers(&mut headers);
+        split_cookie_fields(&mut headers);
         if holds_request || !report.body.is_empty() && !stream_request {
             headers.remove(http::header::CONTENT_LENGTH);
             headers.insert(
@@ -504,15 +508,20 @@ impl MitmEngine {
         let mut upstream = upstream.ready().await.map_err(not_sent)?;
         if !stream_request {
             let trailers = request_trailers;
-            let end = report.body.is_empty() && trailers.is_none();
+            let sent_body = Bytes::from(report.body);
+            let end = sent_body.is_empty() && trailers.is_none();
             let (response, mut send) = upstream
                 .send_request(upstream_request, end)
                 .map_err(not_sent)?;
             if !end {
-                send_bytes(&mut send, Bytes::from(report.body)).await?;
+                send_bytes(&mut send, sent_body.clone()).await?;
                 finish(&mut send, trailers)?;
             }
             let response = response.await.map_err(h2_error)?;
+            let sent = SentRequest {
+                headers: report.headers,
+                body: Some(sent_body.to_vec()),
+            };
             return self
                 .respond_planned(
                     respond,
@@ -520,6 +529,7 @@ impl MitmEngine {
                     request_id,
                     url,
                     method,
+                    sent,
                     stream_response,
                     recording.as_mut(),
                     is_head,
@@ -527,6 +537,10 @@ impl MitmEngine {
                 )
                 .await;
         }
+        let sent = SentRequest {
+            headers: report.headers,
+            body: None,
+        };
         // The request body streams while the response is handled, so a
         // bidirectional stream (gRPC) keeps going both ways.
         let (response, mut send) = upstream
@@ -547,6 +561,7 @@ impl MitmEngine {
                 request_id,
                 url,
                 method,
+                sent,
                 stream_response,
                 recording.as_mut(),
                 is_head,
@@ -571,6 +586,7 @@ impl MitmEngine {
         request_id: String,
         url: String,
         method: String,
+        sent: SentRequest,
         stream_response: bool,
         mut recording: Option<&mut Recording<'_>>,
         is_head: bool,
@@ -606,6 +622,8 @@ impl MitmEngine {
                     status_code: Some(parts.status.as_u16()),
                     headers: to_metadata(&response_headers),
                     body: Vec::new(),
+                    request_headers: sent.headers,
+                    request_body: sent.body,
                 })
                 .await?;
             if report.terminal_action.is_some() {
@@ -668,6 +686,8 @@ impl MitmEngine {
                 status_code: Some(parts.status.as_u16()),
                 headers: to_metadata(&response_headers),
                 body: data,
+                request_headers: sent.headers,
+                request_body: sent.body,
             })
             .await?;
         let status = status(report.final_status_code, parts.status);
@@ -1100,6 +1120,76 @@ fn header_list(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The request a response answers, as the rules and request scripts left
+/// it, for the `$request` of response scripts.
+struct SentRequest {
+    headers: Vec<MetadataEntry>,
+    /// Only when the request body was held whole for a rule.
+    body: Option<Vec<u8>>,
+}
+
+/// Header pairs of a request for the rewrite hook: the `cookie` fields an
+/// HTTP/2 client splits (RFC 9113 section 8.2.3) are joined with "; " into
+/// one field where the first one was, so rules and scripts read and write
+/// one valid cookie list.
+fn plan_header_list(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut list: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    let mut cookie_at = None;
+    for (name, value) in header_list(headers) {
+        if name != http::header::COOKIE.as_str() {
+            list.push((name, value));
+            continue;
+        }
+        match cookie_at {
+            Some(index) => {
+                let joined = &mut list[index].1;
+                joined.push_str("; ");
+                joined.push_str(&value);
+            }
+            None => {
+                cookie_at = Some(list.len());
+                list.push((name, value));
+            }
+        }
+    }
+    list
+}
+
+/// Splits each `cookie` field back into one field per cookie pair, as an
+/// HTTP/2 client sends them (RFC 9113 section 8.2.3), so header compression
+/// keeps working for the pairs that do not change.
+fn split_cookie_fields(headers: &mut HeaderMap) {
+    let values = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    headers.remove(http::header::COOKIE);
+    for value in values {
+        let pairs = value
+            .to_str()
+            .ok()
+            .map(|text| {
+                text.split(';')
+                    .map(str::trim)
+                    .filter(|pair| !pair.is_empty())
+                    .filter_map(|pair| HeaderValue::from_str(pair).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if pairs.is_empty() {
+            headers.append(http::header::COOKIE, value);
+            continue;
+        }
+        for pair in pairs {
+            headers.append(http::header::COOKIE, pair);
+        }
+    }
+}
+
 /// A header map from the hook's pairs; names HTTP/2 cannot carry
 /// (upper case is lowered, invalid ones are dropped).
 fn header_map(headers: &[(String, String)]) -> HeaderMap {
@@ -1218,6 +1308,38 @@ mod tests {
         strip_connection_headers(&mut map);
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("x-test").unwrap(), "1");
+    }
+
+    #[test]
+    fn split_cookie_fields_are_joined_for_rules_and_split_on_the_way_out() {
+        let mut map = HeaderMap::new();
+        map.append(http::header::COOKIE, HeaderValue::from_static("a=1"));
+        map.append(http::header::ACCEPT, HeaderValue::from_static("x"));
+        map.append(http::header::COOKIE, HeaderValue::from_static("b=2"));
+        let list = plan_header_list(&map);
+        assert_eq!(
+            list,
+            vec![
+                ("cookie".to_string(), "a=1; b=2".to_string()),
+                ("accept".to_string(), "x".to_string()),
+            ]
+        );
+        // The capture still sees the fields as sent.
+        assert_eq!(header_list(&map).len(), 3);
+
+        // What a script hands back is one cookie list; it goes out split.
+        let mut out = header_map(&[
+            ("Cookie".to_string(), "a=1; b=3;  ;c=4".to_string()),
+            ("accept".to_string(), "x".to_string()),
+        ]);
+        split_cookie_fields(&mut out);
+        let cookies = out
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(cookies, ["a=1", "b=3", "c=4"]);
+        assert_eq!(out.get(http::header::ACCEPT).unwrap(), "x");
     }
 
     #[test]

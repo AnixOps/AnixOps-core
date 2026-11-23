@@ -7,7 +7,7 @@ The `$`-API is implemented once in Rust (`ScriptHost`):
 
 | Global | Behavior |
 |---|---|
-| `$request`, `$response` | URL, method, headers (object), UTF-8 body when `requires-body=true`; response status. |
+| `$request`, `$response` | URL, method, headers (object), UTF-8 body when `requires-body=true`; response status. Repeated header names are joined with `, `, except `Cookie` (HTTP/2 clients send one field per cookie), which is joined with `; ` so the value is one valid cookie list. A response script's `$request` is the request the response answers: its headers as the request rules and scripts left them, and, with `requires-body=true`, its body when the data plane held it (a request rule or script read it; a body that was streamed to the origin, is over `max-size`, or is not UTF-8 outside binary mode is left out). |
 | `$argument` | The line's `argument=` value. |
 | `$done(value)` | First call wins. Request phase: `url`, `headers`, `body`, or `response: {status, headers, body}` to answer without the origin. Response phase: `status` (number or status line), `headers`, `body`. `$done()` keeps the message. String bodies only. |
 | `$persistentStore.read/write/remove` | Shared key-value store; key ≤ 256 B, value ≤ 512 KiB, total ≤ 8 MiB. A missing key uses `networkcore.script.<tag>`. The file store (`JsonFileScriptStore`) writes a temporary sibling, flushes it to disk and renames it over the store (retried briefly when Windows holds the file); a write that changes nothing is skipped. `open_script_store` never fails a runtime: a file that is not a JSON object of strings is moved to `<path>.corrupt` (only the latest copy is kept) and the store starts empty; a file that cannot be read or moved leaves scripts an in-memory store. |

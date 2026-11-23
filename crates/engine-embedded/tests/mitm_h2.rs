@@ -146,9 +146,21 @@ impl TcpOutbound for H2Origin {
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or("-")
                             .to_string();
+                        // Cookie fields as the origin got them, one by one.
+                        let cookies = parts
+                            .headers
+                            .get_all("cookie")
+                            .iter()
+                            .map(|value| value.to_str().unwrap_or("?").to_string())
+                            .collect::<Vec<_>>();
+                        let cookies = if cookies.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" cookie={}", cookies.join("|"))
+                        };
                         requests
                             .send(format!(
-                                "{} {} {} {encoding}",
+                                "{} {} {} {encoding}{cookies}",
                                 parts.method,
                                 parts.uri,
                                 data.len()
@@ -597,6 +609,124 @@ async fn each_http2_stream_is_routed_on_its_own() {
     assert_eq!(a.opened.load(Ordering::SeqCst), 1);
     assert_eq!(b.opened.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+/// HTTP/2 clients split `Cookie` into one field per pair (RFC 9113 section
+/// 8.2.3). Scripts see one cookie list joined with "; ", a request script
+/// that hands the headers back does not merge them into one broken value,
+/// and a response script reads the request it answers.
+#[cfg(feature = "scripts")]
+#[tokio::test]
+async fn split_cookies_reach_scripts_as_one_list_and_the_origin_intact() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-mitm-h2-cookies-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let request_script = dir.join("request.js");
+    std::fs::write(&request_script, "$done({ headers: $request.headers });").unwrap();
+    let response_script = dir.join("response.js");
+    std::fs::write(
+        &response_script,
+        "$done({ body: $request.headers['cookie'] + '|' + $request.headers['x-token'] });",
+    )
+    .unwrap();
+    let plugin = "#!name = Cookies\n\
+[Script]\n\
+http-request ^https://api\\.example\\.test/data script-path=https://scripts.example.test/request.js, tag=request\n\
+http-response ^https://api\\.example\\.test/data script-path=https://scripts.example.test/response.js, requires-body=true, tag=response\n\
+\n\
+[MITM]\n\
+hostname = api.example.test\n";
+    let device_root = root("NetworkCore Test Device Root");
+    let origin_root = root("NetworkCore Test Origin Root");
+    let mut config = mitm_config(&device_root);
+    config.policy = String::new();
+    config.plugins = vec![plugin.to_string()];
+    config.script_assets = [
+        (
+            "https://scripts.example.test/request.js".to_string(),
+            request_script.display().to_string(),
+        ),
+        (
+            "https://scripts.example.test/response.js".to_string(),
+            response_script.display().to_string(),
+        ),
+    ]
+    .into();
+    let engine = Arc::new(
+        MitmEngine::new(&config)
+            .unwrap()
+            .with_upstream_config(trusting(&origin_root.certificate, &[b"http/1.1"])),
+    );
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(H2Origin::new(&origin_root, requests_tx));
+    let target: SocketAddr = "192.0.2.32:443".parse().unwrap();
+
+    let (app, mut tunnel_side) = tokio::io::duplex(256 * 1024);
+    let client = tokio::spawn({
+        let config = trusting(&device_root.certificate, &[b"h2", b"http/1.1"]);
+        async move {
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let tls = connector
+                .connect(ServerName::try_from(HOST).unwrap(), app)
+                .await
+                .expect("the client trusts the device root");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+            let (client, connection) = h2::client::handshake(tls).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut client = client.ready().await.unwrap();
+            let request = Request::builder()
+                .method("GET")
+                .uri("https://api.example.test/data")
+                .header("cookie", "a=1")
+                .header("x-token", "abc")
+                .header("cookie", "b=2")
+                .body(())
+                .unwrap();
+            let (response, _) = client.send_request(request, true).unwrap();
+            let (parts, mut received) = response.await.unwrap().into_parts();
+            assert_eq!(parts.status, StatusCode::OK);
+            String::from_utf8(read_body(&mut received).await).unwrap()
+        }
+    });
+
+    let mut first = vec![0u8; 4096];
+    let n = tunnel_side.read(&mut first).await.unwrap();
+    first.truncate(n);
+    let host = engine.claim(&first, target).expect("intercepted");
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    origin.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    let body = tokio::time::timeout(Duration::from_secs(20), client)
+        .await
+        .expect("client finished")
+        .unwrap();
+    assert_eq!(body, "a=1; b=2|abc");
+    // The origin got each cookie as its own field again, never `a=1, b=2`.
+    let seen = requests.recv().await.unwrap();
+    assert!(seen.ends_with(" cookie=a=1|b=2"), "{seen}");
+    server.abort();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Bytes the going-away origin answers its one request with: more than one

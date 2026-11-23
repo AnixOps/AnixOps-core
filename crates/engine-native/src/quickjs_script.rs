@@ -285,8 +285,18 @@ impl NativeQuickJsScriptExecutor {
                 ScriptRequest {
                     url: message.url.clone(),
                     method,
-                    headers: Vec::new(),
-                    body: None,
+                    // The request this response answers, as Loon and Surge
+                    // give response scripts.
+                    headers: message
+                        .request_headers
+                        .iter()
+                        .map(|header| (header.key.clone(), header.value.clone()))
+                        .collect(),
+                    body: request_body_for_response_script(
+                        dispatch,
+                        message.request_body.as_deref(),
+                        max_body_bytes,
+                    ),
                 },
                 Some(ScriptResponse {
                     status: message.status_code.unwrap_or(200),
@@ -509,6 +519,24 @@ impl NativeQuickJsScriptExecutor {
             cache.put(script_url, &metadata, source.clone());
         }
         Ok(source)
+    }
+}
+
+/// The request body a response script sees as `$request.body`: only with
+/// `requires-body`, only when the data plane held it, and only when it fits
+/// the dispatch's body limit. A body the script's mode cannot carry (not
+/// UTF-8 in text mode) is left out instead of deferring the script, since
+/// the response is what the script works on.
+fn request_body_for_response_script(
+    dispatch: &HttpMitmScriptDispatch,
+    body: Option<&[u8]>,
+    max_body_bytes: usize,
+) -> Option<String> {
+    let body = body.filter(|body| dispatch.requires_body && body.len() <= max_body_bytes)?;
+    if dispatch.binary_body_mode {
+        Some(binary_body_string(body))
+    } else {
+        std::str::from_utf8(body).ok().map(str::to_string)
     }
 }
 

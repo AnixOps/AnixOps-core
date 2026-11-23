@@ -893,6 +893,68 @@ hostname = api.example.test\n";
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A response script reads the request it answers (`$request.headers`) as
+/// the request rules left it.
+#[cfg(feature = "scripts")]
+#[tokio::test]
+async fn response_scripts_read_the_request_headers() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-mitm-request-scripts-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("echo.js");
+    std::fs::write(
+        &script,
+        "$done({ body: [$request.method, $request.headers['X-Token'], $request.headers['Cookie'],\
+         $request.headers['X-Added'], $response.body].join('|') });",
+    )
+    .unwrap();
+    let plugin = "#!name = Echo\n\
+[Rewrite]\n\
+^https://api\\.example\\.test/data header-add X-Added rule\n\
+\n\
+[Script]\n\
+http-response ^https://api\\.example\\.test/data script-path=https://scripts.example.test/echo.js, requires-body=true, tag=echo\n\
+\n\
+[MITM]\n\
+hostname = api.example.test\n";
+    let device_root = root("NetworkCore Test Device Root");
+    let origin_root = root("NetworkCore Test Origin Root");
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let config = MitmConfig {
+        policy: String::new(),
+        plugins: vec![plugin.to_string()],
+        ca_certificate: base64.encode(&device_root.certificate),
+        ca_private_key: base64.encode(x963(&device_root.key)),
+        script_assets: [(
+            "https://scripts.example.test/echo.js".to_string(),
+            script.display().to_string(),
+        )]
+        .into(),
+        resource_assets: Default::default(),
+        script_store_path: None,
+    };
+    let engine = Arc::new(
+        MitmEngine::new(&config)
+            .unwrap()
+            .with_upstream_config(trusting(&origin_root.certificate, &[b"http/1.1"])),
+    );
+    let (requests_tx, _requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(Origin::new(&origin_root, requests_tx));
+
+    let (head, body) = exchange(
+        engine,
+        origin,
+        &device_root,
+        b"GET /data HTTP/1.1\r\nHost: api.example.test\r\nX-Token: abc\r\nCookie: a=1; b=2\r\n\r\n",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "GET|abc|a=1; b=2|rule|hello from origin");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(feature = "scripts")]
 #[tokio::test]
 async fn scheduled_scripts_run_by_hand_and_on_network_changes() {

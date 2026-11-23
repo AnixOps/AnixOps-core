@@ -20,6 +20,8 @@ fn respond_action_replaces_the_request_with_a_local_response() {
             value: "api.networkcore.test".to_string(),
         }],
         body: Vec::new(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
     let outcome = HttpMitmOutcome {
         action: HttpMitmAction::Respond {

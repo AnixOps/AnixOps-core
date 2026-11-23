@@ -1298,6 +1298,8 @@ fn plain_http_rewrite_application_applies_header_body_and_defers_script_dispatch
             },
         ],
         body: b"from=1".to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
     let outcome = HttpMitmOutcome {
         action: HttpMitmAction::Continue,
@@ -1447,6 +1449,8 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
             value: "application/json".to_string(),
         }],
         body: b"{}".to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
 
     let request_execution = executor.execute(&request_dispatch, &request);
@@ -1495,6 +1499,8 @@ fn node_script_executor_runs_explicit_local_asset_with_persistent_store() {
             value: "application/json".to_string(),
         }],
         body: b"{\"from\":\"upstream\"}".to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
 
     let response_execution = executor.execute(&response_dispatch, &response);
@@ -1577,6 +1583,8 @@ fn native_http_mitm_hook_applies_locally_mapped_script_dispatch() {
             value: "application/json".to_string(),
         }],
         body: b"{}".to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
 
     let report = hook.plan_plain_http(&message);
@@ -1636,6 +1644,8 @@ fn native_http_mitm_hook_fails_open_when_local_script_runner_cannot_start() {
             value: "application/json".to_string(),
         }],
         body: b"{}".to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
 
     let report = hook.plan_plain_http(&message);
@@ -1674,6 +1684,8 @@ fn plain_http_rewrite_plan_applies_plugin_reject_to_terminal_response() {
         status_code: None,
         headers: Vec::new(),
         body: Vec::new(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
 
     let report = plan_and_apply_plain_http_mitm(
@@ -2340,6 +2352,8 @@ fn explicit_https_request_rewrite_preview_applies_headers_and_defers_body_and_sc
             value: "old".to_string(),
         }],
         body: b"request-body".to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
     let outcome = HttpMitmOutcome {
         action: HttpMitmAction::Continue,
@@ -2440,6 +2454,8 @@ fn explicit_https_response_rewrite_preview_applies_headers_body_and_defers_scrip
             },
         ],
         body: b"response-body".to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
     let outcome = HttpMitmOutcome {
         action: HttpMitmAction::Continue,

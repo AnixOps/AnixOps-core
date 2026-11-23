@@ -757,6 +757,8 @@ impl MitmEngine {
                     status_code: None,
                     headers: to_metadata(&request.headers),
                     body: request_body,
+                    request_headers: Vec::new(),
+                    request_body: None,
                 })
                 .await?;
             let client_close = request.has_token("Connection", "close") || version == "HTTP/1.0";
@@ -824,6 +826,10 @@ impl MitmEngine {
             } else {
                 origin.write_all(&report.body).await?;
             }
+            // The request as the rules and request scripts left it, for the
+            // `$request` of response scripts; its body only when it was held.
+            let sent_headers = report.headers;
+            let sent_body = (!stream_request).then_some(report.body);
 
             // Interim 1xx responses go straight to the client.
             let (response, status) = loop {
@@ -952,6 +958,8 @@ impl MitmEngine {
                         status_code: Some(status),
                         headers: to_metadata(&response.headers),
                         body: Vec::new(),
+                        request_headers: sent_headers,
+                        request_body: sent_body,
                     })
                     .await?;
                 if report.terminal_action.is_some() {
@@ -1014,6 +1022,8 @@ impl MitmEngine {
                     status_code: Some(status),
                     headers: to_metadata(&response_headers),
                     body: response_body,
+                    request_headers: sent_headers,
+                    request_body: sent_body,
                 })
                 .await?;
             let mut head = response_head(

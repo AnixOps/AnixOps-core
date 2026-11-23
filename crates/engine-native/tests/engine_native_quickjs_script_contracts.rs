@@ -162,6 +162,8 @@ fn message(phase: HttpMitmPhase, body: &str) -> NativePlainHttpMessage {
             value: "application/json".to_string(),
         }],
         body: body.as_bytes().to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     }
 }
 
@@ -195,6 +197,52 @@ fn quickjs_response_script_rewrites_body_and_persists_store() {
         .any(|header| header.key == "X-Script" && header.value == "1"));
     let stored = std::fs::read_to_string(&store).expect("store file should be written");
     assert!(stored.contains("\"last\":\"seen\""), "{stored}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn quickjs_response_script_reads_the_request_it_answers() {
+    let dir = temp_dir("response-request");
+    let script = dir.join("request-in-response.js");
+    std::fs::write(
+        &script,
+        "$done({ body: [$request.method, $request.headers['Cookie'], $request.headers['Content-Type'],\
+         String($request.body), $response.headers['Content-Type'], $response.body].join('|') });",
+    )
+    .unwrap();
+    let hook = hook(executor(&script, None), 1000);
+    let mut response = message(HttpMitmPhase::Response, "{\"ok\":true}");
+    response.method = Some("POST".to_string());
+    response.request_headers = vec![
+        MetadataEntry {
+            key: "Cookie".to_string(),
+            value: "session=abc; theme=dark".to_string(),
+        },
+        MetadataEntry {
+            key: "Content-Type".to_string(),
+            value: "application/x-www-form-urlencoded".to_string(),
+        },
+    ];
+    response.request_body = Some(b"user=1".to_vec());
+
+    let report = hook.plan_plain_http(&response);
+
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+    assert_eq!(
+        String::from_utf8(report.body).unwrap(),
+        "POST|session=abc; theme=dark|application/x-www-form-urlencoded|user=1|application/json|{\"ok\":true}"
+    );
+
+    // A request body text mode cannot carry, or one past the limit, is left
+    // out; the response script still runs.
+    for body in [vec![0xff, 0xfe], vec![b'a'; 4097]] {
+        response.request_body = Some(body);
+        let report = hook.plan_plain_http(&response);
+        assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+        assert!(String::from_utf8(report.body)
+            .unwrap()
+            .contains("|application/x-www-form-urlencoded|undefined|"),);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
