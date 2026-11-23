@@ -1154,6 +1154,7 @@ async fn run_udp_flow(
                     in_port: None,
                     port: Some(app.port()),
                 },
+                lan_peer: None,
             };
             dispatcher.open_origin_udp_flow(&target, None, origin).await
         });
@@ -1448,6 +1449,7 @@ async fn handle_tcp(
     let origin = FlowOrigin {
         process: process.as_deref(),
         source,
+        lan_peer: None,
     };
     let connect = dispatcher.connect_origin_flow(&target, host.as_deref(), origin, http.as_ref());
     let mut remote = match tokio::time::timeout(settings.connect_timeout, connect).await {

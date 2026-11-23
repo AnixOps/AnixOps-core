@@ -29,6 +29,7 @@ use tokio::sync::oneshot;
 
 use crate::config::RuntimeConfig;
 use crate::connections::{Dispatcher, FlowOrigin};
+use crate::lan_guard::LanPeer;
 use crate::lan_share::{LanShare, LanShareSlot};
 use crate::replay_proxy::{ReplayProxy, ReplayProxySlot};
 use crate::routing::FlowSource;
@@ -226,9 +227,7 @@ impl LocalProxy {
         let shared = self.lan_share.control(request, |options| {
             LanShare::start(
                 self.dispatcher.clone(),
-                self.decrypting
-                    .clone()
-                    .map(|decrypting| decrypting as Arc<dyn ClientInterceptor>),
+                self.decrypting.clone(),
                 self.ca_certificate.clone(),
                 options,
             )
@@ -305,6 +304,7 @@ impl ProcessRouting {
         let origin = FlowOrigin {
             process: process.as_deref(),
             source: client_source(client),
+            lan_peer: None,
         };
         self.0
             .connect_origin_flow(target, None, origin, http.as_ref())
@@ -343,8 +343,9 @@ impl ClientConnector for ProcessRouting {
 }
 
 /// The config's `mitm` section on the local listener: claimed connections go
-/// to the same [`FlowInterceptor`] the packet tunnel uses.
-pub(crate) struct Decrypting {
+/// to the same [`FlowInterceptor`] the packet tunnel uses. The LAN share
+/// serves it through `LanDecrypting`, which marks its flows.
+pub struct Decrypting {
     dispatcher: Arc<Dispatcher>,
     interceptor: Arc<dyn FlowInterceptor>,
     settings: TunnelSettings,
@@ -375,18 +376,17 @@ fn flow_addr(target: &TargetAddr) -> SocketAddr {
     }
 }
 
-impl ClientInterceptor for Decrypting {
-    fn claim(&self, target: &TargetAddr, first: &[u8]) -> Option<String> {
-        self.interceptor.claim(first, flow_addr(target))
-    }
-
-    fn serve<'a>(
+impl Decrypting {
+    /// Serves a claimed connection of `client`; `lan_peer` is set for
+    /// another device using the LAN share.
+    fn serve_client<'a>(
         &'a self,
         client: ClientAddrs,
         target: &'a TargetAddr,
         host: String,
         stream: BoxStream,
         first: Vec<u8>,
+        lan_peer: Option<LanPeer>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             crate::tunnel::bump(&self.stats.mitm_flows);
@@ -397,6 +397,7 @@ impl ClientInterceptor for Decrypting {
                 host: &host,
                 http: http.as_ref(),
                 source: client_source(client),
+                lan_peer,
             };
             let flow = InterceptedFlow {
                 inbound: stream,
@@ -411,6 +412,50 @@ impl ClientInterceptor for Decrypting {
     }
 }
 
+impl ClientInterceptor for Decrypting {
+    fn claim(&self, target: &TargetAddr, first: &[u8]) -> Option<String> {
+        self.interceptor.claim(first, flow_addr(target))
+    }
+
+    fn serve<'a>(
+        &'a self,
+        client: ClientAddrs,
+        target: &'a TargetAddr,
+        host: String,
+        stream: BoxStream,
+        first: Vec<u8>,
+    ) -> BoxFuture<'a, ()> {
+        self.serve_client(client, target, host, stream, first, None)
+    }
+}
+
+/// [`Decrypting`] on the LAN share's listener: the decrypted connections of
+/// other devices carry their [`LanPeer`], so DIRECT does not take them to
+/// this computer itself either (see [`crate::lan_guard`]).
+pub(crate) struct LanDecrypting {
+    pub(crate) decrypting: Arc<Decrypting>,
+    pub(crate) block_private_networks: bool,
+}
+
+impl ClientInterceptor for LanDecrypting {
+    fn claim(&self, target: &TargetAddr, first: &[u8]) -> Option<String> {
+        self.decrypting.claim(target, first)
+    }
+
+    fn serve<'a>(
+        &'a self,
+        client: ClientAddrs,
+        target: &'a TargetAddr,
+        host: String,
+        stream: BoxStream,
+        first: Vec<u8>,
+    ) -> BoxFuture<'a, ()> {
+        let lan_peer = crate::lan_share::lan_peer(client, self.block_private_networks);
+        self.decrypting
+            .serve_client(client, target, host, stream, first, lan_peer)
+    }
+}
+
 /// Connects an intercepted flow to what the client asked the proxy for, a
 /// name included, instead of the placeholder address the interceptor holds.
 struct RequestedTarget<'a> {
@@ -419,6 +464,7 @@ struct RequestedTarget<'a> {
     host: &'a str,
     http: Option<&'a sniff::HttpRequestHead>,
     source: FlowSource,
+    lan_peer: Option<LanPeer>,
 }
 
 impl TcpOutbound for RequestedTarget<'_> {
@@ -433,6 +479,7 @@ impl TcpOutbound for RequestedTarget<'_> {
         let origin = FlowOrigin {
             process: None,
             source: self.source,
+            lan_peer: self.lan_peer,
         };
         Box::pin(
             self.dispatcher

@@ -65,6 +65,7 @@ pub mod first_payload;
 pub mod http1;
 pub(crate) mod icmp;
 pub mod interface;
+pub mod lan_guard;
 #[cfg(feature = "local-proxy")]
 pub mod lan_share;
 #[cfg(feature = "local-proxy")]
@@ -417,18 +418,19 @@ impl EmbeddedRuntime {
         dispatcher: &Arc<Dispatcher>,
         request: &[u8],
     ) -> Option<Result<Vec<u8>, RuntimeError>> {
-        let decrypting =
-            || -> Result<Option<Arc<dyn inbound_mixed::ClientInterceptor>>, RuntimeError> {
-                Ok(match &self.interceptor {
-                    Some(interceptor) => Some(Arc::new(local_proxy::Decrypting::new(
-                        dispatcher.clone(),
-                        interceptor.clone(),
-                        tunnel_settings(&self.config)?,
-                    ))
-                        as Arc<dyn inbound_mixed::ClientInterceptor>),
-                    None => None,
-                })
-            };
+        let decrypting = || -> Result<Option<Arc<local_proxy::Decrypting>>, RuntimeError> {
+            Ok(match &self.interceptor {
+                Some(interceptor) => Some(Arc::new(local_proxy::Decrypting::new(
+                    dispatcher.clone(),
+                    interceptor.clone(),
+                    tunnel_settings(&self.config)?,
+                ))),
+                None => None,
+            })
+        };
+        let as_interceptor = |decrypting: Option<Arc<local_proxy::Decrypting>>| {
+            decrypting.map(|decrypting| decrypting as Arc<dyn inbound_mixed::ClientInterceptor>)
+        };
         let replay = self.replay_proxy.control(request, |decrypt| {
             if self.tunnel.is_none() {
                 return Err(RuntimeError::new(
@@ -436,7 +438,11 @@ impl EmbeddedRuntime {
                     "replay proxy needs a running tunnel",
                 ));
             }
-            let interceptor = if decrypt { decrypting()? } else { None };
+            let interceptor = if decrypt {
+                as_interceptor(decrypting()?)
+            } else {
+                None
+            };
             replay_proxy::ReplayProxy::start(dispatcher.clone(), interceptor)
         });
         if replay.is_some() {
@@ -449,7 +455,7 @@ impl EmbeddedRuntime {
         let system = self.system_proxy.control(request, |port| {
             system_proxy::SystemProxy::start(
                 dispatcher.clone(),
-                decrypting()?,
+                as_interceptor(decrypting()?),
                 system_proxy::SystemProxyOptions {
                     port,
                     max_connections: self.config.limits.max_tcp_connections,

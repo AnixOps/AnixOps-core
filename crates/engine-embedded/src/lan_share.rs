@@ -10,6 +10,13 @@
 //! private and link-local addresses are answered
 //! ([`PeerFilter::PrivateNetworks`]), optionally with proxy credentials.
 //!
+//! A device's flows that go DIRECT never reach this computer itself: its
+//! loopback (`127.0.0.0/8`, `::1`, `localhost`), its other interface
+//! addresses, link-local addresses and, with `block_private_networks`,
+//! private networks are refused after routing and name resolution, whatever
+//! the rules say; see [`crate::lan_guard`]. The computer's own programs
+//! (loopback clients of the share) are not checked.
+//!
 //! The listener also serves a setup page ([`PAGE_HOST`]): opening
 //! `http://<computer>:<port>/` on the phone (what the desktop client puts in
 //! a QR code) shows the proxy address to enter and the downloads of the
@@ -24,7 +31,7 @@
 //! | `cmd` | Request fields | Answer |
 //! | --- | --- | --- |
 //! | `lan_share` | | [`LanShareStatus`] |
-//! | `start_lan_share` | optional `port` (default [`DEFAULT_PORT`], `0` picks one), `username` and `password` | [`LanShareStatus`]; a running share is restarted with the new settings |
+//! | `start_lan_share` | optional `port` (default [`DEFAULT_PORT`], `0` picks one), `username` and `password`, `block_private_networks` (default `false`) | [`LanShareStatus`]; a running share is restarted with the new settings |
 //! | `stop_lan_share` | | [`LanShareStatus`] |
 
 use std::io;
@@ -45,6 +52,8 @@ use tokio::sync::oneshot;
 
 use crate::connections::{Dispatcher, FlowOrigin};
 use crate::control::MAX_REQUEST_LEN;
+use crate::lan_guard::LanPeer;
+use crate::local_proxy::{Decrypting, LanDecrypting};
 use crate::{RuntimeError, RuntimeErrorCode};
 
 /// The made-up host name the setup page answers to through the proxy.
@@ -64,6 +73,10 @@ pub struct LanShareOptions {
     pub port: u16,
     /// Proxy credentials the phone must send; the setup page needs none.
     pub credentials: Option<Credentials>,
+    /// Also refuse DIRECT flows of other devices to private networks
+    /// (RFC 1918, `100.64.0.0/10`, IPv6 ULA), not only to this computer;
+    /// see [`crate::lan_guard`].
+    pub block_private_networks: bool,
 }
 
 /// A running share. Stops when dropped.
@@ -72,18 +85,19 @@ pub struct LanShare {
     https_decryption: bool,
     certificate: bool,
     credentials: bool,
+    block_private_networks: bool,
     stats: Arc<MixedStats>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl LanShare {
-    /// Starts listening for `dispatcher`'s flows. `interceptor` decrypts
+    /// Starts listening for `dispatcher`'s flows. `decrypting` decrypts
     /// HTTPS like on the computer's own listener; `certificate_der` is the
     /// root the setup page offers, normally that of the `mitm` section.
     pub fn start(
         dispatcher: Arc<Dispatcher>,
-        interceptor: Option<Arc<dyn ClientInterceptor>>,
+        decrypting: Option<Arc<Decrypting>>,
         certificate_der: Option<Vec<u8>>,
         options: LanShareOptions,
     ) -> Result<Self, RuntimeError> {
@@ -107,6 +121,14 @@ impl LanShare {
             .local_addr()
             .map_err(|_| resource("lan share listener could not start"))?
             .port();
+        let block_private_networks = options.block_private_networks;
+        // Decrypted connections of other devices are marked like the others.
+        let interceptor = decrypting.map(|decrypting| {
+            Arc::new(LanDecrypting {
+                decrypting,
+                block_private_networks,
+            }) as Arc<dyn ClientInterceptor>
+        });
         let https_decryption = interceptor.is_some();
         let certificate = certificate_der.map(|der| Arc::new(Certificate::new(der)));
         let pages = SetupPages {
@@ -121,7 +143,10 @@ impl LanShare {
             pages: Some(Arc::new(pages)),
             ..MixedSettings::default()
         };
-        let connector = Arc::new(LanClients(dispatcher)) as Arc<dyn ClientConnector>;
+        let connector = Arc::new(LanClients {
+            dispatcher,
+            block_private_networks,
+        }) as Arc<dyn ClientConnector>;
         let stats = Arc::new(MixedStats::default());
         let thread_stats = stats.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -149,6 +174,7 @@ impl LanShare {
             https_decryption,
             certificate: certificate.is_some(),
             credentials,
+            block_private_networks,
             stats,
             shutdown_tx: Some(shutdown_tx),
             thread: Some(thread),
@@ -178,6 +204,7 @@ impl LanShare {
             https_decryption: self.https_decryption,
             certificate: self.certificate,
             credentials: self.credentials,
+            block_private_networks: self.block_private_networks,
             accepted: self.stats.accepted.load(Ordering::Relaxed),
             rejected: self.stats.rejected.load(Ordering::Relaxed),
             active: self.stats.active.load(Ordering::Relaxed),
@@ -218,6 +245,9 @@ pub struct LanShareStatus {
     pub certificate: bool,
     /// Whether the proxy asks for credentials.
     pub credentials: bool,
+    /// Whether other devices' DIRECT flows to private networks are refused
+    /// as well; flows to this computer itself always are.
+    pub block_private_networks: bool,
     /// Client connections accepted, refused (not from a private address,
     /// or over the connection limit), open now, and setup pages served.
     pub accepted: u64,
@@ -279,6 +309,7 @@ impl LanShareSlot {
                 port,
                 username,
                 password,
+                block_private_networks,
             } => {
                 let username = username.filter(|username| !username.is_empty());
                 let password = password.filter(|password| !password.is_empty());
@@ -298,7 +329,12 @@ impl LanShareSlot {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 // Free the port before a restart binds it again.
                 drop(slot.take());
-                start(LanShareOptions { port, credentials }).map(|share| {
+                start(LanShareOptions {
+                    port,
+                    credentials,
+                    block_private_networks,
+                })
+                .map(|share| {
                     let status = share.status();
                     *slot = Some(share);
                     status
@@ -329,6 +365,8 @@ enum LanShareControl {
         username: Option<String>,
         #[serde(default)]
         password: Option<String>,
+        #[serde(default)]
+        block_private_networks: bool,
     },
     #[serde(rename = "stop_lan_share")]
     Stop,
@@ -344,8 +382,24 @@ pub fn device_label(peer: IpAddr) -> String {
     format!("LAN {}", peer.to_canonical())
 }
 
-/// Routes a phone's connections, named by the phone's address.
-struct LanClients(Arc<Dispatcher>);
+/// How the flows of `client` are checked: another device is a [`LanPeer`];
+/// this computer's own programs (a loopback client) are not checked.
+pub(crate) fn lan_peer(client: ClientAddrs, block_private_networks: bool) -> Option<LanPeer> {
+    if client.peer.ip().to_canonical().is_loopback() {
+        return None;
+    }
+    Some(LanPeer {
+        via: client.local.ip().to_canonical(),
+        block_private_networks,
+    })
+}
+
+/// Routes a phone's connections, named by the phone's address and kept away
+/// from this computer itself (see [`crate::lan_guard`]).
+struct LanClients {
+    dispatcher: Arc<Dispatcher>,
+    block_private_networks: bool,
+}
 
 impl ClientConnector for LanClients {
     fn connect_client<'a>(
@@ -358,10 +412,17 @@ impl ClientConnector for LanClients {
             let origin = FlowOrigin {
                 process: Some(&label),
                 source: crate::local_proxy::client_source(client),
+                lan_peer: lan_peer(client, self.block_private_networks),
             };
-            self.0.connect_origin_flow(target, None, origin, None).await
+            self.dispatcher
+                .connect_origin_flow(target, None, origin, None)
+                .await
         })
     }
+
+    // No `open_client_udp`: the share does not answer UDP ASSOCIATE
+    // (`MixedSettings::udp` stays off). Answering it needs the same check
+    // on the UDP path of the dispatcher first.
 }
 
 /// The root certificate in the forms phones install.
@@ -839,6 +900,82 @@ mod tests {
             device_label("::ffff:192.168.1.23".parse().unwrap()),
             "LAN 192.168.1.23"
         );
+    }
+
+    #[test]
+    fn other_devices_are_lan_peers_and_this_computer_is_not() {
+        let own = ClientAddrs {
+            peer: "127.0.0.1:50000".parse().unwrap(),
+            local: "127.0.0.1:8899".parse().unwrap(),
+        };
+        assert_eq!(lan_peer(own, true), None);
+        let phone = ClientAddrs {
+            peer: "[::ffff:192.168.1.23]:50000".parse().unwrap(),
+            local: "[::ffff:192.168.1.5]:8899".parse().unwrap(),
+        };
+        assert_eq!(
+            lan_peer(phone, true),
+            Some(LanPeer {
+                via: "192.168.1.5".parse().unwrap(),
+                block_private_networks: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_phone_cannot_reach_this_computers_loopback_services() {
+        // A service that listens on loopback only, like a database or the
+        // Docker API.
+        let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = service.local_addr().unwrap().port();
+        let clients = LanClients {
+            dispatcher: Arc::new(Dispatcher::single(Arc::new(
+                crate::direct::DirectOutbound::new(Arc::new(engine_outbound::TcpDialer)),
+            ))),
+            block_private_networks: false,
+        };
+        let phone = ClientAddrs {
+            peer: "192.168.1.23:50000".parse().unwrap(),
+            local: "192.0.2.5:8899".parse().unwrap(),
+        };
+        let mut targets = vec![
+            TargetAddr::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+            TargetAddr::Ip(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))),
+            TargetAddr::Ip(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))),
+            TargetAddr::Domain("localhost".to_string(), port),
+            TargetAddr::Domain("127.0.0.1".to_string(), port),
+        ];
+        // This computer's other addresses (not the one the phone reached).
+        targets.extend(
+            lan_addresses()
+                .into_iter()
+                .map(|address| TargetAddr::Ip(SocketAddr::from((address, port)))),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for target in &targets {
+                let refused = clients.connect_client(phone, target).await.err();
+                assert_eq!(
+                    refused.map(|error| error.kind()),
+                    Some(io::ErrorKind::PermissionDenied),
+                    "{target}"
+                );
+            }
+            // The computer's own programs on the share's port still can.
+            let own = ClientAddrs {
+                peer: "127.0.0.1:50000".parse().unwrap(),
+                local: "127.0.0.1:8899".parse().unwrap(),
+            };
+            clients.connect_client(own, &targets[0]).await.unwrap();
+        });
+        let closed = clients.dispatcher.tracker().connections().closed;
+        assert!(closed
+            .iter()
+            .filter(|connection| connection.process.as_deref() == Some("LAN 192.168.1.23"))
+            .all(|connection| connection.error == Some(crate::lan_guard::REFUSED)));
     }
 
     #[test]

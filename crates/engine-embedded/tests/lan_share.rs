@@ -66,6 +66,8 @@ fn share_serves_the_setup_page_and_relays_with_a_device_label() {
     // No `mitm` section: no decryption and no certificate to offer.
     assert_eq!(status["https_decryption"], false);
     assert_eq!(status["certificate"], false);
+    // Only this computer itself is kept from other devices by default.
+    assert_eq!(status["block_private_networks"], false);
     let share = share_addr(&status);
 
     // A browser that opened the share's own address.
@@ -149,5 +151,27 @@ fn share_restarts_on_a_new_port_and_reports_busy_ports() {
     // The old share was stopped before the new port was tried.
     assert!(TcpStream::connect(first).is_err());
     assert_eq!(control(&proxy, r#"{"cmd":"lan_share"}"#)["running"], false);
+    proxy.stop();
+}
+
+#[test]
+fn share_can_keep_devices_off_private_networks() {
+    let mut proxy = LocalProxy::start(DIRECT, loopback(), MixedSettings::default()).unwrap();
+    let status = control(
+        &proxy,
+        r#"{"cmd":"start_lan_share","port":0,"block_private_networks":true}"#,
+    );
+    assert_eq!(status["running"], true);
+    assert_eq!(status["block_private_networks"], true);
+    // The computer's own programs (loopback clients) are not checked.
+    let share = share_addr(&status);
+    let echo = echo_server();
+    let mut stream = TcpStream::connect(share).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    write!(stream, "CONNECT {echo} HTTP/1.1\r\nHost: {echo}\r\n\r\n").unwrap();
+    let mut established = [0u8; 39];
+    stream.read_exact(&mut established).unwrap();
+    assert_eq!(&established, b"HTTP/1.1 200 Connection established\r\n\r\n");
+    drop(stream);
     proxy.stop();
 }

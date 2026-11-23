@@ -37,6 +37,7 @@ use crate::capture::{self, CaptureStore, Direction};
 use crate::config::DnsVia;
 use crate::direct::{self, DirectOutbound};
 use crate::fake_ip::FakeIpPool;
+use crate::lan_guard::{self, LanPeer};
 use crate::routing::{DomainResolver, FlowSource, RouteInfo, RoutedOutbound};
 
 /// Closed connections kept for the list, newest first.
@@ -129,7 +130,9 @@ pub struct ConnectionSnapshot {
     pub download: u64,
     /// `rejected` (a REJECT rule), `quic_blocked` (a UDP flow to port 443
     /// refused by `block_quic`), `quic_mitm_fallback` (QUIC to a decrypted
-    /// host, refused so the app uses TCP) or `connect_failed`.
+    /// host, refused so the app uses TCP), `lan_share_local_target` (a
+    /// device using the LAN share asked DIRECT for this computer itself; see
+    /// [`crate::lan_guard`]) or `connect_failed`.
     pub error: Option<&'static str>,
     /// Capture was on as the connection opened: `capture_connection` may
     /// have its bytes (see [`crate::capture`]).
@@ -779,7 +782,7 @@ impl Dispatcher {
     }
 
     /// The new destination of a flow a `redirects` line matches, with that
-    /// line, or `None`.
+    /// line and whether the line named a new host, or `None`.
     fn redirect(
         &self,
         target: &TargetAddr,
@@ -787,7 +790,7 @@ impl Dispatcher {
         origin: FlowOrigin<'_>,
         network: RouteNetwork,
         http: Option<&HttpRequestHead>,
-    ) -> Option<(TargetAddr, String)> {
+    ) -> Option<(TargetAddr, String, bool)> {
         if self.redirects.is_empty() {
             return None;
         }
@@ -808,7 +811,12 @@ impl Dispatcher {
             query.url.clone_from(&http.url);
         }
         let rule = self.redirects.find(&query)?;
-        Some((redirected_target(target, &rule.to), rule.to_string()))
+        let new_host = rule.to.host != RedirectHost::Keep;
+        Some((
+            redirected_target(target, &rule.to),
+            rule.to_string(),
+            new_host,
+        ))
     }
 
     /// Replaces the outbound of the direct mode.
@@ -991,7 +999,7 @@ impl Dispatcher {
         };
         let redirected = self.redirect(target, host, origin, RouteNetwork::Tcp, http);
         let (target, host) = match &redirected {
-            Some((new, _)) => (new, None),
+            Some((new, _, _)) => (new, None),
             None => (target, host),
         };
         let (route, _) = routed
@@ -1102,7 +1110,7 @@ impl Dispatcher {
         }
         let redirected = self.redirect(target, host, origin, RouteNetwork::Tcp, http);
         let (target, host) = match &redirected {
-            Some((new, rule)) => {
+            Some((new, rule, _)) => {
                 guard.set_redirect(RedirectSnapshot {
                     destination: new.to_string(),
                     rule: rule.clone(),
@@ -1114,13 +1122,37 @@ impl Dispatcher {
         let (outbound, route) = self
             .route(mode, target, host, origin, RouteNetwork::Tcp, http, &guard)
             .await?;
-        let resolved = if unfaked.is_some() {
+        // A device using the LAN share may not reach this computer itself
+        // through DIRECT (see `crate::lan_guard`), unless a `redirects` line
+        // the user wrote named the new host.
+        let host_redirected = redirected
+            .as_ref()
+            .is_some_and(|(_, _, new_host)| *new_host);
+        let lan_peer = origin
+            .lan_peer
+            .filter(|_| outbound.protocol() == direct::PROTOCOL && !host_redirected);
+        if lan_peer.is_some() {
+            if let TargetAddr::Domain(name, _) = target {
+                if lan_guard::is_local_name(name) {
+                    guard.fail(lan_guard::REFUSED);
+                    return Err(lan_guard::refused());
+                }
+            }
+        }
+        // With a LAN peer the name is resolved here, the way a Fake-IP flow's
+        // is, so the address checked is the address dialed.
+        let resolved = if unfaked.is_some() || lan_peer.is_some() {
             self.direct_target(target, &*outbound, mode).await?
         } else {
             None
         };
         let named = resolved.or_else(|| proxied_name(target, host, &*outbound));
-        let stream = match outbound.connect(named.as_ref().unwrap_or(target)).await {
+        let dial = named.as_ref().unwrap_or(target);
+        let connected = match lan_peer {
+            Some(peer) => self.connect_lan_peer(peer, &*outbound, dial, &guard).await,
+            None => outbound.connect(dial).await,
+        };
+        let stream = match connected {
             Ok(stream) => stream,
             Err(error) => {
                 self.report_connect_failure(&route, &error);
@@ -1132,6 +1164,54 @@ impl Dispatcher {
             inner: stream,
             guard,
         }))
+    }
+
+    /// Connects a DIRECT flow of a device using the LAN share to `target`,
+    /// refusing it when any address of `target` is this computer itself, its
+    /// loopback or link-local, or (on request) a private network; see
+    /// [`crate::lan_guard`]. A name is resolved here (the way the DIRECT
+    /// outbound would) and the checked addresses are dialed in turn, so a
+    /// later lookup cannot answer with another address. An address in the
+    /// Fake-IP range is refused too: dialing it would bring the flow back
+    /// through the tunnel without its origin.
+    async fn connect_lan_peer(
+        &self,
+        peer: LanPeer,
+        outbound: &dyn TcpOutbound,
+        target: &TargetAddr,
+        guard: &ConnectionGuard,
+    ) -> io::Result<BoxStream> {
+        let addresses: Vec<SocketAddr> = match target {
+            TargetAddr::Ip(address) => vec![*address],
+            TargetAddr::Domain(name, port) => tokio::net::lookup_host((name.as_str(), *port))
+                .await?
+                .collect(),
+        };
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "target did not resolve",
+            ));
+        }
+        let fake = |address: IpAddr| {
+            self.fake_ip
+                .as_ref()
+                .is_some_and(|pool| pool.contains(address))
+        };
+        if addresses.iter().any(|address| {
+            fake(address.ip()) || lan_guard::refuses(peer, address.ip(), lan_guard::is_own_address)
+        }) {
+            guard.fail(lan_guard::REFUSED);
+            return Err(lan_guard::refused());
+        }
+        let mut last_error = None;
+        for address in addresses {
+            match outbound.connect(&TargetAddr::Ip(address)).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::from(io::ErrorKind::NotFound)))
     }
 
     /// The name the Fake-IP table gave `address`, if it is a fake address.
@@ -1197,7 +1277,7 @@ impl Dispatcher {
         }
         let redirected = self.redirect(target, host, origin, RouteNetwork::Udp, None);
         let (target, host) = match &redirected {
-            Some((new, rule)) => {
+            Some((new, rule, _)) => {
                 guard.set_redirect(RedirectSnapshot {
                     destination: new.to_string(),
                     rule: rule.clone(),
@@ -1283,12 +1363,16 @@ impl TcpOutbound for Dispatcher {
     }
 }
 
-/// Who opened a flow: the local process (for `PROCESS-NAME`), and the
-/// client's address and listener port (for `SRC-IP` and `IN-PORT`).
+/// Who opened a flow: the local process (for `PROCESS-NAME`), the client's
+/// address and listener port (for `SRC-IP` and `IN-PORT`), and whether it is
+/// another device on the local network using the LAN share.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FlowOrigin<'a> {
     pub process: Option<&'a str>,
     pub source: FlowSource,
+    /// Set for a flow of another device through the LAN share: DIRECT may
+    /// not take it to this computer itself; see [`crate::lan_guard`].
+    pub lan_peer: Option<LanPeer>,
 }
 
 /// See [`Dispatcher::with_host`].
@@ -1304,6 +1388,7 @@ impl HostedDispatcher<'_> {
         FlowOrigin {
             process: None,
             source: self.source,
+            lan_peer: None,
         }
     }
 }
@@ -1321,6 +1406,7 @@ impl TcpOutbound for HostedDispatcher<'_> {
         let origin = FlowOrigin {
             process: None,
             source: self.source,
+            lan_peer: None,
         };
         Box::pin(
             self.dispatcher
@@ -1332,6 +1418,7 @@ impl TcpOutbound for HostedDispatcher<'_> {
         let origin = FlowOrigin {
             process: None,
             source: self.source,
+            lan_peer: None,
         };
         Box::pin(
             self.dispatcher
@@ -1464,4 +1551,263 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod lan_peer_tests {
+    use super::*;
+
+    /// Accepts every connection without dialing, recording the target.
+    struct Record {
+        protocol: &'static str,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Record {
+        fn new(protocol: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                protocol,
+                seen: Mutex::default(),
+            })
+        }
+
+        fn seen(&self) -> Vec<String> {
+            lock(&self.seen).clone()
+        }
+    }
+
+    impl TcpOutbound for Record {
+        fn protocol(&self) -> &'static str {
+            self.protocol
+        }
+
+        fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+            Box::pin(async move {
+                lock(&self.seen).push(target.to_string());
+                let (client, _server) = tokio::io::duplex(64);
+                Ok(Box::new(client) as BoxStream)
+            })
+        }
+    }
+
+    /// A `dns` section that answers from a fixed table.
+    struct Names;
+
+    impl DomainResolver for Names {
+        fn resolve<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>> {
+            Box::pin(async move {
+                match domain {
+                    // DNS rebinding: a public-looking name that answers loopback.
+                    "rebind.example" => Ok("127.0.0.1".parse().unwrap()),
+                    "docker.example" => Ok("::ffff:127.0.0.2".parse().unwrap()),
+                    "printer.example" => Ok("192.168.213.40".parse().unwrap()),
+                    _ => Err(io::Error::new(io::ErrorKind::NotFound, "no such name")),
+                }
+            })
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn ip(address: &str) -> TargetAddr {
+        TargetAddr::Ip(address.parse().unwrap())
+    }
+
+    fn name(name: &str, port: u16) -> TargetAddr {
+        TargetAddr::Domain(name.to_string(), port)
+    }
+
+    /// A phone at 192.168.1.23 that reached the share on 192.168.1.5.
+    fn phone(block_private_networks: bool) -> FlowOrigin<'static> {
+        FlowOrigin {
+            process: Some("LAN 192.168.1.23"),
+            source: FlowSource {
+                address: Some("192.168.1.23".parse().unwrap()),
+                in_port: Some(8899),
+                port: Some(50000),
+            },
+            lan_peer: Some(LanPeer {
+                via: "192.168.1.5".parse().unwrap(),
+                block_private_networks,
+            }),
+        }
+    }
+
+    fn with_names(dispatcher: Dispatcher) -> Dispatcher {
+        Dispatcher {
+            resolver: Some(Arc::new(Names)),
+            ..dispatcher
+        }
+    }
+
+    async fn connect(
+        dispatcher: &Dispatcher,
+        target: &TargetAddr,
+        origin: FlowOrigin<'_>,
+    ) -> io::Result<()> {
+        dispatcher
+            .connect_origin_flow(target, None, origin, None)
+            .await
+            .map(drop)
+    }
+
+    #[test]
+    fn devices_on_the_lan_never_reach_this_computer_through_direct() {
+        runtime().block_on(async {
+            let direct = Record::new(direct::PROTOCOL);
+            let dispatcher = with_names(Dispatcher::single(direct.clone()));
+            for target in [
+                ip("127.0.0.1:6379"),
+                ip("127.0.0.53:53"),
+                ip("[::1]:2375"),
+                ip("[::ffff:127.0.0.1]:8890"),
+                ip("0.0.0.0:9477"),
+                ip("169.254.169.254:80"),
+                ip("[fe80::1]:80"),
+                name("localhost", 8890),
+                name("App.Localhost.", 3000),
+                name("rebind.example", 6379),
+                name("docker.example", 2375),
+            ] {
+                let error = connect(&dispatcher, &target, phone(false))
+                    .await
+                    .expect_err(&target.to_string());
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{target}");
+            }
+            assert!(direct.seen().is_empty(), "{:?}", direct.seen());
+            let closed = dispatcher.tracker().connections().closed;
+            assert_eq!(closed.len(), 11);
+            assert!(closed
+                .iter()
+                .all(|connection| connection.error == Some(lan_guard::REFUSED)
+                    && connection.outbound == "DIRECT"));
+
+            // Other devices on the network and the internet stay reachable;
+            // a name is dialed at the address that was checked.
+            connect(&dispatcher, &ip("192.168.213.40:80"), phone(false))
+                .await
+                .unwrap();
+            connect(&dispatcher, &name("printer.example", 631), phone(false))
+                .await
+                .unwrap();
+            connect(&dispatcher, &ip("93.184.216.34:443"), phone(false))
+                .await
+                .unwrap();
+            assert_eq!(
+                direct.seen(),
+                [
+                    "192.168.213.40:80",
+                    "192.168.213.40:631",
+                    "93.184.216.34:443"
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn names_resolved_by_the_system_are_checked_too() {
+        runtime().block_on(async {
+            let direct = Record::new(direct::PROTOCOL);
+            // No `dns` section: the name goes to the system resolver, as the
+            // DIRECT outbound would send it.
+            let dispatcher = Dispatcher::single(direct.clone());
+            let error = connect(&dispatcher, &name("127.0.0.1", 6379), phone(false))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            let error = connect(&dispatcher, &name("localhost", 6379), phone(false))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(direct.seen().is_empty(), "{:?}", direct.seen());
+        });
+    }
+
+    #[test]
+    fn the_direct_mode_is_checked_like_a_direct_rule() {
+        runtime().block_on(async {
+            let node = Record::new("vless");
+            let direct = Record::new(direct::PROTOCOL);
+            let dispatcher =
+                with_names(Dispatcher::single(node.clone()).with_direct(direct.clone()));
+            dispatcher.set_mode(Mode::Direct);
+            let error = connect(&dispatcher, &ip("127.0.0.1:6379"), phone(false))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(direct.seen().is_empty());
+
+            // Through a node the far side resolves and dials: not this
+            // computer, so nothing is refused.
+            dispatcher.set_mode(Mode::Rule);
+            connect(&dispatcher, &ip("127.0.0.1:6379"), phone(false))
+                .await
+                .unwrap();
+            assert_eq!(node.seen(), ["127.0.0.1:6379"]);
+        });
+    }
+
+    #[test]
+    fn this_computers_own_programs_keep_reaching_loopback() {
+        runtime().block_on(async {
+            let direct = Record::new(direct::PROTOCOL);
+            let dispatcher = with_names(Dispatcher::single(direct.clone()));
+            connect(&dispatcher, &ip("127.0.0.1:6379"), FlowOrigin::default())
+                .await
+                .unwrap();
+            connect(&dispatcher, &name("localhost", 8890), FlowOrigin::default())
+                .await
+                .unwrap();
+            assert_eq!(direct.seen(), ["127.0.0.1:6379", "localhost:8890"]);
+        });
+    }
+
+    #[test]
+    fn private_networks_are_refused_when_asked() {
+        runtime().block_on(async {
+            let direct = Record::new(direct::PROTOCOL);
+            let dispatcher = with_names(Dispatcher::single(direct.clone()));
+            for target in [ip("192.168.213.40:80"), name("printer.example", 631)] {
+                let error = connect(&dispatcher, &target, phone(true))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{target}");
+            }
+            connect(&dispatcher, &ip("93.184.216.34:443"), phone(true))
+                .await
+                .unwrap();
+            assert_eq!(direct.seen(), ["93.184.216.34:443"]);
+        });
+    }
+
+    #[test]
+    fn a_redirect_to_a_new_host_is_the_users_choice() {
+        runtime().block_on(async {
+            let direct = Record::new(direct::PROTOCOL);
+            let dispatcher = with_names(
+                Dispatcher::single(direct.clone()).with_redirects(
+                    RedirectTable::parse(&[
+                        "DOMAIN,api.example.com,127.0.0.1:3000",
+                        "DOMAIN,rebind.example,:8080",
+                    ])
+                    .unwrap(),
+                ),
+            );
+            connect(&dispatcher, &name("api.example.com", 443), phone(false))
+                .await
+                .unwrap();
+            assert_eq!(direct.seen(), ["127.0.0.1:3000"]);
+            // A line that keeps the host only moves the port: still checked.
+            let error = connect(&dispatcher, &name("rebind.example", 443), phone(false))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(direct.seen(), ["127.0.0.1:3000"]);
+        });
+    }
 }
