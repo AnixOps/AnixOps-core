@@ -124,6 +124,53 @@ fn indexed_decisions_match_linear_decisions() {
     }
 }
 
+/// [`Environment`] once its lookups were made: a name it cannot resolve
+/// reports a failed lookup, which `dns-continue` matches on from.
+struct Looked;
+
+impl RoutingEnvironment for Looked {
+    fn resolve(&self, domain: &str) -> Option<IpAddr> {
+        Environment.resolve(domain)
+    }
+
+    fn geoip_country(&self, ip: IpAddr) -> Option<String> {
+        Environment.geoip_country(ip)
+    }
+
+    fn resolve_failed(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn indexed_decisions_match_linear_decisions_with_dns_continue() {
+    let mut rules = RULES.to_vec();
+    *rules.last_mut().unwrap() = "FINAL,Proxy,dns-continue";
+    let model = model(&rules);
+    let index = RuleIndex::new(&model);
+    assert!(index.fits(&model));
+    for query in queries() {
+        for environment in [&Environment as &dyn RoutingEnvironment, &Looked] {
+            assert_eq!(
+                model.decide_indexed(&index, &query, environment),
+                model.decide(&query, environment),
+                "{query:?}"
+            );
+        }
+    }
+    // Before the lookup the IP rule asks for it; after it failed, the
+    // domain rule past the IP rules still matches.
+    let query = RouteQuery::domain("after.fail.test");
+    assert_eq!(
+        model.decide_indexed(&index, &query, &Environment).matched,
+        RouteMatch::ResolveFailed(10)
+    );
+    assert_eq!(
+        model.decide_indexed(&index, &query, &Looked).matched,
+        RouteMatch::Rule(15)
+    );
+}
+
 #[test]
 fn the_first_matching_rule_wins_over_a_later_indexed_one() {
     let model = model(RULES);

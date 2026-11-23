@@ -139,7 +139,7 @@ fn a_node_that_cannot_run_is_left_out_of_the_rules_not_the_whole_routing() {
         [
             "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
             format!("DOMAIN,jp.example.org,{jp}"),
-            "FINAL,Proxy".to_string(),
+            "FINAL,Proxy,dns-continue".to_string(),
         ]
     );
     // Every drop is said, the summary first, and no credential is.
@@ -764,7 +764,11 @@ rules:
     let routing = import_text(text).unwrap().routing.unwrap();
     assert_eq!(
         routing["rules"],
-        serde_json::json!(["RULE-SET,listed,Proxy", "GEOSITE,cn,DIRECT", "FINAL,DIRECT"])
+        serde_json::json!([
+            "RULE-SET,listed,Proxy",
+            "GEOSITE,cn,DIRECT",
+            "FINAL,DIRECT,dns-continue"
+        ])
     );
     assert_eq!(
         routing["rule_sets"],

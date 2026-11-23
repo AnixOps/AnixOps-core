@@ -423,6 +423,9 @@ struct QueryEnvironment<'a> {
     network: Option<&'a NetworkContext>,
     devices: &'a BTreeMap<IpAddr, String>,
     resolved: Option<IpAddr>,
+    /// The lookup for this connection was made and failed (`dns-continue`
+    /// then matches on without an address).
+    resolve_failed: bool,
     round_robin: &'a AtomicUsize,
     /// Verdicts of the rule scripts run for this connection so far; `None`
     /// when deciding without a connection, where no script matches.
@@ -464,6 +467,10 @@ impl RoutingEnvironment for QueryEnvironment<'_> {
 
     fn resolve(&self, _domain: &str) -> Option<IpAddr> {
         self.resolved
+    }
+
+    fn resolve_failed(&self) -> bool {
+        self.resolve_failed
     }
 
     fn script_matches(&self, name: &str) -> Option<bool> {
@@ -1014,7 +1021,20 @@ impl RoutedOutbound {
         resolved: Option<IpAddr>,
         scripts: Option<&BTreeMap<String, bool>>,
     ) -> RouteResolution {
-        self.with_scripts(resolved, scripts, |environment| {
+        self.decide_looked_up(table, query, resolved, false, scripts)
+    }
+
+    /// [`Self::decide`], also saying whether the lookup for the connection
+    /// was made and failed (`resolve_failed`).
+    fn decide_looked_up(
+        &self,
+        table: &RoutingTable,
+        query: &RouteQuery,
+        resolved: Option<IpAddr>,
+        resolve_failed: bool,
+        scripts: Option<&BTreeMap<String, bool>>,
+    ) -> RouteResolution {
+        self.with_scripts(resolved, resolve_failed, scripts, |environment| {
             table.model.decide_indexed(&table.index, query, environment)
         })
     }
@@ -1024,12 +1044,13 @@ impl RoutedOutbound {
         resolved: Option<IpAddr>,
         body: impl FnOnce(&QueryEnvironment<'_>) -> T,
     ) -> T {
-        self.with_scripts(resolved, None, body)
+        self.with_scripts(resolved, false, None, body)
     }
 
     fn with_scripts<T>(
         &self,
         resolved: Option<IpAddr>,
+        resolve_failed: bool,
         scripts: Option<&BTreeMap<String, bool>>,
         body: impl FnOnce(&QueryEnvironment<'_>) -> T,
     ) -> T {
@@ -1062,6 +1083,7 @@ impl RoutedOutbound {
             network: network.as_ref(),
             devices: &devices,
             resolved,
+            resolve_failed,
             round_robin: &self.round_robin,
             scripts,
         })
@@ -1635,22 +1657,28 @@ impl RoutedOutbound {
     /// of them, so this ends after at most one pass more than the scripts.
     async fn decide_resolving(&self, table: &RoutingTable, query: &RouteQuery) -> RouteResolution {
         let mut resolved = None;
+        let mut resolve_failed = false;
         let mut verdicts = BTreeMap::new();
         loop {
-            let resolution = self.decide(table, query, resolved, Some(&verdicts));
+            let resolution =
+                self.decide_looked_up(table, query, resolved, resolve_failed, Some(&verdicts));
             match resolution.matched {
                 // With `dns-failed` the first pass, which has no address yet,
                 // already names FINAL: look the name up first all the same.
                 RouteMatch::ResolveFailed(_) | RouteMatch::FinalAfterResolveFailed(_)
-                    if resolved.is_none() =>
+                    if resolved.is_none() && !resolve_failed =>
                 {
                     let Some(domain) = query.domain.as_deref() else {
                         return resolution;
                     };
-                    let Ok(address) = self.resolver.resolve(domain).await else {
-                        return resolution;
-                    };
-                    resolved = Some(address);
+                    match self.resolver.resolve(domain).await {
+                        Ok(address) => resolved = Some(address),
+                        // `dns-continue` (Clash): decide again knowing the
+                        // lookup failed, so the rules after the IP rules
+                        // still match. Otherwise the first pass stands.
+                        Err(_) if table.model.final_dns_continue => resolve_failed = true,
+                        Err(_) => return resolution,
+                    }
                 }
                 RouteMatch::ScriptPending(index) => {
                     let Some(name) = script_name(&table.model.rules[index].matcher) else {
