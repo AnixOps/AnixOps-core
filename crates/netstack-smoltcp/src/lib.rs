@@ -9,6 +9,11 @@ pub use packet::AnyIpPktFrame;
 mod filter;
 pub use filter::{IpFilter, IpFilters};
 
+mod reassembly;
+
+mod stats;
+pub use stats::StackStats;
+
 pub mod udp;
 pub use udp::UdpSocket;
 

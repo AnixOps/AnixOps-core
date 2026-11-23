@@ -558,6 +558,162 @@ fn udp_flow_is_relayed_through_the_outbound() {
     tunnel.stop();
 }
 
+/// `packet`, an IPv4 packet without options, split into fragments of `chunk`
+/// payload bytes (a multiple of 8), as the system splits a datagram larger
+/// than the MTU.
+fn fragments(packet: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+    let payload = &packet[20..];
+    let count = payload.len().div_ceil(chunk);
+    payload
+        .chunks(chunk)
+        .enumerate()
+        .map(|(index, piece)| {
+            let mut fragment = packet[..20].to_vec();
+            fragment.extend_from_slice(piece);
+            let total_len = (20 + piece.len()) as u16;
+            fragment[2..4].copy_from_slice(&total_len.to_be_bytes());
+            // More Fragments on all but the last; the offset counts 8 bytes.
+            let more = if index + 1 < count { 0x2000 } else { 0 };
+            let flags = more | (index * chunk / 8) as u16;
+            fragment[6..8].copy_from_slice(&flags.to_be_bytes());
+            fragment[10..12].fill(0);
+            let checksum = ipv4_checksum(&fragment[..20]);
+            fragment[10..12].copy_from_slice(&checksum.to_be_bytes());
+            fragment
+        })
+        .collect()
+}
+
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = header
+        .chunks(2)
+        .map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+#[test]
+fn a_fragmented_udp_datagram_is_relayed_whole() {
+    let echo = start_udp_echo_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(UdpRedirect(echo)), sink).unwrap();
+
+    // Larger than the MTU: it comes in two fragments, here the last first.
+    let payload = vec![7u8; 2000];
+    let pieces = fragments(&udp_to_remote(40002, &payload), 1480);
+    assert_eq!(pieces.len(), 2);
+    for piece in pieces.iter().rev() {
+        assert!(tunnel.input_packet(piece));
+    }
+    echoed(&rx, 40002, &payload);
+
+    let stats = tunnel.stats();
+    assert_eq!(stats.udp_reassembled, 1);
+    assert_eq!(stats.udp_flows, 1);
+    assert_eq!(stats.ip_fragments_dropped, 0);
+    tunnel.stop();
+}
+
+#[test]
+fn a_malformed_or_fragmented_udp_packet_leaves_dns_working() {
+    let (sink, rx) = capture();
+    let mut tunnel =
+        Tunnel::start(settings(), Arc::new(Redirect(start_dns_server())), sink).unwrap();
+
+    // A UDP length field that counts more than the packet carries.
+    let mut malformed = Vec::new();
+    PacketBuilder::ipv4(APP, DNS, 64)
+        .udp(5353, 53)
+        .write(&mut malformed, &dns_query())
+        .unwrap();
+    malformed[24..26].copy_from_slice(&1000u16.to_be_bytes());
+    assert!(tunnel.input_packet(&malformed));
+    // The first fragment of a datagram whose other fragment never comes.
+    let orphan = fragments(&udp_to_remote(40003, &[1; 2000]), 1480).remove(0);
+    assert!(tunnel.input_packet(&orphan));
+
+    let query = dns_query();
+    let response = ask(&tunnel, &rx, &query);
+    assert_eq!(&response[..2], &query[..2]);
+    assert_eq!(response[2] & 0x80, 0x80);
+
+    let stats = tunnel.stats();
+    assert_eq!(stats.udp_malformed, 1);
+    assert_eq!(stats.udp_reassembled, 0);
+    assert_eq!(stats.dns_queries, 1);
+    tunnel.stop();
+}
+
+/// DNS-over-TCP server like [`start_dns_server`], except that it pads the
+/// answer about `example.com` to the largest DNS message, more than one UDP
+/// datagram carries.
+fn start_oversized_dns_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            thread::spawn(move || {
+                let mut length = [0u8; 2];
+                if stream.read_exact(&mut length).is_err() {
+                    return;
+                }
+                let mut answer = vec![0u8; usize::from(u16::from_be_bytes(length))];
+                if stream.read_exact(&mut answer).is_err() {
+                    return;
+                }
+                answer[2] |= 0x80;
+                if answer.windows(5).any(|name| name == b"\x03com\x00") {
+                    answer.resize(usize::from(u16::MAX), 0);
+                }
+                let _ = stream.write_all(&(answer.len() as u16).to_be_bytes());
+                let _ = stream.write_all(&answer);
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn an_answer_too_large_for_one_packet_leaves_dns_working() {
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(
+        settings(),
+        Arc::new(Redirect(start_oversized_dns_server())),
+        sink,
+    )
+    .unwrap();
+
+    let mut packet = Vec::new();
+    PacketBuilder::ipv4(APP, DNS, 64)
+        .udp(5353, 53)
+        .write(&mut packet, &dns_query())
+        .unwrap();
+    assert!(tunnel.input_packet(&packet));
+    let deadline = Instant::now() + WAIT;
+    while tunnel.stats().udp_unsendable == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the answer too large for one packet should be counted"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // The answer about another name still goes out.
+    let mut query = vec![
+        0x56, 0x78, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    query.extend_from_slice(b"\x07example\x03net\x00\x00\x01\x00\x01");
+    let response = ask(&tunnel, &rx, &query);
+    assert_eq!(&response[..2], &query[..2]);
+    assert_eq!(response.len(), query.len());
+    assert_eq!(tunnel.stats().udp_unsendable, 1);
+    tunnel.stop();
+}
+
 /// Test outbound whose UDP flows go to their target, as DIRECT does.
 struct UdpToTarget;
 
