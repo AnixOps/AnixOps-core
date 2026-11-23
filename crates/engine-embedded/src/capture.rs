@@ -47,6 +47,7 @@
 //! export, and sessions older than the retention (default 7 days) are
 //! deleted. See [`storage`].
 
+pub mod archive;
 pub mod decode;
 pub mod export;
 pub mod filter;
@@ -1226,6 +1227,96 @@ impl CaptureStore {
         Ok(json!({ "deleted": storage.delete(id)? }))
     }
 
+    /// The `copy_capture` answer: session `id` sealed again under `key`,
+    /// for a client to keep in a store of its own (see
+    /// [`storage::Storage::reseal`]):
+    /// `{"session", "file_name", "size", "data_base64"}`.
+    pub fn copy_session(&self, id: &str, key: &[u8]) -> Result<Vec<u8>, storage::StorageError> {
+        let file = {
+            let storage = lock(&self.storage);
+            storage
+                .as_ref()
+                .ok_or(storage::StorageError::NotConfigured)?
+                .reseal(id, key)?
+        };
+        let head = json!({
+            "session": id,
+            "file_name": format!("{id}.anxcap"),
+            "size": file.len(),
+        })
+        .to_string();
+        let mut answer = String::with_capacity(head.len() + file.len() * 4 / 3 + 32);
+        answer.push_str(&head[..head.len() - 1]);
+        answer.push_str(",\"data_base64\":\"");
+        base64::engine::general_purpose::STANDARD.encode_string(&file, &mut answer);
+        answer.push_str("\"}");
+        Ok(answer.into_bytes())
+    }
+
+    /// Keeps a session file from `copy_capture` as session `id`:
+    /// `{"session": {...}}`.
+    pub fn import_session(&self, id: &str, file: &[u8]) -> Result<Value, storage::StorageError> {
+        let storage = lock(&self.storage);
+        let storage = storage
+            .as_ref()
+            .ok_or(storage::StorageError::NotConfigured)?;
+        Ok(json!({ "session": storage.import(id, file)? }))
+    }
+
+    /// What the capture viewer answers to `connections`: the connections
+    /// the store holds, in the shape of the engine's list, all closed and
+    /// newest first. Capture keeps no rule or outbound, so those are
+    /// empty; the bytes are those seen while capturing. One still open
+    /// when it was saved ends at its last kept bytes or message.
+    pub fn connections_json(&self) -> Value {
+        let inner = lock(&self.inner);
+        let closed =
+            inner
+                .connections
+                .iter()
+                .rev()
+                .map(|(&id, captured)| {
+                    let last =
+                        captured
+                            .chunks
+                            .iter()
+                            .map(|chunk| chunk.at_ms)
+                            .chain(captured.http.iter().map(|exchange| {
+                                exchange.ended_at_ms.unwrap_or(exchange.started_at_ms)
+                            }))
+                            .max()
+                            .unwrap_or(captured.started_at_ms)
+                            .max(captured.started_at_ms);
+                    json!({
+                        "id": id,
+                        "network": captured.network,
+                        "host": captured.host,
+                        "destination": captured.destination,
+                        "rule": "",
+                        "chain": [],
+                        "outbound": "",
+                        "started_at_ms": captured.started_at_ms,
+                        "ended_at_ms": captured.ended_at_ms.unwrap_or(last),
+                        "upload": captured.seen[0],
+                        "download": captured.seen[1],
+                        "error": null,
+                        "captured": true,
+                    })
+                })
+                .collect::<Vec<_>>();
+        json!({
+            "traffic": {
+                "upload_total": 0,
+                "download_total": 0,
+                "upload_rate": 0,
+                "download_rate": 0,
+                "active": 0,
+            },
+            "active": [],
+            "closed": closed,
+        })
+    }
+
     /// Copies of the selected decrypted exchanges, redacted when asked.
     fn exchanges(&self, selection: Selection, redact: bool) -> Vec<HttpExchange> {
         let inner = lock(&self.inner);
@@ -1375,6 +1466,9 @@ pub enum ExportFormat {
     Code,
     Postman,
     Insomnia,
+    /// Everything at once ([`archive`]): a listing of the connections,
+    /// HAR and pcapng, in one ZIP file.
+    Zip,
 }
 
 impl ExportFormat {
@@ -1384,6 +1478,7 @@ impl ExportFormat {
             Self::Har | Self::Postman | Self::Insomnia => "application/json",
             Self::Curl => "application/x-sh",
             Self::Code => "text/plain; charset=utf-8",
+            Self::Zip => "application/zip",
         }
     }
 
@@ -1396,6 +1491,7 @@ impl ExportFormat {
             Self::Code => language.extension(),
             Self::Postman => "postman_collection.json",
             Self::Insomnia => "insomnia.json",
+            Self::Zip => "zip",
         }
     }
 }
@@ -1442,6 +1538,7 @@ pub fn export_file(store: &CaptureStore, request: &ExportRequest) -> Vec<u8> {
     match request.format {
         ExportFormat::Pcapng => store.export_pcapng(id, redact),
         ExportFormat::Har => store.export_har(id, redact),
+        ExportFormat::Zip => archive::capture_zip(store, id, redact, unix_millis()),
         format => {
             let exchanges = store.exchanges(request.selection, redact);
             let exchanges = exchanges.iter().collect::<Vec<_>>();
@@ -2710,6 +2807,75 @@ mod tests {
         let answer: Value = serde_json::from_slice(&export_answer(&store, &one)).unwrap();
         assert_eq!(answer["file_name"], "anixops-capture-4-1.sh");
         assert_eq!(answer["redacted"], true);
+    }
+
+    #[test]
+    fn zip_export_packs_listing_har_and_pcapng_redacted_unless_asked_not_to() {
+        use base64::Engine as _;
+
+        let store = store(MAX_TOTAL_BYTES_LIMIT);
+        store.begin(4, Network::Tcp, Some("a.test"), "a.test:443", 1);
+        store.mark_decrypted(4);
+        filed(&store, 4, "GET", "https://a.test/x?token=tok-value-1", 200);
+        store.begin(5, Network::Udp, None, "192.0.2.9:53", 2);
+        store.record(5, Direction::Up, b"query");
+
+        let answer: Value = serde_json::from_slice(&export_answer(
+            &store,
+            &ExportRequest::new(ExportFormat::Zip),
+        ))
+        .unwrap();
+        assert!(answer["file_name"].as_str().unwrap().ends_with(".zip"));
+        assert_eq!(answer["content_type"], "application/zip");
+        let zip = base64::engine::general_purpose::STANDARD
+            .decode(answer["data_base64"].as_str().unwrap())
+            .unwrap();
+        let files = archive::unzip(&zip);
+        let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "README.txt",
+                "connections.json",
+                "capture.har",
+                "capture.pcapng"
+            ]
+        );
+        let contains = |file: &[u8], needle: &[u8]| file.windows(needle.len()).any(|w| w == needle);
+        for (name, data) in &files {
+            assert!(!contains(data, b"secret-value"), "{name}");
+            assert!(!contains(data, b"tok-value-1"), "{name}");
+        }
+        let listing: Value = serde_json::from_slice(&files[1].1).unwrap();
+        assert_eq!(listing["redacted"], true);
+        let connections = listing["connections"].as_array().unwrap();
+        assert_eq!(connections.len(), 2);
+        assert_eq!(connections[0]["id"], 4);
+        assert_eq!(connections[0]["requests"][0]["method"], "GET");
+        assert_eq!(connections[0]["requests"][0]["status"], 200);
+        assert_eq!(connections[1]["network"], "udp");
+        assert_eq!(connections[1]["upload"]["captured"], 5);
+        assert_eq!(files[3].1, store.export_pcapng(None, true));
+
+        let raw = ExportRequest {
+            redact: false,
+            ..ExportRequest::new(ExportFormat::Zip)
+        };
+        let files = archive::unzip(&export_file(&store, &raw));
+        assert!(contains(&files[2].1, b"secret-value"));
+        assert!(String::from_utf8_lossy(&files[0].1).contains("NOT masked"));
+
+        // One connection: only its own files.
+        let one = ExportRequest {
+            selection: Selection {
+                id: Some(5),
+                exchange: None,
+            },
+            ..ExportRequest::new(ExportFormat::Zip)
+        };
+        let files = archive::unzip(&export_file(&store, &one));
+        let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["README.txt", "connections.json", "capture.pcapng"]);
     }
 
     fn decrypted(store: &CaptureStore, id: u64) {

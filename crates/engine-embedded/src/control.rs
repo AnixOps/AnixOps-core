@@ -39,12 +39,13 @@
 //! | `set_capture` | `enabled`, optional `max_total_bytes` | [`crate::capture::CaptureStatus`]: keep the bytes of new connections |
 //! | `clear_capture` | | [`crate::capture::CaptureStatus`]: connections still open record their later exchanges under new indexes |
 //! | `capture_connection` | `id` | `{"capture": {...} \| null}`: kept bytes and decrypted HTTP messages of one connection |
-//! | `export_capture` | `format` (`pcapng` \| `har` \| `curl` \| `code` \| `postman` \| `insomnia`), optional `id`, `exchange` (index in that connection's `http`), `language` (`code`: `python` \| `javascript` \| `swift` \| `kotlin` \| `go`), `redact` (default `true`) | `{"format", "file_name", "content_type", "size", "redacted", "data_base64"}` |
+//! | `export_capture` | `format` (`pcapng` \| `har` \| `zip` (both and a listing of the connections, [`crate::capture::archive`]) \| `curl` \| `code` \| `postman` \| `insomnia`), optional `id`, `exchange` (index in that connection's `http`), `language` (`code`: `python` \| `javascript` \| `swift` \| `kotlin` \| `go`), `redact` (default `true`) | `{"format", "file_name", "content_type", "size", "redacted", "data_base64"}` |
 //! | `set_capture_storage` | `dir`, `key_base64` (32 bytes the client keeps), optional `retention_days` (default 7, 1–365) | `{"retention_days", "purged"}`: where `save_capture` writes; old sessions are deleted |
 //! | `save_capture` | optional `name` | `{"session": {"session", "name", "saved_at_ms", "expires_at_ms", "size", "connections", "requests"}}`: seals what capture holds |
 //! | `capture_sessions` | | `{"sessions": [...]}`, newest first; a session this key cannot open has `"unreadable": true` |
 //! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off; its connections get new ids from [`crate::capture::LOADED_ID_BASE`] (2^52) up, so no live connection writes into them |
 //! | `delete_capture` | `session` | `{"deleted": bool}` |
+//! | `copy_capture` | `session`, `key_base64` (32 bytes) | `{"session", "file_name", "size", "data_base64"}`: the session file sealed again under that key, for the app's own store (the capture viewer's `import_capture`) |
 //! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter` | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`) |
 //! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events, WebSocket messages) from `since_message` on |
 //! | `capture_h2_frames` | `id`, optional `since` | `{"h2_frames": {"seen", "dropped", "frames": [...]} \| null}`: the HTTP/2 frame headers of a decrypted `h2` connection on both links (`link`: `app` \| `origin`, `dir`, `type`, `flags`, `stream`, `length`, `error`, `value`), the last 512 |
@@ -62,6 +63,11 @@
 //! tunnel runtime alone answers `system_proxy`, `start_system_proxy` and
 //! `stop_system_proxy`: the `127.0.0.1` listener that iOS and macOS register
 //! as the system proxy, see [`crate::system_proxy`].
+//!
+//! The capture viewer ([`handle_capture_viewer`], [`crate::capture_viewer`])
+//! answers the same capture commands with no engine, for saved sessions,
+//! and `import_capture` (`session`, `data_base64`: a `copy_capture` file)
+//! besides; a running engine refuses `import_capture`.
 //!
 //! Capture is off until `set_capture` turns it on and lasts until the engine
 //! stops; see [`crate::capture`] for what is kept and its memory budget,
@@ -273,6 +279,14 @@ enum ControlRequest {
     DeleteCapture {
         session: String,
     },
+    CopyCapture {
+        session: String,
+        key_base64: String,
+    },
+    ImportCapture {
+        session: String,
+        data_base64: String,
+    },
     CaptureRequests {
         #[serde(default)]
         since_seq: u64,
@@ -436,6 +450,10 @@ pub fn handle_with_interceptor(
         return Err(invalid("control request size is out of range"));
     }
     let tracker = dispatcher.tracker();
+    let request = match capture_command(tracker.capture(), request, CaptureHost::Engine) {
+        Ok(answer) => return answer,
+        Err(other) => other,
+    };
     let answer = match request {
         ControlRequest::Traffic => serde_json::to_value(tracker.traffic()),
         ControlRequest::Connections => serde_json::to_value(tracker.connections()),
@@ -660,91 +678,6 @@ pub fn handle_with_interceptor(
                 "text": metrics::render(dispatcher, labels),
             }))
         }
-        ControlRequest::Capture => serde_json::to_value(tracker.capture().status()),
-        ControlRequest::SetCapture {
-            enabled,
-            max_total_bytes,
-        } => {
-            tracker.capture().set(enabled, max_total_bytes);
-            serde_json::to_value(tracker.capture().status())
-        }
-        ControlRequest::ClearCapture => {
-            tracker.capture().clear();
-            serde_json::to_value(tracker.capture().status())
-        }
-        ControlRequest::CaptureConnection { id } => {
-            Ok(json!({ "capture": tracker.capture().connection_json(id) }))
-        }
-        ControlRequest::CaptureExchange {
-            id,
-            index,
-            since_message,
-        } => Ok(json!({
-            "exchange": tracker.capture().exchange_json(id, index, since_message),
-        })),
-        ControlRequest::CaptureH2Frames { id, since } => Ok(json!({
-            "h2_frames": tracker.capture().h2_frames_json(id, since),
-        })),
-        ControlRequest::ExportCapture {
-            format,
-            id,
-            exchange,
-            language,
-            redact,
-        } => {
-            if exchange.is_some() && id.is_none() {
-                return Err(invalid("exchange needs the connection id"));
-            }
-            let request = ExportRequest {
-                format,
-                selection: Selection { id, exchange },
-                language,
-                redact,
-            };
-            // The file goes out as written, without a JSON value in between.
-            return Ok(capture::export_answer(tracker.capture(), &request));
-        }
-        ControlRequest::SetCaptureStorage {
-            dir,
-            key_base64,
-            retention_days,
-        } => {
-            use base64::Engine as _;
-            let key = base64::engine::general_purpose::STANDARD
-                .decode(key_base64.trim())
-                .map_err(|_| storage_error(capture::storage::StorageError::InvalidKey))?;
-            let set = tracker.capture().set_storage(&dir, &key, retention_days);
-            Ok(set.map_err(storage_error)?)
-        }
-        ControlRequest::SaveCapture { name } => {
-            let saved = tracker.capture().save_session(name.as_deref());
-            Ok(saved.map_err(storage_error)?)
-        }
-        ControlRequest::CaptureSessions => {
-            let sessions = tracker.capture().sessions();
-            Ok(sessions.map_err(storage_error)?)
-        }
-        ControlRequest::LoadCapture { session } => {
-            let status = tracker.capture().load_session(&session);
-            serde_json::to_value(status.map_err(storage_error)?)
-        }
-        ControlRequest::DeleteCapture { session } => {
-            let deleted = tracker.capture().delete_session(&session);
-            Ok(deleted.map_err(storage_error)?)
-        }
-        ControlRequest::CaptureRequests {
-            since_seq,
-            since_rev,
-            limit,
-            filter,
-        } => match Filter::parse(&filter) {
-            Ok(filter) => Ok(tracker
-                .capture()
-                .requests_json(since_seq, since_rev, limit, &filter)),
-            Err(error) => Ok(json!({
-                "error": { "code": "invalid_filter", "at": error.at },
-            })),
-        },
         ControlRequest::ProStatus => serde_json::to_value(pro::status()),
         ControlRequest::SetProLicense { license } => {
             serde_json::to_value(pro::set_license(license.as_deref()))
@@ -762,10 +695,184 @@ pub fn handle_with_interceptor(
                 Err(rejection) => json!({ "reloaded": false, "error": rejection }),
             })
         }
+        // Answered by `capture_command` above.
+        _ => return Err(invalid("control request is not a known command")),
     };
     answer
         .and_then(|answer| serde_json::to_vec(&answer))
         .map_err(|_| RuntimeError::new(RuntimeErrorCode::InternalError, "control answer failed"))
+}
+
+/// Where a capture command is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureHost {
+    /// A running engine, capturing live.
+    Engine,
+    /// The capture viewer ([`handle_capture_viewer`]): saved sessions only.
+    Viewer,
+}
+
+/// Answers the capture commands, which the engine and the capture viewer
+/// share; any other request comes back as `Err` for the caller to answer.
+fn capture_command(
+    store: &capture::CaptureStore,
+    request: ControlRequest,
+    host: CaptureHost,
+) -> Result<Result<Vec<u8>, RuntimeError>, ControlRequest> {
+    let answer = match request {
+        ControlRequest::Capture => json_value(store.status()),
+        ControlRequest::SetCapture {
+            enabled,
+            max_total_bytes,
+        } => {
+            if enabled && host == CaptureHost::Viewer {
+                Err(invalid("the capture viewer only opens saved sessions"))
+            } else {
+                store.set(enabled, max_total_bytes);
+                json_value(store.status())
+            }
+        }
+        ControlRequest::ClearCapture => {
+            store.clear();
+            json_value(store.status())
+        }
+        ControlRequest::CaptureConnection { id } => {
+            Ok(json!({ "capture": store.connection_json(id) }))
+        }
+        ControlRequest::CaptureExchange {
+            id,
+            index,
+            since_message,
+        } => Ok(json!({
+            "exchange": store.exchange_json(id, index, since_message),
+        })),
+        ControlRequest::CaptureH2Frames { id, since } => Ok(json!({
+            "h2_frames": store.h2_frames_json(id, since),
+        })),
+        ControlRequest::ExportCapture {
+            format,
+            id,
+            exchange,
+            language,
+            redact,
+        } => {
+            if exchange.is_some() && id.is_none() {
+                return Ok(Err(invalid("exchange needs the connection id")));
+            }
+            let request = ExportRequest {
+                format,
+                selection: Selection { id, exchange },
+                language,
+                redact,
+            };
+            // The file goes out as written, without a JSON value in between.
+            return Ok(Ok(capture::export_answer(store, &request)));
+        }
+        ControlRequest::SetCaptureStorage {
+            dir,
+            key_base64,
+            retention_days,
+        } => decode_key(&key_base64).and_then(|key| {
+            store
+                .set_storage(&dir, &key, retention_days)
+                .map_err(storage_error)
+        }),
+        ControlRequest::SaveCapture { name } => {
+            if host == CaptureHost::Viewer {
+                Err(invalid("the capture viewer only opens saved sessions"))
+            } else {
+                store.save_session(name.as_deref()).map_err(storage_error)
+            }
+        }
+        ControlRequest::CaptureSessions => store.sessions().map_err(storage_error),
+        ControlRequest::LoadCapture { session } => store
+            .load_session(&session)
+            .map_err(storage_error)
+            .and_then(json_value),
+        ControlRequest::DeleteCapture { session } => {
+            store.delete_session(&session).map_err(storage_error)
+        }
+        ControlRequest::CopyCapture {
+            session,
+            key_base64,
+        } => {
+            return Ok(decode_key(&key_base64)
+                .and_then(|key| store.copy_session(&session, &key).map_err(storage_error)));
+        }
+        ControlRequest::ImportCapture {
+            session,
+            data_base64,
+        } => {
+            if host == CaptureHost::Engine {
+                Err(invalid("import_capture is answered by the capture viewer"))
+            } else {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(data_base64.trim())
+                    .map_err(|_| invalid("data_base64 is not base64"))
+                    .and_then(|file| store.import_session(&session, &file).map_err(storage_error))
+            }
+        }
+        ControlRequest::CaptureRequests {
+            since_seq,
+            since_rev,
+            limit,
+            filter,
+        } => match Filter::parse(&filter) {
+            Ok(filter) => Ok(store.requests_json(since_seq, since_rev, limit, &filter)),
+            Err(error) => Ok(json!({
+                "error": { "code": "invalid_filter", "at": error.at },
+            })),
+        },
+        other => return Err(other),
+    };
+    Ok(answer.and_then(|answer| {
+        serde_json::to_vec(&answer).map_err(|_| {
+            RuntimeError::new(RuntimeErrorCode::InternalError, "control answer failed")
+        })
+    }))
+}
+
+/// Largest request the capture viewer accepts: `import_capture` with a
+/// whole session file in base64.
+pub const MAX_VIEWER_REQUEST_LEN: usize = 96 * 1024 * 1024;
+
+/// Answers one request against `store` with no engine running: the capture
+/// viewer a client uses to open saved sessions while its tunnel is off
+/// ([`crate::capture_viewer`]). It takes the capture commands except
+/// turning capture on and `save_capture`, plus `import_capture`, and
+/// `connections` and `traffic` from what the store holds
+/// ([`capture::CaptureStore::connections_json`]); anything else is refused.
+pub fn handle_capture_viewer(
+    store: &capture::CaptureStore,
+    request: &[u8],
+) -> Result<Vec<u8>, RuntimeError> {
+    if request.is_empty() || request.len() > MAX_VIEWER_REQUEST_LEN {
+        return Err(invalid("control request size is out of range"));
+    }
+    let request: ControlRequest = serde_json::from_slice(request)
+        .map_err(|_| invalid("control request is not a known command"))?;
+    let answer = match capture_command(store, request, CaptureHost::Viewer) {
+        Ok(answer) => return answer,
+        Err(ControlRequest::Connections) => store.connections_json(),
+        Err(ControlRequest::Traffic) => store.connections_json()["traffic"].clone(),
+        Err(_) => return Err(invalid("the capture viewer only answers capture commands")),
+    };
+    serde_json::to_vec(&answer)
+        .map_err(|_| RuntimeError::new(RuntimeErrorCode::InternalError, "control answer failed"))
+}
+
+fn json_value(value: impl Serialize) -> Result<serde_json::Value, RuntimeError> {
+    serde_json::to_value(value)
+        .map_err(|_| RuntimeError::new(RuntimeErrorCode::InternalError, "control answer failed"))
+}
+
+/// A 32-byte session key in base64.
+fn decode_key(key_base64: &str) -> Result<Vec<u8>, RuntimeError> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(key_base64.trim())
+        .map_err(|_| storage_error(capture::storage::StorageError::InvalidKey))
 }
 
 /// Answers a request to a whole-device WireGuard tunnel, which has no flows
