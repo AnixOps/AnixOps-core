@@ -17,7 +17,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,7 @@ use tokio::sync::Notify;
 use crate::capture::{self, CaptureStore, Direction};
 use crate::config::DnsVia;
 use crate::direct::{self, DirectOutbound};
+use crate::dns_cache::{DnsCache, DnsPools, DnsReset};
 use crate::fake_ip::FakeIpPool;
 use crate::first_payload::ServerFirst;
 use crate::lan_guard::{self, LanPeer};
@@ -664,7 +665,13 @@ pub struct Dispatcher {
     /// Destinations whose packet tunnel flows connect without waiting for
     /// the app's first bytes; forgotten on `reset_network`.
     server_first: Arc<ServerFirst>,
+    /// The DNS answers and upstream connections of the tunnels running on
+    /// this dispatcher, for [`Dispatcher::reset_dns`].
+    tunnel_dns: Mutex<Vec<TunnelDns>>,
 }
+
+/// A running tunnel's DNS cache and upstream connection pools.
+type TunnelDns = (Weak<Mutex<DnsCache>>, Weak<DnsPools>);
 
 /// The port QUIC (HTTP/3) runs on: `block_quic` refuses UDP flows to it.
 pub const QUIC_PORT: u16 = 443;
@@ -691,6 +698,7 @@ impl Dispatcher {
             resolver: None,
             block_quic: AtomicBool::new(false),
             server_first: Arc::default(),
+            tunnel_dns: Mutex::default(),
         }
     }
 
@@ -708,6 +716,7 @@ impl Dispatcher {
             fake_ip: None,
             block_quic: AtomicBool::new(false),
             server_first: Arc::default(),
+            tunnel_dns: Mutex::default(),
         }
     }
 
@@ -892,6 +901,43 @@ impl Dispatcher {
 
     pub fn tracker(&self) -> &Arc<ConnectionTracker> {
         &self.tracker
+    }
+
+    /// Lets [`Dispatcher::reset_dns`] reach a tunnel's DNS cache and
+    /// upstream pools; they stay owned by the tunnel.
+    pub fn attach_dns(&self, cache: &Arc<Mutex<DnsCache>>, pools: &Arc<DnsPools>) {
+        let mut attached = self.tunnel_dns.lock().unwrap_or_else(|e| e.into_inner());
+        attached.retain(|(cache, pools)| cache.strong_count() > 0 || pools.strong_count() > 0);
+        attached.push((Arc::downgrade(cache), Arc::downgrade(pools)));
+    }
+
+    /// After the device changed networks: drops the answers the tunnels
+    /// cached and the addresses the resolver of IP rules and Fake-IP DIRECT
+    /// flows kept, and every upstream DNS connection kept for reuse. They
+    /// came from (or ran over) the old network: split-horizon and carrier
+    /// CDN answers no longer fit, and a kept connection would cost the next
+    /// query half its budget before a new one is dialed. Exchanges in flight
+    /// still answer their apps but cache nothing. Fake-IP mappings stay:
+    /// apps still hold those addresses.
+    pub fn reset_dns(&self) -> DnsReset {
+        let mut reset = DnsReset::default();
+        let attached = self
+            .tunnel_dns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for (cache, pools) in attached {
+            if let Some(cache) = cache.upgrade() {
+                reset.flushed += cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+            if let Some(pools) = pools.upgrade() {
+                reset.dropped += pools.clear();
+            }
+        }
+        if let Some(resolver) = &self.resolver {
+            reset += resolver.reset_network();
+        }
+        reset
     }
 
     /// The untracked outbound of the direct mode, for DNS servers reached

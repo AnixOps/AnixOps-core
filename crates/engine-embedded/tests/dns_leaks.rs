@@ -27,6 +27,7 @@ use engine_embedded::config::{
 };
 use engine_embedded::connections::{Dispatcher, Mode};
 use engine_embedded::direct::DirectOutbound;
+use engine_embedded::dns_cache::DnsReset;
 use engine_embedded::dns_policy::DnsPolicy;
 use engine_embedded::dns_resolver::PolicyResolver;
 use engine_embedded::fake_ip::FakeIpPool;
@@ -547,6 +548,43 @@ fn fake_ip_names_resolve_directly_in_the_direct_mode_and_apart() {
                 ("hk-1", "www.blocked.example:443".to_string()),
             ]
         );
+        assert_eq!(outbounds.asked(), ["www.blocked.example"]);
+    });
+}
+
+/// After a network change the addresses kept for IP rules and the upstream
+/// connection kept for reuse belong to the old network: the next lookup
+/// asks again over a new connection.
+#[test]
+fn reset_network_drops_resolved_addresses_and_kept_dns_connections() {
+    let outbounds = Outbounds::new();
+    let routed = cn_direct(&outbounds);
+    let dispatcher = Dispatcher::routed(routed.clone());
+    let name = domain("www.blocked.example", 443);
+    runtime().block_on(async {
+        assert_eq!(
+            routed.route_resolving(&name).await,
+            RouteOutcome::Node("hk-1".to_string())
+        );
+        assert_eq!(outbounds.hits(), [("hk-1", "1.1.1.1:53".to_string())]);
+        assert_eq!(outbounds.asked(), ["www.blocked.example"]);
+
+        assert_eq!(
+            dispatcher.reset_dns(),
+            DnsReset {
+                flushed: 1,
+                dropped: 1
+            }
+        );
+        assert_eq!(dispatcher.reset_dns(), DnsReset::default());
+
+        assert_eq!(
+            routed.route_resolving(&name).await,
+            RouteOutcome::Node("hk-1".to_string())
+        );
+        // A new connection (the kept one was dropped), and the name was
+        // asked again (the kept address was dropped).
+        assert_eq!(outbounds.hits(), [("hk-1", "1.1.1.1:53".to_string())]);
         assert_eq!(outbounds.asked(), ["www.blocked.example"]);
     });
 }

@@ -14,6 +14,12 @@
 //!   instead of sending it again;
 //! * keeps idle upstream connections in [`UpstreamPool`] for the next query.
 //!
+//! When the network under the engine changes (`reset_network`), the answers
+//! and the kept connections belong to the old network: [`DnsCache::clear`]
+//! and [`DnsPools::clear`] drop them, and an exchange that started before
+//! the reset neither caches its answer nor returns its connection (each
+//! keeps a generation that the clear moves on).
+//!
 //! Only standard answers are kept: `NOERROR` or `NXDOMAIN`, not truncated,
 //! for the question that was asked, at most [`MAX_CACHED_RESPONSE`] bytes
 //! each and [`MAX_CACHE_BYTES`] together (a longer answer is still forwarded,
@@ -114,6 +120,24 @@ pub struct DnsCache {
     bytes: usize,
     next_seq: u64,
     inflight: HashMap<CacheKey, Vec<Waiter>>,
+    /// Moves on with every [`DnsCache::clear`].
+    generation: u64,
+}
+
+/// What a `reset_network` dropped from the DNS state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DnsReset {
+    /// Cached answers (and resolved addresses) dropped.
+    pub flushed: usize,
+    /// Kept upstream connections dropped.
+    pub dropped: usize,
+}
+
+impl std::ops::AddAssign for DnsReset {
+    fn add_assign(&mut self, other: Self) {
+        self.flushed += other.flushed;
+        self.dropped += other.dropped;
+    }
 }
 
 impl DnsCache {
@@ -175,6 +199,39 @@ impl DnsCache {
         self.by_expiry.insert(entry.expiry_key(), key.clone());
         self.bytes += size;
         self.entries.insert(key, entry);
+    }
+
+    /// [`Self::insert`], unless the cache was cleared since `generation`
+    /// ([`Self::generation`] when the exchange started): an answer from
+    /// before a network change is not kept for the new network.
+    pub fn insert_since(
+        &mut self,
+        generation: u64,
+        key: CacheKey,
+        question: &Question,
+        response: &[u8],
+        now: Instant,
+    ) {
+        if generation == self.generation {
+            self.insert(key, question, response, now);
+        }
+    }
+
+    /// Moves on with every [`Self::clear`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Drops every cached answer (the network changed) and returns how many.
+    /// Exchanges in flight keep their waiters, who still get the answer; it
+    /// is only not cached ([`Self::insert_since`]).
+    pub fn clear(&mut self) -> usize {
+        let flushed = self.entries.len();
+        self.entries.clear();
+        self.by_expiry.clear();
+        self.bytes = 0;
+        self.generation += 1;
+        flushed
     }
 
     /// Drops the answer kept for `key`, if any.
@@ -402,10 +459,26 @@ pub struct DnsPools {
     pub quic: std::sync::Mutex<crate::dns_quic::QuicPool>,
 }
 
+impl DnsPools {
+    /// Drops every kept connection (the network changed) and returns how
+    /// many; DNS over QUIC connections are closed, so a query still on one
+    /// fails at once instead of waiting out half its budget.
+    pub fn clear(&self) -> usize {
+        let tcp = self.tcp.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "dns-quic")]
+        let quic = self.quic.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(not(feature = "dns-quic"))]
+        let quic = 0;
+        tcp + quic
+    }
+}
+
 /// Idle upstream connections, per server and outbound.
 #[derive(Default)]
 pub struct UpstreamPool {
     idle: HashMap<PoolKey, Vec<(BoxStream, Instant)>>,
+    /// Moves on with every [`UpstreamPool::clear`].
+    generation: u64,
 }
 
 /// A server index and the outbound (by address) its connections run through.
@@ -428,12 +501,40 @@ impl UpstreamPool {
         None
     }
 
-    pub fn put(&mut self, key: PoolKey, stream: BoxStream, now: Instant) {
+    /// Keeps `stream` for `key`, unless the pool was cleared since
+    /// `generation` ([`Self::generation`] before the stream was taken or
+    /// dialed): a connection from before a network change is dropped.
+    pub fn put(&mut self, key: PoolKey, stream: BoxStream, now: Instant, generation: u64) {
+        if generation != self.generation {
+            return;
+        }
         let idle = self.idle.entry(key).or_default();
         idle.retain(|(_, since)| now.saturating_duration_since(*since) < MAX_IDLE);
         if idle.len() < MAX_IDLE_PER_UPSTREAM {
             idle.push((stream, now));
         }
+    }
+
+    /// Moves on with every [`Self::clear`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Drops every idle connection and returns how many.
+    pub fn clear(&mut self) -> usize {
+        let dropped = self.idle.values().map(Vec::len).sum();
+        self.idle.clear();
+        self.generation += 1;
+        dropped
+    }
+
+    /// Idle connections kept now.
+    pub fn len(&self) -> usize {
+        self.idle.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

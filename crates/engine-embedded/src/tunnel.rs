@@ -784,6 +784,8 @@ fn spawn_tasks(
     let dns_permits = Arc::new(Semaphore::new(settings.max_dns_in_flight));
     let dns_state = Arc::new(std::sync::Mutex::new(DnsCache::default()));
     let upstream_pool = Arc::new(DnsPools::default());
+    // `reset_network` reaches them through the dispatcher.
+    dispatcher.attach_dns(&dns_state, &upstream_pool);
     let mut flows = UdpFlows::default();
     tokio::spawn(async move {
         while let Some((payload, src, dst)) = udp_rx.next().await {
@@ -983,6 +985,8 @@ fn spawn_dns_exchange(job: DnsExchange) {
             state,
             pool,
         } = job;
+        // An answer from before a network change is not cached after it.
+        let generation = state.lock().unwrap_or_else(|e| e.into_inner()).generation();
         // DNS queries are the tunnel's own traffic, not listed connections.
         // Routing that rejects the proxy gives no outbound: no query rather
         // than one in the clear.
@@ -1008,7 +1012,13 @@ fn spawn_dns_exchange(job: DnsExchange) {
             Some(key) => {
                 let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
                 if let (Ok(response), Some(question)) = (&result, dns::question(&payload)) {
-                    state.insert(key.clone(), &question, response, std::time::Instant::now());
+                    state.insert_since(
+                        generation,
+                        key.clone(),
+                        &question,
+                        response,
+                        std::time::Instant::now(),
+                    );
                 }
                 state.finish(key)
             }

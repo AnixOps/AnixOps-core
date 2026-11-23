@@ -351,6 +351,14 @@ pub trait DomainResolver: Send + Sync {
     fn resolve_direct<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>> {
         self.resolve(domain)
     }
+
+    /// The device changed networks: drop the addresses kept and the upstream
+    /// connections kept for reuse, which belong to the old network (see
+    /// [`crate::connections::Dispatcher::reset_dns`]). The default keeps
+    /// nothing to drop.
+    fn reset_network(&self) -> crate::dns_cache::DnsReset {
+        crate::dns_cache::DnsReset::default()
+    }
 }
 
 /// The operating system resolver (`getaddrinfo`), first address returned.

@@ -33,6 +33,8 @@ const MAX_ANSWER: usize = 2 + 65_535;
 #[derive(Default)]
 pub struct QuicPool {
     connections: HashMap<PoolKey, (Arc<QuicConnection>, std::time::Instant)>,
+    /// Moves on with every [`QuicPool::clear`].
+    generation: u64,
 }
 
 impl QuicPool {
@@ -49,7 +51,19 @@ impl QuicPool {
         Some(connection.clone())
     }
 
-    fn put(&mut self, key: PoolKey, connection: Arc<QuicConnection>, now: std::time::Instant) {
+    /// Keeps `connection` for `key`, unless the pool was cleared since
+    /// `generation`: a connection dialed before a network change is closed.
+    fn put(
+        &mut self,
+        key: PoolKey,
+        connection: Arc<QuicConnection>,
+        now: std::time::Instant,
+        generation: u64,
+    ) {
+        if generation != self.generation {
+            connection.connection.close(0u32.into(), b"network changed");
+            return;
+        }
         self.connections.retain(|_, (kept, used)| {
             now.saturating_duration_since(*used) < MAX_IDLE
                 && kept.connection.close_reason().is_none()
@@ -68,6 +82,18 @@ impl QuicPool {
         {
             self.connections.remove(&key);
         }
+    }
+
+    /// Closes and drops every kept connection (the network changed): a
+    /// query still on one fails at once. Returns how many.
+    pub fn clear(&mut self) -> usize {
+        let dropped = self.connections.len();
+        for (connection, _) in self.connections.values() {
+            connection.connection.close(0u32.into(), b"network changed");
+        }
+        self.connections.clear();
+        self.generation += 1;
+        dropped
     }
 
     /// Connections kept now.
@@ -91,6 +117,7 @@ pub async fn exchange(
     deadline: Instant,
     pool: Option<(&Mutex<QuicPool>, PoolKey)>,
 ) -> Result<Vec<u8>, OutboundFailure> {
+    let generation = pool.map_or(0, |(pool, _)| lock(pool).generation);
     if let Some((pool, key)) = pool {
         let kept = lock(pool).get(key, std::time::Instant::now());
         if let Some(connection) = kept {
@@ -125,7 +152,7 @@ pub async fn exchange(
     };
     if let Some((pool, key)) = pool {
         if result.is_ok() {
-            lock(pool).put(key, connection, std::time::Instant::now());
+            lock(pool).put(key, connection, std::time::Instant::now(), generation);
         }
     }
     result
@@ -300,6 +327,76 @@ mod tests {
             1,
             "the connection was kept"
         );
+        assert_eq!(pool.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cleared_pool_closes_its_connections_and_dials_anew() {
+        let (server, connections) = doq_server();
+        // Only the test skips the certificate check: the server's is self-signed.
+        let connector = QuicConnector::new(
+            server.ip().to_string(),
+            server.port(),
+            &transport_tls::TlsSettings {
+                server_name: "doq.test".to_string(),
+                alpn: vec!["doq".to_string()],
+                insecure: true,
+                ..transport_tls::TlsSettings::default()
+            },
+            &["doq"],
+            transport_quic::Congestion::Cubic,
+        )
+        .unwrap()
+        .without_keep_alive()
+        .unwrap();
+        let direct = crate::direct::DirectOutbound::new(Arc::new(engine_outbound::TcpDialer));
+        let pool = Mutex::new(QuicPool::default());
+        let target = TargetAddr::Ip(server);
+        let ask_once = |id: u16| {
+            let query = crate::dns::query(id, "a.example", crate::dns::TYPE_A).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (connector, target, direct, pool) = (&connector, &target, &direct, &pool);
+            async move {
+                exchange(
+                    connector,
+                    target,
+                    direct,
+                    &query,
+                    deadline,
+                    Some((pool, (0, 0))),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        ask_once(0x0101).await;
+        assert_eq!(pool.lock().unwrap().len(), 1);
+        let kept = pool
+            .lock()
+            .unwrap()
+            .connections
+            .values()
+            .next()
+            .unwrap()
+            .0
+            .clone();
+
+        assert_eq!(pool.lock().unwrap().clear(), 1);
+        assert!(pool.lock().unwrap().is_empty());
+        assert!(
+            kept.connection.close_reason().is_some(),
+            "the kept connection is closed"
+        );
+
+        // A connection dialed before the clear is not kept after it.
+        let stale = pool.lock().unwrap().generation - 1;
+        pool.lock()
+            .unwrap()
+            .put((0, 0), kept, std::time::Instant::now(), stale);
+        assert!(pool.lock().unwrap().is_empty());
+
+        ask_once(0x0202).await;
+        assert_eq!(connections.load(Ordering::SeqCst), 2, "a new connection");
         assert_eq!(pool.lock().unwrap().len(), 1);
     }
 

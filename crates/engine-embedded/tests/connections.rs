@@ -1279,3 +1279,90 @@ fn control_names_devices_reports_the_radio_and_tests_source_ports() {
         }
     });
 }
+
+/// `reset_network` drops the answers a tunnel cached and the upstream DNS
+/// connections it kept; an exchange that started before the reset neither
+/// caches its answer nor returns its connection.
+#[test]
+fn reset_network_flushes_the_tunnel_dns_cache_and_pools() {
+    use engine_embedded::dns::{query, question, TYPE_A};
+    use engine_embedded::dns_cache::{CacheKey, DnsCache, DnsPools, Lookup};
+    use std::time::Instant;
+
+    runtime().block_on(async {
+        let dispatcher = Dispatcher::single(Arc::new(Echo("test-echo")));
+        let cache = Arc::new(std::sync::Mutex::new(DnsCache::default()));
+        let pools = Arc::new(DnsPools::default());
+        dispatcher.attach_dns(&cache, &pools);
+
+        let asked = query(7, "example.com", TYPE_A).unwrap();
+        let asked_question = question(&asked).unwrap();
+        let mut answer = asked.clone();
+        answer[2] |= 0x80;
+        answer[3] = 0x80;
+        answer[7] = 1;
+        answer.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 1, 0x2C, 0, 4, 192, 0, 2, 1]);
+        let key = CacheKey {
+            name: "example.com".to_string(),
+            qtype: TYPE_A,
+            server: 0,
+            proxied: true,
+        };
+        let now = Instant::now();
+        let before = {
+            let mut cache = cache.lock().unwrap();
+            let before = cache.generation();
+            cache.insert_since(before, key.clone(), &asked_question, &answer, now);
+            assert_eq!(cache.len(), 1);
+            before
+        };
+        let pool_before = {
+            let mut tcp = pools.tcp.lock().unwrap();
+            let generation = tcp.generation();
+            let (idle, _peer) = tokio::io::duplex(64);
+            tcp.put((0, 0), Box::new(idle), now, generation);
+            assert_eq!(tcp.len(), 1);
+            generation
+        };
+
+        let answer_json = control_json(&dispatcher, r#"{"cmd":"reset_network"}"#);
+        assert_eq!(answer_json["dns_flushed"], 1);
+        assert_eq!(answer_json["dns_connections_dropped"], 1);
+        assert!(cache.lock().unwrap().is_empty());
+        assert!(pools.tcp.lock().unwrap().is_empty());
+        assert!(matches!(
+            cache
+                .lock()
+                .unwrap()
+                .lookup(&key, &asked, asked_question.end, now),
+            Lookup::Miss
+        ));
+
+        // What an exchange from before the reset brings back is not kept.
+        cache
+            .lock()
+            .unwrap()
+            .insert_since(before, key.clone(), &asked_question, &answer, now);
+        assert!(cache.lock().unwrap().is_empty());
+        let (late, _peer) = tokio::io::duplex(64);
+        pools
+            .tcp
+            .lock()
+            .unwrap()
+            .put((0, 0), Box::new(late), now, pool_before);
+        assert!(pools.tcp.lock().unwrap().is_empty());
+
+        // New exchanges are kept again.
+        let mut kept = cache.lock().unwrap();
+        let current = kept.generation();
+        kept.insert_since(current, key, &asked_question, &answer, now);
+        assert_eq!(kept.len(), 1);
+        drop(kept);
+
+        // Without a tunnel attached (or once it stopped) there is nothing to drop.
+        drop((cache, pools));
+        let answer_json = control_json(&dispatcher, r#"{"cmd":"reset_network"}"#);
+        assert_eq!(answer_json["dns_flushed"], 0);
+        assert_eq!(answer_json["dns_connections_dropped"], 0);
+    });
+}

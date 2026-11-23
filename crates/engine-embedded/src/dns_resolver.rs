@@ -18,11 +18,15 @@
 //! query in that mode. Those answers are kept apart from the others, so an
 //! answer a `proxy` server gave in the clear never reaches an IP rule after
 //! the switch back to the rule mode.
+//!
+//! `reset_network` drops the kept addresses and upstream connections
+//! ([`DomainResolver::reset_network`]); a lookup that started before it
+//! answers its connection but keeps nothing.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -30,7 +34,7 @@ use engine_outbound::{BoxFuture, TcpOutbound};
 
 use crate::config::DnsVia;
 use crate::dns::{self, TYPE_A, TYPE_AAAA};
-use crate::dns_cache::{self, DnsPools};
+use crate::dns_cache::{self, DnsPools, DnsReset};
 use crate::dns_policy::{DnsPolicy, Plan};
 use crate::routing::{DomainResolver, RoutedOutbound};
 
@@ -49,6 +53,9 @@ pub struct PolicyResolver {
     pools: DnsPools,
     cache: Mutex<HashMap<CacheKey, (IpAddr, Instant)>>,
     next_id: AtomicU16,
+    /// Moves on with every reset, under the `cache` lock; an address looked
+    /// up before it is not kept.
+    generation: AtomicU64,
 }
 
 /// A cached answer: the name, and whether `proxy` servers were reached
@@ -71,6 +78,7 @@ impl PolicyResolver {
             pools: DnsPools::default(),
             cache: Mutex::default(),
             next_id: AtomicU16::new(seed),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -87,6 +95,7 @@ impl PolicyResolver {
             proxied,
         };
         let now = Instant::now();
+        let generation = self.generation.load(Ordering::Acquire);
         if let Some((address, expires)) = self.cached(&key) {
             if expires > now {
                 return Ok(address);
@@ -111,7 +120,7 @@ impl PolicyResolver {
                 Plan::Forward(server) => self.forward(&routed, server, &query, key.proxied).await?,
             };
             if let Some((address, ttl)) = dns_cache::first_address(&response, &question) {
-                self.remember(key, address, now + ttl.min(MAX_CACHE_TTL));
+                self.remember(key, address, now + ttl.min(MAX_CACHE_TTL), generation);
                 return Ok(address);
             }
         }
@@ -153,8 +162,11 @@ impl PolicyResolver {
             .copied()
     }
 
-    fn remember(&self, key: CacheKey, address: IpAddr, expires: Instant) {
+    fn remember(&self, key: CacheKey, address: IpAddr, expires: Instant, generation: u64) {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
         if cache.len() >= MAX_CACHED && !cache.contains_key(&key) {
             let now = Instant::now();
             cache.retain(|_, (_, expires)| *expires > now);
@@ -173,5 +185,19 @@ impl DomainResolver for PolicyResolver {
 
     fn resolve_direct<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>> {
         Box::pin(self.lookup(domain, false))
+    }
+
+    fn reset_network(&self) -> DnsReset {
+        let flushed = {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            let flushed = cache.len();
+            cache.clear();
+            flushed
+        };
+        DnsReset {
+            flushed,
+            dropped: self.pools.clear(),
+        }
     }
 }

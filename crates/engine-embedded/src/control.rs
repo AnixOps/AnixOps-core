@@ -25,7 +25,7 @@
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
 //! | `network_changed` | | `{"scheduled": network-change script count}` |
-//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped, "first_wait_forgotten": destinations no longer connected without the first-payload wait}` |
+//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped, "first_wait_forgotten": destinations no longer connected without the first-payload wait, "dns_flushed": DNS answers and resolved addresses dropped, "dns_connections_dropped": kept upstream DNS connections dropped}` |
 //! | `set_network` | optional `type` (`wifi` \| `wired` \| `cellular`), `ssid`, `bssid`, `router`, `addresses` (IPs of the default interface), `radio` (cellular radio technology such as `LTE` or `NR`) | `{"changed": bool}`: the network subnet groups and `SUBNET` / `CELLULAR-RADIO` rules match; all fields absent means unknown |
 //! | `devices` | | `{"devices": {ip: name}}` |
 //! | `set_devices` | `devices` (`{ip: name}`, at most 256) | `{"changed": bool}`: the names `DEVICE-NAME` rules match, replacing the earlier ones |
@@ -91,7 +91,13 @@
 //! network: a group is checked again as soon as a connection goes through
 //! it (see [`crate::routing`]), and every destination the packet tunnel
 //! learned to connect without waiting for the app's first bytes (see
-//! [`crate::first_payload`]). A running WireGuard node moves its session to
+//! [`crate::first_payload`]). It drops the DNS answers the tunnel cached,
+//! the addresses kept for IP rules and Fake-IP DIRECT flows, and every
+//! upstream DNS connection kept for reuse
+//! ([`crate::connections::Dispatcher::reset_dns`]): answers from the old
+//! network (split-horizon names, a carrier's CDN) no longer fit, and a kept
+//! connection over the old path would cost the next query half its budget.
+//! Fake-IP mappings stay. A running WireGuard node moves its session to
 //! a new UDP socket and counts as one reset.
 //!
 //! A whole-device WireGuard tunnel (a config whose single `outbound` is
@@ -583,6 +589,7 @@ pub fn handle_with_interceptor(
             // new one (another path, another middlebox, another server
             // behind the address): every destination is sniffed again.
             let first_wait_forgotten = dispatcher.server_first().clear();
+            let dns = dispatcher.reset_dns();
             let closed = if close_connections {
                 tracker.close_all()
             } else {
@@ -593,6 +600,8 @@ pub fn handle_with_interceptor(
                 "closed": closed,
                 "health_forgotten": health_forgotten,
                 "first_wait_forgotten": first_wait_forgotten,
+                "dns_flushed": dns.flushed,
+                "dns_connections_dropped": dns.dropped,
             }))
         }
         ControlRequest::RunScript { tag } => Ok(script(interceptor, ScriptControl::Run { tag })?),
@@ -782,9 +791,9 @@ pub fn handle_with_interceptor(
 /// Answers a request to a whole-device WireGuard tunnel, which has no flows
 /// to control. `reset_network` moves the running tunnel to a new UDP socket
 /// ([`crate::wireguard::PathControl::reset`]): `reset` is 1 when a tunnel
-/// runs, `closed`, `health_forgotten` and `first_wait_forgotten` are 0.
-/// `set_network` is checked and changes nothing (`"changed": false`). Every
-/// other command is refused.
+/// runs, `closed`, `health_forgotten`, `first_wait_forgotten` and the DNS
+/// counts are 0. `set_network` is checked and changes nothing
+/// (`"changed": false`). Every other command is refused.
 #[cfg(feature = "wireguard")]
 pub(crate) fn handle_wireguard(
     paths: &crate::wireguard::PathControl,
@@ -802,6 +811,8 @@ pub(crate) fn handle_wireguard(
                 "closed": 0,
                 "health_forgotten": 0,
                 "first_wait_forgotten": 0,
+                "dns_flushed": 0,
+                "dns_connections_dropped": 0,
             })
         }
         ControlRequest::SetNetwork {
