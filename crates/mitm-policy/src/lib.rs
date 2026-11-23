@@ -12,6 +12,7 @@ pub mod loon_map_local;
 pub mod loon_plugin;
 mod loon_syntax;
 pub mod managed_sdwan;
+mod policy_cache;
 
 use control_domain::{
     AuditDecision, AuditEvent, CertificateTrustState, Diagnostic, DiagnosticSeverity, DomainError,
@@ -333,6 +334,7 @@ impl AnixOpsMitmPolicyEngine {
     }
 
     pub fn load_config(&mut self, config_text: &str) -> DomainResult<MitmPolicyLoadReport> {
+        POLICY_LOADS.with(|loads| loads.set(loads.get() + 1));
         let config = CString::new(config_text).map_err(|_| {
             DomainError::new(
                 MITM_POLICY_INPUT_NUL_BYTE_CODE,
@@ -874,13 +876,27 @@ impl From<sys::AnixOpsScriptKind> for MitmPolicyScriptKind {
     }
 }
 
+thread_local! {
+    static POLICY_LOADS: Cell<u64> = Cell::new(0);
+}
+
+/// How many times this thread has loaded text into an engine
+/// ([`AnixOpsMitmPolicyEngine::load_config`]); tests use it to check that a
+/// policy is compiled once per revision, not once per message or host.
+#[doc(hidden)]
+pub fn policy_loads_on_this_thread() -> u64 {
+    POLICY_LOADS.with(Cell::get)
+}
+
 /// Loaded engines kept between HTTP events. Loading a policy parses it and
 /// compiles every rule, far more work than planning one message, and a
 /// policy with large plugins runs to megabytes.
 static ENGINE_POOL: std::sync::Mutex<Vec<PooledEngine>> = std::sync::Mutex::new(Vec::new());
-/// Idle engines kept; more run at once when messages are planned in
-/// parallel, and the extra ones are dropped afterwards.
-const ENGINE_POOL_MAX_IDLE: usize = 2;
+/// Idle engines kept. Scripted messages are planned in parallel on the
+/// blocking pool, so a page loading several resources at once holds several
+/// leases; engines of the current policy are kept before those of an older
+/// one, and the extra ones are dropped afterwards.
+const ENGINE_POOL_MAX_IDLE: usize = 4;
 
 /// Policies up to this size are hashed whole; larger ones by samples, so a
 /// multi-megabyte policy costs little per message. The embedded data plane
@@ -988,13 +1004,25 @@ impl Drop for EngineLease {
             return;
         };
         if let Ok(mut pool) = ENGINE_POOL.lock() {
+            let current = pooled.policy;
             pool.push(pooled);
             while pool.len() > ENGINE_POOL_MAX_IDLE {
-                pool.remove(0);
+                // An engine of a replaced policy goes first, oldest first.
+                let index = pool
+                    .iter()
+                    .position(|entry| entry.policy != current)
+                    .unwrap_or(0);
+                pool.remove(index);
             }
         }
     }
 }
+
+/// Engines answering [`MitmPluginService::evaluate_mitm_hostname`], one per
+/// recent policy revision. They only read the hostname list and are set to
+/// a trusted certificate, so they are kept apart from [`ENGINE_POOL`].
+static HOSTNAME_ENGINES: policy_cache::PolicyCache<policy_cache::SharedEngine> =
+    policy_cache::PolicyCache::new(2);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnixOpsMitmPluginService;
@@ -1341,12 +1369,17 @@ impl MitmPluginService for AnixOpsMitmPluginService {
             return Ok(MitmHostnameDecision::Bypass);
         };
 
-        let mut engine = AnixOpsMitmPolicyEngine::new()?;
-        engine.load_config(source)?;
-        // The data plane only asks once the operator-supplied MITM CA is
-        // active, so evaluate the hostname list as trusted.
-        engine.set_certificate_trust_state(CertificateTrustState::Trusted);
-        let decision = engine.evaluate_mitm(hostname, is_quic)?;
+        // The data plane asks for every TLS and QUIC host it sees, so the
+        // policy is compiled once per revision, not once per host.
+        let engine = HOSTNAME_ENGINES.get_or_build(source, |source| {
+            let mut engine = AnixOpsMitmPolicyEngine::new()?;
+            engine.load_config(source)?;
+            // The data plane only asks once the operator-supplied MITM CA is
+            // active, so evaluate the hostname list as trusted.
+            engine.set_certificate_trust_state(CertificateTrustState::Trusted);
+            Ok(policy_cache::SharedEngine::new(engine))
+        })?;
+        let decision = engine.with(|engine| engine.evaluate_mitm(hostname, is_quic))?;
         Ok(match decision.decision {
             MitmPolicyMitmDecisionType::Bypass => MitmHostnameDecision::Bypass,
             MitmPolicyMitmDecisionType::Intercept => MitmHostnameDecision::Intercept,

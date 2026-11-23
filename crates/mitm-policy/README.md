@@ -173,6 +173,14 @@ the body to the core, so a body the core cannot read never fails the plan:
   and for scripts with `requires-body=true`; a script without it gets no
   body and cannot replace one (engine-native ignores a body such a script
   returns, with `engine.native.runtime.http_script_body_ignored`).
+- A policy is compiled once per revision (its length and a hash of its
+  text), not once per message or host: `evaluate_mitm_hostname` keeps one
+  trusted engine for each of the 2 most recent revisions, `[Map Local]` and
+  header-block rules keep their matchers and jq rules their parsed list for
+  the 4 most recent, and planning leases engines from a pool of 4 idle
+  engines that drops those of a replaced policy first.
+  `policy_loads_on_this_thread()` counts loads for tests
+  (`tests/policy_cache_contracts.rs`).
 
 The corpus in `tests/fixtures/loon-plugins` has an expected level for each
 plugin, and `tests/loon_plugin_contracts.rs` prints the graded report for

@@ -105,6 +105,40 @@ pub const SCRIPT_MEMORY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 pub const SCRIPT_MAX_TIMEOUT_MS: usize = 3_000;
 const LEAF_CACHE_ENTRIES: usize = 64;
 const DECISION_CACHE_ENTRIES: usize = 512;
+
+/// Hostname decisions in two generations of at most half of
+/// [`DECISION_CACHE_ENTRIES`] each. A full recent generation becomes the
+/// older one and the previous older one is dropped; a host found in the
+/// older generation moves back to the recent one. Hosts in use stay cached
+/// instead of every host being evaluated again at once.
+#[derive(Debug, Default)]
+struct DecisionCache {
+    recent: HashMap<String, bool>,
+    older: HashMap<String, bool>,
+}
+
+impl DecisionCache {
+    fn get(&mut self, host: &str) -> Option<bool> {
+        if let Some(decision) = self.recent.get(host) {
+            return Some(*decision);
+        }
+        let decision = self.older.remove(host)?;
+        self.insert(host.to_string(), decision);
+        Some(decision)
+    }
+
+    fn insert(&mut self, host: String, decision: bool) {
+        if !self.recent.contains_key(&host) && self.recent.len() >= DECISION_CACHE_ENTRIES / 2 {
+            self.older = std::mem::take(&mut self.recent);
+        }
+        self.recent.insert(host, decision);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.recent.len() + self.older.len()
+    }
+}
 const HTTPS_PORT: u16 = 443;
 const HTTP_PORT: u16 = 80;
 /// Request methods of a plain HTTP flow that is taken over. `CONNECT` and
@@ -153,7 +187,7 @@ pub struct MitmEngine {
     /// `upstream` offering `h2` before `http/1.1`, for apps that offer it.
     upstream_h2: Arc<ClientConfig>,
     leaves: Mutex<HashMap<String, Arc<ServerConfig>>>,
-    decisions: Mutex<HashMap<String, bool>>,
+    decisions: Mutex<DecisionCache>,
     /// What decryption did per host, for `mitm_hosts`.
     outcomes: Mutex<outcomes::HostOutcomes>,
     next_request: AtomicU64,
@@ -271,7 +305,7 @@ impl MitmEngine {
             upstream,
             upstream_h2,
             leaves: Mutex::new(HashMap::new()),
-            decisions: Mutex::new(HashMap::new()),
+            decisions: Mutex::new(DecisionCache::default()),
             outcomes: Mutex::new(outcomes::HostOutcomes::default()),
             next_request: AtomicU64::new(1),
             plugin_rules,
@@ -345,7 +379,7 @@ impl MitmEngine {
             .decisions
             .lock()
             .ok()
-            .and_then(|cache| cache.get(host).copied())
+            .and_then(|mut cache| cache.get(host))
         {
             return decision;
         }
@@ -355,9 +389,6 @@ impl MitmEngine {
             Ok(MitmHostnameDecision::Intercept)
         );
         if let Ok(mut cache) = self.decisions.lock() {
-            if cache.len() >= DECISION_CACHE_ENTRIES {
-                cache.clear();
-            }
             cache.insert(host.to_string(), decision);
         }
         decision
@@ -1682,4 +1713,32 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// mitm-scripts-07: a full cache drops its older half, never the hosts
+    /// in use.
+    #[test]
+    fn hostname_decisions_in_use_survive_a_full_cache() {
+        let mut cache = DecisionCache::default();
+        cache.insert("busy.example.test".to_string(), true);
+        for index in 0..DECISION_CACHE_ENTRIES * 4 {
+            cache.insert(format!("host-{index}.example.test"), false);
+            if index % 64 == 0 {
+                assert_eq!(cache.get("busy.example.test"), Some(true), "{index}");
+            }
+            assert!(cache.len() <= DECISION_CACHE_ENTRIES);
+        }
+        assert_eq!(cache.get("busy.example.test"), Some(true));
+        assert_eq!(
+            cache.get("host-0.example.test"),
+            None,
+            "an unused host left"
+        );
+        let last = format!("host-{}.example.test", DECISION_CACHE_ENTRIES * 4 - 1);
+        assert_eq!(cache.get(&last), Some(false));
+    }
 }

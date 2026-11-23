@@ -9,6 +9,7 @@
 //! loaded source because the core's result value is capped at 2 KiB.
 
 use crate::loon_syntax::tokens;
+use crate::policy_cache::PolicyCache;
 use crate::{MitmPolicyBodyRewriteChain, MitmPolicyPhase};
 use jaq_core::load::{Arena, File, Loader};
 use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
@@ -78,6 +79,9 @@ fn jq_rules(source: &str) -> Vec<(String, MitmPolicyPhase, String)> {
         .collect()
 }
 
+/// jq rules of the most recent policy revisions.
+static JQ_RULES: PolicyCache<Vec<(String, MitmPolicyPhase, String)>> = PolicyCache::new(4);
+
 /// Runs the jq steps of `chain` on `body`. `None` when no jq step changed it.
 pub fn apply_jq_steps(
     source: &str,
@@ -93,7 +97,10 @@ pub fn apply_jq_steps(
     if steps.is_empty() {
         return None;
     }
-    let rules = jq_rules(source);
+    // Read once per policy revision, not once per message.
+    let rules = JQ_RULES
+        .get_or_build(source, |source| Ok(jq_rules(source)))
+        .ok()?;
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     let mut current = body.to_string();
     let mut changed = false;
