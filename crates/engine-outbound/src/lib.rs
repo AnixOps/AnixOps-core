@@ -171,10 +171,11 @@ impl Dialer for OutboundDialer {
 
 /// A system UDP socket connected to `host:port`, as a flow. UDP has no
 /// handshake to race the resolved addresses on, so it takes the first in
-/// [`happy_eyeballs::resolve`] order: the family TCP or QUIC last connected
-/// to the host with, else the resolver's first.
+/// [`happy_eyeballs::resolve`] order for UDP: the family QUIC last
+/// connected to the host with, else the family TCP did, else the
+/// resolver's first.
 async fn socket_flow(host: &str, port: u16) -> io::Result<UdpFlow> {
-    let addr = happy_eyeballs::resolve(host, port)
+    let addr = happy_eyeballs::resolve(host, port, happy_eyeballs::Transport::Udp)
         .await
         .map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => {

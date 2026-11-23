@@ -35,9 +35,13 @@ It contains interfaces only, plus the default `TcpDialer`:
   3 s each, the last with the rest of the 10 s handshake timeout. UDP without a
   handshake (`Dialer::open_datagram`, the direct outbound) takes the first
   address in the same order. The last address never has a limit of its own;
-  the caller's connect timeout bounds the whole. Remembered families are
-  forgotten when the path changes (`protect::path_generation`) and on
-  `Dispatcher::reset_sessions`.
+  the caller's connect timeout bounds the whole. Families are remembered per
+  host and transport (`Transport::Tcp` / `Transport::Udp`), since IPv6 TCP can
+  work where IPv6 UDP is dropped: QUIC and UDP flows use the UDP entry and fall
+  back to the TCP one, and a TCP success never overrides what QUIC learned.
+  When the table (1024 entries) is full, expired entries go first, then the
+  oldest. Remembered families are forgotten when the path changes
+  (`protect::path_generation`) and on `Dispatcher::reset_sessions`.
 - `uri_host`: an IPv6 literal in brackets for URI authorities and `Host`
   headers (gRPC, WebSocket, XHTTP).
 - UDP flows over a connected socket (`UdpFlow::connected_socket`) keep no

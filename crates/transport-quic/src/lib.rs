@@ -224,6 +224,7 @@ impl QuicConnector {
         engine_outbound::happy_eyeballs::connect_host(
             &self.server,
             self.port,
+            engine_outbound::happy_eyeballs::Transport::Udp,
             engine_outbound::happy_eyeballs::Schedule::Sequential {
                 limit: ADDRESS_ATTEMPT_LIMIT,
             },

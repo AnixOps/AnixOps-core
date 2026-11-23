@@ -148,6 +148,7 @@ pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
     crate::happy_eyeballs::connect_host(
         host,
         port,
+        crate::happy_eyeballs::Transport::Tcp,
         crate::happy_eyeballs::Schedule::TCP,
         connect_tcp,
     )

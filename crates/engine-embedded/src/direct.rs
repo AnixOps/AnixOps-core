@@ -8,7 +8,7 @@
 use std::io;
 use std::sync::Arc;
 
-use engine_outbound::happy_eyeballs::{self, Schedule};
+use engine_outbound::happy_eyeballs::{self, Schedule, Transport};
 use engine_outbound::registry::{parse_settings, BuildError, OutboundFactory, Settings};
 use engine_outbound::{BoxFuture, BoxStream, Dialer, TargetAddr, TcpOutbound, UdpFlow};
 
@@ -42,21 +42,22 @@ impl DirectOutbound {
     }
 }
 
-/// The addresses of `target` in the order to try them, a domain resolved by
-/// the system ([`happy_eyeballs::resolve`]).
-async fn addresses(target: &TargetAddr) -> io::Result<Vec<std::net::SocketAddr>> {
+/// The addresses of `target` in the order to try them over `transport`, a
+/// domain resolved by the system ([`happy_eyeballs::resolve`]).
+async fn addresses(
+    target: &TargetAddr,
+    transport: Transport,
+) -> io::Result<Vec<std::net::SocketAddr>> {
     match target {
         TargetAddr::Ip(address) => Ok(vec![*address]),
-        TargetAddr::Domain(domain, port) => {
-            happy_eyeballs::resolve(domain, *port)
-                .await
-                .map_err(|error| match error.kind() {
-                    io::ErrorKind::NotFound => {
-                        io::Error::new(io::ErrorKind::NotFound, "target did not resolve")
-                    }
-                    _ => error,
-                })
-        }
+        TargetAddr::Domain(domain, port) => happy_eyeballs::resolve(domain, *port, transport)
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => {
+                    io::Error::new(io::ErrorKind::NotFound, "target did not resolve")
+                }
+                _ => error,
+            }),
     }
 }
 
@@ -71,13 +72,13 @@ impl TcpOutbound for DirectOutbound {
                 let host = target.host();
                 return self.dialer.dial(&host, target.port()).await;
             };
-            let addresses = addresses(target).await?;
+            let addresses = addresses(target, Transport::Tcp).await?;
             let (address, stream) = happy_eyeballs::connect(&addresses, Schedule::TCP, |address| {
                 crate::interface::connect_tcp(interface, address)
             })
             .await?;
             if let TargetAddr::Domain(domain, _) = target {
-                happy_eyeballs::remember(domain, address);
+                happy_eyeballs::remember(domain, Transport::Tcp, address);
             }
             let _ = stream.set_nodelay(true);
             Ok(Box::new(stream) as BoxStream)
@@ -88,11 +89,12 @@ impl TcpOutbound for DirectOutbound {
     fn open_udp<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
         Box::pin(async move {
             // No handshake to race on: the first address in
-            // `happy_eyeballs` order, the family TCP last connected with.
+            // `happy_eyeballs` order for UDP, the family QUIC last connected
+            // with, else the family TCP did.
             let address = match target {
                 TargetAddr::Ip(address) => *address,
                 TargetAddr::Domain(..) => {
-                    addresses(target)
+                    addresses(target, Transport::Udp)
                         .await
                         .map_err(|error| match error.kind() {
                             io::ErrorKind::NotFound => io::Error::new(
