@@ -103,7 +103,10 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
-const FORMATS: &[(&str, fn(&[Entry]) -> String)] = &[
+/// Renders a list of entries in one subscription format.
+type Render = fn(&[Entry]) -> String;
+
+const FORMATS: &[(&str, Render)] = &[
     ("clash", clash),
     ("surge", surge),
     ("loon", loon),
