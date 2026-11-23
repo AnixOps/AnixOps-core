@@ -1,0 +1,11 @@
+{
+  "invocation": {
+    "phase": "response",
+    "request": { "url": "https://api.example.test/", "method": "GET" },
+    "response": { "status": 200, "body": "" }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "body": "POST|follow=false|binary=false|body=00ff10\nPOST|follow=true|binary=false|body=78" }
+  }
+}

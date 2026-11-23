@@ -1,0 +1,17 @@
+{
+  "invocation": {
+    "phase": "response",
+    "request": {
+      "url": "https://api.example.test/login",
+      "method": "POST",
+      "headers": { "Cookie": "session=abc; theme=dark", "Authorization": "Bearer t0k" },
+      "body": "user=1"
+    },
+    "response": { "status": 200, "headers": { "Content-Type": "text/plain" }, "body": "ok" }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "body": "POST|https://api.example.test/login|session=abc; theme=dark|user=1|200" },
+    "store": { "token": "Bearer t0k" }
+  }
+}

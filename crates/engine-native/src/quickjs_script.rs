@@ -15,9 +15,10 @@ use control_domain::{
     MetadataEntry,
 };
 use script_runtime::{
-    binary_body_bytes, binary_body_string, DisabledScriptHttpClient, JsonFileScriptStore,
+    binary_body_bytes, binary_body_string, open_script_store, DisabledScriptHttpClient,
     MemoryScriptStore, QuickJsScriptRuntime, ScriptHttpClient, ScriptInvocation, ScriptLimits,
     ScriptNotification, ScriptPhase, ScriptRequest, ScriptResponse, ScriptRunStatus, ScriptStore,
+    ScriptStoreRecovery,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -89,6 +90,8 @@ pub struct NativeQuickJsScriptExecutor {
     config: NativeQuickJsScriptRuntimeConfig,
     script_asset_hashes: BTreeMap<String, String>,
     store: Arc<dyn ScriptStore>,
+    /// How the persistent store was opened (a broken file is set aside).
+    store_recovery: ScriptStoreRecovery,
     runtime: QuickJsScriptRuntime,
     notifications: Arc<Mutex<VecDeque<ScriptNotification>>>,
     /// Shared cap on the heap limits of dispatches running at once.
@@ -156,6 +159,9 @@ impl std::fmt::Debug for NativeQuickJsScriptExecutor {
 
 impl NativeQuickJsScriptExecutor {
     /// Pins every mapped script by SHA-256 and opens the persistent store.
+    /// A store file that cannot be read never fails the runtime: it is set
+    /// aside or replaced by an in-memory store (see
+    /// [`Self::persistent_store_recovery`]).
     pub fn new(config: NativeQuickJsScriptRuntimeConfig) -> DomainResult<Self> {
         let mut script_asset_hashes = BTreeMap::new();
         for (url, path) in &config.script_assets {
@@ -166,15 +172,18 @@ impl NativeQuickJsScriptExecutor {
             };
             script_asset_hashes.insert(url.clone(), hash);
         }
-        let store: Arc<dyn ScriptStore> = match config.persistent_store_path.as_deref() {
-            Some(path) => Arc::new(JsonFileScriptStore::open(path).map_err(|_| {
-                config_invalid("QuickJS persistent store must be a JSON object file or absent")
-            })?),
-            None => Arc::new(MemoryScriptStore::new()),
-        };
+        let (store, store_recovery): (Arc<dyn ScriptStore>, _) =
+            match config.persistent_store_path.as_deref() {
+                Some(path) => open_script_store(path),
+                None => (
+                    Arc::new(MemoryScriptStore::new()),
+                    ScriptStoreRecovery::Opened,
+                ),
+            };
         Ok(Self {
             config,
             script_asset_hashes,
+            store_recovery,
             runtime: QuickJsScriptRuntime::new(store.clone(), Arc::new(DisabledScriptHttpClient)),
             store,
             notifications: Arc::default(),
@@ -206,6 +215,12 @@ impl NativeQuickJsScriptExecutor {
         &self.script_asset_hashes
     }
 
+    /// Whether the persistent store file had to be set aside or replaced by
+    /// an in-memory store when the executor was built.
+    pub fn persistent_store_recovery(&self) -> &ScriptStoreRecovery {
+        &self.store_recovery
+    }
+
     pub fn execute(
         &self,
         dispatch: &HttpMitmScriptDispatch,
@@ -222,30 +237,36 @@ impl NativeQuickJsScriptExecutor {
             (rule, 0) => rule,
             (rule, runtime) => rule.min(runtime),
         };
-        let body = if dispatch.requires_body {
-            if message.body.len() > max_body_bytes {
-                return script_execution_deferred(
-                    "native HTTP script dispatch body exceeds the max-size limit",
-                );
-            }
-            if dispatch.binary_body_mode {
-                Some(binary_body_string(&message.body))
-            } else {
-                match std::str::from_utf8(&message.body) {
-                    Ok(body) => Some(body.to_string()),
-                    Err(_) => {
-                        return script_execution_deferred(
-                            "native HTTP script dispatch requires a UTF-8 buffered body",
-                        )
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        if dispatch.requires_body && message.body.len() > max_body_bytes {
+            return script_execution_deferred(
+                "native HTTP script dispatch body exceeds the max-size limit",
+            );
+        }
         let source = match self.script_source(&dispatch.script_path) {
             Ok(source) => source,
             Err(reason) => return script_execution_deferred(reason),
+        };
+        // Outside binary-body-mode a body that is not UTF-8 still reaches a
+        // script that reads Quantumult X `bodyBytes` (protobuf, images), as
+        // bytes only; other text scripts cannot use it and are deferred.
+        let mut body_is_bytes = false;
+        let body = if !dispatch.requires_body {
+            None
+        } else if dispatch.binary_body_mode {
+            Some(binary_body_string(&message.body))
+        } else {
+            match std::str::from_utf8(&message.body) {
+                Ok(body) => Some(body.to_string()),
+                Err(_) if source.contains("bodyBytes") => {
+                    body_is_bytes = true;
+                    Some(binary_body_string(&message.body))
+                }
+                Err(_) => {
+                    return script_execution_deferred(
+                        "native HTTP script dispatch requires a UTF-8 buffered body",
+                    )
+                }
+            }
         };
 
         let headers = message
@@ -270,8 +291,18 @@ impl NativeQuickJsScriptExecutor {
                 ScriptRequest {
                     url: message.url.clone(),
                     method,
-                    headers: Vec::new(),
-                    body: None,
+                    // The request this response answers, as Loon and Surge
+                    // give response scripts.
+                    headers: message
+                        .request_headers
+                        .iter()
+                        .map(|header| (header.key.clone(), header.value.clone()))
+                        .collect(),
+                    body: request_body_for_response_script(
+                        dispatch,
+                        message.request_body.as_deref(),
+                        max_body_bytes,
+                    ),
                 },
                 Some(ScriptResponse {
                     status: message.status_code.unwrap_or(200),
@@ -291,6 +322,7 @@ impl NativeQuickJsScriptExecutor {
             request,
             response,
             binary_body: dispatch.binary_body_mode,
+            body_is_bytes,
             event: None,
             rule: None,
         };
@@ -329,6 +361,9 @@ impl NativeQuickJsScriptExecutor {
         }
 
         let mutation = outcome.applied_mutation().cloned().unwrap_or_default();
+        // Quantumult X `bodyBytes` makes the bodies byte strings outside
+        // binary-body-mode too.
+        let binary_bodies = dispatch.binary_body_mode || mutation.binary_bodies;
         let to_entries = |headers: Vec<(String, String)>| {
             headers
                 .into_iter()
@@ -337,7 +372,7 @@ impl NativeQuickJsScriptExecutor {
         };
         // The host only accepts byte strings for binary `$done` bodies.
         let to_bytes = |body: String| {
-            if dispatch.binary_body_mode {
+            if binary_bodies {
                 binary_body_bytes(&body).unwrap_or_default()
             } else {
                 body.into_bytes()
@@ -494,6 +529,24 @@ impl NativeQuickJsScriptExecutor {
             cache.put(script_url, &metadata, source.clone());
         }
         Ok(source)
+    }
+}
+
+/// The request body a response script sees as `$request.body`: only with
+/// `requires-body`, only when the data plane held it, and only when it fits
+/// the dispatch's body limit. A body the script's mode cannot carry (not
+/// UTF-8 in text mode) is left out instead of deferring the script, since
+/// the response is what the script works on.
+fn request_body_for_response_script(
+    dispatch: &HttpMitmScriptDispatch,
+    body: Option<&[u8]>,
+    max_body_bytes: usize,
+) -> Option<String> {
+    let body = body.filter(|body| dispatch.requires_body && body.len() <= max_body_bytes)?;
+    if dispatch.binary_body_mode {
+        Some(binary_body_string(body))
+    } else {
+        std::str::from_utf8(body).ok().map(str::to_string)
     }
 }
 

@@ -16,6 +16,14 @@ links PCRE2 statically (`.cargo/config.toml` sets `PCRE2_SYS_STATIC=1`), and
 engine to the PCRE2 backend before loading a config. Without the feature the
 core falls back to POSIX regex.
 
+Every Rust `#[repr(C)]` enum mirrors every enumerator of its C enum, with the
+same value: reading a C value that has no Rust variant is undefined
+behaviour. The unit test `rust_enums_mirror_every_c_enumerator` parses
+`include/mitm_anixops.h` and fails when the header gains, loses or renumbers
+an enumerator (it covers `anixops_rewrite_action`, including
+`ANIXOPS_REWRITE_URL_REWRITE_200`, and the other enums and buffer capacities the crate
+mirrors), so a submodule bump cannot silently drift from the header.
+
 This crate is intentionally low-level. Safe policy and domain adapter APIs must
 live in the `mitm-policy` crate.
 

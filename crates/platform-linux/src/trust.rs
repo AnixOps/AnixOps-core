@@ -120,7 +120,7 @@ pub fn apply_linux_trust<R: LinuxTrustRefreshRunner>(
             request.certificate_path.display()
         ))
     })?;
-    validate_certificate(&certificate)?;
+    let certificate = certificate_pem_blocks(&certificate)?;
     if request.snapshot_path.exists() {
         return Err(DomainError::new(
             LINUX_TRUST_WRITE_FAILED_CODE,
@@ -280,17 +280,84 @@ fn validate_rollback_paths(trust_file: &Path, snapshot: &Path) -> DomainResult<(
     Ok(())
 }
 
-fn validate_certificate(contents: &str) -> DomainResult<()> {
-    if !contents.contains("-----BEGIN CERTIFICATE-----")
-        || !contents.contains("-----END CERTIFICATE-----")
-        || contents.contains("-----BEGIN PRIVATE KEY-----")
-    {
-        return Err(DomainError::new(
-            LINUX_TRUST_INVALID_CODE,
+/// Parses the certificate source and returns only its `CERTIFICATE` PEM
+/// blocks, normalised to one block after another.
+///
+/// Any other PEM block (private keys in every encoding, certificate requests,
+/// parameters, ...) rejects the whole input instead of being silently dropped,
+/// so a combined "certificate + key" file never reaches the system trust
+/// directory or the snapshot, and the caller learns the file was unsuitable.
+fn certificate_pem_blocks(contents: &str) -> DomainResult<String> {
+    const BEGIN: &str = "-----BEGIN ";
+    const END: &str = "-----END ";
+    const TAIL: &str = "-----";
+    let invalid = |message: &str| DomainError::new(LINUX_TRUST_INVALID_CODE, message.to_string());
+    // Defence in depth: no spelling of a private key header may pass, even
+    // outside a well-formed block.
+    if contents.contains("PRIVATE KEY") {
+        return Err(invalid(
+            "linux trust source must contain only public CA certificate PEM blocks and no private key",
+        ));
+    }
+    let mut certificates = String::new();
+    let mut open: Option<(String, String)> = None;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if let Some(label) = line
+            .strip_prefix(BEGIN)
+            .and_then(|rest| rest.strip_suffix(TAIL))
+        {
+            if open.is_some() {
+                return Err(invalid("linux trust source has a nested PEM block"));
+            }
+            if label != "CERTIFICATE" {
+                return Err(invalid(
+                    "linux trust source must contain only CERTIFICATE PEM blocks",
+                ));
+            }
+            open = Some((label.to_string(), String::new()));
+            continue;
+        }
+        if let Some(label) = line
+            .strip_prefix(END)
+            .and_then(|rest| rest.strip_suffix(TAIL))
+        {
+            let Some((open_label, body)) = open.take() else {
+                return Err(invalid("linux trust source has an unmatched PEM END line"));
+            };
+            if label != open_label || body.is_empty() {
+                return Err(invalid(
+                    "linux trust source has a malformed CERTIFICATE block",
+                ));
+            }
+            certificates.push_str("-----BEGIN CERTIFICATE-----\n");
+            certificates.push_str(&body);
+            certificates.push_str("-----END CERTIFICATE-----\n");
+            continue;
+        }
+        if line.starts_with("-----") {
+            return Err(invalid("linux trust source has a malformed PEM boundary"));
+        }
+        if let Some((_, body)) = open.as_mut() {
+            if !line.is_empty() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        // Text outside PEM blocks (for example "Bag Attributes" written by
+        // export tools) is not copied into the trust file.
+    }
+    if open.is_some() {
+        return Err(invalid(
+            "linux trust source has an unterminated CERTIFICATE block",
+        ));
+    }
+    if certificates.is_empty() {
+        return Err(invalid(
             "linux trust source must contain a public CA certificate PEM and no private key",
         ));
     }
-    Ok(())
+    Ok(certificates)
 }
 
 fn reject_symlink(path: &Path) -> DomainResult<()> {
@@ -306,10 +373,18 @@ fn reject_symlink(path: &Path) -> DomainResult<()> {
     Ok(())
 }
 
+/// The snapshot carries the previous trust file and the applied certificate;
+/// it is private to the administrator that created it.
+const SNAPSHOT_FILE_MODE: u32 = 0o600;
+/// Trust anchors are public certificates and must stay world-readable so
+/// every TLS client on the host can load them; never wider than that.
+const TRUST_FILE_MODE: u32 = 0o644;
+
 fn write_new_file(path: &Path, contents: &[u8]) -> DomainResult<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    restrict_mode(&mut options, SNAPSHOT_FILE_MODE);
+    let mut file = options
         .open(path)
         .map_err(|error| write_error(format!("create {}: {error}", path.display())))?;
     file.write_all(contents)
@@ -319,8 +394,51 @@ fn write_new_file(path: &Path, contents: &[u8]) -> DomainResult<()> {
 
 fn write_atomic_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("networkcore-{}.tmp", std::process::id()));
-    fs::write(&temporary, contents)?;
-    fs::rename(temporary, path)
+    // A stale temporary from an interrupted run is ours to replace; never
+    // follow a symlink planted at that name.
+    match fs::symlink_metadata(&temporary) {
+        Ok(_) => fs::remove_file(&temporary)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    restrict_mode(&mut options, TRUST_FILE_MODE);
+    let result = options.open(&temporary).and_then(|mut file| {
+        file.write_all(contents)?;
+        // `mode` is filtered by the umask; set the exact mode explicitly.
+        set_exact_mode(&file, TRUST_FILE_MODE)?;
+        file.sync_all()
+    });
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_mode(options: &mut OpenOptions, mode: u32) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(mode);
+}
+
+#[cfg(not(unix))]
+fn restrict_mode(_options: &mut OpenOptions, _mode: u32) {}
+
+#[cfg(unix)]
+fn set_exact_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_exact_mode(_file: &fs::File, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn verify_contents(path: &Path, expected: &str) -> DomainResult<()> {

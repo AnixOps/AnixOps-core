@@ -2,9 +2,9 @@
 //!
 //! [`WindowsTun::open`] loads `wintun.dll` from a path the caller gives (the
 //! client's install directory, never the search path), creates the adapter,
-//! gives it an address, points its DNS at the tunnel and adds the capture
-//! routes (`0.0.0.0/1` + `128.0.0.0/1`, and `::/1` + `8000::/1` when IPv6 is
-//! on) through it. They are more specific than any default route, so the
+//! gives it an address, points its IPv4 and IPv6 DNS at the tunnel and adds
+//! the capture routes (`0.0.0.0/1` + `128.0.0.0/1`, and `::/1` + `8000::/1`
+//! when IPv6 is on) through it. They are more specific than any default route, so the
 //! physical default route stays in place and comes back by itself when the
 //! adapter goes away: closing the adapter deletes it together with its
 //! address and routes.
@@ -27,6 +27,15 @@
 //! [`WindowsTun::on_physical_interface_change`] runs, so the host can move
 //! long-lived sockets (`engine_outbound::protect::path_changed`) and close
 //! the connections still pinned to the old interface (`reset_network`).
+//!
+//! While the adapter is open, DNS that would leave through any other
+//! interface is blocked (`block_outside_dns`, on by default): Windows asks
+//! the DNS servers of every interface at once, and the physical network's
+//! resolver would otherwise see every name and could answer first. Windows
+//! Filtering Platform filters in a dynamic session permit remote port 53
+//! only through the adapter, from this process (the engine's own upstream
+//! queries) and on loopback; they go away with the adapter or the process.
+//! [`WindowsTun::outside_dns_blocked`] reports whether they are in place.
 //!
 //! Packets read from the adapter go to the callback given to
 //! [`WindowsTun::start_reader`] on a dedicated thread; packets for the
@@ -55,6 +64,15 @@ pub struct WindowsTunSettings {
     /// The adapter's IPv6 address and prefix length; `None` leaves IPv6
     /// traffic on the physical interface.
     pub ipv6: Option<(Ipv6Addr, u8)>,
+    /// IPv6 DNS server the adapter announces when it has an IPv6 address:
+    /// another address in its IPv6 subnet, answered by the tunnel like
+    /// `dns`. Ignored when `ipv6` is `None`.
+    pub dns6: Option<Ipv6Addr>,
+    /// Blocks DNS (remote port 53) through every other interface while the
+    /// adapter is open, except this process's own queries and loopback.
+    /// Explicit queries to a resolver on the local network (`nslookup name
+    /// 192.168.1.1`) are blocked as well.
+    pub block_outside_dns: bool,
     /// Adapter MTU.
     pub mtu: u32,
     /// Wintun ring capacity in bytes: a power of two between 128 KiB and
@@ -69,6 +87,8 @@ impl Default for WindowsTunSettings {
             ipv4: (Ipv4Addr::new(172, 19, 0, 1), 30),
             dns: Ipv4Addr::new(172, 19, 0, 2),
             ipv6: Some((Ipv6Addr::new(0xfdfe, 0xdcba, 0x9876, 0, 0, 0, 0, 1), 126)),
+            dns6: Some(Ipv6Addr::new(0xfdfe, 0xdcba, 0x9876, 0, 0, 0, 0, 2)),
+            block_outside_dns: true,
             mtu: 1500,
             ring_capacity: 0x0040_0000,
         }
@@ -94,9 +114,16 @@ impl WindowsTunSettings {
                 "the TUN DNS address must be another address in the adapter subnet",
             ));
         }
-        if let Some((_, prefix)) = self.ipv6 {
+        if let Some((address, prefix)) = self.ipv6 {
             if !(8..=126).contains(&prefix) {
                 return Err(invalid("the TUN IPv6 prefix must be /8 to /126"));
+            }
+            if let Some(dns6) = self.dns6 {
+                if dns6 == address || !same_ipv6_subnet(dns6, address, prefix) {
+                    return Err(invalid(
+                        "the TUN IPv6 DNS address must be another address in the adapter's IPv6 subnet",
+                    ));
+                }
             }
         }
         if !(576..=9000).contains(&self.mtu) {
@@ -116,6 +143,16 @@ impl WindowsTunSettings {
 fn same_ipv4_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix: u8) -> bool {
     let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
     u32::from(a) & mask == u32::from(b) & mask
+}
+
+fn same_ipv6_subnet(a: Ipv6Addr, b: Ipv6Addr, prefix: u8) -> bool {
+    let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+    u128::from(a) & mask == u128::from(b) & mask
+}
+
+/// The IPv6 DNS server the adapter announces, if any.
+pub fn ipv6_dns_server(settings: &WindowsTunSettings) -> Option<Ipv6Addr> {
+    settings.ipv6.and(settings.dns6)
 }
 
 /// A route the adapter carries: the halves of each address space, so the
@@ -468,6 +505,14 @@ mod unsupported {
             0
         }
 
+        pub fn outside_dns_blocked(&self) -> bool {
+            false
+        }
+
+        pub fn outside_dns_block_error(&self) -> Option<&str> {
+            None
+        }
+
         pub fn writer(&self) -> WindowsTunWriter {
             WindowsTunWriter(())
         }
@@ -508,6 +553,7 @@ mod native {
     use std::sync::Arc;
     use std::thread;
 
+    use crate::dns_guard::DnsGuard;
     use windows_sys::core::GUID;
     use windows_sys::Win32::Foundation::{
         CloseHandle, FreeLibrary, GetLastError, HANDLE, HMODULE, WAIT_OBJECT_0,
@@ -681,6 +727,9 @@ mod native {
     }
 
     pub struct WindowsTun {
+        /// Removed first on shutdown, before the adapter goes away.
+        dns_guard: Option<DnsGuard>,
+        dns_guard_error: Option<String>,
         session: Arc<Session>,
         interface_index: u32,
         physical: Arc<PhysicalInterfaceTracker>,
@@ -744,16 +793,36 @@ mod native {
                 configure_interface(&luid, AF_INET6, settings.mtu)?;
                 add_address(&luid, ipv6_sockaddr(address), prefix)?;
             }
-            set_dns(interface_index, settings.dns)?;
+            set_dns(interface_index, "ipv4", &settings.dns.to_string())?;
+            if let Some(dns6) = ipv6_dns_server(settings) {
+                set_dns(interface_index, "ipv6", &dns6.to_string())?;
+            }
             for route in capture_routes(settings) {
                 add_route(&luid, interface_index, route)?;
             }
+            // Best effort: without the filter engine (the Base Filtering
+            // Engine service stopped) the tunnel still works, and the host
+            // reports `outside_dns_blocked() == false`.
+            let (dns_guard, dns_guard_error) = if settings.block_outside_dns {
+                // SAFETY: every bit pattern of the LUID is a valid `u64`.
+                let tun_luid = unsafe { luid.Value };
+                match std::env::current_exe()
+                    .and_then(|executable| DnsGuard::install(tun_luid, &executable))
+                {
+                    Ok(guard) => (Some(guard), None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            } else {
+                (None, None)
+            };
 
             let physical = Arc::new(PhysicalInterfaceTracker::new(interface_index, physical));
             // Started after the capture routes, so their own notifications
             // do not count as a network change.
             let watch = RouteWatch::start(physical.clone())?;
             Ok(Self {
+                dns_guard,
+                dns_guard_error,
                 session,
                 interface_index,
                 physical,
@@ -804,6 +873,17 @@ mod native {
         /// The adapter's interface index.
         pub fn interface_index(&self) -> u32 {
             self.interface_index
+        }
+
+        /// Whether DNS through other interfaces is blocked now.
+        pub fn outside_dns_blocked(&self) -> bool {
+            self.dns_guard.is_some()
+        }
+
+        /// Why DNS through other interfaces could not be blocked, when
+        /// `block_outside_dns` asked for it and it failed.
+        pub fn outside_dns_block_error(&self) -> Option<&str> {
+            self.dns_guard_error.as_deref()
         }
 
         /// A handle that writes packets into the adapter.
@@ -867,7 +947,10 @@ mod native {
         }
 
         fn shutdown(&mut self) {
-            // First, so closing the adapter (and its routes) is not taken
+            // Before the adapter goes away, so DNS is never blocked without
+            // the tunnel to carry it.
+            self.dns_guard = None;
+            // Before the session closes, so closing the adapter (and its routes) is not taken
             // for a network change.
             self.watch = None;
             self.physical.set_on_change(None);
@@ -1219,12 +1302,13 @@ mod native {
         win32(result, "a TUN route could not be added")
     }
 
-    /// Points the adapter's IPv4 DNS at `dns` with netsh from System32.
-    fn set_dns(index: u32, dns: Ipv4Addr) -> io::Result<()> {
+    /// Points the adapter's DNS of `family` (`ipv4` or `ipv6`) at `dns` with
+    /// netsh from System32.
+    fn set_dns(index: u32, family: &str, dns: &str) -> io::Result<()> {
         let status = netsh_command()?
             .args([
                 "interface",
-                "ipv4",
+                family,
                 "set",
                 "dnsservers",
                 &format!("name={index}"),
@@ -1316,6 +1400,45 @@ mod tests {
             ..WindowsTunSettings::default()
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn ipv6_dns_is_announced_inside_the_adapter_ipv6_subnet() {
+        let settings = WindowsTunSettings::default();
+        assert!(settings.block_outside_dns);
+        assert_eq!(
+            ipv6_dns_server(&settings),
+            Some("fdfe:dcba:9876::2".parse().unwrap())
+        );
+        // Outside the subnet, or the adapter's own address: rejected.
+        for dns6 in ["fdfe:dcba:9876::5", "2001:db8::2", "fdfe:dcba:9876::1"] {
+            let settings = WindowsTunSettings {
+                dns6: Some(dns6.parse().unwrap()),
+                ..WindowsTunSettings::default()
+            };
+            assert!(settings.validate().is_err(), "{dns6}");
+        }
+        // A wider prefix takes any other address of it.
+        let settings = WindowsTunSettings {
+            ipv6: Some(("fd00::1".parse().unwrap(), 64)),
+            dns6: Some("fd00::abcd".parse().unwrap()),
+            ..WindowsTunSettings::default()
+        };
+        settings.validate().unwrap();
+        // Without IPv6 on the adapter there is no IPv6 DNS server to check.
+        let settings = WindowsTunSettings {
+            ipv6: None,
+            dns6: Some("2001:db8::2".parse().unwrap()),
+            ..WindowsTunSettings::default()
+        };
+        settings.validate().unwrap();
+        assert_eq!(ipv6_dns_server(&settings), None);
+        let settings = WindowsTunSettings {
+            dns6: None,
+            ..WindowsTunSettings::default()
+        };
+        settings.validate().unwrap();
+        assert_eq!(ipv6_dns_server(&settings), None);
     }
 
     #[test]

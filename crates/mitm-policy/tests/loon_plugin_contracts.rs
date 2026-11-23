@@ -1182,3 +1182,235 @@ fn plugin_url_regex_with_a_policy_routes_and_a_rejecting_one_stays_with_the_core
     );
     assert_eq!(rules[0].target, PolicyTarget::Group("PROXY".to_string()));
 }
+
+const ARGUMENT_PLUGIN: &str = concat!(
+    "#!name = Argument Scripts\n",
+    "[Script]\n",
+    "http-response ^https://a\\.example\\.test/feed script-path=https://scripts.example.test/feed.js, requires-body=true, argument=[{HideAds},{Mode}], enable={Enabled}\n",
+    "http-response ^https://a\\.example\\.test/off script-path=https://scripts.example.test/off.js, requires-body=true, enable={Off}\n",
+    "http-response ^https://a\\.example\\.test/json script-path=https://scripts.example.test/json.js, requires-body=true, argument={\"lang\":\"zh\",\"hide\":true}\n",
+    "http-response ^https://a\\.example\\.test/missing script-path=https://scripts.example.test/missing.js, enable={Missing}\n",
+    "[Argument]\n",
+    "HideAds = switch,true,tag=Hide ads\n",
+    "Mode = select,\"a,b\",c,tag=Mode\n",
+    "Enabled = switch,true\n",
+    "Off = switch,false\n",
+    "[MITM]\n",
+    "hostname = a.example.test\n",
+);
+
+#[test]
+fn script_arguments_and_switches_resolve_from_the_plugin_arguments() {
+    let plugin = import_loon_plugin(ARGUMENT_PLUGIN).expect("argument plugin should import");
+    let status_of = |reason: &str| {
+        plugin
+            .report
+            .lines
+            .iter()
+            .find(|line| line.reason == reason)
+            .map(|line| line.status)
+    };
+    assert_eq!(
+        status_of("script.disabled"),
+        Some(LoonLineStatus::Ignored),
+        "{}",
+        plugin.report.render_text("arguments")
+    );
+    assert_eq!(
+        status_of("script.enable_unresolved"),
+        Some(LoonLineStatus::Partial),
+        "{}",
+        plugin.report.render_text("arguments")
+    );
+
+    // The merged policy has no `[Argument]`: every value travels resolved.
+    let merged = merged_plugin_source("Arguments", &[&plugin]);
+    assert!(!merged.contains("[Argument]"), "{merged}");
+    let engine = loaded_engine(&merged);
+
+    let feed = engine
+        .evaluate_script("https://a.example.test/feed", MitmPolicyPhase::Response)
+        .expect("feed script should evaluate");
+    assert_eq!(feed.kind, MitmPolicyScriptKind::HttpResponse, "{merged}");
+    assert_eq!(feed.argument, "HideAds=true&Mode=a,b", "{merged}");
+
+    let off = engine
+        .evaluate_script("https://a.example.test/off", MitmPolicyPhase::Response)
+        .expect("disabled script should evaluate");
+    assert_eq!(off.kind, MitmPolicyScriptKind::None, "{merged}");
+
+    let json = engine
+        .evaluate_script("https://a.example.test/json", MitmPolicyPhase::Response)
+        .expect("JSON argument script should evaluate");
+    assert_eq!(json.kind, MitmPolicyScriptKind::HttpResponse, "{merged}");
+    assert_eq!(json.argument, r#"{"lang":"zh","hide":true}"#, "{merged}");
+
+    // An `enable` naming nothing the plugin declares keeps the script on.
+    let missing = engine
+        .evaluate_script("https://a.example.test/missing", MitmPolicyPhase::Response)
+        .expect("unresolved switch script should evaluate");
+    assert_eq!(missing.kind, MitmPolicyScriptKind::HttpResponse, "{merged}");
+}
+
+#[test]
+fn merged_plugins_keep_their_own_argument_values() {
+    let plugin = |host: &str, lang: &str| {
+        import_loon_plugin(&format!(
+            "#!name = {host}\n\
+             [Argument]\n\
+             Lang = input,{lang}\n\
+             [Script]\n\
+             http-request ^https://{host}/api script-path=https://scripts.example.test/{host}.js, argument=lang={{Lang}}\n\
+             [MITM]\n\
+             hostname = {host}\n"
+        ))
+        .expect("plugin should import")
+    };
+    let first = plugin("one.example.test", "zh");
+    let second = plugin("two.example.test", "en");
+    let engine = loaded_engine(&merged_plugin_source("Both", &[&first, &second]));
+    for (url, expected) in [
+        ("https://one.example.test/api", "lang=zh"),
+        ("https://two.example.test/api", "lang=en"),
+    ] {
+        let dispatch = engine
+            .evaluate_script(url, MitmPolicyPhase::Request)
+            .expect("script should evaluate");
+        assert_eq!(dispatch.kind, MitmPolicyScriptKind::HttpRequest, "{url}");
+        assert_eq!(dispatch.argument, expected, "{url}");
+    }
+}
+
+/// A quoted JSON argument with unescaped inner quotes (the Surge module form
+/// `argument="{"a":"{{{X}}}",...}"`) is read whole, as the core reads it, not
+/// cut at the first inner quote.
+#[test]
+fn surge_quoted_json_argument_with_inner_quotes_reaches_the_script_whole() {
+    let plugin = import_loon_plugin(concat!(
+        "#!name = Quoted JSON\n",
+        "#!arguments=Lang:off\n",
+        "[Script]\n",
+        "x = type=http-response,pattern=^https://a\\.example\\.test/,requires-body=1,script-path=https://s.example.test/a.js,argument=\"{\"captionLang\":\"{{{Lang}}}\",\"debug\":false}\"\n",
+        "[MITM]\n",
+        "hostname = a.example.test\n",
+    ))
+    .expect("Surge module should import");
+    let merged = merged_plugin_source("Quoted JSON", &[&plugin]);
+    let engine = loaded_engine(&merged);
+    let dispatch = engine
+        .evaluate_script("https://a.example.test/feed", MitmPolicyPhase::Response)
+        .expect("script should evaluate");
+    assert_eq!(
+        dispatch.kind,
+        MitmPolicyScriptKind::HttpResponse,
+        "{merged}"
+    );
+    assert_eq!(
+        dispatch.argument, r#"{"captionLang":"off","debug":false}"#,
+        "{merged}"
+    );
+    assert_eq!(
+        dispatch.script_path, "https://s.example.test/a.js",
+        "{merged}"
+    );
+}
+
+/// The Loon form: a quoted JSON argument followed by another attribute, and
+/// a quoted `enable`.
+#[test]
+fn loon_quoted_json_argument_and_quoted_switch_are_read_like_the_core() {
+    let plugin = import_loon_plugin(concat!(
+        "#!name = Quoted Loon\n",
+        "[Script]\n",
+        "http-response ^https://b\\.example\\.test/json script-path=https://s.example.test/b.js, requires-body=true, argument=\"{\"lang\":\"zh\",\"hide\":true}\", tag=Feed\n",
+        "http-response ^https://b\\.example\\.test/off script-path=https://s.example.test/off.js, enable=\"{Off}\", tag=Off\n",
+        "[Argument]\n",
+        "Off = switch,false\n",
+        "[MITM]\n",
+        "hostname = b.example.test\n",
+    ))
+    .expect("Loon plugin should import");
+    let disabled = plugin
+        .report
+        .lines
+        .iter()
+        .find(|line| line.reason == "script.disabled")
+        .map(|line| line.status);
+    assert_eq!(
+        disabled,
+        Some(LoonLineStatus::Ignored),
+        "{}",
+        plugin.report.render_text("quoted-loon")
+    );
+    let merged = merged_plugin_source("Quoted Loon", &[&plugin]);
+    let engine = loaded_engine(&merged);
+    let json = engine
+        .evaluate_script("https://b.example.test/json", MitmPolicyPhase::Response)
+        .expect("JSON argument script should evaluate");
+    assert_eq!(json.kind, MitmPolicyScriptKind::HttpResponse, "{merged}");
+    assert_eq!(json.argument, r#"{"lang":"zh","hide":true}"#, "{merged}");
+    assert_eq!(json.tag, "Feed", "{merged}");
+    let off = engine
+        .evaluate_script("https://b.example.test/off", MitmPolicyPhase::Response)
+        .expect("disabled script should evaluate");
+    assert_eq!(off.kind, MitmPolicyScriptKind::None, "{merged}");
+}
+
+/// An argument the core would cut at its attribute buffer is graded partial.
+#[test]
+fn script_argument_longer_than_the_core_reads_is_graded_partial() {
+    let long = "x".repeat(5000);
+    let plugin = import_loon_plugin(&format!(
+        "#!name = Long Argument\n\
+         [Script]\n\
+         http-response ^https://c\\.example\\.test/ script-path=https://s.example.test/c.js, argument={{\"k\":\"{long}\"}}\n\
+         [MITM]\n\
+         hostname = c.example.test\n"
+    ))
+    .expect("plugin should import");
+    let status = plugin
+        .report
+        .lines
+        .iter()
+        .find(|line| line.reason == "script.argument_too_long")
+        .map(|line| line.status);
+    assert_eq!(
+        status,
+        Some(LoonLineStatus::Partial),
+        "{}",
+        plugin.report.render_text("long-argument")
+    );
+}
+
+/// A `200` URL rewrite (not performed by the data plane) is commented out,
+/// so it no longer hides a later reject for the same URL.
+#[test]
+fn url_rewrite_200_lines_leave_the_core_and_do_not_hide_later_rules() {
+    let plugin = import_loon_plugin(concat!(
+        "#!name = Rewrite 200\n",
+        "[Rewrite]\n",
+        "^https://m\\.example\\.test/ https://n.example.test/ 200\n",
+        "^https://m\\.example\\.test/ reject\n",
+        "[MITM]\n",
+        "hostname = m.example.test\n",
+    ))
+    .expect("plugin should import");
+    let status = plugin
+        .report
+        .lines
+        .iter()
+        .find(|line| line.reason == "rewrite.action_unsupported")
+        .map(|line| line.status);
+    assert_eq!(
+        status,
+        Some(LoonLineStatus::Unsupported),
+        "{}",
+        plugin.report.render_text("rewrite-200")
+    );
+    let merged = merged_plugin_source("Rewrite 200", &[&plugin]);
+    let engine = loaded_engine(&merged);
+    let plan = engine
+        .evaluate_url_rewrite("https://m.example.test/ad", MitmPolicyPhase::Request)
+        .expect("URL rules should evaluate");
+    assert_eq!(plan.action, MitmPolicyRewriteAction::Reject, "{merged}");
+}

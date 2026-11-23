@@ -11643,6 +11643,8 @@ where
         status_code,
         headers: parsed_headers,
         body: body.unwrap_or_default().as_bytes().to_vec(),
+        request_headers: Vec::new(),
+        request_body: None,
     };
     let native_report =
         engine_native::plan_and_apply_plain_http_mitm(&message, &instance, &service);

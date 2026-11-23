@@ -53,6 +53,7 @@ pub use quickjs_script::{
 #[cfg(feature = "quickjs")]
 pub use script_runtime::{
     ScriptHttpClient, ScriptHttpClientRequest, ScriptNotification, ScriptResponse,
+    ScriptStoreRecovery,
 };
 
 pub use h2_mitm::{
@@ -306,6 +307,11 @@ pub const ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_FAILED_CODE: &str =
     "engine.native.runtime.http_script_failed";
 pub const ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_URL_MUTATION_BLOCKED_CODE: &str =
     "engine.native.runtime.http_script_url_mutation_blocked";
+/// A script without `requires-body=true` returned a body. It never read the
+/// body, and the data plane may already be streaming it, so the body it
+/// returned is ignored.
+pub const ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE: &str =
+    "engine.native.runtime.http_script_body_ignored";
 pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_HTTPS_REQUEST_REWRITE_PREVIEW_READY_CODE: &str =
     "engine.native.runtime.http_proxy_https_request_rewrite_preview_ready";
 pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_HTTPS_REQUEST_REWRITE_PREVIEW_DEFERRED_CODE: &str =
@@ -951,8 +957,13 @@ impl NativeNodeScriptExecutor {
         script_asset_path: &str,
         body_path: &std::path::Path,
     ) -> NativeHttpScriptExecutionReport {
-        let request_headers = match serde_json::to_string(&script_headers_to_map(&message.headers))
-        {
+        // A response script's `$request` is the request the response
+        // answers, not the response's own head.
+        let request_headers = match message.phase {
+            HttpMitmPhase::Request => &message.headers,
+            HttpMitmPhase::Response => &message.request_headers,
+        };
+        let request_headers = match serde_json::to_string(&script_headers_to_map(request_headers)) {
             Ok(headers) => headers,
             Err(_) => {
                 return script_execution_failed(
@@ -1431,7 +1442,10 @@ fn apply_script_dispatch_to_plain_http_rewrite_report(
         status_code: report.final_status_code,
         headers: report.headers.clone(),
         body: report.body.clone(),
+        request_headers: original_message.request_headers.clone(),
+        request_body: original_message.request_body.clone(),
     };
+    let requires_body = dispatch.requires_body;
     let execution = script_executor.execute(dispatch, &script_message);
     report.diagnostics.extend(execution.diagnostics.clone());
     if !execution.executed {
@@ -1478,8 +1492,17 @@ fn apply_script_dispatch_to_plain_http_rewrite_report(
         report.applied = true;
     }
     if let Some(body) = execution.body {
-        report.body = body;
-        report.applied = true;
+        if requires_body {
+            report.body = body;
+            report.applied = true;
+        } else {
+            report.diagnostics.push(engine_diagnostic(
+                DiagnosticSeverity::Warning,
+                ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE,
+                "native HTTP script runtime ignored a body returned by a script without requires-body",
+                SOURCE_ENGINE_NATIVE_MITM,
+            ));
+        }
     }
     if let Some(status_code) = execution.status_code {
         report.final_status_code = Some(status_code);
@@ -1541,10 +1564,24 @@ fn script_execution_failed(message: &'static str) -> NativeHttpScriptExecutionRe
     }
 }
 
+/// Repeated names are joined as `script-runtime` joins them: `Cookie` with
+/// "; ", the rest with ", ", so no field is lost.
 fn script_headers_to_map(headers: &[MetadataEntry]) -> BTreeMap<String, String> {
-    let mut values = BTreeMap::new();
+    let mut values = BTreeMap::<String, String>::new();
     for header in headers {
-        values.insert(header.key.clone(), header.value.clone());
+        match values.get_mut(&header.key) {
+            Some(existing) => {
+                existing.push_str(if header.key.eq_ignore_ascii_case("cookie") {
+                    "; "
+                } else {
+                    ", "
+                });
+                existing.push_str(&header.value);
+            }
+            None => {
+                values.insert(header.key.clone(), header.value.clone());
+            }
+        }
     }
     values
 }
@@ -1972,6 +2009,16 @@ pub struct NativePlainHttpMessage {
     pub status_code: Option<u16>,
     pub headers: Vec<MetadataEntry>,
     pub body: Vec<u8>,
+    /// Response phase: the headers of the request this response answers, as
+    /// the request rules and scripts left them. Response scripts read them
+    /// as `$request.headers`; rules never see them. Empty in the request
+    /// phase.
+    pub request_headers: Vec<MetadataEntry>,
+    /// Response phase: the request body, when the data plane held it whole
+    /// (a request rule or script read it), for a response script with
+    /// `requires-body` (`$request.body`). `None` when the body was streamed
+    /// to the origin, and in the request phase.
+    pub request_body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5733,6 +5780,8 @@ fn explicit_http_proxy_request_to_plain_http_message(
         status_code: None,
         headers: request.headers.clone(),
         body: request.body.clone(),
+        request_headers: Vec::new(),
+        request_body: None,
     }
 }
 
@@ -5748,6 +5797,8 @@ fn plain_http_proxy_response_to_plain_http_message(
         status_code: Some(response.status_code),
         headers: response.headers.clone(),
         body: response.body.clone(),
+        request_headers: request.headers.clone(),
+        request_body: Some(request.body.clone()),
     }
 }
 
@@ -8010,6 +8061,8 @@ mod script_runtime_security_tests {
                 status_code: None,
                 headers: Vec::new(),
                 body: Vec::new(),
+                request_headers: Vec::new(),
+                request_body: None,
             },
         );
         let _ = std::fs::remove_file(&path);
@@ -8062,6 +8115,8 @@ mod script_runtime_security_tests {
                 status_code: None,
                 headers: Vec::new(),
                 body: Vec::new(),
+                request_headers: Vec::new(),
+                request_body: None,
             },
         );
         let _ = std::fs::remove_dir_all(&root);

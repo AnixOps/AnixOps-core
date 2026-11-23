@@ -1,0 +1,16 @@
+{
+  "invocation": {
+    "phase": "response",
+    "bodyIsBytes": true,
+    "request": { "url": "https://api.example.test/v1/feed", "method": "POST" },
+    "response": { "status": 200, "body": "\u0008\u0096\u0001ÿ" }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": {
+      "body": "\u0096\u0001ÿ",
+      "binaryBodies": true,
+      "headers": { "X-Text": "undefined" }
+    }
+  }
+}

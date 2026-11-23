@@ -9,26 +9,38 @@
 //! - A body no rule reads is relayed frame by frame as flow control
 //!   allows, trailers included (gRPC), and only its head is planned; a
 //!   body a rule reads is held whole up to [`MAX_BODY_BYTES`], and a
-//!   larger one is relayed without rewriting (`too_large`).
+//!   larger one is relayed without rewriting (`too_large`). All streams of
+//!   one connection hold at most [`MAX_HELD_BODY_BYTES`] of such bodies at
+//!   once; a body that finds no room is relayed without rewriting too
+//!   (`busy`), never waited for, since a stream that waits holds flow
+//!   control window the others need.
 //! - `text/event-stream` responses are relayed as they arrive
 //!   (`streaming`).
 //! - A request for another authority than the intercepted host gets
 //!   `421 Misdirected Request`, so the app opens a connection of its own
 //!   for it; `CONNECT` gets `405`.
 //!
+//! When the origin sends GOAWAY or closes, the app's connection is shut
+//! down gracefully too: the app gets a GOAWAY, the streams in flight finish
+//! (for at most `idle_timeout`), and a stream the origin never took is
+//! reset with `REFUSED_STREAM`, which tells the app it may send it again on
+//! a new connection. A stream the origin reset gets the origin's reason.
+//!
 //! All streams of one connection run in the flow's own task, without
 //! spawning. Memory stays bounded for the Network Extension: at most
 //! [`MAX_CONCURRENT_STREAMS`] streams, [`STREAM_WINDOW`] of receive window
-//! per stream and [`SEND_BUFFER`] of queued data per stream on each side.
+//! per stream, [`SEND_BUFFER`] of queued data per stream on each side and
+//! [`MAX_HELD_BODY_BYTES`] of bodies held for rules.
 
 use std::io;
 use std::pin::{pin, Pin};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use control_domain::HttpMitmPhase;
+use control_domain::{HttpMitmPhase, MetadataEntry};
 use engine_native::NativePlainHttpMessage;
 use futures::stream::{FuturesUnordered, StreamExt};
 use h2::client::SendRequest;
@@ -57,6 +69,9 @@ pub const SEND_BUFFER: usize = 128 * 1024;
 const MAX_HEADER_LIST: u32 = 64 * 1024;
 /// Grace for in-flight streams after an idle connection sent GOAWAY.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// Body bytes the streams of one connection hold at once for rules to
+/// read (each held body is copied about twice more while it is planned).
+pub const MAX_HELD_BODY_BYTES: usize = 2 * MAX_BODY_BYTES;
 
 /// Headers that do not exist in HTTP/2 or that the relay sets itself.
 const CONNECTION_HEADERS: [&str; 6] = [
@@ -75,6 +90,93 @@ fn h2_error(error: h2::Error) -> io::Error {
             .unwrap_or_else(|| io::Error::other("http/2 failed"));
     }
     io::Error::other(error)
+}
+
+/// A request that never reached the origin: its connection was going away
+/// or gone before the stream opened there, so the app may send it again.
+#[derive(Debug)]
+struct NotSent(h2::Error);
+
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request not sent to the origin: {}", self.0)
+    }
+}
+
+impl std::error::Error for NotSent {}
+
+fn not_sent(error: h2::Error) -> io::Error {
+    io::Error::other(NotSent(error))
+}
+
+/// How the app's stream is reset after `error`, and whether the origin's
+/// connection is going away (so the app's connection should too).
+fn reset_reason(error: &io::Error) -> (Reason, bool) {
+    let inner = error.get_ref();
+    if inner.is_some_and(|inner| inner.is::<NotSent>()) {
+        return (Reason::REFUSED_STREAM, true);
+    }
+    match inner.and_then(|inner| inner.downcast_ref::<h2::Error>()) {
+        // The origin's GOAWAY reset only streams it never processed (those
+        // past its last stream id, RFC 9113 section 6.8).
+        Some(h2) if h2.is_go_away() && h2.is_remote() => (Reason::REFUSED_STREAM, true),
+        Some(h2) if h2.is_reset() && h2.is_remote() => {
+            (h2.reason().unwrap_or(Reason::INTERNAL_ERROR), false)
+        }
+        _ => (Reason::INTERNAL_ERROR, false),
+    }
+}
+
+/// The body bytes the streams of one connection may still hold for rules
+/// (see [`MAX_HELD_BODY_BYTES`]).
+struct BodyBudget {
+    left: AtomicUsize,
+}
+
+impl BodyBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            left: AtomicUsize::new(bytes),
+        }
+    }
+}
+
+/// What one stream holds of a [`BodyBudget`], given back when dropped,
+/// whichever way the stream ends.
+struct Held<'a> {
+    budget: &'a BodyBudget,
+    bytes: usize,
+}
+
+impl<'a> Held<'a> {
+    fn new(budget: &'a BodyBudget) -> Self {
+        Self { budget, bytes: 0 }
+    }
+
+    /// Takes `bytes` more; `false`, taking nothing, when they do not fit.
+    fn grow(&mut self, bytes: usize) -> bool {
+        let left = &self.budget.left;
+        let mut current = left.load(Ordering::Acquire);
+        let taken = loop {
+            let Some(rest) = current.checked_sub(bytes) else {
+                break false;
+            };
+            match left.compare_exchange_weak(current, rest, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break true,
+                Err(actual) => current = actual,
+            }
+        };
+        if taken {
+            self.bytes += bytes;
+        }
+        taken
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.budget.left.fetch_add(self.bytes, Ordering::AcqRel);
+    }
 }
 
 impl MitmEngine {
@@ -133,12 +235,19 @@ impl MitmEngine {
             reroute: &reroute,
             extra: tokio::sync::Mutex::new(Vec::new()),
             drivers: driver_tx,
+            going_away: AtomicBool::new(false),
         };
+        let budget = BodyBudget::new(MAX_HELD_BODY_BYTES);
         let mut drivers = FuturesUnordered::new();
         let mut upstream = pin!(upstream);
+        let mut upstream_done = false;
         let mut streams = FuturesUnordered::new();
         let idle = tokio::time::sleep(idle_timeout);
         let mut idle = pin!(idle);
+        // Once the origin's connection is gone: how long the streams in
+        // flight may still take.
+        let drain = tokio::time::sleep(idle_timeout);
+        let mut drain = pin!(drain);
         let mut closing = false;
         loop {
             tokio::select! {
@@ -148,6 +257,7 @@ impl MitmEngine {
                             request,
                             respond,
                             &origins,
+                            &budget,
                             host,
                             authority,
                             capture.as_ref(),
@@ -159,10 +269,26 @@ impl MitmEngine {
                 },
                 Some(()) = streams.next(), if !streams.is_empty() => {
                     idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                    if upstream_done && streams.is_empty() {
+                        // The GOAWAY the app got is flushed as the
+                        // connection is polled for the grace below.
+                        idle.as_mut().reset(tokio::time::Instant::now() + SHUTDOWN_GRACE);
+                    }
                 }
                 Some(driver) = driver_rx.recv() => drivers.push(driver),
                 Some(()) = drivers.next(), if !drivers.is_empty() => {}
-                _ = &mut upstream => break,
+                // The origin's connection ended (GOAWAY, or closed). A
+                // finished h2 connection is ready again at once when
+                // polled, so this branch runs once.
+                _ = &mut upstream, if !upstream_done => {
+                    upstream_done = true;
+                    origins.going_away.store(true, Ordering::Release);
+                    drain.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                    if streams.is_empty() {
+                        idle.as_mut().reset(tokio::time::Instant::now() + SHUTDOWN_GRACE);
+                    }
+                }
+                _ = &mut drain, if upstream_done => break,
                 _ = &mut idle, if streams.is_empty() => {
                     if closing {
                         break;
@@ -172,33 +298,56 @@ impl MitmEngine {
                     idle.as_mut().reset(tokio::time::Instant::now() + SHUTDOWN_GRACE);
                 }
             }
+            // The origin is going away: the app gets a GOAWAY, so it sends
+            // new requests on a new connection while these streams finish.
+            if !closing && origins.going_away.load(Ordering::Acquire) {
+                closing = true;
+                server.graceful_shutdown();
+            }
         }
         Ok(())
     }
 
-    /// One stream; failures reset it and leave the connection up.
+    /// One stream; failures reset it and leave the connection up (see
+    /// [`reset_reason`] for the reason the app gets).
+    #[allow(clippy::too_many_arguments)]
     async fn h2_stream(
         &self,
         request: Request<RecvStream>,
         mut respond: SendResponse<Bytes>,
         origins: &Origins<'_>,
+        budget: &BodyBudget,
         host: &str,
         authority: &str,
         capture: Option<&(std::sync::Arc<crate::capture::CaptureStore>, u64)>,
     ) {
         let relayed = self
-            .relay_h2_stream(request, &mut respond, origins, host, authority, capture)
+            .relay_h2_stream(
+                request,
+                &mut respond,
+                origins,
+                budget,
+                host,
+                authority,
+                capture,
+            )
             .await;
-        if relayed.is_err() {
-            respond.send_reset(Reason::INTERNAL_ERROR);
+        if let Err(error) = relayed {
+            let (reason, going_away) = reset_reason(&error);
+            if going_away {
+                origins.going_away.store(true, Ordering::Release);
+            }
+            respond.send_reset(reason);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn relay_h2_stream(
         &self,
         request: Request<RecvStream>,
         respond: &mut SendResponse<Bytes>,
         origins: &Origins<'_>,
+        budget: &BodyBudget,
         host: &str,
         authority: &str,
         capture: Option<&(std::sync::Arc<crate::capture::CaptureStore>, u64)>,
@@ -232,10 +381,13 @@ impl MitmEngine {
             .to_string();
         let url = format!("https://{authority}{path}");
         let is_head = parts.method == Method::HEAD;
+        // Rules and scripts see one `cookie` field, as in HTTP/1.1; the
+        // capture keeps the fields as they came.
         let mut request_headers = vec![("host".to_string(), authority.to_string())];
-        request_headers.extend(header_list(&parts.headers));
+        request_headers.extend(plan_header_list(&parts.headers));
         let mut recording = capture.map(|capture| {
-            let mut recording = Recording::new(capture, &method, &url, &request_headers[1..]);
+            let mut recording =
+                Recording::new(capture, &method, &url, &header_list(&parts.headers));
             recording.exchange.http_version = HTTP_2;
             recording.publish();
             recording
@@ -259,27 +411,29 @@ impl MitmEngine {
         let stream_response = !self.needs_body(&url, HttpMitmPhase::Response);
         let request_ends = request_body.is_end_stream();
 
-        // The request body, when a rule reads it.
+        // The request body, when a rule reads it; what it holds of the
+        // connection's budget goes back when this stream ends.
+        let mut held = Held::new(budget);
         let mut held_request = None;
         if !stream_request && !request_ends {
-            match collect(&mut request_body, MAX_BODY_BYTES).await? {
+            match collect(&mut request_body, MAX_BODY_BYTES, &mut held).await? {
                 Collected::Complete(body, trailers) => held_request = Some((body, trailers)),
-                Collected::TooLarge(prefix) => {
+                Collected::Partial(prefix, note) => {
                     // Relayed as it is, without rewriting.
                     if let Some(recording) = &mut recording {
                         recording.exchange.request_body = CapturedBody {
                             data: prefix[..prefix.len().min(MAX_HTTP_BODY_BYTES)].to_vec(),
                             size: prefix.len() as u64,
                         };
-                        recording.exchange.note = Some("too_large");
+                        recording.exchange.note = Some(note);
                         recording.exchange.rules_skipped = true;
                     }
                     let headers = upstream_headers(&parts.headers);
                     let upstream_request = build_request(&parts.method, authority, &path, headers)?;
-                    let mut upstream = upstream.ready().await.map_err(h2_error)?;
+                    let mut upstream = upstream.ready().await.map_err(not_sent)?;
                     let (response, mut send) = upstream
                         .send_request(upstream_request, false)
-                        .map_err(h2_error)?;
+                        .map_err(not_sent)?;
                     send_bytes(&mut send, Bytes::from(prefix)).await?;
                     pump(&mut request_body, &mut send, None).await?;
                     let response = response.await.map_err(h2_error)?;
@@ -289,12 +443,10 @@ impl MitmEngine {
                 }
             }
         }
-        let body_for_plan = held_request
-            .as_ref()
-            .map(|(body, _)| body.to_vec())
-            .unwrap_or_default();
-        if let (Some(recording), Some((body, _))) = (&mut recording, &held_request) {
-            recording.exchange.request_body = CapturedBody::of(body);
+        let holds_request = held_request.is_some();
+        let (body_for_plan, request_trailers) = held_request.unwrap_or_default();
+        if let (Some(recording), true) = (&mut recording, holds_request) {
+            recording.exchange.request_body = CapturedBody::of(&body_for_plan);
         }
         let request_id = self.next_request_id();
         let report = self
@@ -306,6 +458,8 @@ impl MitmEngine {
                 status_code: None,
                 headers: to_metadata(&request_headers),
                 body: body_for_plan,
+                request_headers: Vec::new(),
+                request_body: None,
             })
             .await?;
 
@@ -337,12 +491,16 @@ impl MitmEngine {
             .to_string();
         let mut headers = header_map(&from_metadata(&report.headers));
         strip_connection_headers(&mut headers);
-        if held_request.is_some() || !report.body.is_empty() && !stream_request {
+        split_cookie_fields(&mut headers);
+        if holds_request || !report.body.is_empty() && !stream_request {
             headers.remove(http::header::CONTENT_LENGTH);
             headers.insert(
                 http::header::CONTENT_LENGTH,
                 HeaderValue::from(report.body.len()),
             );
+        }
+        if stream_request {
+            keep_streamed_body_headers(&mut headers, &parts.headers);
         }
         if !stream_response {
             // Rules read the response body as sent, so ask for it
@@ -353,18 +511,23 @@ impl MitmEngine {
             );
         }
         let upstream_request = build_request(&parts.method, authority, &path, headers)?;
-        let mut upstream = upstream.ready().await.map_err(h2_error)?;
+        let mut upstream = upstream.ready().await.map_err(not_sent)?;
         if !stream_request {
-            let trailers = held_request.and_then(|(_, trailers)| trailers);
-            let end = report.body.is_empty() && trailers.is_none();
+            let trailers = request_trailers;
+            let sent_body = Bytes::from(report.body);
+            let end = sent_body.is_empty() && trailers.is_none();
             let (response, mut send) = upstream
                 .send_request(upstream_request, end)
-                .map_err(h2_error)?;
+                .map_err(not_sent)?;
             if !end {
-                send_bytes(&mut send, Bytes::from(report.body)).await?;
+                send_bytes(&mut send, sent_body.clone()).await?;
                 finish(&mut send, trailers)?;
             }
             let response = response.await.map_err(h2_error)?;
+            let sent = SentRequest {
+                headers: report.headers,
+                body: Some(sent_body.to_vec()),
+            };
             return self
                 .respond_planned(
                     respond,
@@ -372,17 +535,23 @@ impl MitmEngine {
                     request_id,
                     url,
                     method,
+                    sent,
                     stream_response,
                     recording.as_mut(),
                     is_head,
+                    budget,
                 )
                 .await;
         }
+        let sent = SentRequest {
+            headers: report.headers,
+            body: None,
+        };
         // The request body streams while the response is handled, so a
         // bidirectional stream (gRPC) keeps going both ways.
         let (response, mut send) = upstream
             .send_request(upstream_request, request_ends)
-            .map_err(h2_error)?;
+            .map_err(not_sent)?;
         let mut tap = Tap::new(recording.is_some());
         let request = async {
             if !request_ends {
@@ -398,9 +567,11 @@ impl MitmEngine {
                 request_id,
                 url,
                 method,
+                sent,
                 stream_response,
                 recording.as_mut(),
                 is_head,
+                budget,
             )
             .await
         };
@@ -421,9 +592,11 @@ impl MitmEngine {
         request_id: String,
         url: String,
         method: String,
+        sent: SentRequest,
         stream_response: bool,
         mut recording: Option<&mut Recording<'_>>,
         is_head: bool,
+        budget: &BodyBudget,
     ) -> io::Result<()> {
         let (parts, mut body) = response.into_parts();
         let event_stream = parts
@@ -455,6 +628,8 @@ impl MitmEngine {
                     status_code: Some(parts.status.as_u16()),
                     headers: to_metadata(&response_headers),
                     body: Vec::new(),
+                    request_headers: sent.headers,
+                    request_body: sent.body,
                 })
                 .await?;
             if report.terminal_action.is_some() {
@@ -472,6 +647,7 @@ impl MitmEngine {
             *head.status_mut() = status(report.final_status_code, parts.status);
             *head.headers_mut() = header_map(&from_metadata(&report.headers));
             strip_connection_headers(head.headers_mut());
+            keep_streamed_body_headers(head.headers_mut(), &parts.headers);
             if let Some(recording) = recording.as_deref_mut() {
                 recording.exchange.status = Some(head.status().as_u16());
                 recording.exchange.response_headers = header_list(head.headers());
@@ -489,15 +665,16 @@ impl MitmEngine {
         }
 
         // A rule reads the body: hold it whole, or relay it unchanged when
-        // it is too large.
-        let (data, trailers) = match collect(&mut body, MAX_BODY_BYTES).await? {
+        // it is too large or the connection's budget has no room for it.
+        let mut held = Held::new(budget);
+        let (data, trailers) = match collect(&mut body, MAX_BODY_BYTES, &mut held).await? {
             Collected::Complete(data, trailers) => (
-                super::decoded_for_rules(&mut response_headers, data.to_vec()),
+                super::decoded_for_rules(&mut response_headers, data),
                 trailers,
             ),
-            Collected::TooLarge(prefix) => {
+            Collected::Partial(prefix, note) => {
                 if let Some(recording) = recording.as_deref_mut() {
-                    recording.exchange.note = Some("too_large");
+                    recording.exchange.note = Some(note);
                     recording.exchange.rules_skipped = true;
                 }
                 let response = Response::from_parts(parts, body);
@@ -515,6 +692,8 @@ impl MitmEngine {
                 status_code: Some(parts.status.as_u16()),
                 headers: to_metadata(&response_headers),
                 body: data,
+                request_headers: sent.headers,
+                request_body: sent.body,
             })
             .await?;
         let status = status(report.final_status_code, parts.status);
@@ -652,24 +831,34 @@ impl Tap {
 }
 
 enum Collected {
-    Complete(Bytes, Option<HeaderMap>),
-    /// Past the limit: what was read so far.
-    TooLarge(Vec<u8>),
+    Complete(Vec<u8>, Option<HeaderMap>),
+    /// Not held whole: what was read so far, and why (`too_large` past the
+    /// limit, `busy` when the connection's [`BodyBudget`] had no room).
+    Partial(Vec<u8>, &'static str),
 }
 
-/// Reads a body whole, up to `limit` bytes.
-async fn collect(body: &mut RecvStream, limit: usize) -> io::Result<Collected> {
+/// Reads a body whole, up to `limit` bytes, each piece taken from `held`
+/// first.
+async fn collect(
+    body: &mut RecvStream,
+    limit: usize,
+    held: &mut Held<'_>,
+) -> io::Result<Collected> {
     let mut data = Vec::new();
     while let Some(chunk) = body.data().await {
         let chunk = chunk.map_err(h2_error)?;
         let _ = body.flow_control().release_capacity(chunk.len());
+        let fits = held.grow(chunk.len());
         data.extend_from_slice(&chunk);
+        if !fits {
+            return Ok(Collected::Partial(data, "busy"));
+        }
         if data.len() > limit {
-            return Ok(Collected::TooLarge(data));
+            return Ok(Collected::Partial(data, "too_large"));
         }
     }
     let trailers = body.trailers().await.map_err(h2_error)?;
-    Ok(Collected::Complete(Bytes::from(data), trailers))
+    Ok(Collected::Complete(data, trailers))
 }
 
 /// Relays `body` (data, then trailers or the end of the stream) to `send`
@@ -755,6 +944,9 @@ struct Origins<'r> {
     extra: tokio::sync::Mutex<Vec<(String, SendRequest<Bytes>)>>,
     /// Hands each new connection's driver to the relay loop.
     drivers: tokio::sync::mpsc::UnboundedSender<engine_outbound::BoxFuture<'static, ()>>,
+    /// The origin's connection sent GOAWAY or closed: the relay loop shuts
+    /// the app's connection down gracefully.
+    going_away: AtomicBool,
 }
 
 impl Origins<'_> {
@@ -895,6 +1087,18 @@ fn upstream_headers(headers: &HeaderMap) -> HeaderMap {
     headers
 }
 
+/// A body relayed frame by frame goes on exactly as `original` sized and
+/// encoded it, so those headers stay the original's whatever a rule or a
+/// script without `requires-body` did to the head.
+fn keep_streamed_body_headers(headers: &mut HeaderMap, original: &HeaderMap) {
+    for name in [http::header::CONTENT_LENGTH, http::header::CONTENT_ENCODING] {
+        headers.remove(&name);
+        for value in original.get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+}
+
 fn strip_connection_headers(headers: &mut HeaderMap) {
     for name in CONNECTION_HEADERS {
         headers.remove(name);
@@ -920,6 +1124,76 @@ fn header_list(headers: &HeaderMap) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// The request a response answers, as the rules and request scripts left
+/// it, for the `$request` of response scripts.
+struct SentRequest {
+    headers: Vec<MetadataEntry>,
+    /// Only when the request body was held whole for a rule.
+    body: Option<Vec<u8>>,
+}
+
+/// Header pairs of a request for the rewrite hook: the `cookie` fields an
+/// HTTP/2 client splits (RFC 9113 section 8.2.3) are joined with "; " into
+/// one field where the first one was, so rules and scripts read and write
+/// one valid cookie list.
+fn plan_header_list(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut list: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    let mut cookie_at: Option<usize> = None;
+    for (name, value) in header_list(headers) {
+        if name != http::header::COOKIE.as_str() {
+            list.push((name, value));
+            continue;
+        }
+        match cookie_at {
+            Some(index) => {
+                let joined = &mut list[index].1;
+                joined.push_str("; ");
+                joined.push_str(&value);
+            }
+            None => {
+                cookie_at = Some(list.len());
+                list.push((name, value));
+            }
+        }
+    }
+    list
+}
+
+/// Splits each `cookie` field back into one field per cookie pair, as an
+/// HTTP/2 client sends them (RFC 9113 section 8.2.3), so header compression
+/// keeps working for the pairs that do not change.
+fn split_cookie_fields(headers: &mut HeaderMap) {
+    let values = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    headers.remove(http::header::COOKIE);
+    for value in values {
+        let pairs = value
+            .to_str()
+            .ok()
+            .map(|text| {
+                text.split(';')
+                    .map(str::trim)
+                    .filter(|pair| !pair.is_empty())
+                    .filter_map(|pair| HeaderValue::from_str(pair).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if pairs.is_empty() {
+            headers.append(http::header::COOKIE, value);
+            continue;
+        }
+        for pair in pairs {
+            headers.append(http::header::COOKIE, pair);
+        }
+    }
 }
 
 /// A header map from the hook's pairs; names HTTP/2 cannot carry
@@ -1043,6 +1317,38 @@ mod tests {
     }
 
     #[test]
+    fn split_cookie_fields_are_joined_for_rules_and_split_on_the_way_out() {
+        let mut map = HeaderMap::new();
+        map.append(http::header::COOKIE, HeaderValue::from_static("a=1"));
+        map.append(http::header::ACCEPT, HeaderValue::from_static("x"));
+        map.append(http::header::COOKIE, HeaderValue::from_static("b=2"));
+        let list = plan_header_list(&map);
+        assert_eq!(
+            list,
+            vec![
+                ("cookie".to_string(), "a=1; b=2".to_string()),
+                ("accept".to_string(), "x".to_string()),
+            ]
+        );
+        // The capture still sees the fields as sent.
+        assert_eq!(header_list(&map).len(), 3);
+
+        // What a script hands back is one cookie list; it goes out split.
+        let mut out = header_map(&[
+            ("Cookie".to_string(), "a=1; b=3;  ;c=4".to_string()),
+            ("accept".to_string(), "x".to_string()),
+        ]);
+        split_cookie_fields(&mut out);
+        let cookies = out
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(cookies, ["a=1", "b=3", "c=4"]);
+        assert_eq!(out.get(http::header::ACCEPT).unwrap(), "x");
+    }
+
+    #[test]
     fn same_host_reads_authority_or_host() {
         let uri: Uri = "https://a.test/x".parse().unwrap();
         assert!(same_host(&uri, &HeaderMap::new(), "A.test"));
@@ -1060,5 +1366,41 @@ mod tests {
         assert_eq!(body.data.len(), MAX_HTTP_BODY_BYTES);
         assert_eq!(body.size, MAX_HTTP_BODY_BYTES as u64 + 10);
         assert!(Tap::new(false).into_body().is_none());
+    }
+
+    #[test]
+    fn held_bodies_share_the_connections_budget_and_give_it_back() {
+        let budget = BodyBudget::new(100);
+        let left = || budget.left.load(Ordering::Acquire);
+        let mut first = Held::new(&budget);
+        assert!(first.grow(60));
+        {
+            let mut second = Held::new(&budget);
+            assert!(second.grow(30));
+            // A piece that does not fit takes nothing.
+            assert!(!second.grow(11));
+            assert_eq!(left(), 10);
+            assert!(second.grow(10));
+            assert!(!first.grow(1));
+            assert_eq!((first.bytes, second.bytes, left()), (60, 40, 0));
+        }
+        // The second stream ended: exactly what it held is back.
+        assert_eq!(left(), 40);
+        assert!(!first.grow(41));
+        assert!(first.grow(40));
+        assert_eq!(left(), 0);
+        drop(first);
+        assert_eq!(left(), 100);
+    }
+
+    #[test]
+    fn streams_the_relay_fails_are_reset_as_internal_errors_unless_never_sent() {
+        let never_sent = not_sent(h2::Error::from(Reason::REFUSED_STREAM));
+        assert_eq!(reset_reason(&never_sent), (Reason::REFUSED_STREAM, true));
+        // Made here, not by the origin: neither a remote reset nor GOAWAY.
+        let local = io::Error::other(h2::Error::from(Reason::CANCEL));
+        assert_eq!(reset_reason(&local), (Reason::INTERNAL_ERROR, false));
+        let broken = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert_eq!(reset_reason(&broken), (Reason::INTERNAL_ERROR, false));
     }
 }

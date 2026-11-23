@@ -79,6 +79,29 @@ The plugin as a whole is graded `full`, `partial`, or `unsupported`.
 - Surge module arguments (`#!arguments=Name:default,...`) replace `{{{Name}}}`
   with the default value before grading; a `#` default turns the line into a
   comment.
+- Script `argument=` and `enable=` (or `enabled=`) values are resolved
+  against `#!arguments` and `[Argument]` defaults at import, wherever the
+  `[Argument]` section sits, because the merged policy carries no
+  `[Argument]` and the core reads `enable` as a plain boolean. `{Name}`,
+  `{{{Name}}}` and the list form `[{A},{B}]` (`A=x&B=y`) use the declared
+  default; braces that name no declared argument, such as JSON, stay as
+  written. A resolved argument that still holds braces or starts with `[` is
+  encoded so the core's own template pass leaves it alone, and decoded when
+  the dispatch leaves the core. An `enable` that resolves to `false`, `0`,
+  `no` or `off` comments the script out (`script.disabled`, ignored); one
+  that names no declared argument keeps the script on and is graded partial
+  (`script.enable_unresolved`). Attribute values are read exactly as the
+  core reads them: the attributes split at commas outside quotes and
+  brackets, and a quoted value loses its outer quotes only when it starts
+  and ends with the same quote, so the Surge form
+  `argument="{"lang":"{{{Lang}}}","debug":false}"` (inner quotes left
+  unescaped) is read whole. An `argument=` whose written segment reaches the
+  core's 4096-byte attribute buffer is graded partial
+  (`script.argument_too_long`), since the core would cut it.
+- A URL rewrite with the core's `200` action (a transparent rewrite the data
+  plane does not perform) is graded unsupported and commented out, so it
+  does not stop the core's URL rule lookup before a later reject or redirect
+  for the same URL.
 - `[Script]` `http-request` and `http-response` lines (P1) are planned by the
   `mitm_anixops` core and run on desktop in the in-process QuickJS runtime of
   `crates/script-runtime`. `binary-body-mode` is supported: the core reports
@@ -113,6 +136,72 @@ The plugin as a whole is graded `full`, `partial`, or `unsupported`.
   pair, and every matching body rule applies in order. Url-first body rewrite
   lines in `[Rewrite]` are supported too. jq lines (`http-response-jq`,
   `response-body-jq`) are unsupported because the core is built without jq.
+
+## Applying a plan to an HTTP event
+
+`MitmPluginService::handle_http_mitm_event` builds the plan without passing
+the body to the core, so a body the core cannot read never fails the plan:
+
+- URL reject, redirect and header rules apply to every message. A
+  `URL_REWRITE_200` rule (`<pattern> <url> 200`) is not a redirect; the
+  message continues unchanged.
+- `reject`, `reject-200` and `reject-<status>` answer with no body
+  (`HttpMitmAction::Reject`). `reject-dict` and `reject-array` answer `200`
+  with `application/json; charset=utf-8` `{}` / `[]`, `reject-img` (and
+  `reject-tinygif`) with a 1x1 `image/gif`, and `reject-video` with an empty
+  `video/mp4` body (`HttpMitmAction::Respond`), so an app reading the answer
+  still parses it. `MitmPolicyRewriteResult::reject_body` names the variant.
+- `header-replace-regex` rules are evaluated against every current value of
+  their header, after the rules before them, and replace the header value by
+  value (the header is deleted and added back, so it moves to the end). With
+  several `Set-Cookie` headers only the matching one changes. A value whose
+  rewrite exceeds the core's value capacity stays unchanged with a
+  `mitm.policy.http_event.header_regex_skipped` warning.
+- Body rules (regex, jq) run only on a text body: UTF-8 without NUL bytes.
+  Any other body keeps it unchanged with a
+  `mitm.policy.http_event.binary_body_rules_skipped` warning; script
+  dispatch, including `binary-body-mode` scripts, is unaffected.
+- The body chain runs on the whole body. When its output outgrows the
+  buffer the chain is retried with a larger one, up to
+  `MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES` (4 MiB). A body that cannot be
+  rewritten whole is left unchanged with a `body_rewrite_skipped` warning
+  rather than dropping the message's other mutations; when more than 16 body
+  rules match, every regex rule still applies and the warning
+  `body_rewrite_records_capped` says jq steps past the core's record cap were
+  not run.
+- `needs_body` asks the data plane to hold the body back only for body rules
+  and for scripts with `requires-body=true`; a script without it gets no
+  body and cannot replace one (engine-native ignores a body such a script
+  returns, with `engine.native.runtime.http_script_body_ignored`).
+- A policy is compiled once per revision (its length and a hash of its
+  text), not once per message or host: `evaluate_mitm_hostname` keeps one
+  trusted engine per revision, `[Map Local]` and header-block rules keep
+  their matchers, and jq rules their parsed list and each filter's compiled
+  jaq program (compiled on the rule's first match). Planning leases engines
+  from a pool. A revision has at most as many planning engines, leased or
+  idle, as fit in 2 MiB of policy text (one at least, 4 at most); at most 4
+  idle engines of all revisions are kept, holding at most 2 MiB together
+  (one at least), and those of a replaced policy go first. Inside
+  `plan_waiting_for_engines` (the embedded data plane plans scripted
+  messages on its blocking pool there) planning waits for a leased engine
+  to come back instead of loading the policy again, so a 3 MiB policy is
+  loaded once however many requests a page makes at the same time.
+  Elsewhere nothing waits: planning at the limit loads an engine for the one
+  message, and `needs_body`, which runs on async threads, uses one shared
+  engine per revision instead.
+- Compiled forms live as long as their policy: the owner keeps a
+  `CompiledPolicyRelease` beside the loaded policy (engine-embedded's
+  `MitmEngine` does), and dropping it, or calling
+  `release_compiled_policy(source)`, frees that revision's idle engines,
+  hostname and `needs_body` engines, Map Local, header-block and jq rules.
+  The caches hold at most 4 revisions, enough for the current policy, an
+  old one kept by long-lived connections after a reload, a desktop local
+  proxy and temporary probe proxies without evicting one another; the
+  capacity only bounds what a caller that never releases keeps.
+  `policy_loads_on_this_thread()`, `planning_engine_loads()`,
+  `loon_jq::jq_compilations_on_this_thread()` and `idle_policy_engines()`
+  are for tests (`tests/policy_cache_contracts.rs`,
+  `tests/engine_pool_contracts.rs`).
 
 The corpus in `tests/fixtures/loon-plugins` has an expected level for each
 plugin, and `tests/loon_plugin_contracts.rs` prints the graded report for

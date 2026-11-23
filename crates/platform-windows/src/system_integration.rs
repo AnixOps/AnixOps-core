@@ -1,6 +1,6 @@
 //! Native Windows service, proxy, certificate, and driver integration.
 
-use crate::managed::{WindowsProxySettings, WindowsProxySnapshot};
+use crate::managed::{WindowsConnectionProxySnapshot, WindowsProxySettings, WindowsProxySnapshot};
 use control_domain::{DomainError, DomainResult};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -156,6 +156,155 @@ fn owned_startup_task_names(csv: &str) -> Vec<String> {
     names
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+/// `schtasks /Query /XML` output as text: UTF-16 (with or without a byte
+/// order mark) or UTF-8, whichever it is. Anything else was written in a
+/// legacy code page, which the bytes alone do not name, so every plausible
+/// reading is returned: the OEM and then the ANSI code page (Windows only),
+/// and lossy UTF-8 last. The caller accepts the output when one reading
+/// matches what it expects.
+fn decode_task_xml(bytes: &[u8]) -> Vec<String> {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || (bytes.len() >= 2 && bytes[1] == 0);
+    if utf16 {
+        let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+        let units: Vec<u16> = body
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        return vec![String::from_utf16_lossy(&units)];
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if let Ok(text) = std::str::from_utf8(body) {
+        return vec![text.to_owned()];
+    }
+    let mut readings = legacy_code_page_readings(body);
+    readings.push(String::from_utf8_lossy(body).into_owned());
+    readings
+}
+
+/// `bytes` read in the OEM and in the ANSI code page, each that decodes.
+#[cfg(windows)]
+fn legacy_code_page_readings(bytes: &[u8]) -> Vec<String> {
+    use windows_sys::Win32::Globalization::{
+        MultiByteToWideChar, CP_ACP, CP_OEMCP, MB_ERR_INVALID_CHARS,
+    };
+
+    let Ok(length) = i32::try_from(bytes.len()) else {
+        return Vec::new();
+    };
+    if length == 0 {
+        return Vec::new();
+    }
+    let mut readings = Vec::new();
+    for code_page in [CP_OEMCP, CP_ACP] {
+        // SAFETY: `bytes` is valid for `length` bytes; a null output
+        // buffer of size 0 asks only for the length needed.
+        let needed = unsafe {
+            MultiByteToWideChar(
+                code_page,
+                MB_ERR_INVALID_CHARS,
+                bytes.as_ptr(),
+                length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let Ok(capacity) = usize::try_from(needed) else {
+            continue;
+        };
+        if capacity == 0 {
+            continue;
+        }
+        let mut wide = vec![0u16; capacity];
+        // SAFETY: `wide` holds `needed` UTF-16 units.
+        let written = unsafe {
+            MultiByteToWideChar(
+                code_page,
+                MB_ERR_INVALID_CHARS,
+                bytes.as_ptr(),
+                length,
+                wide.as_mut_ptr(),
+                needed,
+            )
+        };
+        let Ok(written) = usize::try_from(written) else {
+            continue;
+        };
+        if written == 0 {
+            continue;
+        }
+        wide.truncate(written);
+        let reading = String::from_utf16_lossy(&wide);
+        if !readings.contains(&reading) {
+            readings.push(reading);
+        }
+    }
+    readings
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn legacy_code_page_readings(_bytes: &[u8]) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Every text value of `<tag>...</tag>` in `xml`, unescaped and trimmed.
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else {
+            break;
+        };
+        values.push(xml_unescape(after[..end].trim()));
+        rest = &after[end + close.len()..];
+    }
+    values
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Whether a registered logon task (its exported XML) still is the one
+/// [`startup_task_xml`] defined: one action that runs `executable` with
+/// `--start-after-login`, as the user's interactive token at the highest
+/// available level, and no principal that is SYSTEM, a service account or a
+/// group.
+fn startup_task_matches(xml: &str, executable: &str) -> bool {
+    let commands = xml_values(xml, "Command");
+    let privileged = |user: &String| {
+        let user = user.to_ascii_uppercase();
+        matches!(user.as_str(), "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
+            || user.ends_with("SYSTEM")
+            || user.ends_with("LOCAL SERVICE")
+            || user.ends_with("NETWORK SERVICE")
+    };
+    commands.len() == 1
+        && commands[0]
+            .trim_matches('"')
+            .eq_ignore_ascii_case(executable)
+        && xml.matches("<Exec>").count() == 1
+        && xml_values(xml, "Arguments") == ["--start-after-login"]
+        && xml_values(xml, "RunLevel") == ["HighestAvailable"]
+        && xml_values(xml, "LogonType") == ["InteractiveToken"]
+        && !xml_values(xml, "UserId").iter().any(privileged)
+        && xml_values(xml, "GroupId").is_empty()
+}
+
 #[cfg(test)]
 mod startup_task_tests {
     use super::*;
@@ -171,6 +320,101 @@ mod startup_task_tests {
             2
         );
         assert!(xml.contains("<Arguments>--start-after-login</Arguments>"));
+    }
+
+    #[test]
+    fn registered_task_must_match_the_definition() {
+        let executable = r"C:\Program Files\AnixOps Net\anixops-net.exe";
+        let xml = startup_task_xml("S-1-5-21-1-2-3-1001", executable);
+        assert!(startup_task_matches(&xml, executable));
+        // Read back as schtasks prints it: UTF-16 with a byte order mark,
+        // or plain UTF-8.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in xml.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_task_xml(&utf16), vec![xml.clone()]);
+        assert_eq!(decode_task_xml(xml.as_bytes()), vec![xml.clone()]);
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(xml.as_bytes());
+        assert_eq!(decode_task_xml(&with_bom), vec![xml.clone()]);
+
+        let other = r"C:\Users\Public\evil.exe";
+        assert!(!startup_task_matches(
+            &xml.replace(executable, other),
+            executable
+        ));
+        assert!(!startup_task_matches(
+            &xml.replace("S-1-5-21-1-2-3-1001", "S-1-5-18"),
+            executable
+        ));
+        assert!(!startup_task_matches(
+            &xml.replace("InteractiveToken", "ServiceAccount"),
+            executable
+        ));
+        assert!(!startup_task_matches(
+            &xml.replace("--start-after-login", "--evil"),
+            executable
+        ));
+        let second_action = xml.replace(
+            "</Exec>",
+            "</Exec>\n    <Exec><Command>C:\\evil.exe</Command></Exec>",
+        );
+        assert!(!startup_task_matches(&second_action, executable));
+    }
+
+    #[test]
+    fn output_in_a_legacy_code_page_still_has_a_reading() {
+        // 0xE9 alone is not UTF-8; the lossy reading is always offered,
+        // after any code page readings.
+        let bytes = b"<Command>C:\\Caf\xE9\\app.exe</Command>";
+        let readings = decode_task_xml(bytes);
+        assert_eq!(
+            readings.last().map(String::as_str),
+            Some("<Command>C:\\Caf\u{FFFD}\\app.exe</Command>")
+        );
+        #[cfg(not(windows))]
+        assert_eq!(readings.len(), 1);
+    }
+
+    /// A non-ASCII install path, printed in the ANSI code page (as a
+    /// redirected console tool may), is still recognised.
+    #[cfg(windows)]
+    #[test]
+    fn registered_task_in_the_ansi_code_page_matches() {
+        use windows_sys::Win32::Globalization::{
+            WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS,
+        };
+
+        let executable = "C:\\Users\\Caf\u{e9}\\AnixOps Net\\anixops-net.exe";
+        let xml = startup_task_xml("S-1-5-21-1-2-3-1001", executable);
+        let wide: Vec<u16> = xml.encode_utf16().collect();
+        let length = i32::try_from(wide.len()).expect("the definition is small");
+        let mut ansi = vec![0u8; wide.len() * 4];
+        let mut used_default: windows_sys::core::BOOL = 0;
+        // SAFETY: `wide` holds `length` units and `ansi` has room for
+        // four bytes per unit, more than any code page needs.
+        let written = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                WC_NO_BEST_FIT_CHARS,
+                wide.as_ptr(),
+                length,
+                ansi.as_mut_ptr(),
+                i32::try_from(ansi.len()).expect("the buffer is small"),
+                std::ptr::null(),
+                &mut used_default,
+            )
+        };
+        assert!(written > 0, "the definition converts to the ANSI code page");
+        if used_default != 0 {
+            // This code page has no such letter; nothing to check here.
+            return;
+        }
+        ansi.truncate(usize::try_from(written).expect("a positive length"));
+        assert!(decode_task_xml(&ansi)
+            .iter()
+            .any(|reading| startup_task_matches(reading, executable)));
     }
 
     #[test]
@@ -217,11 +461,12 @@ pub fn read_current_user_system_proxy() -> DomainResult<WindowsProxySettings> {
     native::read_current_user_system_proxy()
 }
 
-/// Writes only the current user's WinINet proxy settings and returns what
-/// they were before. Unlike `apply_system_proxy` this leaves the machine-wide
-/// WinHTTP proxy alone, so a process without administrator rights can call it:
-/// a client whose window is not elevated sets the user's proxy here and leaves
-/// WinHTTP to its service (`apply_winhttp_proxy`).
+/// Writes only the current user's flat WinINet LAN values (`ProxyEnable`,
+/// `ProxyServer`, `ProxyOverride`) and returns what they were before. It
+/// neither records nor turns off a configuration script or automatic
+/// detection, and leaves dial-up / VPN entries alone; a client that owns the
+/// system proxy uses `WindowsSystemIntegration::apply_system_proxy`, which
+/// does. Like it, this never touches the machine-wide WinHTTP proxy.
 pub fn apply_current_user_system_proxy(
     settings: &WindowsProxySettings,
 ) -> DomainResult<WindowsProxySettings> {
@@ -245,7 +490,10 @@ pub struct WindowsWinHttpProxy {
 
 /// Writes only the machine-wide WinHTTP proxy, which services use, and returns
 /// what it was before. Needs administrator rights; the current user's WinINet
-/// settings are not touched.
+/// settings are not touched. Connecting a client must not call this: system
+/// services (Windows Update, Defender, certificate revocation) use WinHTTP,
+/// and a value left behind by a crash outlives the client. It stays for an
+/// administrator who asks for it explicitly.
 pub fn apply_winhttp_proxy(settings: &WindowsProxySettings) -> DomainResult<WindowsWinHttpProxy> {
     settings.validate()?;
     native::apply_winhttp_proxy(settings)
@@ -255,6 +503,287 @@ pub fn apply_winhttp_proxy(settings: &WindowsProxySettings) -> DomainResult<Wind
 /// `apply_winhttp_proxy` returned.
 pub fn restore_winhttp_proxy(previous: &WindowsWinHttpProxy) -> DomainResult<()> {
     native::restore_winhttp_proxy(previous)
+}
+
+/// Reads the machine-wide WinHTTP proxy without changing it.
+pub fn read_winhttp_proxy() -> DomainResult<WindowsWinHttpProxy> {
+    native::read_winhttp_proxy()
+}
+
+/// Puts the machine-wide WinHTTP proxy back to `previous` only while it
+/// still holds the value `apply_winhttp_proxy(applied)` wrote; another
+/// program's (or the user's) later value is left alone. When `previous`
+/// itself was that value (a leftover of an earlier session), WinHTTP goes
+/// back to "no proxy". Returns whether WinHTTP was changed.
+pub fn restore_winhttp_proxy_if_unchanged(
+    previous: &WindowsWinHttpProxy,
+    applied: &WindowsProxySettings,
+) -> DomainResult<bool> {
+    let current = native::read_winhttp_proxy()?;
+    match winhttp_restore_target(previous, &current, applied) {
+        Some(target) => native::restore_winhttp_proxy(&target).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// Every WinINet connection's own proxy settings for the current user: the
+/// LAN first, then each dial-up / VPN (RAS) entry.
+pub fn read_current_user_connection_proxies() -> DomainResult<Vec<WindowsConnectionProxySnapshot>> {
+    native::read_all_connection_proxies()
+}
+
+/// The proxy configuration that WinINet and WinHTTP clients (browsers among
+/// them) actually use for the current user's active connection
+/// (`WinHttpGetIEProxyConfigForCurrentUser`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsEffectiveProxy {
+    /// Automatic detection (WPAD) is on; it takes precedence over a proxy.
+    pub auto_detect: bool,
+    /// An automatic configuration script (PAC); it takes precedence too.
+    pub auto_config_url: String,
+    pub proxy: String,
+    pub bypass: String,
+    /// Group policy applies one proxy to every user of the machine
+    /// (`ProxySettingsPerUser` = 0), so per-user settings have no effect.
+    pub per_machine_policy: bool,
+}
+
+impl WindowsEffectiveProxy {
+    /// Whether traffic of the active connection goes to `settings.server`:
+    /// no automatic detection or configuration script overrides it and the
+    /// proxy is that server (for every scheme when it names several).
+    pub fn routes_through(&self, settings: &WindowsProxySettings) -> bool {
+        let server = settings.server.trim();
+        let proxy = self.proxy.trim();
+        if !settings.enabled
+            || server.is_empty()
+            || proxy.is_empty()
+            || self.auto_detect
+            || !self.auto_config_url.trim().is_empty()
+        {
+            return false;
+        }
+        proxy.eq_ignore_ascii_case(server)
+            || proxy
+                .split(';')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .all(|entry| {
+                    entry
+                        .split_once('=')
+                        .map_or(entry, |(_, value)| value)
+                        .trim()
+                        .eq_ignore_ascii_case(server)
+                })
+    }
+}
+
+/// Reads [`WindowsEffectiveProxy`]; a client checks it after connecting and
+/// tells the user (suggesting TUN mode) when automatic configuration or a
+/// policy keeps traffic away from the local proxy.
+pub fn read_current_user_effective_proxy() -> DomainResult<WindowsEffectiveProxy> {
+    native::read_current_user_effective_proxy()
+}
+
+/// WinINet `PROXY_TYPE_*` connection flags.
+pub const WININET_PROXY_TYPE_DIRECT: u32 = 0x1;
+pub const WININET_PROXY_TYPE_PROXY: u32 = 0x2;
+pub const WININET_PROXY_TYPE_AUTO_PROXY_URL: u32 = 0x4;
+pub const WININET_PROXY_TYPE_AUTO_DETECT: u32 = 0x8;
+const WININET_PROXY_TYPE_MASK: u32 = 0xF;
+/// WinHTTP access types.
+const WINHTTP_NO_PROXY: u32 = 1;
+const WINHTTP_NAMED_PROXY: u32 = 3;
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// What an apply writes on a connection: the proxy (or direct when the
+/// settings disable it), with automatic detection and the configuration
+/// script off, since either would take precedence over the proxy.
+fn applied_connection(
+    connection: Option<String>,
+    settings: &WindowsProxySettings,
+) -> WindowsConnectionProxySnapshot {
+    WindowsConnectionProxySnapshot {
+        connection,
+        flags: if settings.enabled {
+            WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_PROXY
+        } else {
+            WININET_PROXY_TYPE_DIRECT
+        },
+        server: settings.server.clone(),
+        bypass: settings.bypass.clone(),
+        auto_config_url: String::new(),
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Whether a connection still holds what an apply of `applied` wrote; a
+/// connection the user changed since (a configuration script turned back
+/// on, another proxy) is not restored over.
+fn connection_still_applied(
+    current: &WindowsConnectionProxySnapshot,
+    applied: &WindowsProxySettings,
+) -> bool {
+    let expected = applied_connection(current.connection.clone(), applied);
+    current.flags & WININET_PROXY_TYPE_MASK == expected.flags
+        && current.server == expected.server
+        && current.bypass == expected.bypass
+        && current.auto_config_url.is_empty()
+}
+
+/// What WinHTTP goes back to, or `None` to leave it: only while it still
+/// holds the value an apply of `applied` wrote. A `previous` equal to that
+/// value was a leftover of an earlier session and becomes "no proxy".
+fn winhttp_restore_target(
+    previous: &WindowsWinHttpProxy,
+    current: &WindowsWinHttpProxy,
+    applied: &WindowsProxySettings,
+) -> Option<WindowsWinHttpProxy> {
+    let written = |value: &WindowsWinHttpProxy| {
+        if applied.enabled {
+            value.access_type == WINHTTP_NAMED_PROXY
+                && value.server == applied.server
+                && value.bypass == applied.bypass
+        } else {
+            value.access_type == WINHTTP_NO_PROXY
+        }
+    };
+    if !written(current) {
+        return None;
+    }
+    if applied.enabled && written(previous) {
+        return Some(WindowsWinHttpProxy {
+            access_type: WINHTTP_NO_PROXY,
+            server: String::new(),
+            bypass: String::new(),
+        });
+    }
+    Some(previous.clone())
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+/// The WinHTTP value a snapshot taken before 1.0 recorded as "before".
+fn snapshot_winhttp(snapshot: &WindowsProxySnapshot) -> WindowsWinHttpProxy {
+    WindowsWinHttpProxy {
+        access_type: snapshot.winhttp_access_type,
+        server: snapshot.winhttp_server.clone(),
+        bypass: snapshot.winhttp_bypass.clone(),
+    }
+}
+
+#[cfg(test)]
+mod proxy_ownership_tests {
+    use super::*;
+
+    fn proxy(server: &str) -> WindowsProxySettings {
+        WindowsProxySettings {
+            enabled: true,
+            server: server.to_string(),
+            bypass: "<local>".to_string(),
+        }
+    }
+
+    fn winhttp(access_type: u32, server: &str, bypass: &str) -> WindowsWinHttpProxy {
+        WindowsWinHttpProxy {
+            access_type,
+            server: server.to_string(),
+            bypass: bypass.to_string(),
+        }
+    }
+
+    #[test]
+    fn winhttp_is_restored_only_while_it_holds_the_written_value() {
+        let applied = proxy("127.0.0.1:7890");
+        let ours = winhttp(WINHTTP_NAMED_PROXY, "127.0.0.1:7890", "<local>");
+        let corporate = winhttp(WINHTTP_NAMED_PROXY, "proxy.corp:8080", "*.corp");
+        let none = winhttp(WINHTTP_NO_PROXY, "", "");
+        // Still ours: back to what it was.
+        assert_eq!(
+            winhttp_restore_target(&corporate, &ours, &applied),
+            Some(corporate.clone())
+        );
+        // Changed since (an administrator or another tool): left alone.
+        assert_eq!(winhttp_restore_target(&none, &corporate, &applied), None);
+        assert_eq!(winhttp_restore_target(&corporate, &none, &applied), None);
+        // The "previous" value was a leftover of a crashed session: cleared,
+        // never written back.
+        assert_eq!(
+            winhttp_restore_target(&ours, &ours, &applied),
+            Some(none.clone())
+        );
+    }
+
+    #[test]
+    fn a_connection_the_user_changed_is_not_restored_over() {
+        let applied = proxy("127.0.0.1:7890");
+        let written = applied_connection(None, &applied);
+        assert_eq!(
+            written.flags,
+            WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_PROXY
+        );
+        assert!(written.auto_config_url.is_empty());
+        assert!(connection_still_applied(&written, &applied));
+        // The configuration script was turned back on.
+        let mut pac = written.clone();
+        pac.flags |= WININET_PROXY_TYPE_AUTO_PROXY_URL;
+        pac.auto_config_url = "http://wpad.corp/proxy.pac".to_string();
+        assert!(!connection_still_applied(&pac, &applied));
+        // Automatic detection was turned back on.
+        let mut detect = written.clone();
+        detect.flags |= WININET_PROXY_TYPE_AUTO_DETECT;
+        assert!(!connection_still_applied(&detect, &applied));
+        // Another proxy.
+        let mut other = written.clone();
+        other.server = "127.0.0.1:8888".to_string();
+        assert!(!connection_still_applied(&other, &applied));
+        // A disabled apply writes direct only.
+        let direct = WindowsProxySettings {
+            enabled: false,
+            ..applied.clone()
+        };
+        assert_eq!(
+            applied_connection(Some("VPN".into()), &direct).flags,
+            WININET_PROXY_TYPE_DIRECT
+        );
+    }
+
+    #[test]
+    fn effective_proxy_must_not_be_overridden_by_automatic_configuration() {
+        let settings = proxy("127.0.0.1:7890");
+        let mut effective = WindowsEffectiveProxy {
+            proxy: "127.0.0.1:7890".to_string(),
+            bypass: "<local>".to_string(),
+            ..WindowsEffectiveProxy::default()
+        };
+        assert!(effective.routes_through(&settings));
+        effective.proxy = "http=127.0.0.1:7890;https=127.0.0.1:7890".to_string();
+        assert!(effective.routes_through(&settings));
+        effective.proxy = "http=127.0.0.1:7890;https=proxy.corp:8080".to_string();
+        assert!(!effective.routes_through(&settings));
+        effective.proxy = "127.0.0.1:7890".to_string();
+        effective.auto_config_url = "http://wpad.corp/proxy.pac".to_string();
+        assert!(!effective.routes_through(&settings));
+        effective.auto_config_url.clear();
+        effective.auto_detect = true;
+        assert!(!effective.routes_through(&settings));
+    }
+
+    #[test]
+    fn snapshots_written_before_one_point_zero_still_load() {
+        let legacy = serde_json::json!({
+            "enabled": false,
+            "server": "",
+            "bypass": "",
+            "winhttp_access_type": 1,
+            "winhttp_server": "",
+            "winhttp_bypass": ""
+        });
+        let snapshot: WindowsProxySnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!snapshot.winhttp_untouched);
+        assert!(snapshot.applied.is_none());
+        assert!(snapshot.connections.is_empty());
+        assert_eq!(snapshot_winhttp(&snapshot).access_type, WINHTTP_NO_PROXY);
+    }
 }
 
 /// Probes the explicit loopback endpoint configured for the managed desktop
@@ -365,10 +894,16 @@ pub trait WindowsSystemIntegration {
     fn stop_service(&self) -> DomainResult<WindowsServiceStatus>;
     fn restart_service(&self) -> DomainResult<WindowsServiceStatus>;
     fn service_status(&self) -> DomainResult<WindowsServiceStatus>;
+    /// Points every WinINet connection of the current user (the LAN and each
+    /// dial-up / VPN entry) at `settings`, with automatic detection and the
+    /// configuration script off, and returns what each had. The machine-wide
+    /// WinHTTP proxy is never changed.
     fn apply_system_proxy(
         &self,
         settings: &WindowsProxySettings,
     ) -> DomainResult<WindowsProxySnapshot>;
+    /// Puts back what `snapshot` recorded on every connection that still
+    /// holds the applied value; a connection changed since is left alone.
     fn restore_system_proxy(&self, snapshot: &WindowsProxySnapshot) -> DomainResult<()>;
     fn install_root_certificate(&self, certificate: &Path) -> DomainResult<String>;
     fn remove_root_certificate(&self, sha1_thumbprint: &str) -> DomainResult<()>;
@@ -505,6 +1040,18 @@ mod native {
         Err(unsupported())
     }
 
+    pub fn read_winhttp_proxy() -> DomainResult<WindowsWinHttpProxy> {
+        Err(unsupported())
+    }
+
+    pub fn read_all_connection_proxies() -> DomainResult<Vec<WindowsConnectionProxySnapshot>> {
+        Err(unsupported())
+    }
+
+    pub fn read_current_user_effective_proxy() -> DomainResult<WindowsEffectiveProxy> {
+        Err(unsupported())
+    }
+
     pub fn install_root_certificate(_certificate: &Path) -> DomainResult<String> {
         Err(unsupported())
     }
@@ -562,12 +1109,20 @@ mod native {
         ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS,
         ERROR_SERVICE_NOT_ACTIVE, ERROR_SUCCESS, HANDLE,
     };
+    use windows_sys::Win32::NetworkManagement::Rras::{
+        RasEnumEntriesW, ERROR_BUFFER_TOO_SMALL, RASENTRYNAMEW,
+    };
     use windows_sys::Win32::Networking::WinHttp::{
-        WinHttpGetDefaultProxyConfiguration, WinHttpSetDefaultProxyConfiguration,
-        WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_PROXY_INFO,
+        WinHttpGetDefaultProxyConfiguration, WinHttpGetIEProxyConfigForCurrentUser,
+        WinHttpSetDefaultProxyConfiguration, WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_CURRENT_USER_IE_PROXY_CONFIG, WINHTTP_PROXY_INFO,
     };
     use windows_sys::Win32::Networking::WinInet::{
-        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+        InternetQueryOptionW, InternetSetOptionW, INTERNET_OPTION_PER_CONNECTION_OPTION,
+        INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+        INTERNET_PER_CONN_AUTOCONFIG_URL, INTERNET_PER_CONN_FLAGS, INTERNET_PER_CONN_FLAGS_UI,
+        INTERNET_PER_CONN_OPTIONW, INTERNET_PER_CONN_OPTION_LISTW, INTERNET_PER_CONN_PROXY_BYPASS,
+        INTERNET_PER_CONN_PROXY_SERVER,
     };
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::Cryptography::{
@@ -582,7 +1137,7 @@ mod native {
     use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-        HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
     };
     use windows_sys::Win32::System::Services::{
         ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
@@ -788,17 +1343,48 @@ mod native {
     /// and Windows silently skips such programs in the Run key, so the logon
     /// task replaces the legacy Run entry (which is removed when owned).
     pub fn enable_current_user_startup(executable: &Path) -> DomainResult<()> {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+
         let command = startup_task_command_path(executable)?;
         let sid = current_user_sid()?;
         let xml = startup_task_xml(&sid, &command);
-        let xml_path =
-            std::env::temp_dir().join(format!("anixops-net-startup-{}.xml", std::process::id()));
         let mut bytes = vec![0xFF, 0xFE];
         for unit in xml.encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
-        fs::write(&xml_path, bytes)
-            .map_err(|_| startup_error("the startup task definition could not be written"))?;
+        // The definition runs elevated at every logon, so it is written
+        // where only SYSTEM and Administrators can write (never the user's
+        // %TEMP%, which every process of the user can change), under a
+        // random name created exclusively, and held open without write
+        // sharing until schtasks has read it.
+        let (xml_path, mut file) = crate::managed_files::create_managed_temporary_file(
+            &startup_task_directory(),
+            "startup-task",
+            "xml",
+        )
+        .map_err(|_| startup_error("the startup task definition could not be created"))?;
+        let written = file.write_all(&bytes).and_then(|_| file.sync_all());
+        drop(file);
+        let held = written.and_then(|_| {
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&xml_path)
+        });
+        let held = match held {
+            Ok(held) => held,
+            Err(_) => {
+                let _ = fs::remove_file(&xml_path);
+                return Err(startup_error(
+                    "the startup task definition could not be written",
+                ));
+            }
+        };
         let name = startup_task_name(&sid);
         let created = run_schtasks(&[
             OsStr::new("/Create"),
@@ -808,9 +1394,39 @@ mod native {
             xml_path.as_os_str(),
             OsStr::new("/F"),
         ]);
+        drop(held);
         let _ = fs::remove_file(&xml_path);
         created?;
+        // Read the registered task back: it must run this executable, as
+        // the signed-in user's interactive token, and nothing else.
+        let registered = schtasks_output(&[
+            OsStr::new("/Query"),
+            OsStr::new("/TN"),
+            OsStr::new(&name),
+            OsStr::new("/XML"),
+        ]);
+        let verified = registered.as_ref().is_ok_and(|output| {
+            decode_task_xml(output)
+                .iter()
+                .any(|xml| startup_task_matches(xml, &command))
+        });
+        if !verified {
+            let _ = run_schtasks(&[
+                OsStr::new("/Delete"),
+                OsStr::new("/TN"),
+                OsStr::new(&name),
+                OsStr::new("/F"),
+            ]);
+            return Err(startup_error(
+                "the registered startup task did not match its definition and was removed",
+            ));
+        }
         remove_owned_legacy_run_entry(executable)
+    }
+
+    /// Protected folder for the logon task definition while schtasks reads it.
+    fn startup_task_directory() -> PathBuf {
+        crate::managed::windows_managed_data_directory().join("tmp")
     }
 
     pub fn disable_current_user_startup(executable: &Path) -> DomainResult<()> {
@@ -994,26 +1610,45 @@ mod native {
         }
     }
 
+    /// Points every WinINet connection of the current user (the LAN and
+    /// each dial-up / VPN entry) at `settings`, with automatic detection and
+    /// the configuration script off, and records what each had. The
+    /// machine-wide WinHTTP proxy is read for the record but never changed:
+    /// system services (Windows Update, Defender, certificate revocation)
+    /// use it, it is invisible in Settings, and a value left behind would
+    /// outlive the client.
     pub fn apply_system_proxy(
         settings: &WindowsProxySettings,
     ) -> DomainResult<WindowsProxySnapshot> {
         settings.validate()?;
         let key = open_internet_settings_key()?;
-        let mut snapshot = WindowsProxySnapshot {
+        let winhttp = read_winhttp_proxy().unwrap_or(WindowsWinHttpProxy {
+            access_type: WINHTTP_ACCESS_TYPE_NO_PROXY,
+            server: String::new(),
+            bypass: String::new(),
+        });
+        let snapshot = WindowsProxySnapshot {
             enabled: read_registry_dword(&key, "ProxyEnable")? != 0,
             server: read_registry_string(&key, "ProxyServer")?,
             bypass: read_registry_string(&key, "ProxyOverride")?,
-            winhttp_access_type: WINHTTP_ACCESS_TYPE_NO_PROXY,
-            winhttp_server: String::new(),
-            winhttp_bypass: String::new(),
+            winhttp_access_type: winhttp.access_type,
+            winhttp_server: winhttp.server,
+            winhttp_bypass: winhttp.bypass,
+            winhttp_untouched: true,
+            applied: Some(settings.clone()),
+            connections: read_all_connection_proxies()?,
         };
-        read_winhttp_snapshot(&mut snapshot)?;
 
         let apply_result = (|| {
+            for connection in &snapshot.connections {
+                write_connection_proxy(&applied_connection(
+                    connection.connection.clone(),
+                    settings,
+                ))?;
+            }
             write_registry_dword(&key, "ProxyEnable", u32::from(settings.enabled))?;
             write_registry_string(&key, "ProxyServer", &settings.server)?;
             write_registry_string(&key, "ProxyOverride", &settings.bypass)?;
-            set_winhttp_proxy(settings.enabled, &settings.server, &settings.bypass)?;
             notify_proxy_change()
         })();
         if let Err(error) = apply_result {
@@ -1028,17 +1663,297 @@ mod native {
         Ok(snapshot)
     }
 
+    /// Puts back what `snapshot` recorded, step by step: a failing step
+    /// does not stop the others, and the change notification always goes
+    /// out. A connection that no longer holds the applied value is left as
+    /// the user set it; WinHTTP is only touched for snapshots taken before
+    /// 1.0, and only while it still holds the value those applies wrote.
     pub fn restore_system_proxy(snapshot: &WindowsProxySnapshot) -> DomainResult<()> {
-        let key = open_internet_settings_key()?;
-        write_registry_dword(&key, "ProxyEnable", u32::from(snapshot.enabled))?;
-        write_registry_string(&key, "ProxyServer", &snapshot.server)?;
-        write_registry_string(&key, "ProxyOverride", &snapshot.bypass)?;
-        set_winhttp_proxy(
-            snapshot.winhttp_access_type == WINHTTP_ACCESS_TYPE_NAMED_PROXY,
-            &snapshot.winhttp_server,
-            &snapshot.winhttp_bypass,
-        )?;
-        notify_proxy_change()
+        let mut failures: Vec<String> = Vec::new();
+        if !snapshot.winhttp_untouched {
+            // Before 1.0 the apply wrote WinHTTP as it wrote WinINet; the
+            // caller checked that WinINet still holds the applied value, so
+            // the current WinINet value is what WinHTTP was set to.
+            let applied = match &snapshot.applied {
+                Some(applied) => Some(applied.clone()),
+                None => match read_current_user_system_proxy() {
+                    Ok(current) => Some(current),
+                    Err(error) => {
+                        failures.push(error.message);
+                        None
+                    }
+                },
+            };
+            if let Some(applied) = applied {
+                match read_winhttp_proxy() {
+                    Ok(now) => {
+                        if let Some(target) =
+                            winhttp_restore_target(&snapshot_winhttp(snapshot), &now, &applied)
+                        {
+                            if let Err(error) = restore_winhttp_proxy(&target) {
+                                failures.push(error.message);
+                            }
+                        }
+                    }
+                    Err(error) => failures.push(error.message),
+                }
+            }
+        }
+
+        if let Some(applied) = &snapshot.applied {
+            for previous in &snapshot.connections {
+                match read_connection_proxy(previous.connection.as_deref()) {
+                    Ok(now) if connection_still_applied(&now, applied) => {
+                        if let Err(error) = write_connection_proxy(previous) {
+                            failures.push(error.message);
+                        }
+                    }
+                    Ok(_) => {}
+                    // A dial-up entry deleted since has nothing to restore.
+                    Err(_) if previous.connection.is_some() => {}
+                    Err(error) => failures.push(error.message),
+                }
+            }
+        }
+
+        // Snapshots taken before 1.0 recorded only the flat LAN values; the
+        // caller restores them only while they hold the applied proxy. Newer
+        // snapshots restored the LAN with the other connections above.
+        if snapshot.connections.is_empty() {
+            let written = open_internet_settings_key().and_then(|key| {
+                write_registry_dword(&key, "ProxyEnable", u32::from(snapshot.enabled))?;
+                write_registry_string(&key, "ProxyServer", &snapshot.server)?;
+                write_registry_string(&key, "ProxyOverride", &snapshot.bypass)
+            });
+            if let Err(error) = written {
+                failures.push(error.message);
+            }
+        }
+        if let Err(error) = notify_proxy_change() {
+            failures.push(error.message);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(proxy_error(&format!(
+                "system proxy could not be fully restored: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    pub fn read_all_connection_proxies() -> DomainResult<Vec<WindowsConnectionProxySnapshot>> {
+        let mut connections = vec![read_connection_proxy(None)?];
+        for name in dial_up_connection_names() {
+            // An entry that cannot be read is left out, and so never written.
+            if let Ok(connection) = read_connection_proxy(Some(&name)) {
+                connections.push(connection);
+            }
+        }
+        Ok(connections)
+    }
+
+    fn read_connection_proxy(
+        connection: Option<&str>,
+    ) -> DomainResult<WindowsConnectionProxySnapshot> {
+        // The _UI flags are the ones the user set; plain FLAGS may carry
+        // WinINet's own adjustments of automatic detection.
+        query_connection_proxy(connection, INTERNET_PER_CONN_FLAGS_UI)
+            .or_else(|_| query_connection_proxy(connection, INTERNET_PER_CONN_FLAGS))
+    }
+
+    fn query_connection_proxy(
+        connection: Option<&str>,
+        flags_option: u32,
+    ) -> DomainResult<WindowsConnectionProxySnapshot> {
+        let mut name = connection.map(wide);
+        let mut options: [INTERNET_PER_CONN_OPTIONW; 4] = unsafe { zeroed() };
+        options[0].dwOption = flags_option;
+        options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
+        options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        options[3].dwOption = INTERNET_PER_CONN_AUTOCONFIG_URL;
+        let mut list = INTERNET_PER_CONN_OPTION_LISTW {
+            dwSize: size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+            pszConnection: name.as_mut().map_or(null_mut(), |name| name.as_mut_ptr()),
+            dwOptionCount: options.len() as u32,
+            dwOptionError: 0,
+            pOptions: options.as_mut_ptr(),
+        };
+        let mut size = size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32;
+        if unsafe {
+            InternetQueryOptionW(
+                null(),
+                INTERNET_OPTION_PER_CONNECTION_OPTION,
+                &mut list as *mut INTERNET_PER_CONN_OPTION_LISTW as *mut c_void,
+                &mut size,
+            )
+        } == 0
+        {
+            return Err(last_proxy_error(
+                "WinINet connection proxy settings could not be read",
+            ));
+        }
+        // SAFETY: the query filled each option with the member its option
+        // id names; the strings are allocated with GlobalAlloc.
+        let take = |option: &INTERNET_PER_CONN_OPTIONW| unsafe {
+            let pointer = option.Value.pszValue;
+            let value = read_allocated_wide(pointer);
+            if !pointer.is_null() {
+                GlobalFree(pointer as *mut c_void);
+            }
+            value
+        };
+        Ok(WindowsConnectionProxySnapshot {
+            connection: connection.map(str::to_string),
+            flags: unsafe { options[0].Value.dwValue },
+            server: take(&options[1]),
+            bypass: take(&options[2]),
+            auto_config_url: take(&options[3]),
+        })
+    }
+
+    fn write_connection_proxy(value: &WindowsConnectionProxySnapshot) -> DomainResult<()> {
+        set_connection_proxy(value, INTERNET_PER_CONN_FLAGS_UI)
+            .or_else(|_| set_connection_proxy(value, INTERNET_PER_CONN_FLAGS))
+    }
+
+    fn set_connection_proxy(
+        value: &WindowsConnectionProxySnapshot,
+        flags_option: u32,
+    ) -> DomainResult<()> {
+        let mut name = value.connection.as_deref().map(wide);
+        let mut server = wide(&value.server);
+        let mut bypass = wide(&value.bypass);
+        let mut auto_config_url = wide(&value.auto_config_url);
+        let mut options: [INTERNET_PER_CONN_OPTIONW; 4] = unsafe { zeroed() };
+        options[0].dwOption = flags_option;
+        options[0].Value.dwValue = value.flags;
+        options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
+        options[1].Value.pszValue = server.as_mut_ptr();
+        options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        options[2].Value.pszValue = bypass.as_mut_ptr();
+        options[3].dwOption = INTERNET_PER_CONN_AUTOCONFIG_URL;
+        options[3].Value.pszValue = auto_config_url.as_mut_ptr();
+        let list = INTERNET_PER_CONN_OPTION_LISTW {
+            dwSize: size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+            pszConnection: name.as_mut().map_or(null_mut(), |name| name.as_mut_ptr()),
+            dwOptionCount: options.len() as u32,
+            dwOptionError: 0,
+            pOptions: options.as_mut_ptr(),
+        };
+        if unsafe {
+            InternetSetOptionW(
+                null(),
+                INTERNET_OPTION_PER_CONNECTION_OPTION,
+                &list as *const INTERNET_PER_CONN_OPTION_LISTW as *const c_void,
+                size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_proxy_error(
+                "WinINet connection proxy settings could not be written",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The current user's dial-up, PPPoE and built-in VPN entries; none
+    /// when the phone book cannot be read.
+    fn dial_up_connection_names() -> Vec<String> {
+        let entry_size = size_of::<RASENTRYNAMEW>();
+        let mut entries: Vec<RASENTRYNAMEW> = vec![unsafe { zeroed() }; 1];
+        entries[0].dwSize = entry_size as u32;
+        let mut bytes = entry_size as u32;
+        let mut count = 0u32;
+        let mut result = unsafe {
+            RasEnumEntriesW(null(), null(), entries.as_mut_ptr(), &mut bytes, &mut count)
+        };
+        if result == ERROR_BUFFER_TOO_SMALL {
+            let needed = (bytes as usize).div_ceil(entry_size).max(1);
+            entries = vec![unsafe { zeroed() }; needed];
+            for entry in &mut entries {
+                entry.dwSize = entry_size as u32;
+            }
+            bytes = (needed * entry_size) as u32;
+            count = 0;
+            result = unsafe {
+                RasEnumEntriesW(null(), null(), entries.as_mut_ptr(), &mut bytes, &mut count)
+            };
+        }
+        if result != ERROR_SUCCESS {
+            return Vec::new();
+        }
+        entries
+            .iter()
+            .take(count as usize)
+            .map(|entry| {
+                let length = entry
+                    .szEntryName
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szEntryName.len());
+                String::from_utf16_lossy(&entry.szEntryName[..length])
+            })
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    pub fn read_current_user_effective_proxy() -> DomainResult<WindowsEffectiveProxy> {
+        let mut config: WINHTTP_CURRENT_USER_IE_PROXY_CONFIG = unsafe { zeroed() };
+        if unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut config) } == 0 {
+            return Err(last_proxy_error(
+                "the effective proxy configuration could not be read",
+            ));
+        }
+        // SAFETY: the strings are allocated with GlobalAlloc or null.
+        let take = |pointer: *mut u16| unsafe {
+            let value = read_allocated_wide(pointer);
+            if !pointer.is_null() {
+                GlobalFree(pointer as *mut c_void);
+            }
+            value
+        };
+        Ok(WindowsEffectiveProxy {
+            auto_detect: config.fAutoDetect != 0,
+            auto_config_url: take(config.lpszAutoConfigUrl),
+            proxy: take(config.lpszProxy),
+            bypass: take(config.lpszProxyBypass),
+            per_machine_policy: per_machine_proxy_policy(),
+        })
+    }
+
+    /// `ProxySettingsPerUser` = 0 under the Internet Settings policy key.
+    fn per_machine_proxy_policy() -> bool {
+        let path = wide(r"SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Internet Settings");
+        let mut key: HKEY = null_mut();
+        if unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                path.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut key,
+            )
+        } != ERROR_SUCCESS
+        {
+            return false;
+        }
+        let key = RegistryKey(key);
+        let name = wide("ProxySettingsPerUser");
+        let mut value = 1u32;
+        let mut size = size_of::<u32>() as u32;
+        let mut value_type = 0;
+        let result = unsafe {
+            RegQueryValueExW(
+                key.0,
+                name.as_ptr(),
+                null(),
+                &mut value_type,
+                &mut value as *mut u32 as *mut u8,
+                &mut size,
+            )
+        };
+        result == ERROR_SUCCESS && value_type == REG_DWORD && value == 0
     }
 
     fn write_current_user_system_proxy(settings: &WindowsProxySettings) -> DomainResult<()> {
@@ -1069,21 +1984,25 @@ mod native {
         write_current_user_system_proxy(previous)
     }
 
-    fn read_winhttp_proxy() -> DomainResult<WindowsWinHttpProxy> {
-        let mut snapshot = WindowsProxySnapshot {
-            enabled: false,
-            server: String::new(),
-            bypass: String::new(),
-            winhttp_access_type: WINHTTP_ACCESS_TYPE_NO_PROXY,
-            winhttp_server: String::new(),
-            winhttp_bypass: String::new(),
+    pub fn read_winhttp_proxy() -> DomainResult<WindowsWinHttpProxy> {
+        let mut info = WINHTTP_PROXY_INFO::default();
+        if unsafe { WinHttpGetDefaultProxyConfiguration(&mut info) } == 0 {
+            return Err(last_proxy_error("WinHTTP proxy could not be read"));
+        }
+        let proxy = WindowsWinHttpProxy {
+            access_type: info.dwAccessType,
+            server: unsafe { read_allocated_wide(info.lpszProxy) },
+            bypass: unsafe { read_allocated_wide(info.lpszProxyBypass) },
         };
-        read_winhttp_snapshot(&mut snapshot)?;
-        Ok(WindowsWinHttpProxy {
-            access_type: snapshot.winhttp_access_type,
-            server: snapshot.winhttp_server,
-            bypass: snapshot.winhttp_bypass,
-        })
+        unsafe {
+            if !info.lpszProxy.is_null() {
+                GlobalFree(info.lpszProxy as *mut c_void);
+            }
+            if !info.lpszProxyBypass.is_null() {
+                GlobalFree(info.lpszProxyBypass as *mut c_void);
+            }
+        }
+        Ok(proxy)
     }
 
     pub fn apply_winhttp_proxy(
@@ -1563,25 +2482,6 @@ mod native {
         Ok(())
     }
 
-    fn read_winhttp_snapshot(snapshot: &mut WindowsProxySnapshot) -> DomainResult<()> {
-        let mut info = WINHTTP_PROXY_INFO::default();
-        if unsafe { WinHttpGetDefaultProxyConfiguration(&mut info) } == 0 {
-            return Err(last_proxy_error("WinHTTP proxy could not be read"));
-        }
-        snapshot.winhttp_access_type = info.dwAccessType;
-        snapshot.winhttp_server = unsafe { read_allocated_wide(info.lpszProxy) };
-        snapshot.winhttp_bypass = unsafe { read_allocated_wide(info.lpszProxyBypass) };
-        unsafe {
-            if !info.lpszProxy.is_null() {
-                GlobalFree(info.lpszProxy as *mut c_void);
-            }
-            if !info.lpszProxyBypass.is_null() {
-                GlobalFree(info.lpszProxyBypass as *mut c_void);
-            }
-        }
-        Ok(())
-    }
-
     fn set_winhttp_proxy(enabled: bool, server: &str, bypass: &str) -> DomainResult<()> {
         let mut server_wide = wide(server);
         let mut bypass_wide = wide(bypass);
@@ -1791,10 +2691,106 @@ mod native {
             );
         }
 
+        /// Tests that write the current user's proxy run one at a time.
+        static USER_PROXY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn user_proxy_lock() -> std::sync::MutexGuard<'static, ()> {
+            USER_PROXY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// Puts the LAN connection back as the test found it, whatever
+        /// happens.
+        struct LanConnectionGuard(WindowsConnectionProxySnapshot, WindowsProxySettings);
+
+        impl Drop for LanConnectionGuard {
+            fn drop(&mut self) {
+                let _ = write_connection_proxy(&self.0);
+                let _ = write_current_user_system_proxy(&self.1);
+            }
+        }
+
+        #[test]
+        fn apply_turns_off_the_configuration_script_and_leaves_winhttp_alone() {
+            let _lock = user_proxy_lock();
+            let original = read_connection_proxy(None).expect("LAN settings are readable");
+            let original_flat =
+                read_current_user_system_proxy().expect("the user's proxy should be readable");
+            let _guard = LanConnectionGuard(original, original_flat);
+            let winhttp_before = read_winhttp_proxy().expect("WinHTTP is readable");
+
+            // A configuration script, as a corporate network sets one.
+            write_connection_proxy(&WindowsConnectionProxySnapshot {
+                connection: None,
+                flags: WININET_PROXY_TYPE_DIRECT | WININET_PROXY_TYPE_AUTO_PROXY_URL,
+                server: String::new(),
+                bypass: String::new(),
+                auto_config_url: "http://127.0.0.1:9/anixops-test.pac".to_string(),
+            })
+            .expect("a configuration script is written");
+            let with_script = read_connection_proxy(None).expect("LAN settings are readable");
+            assert_eq!(
+                with_script.auto_config_url,
+                "http://127.0.0.1:9/anixops-test.pac"
+            );
+            // The flat values clients compare to tell whether the proxy is
+            // still theirs.
+            let flat_with_script =
+                read_current_user_system_proxy().expect("the user's proxy should be readable");
+
+            let settings = WindowsProxySettings {
+                enabled: true,
+                server: "127.0.0.1:65530".to_string(),
+                bypass: "<local>".to_string(),
+            };
+            let snapshot = apply_system_proxy(&settings).expect("the proxy is applied");
+            assert!(snapshot.winhttp_untouched);
+            assert_eq!(snapshot.applied.as_ref(), Some(&settings));
+            assert_eq!(snapshot.connections.first(), Some(&with_script));
+            let lan = read_connection_proxy(None).expect("LAN settings are readable");
+            assert!(connection_still_applied(&lan, &settings), "{lan:?}");
+            assert_eq!(
+                read_winhttp_proxy().expect("WinHTTP is readable"),
+                winhttp_before
+            );
+
+            restore_system_proxy(&snapshot).expect("the proxy is restored");
+            let restored = read_connection_proxy(None).expect("LAN settings are readable");
+            assert_eq!(
+                restored.flags & WININET_PROXY_TYPE_MASK,
+                with_script.flags & WININET_PROXY_TYPE_MASK
+            );
+            assert_eq!(restored.auto_config_url, with_script.auto_config_url);
+            assert_eq!(
+                read_current_user_system_proxy().expect("the user's proxy should be readable"),
+                flat_with_script,
+                "restoring the connection settings puts the flat values back too"
+            );
+            assert_eq!(
+                read_winhttp_proxy().expect("WinHTTP is readable"),
+                winhttp_before
+            );
+
+            // A connection changed after the apply is not restored over.
+            let snapshot = apply_system_proxy(&settings).expect("the proxy is applied");
+            let mut changed = applied_connection(None, &settings);
+            changed.server = "127.0.0.1:65531".to_string();
+            write_connection_proxy(&changed).expect("another proxy is written");
+            restore_system_proxy(&snapshot).expect("the restore succeeds");
+            assert_eq!(
+                read_connection_proxy(None)
+                    .expect("LAN settings are readable")
+                    .server,
+                "127.0.0.1:65531"
+            );
+        }
+
         /// Writes back the settings that are already there, so the test leaves
         /// the machine as it found it and needs no administrator rights.
         #[test]
         fn current_user_proxy_is_written_without_touching_winhttp() {
+            let _lock = user_proxy_lock();
             let current =
                 read_current_user_system_proxy().expect("the user's proxy should be readable");
             let previous = apply_current_user_system_proxy(&current)

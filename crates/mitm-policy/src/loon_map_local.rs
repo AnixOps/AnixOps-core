@@ -9,10 +9,11 @@
 //! [`inline_remote_data`].
 
 use crate::loon_syntax::{attributes, quote, tokens};
+use crate::policy_cache::{PolicyCache, SharedEngine, POLICY_REVISIONS};
 use crate::{AnixOpsMitmPolicyEngine, MitmPolicyPhase};
 use control_domain::{DomainResult, MetadataEntry};
 
-const TINY_GIF: [u8; 43] = [
+pub(crate) static TINY_GIF: [u8; 43] = [
     0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
     0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
@@ -270,35 +271,78 @@ pub fn map_local_rules(source: &str) -> Vec<LoonMapLocalRule> {
 }
 
 /// Returns the first `[Map Local]` rule whose pattern matches `url`.
+///
+/// The rules and their matcher are compiled once per policy revision; every
+/// request of that policy reuses them.
 pub fn match_map_local(source: &str, url: &str) -> DomainResult<Option<LoonMapLocalRule>> {
-    let rules = map_local_rules(source);
-    if rules.is_empty() {
-        return Ok(None);
-    }
-    match first_match(&rules, url)? {
-        Some(found) => Ok(found),
-        None => {
-            // One refused pattern fails the whole load; retry without the
-            // refused ones, which were graded unsupported at import.
-            let accepted = rules
-                .into_iter()
-                .filter(|rule| map_local_pattern_accepted(&rule.pattern))
-                .collect::<Vec<_>>();
-            Ok(first_match(&accepted, url)?.flatten())
+    COMPILED
+        .get_or_build(source, CompiledMapLocal::build)?
+        .find(url)
+}
+
+/// The `[Map Local]` rules of one policy and one engine matching their
+/// patterns as request-phase reject rules; the matched pattern names the rule.
+struct CompiledMapLocal {
+    rules: Vec<LoonMapLocalRule>,
+    /// `None` when there are no rules or the core refuses every pattern.
+    matcher: Option<SharedEngine>,
+}
+
+/// Map Local rules of the policies in use, released with their policy
+/// ([`crate::CompiledPolicyRelease`]).
+static COMPILED: PolicyCache<CompiledMapLocal> = PolicyCache::new(POLICY_REVISIONS);
+
+/// Drops the compiled rules of a policy no longer in use.
+pub(crate) fn release(policy: crate::PolicyFingerprint) {
+    COMPILED.remove(policy);
+}
+
+impl CompiledMapLocal {
+    fn build(source: &str) -> DomainResult<Self> {
+        let rules = map_local_rules(source);
+        if rules.is_empty() {
+            return Ok(Self {
+                rules,
+                matcher: None,
+            });
         }
+        if let Some(matcher) = load_matcher(&rules)? {
+            return Ok(Self {
+                rules,
+                matcher: Some(matcher),
+            });
+        }
+        // One refused pattern fails the whole load; keep only the accepted
+        // ones, which the importer graded supported.
+        let rules = rules
+            .into_iter()
+            .filter(|rule| map_local_pattern_accepted(&rule.pattern))
+            .collect::<Vec<_>>();
+        let matcher = if rules.is_empty() {
+            None
+        } else {
+            load_matcher(&rules)?
+        };
+        Ok(Self { rules, matcher })
+    }
+
+    fn find(&self, url: &str) -> DomainResult<Option<LoonMapLocalRule>> {
+        let Some(matcher) = &self.matcher else {
+            return Ok(None);
+        };
+        let result =
+            matcher.with(|engine| engine.evaluate_url_rewrite(url, MitmPolicyPhase::Request))?;
+        Ok(self
+            .rules
+            .iter()
+            .find(|rule| result.rule_index >= 0 && rule.pattern == result.matched_pattern)
+            .cloned())
     }
 }
 
-/// Matches `url` with the core, using the patterns as request-phase reject
-/// rules; the matched pattern names the rule. `None` when the core refuses
-/// the patterns.
-fn first_match(
-    rules: &[LoonMapLocalRule],
-    url: &str,
-) -> DomainResult<Option<Option<LoonMapLocalRule>>> {
-    if rules.is_empty() {
-        return Ok(Some(None));
-    }
+/// An engine with `rules`' patterns as request-phase reject rules. `None`
+/// when the core refuses a pattern.
+fn load_matcher(rules: &[LoonMapLocalRule]) -> DomainResult<Option<SharedEngine>> {
     let mut config = String::from("[Rewrite]\n");
     for rule in rules {
         config.push_str(&quote(&rule.pattern));
@@ -308,13 +352,7 @@ fn first_match(
     if engine.load_config(&config).is_err() {
         return Ok(None);
     }
-    let result = engine.evaluate_url_rewrite(url, MitmPolicyPhase::Request)?;
-    Ok(Some(
-        rules
-            .iter()
-            .find(|rule| result.rule_index >= 0 && rule.pattern == result.matched_pattern)
-            .cloned(),
-    ))
+    Ok(Some(SharedEngine::new(engine)))
 }
 
 /// True when the core compiles `pattern` as a URL regex.

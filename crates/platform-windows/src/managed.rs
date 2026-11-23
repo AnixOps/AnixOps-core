@@ -1,10 +1,13 @@
 //! Durable configuration and state shared by the Windows GUI and service host.
 
+use crate::managed_files::{
+    ensure_managed_directory, is_within_managed_root, read_managed_file,
+    windows_managed_root_directory, write_managed_file_atomic,
+};
 use control_domain::{DomainError, DomainResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,14 +69,46 @@ impl WindowsSystemProxyOwner {
     }
 }
 
+/// The current user's system proxy as it was before an apply, and what the
+/// apply wrote, so a restore puts back only what still holds this
+/// client's value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsProxySnapshot {
+    /// The WinINet LAN values `ProxyEnable`, `ProxyServer`, `ProxyOverride`.
     pub enabled: bool,
     pub server: String,
     pub bypass: String,
+    /// The machine-wide WinHTTP proxy as it was.
     pub winhttp_access_type: u32,
     pub winhttp_server: String,
     pub winhttp_bypass: String,
+    /// Whether the apply left WinHTTP alone (every snapshot taken since
+    /// 1.0). Older snapshots lack it (`false`): their apply also set WinHTTP
+    /// to the applied proxy, which a restore undoes only while WinHTTP still
+    /// holds exactly that value.
+    #[serde(default)]
+    pub winhttp_untouched: bool,
+    /// The proxy the apply wrote; `None` in snapshots taken before 1.0.
+    #[serde(default)]
+    pub applied: Option<WindowsProxySettings>,
+    /// Every WinINet connection's own settings as they were: the LAN and
+    /// each dial-up / VPN (RAS) entry, including the automatic
+    /// configuration script and automatic detection. Empty in snapshots
+    /// taken before 1.0, whose restore only puts back the LAN values above.
+    #[serde(default)]
+    pub connections: Vec<WindowsConnectionProxySnapshot>,
+}
+
+/// One WinINet connection's proxy settings (`INTERNET_PER_CONN_*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsConnectionProxySnapshot {
+    /// The dial-up / VPN entry name; `None` is the LAN connection.
+    pub connection: Option<String>,
+    /// `PROXY_TYPE_*` flags (direct, proxy, configuration script, detect).
+    pub flags: u32,
+    pub server: String,
+    pub bypass: String,
+    pub auto_config_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,11 +332,11 @@ impl Default for WindowsManagedState {
     }
 }
 
+/// `%ProgramData%\AnixOps\NetworkCore` ([`WINDOWS_MANAGED_PRODUCT_DIRECTORY`]),
+/// built from its components so it lies under the managed root on every
+/// platform the crate builds for.
 pub fn windows_managed_data_directory() -> PathBuf {
-    env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join(WINDOWS_MANAGED_PRODUCT_DIRECTORY)
+    windows_managed_root_directory().join("NetworkCore")
 }
 
 pub fn windows_managed_config_path() -> PathBuf {
@@ -322,9 +357,15 @@ pub fn windows_managed_log_path(component: &str) -> PathBuf {
 
 /// Append a human-readable diagnostic line without making logging a prerequisite for runtime work.
 pub fn append_managed_log(component: &str, message: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // The log folder is secured once per process, not on every line.
+    static LOG_DIRECTORY_SECURED: AtomicBool = AtomicBool::new(false);
     let path = windows_managed_log_path(component);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        if !LOG_DIRECTORY_SECURED.load(Ordering::Acquire) {
+            ensure_managed_directory(parent)?;
+            LOG_DIRECTORY_SECURED.store(true, Ordering::Release);
+        }
     }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -335,8 +376,8 @@ pub fn append_managed_log(component: &str, message: &str) -> std::io::Result<()>
 }
 
 pub fn read_managed_config(path: &Path) -> DomainResult<WindowsManagedConfig> {
-    let bytes =
-        fs::read(path).map_err(|_| config_io_error("managed configuration could not be read"))?;
+    let bytes = read_managed_file(path)
+        .map_err(|_| config_io_error("managed configuration could not be read"))?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|_| config_error("managed configuration is not valid JSON"))?;
     if value
@@ -359,16 +400,46 @@ pub fn read_managed_config(path: &Path) -> DomainResult<WindowsManagedConfig> {
     let config: WindowsManagedConfig = serde_json::from_value(value)
         .map_err(|_| config_error("managed configuration is not valid JSON"))?;
     config.validate()?;
+    if is_within_managed_root(path) {
+        validate_managed_file_references(&config)?;
+    }
     Ok(config)
+}
+
+/// The managed configuration names files the elevated engine then loads
+/// (the engine envelope, the HTTPS decryption root and its key). Read from
+/// the managed folder, it may only name files inside that folder, so an
+/// edited configuration cannot point the engine at a file another account
+/// controls.
+pub fn validate_managed_file_references(config: &WindowsManagedConfig) -> DomainResult<()> {
+    let mut paths: Vec<&Path> = Vec::new();
+    if let Some(embedded) = config.embedded.as_ref().filter(|embedded| embedded.enabled) {
+        paths.push(&embedded.envelope_path);
+    }
+    if let Some(native_mitm) = config.native_mitm.as_ref().filter(|mitm| mitm.enabled) {
+        paths.push(&native_mitm.ca_certificate_path);
+        paths.push(&native_mitm.ca_private_key_path);
+    }
+    if paths.iter().all(|path| is_within_managed_root(path)) {
+        Ok(())
+    } else {
+        Err(config_error(
+            "managed configuration names a file outside the managed data directory",
+        ))
+    }
 }
 
 pub fn write_managed_config(path: &Path, config: &WindowsManagedConfig) -> DomainResult<()> {
     config.validate()?;
+    if is_within_managed_root(path) {
+        validate_managed_file_references(config)?;
+    }
     write_json_atomic(path, config, WINDOWS_MANAGED_CONFIG_IO_CODE)
 }
 
 pub fn read_managed_state(path: &Path) -> DomainResult<WindowsManagedState> {
-    let bytes = fs::read(path).map_err(|_| state_io_error("managed state could not be read"))?;
+    let bytes =
+        read_managed_file(path).map_err(|_| state_io_error("managed state could not be read"))?;
     let state: WindowsManagedState = serde_json::from_slice(&bytes)
         .map_err(|_| state_io_error("managed state is not valid JSON"))?;
     if state.schema_version != WINDOWS_MANAGED_STATE_SCHEMA_VERSION {
@@ -396,56 +467,18 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T, code: &str) -> Domain
     write_bytes_atomic(path, &bytes, code)
 }
 
+/// Written through [`write_managed_file_atomic`]: a new file with a random
+/// name, created exclusively with the protected access list in a protected
+/// folder, then moved over `path`. A fixed temporary name (as before 1.0)
+/// let a standard user pre-create it and own the committed file.
 fn write_bytes_atomic(path: &Path, bytes: &[u8], code: &str) -> DomainResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| DomainError::new(code, "managed path has no parent"))?;
-    fs::create_dir_all(parent)
-        .map_err(|_| DomainError::new(code, "managed data directory could not be created"))?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file = fs::File::create(&temporary)
-        .map_err(|_| DomainError::new(code, "managed temporary file could not be created"))?;
-    file.write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| DomainError::new(code, "managed temporary file could not be written"))?;
-    replace_managed_file(&temporary, path)
-        .map_err(|_| DomainError::new(code, "managed file could not be committed"))
-}
-
-#[cfg(windows)]
-fn replace_managed_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let temporary = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    if unsafe {
-        MoveFileExW(
-            temporary.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {}
+        _ => return Err(DomainError::new(code, "managed path has no parent")),
     }
-}
-
-#[cfg(not(windows))]
-fn replace_managed_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(temporary, destination)
+    write_managed_file_atomic(path, bytes).map_err(|error| {
+        DomainError::new(code, format!("managed file could not be written: {error}"))
+    })
 }
 
 fn config_error(message: &str) -> DomainError {

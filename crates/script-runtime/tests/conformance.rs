@@ -6,15 +6,56 @@
 #![cfg(feature = "quickjs")]
 
 use script_runtime::{
-    MemoryScriptStore, QuickJsScriptRuntime, ScriptFailure, ScriptInvocation, ScriptLimits,
-    ScriptMutation, ScriptOutcome, ScriptPhase, ScriptRequest, ScriptResponse, ScriptRuleRequest,
-    ScriptRunStatus, ScriptStore,
+    binary_body_string, MemoryScriptStore, QuickJsScriptRuntime, ScriptFailure, ScriptHttpClient,
+    ScriptHttpClientRequest, ScriptInvocation, ScriptLimits, ScriptMutation, ScriptOutcome,
+    ScriptPhase, ScriptRequest, ScriptResponse, ScriptRuleRequest, ScriptRunStatus, ScriptStore,
+    SCRIPT_HTTP_CLIENT_DISABLED_MESSAGE,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// `$httpClient` for the fixtures: `https://stub.example.test/bytes`
+/// answers four bytes that are not UTF-8, `/echo` describes the request it
+/// got; every other URL fails as a disabled client does.
+struct StubHttpClient;
+
+const STUB_BYTES: [u8; 4] = [0x00, 0x01, 0x80, 0xff];
+
+impl ScriptHttpClient for StubHttpClient {
+    fn execute(&self, request: &ScriptHttpClientRequest) -> Result<ScriptResponse, String> {
+        let body = match request.url.as_str() {
+            "https://stub.example.test/bytes" => STUB_BYTES.to_vec(),
+            "https://stub.example.test/echo" => format!(
+                "{}|follow={}|binary={}|body={}",
+                request.method,
+                request.follow_redirects,
+                request.binary_response,
+                request
+                    .body_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+            .into_bytes(),
+            _ => return Err(SCRIPT_HTTP_CLIENT_DISABLED_MESSAGE.to_string()),
+        };
+        Ok(ScriptResponse {
+            status: 200,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body: Some(if request.binary_response {
+                binary_body_string(&body)
+            } else {
+                String::from_utf8_lossy(&body).into_owned()
+            }),
+        })
+    }
+}
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance")
@@ -73,6 +114,10 @@ fn invocation(value: &Value) -> ScriptInvocation {
             .get("binaryBody")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        body_is_bytes: value
+            .get("bodyIsBytes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         event: text(value.get("event")),
         rule: value.get("rule").map(|rule| ScriptRuleRequest {
             hostname: text(rule.get("hostname")),
@@ -127,6 +172,10 @@ fn expected_mutation(value: Option<&Value>) -> ScriptMutation {
         body: text(object.get("body")),
         response: object.get("response").map(response),
         matched: object.get("matched").and_then(Value::as_bool),
+        binary_bodies: object
+            .get("binaryBodies")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -145,6 +194,7 @@ fn assert_mutation_eq(case: &str, actual: &ScriptMutation, expected: &ScriptMuta
                 )
             }),
             mutation.matched,
+            mutation.binary_bodies,
         )
     };
     assert_eq!(normalize(actual), normalize(expected), "{case}: mutation");
@@ -281,8 +331,7 @@ fn run_suite(capabilities: &[&str], run: &EngineRunner) -> Vec<String> {
 #[test]
 fn quickjs_passes_shared_conformance_fixtures() {
     let skipped = run_suite(&["heap-limit"], &|store, script, invocation, limits| {
-        QuickJsScriptRuntime::new(store, Arc::new(script_runtime::DisabledScriptHttpClient))
-            .run(script, invocation, limits)
+        QuickJsScriptRuntime::new(store, Arc::new(StubHttpClient)).run(script, invocation, limits)
     });
     assert!(skipped.is_empty(), "QuickJS skipped {skipped:?}");
 }
@@ -295,8 +344,7 @@ mod javascriptcore {
     #[test]
     fn javascriptcore_passes_shared_conformance_fixtures() {
         let skipped = run_suite(&[], &|store, script, invocation, limits| {
-            JscScriptRuntime::new(store, Arc::new(script_runtime::DisabledScriptHttpClient))
-                .run(script, invocation, limits)
+            JscScriptRuntime::new(store, Arc::new(StubHttpClient)).run(script, invocation, limits)
         });
         assert_eq!(
             skipped,
@@ -320,6 +368,7 @@ mod javascriptcore {
             },
             response: None,
             binary_body: false,
+            body_is_bytes: false,
             event: None,
             rule: None,
         };
@@ -406,6 +455,92 @@ fn json_file_store_persists_and_refuses_oversized_values() {
 }
 
 #[test]
+fn a_corrupt_store_file_is_set_aside_and_the_store_starts_empty() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-script-store-recover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.json");
+    let backup = dir.join(format!(
+        "store.json{}",
+        script_runtime::SCRIPT_STORE_QUARANTINE_SUFFIX
+    ));
+
+    // A healthy file opens as it is.
+    std::fs::write(&path, br#"{"token":"abc"}"#).unwrap();
+    let (store, recovery) = script_runtime::open_script_store(&path);
+    assert_eq!(recovery, script_runtime::ScriptStoreRecovery::Opened);
+    assert_eq!(store.read("token").as_deref(), Some("abc"));
+    drop(store);
+
+    // Truncated JSON and a non-string value are both set aside; only the
+    // latest copy is kept.
+    for broken in [&br#"{"token":"ab"#[..], &br#"{"count":1}"#[..], &b""[..]] {
+        std::fs::write(&path, broken).unwrap();
+        let (store, recovery) = script_runtime::open_script_store(&path);
+        assert_eq!(
+            recovery,
+            script_runtime::ScriptStoreRecovery::Quarantined {
+                backup: backup.clone()
+            }
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), broken);
+        assert_eq!(store.read("token"), None);
+        assert!(store.write("token", "fresh"));
+        drop(store);
+        let reopened = script_runtime::JsonFileScriptStore::open(&path).expect("fresh store");
+        assert_eq!(reopened.read("token").as_deref(), Some("fresh"));
+    }
+    let names = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        ["store.json", "store.json.corrupt"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "no temporary file or older copy is left behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn json_file_store_skips_writes_that_change_nothing() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-script-store-same-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.json");
+    let store = script_runtime::JsonFileScriptStore::open(&path).expect("missing file is empty");
+    assert!(store.write("token", "abc"));
+    // Replace the file behind the store's back: an unchanged write must not
+    // rewrite it.
+    std::fs::write(&path, br#"{"token":"abc","marker":"kept"}"#).unwrap();
+    assert!(store.write("token", "abc"));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        br#"{"token":"abc","marker":"kept"}"#.to_vec()
+    );
+    assert!(store.write("token", "def"));
+    let reopened = script_runtime::JsonFileScriptStore::open(&path).expect("store reopens");
+    assert_eq!(reopened.read("token").as_deref(), Some("def"));
+    assert_eq!(reopened.read("marker"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn concurrent_dispatches_share_only_the_store() {
     let store = Arc::new(MemoryScriptStore::new());
     let runtime = QuickJsScriptRuntime::new(
@@ -428,6 +563,7 @@ fn concurrent_dispatches_share_only_the_store() {
                     },
                     response: None,
                     binary_body: false,
+                    body_is_bytes: false,
                     event: None,
                     rule: None,
                 };

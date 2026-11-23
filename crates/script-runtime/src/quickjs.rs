@@ -379,6 +379,7 @@ mod tests {
             },
             response: None,
             binary_body: false,
+            body_is_bytes: false,
             event: None,
             rule: None,
         }

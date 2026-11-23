@@ -417,6 +417,107 @@ async fn rewrites_plain_http_without_a_mitm_hostname() {
     server.abort();
 }
 
+/// mitm-scripts-04: `reject-dict` and `reject-img` answer with a body the
+/// app parses (`{}`, a 1x1 GIF); a HEAD answer keeps the length and sends no
+/// body, so the connection stays in step.
+#[tokio::test]
+async fn reject_variants_answer_with_parseable_bodies() {
+    let device_root = root("NetworkCore Test Device Root");
+    let mut config = mitm_config(&device_root);
+    config.plugins.push(
+        "#!name = Bodies\n[Rewrite]\n\
+         ^http://plain\\.example\\.test/dict reject-dict\n\
+         ^http://plain\\.example\\.test/img reject-img\n"
+            .to_string(),
+    );
+    let engine = Arc::new(MitmEngine::new(&config).unwrap());
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(PlainOrigin {
+        requests: requests_tx,
+        body: b"plain origin".to_vec(),
+        extra_headers: "",
+    });
+    let target: SocketAddr = "192.0.2.20:80".parse().unwrap();
+    let first = b"GET /dict HTTP/1.1\r\nHost: plain.example.test\r\n\r\n".to_vec();
+    let host = engine
+        .claim(&first, target)
+        .expect("plain HTTP is relayed through the rewrite hook");
+
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first,
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let origin = origin.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    origin.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+
+    let header = |head: &str, name: &str| -> Option<String> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    };
+
+    let (head, body) = tokio::time::timeout(Duration::from_secs(10), read_response(&mut app))
+        .await
+        .expect("answered in time");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        header(&head, "Content-Type").as_deref(),
+        Some("application/json; charset=utf-8"),
+        "{head}"
+    );
+    assert_eq!(body, "{}");
+
+    app.write_all(b"GET /img HTTP/1.1\r\nHost: plain.example.test\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, body) = tokio::time::timeout(Duration::from_secs(10), read_response(&mut app))
+        .await
+        .expect("answered in time");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(header(&head, "Content-Type").as_deref(), Some("image/gif"));
+    assert_eq!(header(&head, "Content-Length").as_deref(), Some("43"));
+    assert!(body.starts_with("GIF89a"), "{body:?}");
+
+    // HEAD: the GET's length, no body; the connection closes after it.
+    app.write_all(b"HEAD /dict HTTP/1.1\r\nHost: plain.example.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), app.read_to_end(&mut rest))
+        .await
+        .expect("closed in time")
+        .unwrap();
+    let end = rest
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&rest[..end]).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(header(&head, "Content-Length").as_deref(), Some("2"));
+    assert!(rest[end + 4..].is_empty(), "a HEAD answer has no body");
+
+    assert!(requests.try_recv().is_err(), "every answer stayed local");
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_body_rule_reads_a_body_the_origin_compressed_anyway() {
     use std::io::Write;
@@ -538,6 +639,169 @@ async fn bodies_no_rule_reads_stream_past_the_body_limit_and_keep_the_connection
     assert!(head.starts_with("GET /video.bin HTTP/1.1"), "{head}");
     assert!(requests.try_recv().is_err());
     server.abort();
+}
+
+/// A plain HTTP origin that sends the raw bytes of the first request it
+/// reads to `requests`, answers with `response` exactly as given and
+/// closes.
+struct RawOrigin {
+    requests: mpsc::UnboundedSender<Vec<u8>>,
+    response: &'static [u8],
+}
+
+impl TcpOutbound for RawOrigin {
+    fn protocol(&self) -> &'static str {
+        "test-raw-origin"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move {
+            let (near, mut far) = tokio::io::duplex(64 * 1024);
+            let requests = self.requests.clone();
+            let response = self.response;
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = far.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let _ = requests.send(buf);
+                far.write_all(response).await.unwrap();
+                let _ = far.shutdown().await;
+            });
+            Ok(Box::new(near) as BoxStream)
+        })
+    }
+}
+
+/// Relays `request` (the first bytes of a plain HTTP flow) to an origin
+/// answering `response`: what the app got, to the end, and what the
+/// origin was sent.
+async fn plain_exchange(request: &[u8], response: &'static [u8]) -> (Vec<u8>, Vec<u8>) {
+    let device_root = root("NetworkCore Test Device Root");
+    let engine = Arc::new(MitmEngine::new(&mitm_config(&device_root)).unwrap());
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(RawOrigin {
+        requests: requests_tx,
+        response,
+    });
+    let target: SocketAddr = "192.0.2.22:80".parse().unwrap();
+    let host = engine
+        .claim(request, target)
+        .expect("plain HTTP is claimed");
+    let (mut app, tunnel_side) = tokio::io::duplex(64 * 1024);
+    let flow = InterceptedFlow {
+        inbound: Box::new(tunnel_side),
+        first: request.to_vec(),
+        host,
+        target,
+    };
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let origin = origin.clone();
+        async move {
+            let _ = engine
+                .serve_flow(
+                    flow,
+                    origin.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+    });
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), app.read_to_end(&mut received))
+        .await
+        .expect("relayed in time")
+        .unwrap();
+    let sent = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the origin was asked")
+        .unwrap();
+    // The app is done: a connection relayed raw ends both ways.
+    drop(app);
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("served in time")
+        .unwrap();
+    (received, sent)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[tokio::test]
+async fn plain_http_the_relay_cannot_rewrite_still_goes_through() {
+    let get = b"GET /report HTTP/1.1\r\nHost: plain.example.test\r\n\r\n";
+
+    // A file name in GBK, as an old server sends it.
+    let gbk: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"\xb1\xa8\xb1\xed.xls\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    let (received, _) = plain_exchange(get, gbk).await;
+    assert!(
+        contains(&received, b"filename=\"\xb1\xa8\xb1\xed.xls\"\r\n"),
+        "{}",
+        String::from_utf8_lossy(&received)
+    );
+    assert!(received.ends_with(b"\r\n\r\nhello"));
+
+    // An internet radio stream answers `ICY 200 OK`.
+    let icy: &'static [u8] = b"ICY 200 OK\r\nicy-name: radio\r\n\r\nAUDIO-FRAMES";
+    let (received, _) = plain_exchange(get, icy).await;
+    assert_eq!(received, icy);
+
+    // Lines ending in a bare LF, and a length given twice alike.
+    let lf: &'static [u8] = b"HTTP/1.1 200 OK\nContent-Length: 5, 5\nConnection: close\n\nhello";
+    let (received, _) = plain_exchange(get, lf).await;
+    assert!(received.starts_with(b"HTTP/1.1 200"), "{received:?}");
+    assert!(received.ends_with(b"\r\n\r\nhello"));
+
+    // Lengths that disagree are not guessed at: the app gets a 502.
+    let conflicting: &'static [u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+    let (received, _) = plain_exchange(get, conflicting).await;
+    assert!(received.starts_with(b"HTTP/1.1 502"), "{received:?}");
+
+    // A request head the relay cannot read goes to the origin as it came.
+    let odd = b"GET /x HTTP/1.1\r\nHost: plain.example.test\r\nBad Name: \xff\r\n\r\n";
+    let ok: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let (received, sent) = plain_exchange(odd, ok).await;
+    assert_eq!(sent, odd);
+    assert_eq!(received, ok);
+}
+
+#[test]
+fn plain_requests_to_a_forward_proxy_are_left_alone() {
+    let device_root = root("NetworkCore Test Device Root");
+    let engine = MitmEngine::new(&mitm_config(&device_root)).unwrap();
+    let target: SocketAddr = "192.0.2.23:3128".parse().unwrap();
+    assert_eq!(
+        engine.claim(
+            b"GET http://plain.example.test/ HTTP/1.1\r\nHost: plain.example.test\r\n\r\n",
+            target
+        ),
+        None
+    );
+    assert_eq!(
+        engine.claim(
+            b"OPTIONS * HTTP/1.1\r\nHost: plain.example.test\r\n\r\n",
+            target
+        ),
+        None
+    );
+    assert!(engine
+        .claim(
+            b"GET / HTTP/1.1\r\nHost: plain.example.test\r\n\r\n",
+            target
+        )
+        .is_some());
 }
 
 #[test]
@@ -727,6 +991,68 @@ hostname = api.example.test\n";
         dir.join("missing.js").display().to_string(),
     );
     assert!(MitmEngine::new(&missing).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A response script reads the request it answers (`$request.headers`) as
+/// the request rules left it.
+#[cfg(feature = "scripts")]
+#[tokio::test]
+async fn response_scripts_read_the_request_headers() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-mitm-request-scripts-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("echo.js");
+    std::fs::write(
+        &script,
+        "$done({ body: [$request.method, $request.headers['X-Token'], $request.headers['Cookie'],\
+         $request.headers['X-Added'], $response.body].join('|') });",
+    )
+    .unwrap();
+    let plugin = "#!name = Echo\n\
+[Rewrite]\n\
+^https://api\\.example\\.test/data header-add X-Added rule\n\
+\n\
+[Script]\n\
+http-response ^https://api\\.example\\.test/data script-path=https://scripts.example.test/echo.js, requires-body=true, tag=echo\n\
+\n\
+[MITM]\n\
+hostname = api.example.test\n";
+    let device_root = root("NetworkCore Test Device Root");
+    let origin_root = root("NetworkCore Test Origin Root");
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let config = MitmConfig {
+        policy: String::new(),
+        plugins: vec![plugin.to_string()],
+        ca_certificate: base64.encode(&device_root.certificate),
+        ca_private_key: base64.encode(x963(&device_root.key)),
+        script_assets: [(
+            "https://scripts.example.test/echo.js".to_string(),
+            script.display().to_string(),
+        )]
+        .into(),
+        resource_assets: Default::default(),
+        script_store_path: None,
+    };
+    let engine = Arc::new(
+        MitmEngine::new(&config)
+            .unwrap()
+            .with_upstream_config(trusting(&origin_root.certificate, &[b"http/1.1"])),
+    );
+    let (requests_tx, _requests) = mpsc::unbounded_channel();
+    let origin = Arc::new(Origin::new(&origin_root, requests_tx));
+
+    let (head, body) = exchange(
+        engine,
+        origin,
+        &device_root,
+        b"GET /data HTTP/1.1\r\nHost: api.example.test\r\nX-Token: abc\r\nCookie: a=1; b=2\r\n\r\n",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "GET|abc|a=1; b=2|rule|hello from origin");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

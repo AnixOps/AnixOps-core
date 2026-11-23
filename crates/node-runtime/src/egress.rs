@@ -26,10 +26,17 @@
 //! 1. the target the client asked for, when it is a name;
 //! 2. for an address target, the TLS SNI or HTTP `Host` of the first bytes
 //!    the client sends (waiting at most [`SNIFF_WAIT`] for them);
-//! 3. the name a DNS answer relayed through the node mapped the address to
-//!    ([`DomainCache`]).
+//! 3. the name the node's map (`Egress::domains`, a [`DomainCache`] filled
+//!    only by inbounds with their own resolver, through
+//!    [`DomainCache::record`]) gives the address; for UDP datagrams, then
+//!    the name a DNS answer relayed through the same UDP session gave it
+//!    (that session's own map; only a reply to a query the session sent,
+//!    matched by server, transaction id and question, is recorded).
 //!
-//! UDP datagrams use 1 and 3.
+//! TCP connections use 1, 2 and the node's map. UDP datagrams use 1, the
+//! node's map and then the session's map, so a session's own answers cannot
+//! rename an address the node already knows. Relayed DNS answers never reach
+//! the node's map, other UDP sessions or TCP connections.
 //!
 //! A route may list `fallbacks`: more relays, tried in order when the ones
 //! before fail to connect (for example Japan, then the US, then Germany).
@@ -71,7 +78,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::direct::CidrSet;
-use crate::domains::{normalize, DomainCache};
+use crate::domains::{normalize, DomainCache, PendingQueries};
 
 /// The default relay protocol; an empty `protocol` means it.
 pub const RELAY_PROTOCOL: &str = "shadowsocks";
@@ -526,7 +533,9 @@ pub(crate) fn blocked() -> io::Error {
 }
 
 /// The node's routes, block rules and address-to-name map, shared by every
-/// inbound.
+/// inbound. The map learns only from inbounds' own resolvers; DNS answers a
+/// client relays through the node go to that UDP session's own map
+/// (`SessionDns`), so no user can change how another user is routed.
 #[derive(Default)]
 pub struct Egress {
     table: RwLock<Arc<RouteTable>>,
@@ -539,8 +548,9 @@ impl Egress {
         Self::default()
     }
 
-    /// Addresses mapped to names; inbounds with their own resolver record
-    /// their answers here.
+    /// Addresses mapped to names for every user's routing; inbounds with
+    /// their own resolver record their answers here. Never record answers
+    /// from a resolver a user chose here.
     pub fn domains(&self) -> &DomainCache {
         &self.domains
     }
@@ -762,19 +772,69 @@ impl AsyncWrite for SniffStream {
     }
 }
 
+impl Router {
+    async fn bind_routed(&self) -> io::Result<RoutedUdp> {
+        let direct = self.base_udp.bind().await?;
+        let (replies, receiver) = mpsc::channel(256);
+        Ok(RoutedUdp {
+            direct,
+            egress: self.egress.clone(),
+            dns: Arc::new(SessionDns::default()),
+            flows: Mutex::new(HashMap::new()),
+            replies,
+            receiver: tokio::sync::Mutex::new(receiver),
+        })
+    }
+}
+
 impl UdpOutbound for Router {
     fn bind(&self) -> BoxFuture<'_, io::Result<Arc<dyn UdpSession>>> {
-        Box::pin(async move {
-            let direct = self.base_udp.bind().await?;
-            let (replies, receiver) = mpsc::channel(256);
-            Ok(Arc::new(RoutedUdp {
-                direct,
-                egress: self.egress.clone(),
-                flows: Mutex::new(HashMap::new()),
-                replies,
-                receiver: tokio::sync::Mutex::new(receiver),
-            }) as Arc<dyn UdpSession>)
-        })
+        Box::pin(async move { Ok(Arc::new(self.bind_routed().await?) as Arc<dyn UdpSession>) })
+    }
+}
+
+/// What one UDP session learned from the DNS answers relayed through it.
+/// The resolver is whichever server the client chose, so these mappings
+/// route this session's datagrams only; they never reach the node's map.
+struct SessionDns {
+    /// DNS queries this session relayed and still waits for.
+    pending: Mutex<PendingQueries>,
+    /// Addresses the session's own answers mapped to names.
+    domains: DomainCache,
+}
+
+impl SessionDns {
+    fn note_query(&self, message: &[u8], target: &TargetAddr) {
+        let server = match target {
+            TargetAddr::Ip(address) => Some(*address),
+            TargetAddr::Domain(..) => None,
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_query(message, server, Instant::now());
+    }
+
+    /// Records a DNS reply from `source` when it answers a query the
+    /// session relayed.
+    fn record_reply(&self, message: &[u8], source: SocketAddr) {
+        let answered = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take_reply(message, source, Instant::now());
+        if answered {
+            self.domains.record_response(message);
+        }
+    }
+}
+
+impl Default for SessionDns {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(PendingQueries::default()),
+            domains: DomainCache::for_session(),
+        }
     }
 }
 
@@ -787,10 +847,12 @@ struct RoutedFlow {
 }
 
 /// A client's UDP session: direct datagrams on one socket, routed ones on
-/// a relay flow per target. DNS replies are recorded on the way back.
+/// a relay flow per target. DNS replies to the session's own queries are
+/// recorded on the way back, in the session's own map.
 struct RoutedUdp {
     direct: Arc<dyn UdpSession>,
     egress: Arc<Egress>,
+    dns: Arc<SessionDns>,
     flows: Mutex<HashMap<TargetAddr, RoutedFlow>>,
     replies: mpsc::Sender<Reply>,
     receiver: tokio::sync::Mutex<mpsc::Receiver<Reply>>,
@@ -812,11 +874,11 @@ impl RoutedUdp {
         let source = reply_source(target).await;
         let (send, mut recv) = (flow.send, flow.recv);
         let replies = self.replies.clone();
-        let egress = self.egress.clone();
+        let dns = self.dns.clone();
         let reader = tokio::spawn(async move {
             while let Ok(payload) = recv.recv().await {
                 if source.port() == 53 {
-                    egress.domains.record_response(&payload);
+                    dns.record_reply(&payload, source);
                 }
                 if replies.send((payload, source)).await.is_err() {
                     return;
@@ -839,6 +901,22 @@ impl RoutedUdp {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<TargetAddr, RoutedFlow>> {
         self.flows.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The name a datagram to `target` is routed and blocked by: its own
+    /// name, else what the node's map (inbounds' own resolvers) and then
+    /// this session's map say the address was resolved from. The node's
+    /// map comes first, so a client's own resolver cannot rename an
+    /// address the node already knows to dodge a block rule.
+    fn host_for(&self, target: &TargetAddr) -> Option<String> {
+        match target {
+            TargetAddr::Domain(host, _) => normalize(host),
+            TargetAddr::Ip(address) => self
+                .egress
+                .domains
+                .lookup(address.ip())
+                .or_else(|| self.dns.domains.lookup(address.ip())),
+        }
     }
 }
 
@@ -863,12 +941,15 @@ impl UdpSession for RoutedUdp {
         target: &'a TargetAddr,
     ) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
+            if target.port() == 53 {
+                self.dns.note_query(payload, target);
+            }
             let table = self.egress.table();
             let blocks = self.egress.block_rules();
-            let host = match target {
-                _ if table.is_empty() && blocks.is_empty() => None,
-                TargetAddr::Domain(host, _) => normalize(host),
-                TargetAddr::Ip(address) => self.egress.domains.lookup(address.ip()),
+            let host = if table.is_empty() && blocks.is_empty() {
+                None
+            } else {
+                self.host_for(target)
             };
             if host.as_deref().is_some_and(|host| blocks.blocks_host(host)) {
                 return Err(blocked());
@@ -902,7 +983,7 @@ impl UdpSession for RoutedUdp {
                 Got::Direct(received) => {
                     let (n, source) = received?;
                     if source.port() == 53 {
-                        self.egress.domains.record_response(&buf[..n]);
+                        self.dns.record_reply(&buf[..n], source);
                     }
                     Ok((n, source))
                 }
@@ -1094,6 +1175,123 @@ mod tests {
             );
         }
         assert!(compile(&EgressConfig::default()).unwrap().is_empty());
+    }
+
+    /// A DNS message for `route.a.test` (id 0x4242): a query, or a reply
+    /// mapping 203.0.113.9 to the name.
+    fn dns_message(reply: bool) -> Vec<u8> {
+        let (flags, answers) = if reply {
+            ([0x81, 0x80], 1)
+        } else {
+            ([0x01, 0x00], 0)
+        };
+        let mut message = vec![0x42, 0x42, flags[0], flags[1], 0, 1, 0, answers, 0, 0, 0, 0];
+        for label in ["route", "a", "test"] {
+            message.push(label.len() as u8);
+            message.extend_from_slice(label.as_bytes());
+        }
+        message.extend_from_slice(&[0, 0, 1, 0, 1]);
+        if reply {
+            message.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+            message.extend_from_slice(&[203, 0, 113, 9]);
+        }
+        message
+    }
+
+    #[test]
+    fn records_only_dns_replies_to_the_sessions_own_queries() {
+        let query = dns_message(false);
+        let reply = dns_message(true);
+        let server: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let mapped: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let dns = SessionDns::default();
+
+        // A reply nobody asked for (or a spoofed one) is not recorded.
+        dns.record_reply(&reply, server);
+        assert!(dns.domains.lookup(mapped).is_none());
+
+        dns.note_query(&query, &TargetAddr::Ip(server));
+        // From another address it is still not the answer.
+        dns.record_reply(&reply, "198.51.100.1:53".parse().unwrap());
+        assert!(dns.domains.lookup(mapped).is_none());
+        dns.record_reply(&reply, server);
+        assert_eq!(dns.domains.lookup(mapped).as_deref(), Some("route.a.test"));
+    }
+
+    #[tokio::test]
+    async fn relayed_answers_route_only_the_session_that_asked() {
+        let egress = Arc::new(Egress::new());
+        egress.set_blocks(
+            compile_rules(&RulesConfig {
+                block_domains: vec!["route.a.test".into()],
+                ..RulesConfig::default()
+            })
+            .unwrap(),
+        );
+        let router = Router::new(
+            crate::NodeOutbound::direct(crate::DirectOutbound::new(true, Vec::new())),
+            egress.clone(),
+        );
+        let first = router.bind_routed().await.unwrap();
+        let second = router.bind_routed().await.unwrap();
+
+        // The first session's own resolver (whatever it answers) maps
+        // 203.0.113.9 to a blocked name.
+        let server: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        first
+            .dns
+            .note_query(&dns_message(false), &TargetAddr::Ip(server));
+        first.dns.record_reply(&dns_message(true), server);
+        let mapped: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let target = TargetAddr::Ip(SocketAddr::new(mapped, 443));
+
+        // That session is routed by its own answer ...
+        assert_eq!(first.host_for(&target).as_deref(), Some("route.a.test"));
+        let error = first.send_to(b"datagram", &target).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        // ... and nobody else is: neither another session nor the node's
+        // map, which every user's TCP and UDP routing reads.
+        assert!(second.host_for(&target).is_none());
+        assert!(egress.domains().lookup(mapped).is_none());
+        assert!(egress.domains().is_empty());
+
+        // What the node itself knows about an address comes first, so a
+        // session's own answers cannot rename it.
+        egress
+            .domains()
+            .record(mapped, "node.b.test", Duration::from_secs(60));
+        assert_eq!(first.host_for(&target).as_deref(), Some("node.b.test"));
+        assert_eq!(second.host_for(&target).as_deref(), Some("node.b.test"));
+    }
+
+    #[test]
+    fn a_session_flooding_its_map_evicts_nothing_elsewhere() {
+        use crate::domains::SESSION_MAX_ENTRIES;
+
+        let egress = Egress::new();
+        let flooding = SessionDns::default();
+        let other = SessionDns::default();
+        let ttl = Duration::from_secs(3600);
+        let node_address: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        let other_address: std::net::IpAddr = "198.51.100.2".parse().unwrap();
+        egress.domains().record(node_address, "node.a.test", ttl);
+        other.domains.record(other_address, "other.a.test", ttl);
+
+        for index in 0..4 * SESSION_MAX_ENTRIES as u32 {
+            let address = std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + index));
+            flooding.domains.record(address, "flood.a.test", ttl);
+        }
+        assert_eq!(flooding.domains.len(), SESSION_MAX_ENTRIES);
+        assert_eq!(egress.domains().len(), 1);
+        assert_eq!(
+            egress.domains().lookup(node_address).as_deref(),
+            Some("node.a.test")
+        );
+        assert_eq!(other.domains.len(), 1);
+        assert_eq!(
+            other.domains.lookup(other_address).as_deref(),
+            Some("other.a.test")
+        );
     }
 
     #[tokio::test]

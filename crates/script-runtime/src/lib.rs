@@ -33,8 +33,9 @@ pub use jsc::{JscScriptRuntime, MAX_STUCK_WORKERS};
 #[cfg(feature = "quickjs")]
 pub use quickjs::QuickJsScriptRuntime;
 pub use store::{
-    JsonFileScriptStore, MemoryScriptStore, ScriptStore, SCRIPT_STORE_MAX_KEY_BYTES,
-    SCRIPT_STORE_MAX_TOTAL_BYTES, SCRIPT_STORE_MAX_VALUE_BYTES,
+    open_script_store, JsonFileScriptStore, MemoryScriptStore, ScriptStore, ScriptStoreRecovery,
+    SCRIPT_STORE_MAX_KEY_BYTES, SCRIPT_STORE_MAX_TOTAL_BYTES, SCRIPT_STORE_MAX_VALUE_BYTES,
+    SCRIPT_STORE_QUARANTINE_SUFFIX,
 };
 
 use std::time::Duration;
@@ -132,6 +133,11 @@ pub struct ScriptInvocation {
     /// are then byte strings, one char (U+0000 to U+00FF) per byte; convert
     /// with [`binary_body_string`] and [`binary_body_bytes`].
     pub binary_body: bool,
+    /// Text mode only: the phase's body (the request body in the request
+    /// phase, the response body in the response phase) is not UTF-8 and is
+    /// passed as a byte string. The script then gets it only as Quantumult X
+    /// `bodyBytes`, with no text `body`.
+    pub body_is_bytes: bool,
     /// Event name for [`ScriptPhase::Event`] (`$event.name`), such as
     /// `network-changed`.
     pub event: Option<String>,
@@ -155,6 +161,7 @@ impl ScriptInvocation {
             request: ScriptRequest::default(),
             response: None,
             binary_body: false,
+            body_is_bytes: false,
             event,
             rule: None,
         }
@@ -169,13 +176,22 @@ impl ScriptInvocation {
         allow(dead_code)
     )]
     pub(crate) fn body_exceeds(&self, max_bytes: usize) -> bool {
-        let len = |body: Option<&str>| match body {
+        // A byte string holds one char per byte; text is counted in UTF-8.
+        let len = |body: Option<&str>, bytes: bool| match body {
             None => 0,
-            Some(body) if self.binary_body => body.chars().count(),
+            Some(body) if bytes => body.chars().count(),
             Some(body) => body.len(),
         };
-        len(self.request.body.as_deref()) > max_bytes
-            || len(self.response.as_ref().and_then(|r| r.body.as_deref())) > max_bytes
+        let phase_bytes =
+            |phase: ScriptPhase| self.binary_body || (self.body_is_bytes && self.phase == phase);
+        len(
+            self.request.body.as_deref(),
+            phase_bytes(ScriptPhase::Request),
+        ) > max_bytes
+            || len(
+                self.response.as_ref().and_then(|r| r.body.as_deref()),
+                phase_bytes(ScriptPhase::Response),
+            ) > max_bytes
     }
 }
 
@@ -233,6 +249,11 @@ pub struct ScriptMutation {
     /// Whether the connection matches (rule phase): `true` only when the
     /// script passed `matched: true`.
     pub matched: Option<bool>,
+    /// Outside binary-body-mode, `body` and `response.body` are byte strings
+    /// rather than text, because the script returned Quantumult X
+    /// `bodyBytes`. In binary-body-mode bodies are always byte strings and
+    /// this stays `false`.
+    pub binary_bodies: bool,
 }
 
 impl ScriptMutation {
@@ -326,15 +347,42 @@ impl ScriptOutcome {
     }
 }
 
+/// Redirects a `$httpClient` request follows at most before the last
+/// redirect is handed to the script as it is.
+pub const SCRIPT_HTTP_CLIENT_MAX_REDIRECTS: usize = 5;
+
 /// Request a script made through `$httpClient`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptHttpClientRequest {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// Text, or a byte string (one char per byte) when `body_binary`.
     pub body: Option<String>,
-    /// Never longer than the time left in the dispatch.
+    /// The script passed the body as bytes (`Uint8Array`, `ArrayBuffer`,
+    /// Quantumult X `bodyBytes`); send [`Self::body_bytes`].
+    pub body_binary: bool,
+    /// Surge `binary-mode`: the client returns the answer's body as a byte
+    /// string ([`binary_body_string`]) and the script gets a `Uint8Array`.
+    /// Otherwise the body is UTF-8 text.
+    pub binary_response: bool,
+    /// Follow redirects, up to [`SCRIPT_HTTP_CLIENT_MAX_REDIRECTS`]. On
+    /// unless the script set Surge `auto-redirect: false` or Quantumult X
+    /// `opts.redirection: false`.
+    pub follow_redirects: bool,
+    /// Never longer than the time left in the dispatch; redirects share it.
     pub timeout: Duration,
+}
+
+impl ScriptHttpClientRequest {
+    /// The body as it goes on the wire.
+    pub fn body_bytes(&self) -> Vec<u8> {
+        match self.body.as_deref() {
+            None => Vec::new(),
+            Some(body) if self.body_binary => binary_body_bytes(body).unwrap_or_default(),
+            Some(body) => body.as_bytes().to_vec(),
+        }
+    }
 }
 
 /// Network access for `$httpClient`. Implementations decide which hosts and

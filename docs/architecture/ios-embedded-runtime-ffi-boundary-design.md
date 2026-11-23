@@ -118,9 +118,9 @@ struct 必须采用 C-compatible layout，字段必须固定大小、对齐和 o
 | `set_block_quic` | `enabled` | `{"block_quic": bool}`；之后的新 UDP 流按新设置处理，已建立的流不变 |
 | `groups` | | `{"groups": [{"id", "type", "now", "members": [{"name", "latency_ms"}]}]}`，单出站配置为空列表 |
 | `select` | `group`、`member` | `{"now": member}`；只用于 select 组，未知组、非 select 组或非成员返回 `INVALID_ARGUMENT` |
-| `capture` | | `{"enabled", "max_total_bytes", "used_bytes", "connections"}` |
+| `capture` | | `{"enabled", "max_total_bytes", "used_bytes", "connections", "dropped_exchanges", "dropped_bodies"}`：后两项为上次清空以来因预算或每连接上限放掉的交换数、放掉正文的交换数 |
 | `set_capture` | `enabled`，可选 `max_total_bytes` | 同上；打开后新建的连接开始抓包，关闭后已抓到的保留 |
-| `clear_capture` | | 同上；清空已抓到的内容 |
+| `clear_capture` | | 同上；清空已抓到的内容，仍打开的连接之后的交换照常记录（交换下标接着往后编，不复用） |
 | `capture_connection` | `id` | `{"capture": {…} \| null}`：该连接抓到的字节块与 MITM 解密后的 HTTP 请求 / 响应 |
 | `capture_exchange` | `id`、`index`，可选 `since_message` | `{"exchange": {…} \| null}`：一个解密交换（含 `state`、`rules_skipped`）及 `since_message` 之后保留的流内消息（SSE 事件、WebSocket 消息） |
 | `capture_h2_frames` | `id`，可选 `since` | `{"h2_frames": {"seen", "dropped", "frames": […]} \| null}`：解密 `h2` 连接两条链路的帧头时间线（最近 512 帧） |
@@ -155,11 +155,19 @@ select 组选择只保留到 runtime 停止，客户端应把它们写回 profil
 新连接保留每个方向前 64 KiB 的应用负载（出站协议加密之前：明文协议是明文，HTTPS 是 TLS 记录；TCP 同方向连续的读写合并成一块，
 UDP 每个数据报一块，每条连接最多 512 块），连接列表里这类连接带 `"captured": true`。被 MITM 接管的连接不保留重新加密后的字节，
 改为保留解密后的 HTTP/1.1 请求（应用发出的原样）与响应（应用收到的），body 各保留前 64 KiB，每条连接最多 64 次交换，
-`note` 标出 `answered_locally`（改写规则直接应答）、`streaming`（升级或事件流，不留 body）、`too_large`（之后不再解密）。
-全部内容共用一个内存预算（缺省 2 MiB，`max_total_bytes` 可设 64 KiB–16 MiB），超出时先丢最早的连接，Network Extension
-不会因此超出内存上限。导出：`pcapng` 把每条连接写成 raw IP 上的合成 TCP（含三次握手与 FIN）或 UDP 流，客户端地址固定为
+`note` 标出 `answered_locally`（改写规则直接应答）、`streaming`（升级或事件流，不留 body）、`too_large`（之后不再解密）、
+`unparsed`（响应头读不懂，之后原样透传；或分帧冲突，回 502）、`busy`（同一 HTTP/2 连接持有的待改写正文已到上限，本条原样转发）。
+全部内容共用一个内存预算（缺省 2 MiB，`max_total_bytes` 可设 64 KiB–16 MiB），Network Extension 不会因此超出内存上限。
+单条连接最多占预算的一半：超出时先放掉它自己最早的已结束交换的正文（行保留，正文标 `truncated`），再放掉最早的已结束交换；
+原始字节超出份额的部分只计数不保留。整体超预算时依次丢弃：加载的会话连接、已关闭的连接（最早的先丢）、其他打开连接的正文，
+最后才是打开的连接本身；被丢弃或被清空的打开连接下一次有解密交换时重新开始记录，不会在余下的生命周期里被永久漏掉。
+每条连接超过 64 次交换时滚动丢弃最早的已结束交换；交换下标（`capture_requests` 的 `index`、`capture_exchange`、导出的
+`exchange`）在连接存续期间不变、不复用。`dropped_before_seq` 只覆盖真正连续丢掉的前缀，不会让客户端删掉仍保留的行。
+`load_capture` 加载的连接重新编号为 2^52 起，与本次运行的连接 id 不重叠，进行中的实时交换不会写进加载的数据。导出：`pcapng` 把每条连接写成 raw IP 上的合成 TCP（含三次握手与 FIN）或 UDP 流，客户端地址固定为
 `10.7.0.1` / `fd00::1`，域名目标从 `198.18.0.0/15` 取地址并写进名字解析块，Wireshark 可直接“追踪流”；MITM 连接里放的是解密后的
-HTTP 文本。`har` 是 HAR 1.2，只含 MITM 解密的 HTTP 交换。抓到的内容只在 `capture_connection` / `export_capture` 中返回，
+HTTP 文本：头部按写出的正文改写分帧（`Content-Length` 等于写出的字节数，原 `Content-Length` / `Transfer-Encoding` 改名为
+`X-AnixOps-Original-…`，正文只保留一部分时加 `X-AnixOps-Truncated: <写出>/<原长>` 并改名 `Content-Encoding`；HEAD、1xx、
+204、304 的头部不变），尚无响应的请求放在最后，抓包分析工具能逐条配对。`har` 是 HAR 1.2，只含 MITM 解密的 HTTP 交换。抓到的内容只在 `capture_connection` / `export_capture` 中返回，
 不写入 status、日志或错误。
 
 ## ABI Version Negotiation

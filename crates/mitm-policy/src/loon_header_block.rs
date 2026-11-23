@@ -17,6 +17,7 @@
 //! request elsewhere.
 
 use crate::loon_syntax::{quote, tokens};
+use crate::policy_cache::{PolicyCache, SharedEngine, POLICY_REVISIONS};
 use crate::{AnixOpsMitmPolicyEngine, MitmPolicyPhase};
 use control_domain::{
     DomainResult, HttpHeaderMutation, HttpHeaderMutationOperation, HttpMitmPhase, MetadataEntry,
@@ -105,11 +106,18 @@ pub fn apply_header_block(
     headers: &[MetadataEntry],
 ) -> DomainResult<Option<HeaderBlockOutcome>> {
     let response = phase == HttpMitmPhase::Response;
-    let rules = header_block_rules(source)
-        .into_iter()
-        .filter(|rule| rule.response == response)
-        .collect::<Vec<_>>();
-    let Some(rule) = first_matching(&rules, url)? else {
+    let compiled = COMPILED.get_or_build(source, CompiledHeaderBlock::build)?;
+    let rules = if response {
+        &compiled.response
+    } else {
+        &compiled.request
+    };
+    let Some(index) = rules.first_matching(url)? else {
+        return Ok(None);
+    };
+    // The rule's rewrite as a body rule over the block; `None` when the core
+    // refuses it.
+    let Some(rewriter) = &rules.rewriters[index] else {
         return Ok(None);
     };
     let (scheme, authority, path) = split_url(url);
@@ -132,27 +140,13 @@ pub fn apply_header_block(
     }
     block.push_str("\r\n");
 
-    let action = if response {
-        "response-body-replace-regex"
-    } else {
-        "request-body-replace-regex"
-    };
-    let config = format!(
-        "[Rewrite]\n{} {action} {} {}\n",
-        quote(&rule.url_pattern),
-        quote(&rule.regex),
-        quote(&rule.replacement)
-    );
-    let mut engine = AnixOpsMitmPolicyEngine::new()?;
-    if engine.load_config(&config).is_err() {
-        return Ok(None);
-    }
     let policy_phase = if response {
         MitmPolicyPhase::Response
     } else {
         MitmPolicyPhase::Request
     };
-    let (rewritten, chain) = engine.apply_body_chain(url, policy_phase, &block)?;
+    let (rewritten, chain) =
+        rewriter.with(|engine| engine.apply_body_chain(url, policy_phase, &block))?;
     if !chain.rewritten || chain.truncated || rewritten == block {
         return Ok(None);
     }
@@ -231,41 +225,122 @@ pub fn apply_header_block(
     Ok((!outcome.header_mutations.is_empty()).then_some(outcome))
 }
 
-/// The first rule whose URL pattern the core matches against `url`.
-fn first_matching(
-    rules: &[LoonHeaderBlockRule],
-    url: &str,
-) -> DomainResult<Option<LoonHeaderBlockRule>> {
-    if rules.is_empty() {
+/// The header-block rules of one policy, compiled once per policy revision.
+struct CompiledHeaderBlock {
+    request: CompiledRules,
+    response: CompiledRules,
+}
+
+/// Header-block rules of the policies in use, released with their policy
+/// ([`crate::CompiledPolicyRelease`]).
+static COMPILED: PolicyCache<CompiledHeaderBlock> = PolicyCache::new(POLICY_REVISIONS);
+
+/// Drops the compiled rules of a policy no longer in use.
+pub(crate) fn release(policy: crate::PolicyFingerprint) {
+    COMPILED.remove(policy);
+}
+
+impl CompiledHeaderBlock {
+    fn build(source: &str) -> DomainResult<Self> {
+        let (response, request): (Vec<_>, Vec<_>) = header_block_rules(source)
+            .into_iter()
+            .partition(|rule| rule.response);
+        Ok(Self {
+            request: CompiledRules::build(request)?,
+            response: CompiledRules::build(response)?,
+        })
+    }
+}
+
+/// Rules of one phase with their URL matchers and rewrites.
+struct CompiledRules {
+    rules: Vec<LoonHeaderBlockRule>,
+    /// All URL patterns in one engine; `None` when there are no rules or the
+    /// core refuses one of the patterns, which [`Self::singles`] then match.
+    matcher: Option<SharedEngine>,
+    /// One URL matcher per rule, used only without [`Self::matcher`]; `None`
+    /// for a pattern the core refuses.
+    singles: Vec<Option<SharedEngine>>,
+    /// Each rule's rewrite as a body rule over the block; `None` for one the
+    /// core refuses.
+    rewriters: Vec<Option<SharedEngine>>,
+}
+
+impl CompiledRules {
+    fn build(rules: Vec<LoonHeaderBlockRule>) -> DomainResult<Self> {
+        let mut compiled = Self {
+            rules: Vec::new(),
+            matcher: None,
+            singles: Vec::new(),
+            rewriters: Vec::new(),
+        };
+        if rules.is_empty() {
+            return Ok(compiled);
+        }
+        // One load for every pattern; the matched pattern names the rule.
+        let mut config = String::from("[Rewrite]\n");
+        for rule in &rules {
+            config.push_str(&quote(&rule.url_pattern));
+            config.push_str(" reject\n");
+        }
+        compiled.matcher = load(&config)?;
+        if compiled.matcher.is_none() {
+            // A pattern the core refuses fails the whole load: match them
+            // one by one.
+            for rule in &rules {
+                let config = format!("[Rewrite]\n{} reject\n", quote(&rule.url_pattern));
+                compiled.singles.push(load(&config)?);
+            }
+        }
+        for rule in &rules {
+            let action = if rule.response {
+                "response-body-replace-regex"
+            } else {
+                "request-body-replace-regex"
+            };
+            let config = format!(
+                "[Rewrite]\n{} {action} {} {}\n",
+                quote(&rule.url_pattern),
+                quote(&rule.regex),
+                quote(&rule.replacement)
+            );
+            compiled.rewriters.push(load(&config)?);
+        }
+        compiled.rules = rules;
+        Ok(compiled)
+    }
+
+    /// Index of the first rule whose URL pattern the core matches against
+    /// `url`.
+    fn first_matching(&self, url: &str) -> DomainResult<Option<usize>> {
+        if let Some(matcher) = &self.matcher {
+            let result = matcher
+                .with(|engine| engine.evaluate_url_rewrite(url, MitmPolicyPhase::Request))?;
+            return Ok(self.rules.iter().position(|rule| {
+                result.rule_index >= 0 && rule.url_pattern == result.matched_pattern
+            }));
+        }
+        for (index, single) in self.singles.iter().enumerate() {
+            let Some(single) = single else {
+                continue;
+            };
+            let result =
+                single.with(|engine| engine.evaluate_url_rewrite(url, MitmPolicyPhase::Request))?;
+            if result.rule_index >= 0 {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// An engine loaded with `config`; `None` when the core refuses it.
+fn load(config: &str) -> DomainResult<Option<SharedEngine>> {
+    let mut engine = AnixOpsMitmPolicyEngine::new()?;
+    if engine.load_config(config).is_err() {
         return Ok(None);
     }
-    // One load for every pattern; the matched pattern names the rule.
-    let mut config = String::from("[Rewrite]\n");
-    for rule in rules {
-        config.push_str(&quote(&rule.url_pattern));
-        config.push_str(" reject\n");
-    }
-    let mut engine = AnixOpsMitmPolicyEngine::new()?;
-    if engine.load_config(&config).is_ok() {
-        let result = engine.evaluate_url_rewrite(url, MitmPolicyPhase::Request)?;
-        return Ok(rules
-            .iter()
-            .find(|rule| result.rule_index >= 0 && rule.url_pattern == result.matched_pattern)
-            .cloned());
-    }
-    // A pattern the core refuses fails the whole load: try them one by one.
-    for rule in rules {
-        let config = format!("[Rewrite]\n{} reject\n", quote(&rule.url_pattern));
-        let mut engine = AnixOpsMitmPolicyEngine::new()?;
-        if engine.load_config(&config).is_err() {
-            continue;
-        }
-        let result = engine.evaluate_url_rewrite(url, MitmPolicyPhase::Request)?;
-        if result.rule_index >= 0 {
-            return Ok(Some(rule.clone()));
-        }
-    }
-    Ok(None)
+    Ok(Some(SharedEngine::new(engine)))
 }
 
 /// Scheme, authority and path (with query) of `url`.

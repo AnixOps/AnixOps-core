@@ -21,6 +21,8 @@ linux-trust-file-other-backends=blocked
 - apply 的写入或刷新失败必须恢复原文件并删除未完成 snapshot；rollback 的刷新失败必须恢复已应用内容并保留 snapshot。
 - rollback 必须比较当前 trust-file 与 snapshot 中的已应用内容，拒绝覆盖外部修改。
 - `update-ca-certificates` 是显式 Ubuntu-style adapter 的唯一刷新 runner；其他 trust backend 仍是 blocked capability。
+- 证书源逐块解析 PEM：只接受 `CERTIFICATE` 块；出现任何其他块（PKCS#8、RSA、EC、ENCRYPTED、OPENSSH 私钥，证书请求，参数等）或任何 `PRIVATE KEY` 字样时整体拒绝，不静默剥离，也不写 snapshot 或 trust-file。块外文字（如导出工具的 `Bag Attributes`）不写入 trust-file，写入的是规范化后的证书块。
+- trust-file 以显式权限 `0644` 写入（临时文件 `create_new`，不跟随符号链接，再原子改名）；snapshot 以 `0600` 新建。
 
 ## Source Anchors
 
@@ -36,4 +38,7 @@ linux-trust-file-other-backends=blocked
 - `trust_cli_handlers_reject_missing_paths_without_mutation`
 - `trust_apply_refreshes_and_rollback_restores_snapshot`
 - `trust_rollback_rejects_external_changes`
+- `trust_apply_rejects_any_non_certificate_pem_block_without_writing`
+- `trust_apply_installs_only_certificate_blocks`
+- `trust_apply_writes_world_readable_trust_file_and_private_snapshot`
 

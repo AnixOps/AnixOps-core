@@ -5,11 +5,19 @@
 //! The blocked ranges (`block_cidrs` of `PUT /v1/rules`) apply to every
 //! direct dial of the process, after a domain target is resolved: users'
 //! connections, relays served on this node and port-forward targets alike.
+//!
+//! A UDP session resolves each domain destination once, on its first
+//! datagram, and keeps that address for the rest of the session, so one
+//! flow keeps one server address and datagrams do not each wait for a
+//! system lookup; the private and blocked-range checks still run per
+//! datagram.
 
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use engine_inbound::udp::{UdpOutbound, UdpSession};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
@@ -229,11 +237,7 @@ impl UdpOutbound for DirectOutbound {
                     Err(_) => (UdpSocket::bind("0.0.0.0:0").await?, false),
                 },
             };
-            Ok(Arc::new(DirectUdp {
-                policy: self.clone(),
-                socket,
-                dual_stack,
-            }) as Arc<dyn UdpSession>)
+            Ok(Arc::new(DirectUdp::new(self.clone(), socket, dual_stack)) as Arc<dyn UdpSession>)
         })
     }
 }
@@ -252,19 +256,136 @@ fn dual_stack_socket() -> io::Result<UdpSocket> {
     UdpSocket::from_std(socket.into())
 }
 
+/// Domain destinations one UDP session pins at most; past this the oldest
+/// pin is dropped (and re-resolved if that destination is used again).
+const MAX_PINNED_DESTINATIONS: usize = 1024;
+/// How long a failed resolution is remembered before it is retried, so a
+/// burst of datagrams to an unresolvable name costs one lookup.
+const RESOLVE_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
+enum Pinned {
+    /// The address the flow's first datagram went to; every later datagram
+    /// of the session to the same name and port goes there too.
+    Address(SocketAddr),
+    /// The resolution failed; retried after the instant.
+    Failed(io::ErrorKind, String, Instant),
+}
+
+/// Domain destinations of one UDP session, each resolved once and kept for
+/// the session, so a flow (QUIC, games, voice) keeps one server address and
+/// datagrams do not each wait for a system lookup. Bounded, with FIFO
+/// eviction in O(1).
+#[derive(Default)]
+struct PinnedDestinations {
+    entries: HashMap<(String, u16), Pinned>,
+    order: VecDeque<(String, u16)>,
+}
+
+impl PinnedDestinations {
+    /// The pinned address, a remembered failure, or `None` to resolve.
+    fn get(&mut self, key: &(String, u16), now: Instant) -> Option<io::Result<SocketAddr>> {
+        match self.entries.get(key)? {
+            Pinned::Address(address) => Some(Ok(*address)),
+            Pinned::Failed(kind, message, until) if *until > now => {
+                Some(Err(io::Error::new(*kind, message.clone())))
+            }
+            Pinned::Failed(..) => None,
+        }
+    }
+
+    /// Records the outcome of a resolution. A destination another datagram
+    /// pinned meanwhile keeps its first address.
+    fn settle(
+        &mut self,
+        key: (String, u16),
+        outcome: &io::Result<SocketAddr>,
+        now: Instant,
+    ) -> io::Result<SocketAddr> {
+        if let Some(Pinned::Address(address)) = self.entries.get(&key) {
+            return Ok(*address);
+        }
+        let pinned = match outcome {
+            Ok(address) => Pinned::Address(*address),
+            Err(error) => Pinned::Failed(
+                error.kind(),
+                error.to_string(),
+                now + RESOLVE_FAILURE_BACKOFF,
+            ),
+        };
+        if self.entries.insert(key.clone(), pinned).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > MAX_PINNED_DESTINATIONS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        match outcome {
+            Ok(address) => Ok(*address),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 struct DirectUdp {
     policy: DirectOutbound,
     socket: UdpSocket,
     dual_stack: bool,
+    destinations: Mutex<PinnedDestinations>,
+    /// System lookups this session made, for tests and diagnostics.
+    resolutions: AtomicU64,
 }
 
 impl DirectUdp {
+    fn new(policy: DirectOutbound, socket: UdpSocket, dual_stack: bool) -> Self {
+        Self {
+            policy,
+            socket,
+            dual_stack,
+            destinations: Mutex::new(PinnedDestinations::default()),
+            resolutions: AtomicU64::new(0),
+        }
+    }
+
     /// Whether the socket can send to `address`.
     fn reaches(&self, address: &SocketAddr) -> bool {
         match self.policy.source {
             Some(_) => self.policy.reaches(address),
             None => self.dual_stack || address.is_ipv4(),
         }
+    }
+
+    fn pinned(&self) -> std::sync::MutexGuard<'_, PinnedDestinations> {
+        self.destinations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The address of a domain destination: resolved on the session's first
+    /// datagram to it and kept for the rest of the session. The private
+    /// and blocked-range checks still run on every datagram (the caller
+    /// does them), so a rules update applies to pinned flows too.
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<SocketAddr> {
+        let key = (host.to_ascii_lowercase(), port);
+        let known = self.pinned().get(&key, Instant::now());
+        if let Some(known) = known {
+            return known;
+        }
+        self.resolutions.fetch_add(1, Ordering::Relaxed);
+        let outcome = match tokio::net::lookup_host((host, port)).await {
+            Ok(mut addresses) => addresses
+                .find(|address| self.reaches(address))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "target has no usable address")
+                }),
+            Err(error) => Err(error),
+        };
+        self.pinned().settle(key, &outcome, Instant::now())
     }
 }
 
@@ -287,19 +408,7 @@ impl UdpSession for DirectUdp {
                     address
                 }
                 TargetAddr::Ip(address) => *address,
-                TargetAddr::Domain(host, port) => {
-                    let mut addresses = tokio::net::lookup_host((host.as_str(), *port)).await?;
-                    let mut chosen = None;
-                    for address in addresses.by_ref() {
-                        if self.reaches(&address) {
-                            chosen = Some(address);
-                            break;
-                        }
-                    }
-                    chosen.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "target has no usable address")
-                    })?
-                }
+                TargetAddr::Domain(host, port) => self.resolve(host, *port).await?,
             };
             if !self.policy.permits(target, address.ip()) {
                 return Err(io::Error::new(
@@ -410,6 +519,99 @@ mod tests {
         let (n, source) = open.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"ping");
         assert_eq!(source, echo_address);
+    }
+
+    #[tokio::test]
+    async fn udp_resolves_a_domain_destination_once_per_session() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let session = DirectUdp::new(
+            DirectOutbound::new(true, Vec::new()),
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            false,
+        );
+        let target = TargetAddr::Domain("LocalHost".into(), port);
+        for _ in 0..16 {
+            session.send_to(b"x", &target).await.unwrap();
+        }
+        let same = TargetAddr::Domain("localhost".into(), port);
+        session.send_to(b"x", &same).await.unwrap();
+        assert_eq!(session.resolutions.load(Ordering::Relaxed), 1);
+        let pinned = session
+            .pinned()
+            .get(&("localhost".into(), port), Instant::now());
+        assert_eq!(
+            pinned.unwrap().unwrap().ip(),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        let mut buf = [0u8; 8];
+        for _ in 0..17 {
+            echo.recv_from(&mut buf).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_remembers_a_failed_resolution_briefly() {
+        let session = DirectUdp::new(
+            DirectOutbound::new(true, Vec::new()),
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            false,
+        );
+        let target = TargetAddr::Domain("no-such-host.invalid".into(), 9);
+        assert!(session.send_to(b"x", &target).await.is_err());
+        assert!(session.send_to(b"x", &target).await.is_err());
+        assert_eq!(session.resolutions.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn udp_pinned_destination_still_obeys_the_private_filter() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let session = DirectUdp::new(
+            DirectOutbound::new(false, Vec::new()),
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            false,
+        );
+        let target = TargetAddr::Domain("localhost".into(), port);
+        for _ in 0..2 {
+            let error = session.send_to(b"x", &target).await.err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        assert_eq!(session.resolutions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pinned_destinations_are_bounded_first_in_first_out() {
+        let mut pinned = PinnedDestinations::default();
+        let now = Instant::now();
+        let address: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        for index in 0..MAX_PINNED_DESTINATIONS + 10 {
+            let key = (format!("host-{index}.test"), 443);
+            pinned.settle(key, &Ok(address), now).unwrap();
+        }
+        assert_eq!(pinned.len(), MAX_PINNED_DESTINATIONS);
+        assert!(pinned.get(&("host-0.test".into(), 443), now).is_none());
+        assert!(pinned
+            .get(
+                &(format!("host-{}.test", MAX_PINNED_DESTINATIONS + 9), 443),
+                now
+            )
+            .is_some());
+        // A pinned address is never replaced by a later resolution.
+        let other: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let key = (format!("host-{}.test", MAX_PINNED_DESTINATIONS + 9), 443);
+        assert_eq!(pinned.settle(key, &Ok(other), now).unwrap(), address);
+        // A failure expires and is resolved again.
+        let failed = ("down.test".to_string(), 53);
+        let error = Err(io::Error::new(io::ErrorKind::NotFound, "no address"));
+        assert!(pinned.settle(failed.clone(), &error, now).is_err());
+        assert!(pinned.get(&failed, now).unwrap().is_err());
+        assert!(pinned
+            .get(
+                &failed,
+                now + RESOLVE_FAILURE_BACKOFF + Duration::from_secs(1)
+            )
+            .is_none());
     }
 
     #[tokio::test]

@@ -1,0 +1,11 @@
+{
+  "invocation": {
+    "phase": "response",
+    "request": { "url": "https://api.example.test/v1/conf", "method": "GET" },
+    "response": { "status": 200, "body": "{\"n\":7,\"s\":\"é\"}" }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "body": "\u0010\u0007ÿ", "binaryBodies": true }
+  }
+}

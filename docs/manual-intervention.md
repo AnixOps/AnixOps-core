@@ -338,11 +338,12 @@ Before describing VLESS + REALITY as usable on iOS, the maintainer records here
 
 - 首批运维上线环境尚未提供：真实邮件/Telegram 接收渠道、第三方独立 Control 监控、跨地域节点和设备以及维护负责人。当前自动化只能运行测试适配器与代码 CI，不能证明这些真实环境门槛。维护负责人补齐渠道与部署范围后，记录投递/监控/网络/设备及回滚演练证据，再由 CI/CD 推进获准的灰度发布；真实地址与密钥仅放部署系统或密码库。
 - 节点内核的地址段拦截（`PUT /v1/rules` 的 `block_cidrs`、`GET /v1/rules/counters`、feature `block_cidrs`）需要重新发布：内核发布包必须从包含 `block_cidrs` 的 networkcore 版本重新构建。发布前出口节点开启“拒绝中国大陆目标”时，Agent 只记一条警告，不下发、不计数。
-- Windows TUN 模式（`platform-windows::tun` + `engine-outbound::protect`）只能在真机验收：CI 没有 Wintun 驱动和管理员网络栈。需要在 Windows 10/11 x64 上以管理员运行客户端，确认 Wintun 网卡 `AnixOps Net` 出现、`route print` 有 `0.0.0.0/1`、`128.0.0.0/1`（及 IPv6 `::/1`、`8000::/1`）走该网卡、浏览器与命令行流量经代理、代理服务器连接不回环（任务管理器无 CPU 飙升、连接可用）、断开后网卡与路由消失、默认路由仍在。已知限制：DNS 服务器在本地网段（如路由器 192.168.1.1）时 Windows 可能并发向物理网卡 DNS 查询。换网验收（需要客户端已接入 `WindowsTun::physical_interface_handle` 与 `on_physical_interface_change`）：TUN 开启后从 Wi-Fi 切到有线（插扩展坞后关 Wi-Fi）、再切到手机 USB 共享，以及先在纯 IPv4 网络开启、之后网络获得 IPv6，每次约 1～3 秒内浏览器与命令行流量恢复，不需要断开重连；`Get-NetTCPConnection` 中代理服务器连接的本地地址换到新网卡；拔掉所有网络时连接明确失败（不回环、CPU 不飙升），恢复网络后自动可用；睡眠唤醒后同样恢复。
+- Windows TUN 模式（`platform-windows::tun` + `engine-outbound::protect`）只能在真机验收：CI 没有 Wintun 驱动和管理员网络栈。需要在 Windows 10/11 x64 上以管理员运行客户端，确认 Wintun 网卡 `AnixOps Net` 出现、`route print` 有 `0.0.0.0/1`、`128.0.0.0/1`（及 IPv6 `::/1`、`8000::/1`）走该网卡、浏览器与命令行流量经代理、代理服务器连接不回环（任务管理器无 CPU 飙升、连接可用）、断开后网卡与路由消失、默认路由仍在。DNS 防泄漏验收：TUN 开启后 `Get-DnsClientServerAddress` 显示该网卡 IPv4 DNS `172.19.0.2`、IPv6 DNS `fdfe:dcba:9876::2`；`Resolve-DnsName example.com -Server <路由器或运营商 DNS>` 失败，`nslookup example.com`（走网卡 DNS）返回 Fake-IP 或经代理解析的结果；`netsh wfp show filters` 中有名为 `AnixOps Net DNS guard` 的过滤器；断开或结束客户端进程后过滤器消失、物理网卡 DNS 恢复可用；客户端界面在过滤器未能安装（`outside_dns_blocked() == false`）时有提示。换网验收（需要客户端已接入 `WindowsTun::physical_interface_handle` 与 `on_physical_interface_change`）：TUN 开启后从 Wi-Fi 切到有线（插扩展坞后关 Wi-Fi）、再切到手机 USB 共享，以及先在纯 IPv4 网络开启、之后网络获得 IPv6，每次约 1～3 秒内浏览器与命令行流量恢复，不需要断开重连；`Get-NetTCPConnection` 中代理服务器连接的本地地址换到新网卡；拔掉所有网络时连接明确失败（不回环、CPU 不飙升），恢复网络后自动可用；睡眠唤醒后同样恢复。
 - 24 h 长稳（`.github/workflows/soak.yml`，F7）需要一台本仓库可用的自托管 Linux runner：GitHub 托管 job 6 h 即被终止，所以每周定时只跑 5.5 h。本仓库是公开仓库，需在组织的 runner group 设置里允许公开仓库使用该 runner（或专门给一台隔离机器打标签，例如 `soak`），runner 用户需要免密 sudo 来创建 TUN 设备（`ip tuntap`）。准备好后手动触发 `Tunnel soak`：`runner=self-hosted`、`hours=24`、`runner_label=<标签>`。门槛：预热后 RSS 斜率 ≤ 1 MiB/h、连接失败率 ≤ 0.1%、结束后无残留 TCP 流和文件描述符。
 - 证书固定（`pinned_certificate_sha256` / `pinned_public_key_sha256`，见 `crates/engine-embedded/README.md`「Server certificates」）只对重新生成的出站生效：客户端（AnixOps/anixops-net）保存的出站 JSON 来自旧版导入，不带固定，升级内核后需要客户端重新导入订阅或在启动时用 node-import 重新生成出站，并升级客户端引用的内核版本。内核对“`insecure` 且没有固定”的出站只经 `tracing` 发一条警告，本仓库的可执行文件和客户端目前都没有安装 tracing subscriber，接入日志之前这条警告看不到；客户端最好在节点详情里也标出这类节点。
 - WireGuard 换网恢复（整机隧道与路由节点，`crates/outbound-wireguard/src/path.rs`）在 CI 里只用回环 UDP relay 模拟旧路径失效（`crates/engine-embedded/tests/wireguard_packets.rs`、`crates/outbound-wireguard/tests/loopback.rs`），真实的源地址失效（`EADDRNOTAVAIL`）、`IP_BOUND_IF` 换网卡和 IPv6-only/NAT64 网络只能真机确认。需要在 iOS 真机上让整机 WireGuard 隧道在 Wi-Fi 与蜂窝之间来回切换、锁屏休眠后唤醒，在 macOS 上切换 Wi-Fi、插拔网线、断网后恢复：隧道应在几秒内恢复，诊断日志记 `network change: reset 1 sessions, closed 0 connections in … ms`，不再出现 `engine has no network reset`。该项的执行与证据记录在客户端仓库的真机验收清单里。
 - 局域网共享的目标检查（`crates/engine-embedded/src/lan_guard.rs`）只覆盖经共享监听端口进来的流（`LanClients`、`LanDecrypting`）。尚未覆盖的后续项：macOS 包隧道充当局域网网关时（其他设备把本机设为网关）进入的流不带 `lan_peer` 标记，不受检查；分流到“服务器在本机”的节点（如本机 127.0.0.1:7890 上另一个代理程序）的流，可由该程序把回环目标直连出去，当前不检查节点自己的服务器地址；局域网设备的 DIRECT 域名在有 `dns` 段时只由该段解析，只有系统或局域网解析器知道的名字（mDNS `*.local`、路由器下发的 `nas.lan`、企业分离 DNS）对手机会解析失败。客户端升级内核引用后，客户端仓库 `docs/phone-debugging.md` 的「安全边界」需说明：手机经共享不能访问电脑的回环、本机各网卡地址（共享端口除外）和链路本地地址，以及可选的 `block_private_networks` 开关（如界面提供）。
+- HTTPS 解密的超大消息体（mitm-scripts-12 的剩余部分）：engine-embedded 在消息体超过 `MAX_BODY_BYTES` 时（`crates/engine-embedded/src/mitm/mod.rs` 的 `Body::TooLarge` 分支、`http2.rs` 的 `Collected::TooLarge`）仍把这条消息原样转发，不应用不需要正文的计划（URL 拒绝/重定向、header 规则、`requires-body=false` 的脚本），HTTP/1 连接上之后的请求也全部直通。修法：先用不带正文的计划处理头部与 URL 动作，正文按流式转发，连接继续走解密路径；需要补 HTTP/1 与 HTTP/2 的回归测试（超大正文 + URL 拒绝、header 改写、同一连接上的下一个请求仍被处理）。该项改动 engine-embedded 的转发路径，未在 fix/k5-mitm-policy 中实现。
 - NetworkCore 的首批诊断库不含宿主运行时事件接线。后续实现真实观察源、宿主认证身份和持久化发送适配后，需在 CI 中补 Agent/Control 的端到端验收，再安排环境演练。
 
 
@@ -405,6 +406,19 @@ run URL 和状态，以 `task_state: pending_ci`、`next_action: resume_after_ci
 - 刷新后的兜底（建议）：所选 id 不在新节点列表里时回退默认节点并提示用户“所选节点已不在订阅中，已改用 X”，不要静默切换；提示文案进三端字符串目录（简中、繁中、英文）。
 - 客户端测试：刷新时在列表开头插入节点、重排、改名后所选节点和策略组选择不变；旧 id 迁移测试。
 - 发布说明提示：节点 id 格式改变；更换服务器地址、端口、传输或 SNI 的节点会被当作新节点。
+
+## 客户端跟进：Windows 托管文件、系统代理与 TUN DNS（fix/k5-platform）
+
+客户端（AnixOps/anixops-net）按 git rev 固定 platform-windows，以下事项必须在客户端 PR 中完成：
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- `WindowsProxySnapshot` 新增 `winhttp_untouched`、`applied`、`connections`：客户端里手写该结构体的地方（如 `startup.rs` 的字面量）要补上字段；已保存的旧快照照常反序列化。
+- 托管文件：客户端读取 envelope、插件等托管目录下的文件改用 `platform_windows::managed_files::read_managed_file`；HTTPS 解密插件库（`write_library` 等）及其他“写 `.tmp` 再改名”的写入改用 `write_managed_file_atomic`；启动时对用到的托管子目录调用 `ensure_managed_directory`。托管配置里引用的 envelope、根证书与私钥路径必须在 `%ProgramData%\AnixOps` 内，否则 `read_managed_config` / `write_managed_config` 报错。
+- 系统代理：连接改用 `WindowsSystemIntegration::apply_system_proxy` / `restore_system_proxy`（按连接保存与恢复，含 PAC、自动检测与拨号/VPN 条目），不再调用 `apply_winhttp_proxy`；`apply_current_user_system_proxy` 只处理 LAN 平铺值，保留给旧路径。断开、恢复与 `uninstall --purge` 时对旧版本留下的 WinHTTP 残留调用 `restore_winhttp_proxy_if_unchanged`（只在仍是旧版写入的值时恢复，残留清为无代理）。
+- 连接后用 `read_current_user_effective_proxy` 与 `WindowsEffectiveProxy::routes_through` 判断浏览器是否真的经过本地代理；为假（自动配置脚本、自动检测或组策略 `per_machine_policy`）时提示用户并建议改用 TUN 模式。提示文案进三端字符串目录（简中、繁中、英文），不要把“已验证”状态建立在注册表值上。
+- TUN：`WindowsTunSettings` 新增 `dns6`、`block_outside_dns`（客户端用 `..Default::default()` 无需改动）；连接后读取 `WindowsTun::outside_dns_blocked()`，为假时显示 `outside_dns_block_error()` 的提示（文案进三端字符串目录）。
+- Tauri 退出（`RunEvent::Exit` / 关机）时先恢复系统代理、关闭 TUN，再退出进程；WFP 过滤器在进程退出时由系统移除，WinINet 设置不会自动恢复。
+- 发布说明提示：Windows 连接不再修改机器级 WinHTTP 代理；TUN 模式下显式查询局域网 DNS（如 `nslookup name 192.168.1.1`）会被阻止。
 
 ## 后续预计人工事项
 

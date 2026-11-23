@@ -24,6 +24,8 @@ Current status:
 
 `managed` owns the schema-versioned ProgramData configuration and state records.
 `system_integration` calls SCM, WinINet/WinHTTP, CryptoAPI, and NewDev directly
+(the system proxy is applied per WinINet connection; the machine-wide WinHTTP
+proxy is only read, see `docs/architecture/windows-platform-integration.md`)
 and exposes apply, status, rollback, and uninstall operations.
 
 The installed default configuration is intentionally inert: all optional
@@ -40,9 +42,21 @@ with `networkcore-windows-gui.exe --debug` (the GUI and service live in
 `wintun.dll` next to its executable and passes that absolute path to
 `WindowsTun::open`; the DLL is never loaded from the search path. The adapter
 gets `172.19.0.1/30` (DNS `172.19.0.2`, answered by the tunnel) and
-`fdfe:dcba:9876::1/126`, and the capture routes `0.0.0.0/1`, `128.0.0.0/1`,
-`::/1` and `8000::/1`. Closing the adapter removes its address and routes, so
-the physical default route is never touched.
+`fdfe:dcba:9876::1/126` (DNS `fdfe:dcba:9876::2`, `dns6`), and the capture
+routes `0.0.0.0/1`, `128.0.0.0/1`, `::/1` and `8000::/1`. Closing the adapter
+removes its address and routes, so the physical default route is never
+touched.
+
+With `block_outside_dns` (the default) the adapter also opens a Windows
+Filtering Platform dynamic session (`dns_guard`): at the connect layers of
+both families it permits remote port 53 through the adapter, from this
+process (the engine's own upstream queries through the physical interface)
+and on loopback, and blocks it everywhere else, so the physical network's
+resolver neither sees the names nor races the tunnel's answer. The filters
+are removed before the adapter closes and, being dynamic, also when the
+process dies. Installing them is best effort: `WindowsTun::outside_dns_blocked`
+and `outside_dns_block_error` tell the host whether they are in place.
+Explicit queries to a resolver on the local network are blocked too.
 
 The physical interface of each family is recorded before the routes go in.
 The host installs an `engine_outbound::protect` socket protector that calls

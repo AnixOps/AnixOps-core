@@ -1,6 +1,9 @@
 //! Windows platform integration for NetworkCore clients and managed runtime hosts.
 
+#[cfg(windows)]
+mod dns_guard;
 pub mod managed;
+pub mod managed_files;
 pub mod mitm_security;
 pub mod system_integration;
 mod trusted_command;

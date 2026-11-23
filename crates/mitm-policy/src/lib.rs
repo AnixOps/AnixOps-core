@@ -12,13 +12,15 @@ pub mod loon_map_local;
 pub mod loon_plugin;
 mod loon_syntax;
 pub mod managed_sdwan;
+mod policy_cache;
 
 use control_domain::{
     AuditDecision, AuditEvent, CertificateTrustState, Diagnostic, DiagnosticSeverity, DomainError,
     DomainResult, GrantedPermissions, HookPoint, HttpBodyMutation, HttpEvent, HttpHeaderMutation,
     HttpHeaderMutationOperation, HttpMitmAction, HttpMitmEvent, HttpMitmOutcome, HttpMitmPhase,
-    HttpMitmScriptDispatch, HttpMitmScriptKind, MitmHostnameDecision, MitmPluginService,
-    PluginInstance, PluginManifest, PluginPackage, PluginPermission, PluginResult,
+    HttpMitmScriptDispatch, HttpMitmScriptKind, MetadataEntry, MitmHostnameDecision,
+    MitmPluginService, PluginInstance, PluginManifest, PluginPackage, PluginPermission,
+    PluginResult,
 };
 use mitm_anixops_sys as sys;
 use std::cell::Cell;
@@ -27,6 +29,8 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 pub const SOURCE_MITM_POLICY: &str = "mitm.policy";
 
@@ -54,6 +58,26 @@ pub const MITM_POLICY_HTTP_EVENT_MUTATION_DEFERRED_CODE: &str =
     "mitm.policy.http_event.mutation_deferred";
 pub const MITM_POLICY_HTTP_EVENT_SOURCE_MISSING_CODE: &str =
     "mitm.policy.http_event.source_missing";
+/// Body rules matched a body that is not NUL-free UTF-8 text (protobuf,
+/// gRPC, images): they are skipped, every other part of the plan stands.
+pub const MITM_POLICY_HTTP_EVENT_BINARY_BODY_SKIPPED_CODE: &str =
+    "mitm.policy.http_event.binary_body_rules_skipped";
+/// The body rewrite chain could not be applied whole and was skipped.
+pub const MITM_POLICY_HTTP_EVENT_BODY_REWRITE_SKIPPED_CODE: &str =
+    "mitm.policy.http_event.body_rewrite_skipped";
+/// More body rules matched than the core records; jq steps past the
+/// recorded ones did not run.
+pub const MITM_POLICY_HTTP_EVENT_BODY_REWRITE_RECORDS_CAPPED_CODE: &str =
+    "mitm.policy.http_event.body_rewrite_records_capped";
+/// A `header-replace-regex` rule left a header value as it was because the
+/// core could not rewrite it (the result exceeds its value limit, or the
+/// value holds a NUL byte).
+pub const MITM_POLICY_HTTP_EVENT_HEADER_REGEX_SKIPPED_CODE: &str =
+    "mitm.policy.http_event.header_regex_skipped";
+/// More header rules matched than the core plans at once; the rest did not
+/// apply.
+pub const MITM_POLICY_HTTP_EVENT_HEADER_REWRITES_CAPPED_CODE: &str =
+    "mitm.policy.http_event.header_rewrites_capped";
 pub const MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_MESSAGE: &str = concat!(
     "mitm_anixops policy produced an HTTP mutation plan; applying it still requires ",
     "NetworkCore HTTP/TLS data plane integration",
@@ -127,6 +151,55 @@ pub enum MitmPolicyHeaderOperation {
     Replace,
     Delete,
     Set,
+    /// `header-replace-regex` / `response-header-replace-regex`: the
+    /// replacement applies to each current value of the header. A plan made
+    /// without those values carries the unexpanded template, which must
+    /// never be written as the header's value.
+    ReplaceRegex,
+}
+
+/// What a reject rule answers with. Plugins pick a variant so the app can
+/// parse the answer: `reject-dict` and `reject-array` exist so a config or
+/// list request still yields valid (empty) JSON, `reject-img` so an image
+/// slot still gets an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MitmPolicyRejectBody {
+    /// No body: `reject`, `reject-200`, `reject-<status>`, and every action
+    /// that is not a reject.
+    Empty,
+    /// `reject-img` / `reject-tinygif`: a 1x1 transparent GIF.
+    TinyGif,
+    /// `reject-video`: an empty `video/mp4` body.
+    Video,
+    /// `reject-dict`: the JSON object `{}`.
+    JsonObject,
+    /// `reject-array`: the JSON array `[]`.
+    JsonArray,
+}
+
+impl MitmPolicyRejectBody {
+    fn from_sys(action: sys::AnixOpsRewriteAction) -> Self {
+        match action {
+            sys::AnixOpsRewriteAction::RejectImg => Self::TinyGif,
+            sys::AnixOpsRewriteAction::RejectVideo => Self::Video,
+            sys::AnixOpsRewriteAction::RejectDict => Self::JsonObject,
+            sys::AnixOpsRewriteAction::RejectArray => Self::JsonArray,
+            _ => Self::Empty,
+        }
+    }
+
+    /// The `Content-Type` and body of the answer; `None` for no body.
+    pub fn content(self) -> Option<(&'static str, &'static [u8])> {
+        let json = "application/json; charset=utf-8";
+        let content: (&'static str, &'static [u8]) = match self {
+            Self::Empty => return None,
+            Self::TinyGif => ("image/gif", loon_map_local::TINY_GIF.as_slice()),
+            Self::Video => ("video/mp4", b"".as_slice()),
+            Self::JsonObject => (json, b"{}".as_slice()),
+            Self::JsonArray => (json, b"[]".as_slice()),
+        };
+        Some(content)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +210,8 @@ pub struct MitmPolicyRewriteResult {
     pub matched_pattern: String,
     pub value: String,
     pub message: String,
+    /// For [`MitmPolicyRewriteAction::Reject`], the answer's body.
+    pub reject_body: MitmPolicyRejectBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +280,33 @@ pub struct MitmPolicyRewritePlan {
     pub script: MitmPolicyScriptDispatch,
 }
 
+/// Result of [`AnixOpsMitmPolicyEngine::apply_body_chain_whole`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MitmPolicyBodyChainOutcome {
+    /// Every matching rule applied to `body`. `records_capped` when more
+    /// rules matched than `chain` records (see [`sys::ANIXOPS_BODY_CHAIN_CAP`]).
+    Applied {
+        body: String,
+        chain: MitmPolicyBodyRewriteChain,
+        records_capped: bool,
+    },
+    /// The chain could not run whole, so none of it applies; `reason` says why.
+    Skipped {
+        chain: MitmPolicyBodyRewriteChain,
+        reason: &'static str,
+    },
+}
+
+/// Largest body a rewrite chain may grow to. The output buffer starts at the
+/// body's size plus the core's value capacity and doubles up to this.
+pub const MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Messages the core writes into rewrite results.
+const CORE_HEADER_REWRITTEN: &str = "header rewritten";
+const CORE_HEADER_REGEX_NOT_MATCHED: &str = "header regex not matched";
+const CORE_BODY_TRUNCATED: &str = "body truncated";
+const CORE_REPLACEMENT_TRUNCATED: &str = "replacement truncated";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MitmPolicyLastError {
     status: c_int,
@@ -234,6 +336,7 @@ impl AnixOpsMitmPolicyEngine {
     }
 
     pub fn load_config(&mut self, config_text: &str) -> DomainResult<MitmPolicyLoadReport> {
+        POLICY_LOADS.with(|loads| loads.set(loads.get() + 1));
         let config = CString::new(config_text).map_err(|_| {
             DomainError::new(
                 MITM_POLICY_INPUT_NUL_BYTE_CODE,
@@ -395,15 +498,100 @@ impl AnixOpsMitmPolicyEngine {
         Ok(rewrite_result_from_sys(&out))
     }
 
+    /// Runs every body rule matching `url` on `body`. The output buffer holds
+    /// the body plus [`sys::ANIXOPS_VALUE_CAP`] bytes; a chain that grows the
+    /// body further, or matches more than [`sys::ANIXOPS_BODY_CHAIN_CAP`]
+    /// rules, comes back `truncated` (see [`Self::apply_body_chain_whole`]).
     pub fn apply_body_chain(
         &self,
         url: &str,
         phase: MitmPolicyPhase,
         body: &str,
     ) -> DomainResult<(String, MitmPolicyBodyRewriteChain)> {
+        self.apply_body_chain_with_capacity(
+            url,
+            phase,
+            body,
+            body.len().saturating_add(sys::ANIXOPS_VALUE_CAP),
+        )
+    }
+
+    /// [`Self::apply_body_chain`] that tells apart the two reasons the core
+    /// reports `truncated`, since it sets the same flag for both:
+    ///
+    /// - A rule's output did not fit the buffer. The core then carries a cut
+    ///   body on to the next rule, so the chain is run again with a buffer
+    ///   twice as large, up to [`MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES`].
+    /// - More rules matched than the result records. The body itself is
+    ///   whole: once two runs with different buffers produce the same body
+    ///   and no recorded rule reports a cut, it is used as it is.
+    ///
+    /// A chain that still does not fit is [`MitmPolicyBodyChainOutcome::Skipped`]
+    /// as a whole, never applied cut short.
+    pub fn apply_body_chain_whole(
+        &self,
+        url: &str,
+        phase: MitmPolicyPhase,
+        body: &str,
+    ) -> DomainResult<MitmPolicyBodyChainOutcome> {
+        let mut capacity = body.len().saturating_add(sys::ANIXOPS_VALUE_CAP);
+        let mut previous: Option<String> = None;
+        loop {
+            let (out, chain) = self.apply_body_chain_with_capacity(url, phase, body, capacity)?;
+            if !chain.truncated {
+                return Ok(MitmPolicyBodyChainOutcome::Applied {
+                    body: out,
+                    chain,
+                    records_capped: false,
+                });
+            }
+            // A mock body is cut to the core's value capacity whatever the
+            // buffer: a larger one cannot help.
+            if chain
+                .rewrites
+                .iter()
+                .any(|rewrite| rewrite.message == CORE_REPLACEMENT_TRUNCATED)
+            {
+                return Ok(MitmPolicyBodyChainOutcome::Skipped {
+                    chain,
+                    reason: "a mock body exceeds the policy core's value capacity",
+                });
+            }
+            let records_full = chain.rewrites.len() >= sys::ANIXOPS_BODY_CHAIN_CAP;
+            let recorded_cut = chain
+                .rewrites
+                .iter()
+                .any(|rewrite| rewrite.message == CORE_BODY_TRUNCATED);
+            if records_full && !recorded_cut && previous.as_deref() == Some(out.as_str()) {
+                return Ok(MitmPolicyBodyChainOutcome::Applied {
+                    body: out,
+                    chain,
+                    records_capped: true,
+                });
+            }
+            if capacity >= MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES {
+                return Ok(MitmPolicyBodyChainOutcome::Skipped {
+                    chain,
+                    reason: "the rewritten body exceeds the body rewrite output limit",
+                });
+            }
+            previous = records_full.then_some(out);
+            capacity = capacity
+                .saturating_mul(2)
+                .min(MITM_POLICY_BODY_REWRITE_MAX_OUTPUT_BYTES);
+        }
+    }
+
+    fn apply_body_chain_with_capacity(
+        &self,
+        url: &str,
+        phase: MitmPolicyPhase,
+        body: &str,
+        capacity: usize,
+    ) -> DomainResult<(String, MitmPolicyBodyRewriteChain)> {
         let url = c_string(url, "mitm URL contains an unsupported nul byte")?;
         let body = c_string(body, "mitm body contains an unsupported nul byte")?;
-        let mut out_body = vec![0 as c_char; body.as_bytes().len() + sys::ANIXOPS_VALUE_CAP];
+        let mut out_body = vec![0 as c_char; capacity.max(1)];
         let mut out_chain = empty_body_rewrite_chain();
         let status = unsafe {
             sys::anixops_rewrite_apply_body_chain(
@@ -672,6 +860,10 @@ impl From<sys::AnixOpsRewriteAction> for MitmPolicyRewriteAction {
             | sys::AnixOpsRewriteAction::ResponseHeaderAdd
             | sys::AnixOpsRewriteAction::ResponseHeaderReplaceRegex
             | sys::AnixOpsRewriteAction::HeaderDel => Self::HeaderMutation,
+            // A transparent URL rewrite has no outcome in the data plane, and
+            // the importer grades the line unsupported: the message continues
+            // unchanged. It must never become a redirect with status 200.
+            sys::AnixOpsRewriteAction::UrlRewrite200 => Self::Other,
         }
     }
 }
@@ -686,13 +878,148 @@ impl From<sys::AnixOpsScriptKind> for MitmPolicyScriptKind {
     }
 }
 
+thread_local! {
+    static POLICY_LOADS: Cell<u64> = const { Cell::new(0) };
+    static ENGINE_WAIT_ALLOWED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How many times this thread has loaded text into an engine
+/// ([`AnixOpsMitmPolicyEngine::load_config`]); tests use it to check that a
+/// policy is compiled once per revision, not once per message or host.
+#[doc(hidden)]
+pub fn policy_loads_on_this_thread() -> u64 {
+    POLICY_LOADS.with(Cell::get)
+}
+
+/// Engines loaded for planning ([`MitmPluginService::handle_http_mitm_event`]
+/// and [`AnixOpsMitmPluginService::needs_body`]) by every thread of the
+/// process, pooled or not; tests use it to check that parallel planning
+/// loads a policy at most [`engines_per_revision`] times.
+static PLANNING_ENGINE_LOADS: AtomicU64 = AtomicU64::new(0);
+
+/// Planning engines loaded by the whole process ([`PLANNING_ENGINE_LOADS`]).
+#[doc(hidden)]
+pub fn planning_engine_loads() -> u64 {
+    PLANNING_ENGINE_LOADS.load(Ordering::Relaxed)
+}
+
+/// Runs `f`, in which planning on this thread may wait for a loaded engine
+/// of its policy instead of loading another one.
+///
+/// A revision has at most [`engines_per_revision`] planning engines, leased
+/// or idle. When they are all leased, planning in `f` waits until one comes
+/// back; planning elsewhere loads an engine for the one message instead, so
+/// an async runtime thread never blocks. The data plane runs scripted plans
+/// on its blocking pool inside this, since a page loading many resources at
+/// once would otherwise load a multi-megabyte policy once per parallel
+/// request. Leases are held only while one message is planned (scripts run
+/// after the plan), so a wait is short and cannot deadlock.
+pub fn plan_waiting_for_engines<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ENGINE_WAIT_ALLOWED.with(|allowed| allowed.set(self.0));
+        }
+    }
+    let _restore = Restore(ENGINE_WAIT_ALLOWED.with(|allowed| allowed.replace(true)));
+    f()
+}
+
 /// Loaded engines kept between HTTP events. Loading a policy parses it and
 /// compiles every rule, far more work than planning one message, and a
 /// policy with large plugins runs to megabytes.
-static ENGINE_POOL: std::sync::Mutex<Vec<PooledEngine>> = std::sync::Mutex::new(Vec::new());
-/// Idle engines kept; more run at once when messages are planned in
-/// parallel, and the extra ones are dropped afterwards.
-const ENGINE_POOL_MAX_IDLE: usize = 2;
+static ENGINE_POOL: Mutex<EnginePool> = Mutex::new(EnginePool {
+    idle: Vec::new(),
+    live: Vec::new(),
+});
+/// Signalled whenever an engine goes back to [`ENGINE_POOL`] or a counted
+/// engine is freed, for planning that waits ([`plan_waiting_for_engines`]).
+static ENGINE_RETURNED: Condvar = Condvar::new();
+/// Idle engines kept, of all revisions together. Engines of the current
+/// policy are kept before those of an older one.
+const ENGINE_POOL_MAX_IDLE: usize = 4;
+/// Planning engines one revision may have, leased or idle, when its policy
+/// is small.
+const ENGINE_POOL_MAX_PER_REVISION: usize = 4;
+/// Policy text the planning engines of one revision may hold together, and
+/// the idle engines of all revisions (one engine at least). A loaded
+/// engine's memory grows with its policy, so a large policy gets fewer
+/// engines and a memory-limited extension does not hold several compiled
+/// copies of a multi-megabyte policy.
+const ENGINE_POOL_POLICY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Planning engines a revision may have, leased or idle: as many as fit in
+/// [`ENGINE_POOL_POLICY_BYTES`], one at least and
+/// [`ENGINE_POOL_MAX_PER_REVISION`] at most.
+fn engines_per_revision(policy: PolicyFingerprint) -> usize {
+    (ENGINE_POOL_POLICY_BYTES / policy.bytes().max(1)).clamp(1, ENGINE_POOL_MAX_PER_REVISION)
+}
+
+struct EnginePool {
+    idle: Vec<PooledEngine>,
+    /// Counted engines per revision, leased or idle. A revision is listed
+    /// only while it has one.
+    live: Vec<(PolicyFingerprint, usize)>,
+}
+
+impl EnginePool {
+    fn live(&self, policy: PolicyFingerprint) -> usize {
+        self.live
+            .iter()
+            .find(|(key, _)| *key == policy)
+            .map_or(0, |(_, count)| *count)
+    }
+
+    fn add_live(&mut self, policy: PolicyFingerprint) {
+        match self.live.iter_mut().find(|(key, _)| *key == policy) {
+            Some((_, count)) => *count += 1,
+            None => self.live.push((policy, 1)),
+        }
+    }
+
+    fn remove_live(&mut self, policy: PolicyFingerprint) {
+        if let Some(index) = self.live.iter().position(|(key, _)| *key == policy) {
+            self.live[index].1 -= 1;
+            if self.live[index].1 == 0 {
+                self.live.remove(index);
+            }
+        }
+    }
+
+    /// Whether the idle engines exceed [`ENGINE_POOL_MAX_IDLE`] or, two or
+    /// more of them, [`ENGINE_POOL_POLICY_BYTES`].
+    fn idle_over_budget(&self) -> bool {
+        self.idle.len() > ENGINE_POOL_MAX_IDLE
+            || (self.idle.len() > 1
+                && self
+                    .idle
+                    .iter()
+                    .map(|entry| entry.policy.bytes())
+                    .sum::<usize>()
+                    > ENGINE_POOL_POLICY_BYTES)
+    }
+
+    /// Takes the idle engines matching `release` out of the pool; they are
+    /// no longer counted.
+    fn take_idle(&mut self, release: impl Fn(&PooledEngine) -> bool) -> Vec<PooledEngine> {
+        let (released, kept) = std::mem::take(&mut self.idle)
+            .into_iter()
+            .partition::<Vec<_>, _>(|entry| release(entry));
+        self.idle = kept;
+        for entry in &released {
+            self.remove_live(entry.policy);
+        }
+        released
+    }
+}
+
+fn lock_engine_pool() -> MutexGuard<'static, EnginePool> {
+    // Nothing panics while the pool is locked; a poisoned lock still holds
+    // a consistent pool.
+    ENGINE_POOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Policies up to this size are hashed whole; larger ones by samples, so a
 /// multi-megabyte policy costs little per message. The embedded data plane
@@ -726,6 +1053,11 @@ impl PolicyFingerprint {
         }
         Self(bytes.len(), hasher.finish())
     }
+
+    /// The policy's length in bytes.
+    fn bytes(self) -> usize {
+        self.0
+    }
 }
 
 struct PooledEngine {
@@ -738,33 +1070,83 @@ struct PooledEngine {
 // pool hands each engine to one thread at a time.
 unsafe impl Send for PooledEngine {}
 
+/// How [`EngineLease::acquire`] gets an engine when its revision already
+/// has [`engines_per_revision`] engines and none is idle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WhenAtLimit {
+    /// Wait until one comes back ([`plan_waiting_for_engines`]).
+    Wait,
+    /// Load one for this message only; it is not pooled.
+    LoadUnpooled,
+    /// Get none ([`EngineLease::acquire`] answers `None`).
+    GiveUp,
+}
+
 /// An engine loaded with one policy, taken from the pool or loaded fresh.
 /// It goes back to the pool only after [`EngineLease::keep`], so an engine
 /// that saw an error is never reused.
 struct EngineLease {
-    pooled: Option<PooledEngine>,
+    policy: PolicyFingerprint,
+    /// Counted in the pool's `live` until dropped.
+    counted: bool,
+    engine: Option<AnixOpsMitmPolicyEngine>,
     keep: bool,
 }
 
 impl EngineLease {
-    fn acquire(source: &str) -> DomainResult<Self> {
+    /// An engine for planning `source` on this thread, waiting for one only
+    /// inside [`plan_waiting_for_engines`].
+    fn for_planning(source: &str) -> DomainResult<Self> {
+        let at_limit = if ENGINE_WAIT_ALLOWED.with(Cell::get) {
+            WhenAtLimit::Wait
+        } else {
+            WhenAtLimit::LoadUnpooled
+        };
+        Ok(Self::acquire(source, at_limit)?.expect("only GiveUp answers None"))
+    }
+
+    fn acquire(source: &str, at_limit: WhenAtLimit) -> DomainResult<Option<Self>> {
         let policy = PolicyFingerprint::of(source);
-        let pooled = ENGINE_POOL.lock().ok().and_then(|mut pool| {
-            let index = pool.iter().rposition(|entry| entry.policy == policy)?;
-            Some(pool.remove(index))
-        });
-        let pooled = match pooled {
-            Some(pooled) => pooled,
-            None => {
-                let mut engine = AnixOpsMitmPolicyEngine::new()?;
-                engine.load_config(source)?;
-                PooledEngine { policy, engine }
+        let limit = engines_per_revision(policy);
+        let mut pool = lock_engine_pool();
+        let counted = loop {
+            if let Some(index) = pool.idle.iter().rposition(|entry| entry.policy == policy) {
+                let pooled = pool.idle.remove(index);
+                return Ok(Some(Self {
+                    policy,
+                    counted: true,
+                    engine: Some(pooled.engine),
+                    keep: false,
+                }));
+            }
+            if pool.live(policy) < limit {
+                pool.add_live(policy);
+                break true;
+            }
+            match at_limit {
+                WhenAtLimit::Wait => {
+                    pool = ENGINE_RETURNED
+                        .wait(pool)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                WhenAtLimit::LoadUnpooled => break false,
+                WhenAtLimit::GiveUp => return Ok(None),
             }
         };
-        Ok(Self {
-            pooled: Some(pooled),
+        drop(pool);
+        // Counted from here on: a failed load drops the lease, which frees
+        // the place for the next caller.
+        let mut lease = Self {
+            policy,
+            counted,
+            engine: None,
             keep: false,
-        })
+        };
+        PLANNING_ENGINE_LOADS.fetch_add(1, Ordering::Relaxed);
+        let mut engine = AnixOpsMitmPolicyEngine::new()?;
+        engine.load_config(source)?;
+        lease.engine = Some(engine);
+        Ok(Some(lease))
     }
 
     fn keep(&mut self) {
@@ -776,36 +1158,143 @@ impl std::ops::Deref for EngineLease {
     type Target = AnixOpsMitmPolicyEngine;
 
     fn deref(&self) -> &Self::Target {
-        &self
-            .pooled
-            .as_ref()
-            .expect("a lease holds its engine")
-            .engine
+        self.engine.as_ref().expect("a lease holds its engine")
     }
 }
 
 impl std::ops::DerefMut for EngineLease {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self
-            .pooled
-            .as_mut()
-            .expect("a lease holds its engine")
-            .engine
+        self.engine.as_mut().expect("a lease holds its engine")
     }
 }
 
 impl Drop for EngineLease {
     fn drop(&mut self) {
-        let Some(pooled) = self.pooled.take().filter(|_| self.keep) else {
+        let engine = self.engine.take();
+        if !self.counted {
             return;
-        };
-        if let Ok(mut pool) = ENGINE_POOL.lock() {
-            pool.push(pooled);
-            while pool.len() > ENGINE_POOL_MAX_IDLE {
-                pool.remove(0);
+        }
+        let current = self.policy;
+        let mut pool = lock_engine_pool();
+        // Freed after the lock is released.
+        let mut freed = Vec::new();
+        match (engine, self.keep) {
+            (Some(engine), true) => pool.idle.push(PooledEngine {
+                policy: current,
+                engine,
+            }),
+            (engine, _) => {
+                pool.remove_live(current);
+                freed.extend(engine.map(|engine| PooledEngine {
+                    policy: current,
+                    engine,
+                }));
             }
         }
+        while pool.idle_over_budget() {
+            // An engine of a replaced policy goes first, oldest first.
+            let index = pool
+                .idle
+                .iter()
+                .position(|entry| entry.policy != current)
+                .unwrap_or(0);
+            let evicted = pool.idle.remove(index);
+            pool.remove_live(evicted.policy);
+            freed.push(evicted);
+        }
+        drop(pool);
+        ENGINE_RETURNED.notify_all();
+        drop(freed);
     }
+}
+
+/// Number of idle loaded engines; tests use it to check that a released
+/// policy leaves none behind.
+#[doc(hidden)]
+pub fn idle_policy_engines() -> usize {
+    lock_engine_pool().idle.len()
+}
+
+/// Drops every compiled form of `source` the crate keeps between calls:
+/// idle loaded engines, the hostname and body-probe engines, and the
+/// compiled Map Local,
+/// header-block and jq rules. Calls that still run with them finish first;
+/// a later call for `source` compiles it again.
+///
+/// The owner of a loaded policy calls this, through
+/// [`CompiledPolicyRelease`], when it stops using the policy, so compiled
+/// copies of a replaced policy do not stay in memory until other revisions
+/// push them out.
+pub fn release_compiled_policy(source: &str) {
+    release_policy(PolicyFingerprint::of(source));
+}
+
+fn release_policy(policy: PolicyFingerprint) {
+    let idle = lock_engine_pool().take_idle(|entry| entry.policy == policy);
+    // Waiting planners of the revision may load in the freed places.
+    ENGINE_RETURNED.notify_all();
+    // Engines are freed outside the pool's lock.
+    drop(idle);
+    HOSTNAME_ENGINES.remove(policy);
+    BODY_PROBE_ENGINES.remove(policy);
+    loon_map_local::release(policy);
+    loon_header_block::release(policy);
+    loon_jq::release(policy);
+}
+
+/// Releases a policy's compiled forms ([`release_compiled_policy`]) when
+/// dropped. The owner of a loaded policy keeps one beside it, so the
+/// compiled forms live as long as the policy is in use.
+#[derive(Debug)]
+pub struct CompiledPolicyRelease {
+    policy: PolicyFingerprint,
+}
+
+impl CompiledPolicyRelease {
+    /// Releases `source`'s compiled forms when dropped.
+    pub fn new(source: &str) -> Self {
+        Self {
+            policy: PolicyFingerprint::of(source),
+        }
+    }
+}
+
+impl Drop for CompiledPolicyRelease {
+    fn drop(&mut self) {
+        release_policy(self.policy);
+    }
+}
+
+/// Engines answering [`MitmPluginService::evaluate_mitm_hostname`], one per
+/// policy in use, released with the policy ([`CompiledPolicyRelease`]). The
+/// capacity only bounds what callers that never release keep. They only read
+/// the hostname list and are set to a trusted certificate, so they are kept
+/// apart from [`ENGINE_POOL`].
+static HOSTNAME_ENGINES: policy_cache::PolicyCache<policy_cache::SharedEngine> =
+    policy_cache::PolicyCache::new(policy_cache::POLICY_REVISIONS);
+
+/// Engines answering [`AnixOpsMitmPluginService::needs_body`] while every
+/// planning engine of the revision is leased, one per policy in use,
+/// released with the policy ([`CompiledPolicyRelease`]). `needs_body` runs on
+/// the data plane's async threads, where it may neither wait for a planning
+/// engine nor load the whole policy for one message; it only plans an empty
+/// body, so sharing one engine holds its lock briefly.
+static BODY_PROBE_ENGINES: policy_cache::PolicyCache<policy_cache::SharedEngine> =
+    policy_cache::PolicyCache::new(policy_cache::POLICY_REVISIONS);
+
+/// Whether a rule reads the body of `url`'s messages in `phase`, planned on
+/// an empty body.
+fn plan_needs_body(
+    engine: &AnixOpsMitmPolicyEngine,
+    url: &str,
+    phase: MitmPolicyPhase,
+) -> DomainResult<bool> {
+    let (plan, _) = engine.build_rewrite_plan(url, phase, "")?;
+    let (_, chain) = engine.apply_body_chain(url, phase, "")?;
+    // `requires_body` covers a body rewrite and a script with
+    // `requires-body=true`. A script without it never sees the body, so
+    // matching one does not hold the body back.
+    Ok(plan.requires_body || !chain.rewrites.is_empty() || chain.truncated)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -817,7 +1306,8 @@ impl AnixOpsMitmPluginService {
     }
 
     /// Whether planning a message to `url` in `phase` reads its body: a
-    /// body rewrite (including jq) or a script matches. When nothing does,
+    /// body rewrite (including jq) or a script with `requires-body=true`
+    /// matches. When nothing does,
     /// the data plane can forward the body as it arrives instead of holding
     /// it whole, and only the head is planned.
     pub fn needs_body(
@@ -829,15 +1319,25 @@ impl AnixOpsMitmPluginService {
         let Some(source) = plugin_instance.loaded_source.as_deref() else {
             return Ok(false);
         };
-        let mut engine = EngineLease::acquire(source)?;
         let phase = policy_phase_from_domain(phase);
-        let (plan, _) = engine.build_rewrite_plan(url, phase, "")?;
-        let (_, chain) = engine.apply_body_chain(url, phase, "")?;
-        engine.keep();
-        Ok(plan.requires_body
-            || plan.script.kind != MitmPolicyScriptKind::None
-            || !chain.rewrites.is_empty()
-            || chain.truncated)
+        // This runs on an async thread: take an idle planning engine or
+        // load one while the revision has room, and never wait for one.
+        if let Some(mut engine) = EngineLease::acquire(source, WhenAtLimit::GiveUp)? {
+            let needs_body = plan_needs_body(&engine, url, phase)?;
+            engine.keep();
+            return Ok(needs_body);
+        }
+        let engine = BODY_PROBE_ENGINES.get_or_build(source, |source| {
+            let mut engine = AnixOpsMitmPolicyEngine::new()?;
+            engine.load_config(source)?;
+            Ok(policy_cache::SharedEngine::new(engine))
+        })?;
+        let needs_body = engine.with(|engine| plan_needs_body(engine, url, phase));
+        if needs_body.is_err() {
+            // An engine that saw an error is not used again.
+            BODY_PROBE_ENGINES.remove(PolicyFingerprint::of(source));
+        }
+        needs_body
     }
 }
 
@@ -1025,44 +1525,104 @@ impl MitmPluginService for AnixOpsMitmPluginService {
             });
         }
 
-        let mut engine = EngineLease::acquire(source)?;
+        let mut engine = EngineLease::for_planning(source)?;
         let phase = policy_phase_from_domain(http_event.phase);
-        let body = String::from_utf8_lossy(&http_event.body);
-        let (plan, _) = engine.build_rewrite_plan(&http_event.url, phase, &body)?;
+        // The URL decides the action, the header rules and the script; the
+        // body is never handed to the core here, so a binary body (NUL
+        // bytes) cannot fail the plan and take the reject, redirect, header
+        // rewrites and script dispatch down with it.
+        let (plan, _) = engine.build_rewrite_plan(&http_event.url, phase, "")?;
+        let mut diagnostics = vec![mitm_policy_diagnostic(
+            DiagnosticSeverity::Info,
+            MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_CODE,
+            MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_MESSAGE,
+        )];
 
         let action = domain_action_from_policy_rewrite(&plan.rewrite);
-        let mut header_mutations = plan
-            .header_rewrites
-            .iter()
-            .map(domain_header_mutation_from_policy)
-            .collect::<Vec<_>>();
+        let mut header_mutations = header_mutations_from_plan(
+            &engine,
+            &http_event.url,
+            phase,
+            &plan,
+            &http_event.headers,
+            &mut diagnostics,
+        );
         if let Some(outcome) = header_block {
             header_mutations.extend(outcome.header_mutations);
         }
         // Every matching body rule applies in order, so one Loon
         // `[Body Rewrite]` line with several replacement pairs takes effect.
+        // Body rules only run on text; whatever happens to them, the rest of
+        // the plan stands.
+        let mut keep_engine = true;
         let body_mutation = if plan.rewrite.action == MitmPolicyRewriteAction::BodyMutation {
-            let (mut chained_body, chain) =
-                engine.apply_body_chain(&http_event.url, phase, &body)?;
-            let mut rewritten = chain.rewritten;
-            // The core matches jq rules but has no jq backend; jaq runs them.
-            if !chain.truncated {
-                if let Some(jq_body) = loon_jq::apply_jq_steps(source, phase, &chain, &chained_body)
-                {
-                    chained_body = jq_body;
-                    rewritten = true;
+            match text_body(&http_event.body) {
+                None => {
+                    diagnostics.push(mitm_policy_diagnostic(
+                        DiagnosticSeverity::Warning,
+                        MITM_POLICY_HTTP_EVENT_BINARY_BODY_SKIPPED_CODE,
+                        "body rewrite rules match, but the body is not UTF-8 text without NUL bytes, so they were skipped",
+                    ));
+                    None
                 }
+                Some(body) => match engine.apply_body_chain_whole(&http_event.url, phase, body) {
+                    Ok(MitmPolicyBodyChainOutcome::Applied {
+                        body: mut chained_body,
+                        chain,
+                        records_capped,
+                    }) => {
+                        if records_capped {
+                            diagnostics.push(mitm_policy_diagnostic(
+                                DiagnosticSeverity::Warning,
+                                MITM_POLICY_HTTP_EVENT_BODY_REWRITE_RECORDS_CAPPED_CODE,
+                                format!(
+                                    "more than {cap} body rules match; all of them applied, but jq steps after the first {cap} matching rules did not run",
+                                    cap = sys::ANIXOPS_BODY_CHAIN_CAP
+                                ),
+                            ));
+                        }
+                        let mut rewritten = chain.rewritten;
+                        // The core matches jq rules but has no jq backend; jaq runs them.
+                        if let Some(jq_body) =
+                            loon_jq::apply_jq_steps(source, phase, &chain, &chained_body)
+                        {
+                            chained_body = jq_body;
+                            rewritten = true;
+                        }
+                        (rewritten && chained_body.as_bytes() != http_event.body.as_slice()).then(
+                            || HttpBodyMutation {
+                                body: chained_body.into_bytes(),
+                                truncated: false,
+                            },
+                        )
+                    }
+                    Ok(MitmPolicyBodyChainOutcome::Skipped { reason, .. }) => {
+                        diagnostics.push(mitm_policy_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            MITM_POLICY_HTTP_EVENT_BODY_REWRITE_SKIPPED_CODE,
+                            format!("body rewrite skipped: {reason}"),
+                        ));
+                        None
+                    }
+                    Err(error) => {
+                        // An engine that saw an error is not pooled again.
+                        keep_engine = false;
+                        diagnostics.push(mitm_policy_diagnostic(
+                            DiagnosticSeverity::Warning,
+                            MITM_POLICY_HTTP_EVENT_BODY_REWRITE_SKIPPED_CODE,
+                            format!("body rewrite skipped: {}", error.code),
+                        ));
+                        None
+                    }
+                },
             }
-            (rewritten && !chain.truncated && chained_body.as_bytes() != http_event.body.as_slice())
-                .then(|| HttpBodyMutation {
-                    body: chained_body.into_bytes(),
-                    truncated: false,
-                })
         } else {
             None
         };
         let script_dispatch = domain_script_dispatch_from_policy(&plan.script);
-        engine.keep();
+        if keep_engine {
+            engine.keep();
+        }
 
         Ok(HttpMitmOutcome {
             action,
@@ -1078,11 +1638,7 @@ impl MitmPluginService for AnixOpsMitmPluginService {
                     http_event.request_id
                 )),
             }],
-            diagnostics: vec![mitm_policy_diagnostic(
-                DiagnosticSeverity::Info,
-                MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_CODE,
-                MITM_POLICY_HTTP_EVENT_MUTATION_PLANNED_MESSAGE,
-            )],
+            diagnostics,
         })
     }
 
@@ -1096,12 +1652,17 @@ impl MitmPluginService for AnixOpsMitmPluginService {
             return Ok(MitmHostnameDecision::Bypass);
         };
 
-        let mut engine = AnixOpsMitmPolicyEngine::new()?;
-        engine.load_config(source)?;
-        // The data plane only asks once the operator-supplied MITM CA is
-        // active, so evaluate the hostname list as trusted.
-        engine.set_certificate_trust_state(CertificateTrustState::Trusted);
-        let decision = engine.evaluate_mitm(hostname, is_quic)?;
+        // The data plane asks for every TLS and QUIC host it sees, so the
+        // policy is compiled once per revision, not once per host.
+        let engine = HOSTNAME_ENGINES.get_or_build(source, |source| {
+            let mut engine = AnixOpsMitmPolicyEngine::new()?;
+            engine.load_config(source)?;
+            // The data plane only asks once the operator-supplied MITM CA is
+            // active, so evaluate the hostname list as trusted.
+            engine.set_certificate_trust_state(CertificateTrustState::Trusted);
+            Ok(policy_cache::SharedEngine::new(engine))
+        })?;
+        let decision = engine.with(|engine| engine.evaluate_mitm(hostname, is_quic))?;
         Ok(match decision.decision {
             MitmPolicyMitmDecisionType::Bypass => MitmHostnameDecision::Bypass,
             MitmPolicyMitmDecisionType::Intercept => MitmHostnameDecision::Intercept,
@@ -1191,8 +1752,20 @@ fn domain_action_from_policy_rewrite(rewrite: &MitmPolicyRewriteResult) -> HttpM
             status_code: http_status_or(rewrite.status_code, 302),
             location: rewrite.value.clone(),
         },
-        MitmPolicyRewriteAction::Reject => HttpMitmAction::Reject {
-            status_code: http_status_or(rewrite.status_code, 403),
+        // `reject-dict`, `reject-array`, `reject-img` and `reject-video`
+        // answer with a body the app can parse; the others with none.
+        MitmPolicyRewriteAction::Reject => match rewrite.reject_body.content() {
+            Some((content_type, body)) => HttpMitmAction::Respond {
+                status_code: http_status_or(rewrite.status_code, 200),
+                headers: vec![MetadataEntry {
+                    key: "Content-Type".to_string(),
+                    value: content_type.to_string(),
+                }],
+                body: body.to_vec(),
+            },
+            None => HttpMitmAction::Reject {
+                status_code: http_status_or(rewrite.status_code, 403),
+            },
         },
         _ => HttpMitmAction::Continue,
     }
@@ -1206,13 +1779,176 @@ fn http_status_or(status_code: i32, default: u16) -> u16 {
     status_code.try_into().unwrap_or(default)
 }
 
+/// The body as text the core can rewrite: UTF-8 without NUL bytes. The core
+/// reads C strings, so anything else is never handed to it.
+fn text_body(body: &[u8]) -> Option<&str> {
+    std::str::from_utf8(body)
+        .ok()
+        .filter(|text| !text.contains('\0'))
+}
+
+/// The header mutations of `plan`, in rule order, for a message that carries
+/// `headers`.
+///
+/// The plan comes from the core without header values, so a regex rule in it
+/// holds only its replacement template. Each one is evaluated here against
+/// every current value of its header, after the rules before it, the way the
+/// core's own header-list application does. A header whose values change is
+/// deleted and added back value by value, so with several `Set-Cookie`
+/// headers only the matching one changes. A value the core cannot rewrite is
+/// left as it is, with a warning.
+fn header_mutations_from_plan(
+    engine: &AnixOpsMitmPolicyEngine,
+    url: &str,
+    phase: MitmPolicyPhase,
+    plan: &MitmPolicyRewritePlan,
+    headers: &[MetadataEntry],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<HttpHeaderMutation> {
+    let mut working = headers.to_vec();
+    let mut mutations = Vec::new();
+    let mut skipped = false;
+    for rewrite in &plan.header_rewrites {
+        if rewrite.operation != MitmPolicyHeaderOperation::ReplaceRegex {
+            let mutation = domain_header_mutation_from_policy(rewrite);
+            apply_header_mutation(&mut working, &mutation);
+            mutations.push(mutation);
+            continue;
+        }
+        let mut changed = false;
+        for header in working
+            .iter_mut()
+            .filter(|header| header.key.eq_ignore_ascii_case(&rewrite.header_name))
+        {
+            match regex_header_value(engine, url, phase, rewrite, &header.value) {
+                RegexHeaderValue::Rewritten(value) => {
+                    if value != header.value {
+                        header.value = value;
+                        changed = true;
+                    }
+                }
+                RegexHeaderValue::Unchanged => {}
+                RegexHeaderValue::Skipped => skipped = true,
+            }
+        }
+        if !changed {
+            continue;
+        }
+        // Deleted and added back: the data plane appends what is added, so
+        // the working copy moves the header to the end as well.
+        let (same, others): (Vec<MetadataEntry>, Vec<MetadataEntry>) = std::mem::take(&mut working)
+            .into_iter()
+            .partition(|header| header.key.eq_ignore_ascii_case(&rewrite.header_name));
+        working = others;
+        mutations.push(HttpHeaderMutation {
+            operation: HttpHeaderMutationOperation::Delete,
+            name: rewrite.header_name.clone(),
+            value: None,
+        });
+        mutations.extend(same.iter().map(|header| HttpHeaderMutation {
+            operation: HttpHeaderMutationOperation::Add,
+            name: header.key.clone(),
+            value: Some(header.value.clone()),
+        }));
+        working.extend(same);
+    }
+    if skipped {
+        diagnostics.push(mitm_policy_diagnostic(
+            DiagnosticSeverity::Warning,
+            MITM_POLICY_HTTP_EVENT_HEADER_REGEX_SKIPPED_CODE,
+            "a header-replace-regex rule left a header value unchanged: the rewritten value exceeds the policy core's value capacity or the value could not be read",
+        ));
+    }
+    if plan.header_rewrite_truncated {
+        diagnostics.push(mitm_policy_diagnostic(
+            DiagnosticSeverity::Warning,
+            MITM_POLICY_HTTP_EVENT_HEADER_REWRITES_CAPPED_CODE,
+            format!(
+                "more than {cap} header rules match; only the first {cap} applied",
+                cap = sys::ANIXOPS_PLAN_HEADER_CAP
+            ),
+        ));
+    }
+    mutations
+}
+
+enum RegexHeaderValue {
+    Rewritten(String),
+    Unchanged,
+    /// The core could not rewrite the value; it stays as it is.
+    Skipped,
+}
+
+/// Runs the regex rule `rewrite` on one current `value` of its header.
+fn regex_header_value(
+    engine: &AnixOpsMitmPolicyEngine,
+    url: &str,
+    phase: MitmPolicyPhase,
+    rewrite: &MitmPolicyHeaderRewriteResult,
+    value: &str,
+) -> RegexHeaderValue {
+    let Ok(start_index) = usize::try_from(rewrite.rule_index) else {
+        return RegexHeaderValue::Skipped;
+    };
+    match engine.evaluate_named_header(url, phase, start_index, &rewrite.header_name, value) {
+        Ok(result)
+            if result.rule_index == rewrite.rule_index
+                && result.operation == MitmPolicyHeaderOperation::ReplaceRegex =>
+        {
+            match result.message.as_str() {
+                CORE_HEADER_REWRITTEN => RegexHeaderValue::Rewritten(result.value),
+                CORE_HEADER_REGEX_NOT_MATCHED => RegexHeaderValue::Unchanged,
+                // "header value truncated": `result.value` is cut short.
+                _ => RegexHeaderValue::Skipped,
+            }
+        }
+        _ => RegexHeaderValue::Skipped,
+    }
+}
+
+/// Applies `mutation` to `headers` the way the data plane does
+/// (`engine-native`'s plain HTTP header mutation), so later rules see what
+/// earlier ones left.
+fn apply_header_mutation(headers: &mut Vec<MetadataEntry>, mutation: &HttpHeaderMutation) {
+    let name = mutation.name.as_str();
+    match (mutation.operation, mutation.value.as_ref()) {
+        (HttpHeaderMutationOperation::Delete, _) => {
+            headers.retain(|header| !header.key.eq_ignore_ascii_case(name))
+        }
+        (_, None) => {}
+        (HttpHeaderMutationOperation::Add, Some(value)) => headers.push(MetadataEntry {
+            key: mutation.name.clone(),
+            value: value.clone(),
+        }),
+        (HttpHeaderMutationOperation::Replace, Some(value)) => {
+            for header in headers
+                .iter_mut()
+                .filter(|header| header.key.eq_ignore_ascii_case(name))
+            {
+                header.value = value.clone();
+            }
+        }
+        (HttpHeaderMutationOperation::Set, Some(value)) => {
+            headers.retain(|header| !header.key.eq_ignore_ascii_case(name));
+            headers.push(MetadataEntry {
+                key: mutation.name.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+}
+
+/// A header rewrite without a regex as a domain mutation. Regex rewrites go
+/// through [`header_mutations_from_plan`], which has the header's values.
 fn domain_header_mutation_from_policy(
     rewrite: &MitmPolicyHeaderRewriteResult,
 ) -> HttpHeaderMutation {
     HttpHeaderMutation {
         operation: match rewrite.operation {
             MitmPolicyHeaderOperation::Add => HttpHeaderMutationOperation::Add,
-            MitmPolicyHeaderOperation::Replace => HttpHeaderMutationOperation::Replace,
+            MitmPolicyHeaderOperation::Replace | MitmPolicyHeaderOperation::ReplaceRegex => {
+                HttpHeaderMutationOperation::Replace
+            }
             MitmPolicyHeaderOperation::Delete => HttpHeaderMutationOperation::Delete,
             MitmPolicyHeaderOperation::Set => HttpHeaderMutationOperation::Set,
         },
@@ -1259,6 +1995,7 @@ fn rewrite_result_from_sys(result: &sys::AnixOpsRewriteResult) -> MitmPolicyRewr
         matched_pattern: ffi_string(&result.matched_pattern),
         value: ffi_string(&result.value),
         message: ffi_string(&result.message),
+        reject_body: MitmPolicyRejectBody::from_sys(result.action),
     }
 }
 
@@ -1299,10 +2036,10 @@ fn header_operation_from_sys(action: sys::AnixOpsRewriteAction) -> MitmPolicyHea
             MitmPolicyHeaderOperation::Add
         }
         sys::AnixOpsRewriteAction::HeaderReplace
-        | sys::AnixOpsRewriteAction::HeaderReplaceRegex
-        | sys::AnixOpsRewriteAction::ResponseHeaderReplace
+        | sys::AnixOpsRewriteAction::ResponseHeaderReplace => MitmPolicyHeaderOperation::Replace,
+        sys::AnixOpsRewriteAction::HeaderReplaceRegex
         | sys::AnixOpsRewriteAction::ResponseHeaderReplaceRegex => {
-            MitmPolicyHeaderOperation::Replace
+            MitmPolicyHeaderOperation::ReplaceRegex
         }
         sys::AnixOpsRewriteAction::HeaderDel | sys::AnixOpsRewriteAction::ResponseHeaderDel => {
             MitmPolicyHeaderOperation::Delete
@@ -1362,7 +2099,7 @@ fn script_dispatch_from_sys(result: &sys::AnixOpsScriptResult) -> MitmPolicyScri
         matched_pattern: ffi_string(&result.matched_pattern),
         script_path: ffi_string(&result.script_path),
         tag: ffi_string(&result.tag),
-        argument: ffi_string(&result.argument),
+        argument: loon_syntax::decode_core_argument(&ffi_string(&result.argument)),
         message: ffi_string(&result.message),
         binary_body_mode: result.binary_body_mode != 0,
     }
@@ -1526,5 +2263,139 @@ fn empty_rewrite_plan() -> sys::AnixOpsRewritePlan {
         header_rewrite_truncated: 0,
         header_rewrites: [empty_header_rewrite_result(); sys::ANIXOPS_PLAN_HEADER_CAP],
         script: empty_script_result(),
+    }
+}
+
+#[cfg(test)]
+mod engine_pool_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The pool is shared by the whole test binary; these tests run one at
+    /// a time so the idle budget of one does not evict the other's engine.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A policy rejecting `/ads`, padded with comment lines tagged `tag` to
+    /// at least `min_bytes`.
+    fn policy(tag: &str, min_bytes: usize) -> String {
+        let plugin = loon_plugin::import_loon_plugin(concat!(
+            "#!name = Pool\n",
+            "[Rewrite]\n",
+            "^https://a\\.example\\.test/ads reject\n",
+        ))
+        .expect("plugin should import");
+        let mut source = loon_plugin::merged_plugin_source("Pool", &[&plugin]);
+        source.push_str(&format!("\n# engine pool test {tag}"));
+        let mut line = 0usize;
+        while source.len() < min_bytes {
+            source.push_str(&format!("\n# {tag} padding line {line:08}"));
+            line += 1;
+        }
+        source.push('\n');
+        source
+    }
+
+    fn live(source: &str) -> usize {
+        lock_engine_pool().live(PolicyFingerprint::of(source))
+    }
+
+    #[test]
+    fn acquire_at_the_limit_reuses_the_returned_engine() {
+        let _serial = serial();
+        let source = policy("reuse", 3 * 1024 * 1024);
+        assert_eq!(engines_per_revision(PolicyFingerprint::of(&source)), 1);
+
+        let loads_before = policy_loads_on_this_thread();
+        let mut first = EngineLease::acquire(&source, WhenAtLimit::Wait)
+            .expect("policy loads")
+            .expect("Wait always answers an engine");
+        assert_eq!(policy_loads_on_this_thread(), loads_before + 1);
+        assert_eq!(live(&source), 1);
+        assert!(
+            EngineLease::acquire(&source, WhenAtLimit::GiveUp)
+                .expect("acquire answers")
+                .is_none(),
+            "the revision's only engine is leased"
+        );
+
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let before = policy_loads_on_this_thread();
+                let mut second = EngineLease::acquire(&source, WhenAtLimit::Wait)
+                    .expect("policy loads")
+                    .expect("Wait always answers an engine");
+                second.keep();
+                policy_loads_on_this_thread() - before
+            });
+            // Give the waiter time to block on the full revision; if it has
+            // not yet, it finds the returned engine idle instead.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            first.keep();
+            drop(first);
+            assert_eq!(
+                waiter.join().expect("waiter finishes"),
+                0,
+                "the waiter loaded the policy instead of reusing the engine"
+            );
+        });
+        assert_eq!(live(&source), 1);
+
+        release_compiled_policy(&source);
+        assert_eq!(live(&source), 0);
+    }
+
+    #[test]
+    fn engines_of_a_revision_never_exceed_the_limit() {
+        let _serial = serial();
+        const THREADS: usize = 8;
+        // A large policy is loaded again after each lease ended without
+        // keep, so it plans fewer rounds.
+        for (tag, min_bytes, rounds) in [("small", 0, 16), ("large", 3 * 1024 * 1024, 4)] {
+            let source = policy(tag, min_bytes);
+            let limit = engines_per_revision(PolicyFingerprint::of(&source));
+            let peak = AtomicUsize::new(0);
+            let loads: u64 = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..THREADS)
+                    .map(|index| {
+                        let (source, peak) = (&source, &peak);
+                        scope.spawn(move || {
+                            let before = policy_loads_on_this_thread();
+                            for round in 0..rounds {
+                                let mut lease = EngineLease::acquire(source, WhenAtLimit::Wait)
+                                    .expect("policy loads")
+                                    .expect("Wait always answers an engine");
+                                peak.fetch_max(live(source), Ordering::Relaxed);
+                                std::thread::yield_now();
+                                // Some leases end without keep, as on an
+                                // error; their place is freed for a waiter.
+                                if (index + round) % 5 != 0 {
+                                    lease.keep();
+                                }
+                            }
+                            policy_loads_on_this_thread() - before
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().expect("worker finishes"))
+                    .sum()
+            });
+            let peak = peak.into_inner();
+            assert!(
+                (1..=limit).contains(&peak),
+                "{tag}: {peak} engines live, limit {limit}"
+            );
+            assert!(loads >= 1, "{tag}: nothing loaded");
+            assert!(live(&source) <= limit);
+            release_compiled_policy(&source);
+            assert_eq!(live(&source), 0, "{tag}: release leaves no engine counted");
+        }
     }
 }
