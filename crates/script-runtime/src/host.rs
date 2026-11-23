@@ -531,11 +531,14 @@ fn parse_body(value: &Value, max_output_bytes: usize, binary: bool) -> Result<St
 fn parse_http_request(payload: &str) -> Result<ScriptHttpClientRequest, String> {
     let value = serde_json::from_str::<Value>(payload)
         .map_err(|_| "networkcore: invalid $httpClient options".to_string())?;
-    let method = value
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("GET")
-        .to_ascii_uppercase();
+    // Checked here, in Rust: a script controls the whole payload (it can
+    // replace `String.prototype.toUpperCase` or `JSON.stringify`), so the
+    // prelude cannot be trusted to have passed a fixed method name.
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("GET");
+    if !crate::is_http_method_token(method) {
+        return Err(crate::SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE.to_string());
+    }
+    let method = method.to_ascii_uppercase();
     let url = value.get("url").and_then(Value::as_str).unwrap_or("");
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("networkcore: $httpClient needs an http or https URL".to_string());
@@ -639,6 +642,38 @@ mod tests {
         .expect("mixed parse");
         assert_eq!(mutation.body.as_deref(), Some("\u{c3}\u{a9}"));
         assert!(mutation.binary_bodies);
+    }
+
+    #[test]
+    fn http_client_methods_must_be_tokens() {
+        let parse = |method: &str| {
+            parse_http_request(
+                &json!({"url": "http://127.0.0.1:6379/", "method": method}).to_string(),
+            )
+        };
+        let too_long = "A".repeat(crate::SCRIPT_HTTP_CLIENT_MAX_METHOD_BYTES + 1);
+        for bad in [
+            "GET\r\nX",
+            "FLUSHALL\r\nQUIT\r\nX",
+            "G ET",
+            "GET\u{0}",
+            "",
+            "GÉT",
+            "GET/",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                parse(bad).unwrap_err(),
+                crate::SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(parse("get").unwrap().method, "GET");
+        assert_eq!(parse("PATCH").unwrap().method, "PATCH");
+        assert_eq!(parse("propfind").unwrap().method, "PROPFIND");
+        // No method is a GET.
+        let request = parse_http_request(r#"{"url":"https://example.test/"}"#).unwrap();
+        assert_eq!(request.method, "GET");
     }
 
     #[test]

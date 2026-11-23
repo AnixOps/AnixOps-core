@@ -22,7 +22,10 @@ use engine_native::{ScriptHttpClient, ScriptHttpClientRequest, ScriptResponse};
 use engine_outbound::{TargetAddr, TcpOutbound};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
-use script_runtime::{binary_body_string, SCRIPT_HTTP_CLIENT_MAX_REDIRECTS};
+use script_runtime::{
+    binary_body_string, is_http_method_token, SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE,
+    SCRIPT_HTTP_CLIENT_MAX_REDIRECTS,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::http1::{Body, Conn, Framing, Head};
@@ -54,6 +57,12 @@ impl TunnelScriptHttpClient {
 
 impl ScriptHttpClient for TunnelScriptHttpClient {
     fn execute(&self, request: &ScriptHttpClientRequest) -> Result<ScriptResponse, String> {
+        // The script host checks the method too; the request type is public,
+        // so the client refuses a method that could break the request line
+        // before it opens any connection.
+        if !is_http_method_token(&request.method) {
+            return Err(SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE.to_string());
+        }
         let outbound = self.outbound.get().cloned().ok_or(UNAVAILABLE)?;
         let handle = tokio::runtime::Handle::try_current().map_err(|_| UNAVAILABLE)?;
         let url = RequestUrl::parse(&request.url).ok_or(INVALID_URL)?;
@@ -582,6 +591,36 @@ mod tests {
         let seen = seen.lock().unwrap();
         let (target, bytes) = &seen[index];
         (target.clone(), String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    #[test]
+    fn methods_that_are_not_tokens_never_open_a_connection() {
+        for method in [
+            "GET\r\nX",
+            "FLUSHALL\r\nQUIT\r\nX",
+            "G ET",
+            "GET\0",
+            "",
+            "GÉT",
+        ] {
+            let (client, seen) = client(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let result = run(client, request(method, "http://127.0.0.1:6379/", None));
+            assert_eq!(
+                result.unwrap_err(),
+                SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE,
+                "{method:?}"
+            );
+            assert!(seen.lock().unwrap().is_empty(), "{method:?}");
+        }
+        let (client, seen) = client(b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 0\r\n\r\n");
+        let response = run(
+            client,
+            request("PROPFIND", "http://dav.example.test/", None),
+        )
+        .expect("a token method is sent");
+        assert_eq!(response.status, 207);
+        let (_, sent) = seen_text(&seen, 0);
+        assert!(sent.starts_with("PROPFIND / HTTP/1.1\r\n"), "{sent}");
     }
 
     #[test]
