@@ -247,7 +247,7 @@ impl EmbeddedRuntime {
                     let dispatcher = Dispatcher::single(outbound)
                         .with_direct(Arc::new(direct::DirectOutbound::new(dialer)))
                         .with_redirects(config.redirect_table()?)
-                        .with_fake_ip(config.fake_ip_pool()?);
+                        .with_fake_ip(config.runtime_fake_ip_pool()?);
                     dispatcher.set_mode(config.mode);
                     dispatcher.set_block_quic(config.block_quic);
                     Engine::Stack(Arc::new(dispatcher))

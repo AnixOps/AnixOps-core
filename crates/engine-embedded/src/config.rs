@@ -783,8 +783,20 @@ impl RuntimeConfig {
     #[cfg(not(feature = "tls-fingerprints"))]
     pub fn install_tls_fingerprints(&self) {}
 
+    /// The Fake-IP pool of a runtime built from this config: the checks of
+    /// [`Self::fake_ip_pool`], then [`FakeIpPool::retained`], so names keep
+    /// their addresses across a rebuild with the same ranges. Build it once
+    /// per runtime; checking a config uses [`Self::fake_ip_pool`].
+    pub fn runtime_fake_ip_pool(&self) -> Result<Option<Arc<FakeIpPool>>, RuntimeError> {
+        if self.fake_ip_pool()?.is_none() {
+            return Ok(None);
+        }
+        FakeIpPool::retained(&self.dns.fake_ip).map_err(rejected)
+    }
+
     /// The Fake-IP pool of `dns.fake_ip`, `None` when it is off. Each call
-    /// builds a new, empty pool: build it once per runtime.
+    /// builds a new, empty pool of its own and leaves the table kept for the
+    /// next runtime alone; a runtime takes [`Self::runtime_fake_ip_pool`].
     pub fn fake_ip_pool(&self) -> Result<Option<Arc<FakeIpPool>>, RuntimeError> {
         let pool = FakeIpPool::from_config(&self.dns.fake_ip).map_err(rejected)?;
         if let Some(pool) = &pool {
@@ -961,7 +973,7 @@ impl RuntimeConfig {
                 .with_direct(Arc::new(DirectOutbound::new(dialer))),
         }
         .with_redirects(self.redirect_table()?)
-        .with_fake_ip(self.fake_ip_pool()?);
+        .with_fake_ip(self.runtime_fake_ip_pool()?);
         dispatcher.set_mode(self.mode);
         dispatcher.set_block_quic(self.block_quic);
         Ok(dispatcher)

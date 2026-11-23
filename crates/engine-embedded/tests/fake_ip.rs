@@ -11,8 +11,9 @@ use config_core::routing::RoutingSpec;
 use engine_embedded::config::{FakeIpConfig, RuntimeConfig};
 use engine_embedded::connections::Dispatcher;
 use engine_embedded::fake_ip::FakeIpPool;
+use engine_embedded::protocols::default_registry;
 use engine_embedded::routing::{DomainResolver, RoutedOutbound};
-use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
+use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpDialer, TcpOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Echoes every connection in memory and records the targets it was given.
@@ -258,4 +259,92 @@ fn runtime_config_builds_one_pool_and_checks_hosts() {
     )
     .unwrap();
     assert!(off.fake_ip_pool().unwrap().is_none());
+}
+
+/// A runtime config whose Fake-IP section uses `fake_ip` (JSON fields).
+fn rebuilt_config(fake_ip: &str) -> RuntimeConfig {
+    RuntimeConfig::from_json(
+        format!(
+            r#"{{
+                "schema_version": 1,
+                "profile_id": "rebuilt",
+                "outbound": {{"type": "direct"}},
+                "dns": {{"fake_ip": {{"enabled": true, {fake_ip}}}}}
+            }}"#
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+}
+
+/// The pool the runtime of `config` uses, built the way the runtime does.
+fn runtime_pool(config: &RuntimeConfig) -> Arc<FakeIpPool> {
+    config
+        .build_dispatcher(None, &default_registry(), Arc::new(TcpDialer))
+        .unwrap()
+        .fake_ip()
+        .expect("fake-ip is on")
+        .clone()
+}
+
+// The only test of this binary that builds runtime pools: they share the
+// table the process keeps, so the steps run in order here.
+#[test]
+fn a_rebuilt_runtime_keeps_the_names_of_its_fake_addresses() {
+    let same = r#""range": "10.80.0.0/16", "max_entries": 1000"#;
+    FakeIpPool::release_retained();
+
+    // Checking a config (from_json validates, fake_ip_pool builds a pool of
+    // its own) keeps no table.
+    let config = rebuilt_config(same);
+    config
+        .fake_ip_pool()
+        .unwrap()
+        .unwrap()
+        .assign("check.example");
+    assert!(!FakeIpPool::release_retained());
+
+    // Runtime 1 hands out addresses, then goes away (a node switch).
+    let first = runtime_pool(&config);
+    let a = first.assign("a.example");
+    let b = first.assign("b.example");
+    // Past the reserved block, short of the last address.
+    assert!(first.contains(IpAddr::V4(a)) && a.octets()[2] != 0);
+    assert_ne!(a, Ipv4Addr::new(10, 80, 255, 255));
+    drop(first);
+
+    // Runtime 2 of the same ranges, with another filter: an app still
+    // holding a's address reaches a.example, and a new name gets a new
+    // address.
+    let second = runtime_pool(&rebuilt_config(&format!(
+        r#"{same}, "filter": ["a.example"]"#
+    )));
+    assert_eq!(
+        second.resolve_flow(IpAddr::V4(a), None).as_deref(),
+        Some("a.example")
+    );
+    assert_eq!(second.lookup(IpAddr::V4(b)).as_deref(), Some("b.example"));
+    assert!(!second.is_fake_name("a.example"), "the new filter applies");
+    let c = second.assign("c.example");
+    assert!(c != a && c != b);
+    assert_eq!(second.assign("b.example"), b);
+    assert_eq!(second.stats().entries, 3);
+    assert_eq!(second.stats().misses, 0);
+
+    // Another table size starts a new table: the old address maps to no
+    // name and the flow is refused, never sent to another name.
+    let resized = runtime_pool(&rebuilt_config(
+        r#""range": "10.80.0.0/16", "max_entries": 2000"#,
+    ));
+    assert_eq!(resized.stats().entries, 0);
+    assert_eq!(resized.resolve_flow(IpAddr::V4(a), None), None);
+    assert_eq!(resized.stats().misses, 1);
+
+    // Releasing the kept table makes the next runtime start anew too.
+    let third = runtime_pool(&config);
+    let d = third.assign("d.example");
+    assert!(FakeIpPool::release_retained());
+    let fourth = runtime_pool(&config);
+    assert_eq!(fourth.lookup(IpAddr::V4(d)), None);
+    assert_eq!(fourth.stats().entries, 0);
 }
