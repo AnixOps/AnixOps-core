@@ -198,3 +198,37 @@ fn factory_builds_from_settings_and_rejects_bad_ones() {
             .is_err());
     }
 }
+
+#[test]
+fn factory_takes_certificate_pins_only_with_tls() {
+    let mut registry = OutboundRegistry::new();
+    registry.register(Arc::new(HttpFactory));
+    let pin = "0123456789abcdef".repeat(4);
+    // Uppercase with colons, as OpenSSL prints fingerprints.
+    let colons = ["01:23:45:67:89:AB:CD:EF"; 4].join(":");
+    let build = |json: serde_json::Value| {
+        registry
+            .build("http", json.as_object().unwrap(), Arc::new(TcpDialer))
+            .err()
+    };
+    for good in [
+        serde_json::json!({"server": "example.com", "port": 443, "tls": true,
+            "pinned_certificate_sha256": [pin]}),
+        serde_json::json!({"server": "example.com", "port": 443, "tls": true, "insecure": true,
+            "pinned_public_key_sha256": [colons]}),
+    ] {
+        assert_eq!(build(good), None);
+    }
+    assert_eq!(
+        build(
+            serde_json::json!({"server": "example.com", "port": 443, "tls": true,
+            "pinned_certificate_sha256": ["0123"]})
+        ),
+        Some("http proxy certificate pins are invalid")
+    );
+    assert_eq!(
+        build(serde_json::json!({"server": "example.com", "port": 8080,
+            "pinned_certificate_sha256": [pin]})),
+        Some("http proxy certificate pins need tls")
+    );
+}

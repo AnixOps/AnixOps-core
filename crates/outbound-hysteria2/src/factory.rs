@@ -6,7 +6,7 @@ use engine_outbound::registry::{parse_settings, BuildError, OutboundFactory, Set
 use engine_outbound::{Dialer, TcpOutbound};
 use serde::Deserialize;
 use transport_quic::salamander::Salamander;
-use transport_tls::TlsSettings;
+use transport_tls::{parse_sha256_pins, TlsSettings};
 
 use crate::Hysteria2Outbound;
 
@@ -24,9 +24,15 @@ struct Hysteria2Settings {
     /// Defaults to `["h3"]`.
     #[serde(default)]
     alpn: Vec<String>,
-    /// Skip certificate verification (`insecure=1`).
+    /// Skip WebPKI verification (`insecure=1`); the pins below still apply.
     #[serde(default)]
     insecure: bool,
+    /// SHA-256 digests of the server's leaf certificate in hex (`pinSHA256`).
+    #[serde(default)]
+    pinned_certificate_sha256: Vec<String>,
+    /// SHA-256 digests of the leaf certificate's public key (SPKI) in hex.
+    #[serde(default)]
+    pinned_public_key_sha256: Vec<String>,
     /// `{"type": "salamander", "password": ...}`; other types fail the build
     /// instead of connecting without obfuscation.
     #[serde(default)]
@@ -78,6 +84,10 @@ impl OutboundFactory for Hysteria2Factory {
             server_name,
             alpn: settings.alpn,
             insecure: settings.insecure,
+            pinned_certificate_sha256: parse_sha256_pins(&settings.pinned_certificate_sha256)
+                .ok_or("hysteria2 certificate pins are invalid")?,
+            pinned_public_key_sha256: parse_sha256_pins(&settings.pinned_public_key_sha256)
+                .ok_or("hysteria2 certificate pins are invalid")?,
         };
         let mut outbound =
             Hysteria2Outbound::new(settings.server, settings.port, settings.password, &tls)

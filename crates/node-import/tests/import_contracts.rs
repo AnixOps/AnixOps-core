@@ -1,6 +1,7 @@
 //! Subscription text to node list, through the Rust API and the C ABI the
 //! iOS app calls.
 
+use control_domain::{Endpoint, MetadataEntry, NodeDescriptor, Protocol};
 use node_import::ffi::{
     networkcore_import_abi_version, networkcore_import_free_buffer, networkcore_import_nodes,
     NetworkCoreImportBuffer, NETWORKCORE_IMPORT_ABI_VERSION, NETWORKCORE_IMPORT_ERR_EMPTY,
@@ -8,7 +9,7 @@ use node_import::ffi::{
     NETWORKCORE_IMPORT_OK,
 };
 use node_import::ffi::{networkcore_import_share_link, NETWORKCORE_IMPORT_ERR_UNSUPPORTED};
-use node_import::{import_text, share_link, ImportError};
+use node_import::{import_text, outbound_json, share_link, ImportError};
 
 const LINKS: &str = "\
 ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@82.47.34.99:11111#HK
@@ -929,4 +930,270 @@ fn wireguard_links_import_with_allowed_ips_and_reserved() {
     );
     assert_eq!(outbound["reserved"], serde_json::json!([1, 2, 3]));
     assert_eq!(outbound["mtu"], 1380);
+}
+
+/// One SHA-256 digest in lowercase hex and as OpenSSL prints fingerprints,
+/// and another one.
+const PIN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const PIN_COLONS: &str =
+    "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF";
+const OTHER_PIN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+/// Certificate pins reach every TLS and QUIC outbound, in lowercase hex,
+/// next to `insecure`; nodes without pins keep their entries as before.
+#[test]
+fn certificate_pins_reach_the_outbound_entries() {
+    let vmess = base64_standard(
+        serde_json::json!({
+            "v": "2", "ps": "VMess", "add": "vmess.example.test", "port": "443",
+            "id": "00000000-0000-0000-0000-000000000005", "aid": "0", "net": "tcp",
+            "tls": "tls", "allowInsecure": "1", "pcs": PIN
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let text = format!(
+        "\
+hysteria2://hy2-secret@hy2.example.test:443?insecure=1&pinSHA256={PIN_COLONS}#Hy2
+tuic://00000000-0000-0000-0000-000000000001:tuic-secret@tuic.example.test:443?allow_insecure=1&pinSHA256={PIN}#TUIC
+trojan://trojan-secret@trojan.example.test:443?allowInsecure=1&pcs={PIN}#Trojan
+vless://00000000-0000-0000-0000-000000000002@vless.example.test:443?encryption=none&security=tls&allowInsecure=1&pcs={PIN}%2C{OTHER_PIN}#VLESS
+vmess://{vmess}
+hysteria2://hy2-secret@plain.example.test:443?insecure=1#Unpinned
+"
+    );
+    let report = import_text(&text).unwrap();
+    assert!(report.unsupported.is_empty(), "{:?}", report.unsupported);
+    let outbound = |name: &str| {
+        report
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap_or_else(|| panic!("{name} imports"))
+            .outbound
+            .clone()
+    };
+    for name in ["Hy2", "TUIC", "Trojan"] {
+        let outbound = outbound(name);
+        assert_eq!(outbound["insecure"], true, "{name}");
+        assert_eq!(
+            outbound["pinned_certificate_sha256"],
+            serde_json::json!([PIN]),
+            "{name}"
+        );
+        assert!(outbound.get("pinned_public_key_sha256").is_none(), "{name}");
+    }
+    let vless = outbound("VLESS");
+    assert_eq!(vless["tls"]["insecure"], true);
+    assert_eq!(
+        vless["tls"]["pinned_certificate_sha256"],
+        serde_json::json!([PIN, OTHER_PIN])
+    );
+    let vmess = outbound("VMess");
+    assert_eq!(
+        vmess["tls"]["pinned_certificate_sha256"],
+        serde_json::json!([PIN])
+    );
+    let unpinned = outbound("Unpinned");
+    assert!(unpinned.get("pinned_certificate_sha256").is_none());
+    assert!(unpinned.get("pinned_public_key_sha256").is_none());
+}
+
+/// sing-box keeps both kinds of pin in base64; the engine gets both in hex.
+#[test]
+fn sing_box_certificate_and_public_key_pins_reach_the_outbound() {
+    let pin_base64 = base64_standard(&hex_bytes(PIN));
+    let other_base64 = base64_standard(&hex_bytes(OTHER_PIN));
+    let sing_box = format!(
+        r#"{{
+  "outbounds": [
+    {{"type": "hysteria2", "tag": "Hy2", "server": "hy2.example.test", "server_port": 443,
+      "password": "hy2-secret",
+      "tls": {{"enabled": true, "insecure": true, "certificate_public_key_sha256": ["{pin_base64}"]}}}},
+    {{"type": "vless", "tag": "VLESS", "server": "vless.example.test", "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000002",
+      "tls": {{"enabled": true, "certificate_sha256": ["{other_base64}"],
+               "certificate_public_key_sha256": "{pin_base64}"}}}}
+  ]
+}}"#
+    );
+    let report = import_text(&sing_box).unwrap();
+    assert!(report.unsupported.is_empty(), "{:?}", report.unsupported);
+    let hy2 = &report.nodes[0].outbound;
+    assert_eq!(hy2["pinned_public_key_sha256"], serde_json::json!([PIN]));
+    assert!(hy2.get("pinned_certificate_sha256").is_none());
+    let vless = &report.nodes[1].outbound["tls"];
+    assert_eq!(vless["insecure"], false);
+    assert_eq!(
+        vless["pinned_certificate_sha256"],
+        serde_json::json!([OTHER_PIN])
+    );
+    assert_eq!(vless["pinned_public_key_sha256"], serde_json::json!([PIN]));
+}
+
+/// A pin that cannot be read never turns into a node without it: such a
+/// node is unsupported, with a fixed reason and without its secrets.
+#[test]
+fn nodes_with_unreadable_pins_are_unsupported_not_unpinned() {
+    let text = "\
+hysteria2://hy2-secret@hy2.example.test:443?insecure=1&pinSHA256=pin-secret#Hy2
+trojan://trojan-secret@trojan.example.test:443?allowInsecure=1&pcs=ABCD#Trojan
+trojan://trojan-secret@ok.example.test:443?allowInsecure=1#Unpinned
+";
+    let report = import_text(text).unwrap();
+    assert_eq!(report.nodes.len(), 1);
+    assert_eq!(report.nodes[0].name, "Unpinned");
+    let reasons: Vec<_> = report
+        .unsupported
+        .iter()
+        .map(|node| (node.name.as_str(), node.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            ("Hy2", "tls certificate pin is not a sha-256 digest"),
+            ("Trojan", "tls certificate pin is not a sha-256 digest"),
+        ]
+    );
+    let unsupported = serde_json::to_string(&report.unsupported).unwrap();
+    assert!(!unsupported.contains("secret"), "{unsupported}");
+}
+
+fn pinned_node(protocol: Protocol, metadata: &[(&str, &str)]) -> NodeDescriptor {
+    NodeDescriptor {
+        id: "pinned".to_string(),
+        name: "Pinned".to_string(),
+        protocol,
+        endpoint: Endpoint {
+            host: "192.0.2.1".to_string(),
+            port: 443,
+        },
+        tags: Vec::new(),
+        metadata: metadata
+            .iter()
+            .map(|(key, value)| MetadataEntry {
+                key: key.to_string(),
+                value: value.to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// Nodes imported before certificate pins had their own key kept Hysteria2
+/// `pinSHA256` and Xray `pcs` values (hex certificate digests) under the
+/// public key key; they still pin the certificate.
+#[test]
+fn hex_values_under_the_public_key_key_are_certificate_pins() {
+    let node = pinned_node(
+        Protocol::Hysteria2,
+        &[
+            ("hysteria2.password", "hy2-secret"),
+            ("tls.insecure", "true"),
+            ("tls.certificate_public_key_sha256", PIN_COLONS),
+        ],
+    );
+    let outbound = outbound_json(&node).unwrap();
+    assert_eq!(
+        outbound["pinned_certificate_sha256"],
+        serde_json::json!([PIN])
+    );
+    assert!(outbound.get("pinned_public_key_sha256").is_none());
+
+    let node = pinned_node(
+        Protocol::Hysteria2,
+        &[
+            ("hysteria2.password", "hy2-secret"),
+            ("tls.certificate_public_key_sha256", "not-a-digest"),
+        ],
+    );
+    assert_eq!(
+        outbound_json(&node).unwrap_err(),
+        "tls public key pin is not a sha-256 digest"
+    );
+}
+
+/// Pins without TLS have no certificate to check: the node is unsupported
+/// rather than run in the clear with its pins ignored. REALITY checks the
+/// server by its own key and keeps no pins.
+#[test]
+fn pins_need_tls_and_reality_ignores_them() {
+    let plain = pinned_node(
+        Protocol::Vless,
+        &[
+            ("vless.uuid", "00000000-0000-0000-0000-000000000002"),
+            ("tls.enabled", "false"),
+            ("tls.certificate_sha256", PIN),
+        ],
+    );
+    assert_eq!(
+        outbound_json(&plain).unwrap_err(),
+        "certificate pins are set on a node without tls"
+    );
+
+    let reality = pinned_node(
+        Protocol::Vless,
+        &[
+            ("vless.uuid", "00000000-0000-0000-0000-000000000002"),
+            ("tls.enabled", "true"),
+            ("tls.server_name", "www.example.com"),
+            (
+                "tls.reality.public_key",
+                "Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw",
+            ),
+            ("tls.certificate_sha256", PIN),
+        ],
+    );
+    let outbound = outbound_json(&reality).unwrap();
+    assert!(outbound["reality"].is_object());
+    assert!(!outbound.to_string().contains("pinned"));
+}
+
+#[test]
+fn pinned_share_links_import_back_with_their_pins() {
+    assert_round_trip(&format!(
+        "\
+hysteria2://hy2-secret@hy2.example.test:443?sni=cdn.example.test&insecure=1&pinSHA256={PIN}#Hy2
+tuic://00000000-0000-0000-0000-000000000001:tuic-secret@tuic.example.test:443?allow_insecure=1&pinSHA256={PIN_COLONS}#TUIC
+trojan://trojan-secret@trojan.example.test:443?allowInsecure=1&pcs={PIN}#Trojan
+vless://00000000-0000-0000-0000-000000000002@vless.example.test:443?encryption=none&security=tls&allowInsecure=1&pcs={PIN}%2C{OTHER_PIN}&type=ws&path=%2Fws#VLESS
+"
+    ));
+    let vmess = base64_standard(
+        serde_json::json!({
+            "v": "2", "ps": "VMess", "add": "vmess.example.test", "port": "443",
+            "id": "00000000-0000-0000-0000-000000000005", "aid": "0", "net": "tcp",
+            "tls": "tls", "allowInsecure": "1", "pcs": OTHER_PIN
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    assert_round_trip(&format!("vmess://{vmess}"));
+}
+
+/// No link format carries public key pins; a link without them would check
+/// less than the node does, so there is none.
+#[test]
+fn share_links_are_refused_for_public_key_pins() {
+    let hysteria2 = serde_json::json!({
+        "type": "hysteria2", "server": "hy2.example.test", "port": 443,
+        "password": "hy2-secret", "insecure": true,
+        "pinned_public_key_sha256": [PIN]
+    });
+    let vless = serde_json::json!({
+        "type": "vless", "server": "vless.example.test", "port": 443,
+        "uuid": "00000000-0000-0000-0000-000000000002",
+        "tls": {"server_name": "vless.example.test", "insecure": true,
+                "pinned_public_key_sha256": [PIN]}
+    });
+    for outbound in [hysteria2, vless] {
+        let error = share_link("Pinned", &outbound).unwrap_err();
+        assert_eq!(error, "certificate public key pins have no share link form");
+    }
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+        .collect()
 }

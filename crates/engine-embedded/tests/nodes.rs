@@ -565,3 +565,104 @@ fn vless_xhttp_nodes_build_with_their_extra_settings() {
     let (envelope, _) = single_node_envelope("p", &[vless_xhttp], None).unwrap();
     assert_eq!(builds(&envelope), "vless");
 }
+
+/// Subscription pins reach every TLS and QUIC outbound the registry builds,
+/// and a pin the engine cannot read fails the build instead of being
+/// dropped.
+#[test]
+fn certificate_pins_reach_the_built_outbounds() {
+    // A certificate digest in hex and a public key digest in base64, of the
+    // same 32 bytes, so both lists show the same hex.
+    const CERTIFICATE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const PUBLIC_KEY: &str = "ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8=";
+    const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let pinned = |id: &str, protocol: Protocol, own: &[(&str, &str)]| {
+        let mut metadata = own.to_vec();
+        metadata.extend([
+            ("tls.insecure", "true"),
+            ("tls.certificate_sha256", CERTIFICATE),
+            ("tls.certificate_public_key_sha256", PUBLIC_KEY),
+        ]);
+        node(id, protocol, &metadata)
+    };
+    #[allow(unused_mut)]
+    let mut nodes = vec![
+        (
+            "trojan",
+            pinned("trojan", Protocol::Trojan, &[("trojan.password", "secret")]),
+        ),
+        (
+            "vless",
+            pinned(
+                "vless",
+                Protocol::Vless,
+                &[("vless.uuid", UUID), ("tls.enabled", "true")],
+            ),
+        ),
+    ];
+    #[cfg(feature = "vmess")]
+    nodes.push((
+        "vmess",
+        pinned(
+            "vmess",
+            Protocol::Vmess,
+            &[("vmess.uuid", UUID), ("tls.enabled", "true")],
+        ),
+    ));
+    #[cfg(feature = "hysteria2")]
+    nodes.push((
+        "hysteria2",
+        pinned(
+            "hysteria2",
+            Protocol::Hysteria2,
+            &[("hysteria2.password", "secret")],
+        ),
+    ));
+    #[cfg(feature = "tuic")]
+    nodes.push((
+        "tuic",
+        pinned(
+            "tuic",
+            Protocol::Tuic,
+            &[("tuic.uuid", UUID), ("tuic.password", "secret")],
+        ),
+    ));
+
+    for (protocol, node) in nodes {
+        let outbound = outbound_for_node(&node).unwrap();
+        // VLESS and VMess keep their TLS settings in `tls`, the others at
+        // the top level.
+        let tls = if outbound["tls"].is_object() {
+            &outbound["tls"]
+        } else {
+            &outbound
+        };
+        assert_eq!(tls["insecure"], true, "{protocol}");
+        assert_eq!(
+            tls["pinned_certificate_sha256"],
+            serde_json::json!([CERTIFICATE]),
+            "{protocol}"
+        );
+        assert_eq!(
+            tls["pinned_public_key_sha256"],
+            serde_json::json!([CERTIFICATE]),
+            "{protocol}"
+        );
+        let (envelope, _) = single_node_envelope("p", std::slice::from_ref(&node), None).unwrap();
+        assert_eq!(builds(&envelope), protocol);
+
+        let mut envelope: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        let entry = if envelope["outbound"]["tls"].is_object() {
+            &mut envelope["outbound"]["tls"]
+        } else {
+            &mut envelope["outbound"]
+        };
+        entry["pinned_certificate_sha256"] = serde_json::json!(["not a sha-256 digest"]);
+        let config = RuntimeConfig::from_json(envelope.to_string().as_bytes()).unwrap();
+        let message = match config.build_outbound(&default_registry(), Arc::new(TcpDialer)) {
+            Ok(_) => panic!("{protocol} built with an unreadable pin"),
+            Err(error) => error.message,
+        };
+        assert_eq!(message, format!("{protocol} certificate pins are invalid"));
+    }
+}

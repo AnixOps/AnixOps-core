@@ -48,6 +48,7 @@ fn outbound(host: &str, port: u16, password: &str, congestion: Congestion) -> Tu
         server_name: env("NC_TUIC_SERVER_NAME"),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     };
     let uuid = parse_uuid(&env("NC_TUIC_UUID")).unwrap();
     TuicOutbound::new(host, port, uuid, password, &tls, congestion).unwrap()

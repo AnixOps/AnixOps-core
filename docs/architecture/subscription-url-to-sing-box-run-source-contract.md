@@ -93,7 +93,8 @@ adapter when their rendered metadata is supported.
 sing-box/v2rayN QUIC share-link subset. Hysteria2 and TUIC may be imported as
 local-file share-link parser gates. `hysteria2://` and `hy2://` links are
 normalized as `Protocol::Hysteria2`; they retain the password, optional
-`mport` port-hopping range, `sni`, `alpn`, certificate public-key pin,
+`mport` port-hopping range, `sni`, `alpn`, certificate pin (`pinSHA256`, a
+digest of the whole certificate, kept as `tls.certificate_sha256`),
 `insecure`, and `salamander` or `gecko` obfuscation fields. Gecko packet-size
 fields are retained when present. `tuic://` links are normalized as
 `Protocol::Tuic`; they retain UUID, optional password, `sni`, `alpn`,
@@ -107,8 +108,8 @@ fetching, TUN, DNS, firewall, transparent capture, or QUIC MITM.
 
 `v0.2.0-alpha.9` activates a deterministic local-file V2Ray compatibility
 subset for the Windows GUI. Trojan, VLESS, and VMess share links now retain
-explicit TLS enablement, SNI, insecure, ALPN, certificate public-key pins, and
-uTLS fingerprints. VLESS additionally retains Vision flow and REALITY public
+explicit TLS enablement, SNI, insecure, ALPN, certificate pins (`pcs`, kept as
+`tls.certificate_sha256`), and uTLS fingerprints. VLESS additionally retains Vision flow and REALITY public
 key/short-id; VMess retains `security` and `alter_id`. The supported transport
 subset is WebSocket, gRPC, HTTP/HTTP2 (`type=http`/`h2`), HTTPUpgrade, and
 V2Ray QUIC, with the corresponding host/path/service-name values. The same

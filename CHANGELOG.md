@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+### Security
+
+- 证书固定端到端生效（config-core、node-import、transport-tls 与 TLS/QUIC 出站）：订阅里的证书固定此前到不了引擎。Hysteria2 `pinSHA256` 与 Xray `pcs`（整张证书的摘要）被存进公钥固定的元数据键，sing-box `certificate_public_key_sha256` 存下了却没有代码读取，sing-box `certificate_sha256`、Clash `fingerprint`、Surge `server-cert-fingerprint-sha256`、Loon / Quantumult X `tls-cert-sha256` 与 `tls-pubkey-sha256` 没有解析；node-import 不输出固定，`TlsSettings` 没有固定字段，`insecure` 直接接受任何证书。于是“`insecure=1` + 固定”的自签节点实际不校验证书，路径上的中间人可以冒充服务端，拿到 Hysteria2 密码、TUIC UUID 与令牌、Trojan 密码和 VLESS / VMess UUID。现在：
+  - config-core 新模块 `certificate_pin` 解析两种写法（64 位十六进制，大小写均可、字节间可带 `:` 或 `-`；base64，标准或 URL 字母表、带不带填充）。整张证书的摘要存入新键 `tls.certificate_sha256`（逗号分隔的小写十六进制），公钥（SubjectPublicKeyInfo）摘要存入 `tls.certificate_public_key_sha256`（逗号分隔的标准 base64），上面各格式都解析；不是 SHA-256 摘要的值原样保留，交给导入时拒绝。旧目录在 `tls.certificate_public_key_sha256` 下存的十六进制值仍按整张证书的固定读取。
+  - node-import 把两类固定写成出站的 `pinned_certificate_sha256` / `pinned_public_key_sha256`（十六进制列表；没有固定的节点出站 JSON 与之前相同）。值不是 SHA-256 摘要、或节点没开 TLS 却带固定时，该节点报不支持，不会去掉固定运行。分享链接导出写出 `pcs` / `pinSHA256`；公钥固定没有分享链接写法，导出报错而不是丢掉。
+  - transport-tls：`TlsSettings` 新增 `pinned_certificate_sha256`、`pinned_public_key_sha256` 与 `parse_sha256_pins`，`client_config` 改用 `CertificateCheck` 校验：有固定时叶子证书必须命中其中一个（只认叶子证书，链上其他证书谁都能附上）；不带 `insecure` 时先过 WebPKI 再比固定，带 `insecure` 时固定取代 WebPKI。`insecure` 不带固定仍接受任何证书（握手签名照样校验），构建这样的客户端时记一条 `tracing` 警告，只含服务器名，每个名字每个进程一次。QUIC（Hysteria2、TUIC、XHTTP over HTTP/3）用同一份配置。
+  - `trojan`、`vless` / `vmess` 的 `tls`、`hysteria2`、`tuic` 与 `http`（`"tls": true`）出站接受这两个列表，值不是摘要时构建失败（`<类型> certificate pins are invalid`）；`http` 不开 TLS 却带固定也构建失败。REALITY 不受影响。说明见 `crates/engine-embedded/README.md`「Server certificates」。
+  - 客户端已保存的出站 JSON 是旧导入的结果，不带固定；重新导入订阅后才会带上。
+  - 测试：transport-tls 单元测试（带 / 不带 `insecure` 时固定命中与不命中、只认叶子证书、公钥固定、证书解析失败、摘要解析、警告去重）与真实 TLS 握手测试；Hysteria2、TUIC 进程内服务端验证固定命中时能连、不命中时服务端收不到密码或 UUID，工厂接受与拒绝固定；HTTP 工厂；config-core 各格式的解析；node-import 导入、旧数据兼容、拒绝与分享链接往返。
+
 ### Added
 
 - 节点体检（engine-embedded 新模块 `checkup`，`local-proxy` feature，见 `docs/architecture/node-checkup.md`）：经节点出站测多轮“连接 + TLS 握手”（冷 / 热分开）与 HTTP 请求的中位数、抖动和失败率；可选多连接下载吞吐（每秒曲线、峰值、到量即停）与下载期间的负载下延迟（`bloat_ms`）。口径与 AnixOps Speedtest 一致，只在用户发起时运行，失败只给固定代码。

@@ -31,6 +31,17 @@ Each protocol is its own crate behind a cargo feature; `src/protocols.rs` regist
 
 `cargo build -p engine-embedded --no-default-features --features vless` builds a runtime with only VLESS and direct; any other `type` is rejected with `config_rejected`. To add a protocol: create an `outbound-<name>` crate that implements `TcpOutbound` and `engine_outbound::registry::OutboundFactory`, add it as an optional dependency with a feature here, and register its factory in `protocols::default_registry`. `EmbeddedRuntime::with_registry` accepts a caller-built registry, for protocol crates kept outside this repository. The CI job `Protocol feature matrix` builds, lints and runs the C ABI contract tests with each feature alone.
 
+## Server certificates
+
+The TLS and QUIC clients of the outbounds (`trojan`; `vless` and `vmess` with `tls`; `http` with `"tls": true`; `hysteria2`; `tuic`; XHTTP over HTTP/3) check the server certificate in `transport-tls`:
+
+- By default the chain must lead to a WebPKI root and name the server (`server_name`, else `server`).
+- `pinned_certificate_sha256` (SHA-256 of the whole leaf certificate, DER) and `pinned_public_key_sha256` (SHA-256 of its SubjectPublicKeyInfo, DER) are lists of 64 hex digits, either case, `:` or `-` between the bytes allowed. With pins the leaf certificate must match one pin of either list: on top of WebPKI, or in its place with `insecure`, which is how a self-signed server is pinned. Only the leaf counts, never the rest of the chain. The lists sit next to `insecure`: at the top level of `trojan`, `hysteria2`, `tuic` and `http` (where pins without `tls` fail the build), inside `tls` for `vless` and `vmess`. A value that is not a SHA-256 digest fails the build with `<type> certificate pins are invalid`.
+- `insecure` without a pin accepts any certificate; only the handshake signature is still checked. Anyone on the path can then stand in for the server and read what the protocol sends, credentials included, so building such a client logs a `tracing` warning with the server name, once per name per process.
+- REALITY (`vless` with `reality`) authenticates the server with its own key and takes no pins.
+
+`node-import` fills the lists from subscription pins: share-link `pinSHA256` and `pcs`, sing-box `certificate_sha256` and `certificate_public_key_sha256`, Clash `fingerprint`, Surge `server-cert-fingerprint-sha256`, Loon and Quantumult X `tls-cert-sha256` and `tls-pubkey-sha256`. A node whose pin is not a SHA-256 digest is reported unsupported instead of running without it.
+
 ## Proxy chains (`via`)
 
 An outbound may set `via`: the id of another node in `routing.outbounds` (nodes naming the same one share it, for example one iWAN session) or an inline outbound object (the only form a single `outbound` takes). Its TCP connections and its datagrams to the server then go through that outbound (`engine_outbound::OutboundDialer`). Chains are at most 4 outbounds long and loops are rejected. Protocols that open their own sockets (`hysteria2`, `tuic`, `iwan`) cannot use a `via`. See `docs/architecture/outbound-via.md`; `tests/via_chain.rs` runs a Shadowsocks-2022 node through an in-process iWAN line.

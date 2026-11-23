@@ -114,6 +114,7 @@ fn client(server: SocketAddr, uuid: &str, password: &str, congestion: Congestion
         server_name: "tuic.test".into(),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     };
     TuicOutbound::new(
         server.ip().to_string(),

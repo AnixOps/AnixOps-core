@@ -119,6 +119,7 @@ fn client(server: SocketAddr, password: &str, obfs: bool) -> Hysteria2Outbound {
         server_name: "hy2.test".into(),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     };
     let outbound =
         Hysteria2Outbound::new(server.ip().to_string(), server.port(), password, &tls).unwrap();

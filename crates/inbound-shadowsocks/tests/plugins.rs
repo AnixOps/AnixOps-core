@@ -182,6 +182,7 @@ impl WsDialer {
                 server_name: "ss.test".to_owned(),
                 alpn: Vec::new(),
                 insecure: true,
+                ..TlsSettings::default()
             })
             .unwrap()
         });

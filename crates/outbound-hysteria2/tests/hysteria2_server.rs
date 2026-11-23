@@ -12,7 +12,7 @@ use engine_outbound::{TargetAddr, TcpDialer, TcpOutbound};
 use outbound_hysteria2::{
     put_varint, read_varint, Hysteria2Factory, Hysteria2Outbound, AUTH_OK_STATUS, TCP_REQUEST_ID,
 };
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use transport_quic::salamander::{Salamander, SalamanderSocket};
@@ -23,6 +23,12 @@ const PASSWORD: &str = "correct horse";
 struct TestServer {
     addr: SocketAddr,
     connections: Arc<AtomicUsize>,
+    /// Authentication requests received, password included.
+    auth_requests: Arc<AtomicUsize>,
+    /// SHA-256 of the server's certificate (DER).
+    certificate_sha256: [u8; 32],
+    /// SHA-256 of the certificate's SubjectPublicKeyInfo (DER).
+    public_key_sha256: [u8; 32],
 }
 
 async fn hysteria2_server() -> TestServer {
@@ -48,6 +54,8 @@ async fn hysteria2_server_with(obfs: Option<&str>) -> TestServer {
     )
     .unwrap();
     crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let certificate_sha256 = sha256(cert.der());
+    let public_key_sha256 = sha256(&key.subject_public_key_info());
     let config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto).unwrap(),
     ));
@@ -72,23 +80,42 @@ async fn hysteria2_server_with(obfs: Option<&str>) -> TestServer {
     };
     let addr = endpoint.local_addr().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
+    let auth_requests = Arc::new(AtomicUsize::new(0));
     let counter = connections.clone();
+    let auth_counter = auth_requests.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let counter = counter.clone();
+            let auth_counter = auth_counter.clone();
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
-                serve_connection(connection).await;
+                serve_connection(connection, auth_counter).await;
             });
         }
     });
-    TestServer { addr, connections }
+    TestServer {
+        addr,
+        connections,
+        auth_requests,
+        certificate_sha256,
+        public_key_sha256,
+    }
 }
 
-async fn serve_connection(connection: quinn::Connection) {
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    digest
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn serve_connection(connection: quinn::Connection, auth_requests: Arc<AtomicUsize>) {
     let Ok(mut h3) =
         h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection.clone()))
             .await
@@ -101,6 +128,7 @@ async fn serve_connection(connection: quinn::Connection) {
     let Ok((request, mut stream)) = resolver.resolve_request().await else {
         return;
     };
+    auth_requests.fetch_add(1, Ordering::SeqCst);
     let authorized = request.method() == http::Method::POST
         && request.uri().path() == "/auth"
         && request.uri().host() == Some("hysteria")
@@ -172,6 +200,7 @@ fn tls() -> TlsSettings {
         server_name: "hy2.test".to_owned(),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     }
 }
 
@@ -357,4 +386,126 @@ async fn factory_builds_from_settings_and_rejects_obfs() {
     };
     assert!(err.contains("obfs"));
     assert!(!err.contains("cry me a river"));
+}
+
+/// `pinSHA256` with `insecure=1` is how self-signed servers are pinned: the
+/// pinned certificate (or its public key) connects, any other one fails the
+/// handshake before the password leaves the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pins_decide_whether_the_password_is_sent() {
+    let server = hysteria2_server().await;
+    let target = || TargetAddr::Domain("echo.test".to_owned(), 80);
+
+    let pinned = TlsSettings {
+        pinned_certificate_sha256: vec![server.certificate_sha256],
+        ..tls()
+    };
+    let outbound =
+        Hysteria2Outbound::new("127.0.0.1", server.addr.port(), PASSWORD, &pinned).unwrap();
+    assert_eq!(
+        round_trip(&outbound, target(), b"pinned").await,
+        b"echo.test:80|pinned"
+    );
+
+    let public_key = TlsSettings {
+        pinned_public_key_sha256: vec![server.public_key_sha256],
+        ..tls()
+    };
+    let outbound =
+        Hysteria2Outbound::new("127.0.0.1", server.addr.port(), PASSWORD, &public_key).unwrap();
+    assert_eq!(
+        round_trip(&outbound, target(), b"spki").await,
+        b"echo.test:80|spki"
+    );
+    assert_eq!(server.auth_requests.load(Ordering::SeqCst), 2);
+
+    let mut other = server.certificate_sha256;
+    other[0] ^= 1;
+    for wrong in [
+        // Another certificate's digest, with insecure.
+        TlsSettings {
+            pinned_certificate_sha256: vec![other],
+            ..tls()
+        },
+        // The certificate's digest as a public key pin.
+        TlsSettings {
+            pinned_public_key_sha256: vec![server.certificate_sha256],
+            ..tls()
+        },
+        // The right pin without insecure: the self-signed certificate still
+        // has to pass WebPKI.
+        TlsSettings {
+            insecure: false,
+            pinned_certificate_sha256: vec![server.certificate_sha256],
+            ..tls()
+        },
+    ] {
+        let outbound =
+            Hysteria2Outbound::new("127.0.0.1", server.addr.port(), PASSWORD, &wrong).unwrap();
+        assert!(outbound.connect(&target()).await.is_err());
+    }
+    assert_eq!(server.auth_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn factory_takes_certificate_pins() {
+    let server = hysteria2_server().await;
+    let mut registry = OutboundRegistry::new();
+    registry.register(Arc::new(Hysteria2Factory));
+    let settings = |pins: serde_json::Value| {
+        let mut settings = serde_json::json!({
+            "server": "127.0.0.1",
+            "port": server.addr.port(),
+            "password": PASSWORD,
+            "server_name": "hy2.test",
+            "insecure": true,
+        });
+        settings["pinned_certificate_sha256"] = pins;
+        settings
+    };
+
+    let pinned = settings(serde_json::json!([hex(&server.certificate_sha256)]));
+    let outbound = registry
+        .build(
+            "hysteria2",
+            pinned.as_object().unwrap(),
+            Arc::new(TcpDialer),
+        )
+        .unwrap();
+    let echoed = round_trip(
+        outbound.as_ref(),
+        TargetAddr::Domain("echo.test".to_owned(), 80),
+        b"factory",
+    )
+    .await;
+    assert_eq!(echoed, b"echo.test:80|factory");
+    assert_eq!(server.auth_requests.load(Ordering::SeqCst), 1);
+
+    let mut other = server.certificate_sha256;
+    other[31] ^= 1;
+    let wrong = settings(serde_json::json!([hex(&other)]));
+    let outbound = registry
+        .build("hysteria2", wrong.as_object().unwrap(), Arc::new(TcpDialer))
+        .unwrap();
+    assert!(outbound
+        .connect(&TargetAddr::Domain("echo.test".to_owned(), 80))
+        .await
+        .is_err());
+    assert_eq!(server.auth_requests.load(Ordering::SeqCst), 1);
+
+    for invalid in [
+        serde_json::json!(["not a digest"]),
+        serde_json::json!([hex(&server.certificate_sha256[..31])]),
+    ] {
+        let invalid = settings(invalid);
+        let err = match registry.build(
+            "hysteria2",
+            invalid.as_object().unwrap(),
+            Arc::new(TcpDialer),
+        ) {
+            Ok(_) => panic!("an invalid pin built"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "hysteria2 certificate pins are invalid");
+    }
 }

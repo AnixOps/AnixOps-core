@@ -6,7 +6,7 @@ use engine_outbound::registry::{parse_settings, BuildError, OutboundFactory, Set
 use engine_outbound::{Dialer, TcpOutbound};
 use serde::Deserialize;
 use transport_grpc::{GrpcConnector, GrpcSettings};
-use transport_tls::{TlsConnector, TlsSettings};
+use transport_tls::{parse_sha256_pins, TlsConnector, TlsSettings};
 use transport_ws::{WsConnector, WsSettings};
 use transport_xhttp::{
     HttpVersion, Security as XhttpSecurity, XhttpConnector, XhttpSettings, XhttpTarget,
@@ -45,8 +45,16 @@ struct StandardTlsSettings {
     server_name: Option<String>,
     #[serde(default)]
     alpn: Vec<String>,
+    /// Skip WebPKI verification (`allowInsecure=1`); the pins below still
+    /// apply.
     #[serde(default)]
     insecure: bool,
+    /// SHA-256 digests of the server's leaf certificate in hex (`pcs`).
+    #[serde(default)]
+    pinned_certificate_sha256: Vec<String>,
+    /// SHA-256 digests of the leaf certificate's public key (SPKI) in hex.
+    #[serde(default)]
+    pinned_public_key_sha256: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -102,21 +110,30 @@ impl OutboundFactory for VmessFactory {
             ),
             _ => None,
         };
-        let tls = settings.tls.map(|tls| TlsSettings {
-            server_name: tls
-                .server_name
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| settings.server.clone()),
-            // gRPC and XHTTP over HTTP/2 need ALPN `h2`.
-            alpn: if tls.alpn.is_empty()
-                && (grpc_transport || xhttp_version == Some(HttpVersion::Http2))
-            {
-                vec!["h2".to_owned()]
-            } else {
-                tls.alpn
-            },
-            insecure: tls.insecure,
-        });
+        let tls = settings
+            .tls
+            .map(|tls| -> Result<TlsSettings, BuildError> {
+                Ok(TlsSettings {
+                    server_name: tls
+                        .server_name
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| settings.server.clone()),
+                    // gRPC and XHTTP over HTTP/2 need ALPN `h2`.
+                    alpn: if tls.alpn.is_empty()
+                        && (grpc_transport || xhttp_version == Some(HttpVersion::Http2))
+                    {
+                        vec!["h2".to_owned()]
+                    } else {
+                        tls.alpn
+                    },
+                    insecure: tls.insecure,
+                    pinned_certificate_sha256: parse_sha256_pins(&tls.pinned_certificate_sha256)
+                        .ok_or("vmess certificate pins are invalid")?,
+                    pinned_public_key_sha256: parse_sha256_pins(&tls.pinned_public_key_sha256)
+                        .ok_or("vmess certificate pins are invalid")?,
+                })
+            })
+            .transpose()?;
         let default_host = tls
             .as_ref()
             .map_or(settings.server.as_str(), |tls| tls.server_name.as_str());

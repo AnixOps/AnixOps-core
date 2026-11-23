@@ -192,6 +192,7 @@ impl Upstream {
                         server_name: name,
                         alpn: vec!["doq".to_string()],
                         insecure: false,
+                        ..transport_tls::TlsSettings::default()
                     },
                     &["doq"],
                     transport_quic::Congestion::Cubic,
@@ -213,6 +214,7 @@ impl Upstream {
                     server_name: name,
                     alpn: vec![alpn.to_string()],
                     insecure: false,
+                    ..transport_tls::TlsSettings::default()
                 })
                 .map_err(|_| UpstreamError::Invalid)?;
                 if scheme == "tls" {

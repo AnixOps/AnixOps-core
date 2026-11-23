@@ -1,7 +1,7 @@
 //! QUIC transport for QUIC-based protocols (Hysteria2, TUIC, ...): quinn
-//! over rustls, with TLS settings, roots and the `insecure` verifier from
-//! `transport-tls` on the client side, and [`server_endpoint`] for server
-//! inbounds.
+//! over rustls, with TLS settings, roots, certificate pins and `insecure`
+//! from `transport-tls` on the client side, and [`server_endpoint`] for
+//! server inbounds.
 //!
 //! [`QuicConnector`] resolves the server, binds a UDP socket of the matching
 //! family and returns an established [`QuicConnection`]; the protocol crate

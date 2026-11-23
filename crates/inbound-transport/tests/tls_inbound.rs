@@ -108,6 +108,7 @@ async fn tls_echo(addr: SocketAddr, alpn: &[&str]) {
         server_name: "node.test".into(),
         alpn: alpn.iter().map(|p| p.to_string()).collect(),
         insecure: true,
+        ..TlsSettings::default()
     })
     .unwrap();
     let transport: BoxStream = Box::new(TcpStream::connect(addr).await.unwrap());

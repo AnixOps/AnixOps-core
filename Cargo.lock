@@ -3765,10 +3765,12 @@ version = "0.2.0"
 dependencies = [
  "engine-outbound",
  "rcgen",
+ "ring",
  "rustls",
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "webpki-roots",
 ]
 

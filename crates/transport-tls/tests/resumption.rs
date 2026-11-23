@@ -72,6 +72,7 @@ async fn most_handshakes_resume_alone_and_in_bursts() {
         server_name: "localhost".into(),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     })
     .unwrap();
 

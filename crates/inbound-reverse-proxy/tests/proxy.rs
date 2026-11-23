@@ -311,6 +311,7 @@ async fn terminates_tls_and_reports_https() {
             server_name: "a.example".into(),
             alpn: vec!["http/1.1".into()],
             insecure: true,
+            ..transport_tls::TlsSettings::default()
         })
         .unwrap();
         let tcp: BoxStream = Box::new(TcpStream::connect(proxy).await.unwrap());

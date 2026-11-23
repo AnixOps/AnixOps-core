@@ -97,6 +97,7 @@ pub(crate) fn tls_for(url: &ProbeUrl) -> Result<Option<TlsConnector>, DelayError
         server_name: url.host.clone(),
         alpn: vec!["http/1.1".to_string()],
         insecure: false,
+        ..TlsSettings::default()
     })
     .map(Some)
     .map_err(|_| DelayError::InvalidUrl)

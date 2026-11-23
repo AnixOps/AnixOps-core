@@ -61,6 +61,7 @@ fn outbound(host: &str, port: u16, password: &str, salamander: bool) -> Hysteria
         server_name: env("NC_HYSTERIA2_SERVER_NAME"),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     };
     let outbound = Hysteria2Outbound::new(host, port, password, &tls).unwrap();
     if salamander {

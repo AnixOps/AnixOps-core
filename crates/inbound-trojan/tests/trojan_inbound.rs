@@ -136,6 +136,7 @@ fn tls() -> TlsSettings {
         server_name: "trojan.test".into(),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     }
 }
 

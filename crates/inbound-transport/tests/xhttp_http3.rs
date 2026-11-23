@@ -111,6 +111,7 @@ fn tls(alpn: &[&str]) -> TlsSettings {
         server_name: SERVER_NAME.into(),
         alpn: alpn.iter().map(|protocol| protocol.to_string()).collect(),
         insecure: true,
+        ..TlsSettings::default()
     }
 }
 

@@ -16,6 +16,7 @@ pub mod share_link;
 
 pub use share_link::share_link;
 
+use config_core::certificate_pin;
 use config_core::routing::RoutingSpec;
 use config_core::routing_import::{import_subscription_routing, ImportedRuleSet};
 use control_domain::{
@@ -31,7 +32,8 @@ use control_domain::{
     NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SNELL_MODE, NODE_METADATA_SNELL_OBFS,
     NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI, NODE_METADATA_SNELL_PSK,
     NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY, NODE_METADATA_SNELL_VERSION,
-    NODE_METADATA_TLS_ALPN, NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE,
+    NODE_METADATA_TLS_ALPN, NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+    NODE_METADATA_TLS_CERTIFICATE_SHA256, NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE,
     NODE_METADATA_TLS_REALITY_PUBLIC_KEY, NODE_METADATA_TLS_REALITY_SHORT_ID,
     NODE_METADATA_TLS_SERVER_NAME, NODE_METADATA_TLS_UTLS_FINGERPRINT,
     NODE_METADATA_TROJAN_PASSWORD, NODE_METADATA_TUIC_CONGESTION_CONTROL,
@@ -498,7 +500,7 @@ fn vless(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         "server": node.endpoint.host,
         "port": node.endpoint.port,
         "uuid": uuid,
-        "tls": standard_tls(node),
+        "tls": standard_tls(node)?,
         "transport": transport,
     }))
 }
@@ -525,7 +527,7 @@ fn vmess(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         "port": node.endpoint.port,
         "uuid": uuid,
         "security": security,
-        "tls": standard_tls(node),
+        "tls": standard_tls(node)?,
         "transport": transport,
     }))
 }
@@ -545,7 +547,8 @@ fn hysteria2(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         }),
         Some(_) => return Err("hysteria2 obfs other than salamander is not implemented yet"),
     };
-    Ok(json!({
+    let pins = certificate_pins(node)?;
+    let mut outbound = json!({
         "type": "hysteria2",
         "server": node.endpoint.host,
         "port": node.endpoint.port,
@@ -554,7 +557,9 @@ fn hysteria2(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         "alpn": alpn_list(node),
         "insecure": metadata(node, NODE_METADATA_TLS_INSECURE) == Some("true"),
         "obfs": obfs,
-    }))
+    });
+    pins.insert_into(&mut outbound);
+    Ok(outbound)
 }
 
 /// TUIC v5 over QUIC (TLS 1.3 always on). The UDP relay mode does not matter
@@ -564,7 +569,8 @@ fn tuic(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     let password = metadata(node, NODE_METADATA_TUIC_PASSWORD)
         .filter(|password| !password.is_empty())
         .ok_or("tuic password is missing (tuic v4 tokens are not supported)")?;
-    Ok(json!({
+    let pins = certificate_pins(node)?;
+    let mut outbound = json!({
         "type": "tuic",
         "server": node.endpoint.host,
         "port": node.endpoint.port,
@@ -574,7 +580,9 @@ fn tuic(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         "alpn": alpn_list(node),
         "insecure": metadata(node, NODE_METADATA_TLS_INSECURE) == Some("true"),
         "congestion_control": metadata(node, NODE_METADATA_TUIC_CONGESTION_CONTROL),
-    }))
+    });
+    pins.insert_into(&mut outbound);
+    Ok(outbound)
 }
 
 /// Snell v1–v4 and v6 (v5 runs as v4). A missing version means 1, as in
@@ -819,16 +827,89 @@ fn anx(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     Ok(outbound)
 }
 
-/// The standard TLS entry when the node enables TLS, otherwise `null`.
-fn standard_tls(node: &NodeDescriptor) -> Value {
+/// The standard TLS entry when the node enables TLS, otherwise `null`. A node
+/// with certificate pins but without TLS is unsupported: there would be no
+/// certificate to check them against.
+fn standard_tls(node: &NodeDescriptor) -> Result<Value, Unsupported> {
+    let pins = certificate_pins(node)?;
     if metadata(node, NODE_METADATA_TLS_ENABLED) != Some("true") {
-        return Value::Null;
+        if !pins.is_empty() {
+            return Err("certificate pins are set on a node without tls");
+        }
+        return Ok(Value::Null);
     }
-    json!({
+    let mut tls = json!({
         "server_name": metadata(node, NODE_METADATA_TLS_SERVER_NAME),
         "alpn": alpn_list(node),
         "insecure": metadata(node, NODE_METADATA_TLS_INSECURE) == Some("true"),
-    })
+    });
+    pins.insert_into(&mut tls);
+    Ok(tls)
+}
+
+/// A node's certificate pins as the engine's `pinned_certificate_sha256`
+/// and `pinned_public_key_sha256` lists of lowercase hex digests.
+#[derive(Default)]
+struct CertificatePins {
+    certificate: Vec<String>,
+    public_key: Vec<String>,
+}
+
+impl CertificatePins {
+    fn is_empty(&self) -> bool {
+        self.certificate.is_empty() && self.public_key.is_empty()
+    }
+
+    /// Adds the lists to `tls`, an outbound or its `tls` entry; a node
+    /// without pins gets the same entry as before pins existed.
+    fn insert_into(self, tls: &mut Value) {
+        if !self.certificate.is_empty() {
+            tls["pinned_certificate_sha256"] = json!(self.certificate);
+        }
+        if !self.public_key.is_empty() {
+            tls["pinned_public_key_sha256"] = json!(self.public_key);
+        }
+    }
+}
+
+/// The pins of `node`. A value that is not a SHA-256 digest makes the node
+/// unsupported: running it without that pin would trust whichever server
+/// answers, which is what the pin is there to prevent.
+fn certificate_pins(node: &NodeDescriptor) -> Result<CertificatePins, Unsupported> {
+    let mut pins = CertificatePins::default();
+    for pin in metadata_list(node, NODE_METADATA_TLS_CERTIFICATE_SHA256) {
+        let digest =
+            certificate_pin::parse(pin).ok_or("tls certificate pin is not a sha-256 digest")?;
+        push_unique(&mut pins.certificate, certificate_pin::to_hex(&digest));
+    }
+    for pin in metadata_list(node, NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256) {
+        // Imports before `tls.certificate_sha256` existed kept Hysteria2
+        // `pinSHA256` and Xray `pcs` certificate digests here, in hex. Public
+        // key digests are kept in base64.
+        if let Some(digest) = certificate_pin::parse_hex(pin) {
+            push_unique(&mut pins.certificate, certificate_pin::to_hex(&digest));
+        } else {
+            let digest = certificate_pin::parse_base64(pin)
+                .ok_or("tls public key pin is not a sha-256 digest")?;
+            push_unique(&mut pins.public_key, certificate_pin::to_hex(&digest));
+        }
+    }
+    Ok(pins)
+}
+
+/// The non-empty values of a comma-separated metadata entry.
+fn metadata_list<'a>(node: &'a NodeDescriptor, key: &str) -> impl Iterator<Item = &'a str> {
+    metadata(node, key)
+        .into_iter()
+        .flat_map(|list| list.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
 }
 
 /// `null` for tcp, the `ws` or `grpc` transport entry, or unsupported.
@@ -909,7 +990,8 @@ fn trojan(node: &NodeDescriptor) -> Result<Value, Unsupported> {
     if metadata(node, NODE_METADATA_TLS_ENABLED) == Some("false") {
         return Err("trojan without tls is not supported");
     }
-    Ok(json!({
+    let pins = certificate_pins(node)?;
+    let mut outbound = json!({
         "type": "trojan",
         "server": node.endpoint.host,
         "port": node.endpoint.port,
@@ -918,5 +1000,7 @@ fn trojan(node: &NodeDescriptor) -> Result<Value, Unsupported> {
         "alpn": alpn_list(node),
         "insecure": metadata(node, NODE_METADATA_TLS_INSECURE) == Some("true"),
         "transport": transport,
-    }))
+    });
+    pins.insert_into(&mut outbound);
+    Ok(outbound)
 }

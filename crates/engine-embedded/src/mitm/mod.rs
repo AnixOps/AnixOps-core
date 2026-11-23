@@ -243,6 +243,7 @@ impl MitmEngine {
                 server_name: String::new(),
                 alpn: vec!["http/1.1".to_string()],
                 insecure: false,
+                ..transport_tls::TlsSettings::default()
             })
             .map_err(|_| "mitm upstream TLS is unavailable")?,
         );

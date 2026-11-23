@@ -340,6 +340,7 @@ Before describing VLESS + REALITY as usable on iOS, the maintainer records here
 - 节点内核的地址段拦截（`PUT /v1/rules` 的 `block_cidrs`、`GET /v1/rules/counters`、feature `block_cidrs`）需要重新发布：内核发布包必须从包含 `block_cidrs` 的 networkcore 版本重新构建。发布前出口节点开启“拒绝中国大陆目标”时，Agent 只记一条警告，不下发、不计数。
 - Windows TUN 模式（`platform-windows::tun` + `engine-outbound::protect`）只能在真机验收：CI 没有 Wintun 驱动和管理员网络栈。需要在 Windows 10/11 x64 上以管理员运行客户端，确认 Wintun 网卡 `AnixOps Net` 出现、`route print` 有 `0.0.0.0/1`、`128.0.0.0/1`（及 IPv6 `::/1`、`8000::/1`）走该网卡、浏览器与命令行流量经代理、代理服务器连接不回环（任务管理器无 CPU 飙升、连接可用）、断开后网卡与路由消失、默认路由仍在。已知限制：DNS 服务器在本地网段（如路由器 192.168.1.1）时 Windows 可能并发向物理网卡 DNS 查询；切换 Wi-Fi/有线后需重连 TUN 才会换绑物理网卡。
 - 24 h 长稳（`.github/workflows/soak.yml`，F7）需要一台本仓库可用的自托管 Linux runner：GitHub 托管 job 6 h 即被终止，所以每周定时只跑 5.5 h。本仓库是公开仓库，需在组织的 runner group 设置里允许公开仓库使用该 runner（或专门给一台隔离机器打标签，例如 `soak`），runner 用户需要免密 sudo 来创建 TUN 设备（`ip tuntap`）。准备好后手动触发 `Tunnel soak`：`runner=self-hosted`、`hours=24`、`runner_label=<标签>`。门槛：预热后 RSS 斜率 ≤ 1 MiB/h、连接失败率 ≤ 0.1%、结束后无残留 TCP 流和文件描述符。
+- 证书固定（`pinned_certificate_sha256` / `pinned_public_key_sha256`，见 `crates/engine-embedded/README.md`「Server certificates」）只对重新生成的出站生效：客户端（AnixOps/anixops-net）保存的出站 JSON 来自旧版导入，不带固定，升级内核后需要客户端重新导入订阅或在启动时用 node-import 重新生成出站，并升级客户端引用的内核版本。内核对“`insecure` 且没有固定”的出站只经 `tracing` 发一条警告，本仓库的可执行文件和客户端目前都没有安装 tracing subscriber，接入日志之前这条警告看不到；客户端最好在节点详情里也标出这类节点。
 - NetworkCore 的首批诊断库不含宿主运行时事件接线。后续实现真实观察源、宿主认证身份和持久化发送适配后，需在 CI 中补 Agent/Control 的端到端验收，再安排环境演练。
 
 
