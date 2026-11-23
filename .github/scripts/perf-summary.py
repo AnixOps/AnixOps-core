@@ -136,10 +136,26 @@ def scale_summary(root):
                 value = fmt(raw) + (f" {unit}" if unit and raw is not None else "")
             print(f"| {label} | {value} |")
         print()
-    for path in sorted(root.glob("scale-*.json")):
-        report = json.loads(path.read_text())
+    reports = [json.loads(path.read_text()) for path in sorted(root.glob("scale-*.json"))]
+    if len(reports) > 1:
+        print(f"#### {reports[0].get('concurrent')} connections at once, by outbound")
+        print()
+        print("| Outbound | Result | Established | Time to open all | Echo p99 | Memory per connection |")
+        print("| --- | --- | ---: | ---: | ---: | ---: |")
+        for report in reports:
+            print(
+                f"| `{report.get('outbound')}` | {verdict(report)} | {fmt(report.get('established'))} "
+                f"| {fmt(report.get('open_secs'))} s | {fmt(report.get('echo_p99_ms'))} ms "
+                f"| {fmt(report.get('per_conn_kb'))} KiB |"
+            )
+        print()
+    for report in reports:
         outbound = report.get("outbound")
-        print(f"#### {report.get('concurrent')} connections at once, outbound `{outbound}`: {verdict(report)}")
+        title = f"{report.get('concurrent')} connections at once, outbound `{outbound}`: {verdict(report)}"
+        if len(reports) > 1:
+            print(f"<details><summary>{title}</summary>")
+        else:
+            print(f"#### {title}")
         print()
         print("| Metric | Value |")
         print("| --- | ---: |")
@@ -162,7 +178,10 @@ def scale_summary(root):
             value = fmt(raw) + (f" {unit}" if unit and raw is not None else "")
             print(f"| {label} | {value} |")
         print()
-    if not udp.exists() and not any(root.glob("scale-*.json")):
+        if len(reports) > 1:
+            print("</details>")
+            print()
+    if not udp.exists() and not reports:
         print("No results.")
 
 

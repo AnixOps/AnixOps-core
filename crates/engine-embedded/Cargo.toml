@@ -129,6 +129,10 @@ etherparse = "0.16"
 inbound-iwan = { path = "../inbound-iwan" }
 inbound-mixed = { path = "../inbound-mixed" }
 inbound-shadowsocks = { path = "../inbound-shadowsocks" }
+# examples/tunnel_bench.rs: the servers of the outbounds it measures.
+inbound-trojan = { path = "../inbound-trojan" }
+inbound-vless = { path = "../inbound-vless" }
+inbound-vmess = { path = "../inbound-vmess" }
 # tests/rule_sets.rs: signs lists for the signature check.
 ring = "0.17"
 # src/dns_quic.rs: an in-process DNS over QUIC server.
@@ -142,7 +146,7 @@ libc = "0.2"
 
 [[example]]
 name = "tunnel_bench"
-required-features = ["shadowsocks"]
+required-features = ["http", "shadowsocks", "socks", "trojan", "vless", "vmess", "wireguard"]
 
 # Capture quality and overhead gates (.github/workflows/capture-gates.yml).
 [[example]]
