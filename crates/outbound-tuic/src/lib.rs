@@ -38,6 +38,7 @@ use engine_outbound::{
     BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpOutbound, UdpFlow,
 };
 use tokio::sync::Mutex;
+use transport_quic::shared::{Hold, Shared};
 use transport_quic::{quic_error, quinn, Congestion, QuicConnection, QuicConnector, QuicStream};
 use transport_tls::TlsSettings;
 
@@ -57,7 +58,10 @@ pub struct TuicOutbound {
     uuid: [u8; 16],
     password: Vec<u8>,
     quic: QuicConnector,
-    session: Mutex<Option<Session>>,
+    /// The connection new flows use. Every flow holds it
+    /// ([`transport_quic::shared::Hold`]), so a connection taken out of
+    /// this slot (retired) stays open until its last flow ends.
+    session: Mutex<Option<Arc<Shared<Session>>>>,
     /// Bumped by [`TcpOutbound::reset_sessions`]; a session from an older
     /// generation is never reused.
     generation: AtomicU64,
@@ -65,7 +69,8 @@ pub struct TuicOutbound {
 
 /// One authenticated QUIC connection.
 struct Session {
-    quic: QuicConnection,
+    /// Owns the endpoint that drives the connection's socket.
+    _quic: QuicConnection,
     /// The outbound's generation when this session was opened.
     generation: u64,
     /// Started with the first UDP session.
@@ -96,45 +101,53 @@ impl TuicOutbound {
 
     /// Opens a UDP association on the shared connection.
     pub async fn udp_session(&self) -> io::Result<TuicUdpSession> {
-        let (connection, dispatch) = {
-            let mut session = self.session.lock().await;
-            let current = self.live(&mut session).await?;
-            let connection = current.quic.connection.clone();
-            let dispatch = current
-                .udp
-                .get_or_init(|| udp::Dispatch::new(connection.clone()))
-                .clone();
-            (connection, dispatch)
-        };
-        TuicUdpSession::new(connection, dispatch)
+        let hold = self.live().await?;
+        let shared = hold.shared();
+        let connection = shared.connection().clone();
+        let dispatch = shared
+            .value()
+            .udp
+            .get_or_init(|| udp::Dispatch::new(connection.clone()))
+            .clone();
+        Ok(TuicUdpSession::new(connection, dispatch)?.holding(hold))
     }
 
-    /// The live QUIC connection, authenticating a new one if needed.
-    async fn connection(&self) -> io::Result<quinn::Connection> {
+    /// The live QUIC connection, authenticating a new one if needed, with a
+    /// hold that keeps it open for the flow about to use it.
+    async fn connection(&self) -> io::Result<(quinn::Connection, Hold<Session>)> {
+        let hold = self.live().await?;
+        Ok((hold.shared().connection().clone(), hold))
+    }
+
+    async fn live(&self) -> io::Result<Hold<Session>> {
         let mut session = self.session.lock().await;
-        Ok(self.live(&mut session).await?.quic.connection.clone())
-    }
-
-    async fn live<'a>(&self, session: &'a mut Option<Session>) -> io::Result<&'a Session> {
         let generation = self.generation.load(Ordering::Acquire);
-        let open = session.as_ref().is_some_and(|current| {
-            current.generation == generation && current.quic.connection.close_reason().is_none()
-        });
-        if !open {
-            if let Some(stale) = session.take() {
-                stale.quic.connection.close(0u32.into(), b"network changed");
+        if let Some(current) = session.as_ref() {
+            if current.value().generation == generation
+                && current.connection().close_reason().is_none()
+            {
+                return Ok(current.hold());
             }
-            let fresh = self.quic.connect().await?;
-            authenticate(&fresh.connection, &self.uuid, &self.password).await?;
-            *session = Some(Session {
-                quic: fresh,
+        }
+        if let Some(stale) = session.take() {
+            // From before a reset (or already closed): flows still on it
+            // keep it until they end.
+            stale.retire();
+        }
+        let fresh = self.quic.connect().await?;
+        authenticate(&fresh.connection, &self.uuid, &self.password).await?;
+        let connection = fresh.connection.clone();
+        let fresh = Shared::new(
+            Session {
+                _quic: fresh,
                 generation,
                 udp: OnceLock::new(),
-            });
-        }
-        session
-            .as_ref()
-            .ok_or_else(|| io::Error::other("tuic session missing"))
+            },
+            connection,
+        );
+        let hold = fresh.hold();
+        *session = Some(fresh);
+        Ok(hold)
     }
 }
 
@@ -174,15 +187,18 @@ impl TcpOutbound for TuicOutbound {
         PROTOCOL
     }
 
-    /// Closes the shared QUIC connection, which still points at the old
-    /// network after the device changed networks or woke up; the next flow
-    /// opens a fresh one.
+    /// Retires the shared QUIC connection, which may still point at the old
+    /// network after the device changed networks or woke up: the next flow
+    /// opens a fresh one, and flows already open keep the old one until they
+    /// end (it closes with the last of them, at once when there are none).
+    /// When the engine closes those flows too (`close_connections`), the old
+    /// connection closes with them.
     fn reset_sessions(&self) -> usize {
         self.generation.fetch_add(1, Ordering::AcqRel);
         match self.session.try_lock() {
             Ok(mut session) => match session.take() {
                 Some(stale) => {
-                    stale.quic.connection.close(0u32.into(), b"network changed");
+                    stale.retire();
                     1
                 }
                 None => 0,
@@ -195,10 +211,10 @@ impl TcpOutbound for TuicOutbound {
     fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
         Box::pin(async move {
             let header = connect_header(target)?;
-            let connection = self.connection().await?;
+            let (connection, hold) = self.connection().await?;
             let (mut send, recv) = connection.open_bi().await.map_err(quic_error)?;
             send.write_all(&header).await?;
-            Ok(QuicStream::boxed(send, recv))
+            Ok(Box::new(QuicStream::new(send, recv).holding(hold)) as BoxStream)
         })
     }
 

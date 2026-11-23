@@ -18,6 +18,7 @@
 
 pub mod flow;
 pub mod salamander;
+pub mod shared;
 
 use std::io;
 use std::pin::Pin;
@@ -370,15 +371,29 @@ fn transport_config(congestion: Congestion, overhead: u16) -> io::Result<quinn::
 pub struct QuicStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    /// What keeps the stream's connection open while the stream lives,
+    /// such as a [`shared::Hold`].
+    _hold: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl QuicStream {
     pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv }
+        Self {
+            send,
+            recv,
+            _hold: None,
+        }
     }
 
     pub fn boxed(send: quinn::SendStream, recv: quinn::RecvStream) -> BoxStream {
         Box::new(Self::new(send, recv))
+    }
+
+    /// Keeps `hold` (a [`shared::Hold`] on the connection) until the stream
+    /// is dropped.
+    pub fn holding(mut self, hold: impl std::any::Any + Send + Sync) -> Self {
+        self._hold = Some(Box::new(hold));
+        self
     }
 }
 

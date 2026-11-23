@@ -301,12 +301,15 @@ pub trait TcpOutbound: Send + Sync {
         false
     }
 
-    /// Drops the connections this outbound keeps between flows (a shared
-    /// QUIC connection, a pool of idle streams), after the device changed
-    /// networks or woke from sleep: they still use the old path and would
-    /// stall the next flows until they time out. The next flow dials afresh.
-    /// Returns how many sessions or idle connections were dropped; the
-    /// default keeps none. Flows already open are left alone.
+    /// Stops reusing the connections this outbound keeps between flows (a
+    /// shared QUIC connection, a pool of idle streams), after the device
+    /// changed networks or woke from sleep: they may still use the old path
+    /// and would stall the next flows until they time out. The next flow
+    /// dials afresh. Returns how many sessions or idle connections were
+    /// dropped or retired; the default keeps none. Flows already open are
+    /// left alone: a connection that carries open flows is retired, not
+    /// closed, and closes when its last flow ends (the engine closes the
+    /// flows itself when it means to).
     fn reset_sessions(&self) -> usize {
         0
     }

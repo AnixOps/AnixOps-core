@@ -345,6 +345,9 @@ pub struct TuicUdpSession {
     dispatch: Arc<Dispatch>,
     replies: tokio::sync::Mutex<mpsc::Receiver<Reply>>,
     next_packet_id: AtomicU16,
+    /// Keeps the shared connection open while the session lives (a
+    /// `transport_quic::shared::Hold`).
+    _hold: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl TuicUdpSession {
@@ -356,7 +359,15 @@ impl TuicUdpSession {
             dispatch,
             replies: tokio::sync::Mutex::new(replies),
             next_packet_id: AtomicU16::new(random_packet_id()),
+            _hold: None,
         })
+    }
+
+    /// Keeps `hold` until the session is dropped, so a retired connection
+    /// stays open for it.
+    pub(crate) fn holding(mut self, hold: impl std::any::Any + Send + Sync) -> Self {
+        self._hold = Some(Box::new(hold));
+        self
     }
 
     /// Sends one datagram to `target`, in fragments when it is larger than

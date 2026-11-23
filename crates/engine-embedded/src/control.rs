@@ -82,9 +82,12 @@
 //!
 //! `reset_network` is what the client sends when the network under the
 //! engine changed (another Wi-Fi, Wi-Fi to cellular, the default interface
-//! moved) or the device woke from a long sleep: every outbound drops the
-//! sessions it keeps between flows (see
-//! [`engine_outbound::TcpOutbound::reset_sessions`]) and, unless
+//! moved) or the device woke from a long sleep: every outbound stops
+//! reusing the sessions it keeps between flows (see
+//! [`engine_outbound::TcpOutbound::reset_sessions`]; a shared QUIC
+//! connection that still carries flows is retired and closes with its last
+//! flow), the address family each server last connected with is forgotten,
+//! and, unless
 //! `close_connections` is `false`, the open connections are closed so the
 //! apps behind them reconnect at once instead of waiting for a dead path to
 //! time out. It works with or without plugin scripts. It also forgets every

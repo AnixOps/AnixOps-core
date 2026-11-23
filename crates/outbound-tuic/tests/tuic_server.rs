@@ -26,6 +26,8 @@ const PASSWORD: &str = "correct horse";
 struct TestServer {
     addr: SocketAddr,
     connections: Arc<AtomicUsize>,
+    /// Connections that have ended.
+    closed: Arc<AtomicUsize>,
     /// Authenticate commands received (UUID and token).
     auth_commands: Arc<AtomicUsize>,
     /// SHA-256 of the server's certificate (DER).
@@ -61,24 +63,31 @@ async fn tuic_server() -> TestServer {
     let addr = endpoint.local_addr().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
     let auth_commands = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
     let counter = connections.clone();
     let auth_counter = auth_commands.clone();
+    let closed_counter = closed.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let counter = counter.clone();
             let auth_counter = auth_counter.clone();
+            let closed_counter = closed_counter.clone();
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
+                let watched = connection.clone();
                 serve_connection(connection, auth_counter).await;
+                watched.closed().await;
+                closed_counter.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
     TestServer {
         addr,
         connections,
+        closed,
         auth_commands,
         certificate_sha256,
         public_key_sha256,
@@ -412,4 +421,54 @@ async fn factory_takes_certificate_pins() {
         Err(err) => err,
     };
     assert_eq!(err, "tuic certificate pins are invalid");
+}
+
+/// Waits until `counter` reaches `expected`, for at most five seconds.
+async fn wait_for(counter: &AtomicUsize, expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while counter.load(Ordering::SeqCst) != expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {expected}, still {}",
+            counter.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A reset without closing flows keeps open streams on the old connection,
+/// dials a new one for new flows, and closes the old one with its last
+/// stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_retires_the_connection_without_breaking_open_streams() {
+    let server = tuic_server().await;
+    let outbound = outbound(server.addr.port(), PASSWORD);
+    let target = TargetAddr::Domain("echo.test".to_owned(), 80);
+
+    let mut open = outbound.connect(&target).await.unwrap();
+    open.write_all(b"one").await.unwrap();
+    let mut echoed = [0u8; 16];
+    open.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"echo.test:80|one");
+
+    assert_eq!(outbound.reset_sessions(), 1);
+    open.write_all(b"two").await.unwrap();
+    let mut again = [0u8; 3];
+    open.read_exact(&mut again).await.unwrap();
+    assert_eq!(&again, b"two");
+
+    let echoed = round_trip(&outbound, target.clone(), b"new").await;
+    assert_eq!(echoed, b"echo.test:80|new");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(server.closed.load(Ordering::SeqCst), 0);
+
+    drop(open);
+    wait_for(&server.closed, 1).await;
+
+    assert_eq!(outbound.reset_sessions(), 1);
+    wait_for(&server.closed, 2).await;
+    for _ in 0..5 {
+        assert_eq!(outbound.reset_sessions(), 0);
+    }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
 }

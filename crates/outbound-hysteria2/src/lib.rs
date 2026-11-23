@@ -40,6 +40,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use transport_quic::salamander::Salamander;
+use transport_quic::shared::{Hold, Shared};
 use transport_quic::{quic_error, quinn, Congestion, QuicConnection, QuicConnector, QuicStream};
 use transport_tls::TlsSettings;
 
@@ -61,7 +62,10 @@ const MAX_RESPONSE_FIELD: u64 = 64 * 1024;
 pub struct Hysteria2Outbound {
     password: String,
     quic: QuicConnector,
-    session: Mutex<Option<Session>>,
+    /// The connection new flows use. Every flow holds it
+    /// ([`transport_quic::shared::Hold`]), so a connection taken out of
+    /// this slot (retired) stays open until its last flow ends.
+    session: Mutex<Option<Arc<Shared<Session>>>>,
     /// Bumped by [`TcpOutbound::reset_sessions`]; a session from an older
     /// generation is never reused.
     generation: AtomicU64,
@@ -72,8 +76,10 @@ struct Session {
     quic: QuicConnection,
     /// The outbound's generation when this session was opened.
     generation: u64,
-    /// The connection closes when the last request sender is dropped.
-    _requests: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    /// The connection closes when the last request sender is dropped. In a
+    /// mutex only so the session can be shared between threads; it is
+    /// never used again.
+    _requests: std::sync::Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
     driver: JoinHandle<()>,
     /// Present when the server relays UDP.
     udp: Option<Arc<udp::Dispatch>>,
@@ -116,29 +122,39 @@ impl Hysteria2Outbound {
     /// Opens a UDP session on the shared connection. Fails when the server
     /// does not relay UDP.
     pub async fn udp_session(&self) -> io::Result<Hysteria2UdpSession> {
-        let (connection, dispatch) = self.connection().await?;
+        let (connection, dispatch, hold) = self.connection().await?;
         let dispatch = dispatch.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "hysteria2 server does not relay udp",
             )
         })?;
-        Hysteria2UdpSession::new(connection, dispatch)
+        Ok(Hysteria2UdpSession::new(connection, dispatch)?.holding(hold))
     }
 
     /// The live QUIC connection, authenticating a new one if needed, with
-    /// its UDP dispatch when the server relays UDP.
-    async fn connection(&self) -> io::Result<(quinn::Connection, Option<Arc<udp::Dispatch>>)> {
+    /// its UDP dispatch when the server relays UDP, and a hold that keeps it
+    /// open for the flow about to use it.
+    async fn connection(
+        &self,
+    ) -> io::Result<(quinn::Connection, Option<Arc<udp::Dispatch>>, Hold<Session>)> {
         let mut session = self.session.lock().await;
         let generation = self.generation.load(Ordering::Acquire);
         if let Some(current) = session.as_ref() {
-            if current.generation == generation && current.quic.connection.close_reason().is_none()
+            if current.value().generation == generation
+                && current.connection().close_reason().is_none()
             {
-                return Ok((current.quic.connection.clone(), current.udp.clone()));
+                return Ok((
+                    current.connection().clone(),
+                    current.value().udp.clone(),
+                    current.hold(),
+                ));
             }
         }
         if let Some(stale) = session.take() {
-            stale.quic.connection.close(0u32.into(), b"network changed");
+            // From before a reset (or already closed): flows still on it
+            // keep it until they end.
+            stale.retire();
         }
         let fresh = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.handshake(generation))
             .await
@@ -147,8 +163,10 @@ impl Hysteria2Outbound {
             })??;
         let connection = fresh.quic.connection.clone();
         let dispatch = fresh.udp.clone();
+        let fresh = Shared::new(fresh, connection.clone());
+        let hold = fresh.hold();
         *session = Some(fresh);
-        Ok((connection, dispatch))
+        Ok((connection, dispatch, hold))
     }
 
     async fn handshake(&self, generation: u64) -> io::Result<Session> {
@@ -165,7 +183,7 @@ impl Hysteria2Outbound {
         let mut session = Session {
             quic,
             generation,
-            _requests: requests.clone(),
+            _requests: std::sync::Mutex::new(requests.clone()),
             driver,
             udp: None,
         };
@@ -212,15 +230,18 @@ impl TcpOutbound for Hysteria2Outbound {
         PROTOCOL
     }
 
-    /// Closes the shared QUIC connection, which still points at the old
-    /// network after the device changed networks or woke up; the next flow
-    /// opens a fresh one.
+    /// Retires the shared QUIC connection, which may still point at the old
+    /// network after the device changed networks or woke up: the next flow
+    /// opens a fresh one, and flows already open keep the old one until they
+    /// end (it closes with the last of them, at once when there are none).
+    /// When the engine closes those flows too (`close_connections`), the old
+    /// connection closes with them.
     fn reset_sessions(&self) -> usize {
         self.generation.fetch_add(1, Ordering::AcqRel);
         match self.session.try_lock() {
             Ok(mut session) => match session.take() {
                 Some(stale) => {
-                    stale.quic.connection.close(0u32.into(), b"network changed");
+                    stale.retire();
                     1
                 }
                 None => 0,
@@ -233,11 +254,11 @@ impl TcpOutbound for Hysteria2Outbound {
     fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
         Box::pin(async move {
             let request = tcp_request(target)?;
-            let (connection, _) = self.connection().await?;
+            let (connection, _, hold) = self.connection().await?;
             let (mut send, mut recv) = connection.open_bi().await.map_err(quic_error)?;
             send.write_all(&request).await?;
             read_tcp_response(&mut recv).await?;
-            Ok(QuicStream::boxed(send, recv))
+            Ok(Box::new(QuicStream::new(send, recv).holding(hold)) as BoxStream)
         })
     }
 
