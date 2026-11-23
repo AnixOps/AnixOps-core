@@ -1,7 +1,8 @@
 //! mitm-scripts-07 / mitm-scripts-11: a loaded policy is compiled once per
-//! revision. Hostname decisions, Map Local and header-block rules reuse the
-//! compiled forms instead of loading the policy again for every host or
-//! message, and give the same answers as a freshly loaded engine.
+//! revision. Hostname decisions, Map Local, header-block and jq rules reuse
+//! the compiled forms instead of loading the policy or compiling a filter
+//! again for every host or message, and give the same answers as a freshly
+//! loaded engine. Releasing a revision frees its compiled forms.
 //!
 //! One test in its own binary: the load counter is per thread and the caches
 //! are per process, so no other test may run beside it.
@@ -10,10 +11,12 @@ use control_domain::{
     CertificateTrustState, GrantedPermissions, HttpMitmAction, HttpMitmEvent, HttpMitmPhase,
     MetadataEntry, MitmHostnameDecision, MitmPluginService, PluginInstance,
 };
+use mitm_policy::loon_jq::jq_compilations_on_this_thread;
 use mitm_policy::loon_plugin::{import_loon_plugin, merged_plugin_source};
 use mitm_policy::{
-    policy_loads_on_this_thread, user_plugin_package, AnixOpsMitmPluginService,
-    AnixOpsMitmPolicyEngine, MitmPolicyMitmDecisionType,
+    idle_policy_engines, policy_loads_on_this_thread, release_compiled_policy, user_plugin_package,
+    AnixOpsMitmPluginService, AnixOpsMitmPolicyEngine, CompiledPolicyRelease,
+    MitmPolicyMitmDecisionType,
 };
 
 fn load(service: &AnixOpsMitmPluginService, source: &str) -> PluginInstance {
@@ -65,6 +68,18 @@ fn request(url: &str) -> HttpMitmEvent {
     }
 }
 
+fn response(url: &str, body: &str) -> HttpMitmEvent {
+    HttpMitmEvent {
+        request_id: "cache".to_string(),
+        url: url.to_string(),
+        method: Some("GET".to_string()),
+        phase: HttpMitmPhase::Response,
+        status_code: Some(200),
+        headers: Vec::new(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
 #[test]
 fn a_policy_is_compiled_once_per_revision() {
     let plugin = import_loon_plugin(concat!(
@@ -72,6 +87,8 @@ fn a_policy_is_compiled_once_per_revision() {
         "[Rewrite]\n",
         "^https://a\\.example\\.test/ads reject\n",
         "^https://a\\.example\\.test/ua url request-header (\\r\\n)User-Agent:.+(\\r\\n) request-header $1User-Agent: Cached$2\n",
+        "[Body Rewrite]\n",
+        "http-response-jq ^https://a\\.example\\.test/jq 'del(.ad)'\n",
         "[Map Local]\n",
         "^https://a\\.example\\.test/local data=\"local\"\n",
         "[MITM]\n",
@@ -139,12 +156,25 @@ fn a_policy_is_compiled_once_per_revision() {
         let other = plan("https://a.example.test/other");
         assert_eq!(other.action, HttpMitmAction::Continue);
         assert!(other.header_mutations.is_empty());
+        let jq = service
+            .handle_http_mitm_event(
+                &instance,
+                &response("https://a.example.test/jq", r#"{"ad":1,"ok":true}"#),
+            )
+            .expect("response plans");
+        assert_eq!(
+            jq.body_mutation
+                .expect("the jq rule rewrites the body")
+                .body,
+            br#"{"ok":true}"#
+        );
     };
     check_plans();
 
     // Warm: every compiled form exists. Many more hosts and messages load
-    // nothing.
+    // nothing and compile no jq filter.
     let loads = policy_loads_on_this_thread();
+    let jq_compilations = jq_compilations_on_this_thread();
     for index in 0..300 {
         let host = format!("host-{index}.b.example.test");
         assert_eq!(
@@ -162,6 +192,11 @@ fn a_policy_is_compiled_once_per_revision() {
         policy_loads_on_this_thread(),
         loads,
         "the warm policy was loaded again"
+    );
+    assert_eq!(
+        jq_compilations_on_this_thread(),
+        jq_compilations,
+        "the warm jq rule was compiled again"
     );
 
     // A new revision is compiled for itself and answers by its own rules.
@@ -189,4 +224,46 @@ fn a_policy_is_compiled_once_per_revision() {
             .unwrap(),
         MitmHostnameDecision::Intercept
     );
+
+    // Released when its owner stops using it: no idle engine of it stays,
+    // and its hostname engine, Map Local and jq rules are compiled again if
+    // it is ever used again. The other revision keeps its compiled forms.
+    assert!(idle_policy_engines() > 0);
+    drop(CompiledPolicyRelease::new(&source));
+    let before = policy_loads_on_this_thread();
+    service
+        .evaluate_mitm_hostname(&changed_instance, "x.c.example.test", false)
+        .unwrap();
+    assert_eq!(
+        policy_loads_on_this_thread(),
+        before,
+        "releasing one revision kept the other"
+    );
+    assert_eq!(
+        idle_policy_engines(),
+        0,
+        "every idle engine was of the released revision"
+    );
+    let jq_compilations = jq_compilations_on_this_thread();
+    check_plans();
+    assert!(
+        policy_loads_on_this_thread() > before,
+        "the released revision's engines were freed"
+    );
+    assert!(
+        jq_compilations_on_this_thread() > jq_compilations,
+        "the released revision's jq filters were freed"
+    );
+    let before = policy_loads_on_this_thread();
+    service
+        .evaluate_mitm_hostname(&instance, "x.b.example.test", false)
+        .unwrap();
+    assert!(
+        policy_loads_on_this_thread() > before,
+        "the released revision's hostname engine was freed"
+    );
+
+    release_compiled_policy(&source);
+    release_compiled_policy(&changed);
+    assert_eq!(idle_policy_engines(), 0);
 }

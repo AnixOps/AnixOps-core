@@ -175,12 +175,20 @@ the body to the core, so a body the core cannot read never fails the plan:
   returns, with `engine.native.runtime.http_script_body_ignored`).
 - A policy is compiled once per revision (its length and a hash of its
   text), not once per message or host: `evaluate_mitm_hostname` keeps one
-  trusted engine for each of the 2 most recent revisions, `[Map Local]` and
-  header-block rules keep their matchers and jq rules their parsed list for
-  the 4 most recent, and planning leases engines from a pool of 4 idle
-  engines that drops those of a replaced policy first.
-  `policy_loads_on_this_thread()` counts loads for tests
-  (`tests/policy_cache_contracts.rs`).
+  trusted engine per revision, `[Map Local]` and header-block rules keep
+  their matchers, and jq rules their parsed list and each filter's compiled
+  jaq program (compiled on the rule's first match). Planning leases engines
+  from a pool of at most 4 idle engines holding at most 2 MiB of policy text
+  together (one at least), dropping those of a replaced policy first.
+- Compiled forms live as long as their policy: the owner keeps a
+  `CompiledPolicyRelease` beside the loaded policy (engine-embedded's
+  `MitmEngine` does), and dropping it, or calling
+  `release_compiled_policy(source)`, frees that revision's idle engines,
+  hostname engine, Map Local, header-block and jq rules. The caches hold at
+  most 2 revisions, which only bounds what a caller that never releases
+  keeps. `policy_loads_on_this_thread()`,
+  `loon_jq::jq_compilations_on_this_thread()` and `idle_policy_engines()`
+  are for tests (`tests/policy_cache_contracts.rs`).
 
 The corpus in `tests/fixtures/loon-plugins` has an expected level for each
 plugin, and `tests/loon_plugin_contracts.rs` prints the graded report for

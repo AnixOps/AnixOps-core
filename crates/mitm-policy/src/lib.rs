@@ -897,6 +897,11 @@ static ENGINE_POOL: std::sync::Mutex<Vec<PooledEngine>> = std::sync::Mutex::new(
 /// leases; engines of the current policy are kept before those of an older
 /// one, and the extra ones are dropped afterwards.
 const ENGINE_POOL_MAX_IDLE: usize = 4;
+/// Policy text the idle engines may hold together. A loaded engine's memory
+/// grows with its policy, so a large policy keeps fewer idle engines (one at
+/// least) and a memory-limited extension does not hold several compiled
+/// copies of a multi-megabyte policy.
+const ENGINE_POOL_MAX_IDLE_POLICY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Policies up to this size are hashed whole; larger ones by samples, so a
 /// multi-megabyte policy costs little per message. The embedded data plane
@@ -910,6 +915,13 @@ const POLICY_STRIDE_SAMPLE_BYTES: usize = 512;
 /// A policy's identity: its length and a hash of its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PolicyFingerprint(usize, u64);
+
+impl PolicyFingerprint {
+    /// The policy's length in bytes.
+    fn bytes(self) -> usize {
+        self.0
+    }
+}
 
 impl PolicyFingerprint {
     fn of(source: &str) -> Self {
@@ -1006,7 +1018,13 @@ impl Drop for EngineLease {
         if let Ok(mut pool) = ENGINE_POOL.lock() {
             let current = pooled.policy;
             pool.push(pooled);
-            while pool.len() > ENGINE_POOL_MAX_IDLE {
+            let over_budget = |pool: &[PooledEngine]| {
+                pool.len() > ENGINE_POOL_MAX_IDLE
+                    || (pool.len() > 1
+                        && pool.iter().map(|entry| entry.policy.bytes()).sum::<usize>()
+                            > ENGINE_POOL_MAX_IDLE_POLICY_BYTES)
+            };
+            while over_budget(&pool) {
                 // An engine of a replaced policy goes first, oldest first.
                 let index = pool
                     .iter()
@@ -1018,9 +1036,70 @@ impl Drop for EngineLease {
     }
 }
 
+/// Number of idle loaded engines; tests use it to check that a released
+/// policy leaves none behind.
+#[doc(hidden)]
+pub fn idle_policy_engines() -> usize {
+    ENGINE_POOL.lock().map(|pool| pool.len()).unwrap_or(0)
+}
+
+/// Drops every compiled form of `source` the crate keeps between calls:
+/// idle loaded engines, the hostname engine, and the compiled Map Local,
+/// header-block and jq rules. Calls that still run with them finish first;
+/// a later call for `source` compiles it again.
+///
+/// The owner of a loaded policy calls this, through
+/// [`CompiledPolicyRelease`], when it stops using the policy, so compiled
+/// copies of a replaced policy do not stay in memory until other revisions
+/// push them out.
+pub fn release_compiled_policy(source: &str) {
+    release_policy(PolicyFingerprint::of(source));
+}
+
+fn release_policy(policy: PolicyFingerprint) {
+    let idle = ENGINE_POOL.lock().ok().map(|mut pool| {
+        let (released, kept) = std::mem::take(&mut *pool)
+            .into_iter()
+            .partition::<Vec<_>, _>(|entry| entry.policy == policy);
+        *pool = kept;
+        released
+    });
+    // Engines are freed outside the pool's lock.
+    drop(idle);
+    HOSTNAME_ENGINES.remove(policy);
+    loon_map_local::release(policy);
+    loon_header_block::release(policy);
+    loon_jq::release(policy);
+}
+
+/// Releases a policy's compiled forms ([`release_compiled_policy`]) when
+/// dropped. The owner of a loaded policy keeps one beside it, so the
+/// compiled forms live as long as the policy is in use.
+#[derive(Debug)]
+pub struct CompiledPolicyRelease {
+    policy: PolicyFingerprint,
+}
+
+impl CompiledPolicyRelease {
+    /// Releases `source`'s compiled forms when dropped.
+    pub fn new(source: &str) -> Self {
+        Self {
+            policy: PolicyFingerprint::of(source),
+        }
+    }
+}
+
+impl Drop for CompiledPolicyRelease {
+    fn drop(&mut self) {
+        release_policy(self.policy);
+    }
+}
+
 /// Engines answering [`MitmPluginService::evaluate_mitm_hostname`], one per
-/// recent policy revision. They only read the hostname list and are set to
-/// a trusted certificate, so they are kept apart from [`ENGINE_POOL`].
+/// policy in use, released with the policy ([`CompiledPolicyRelease`]). The
+/// capacity only bounds what callers that never release keep. They only read
+/// the hostname list and are set to a trusted certificate, so they are kept
+/// apart from [`ENGINE_POOL`].
 static HOSTNAME_ENGINES: policy_cache::PolicyCache<policy_cache::SharedEngine> =
     policy_cache::PolicyCache::new(2);
 

@@ -6,7 +6,10 @@
 //! every connection and message (is this host decrypted, does a Map Local
 //! or header-block rule match), so each answer's compiled form is built once
 //! per policy revision ([`PolicyFingerprint`]) and shared. A new revision
-//! builds its own; the least recently used revisions are dropped.
+//! builds its own. The owner of a loaded policy releases its revision when it
+//! stops using it ([`crate::CompiledPolicyRelease`]), so compiled forms live
+//! only as long as their policy; the small capacity only bounds what callers
+//! that never release keep.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -80,6 +83,21 @@ impl<T> PolicyCache<T> {
         Ok(built)
     }
 
+    /// Drops the value compiled for `policy`. Holders of its `Arc` keep
+    /// theirs until they finish with it.
+    pub(crate) fn remove(&self, policy: PolicyFingerprint) {
+        let removed = {
+            let mut entries = self.lock();
+            let (removed, kept) = std::mem::take(&mut *entries)
+                .into_iter()
+                .partition::<Vec<_>, _>(|(key, _)| *key == policy);
+            *entries = kept;
+            removed
+        };
+        // Compiled values are freed outside the lock.
+        drop(removed);
+    }
+
     /// The entry for `policy`, moved to the most recently used end.
     fn take_recent(
         entries: &mut Vec<(PolicyFingerprint, Arc<T>)>,
@@ -127,6 +145,29 @@ mod tests {
         assert_eq!(builds.get(), 3, "`a` stayed");
         get("b");
         assert_eq!(builds.get(), 4, "`b` was dropped and is built again");
+    }
+
+    #[test]
+    fn a_removed_revision_is_released_and_built_again() {
+        let cache = PolicyCache::<String>::new(2);
+        let builds = Cell::new(0);
+        let get = |source: &str| {
+            cache
+                .get_or_build(source, |source| {
+                    builds.set(builds.get() + 1);
+                    Ok(source.to_uppercase())
+                })
+                .expect("build succeeds")
+        };
+        let held = get("a");
+        get("b");
+        cache.remove(PolicyFingerprint::of("a"));
+        assert_eq!(cache.lock().len(), 1, "only `b` is kept");
+        assert_eq!(*held, "A", "a holder keeps its value");
+        get("b");
+        assert_eq!(builds.get(), 2, "`b` stayed");
+        get("a");
+        assert_eq!(builds.get(), 3, "`a` was released");
     }
 
     #[test]

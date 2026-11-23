@@ -231,8 +231,14 @@ struct CompiledHeaderBlock {
     response: CompiledRules,
 }
 
-/// Header-block rules of the most recent policy revisions.
-static COMPILED: PolicyCache<CompiledHeaderBlock> = PolicyCache::new(4);
+/// Header-block rules of the policies in use, released with their policy
+/// ([`crate::CompiledPolicyRelease`]).
+static COMPILED: PolicyCache<CompiledHeaderBlock> = PolicyCache::new(2);
+
+/// Drops the compiled rules of a policy no longer in use.
+pub(crate) fn release(policy: crate::PolicyFingerprint) {
+    COMPILED.remove(policy);
+}
 
 impl CompiledHeaderBlock {
     fn build(source: &str) -> DomainResult<Self> {

@@ -72,7 +72,7 @@ use engine_outbound::reject::{rejection, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use mitm_policy::loon_map_local::MAP_LOCAL_REMOTE_DATA_MAX_BYTES;
 use mitm_policy::loon_plugin::{import_loon_plugin_with_resources, merged_plugin_source};
-use mitm_policy::AnixOpsMitmPluginService;
+use mitm_policy::{AnixOpsMitmPluginService, CompiledPolicyRelease};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Issuer, KeyPair,
 };
@@ -197,6 +197,13 @@ pub struct MitmEngine {
     /// every script posts.
     #[cfg(feature = "scripts")]
     scheduler: Option<Arc<scheduler::ScriptScheduler>>,
+    /// Frees the policy's compiled forms that `mitm_policy` keeps between
+    /// messages (hostname engine, idle engines, Map Local, header-block and
+    /// jq rules) when this engine goes away. Each engine's policy is a
+    /// revision of its own (the serial line below), so without this a
+    /// reload would leave the old revision compiled in memory. Last, so it
+    /// runs after the hook is dropped.
+    _compiled_policy: CompiledPolicyRelease,
 }
 
 impl MitmEngine {
@@ -228,6 +235,7 @@ impl MitmEngine {
             "\n# networkcore policy {}\n",
             POLICY_SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
+        let compiled_policy = CompiledPolicyRelease::new(&policy);
         let plugin_rules = accepted
             .iter()
             .flat_map(|import| import.routing_rules())
@@ -311,6 +319,7 @@ impl MitmEngine {
             plugin_rules,
             #[cfg(feature = "scripts")]
             scheduler,
+            _compiled_policy: compiled_policy,
         })
     }
 

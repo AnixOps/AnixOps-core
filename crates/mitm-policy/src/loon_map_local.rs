@@ -288,8 +288,14 @@ struct CompiledMapLocal {
     matcher: Option<SharedEngine>,
 }
 
-/// Map Local rules of the most recent policy revisions.
-static COMPILED: PolicyCache<CompiledMapLocal> = PolicyCache::new(4);
+/// Map Local rules of the policies in use, released with their policy
+/// ([`crate::CompiledPolicyRelease`]).
+static COMPILED: PolicyCache<CompiledMapLocal> = PolicyCache::new(2);
+
+/// Drops the compiled rules of a policy no longer in use.
+pub(crate) fn release(policy: crate::PolicyFingerprint) {
+    COMPILED.remove(policy);
+}
 
 impl CompiledMapLocal {
     fn build(source: &str) -> DomainResult<Self> {

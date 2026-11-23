@@ -14,7 +14,9 @@ use crate::{MitmPolicyBodyRewriteChain, MitmPolicyPhase};
 use jaq_core::load::{Arena, File, Loader};
 use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
 use jaq_json::{read, Val};
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 /// Message of a jq step the core matched but could not run.
 pub const JQ_BACKEND_UNAVAILABLE: &str = "jq backend unavailable";
@@ -26,11 +28,42 @@ pub const JQ_MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 /// JSON. `None` when the body is not JSON, the filter does not compile, or it
 /// fails or yields nothing; the body is then left unchanged, as jq-capable
 /// clients do.
+///
+/// The filter is compiled for this call. Rules of a loaded policy go through
+/// [`apply_jq_steps`], which compiles each filter once per policy revision.
 pub fn run_jq(filter: &str, body: &str) -> Option<String> {
+    let input = parse_body(body)?;
+    run_compiled(&compile_jq(filter)?, input)
+}
+
+/// A compiled jq program. It owns its terms and native function pointers,
+/// so it is `Send + Sync` and one copy serves every thread.
+type JqFilter = jaq_core::Filter<data::JustLut<Val>>;
+
+thread_local! {
+    static JQ_COMPILATIONS: Cell<u64> = Cell::new(0);
+}
+
+/// How many jq filters this thread has compiled; tests use it to check that
+/// a rule's filter is compiled once per policy revision, not once per
+/// message.
+#[doc(hidden)]
+pub fn jq_compilations_on_this_thread() -> u64 {
+    JQ_COMPILATIONS.with(Cell::get)
+}
+
+/// The JSON value of `body`, or `None` when it is too large or not JSON.
+fn parse_body(body: &str) -> Option<Val> {
     if body.len() > JQ_MAX_INPUT_BYTES {
         return None;
     }
-    let input = read::parse_single(body.trim().as_bytes()).ok()?;
+    read::parse_single(body.trim().as_bytes()).ok()
+}
+
+/// Loads jaq's core, std and JSON definitions with `filter` and compiles
+/// them. `None` when the filter does not compile.
+fn compile_jq(filter: &str) -> Option<JqFilter> {
+    JQ_COMPILATIONS.with(|count| count.set(count.get() + 1));
     let defs = jaq_core::defs()
         .chain(jaq_std::defs())
         .chain(jaq_json::defs());
@@ -48,16 +81,41 @@ pub fn run_jq(filter: &str, body: &str) -> Option<String> {
             },
         )
         .ok()?;
-    let compiled = Compiler::default().with_funs(funs).compile(modules).ok()?;
+    let compiled: JqFilter = Compiler::default().with_funs(funs).compile(modules).ok()?;
+    Some(compiled)
+}
+
+/// Runs a compiled filter on `input` and returns its first output as compact
+/// JSON.
+fn run_compiled(compiled: &JqFilter, input: Val) -> Option<String> {
     let ctx = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
     let mut outputs = compiled.id.run((ctx, input)).map(unwrap_valr);
     let first = outputs.next()?.ok()?;
     Some(first.to_string())
 }
 
-/// `<pattern> request-body-jq|response-body-jq <filter>` lines of a loaded
-/// policy source, in order.
-fn jq_rules(source: &str) -> Vec<(String, MitmPolicyPhase, String)> {
+/// One `<pattern> request-body-jq|response-body-jq <filter>` line of a
+/// loaded policy. Its filter is compiled the first time a message matches
+/// it, and the compiled form lives as long as the policy revision.
+struct JqRule {
+    pattern: String,
+    phase: MitmPolicyPhase,
+    filter: String,
+    /// `Some(None)` records a filter that does not compile, so it is not
+    /// compiled again for every message.
+    compiled: OnceLock<Option<JqFilter>>,
+}
+
+impl JqRule {
+    fn compiled(&self) -> Option<&JqFilter> {
+        self.compiled
+            .get_or_init(|| compile_jq(&self.filter))
+            .as_ref()
+    }
+}
+
+/// The jq rules of a loaded policy source, in order.
+fn jq_rules(source: &str) -> Vec<JqRule> {
     source
         .lines()
         .filter_map(|line| {
@@ -74,13 +132,24 @@ fn jq_rules(source: &str) -> Vec<(String, MitmPolicyPhase, String)> {
                 "response-body-jq" => MitmPolicyPhase::Response,
                 _ => return None,
             };
-            Some((parts[0].clone(), phase, parts[2].clone()))
+            Some(JqRule {
+                pattern: parts[0].clone(),
+                phase,
+                filter: parts[2].clone(),
+                compiled: OnceLock::new(),
+            })
         })
         .collect()
 }
 
-/// jq rules of the most recent policy revisions.
-static JQ_RULES: PolicyCache<Vec<(String, MitmPolicyPhase, String)>> = PolicyCache::new(4);
+/// jq rules and their compiled filters, per policy in use; released with
+/// the policy ([`crate::CompiledPolicyRelease`]).
+static JQ_RULES: PolicyCache<Vec<JqRule>> = PolicyCache::new(2);
+
+/// Drops the jq rules and compiled filters of a policy no longer in use.
+pub(crate) fn release(policy: crate::PolicyFingerprint) {
+    JQ_RULES.remove(policy);
+}
 
 /// Runs the jq steps of `chain` on `body`. `None` when no jq step changed it.
 pub fn apply_jq_steps(
@@ -97,7 +166,8 @@ pub fn apply_jq_steps(
     if steps.is_empty() {
         return None;
     }
-    // Read once per policy revision, not once per message.
+    // Read once per policy revision, not once per message; each rule's
+    // filter is compiled on its first match and kept with the revision.
     let rules = JQ_RULES
         .get_or_build(source, |source| Ok(jq_rules(source)))
         .ok()?;
@@ -106,16 +176,23 @@ pub fn apply_jq_steps(
     let mut changed = false;
     for step in steps {
         let nth = seen.entry(step.matched_pattern.as_str()).or_default();
-        let filter = rules
+        let rule = rules
             .iter()
-            .filter(|(pattern, rule_phase, _)| {
-                *pattern == step.matched_pattern && *rule_phase == phase
-            })
-            .nth(*nth)
-            .map(|(_, _, filter)| filter.as_str())
-            .unwrap_or(step.value.as_str());
+            .filter(|rule| rule.pattern == step.matched_pattern && rule.phase == phase)
+            .nth(*nth);
         *nth += 1;
-        if let Some(output) = run_jq(filter, &current) {
+        let Some(input) = parse_body(&current) else {
+            continue;
+        };
+        // A step the source does not list (the core's value is capped at
+        // 2 KiB) is compiled for this message only.
+        let output = match rule {
+            Some(rule) => rule
+                .compiled()
+                .and_then(|compiled| run_compiled(compiled, input)),
+            None => compile_jq(&step.value).and_then(|compiled| run_compiled(&compiled, input)),
+        };
+        if let Some(output) = output {
             changed |= output != current;
             current = output;
         }
@@ -163,5 +240,62 @@ mod tests {
         );
         assert_eq!(run_jq(".a", "not json"), None);
         assert_eq!(run_jq("syntax error (", "{}"), None);
+    }
+
+    #[test]
+    fn a_rule_filter_is_compiled_once_per_policy_revision() {
+        // Unit tests run on their own threads, so the counter is this
+        // test's alone; the source is unique to this test.
+        let source = concat!(
+            "# a_rule_filter_is_compiled_once_per_policy_revision\n",
+            "^https://a\\.example\\.test/jq response-body-jq 'del(.b)'\n",
+            "^https://a\\.example\\.test/bad response-body-jq 'syntax error ('\n",
+        );
+        let chain = |pattern: &str| MitmPolicyBodyRewriteChain {
+            rewrites: vec![crate::MitmPolicyRewriteResult {
+                action: crate::MitmPolicyRewriteAction::BodyMutation,
+                status_code: 0,
+                rule_index: 0,
+                matched_pattern: pattern.to_string(),
+                value: String::new(),
+                message: JQ_BACKEND_UNAVAILABLE.to_string(),
+                reject_body: crate::MitmPolicyRejectBody::Empty,
+            }],
+            rewritten: false,
+            truncated: false,
+        };
+        let good = chain("^https://a\\.example\\.test/jq");
+        let bad = chain("^https://a\\.example\\.test/bad");
+        let before = jq_compilations_on_this_thread();
+        for index in 0..20 {
+            let body = format!(r#"{{"a":{index},"b":1}}"#);
+            assert_eq!(
+                apply_jq_steps(source, MitmPolicyPhase::Response, &good, &body),
+                Some(format!(r#"{{"a":{index}}}"#))
+            );
+            assert_eq!(
+                apply_jq_steps(source, MitmPolicyPhase::Response, &bad, &body),
+                None
+            );
+        }
+        assert_eq!(
+            jq_compilations_on_this_thread() - before,
+            2,
+            "one compile for the filter and one for the broken filter"
+        );
+        // A body that is not JSON leaves the body alone without compiling.
+        assert_eq!(
+            apply_jq_steps(source, MitmPolicyPhase::Response, &good, "not json"),
+            None
+        );
+        assert_eq!(jq_compilations_on_this_thread() - before, 2);
+
+        // Released with its policy: the next message compiles again.
+        release(crate::PolicyFingerprint::of(source));
+        assert_eq!(
+            apply_jq_steps(source, MitmPolicyPhase::Response, &good, r#"{"a":1,"b":2}"#),
+            Some(r#"{"a":1}"#.to_string())
+        );
+        assert_eq!(jq_compilations_on_this_thread() - before, 3);
     }
 }
