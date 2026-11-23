@@ -139,6 +139,40 @@ pub struct ImportReport {
     /// Left out when nothing was.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub routing_warnings: Vec<String>,
+    /// Subscription entries that could not be read and were left out so the
+    /// others still import (a proxy type no reader knows, a malformed share
+    /// link, a field of the wrong type), in subscription order, at most
+    /// [`MAX_SKIPPED_ENTRIES`]. Unlike [`ImportReport::unsupported`] these
+    /// never became nodes, and they do not keep [`ImportReport::routing`]
+    /// out: rules and group members that name them are left out with a
+    /// [`ImportReport::routing_warnings`] line instead. Built-in policy
+    /// entries (Surge's `DIRECT = direct`, a Clash `type: direct` proxy) are
+    /// not listed. Left out when nothing was skipped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedEntry>,
+    /// How many entries were skipped, also those past
+    /// [`MAX_SKIPPED_ENTRIES`]. Left out when none were.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub skipped_count: usize,
+}
+
+/// A subscription entry left out of the import, with a fixed reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedEntry {
+    /// The stable reason code (`subscription.core.*`), such as
+    /// `subscription.core.clash_yaml_unsupported`.
+    pub code: String,
+    /// English, fixed wording: the entry's format and position, its name
+    /// and type when they read as labels, and why it was skipped. Never the
+    /// entry's text or credentials.
+    pub message: String,
+}
+
+/// Most [`ImportReport::skipped`] entries kept.
+pub const MAX_SKIPPED_ENTRIES: usize = 32;
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// A node the engine can run. `outbound` holds its credentials.
@@ -198,12 +232,15 @@ pub fn import_text(text: &str) -> Result<ImportReport, ImportError> {
         id: "import".to_string(),
         location: format!("inline:{text}"),
     };
-    let catalog: NodeCatalog = service
+    let document = service
         .fetch(&source)
         .and_then(|raw| service.parse(&raw))
-        .and_then(|document| service.normalize(&document))
+        .map_err(|_| ImportError::Unrecognized)?;
+    let catalog: NodeCatalog = service
+        .normalize(&document)
         .map_err(|_| ImportError::Unrecognized)?;
     let mut report = report(&catalog.nodes);
+    (report.skipped, report.skipped_count) = skipped_entries(&document.diagnostics);
     let (routing, warnings) = subscription_routing(text, &catalog.nodes, &report);
     report.routing = routing;
     report.routing_warnings = warnings;
@@ -271,6 +308,22 @@ fn subscription_routing(
         routing["rule_sets"] = rule_sets_json(&imported.rule_sets);
     }
     (Some(routing), warnings)
+}
+
+/// The entries a subscription parser left out (its warnings), at most
+/// [`MAX_SKIPPED_ENTRIES`], and how many there were.
+fn skipped_entries(diagnostics: &[control_domain::Diagnostic]) -> (Vec<SkippedEntry>, usize) {
+    let mut skipped = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == control_domain::DiagnosticSeverity::Warning)
+        .map(|diagnostic| SkippedEntry {
+            code: diagnostic.code.clone(),
+            message: diagnostic.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    let count = skipped.len();
+    skipped.truncate(MAX_SKIPPED_ENTRIES);
+    (skipped, count)
 }
 
 /// The warnings of a routing import, at most [`MAX_ROUTING_WARNINGS`].
@@ -346,6 +399,8 @@ pub fn report(nodes: &[NodeDescriptor]) -> ImportReport {
         unsupported: Vec::new(),
         routing: None,
         routing_warnings: Vec::new(),
+        skipped: Vec::new(),
+        skipped_count: 0,
     };
     for node in nodes {
         match outbound_json(node) {

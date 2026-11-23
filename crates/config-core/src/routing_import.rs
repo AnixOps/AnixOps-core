@@ -125,6 +125,12 @@ struct RoutingSource {
     groups: Vec<SourceGroup>,
     /// Clash `rule-providers` by name.
     providers: BTreeMap<String, RuleProvider>,
+    /// Proxy entries that name a built-in policy (Surge's
+    /// `Home = direct, interface=en0`, a Clash `type: reject` proxy): the
+    /// name and the policy (`DIRECT` or a `REJECT` kind) it routes as.
+    aliases: BTreeMap<String, &'static str>,
+    /// Aliases whose options (such as `interface=`) were not imported.
+    alias_options_ignored: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +193,14 @@ fn parse_ini_routing(content: &str) -> Option<RoutingSource> {
         match section.as_str() {
             "rule" => source.rules.push(line.to_string()),
             "remote rule" => source.remote_rules.extend(parse_remote_rule_line(line)),
+            "proxy" => {
+                if let Some((name, policy, has_options)) = crate::proxy_line_builtin_policy(line) {
+                    if has_options {
+                        source.alias_options_ignored.push(name.to_string());
+                    }
+                    source.aliases.insert(name.to_string(), policy);
+                }
+            }
             "proxy group" => {
                 if let Some(group) = parse_ini_group_line(line) {
                     source.groups.push(group);
@@ -275,6 +289,7 @@ fn strip_quotes(value: &str) -> &str {
 #[derive(Debug, Deserialize)]
 struct RawClashRoutingDocument {
     rules: Option<Vec<String>>,
+    proxies: Option<RawClashRoutingProxies>,
     #[serde(rename = "proxy-groups")]
     proxy_groups: Option<Vec<RawClashProxyGroup>>,
     #[serde(rename = "rule-providers")]
@@ -311,6 +326,30 @@ struct RawClashProxyGroup {
     include_all_proxies: Option<RawScalar>,
 }
 
+/// The `proxies` list, read only for entries that name a built-in policy.
+/// Any other shape is ignored here; node parsing reports it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawClashRoutingProxies {
+    List(Vec<serde_json::Value>),
+    Other(serde::de::IgnoredAny),
+}
+
+/// Clash `proxies` entries whose `type` is a built-in policy, by name.
+fn clash_policy_aliases(proxies: Option<RawClashRoutingProxies>) -> BTreeMap<String, &'static str> {
+    let Some(RawClashRoutingProxies::List(proxies)) = proxies else {
+        return BTreeMap::new();
+    };
+    proxies
+        .iter()
+        .filter_map(|proxy| {
+            let name = proxy.get("name")?.as_str()?.trim();
+            let policy = crate::builtin_policy(proxy.get("type")?.as_str()?)?;
+            (!name.is_empty()).then(|| (name.to_string(), policy))
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawScalar {
@@ -332,6 +371,7 @@ impl RawScalar {
 fn parse_clash_routing(content: &str) -> Option<RoutingSource> {
     let raw = serde_saphyr::from_str::<RawClashRoutingDocument>(content.trim()).ok()?;
     let rules = raw.rules.filter(|rules| !rules.is_empty())?;
+    let aliases = clash_policy_aliases(raw.proxies);
     let groups = raw
         .proxy_groups
         .unwrap_or_default()
@@ -401,6 +441,8 @@ fn parse_clash_routing(content: &str) -> Option<RoutingSource> {
         remote_rules: Vec::new(),
         groups,
         providers,
+        aliases,
+        alias_options_ignored: Vec::new(),
     })
 }
 
@@ -571,6 +613,8 @@ fn is_reject_policy(name: &str) -> bool {
 
 struct Importer<'a> {
     nodes_by_name: BTreeMap<&'a str, &'a str>,
+    /// Proxy names that stand for a built-in policy ([`RoutingSource::aliases`]).
+    aliases: BTreeMap<String, &'static str>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -594,8 +638,17 @@ fn build_routing(source: RoutingSource, nodes: &[NodeDescriptor]) -> ImportedRou
     }
     let mut importer = Importer {
         nodes_by_name,
+        aliases: source.aliases,
         diagnostics: Vec::new(),
     };
+    for name in source.alias_options_ignored {
+        if let Some(policy) = importer.aliases.get(&name).copied() {
+            importer.warn(
+                ROUTING_IMPORT_OPTION_IGNORED_CODE,
+                format!("proxy {name} options were ignored: it routes as {policy}"),
+            );
+        }
+    }
 
     let mut source_groups = source.groups;
     expand_filters(&mut importer, &mut source_groups, nodes);
@@ -688,7 +741,14 @@ fn import_groups(importer: &mut Importer, groups: Vec<SourceGroup>) -> Vec<Polic
             .iter()
             .filter(|(group, kind)| {
                 let resolves = |member: &str| {
-                    resolve_member(&importer.nodes_by_name, &kept, *kind, member).is_ok()
+                    resolve_member(
+                        &importer.nodes_by_name,
+                        &importer.aliases,
+                        &kept,
+                        *kind,
+                        member,
+                    )
+                    .is_ok()
                 };
                 kept.contains_key(&group.name)
                     && if *kind == GroupKind::Subnet {
@@ -725,7 +785,13 @@ fn import_groups(importer: &mut Importer, groups: Vec<SourceGroup>) -> Vec<Polic
         }
         let mut members = Vec::new();
         for member in &group.members {
-            match resolve_member(&importer.nodes_by_name, &kept, kind, member) {
+            match resolve_member(
+                &importer.nodes_by_name,
+                &importer.aliases,
+                &kept,
+                kind,
+                member,
+            ) {
                 Ok(target) => members.push(target),
                 Err(reason) => importer.warn(
                     ROUTING_IMPORT_MEMBER_SKIPPED_CODE,
@@ -790,7 +856,14 @@ fn import_subnet_group(
     group: &SourceGroup,
 ) -> Option<PolicyGroupSpec> {
     let default = group.default.as_deref().and_then(|default| {
-        resolve_member(&importer.nodes_by_name, kept, GroupKind::Subnet, default).ok()
+        resolve_member(
+            &importer.nodes_by_name,
+            &importer.aliases,
+            kept,
+            GroupKind::Subnet,
+            default,
+        )
+        .ok()
     });
     // The default resolved when the group was kept (see import_groups).
     let default = default?;
@@ -806,7 +879,13 @@ fn import_subnet_group(
             );
             continue;
         }
-        match resolve_member(&importer.nodes_by_name, kept, GroupKind::Subnet, target) {
+        match resolve_member(
+            &importer.nodes_by_name,
+            &importer.aliases,
+            kept,
+            GroupKind::Subnet,
+            target,
+        ) {
             Ok(target) => network_rules.push(NetworkRuleSpec {
                 when: when.clone(),
                 target,
@@ -841,11 +920,18 @@ fn import_subnet_group(
 
 fn resolve_member(
     nodes_by_name: &BTreeMap<&str, &str>,
+    aliases: &BTreeMap<String, &'static str>,
     groups: &BTreeMap<String, GroupKind>,
     kind: GroupKind,
     member: &str,
 ) -> Result<String, &'static str> {
     let member = member.trim();
+    let member = match aliases.get(member) {
+        Some(policy) if !groups.contains_key(member) && !nodes_by_name.contains_key(member) => {
+            *policy
+        }
+        _ => member,
+    };
     if member.eq_ignore_ascii_case("DIRECT") {
         return Ok("DIRECT".to_string());
     }
@@ -1326,6 +1412,14 @@ fn resolve_rule_target(
     target: &str,
 ) -> Option<String> {
     let target = target.trim();
+    let target = match importer.aliases.get(target) {
+        Some(policy)
+            if !group_ids.contains(target) && !importer.nodes_by_name.contains_key(target) =>
+        {
+            *policy
+        }
+        _ => target,
+    };
     if target.eq_ignore_ascii_case("DIRECT") {
         Some("DIRECT".to_string())
     } else if is_reject_policy(target) {

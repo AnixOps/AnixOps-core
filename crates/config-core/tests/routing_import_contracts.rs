@@ -789,3 +789,122 @@ FINAL,Proxy
     assert!(messages.contains("rule 7 was skipped"), "{messages}");
     assert!(messages.contains("DOH"), "{messages}");
 }
+
+/// A subconverter-style Surge profile: built-in policies and aliases in
+/// `[Proxy]`, and a node of a type the importer skips.
+const SURGE_PROFILE_WITH_SKIPPED_PROXIES: &str = r#"
+[General]
+loglevel = notify
+
+[Proxy]
+DIRECT = direct
+Home = direct, interface=en0
+Block = reject-drop
+HY2 = hysteria2, hy2.example.test, 443, password=hy2-secret
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=f43c0eee-13b9-4f07-bec9-d4b744141503
+
+[Proxy Group]
+Proxy = select, HK, HY2, Home
+
+[Rule]
+DOMAIN-SUFFIX,lan.example,Home
+DOMAIN-SUFFIX,ads.example,Block
+DOMAIN-SUFFIX,video.example,HY2
+FINAL,Proxy
+"#;
+
+#[test]
+fn built_in_policy_aliases_route_as_their_policy_and_skipped_proxies_are_left_out() {
+    let nodes = parse_nodes(SURGE_PROFILE_WITH_SKIPPED_PROXIES);
+    assert_eq!(nodes.len(), 1);
+    let hk = node_id(&nodes, "HK");
+
+    let imported = import_subscription_routing(SURGE_PROFILE_WITH_SKIPPED_PROXIES, &nodes);
+    let model = imported
+        .routing
+        .clone()
+        .expect("routing should import without the skipped proxy");
+
+    assert_eq!(
+        model
+            .rules
+            .iter()
+            .map(|rule| (rule.matcher.clone(), rule.target.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                RuleMatcher::DomainSuffix("lan.example".to_string()),
+                PolicyTarget::Direct
+            ),
+            (
+                RuleMatcher::DomainSuffix("ads.example".to_string()),
+                PolicyTarget::Reject(RejectKind::Drop)
+            ),
+        ]
+    );
+    assert_eq!(model.final_target, PolicyTarget::Group("Proxy".to_string()));
+    assert_eq!(
+        model.group("Proxy").unwrap().members,
+        vec![PolicyTarget::Node(hk), PolicyTarget::Direct]
+    );
+
+    let messages = imported
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("member HY2 was skipped")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("target HY2 was not imported")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| *message == "proxy Home options were ignored: it routes as DIRECT"),
+        "{messages:?}"
+    );
+    assert!(diagnostic_codes(&imported)
+        .contains(&config_core::routing_import::ROUTING_IMPORT_OPTION_IGNORED_CODE));
+    assert!(messages.iter().all(|message| !message.contains("secret")));
+}
+
+#[test]
+fn clash_built_in_policy_proxies_route_as_their_policy() {
+    let profile = CLASH_PROFILE
+        .replace(
+            "proxy-groups:",
+            "  - name: Local\n    type: direct\n  - name: Ads\n    type: reject\nproxy-groups:",
+        )
+        .replace(
+            "  - MATCH,Proxy",
+            "  - DOMAIN,lan.example,Local\n  - DOMAIN,ads.example,Ads\n  - MATCH,Proxy",
+        );
+    let nodes = parse_nodes(&profile);
+    assert_eq!(nodes.len(), 2);
+
+    let imported = import_subscription_routing(&profile, &nodes);
+    let model = imported.routing.expect("clash routing should import");
+    let targets = model
+        .rules
+        .iter()
+        .filter_map(|rule| match &rule.matcher {
+            RuleMatcher::Domain(domain) => Some((domain.as_str(), rule.target.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        vec![
+            ("lan.example", PolicyTarget::Direct),
+            ("ads.example", PolicyTarget::Reject(RejectKind::Reject)),
+        ]
+    );
+}

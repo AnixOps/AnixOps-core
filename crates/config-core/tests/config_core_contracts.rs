@@ -1984,3 +1984,440 @@ fn assert_no_metadata(metadata: &[MetadataEntry], key: &str) {
         "unexpected metadata {key}: {metadata:?}"
     );
 }
+
+fn parse_subscription(source_id: &str, content: &str) -> control_domain::SubscriptionDocument {
+    CoreSubscriptionService::new()
+        .parse(&RawSubscription {
+            source_id: source_id.to_string(),
+            content: content.to_string(),
+        })
+        .unwrap_or_else(|error| panic!("{source_id} should parse: {error:?}"))
+}
+
+/// The skipped-entry warnings of a document as `(code, message)`, after
+/// checking that each is a warning that repeats no credential.
+fn skipped_entries(document: &control_domain::SubscriptionDocument) -> Vec<(String, String)> {
+    document
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            assert_eq!(
+                diagnostic.severity,
+                control_domain::DiagnosticSeverity::Warning
+            );
+            assert!(
+                !diagnostic.message.contains("secret"),
+                "{}",
+                diagnostic.message
+            );
+            (diagnostic.code.clone(), diagnostic.message.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn clash_list_skips_unsupported_and_malformed_proxies_and_keeps_the_rest() {
+    let document = parse_subscription(
+        "clash-mixed",
+        r#"
+proxies:
+  - name: HK
+    type: ss
+    server: 82.47.34.99
+    port: 11111
+    cipher: aes-256-gcm
+    password: hk-secret
+  - name: Direct Out
+    type: direct
+  - name: HY2
+    type: hysteria2
+    server: hy2.example.test
+    port: 443
+    password: hy2-secret
+  - name: Socks
+    type: socks5
+    server: socks.example.test
+    port: 1080
+    username: user
+    password: socks-secret
+  - name: Bad Port
+    type: trojan
+    server: bad.example.test
+    port: not-a-port
+    password: trojan-secret
+  - name: Odd
+    type: ss
+    server: odd.example.test
+    port: 443
+    cipher: aes-256-gcm
+    password: [1, 2]
+"#,
+    );
+
+    let names = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["HK"]);
+    let skipped = skipped_entries(&document);
+    assert_eq!(
+        skipped
+            .iter()
+            .map(|(code, _)| code.as_str())
+            .collect::<Vec<_>>(),
+        [
+            config_core::SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_CLASH_YAML_INVALID_CODE,
+            config_core::SUBSCRIPTION_CLASH_YAML_INVALID_CODE,
+        ]
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("clash proxy 3 (HY2, type hysteria2) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[1]
+            .1
+            .starts_with("clash proxy 4 (Socks, type socks5) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[2]
+            .1
+            .starts_with("clash proxy 5 (Bad Port, type trojan) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[3]
+            .1
+            .starts_with("clash proxy 6 (Odd, type ss) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn clash_list_without_any_supported_proxy_still_fails_with_the_first_reason() {
+    let error = CoreSubscriptionService::new()
+        .parse(&RawSubscription {
+            source_id: "clash-unsupported".to_string(),
+            content: r#"
+proxies:
+  - name: Direct Out
+    type: direct
+  - name: HY2
+    type: hysteria2
+    server: hy2.example.test
+    port: 443
+    password: hy2-secret
+"#
+            .to_string(),
+        })
+        .expect_err("a list without supported proxies should fail");
+
+    assert_eq!(
+        error.code,
+        config_core::SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE
+    );
+    assert!(!error.message.contains("secret"));
+}
+
+#[test]
+fn surge_proxy_section_skips_built_in_policies_and_bad_lines() {
+    let document = parse_subscription(
+        "surge-mixed",
+        r#"
+[General]
+loglevel = notify
+
+[Proxy]
+DIRECT = direct
+Home = direct, interface=en0
+Block = reject-drop
+HY2 = hysteria2, hy2.example.test, 443, password=hy2-secret
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=hk-secret
+Bad = trojan, bad.example.test, 99999, password=trojan-secret
+"#,
+    );
+
+    // The Surge reader took the section, not the Loon one.
+    assert_eq!(document.nodes.len(), 1);
+    let node = &document.nodes[0];
+    assert_eq!(node.id, "surge-ss-hk");
+    assert_metadata(
+        &node.metadata,
+        NODE_METADATA_SOURCE_FORMAT,
+        "surge-proxy-line",
+    );
+    let skipped = skipped_entries(&document);
+    assert_eq!(skipped.len(), 2, "{skipped:?}");
+    assert_eq!(
+        skipped[0].0,
+        config_core::SUBSCRIPTION_SURGE_PROXY_LINE_UNSUPPORTED_CODE
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("surge proxy line 4 (HY2, type hysteria2) was skipped: "),
+        "{skipped:?}"
+    );
+    assert_eq!(
+        skipped[1].0,
+        config_core::SUBSCRIPTION_SURGE_PROXY_LINE_INVALID_CODE
+    );
+    assert!(
+        skipped[1]
+            .1
+            .starts_with("surge proxy line 6 (Bad, type trojan) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn surge_proxy_section_of_built_in_policies_only_fails() {
+    let error = CoreSubscriptionService::new()
+        .parse(&RawSubscription {
+            source_id: "surge-builtins".to_string(),
+            content: "[Proxy]\nDIRECT = direct\nREJECT = reject\n".to_string(),
+        })
+        .expect_err("a section without nodes should fail");
+
+    assert_eq!(
+        error.code,
+        config_core::SUBSCRIPTION_SURGE_PROXY_LINE_UNSUPPORTED_CODE
+    );
+}
+
+#[test]
+fn surge_style_trojan_and_vmess_lines_stay_with_the_surge_reader() {
+    let document = parse_subscription(
+        "surge-trojan-vmess",
+        r#"
+[Proxy]
+T1 = trojan, t1.example.test, 443, password=abc=, sni=t1.example.test
+T2 = trojan, t2.example.test, 443, sni=t2.example.test, password=def
+V1 = vmess, v1.example.test, 443, username=00000000-0000-0000-0000-000000000001
+"#,
+    );
+
+    assert!(
+        document.diagnostics.is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    let ids = document
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        ["surge-trojan-t1", "surge-trojan-t2", "surge-vmess-v1"]
+    );
+    assert_metadata(
+        &document.nodes[0].metadata,
+        NODE_METADATA_TROJAN_PASSWORD,
+        "abc=",
+    );
+}
+
+#[test]
+fn loon_positional_passwords_with_base64_padding_stay_positional() {
+    let document = parse_subscription(
+        "loon-padding",
+        r#"
+[Proxy]
+香港 = Shadowsocks,1.2.3.4,443,2022-blake3-aes-128-gcm,"AAAAAAAAAAAAAAAAAAAAAA==",fast-open=false,udp=true
+JP=Shadowsocks,jp.example.test,8443,2022-blake3-aes-256-gcm,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=,udp=true
+TQ = trojan, tq.example.test, 443, "aGVsbG8=", over-tls=true, tls-name=tq.example.test
+TU = trojan, tu.example.test, 443, aGVsbG8=, tls-name=tu.example.test
+"#,
+    );
+
+    assert!(
+        document.diagnostics.is_empty(),
+        "{:?}",
+        document.diagnostics
+    );
+    assert_eq!(document.nodes.len(), 4);
+    for node in &document.nodes {
+        assert_metadata(
+            &node.metadata,
+            NODE_METADATA_SOURCE_FORMAT,
+            "loon-proxy-line",
+        );
+    }
+    let hong_kong = &document.nodes[0];
+    assert_eq!(hong_kong.name, "香港");
+    assert_eq!(hong_kong.protocol, Protocol::Shadowsocks);
+    assert_metadata(
+        &hong_kong.metadata,
+        NODE_METADATA_SHADOWSOCKS_METHOD,
+        "2022-blake3-aes-128-gcm",
+    );
+    assert_metadata(
+        &hong_kong.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "AAAAAAAAAAAAAAAAAAAAAA==",
+    );
+    let japan = &document.nodes[1];
+    assert_eq!(japan.name, "JP");
+    assert_metadata(
+        &japan.metadata,
+        NODE_METADATA_SHADOWSOCKS_PASSWORD,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    );
+    for trojan in &document.nodes[2..] {
+        assert_eq!(trojan.protocol, Protocol::Trojan);
+        assert_metadata(&trojan.metadata, NODE_METADATA_TROJAN_PASSWORD, "aGVsbG8=");
+    }
+}
+
+#[test]
+fn loon_proxy_section_skips_unsupported_lines() {
+    let document = parse_subscription(
+        "loon-mixed",
+        r#"
+[Proxy]
+HY2 = Hysteria2, hy2.example.test, 443, "hy2-secret"
+HK = Shadowsocks, 82.47.34.99, 11111, aes-256-gcm, "hk-secret"
+DIRECT = direct
+SG = Shadowsocks, 1.2.3.4, 443, 2022-blake3-aes-128-gcm, "AAAAAAAAAAAAAAAAAAAAAA=="
+"#,
+    );
+
+    let names = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["HK", "SG"]);
+    let skipped = skipped_entries(&document);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(
+        skipped[0].0,
+        config_core::SUBSCRIPTION_LOON_PROXY_LINE_UNSUPPORTED_CODE
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("loon proxy line 1 (HY2, type Hysteria2) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn sing_box_outbounds_skip_unsupported_and_malformed_entries() {
+    let document = parse_subscription(
+        "sing-box-mixed",
+        r#"{
+  "outbounds": [
+    {"type": "selector", "tag": "proxy", "outbounds": ["ss-out"]},
+    {"type": "shadowsocks", "tag": "ss-out", "server": "82.47.34.99", "server_port": 11111,
+     "method": "aes-256-gcm", "password": "ss-secret"},
+    {"type": "socks", "tag": "socks-out", "server": "socks.example.test", "server_port": 1080,
+     "password": "socks-secret"},
+    {"type": "shadowtls", "tag": "stls-out", "server": "stls.example.test", "server_port": 443,
+     "password": "stls-secret"},
+    {"type": "trojan", "tag": "odd-out", "server": "odd.example.test", "server_port": [443],
+     "password": "trojan-secret"},
+    {"type": "direct", "tag": "direct"}
+  ]
+}"#,
+    );
+
+    let tags = document
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(tags, ["ss-out"]);
+    let skipped = skipped_entries(&document);
+    assert_eq!(
+        skipped
+            .iter()
+            .map(|(code, _)| code.as_str())
+            .collect::<Vec<_>>(),
+        [
+            config_core::SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
+            config_core::SUBSCRIPTION_SING_BOX_JSON_INVALID_CODE,
+        ]
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("sing-box outbound 3 (socks-out, type socks) was skipped: "),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped[2]
+            .1
+            .starts_with("sing-box outbound 5 (odd-out, type trojan) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn quantumult_x_server_local_skips_unsupported_lines() {
+    let document = parse_subscription(
+        "quantumult-x-mixed",
+        r#"
+[server_local]
+shadowsocks=82.47.34.99:11111, method=aes-256-gcm, password=ss-secret, tag=HK
+http=http.example.test:80, username=user, password=http-secret, tag=HTTP Node
+"#,
+    );
+
+    assert_eq!(document.nodes.len(), 1);
+    assert_eq!(document.nodes[0].name, "HK");
+    let skipped = skipped_entries(&document);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(
+        skipped[0].0,
+        config_core::SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_UNSUPPORTED_CODE
+    );
+    assert!(
+        skipped[0]
+            .1
+            .starts_with("quantumult x server_local line 2 (HTTP Node, type http) was skipped: "),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn link_list_skips_malformed_links_of_known_schemes() {
+    let links = concat!(
+        "ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM#Supported\n",
+        "trojan://trojan-secret@example.com:99999#Bad%20Port\n",
+        "vmess://not-json-secret\n",
+    );
+    for content in [
+        links.to_string(),
+        base64::engine::general_purpose::STANDARD.encode(links),
+    ] {
+        let document = parse_subscription("links-mixed", &content);
+        assert_eq!(document.nodes.len(), 1);
+        assert_eq!(document.nodes[0].name, "Supported");
+        let skipped = skipped_entries(&document);
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|(code, _)| code.as_str())
+                .collect::<Vec<_>>(),
+            [
+                config_core::SUBSCRIPTION_TROJAN_LINK_INVALID_CODE,
+                config_core::SUBSCRIPTION_VMESS_LINK_INVALID_CODE,
+            ]
+        );
+        assert!(
+            skipped[0]
+                .1
+                .starts_with("share link 2 (type trojan) was skipped: "),
+            "{skipped:?}"
+        );
+    }
+}

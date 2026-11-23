@@ -1197,3 +1197,101 @@ fn hex_bytes(hex: &str) -> Vec<u8> {
         .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
         .collect()
 }
+
+#[test]
+fn a_bad_entry_is_skipped_and_reported_while_the_others_import() {
+    let text = CLASH.replace(
+        "proxy-groups:",
+        "  - name: HY2\n    type: hysteria2\n    server: hy2.example.test\n    port: 443\n    password: hy2-secret\n  - name: Local\n    type: direct\nproxy-groups:",
+    );
+    let report = import_text(&text).unwrap();
+    assert_eq!(report.nodes.len(), 2);
+    assert!(report.unsupported.is_empty());
+    assert_eq!(report.skipped_count, 1);
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(
+        report.skipped[0].code,
+        "subscription.core.clash_yaml_unsupported"
+    );
+    assert!(
+        report.skipped[0]
+            .message
+            .starts_with("clash proxy 3 (HY2, type hysteria2) was skipped: "),
+        "{:?}",
+        report.skipped
+    );
+    // A skipped entry never became a node, so the rules still come along.
+    assert!(report.routing.is_some());
+
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["skipped_count"], 1);
+    assert_eq!(
+        json["skipped"][0]["code"],
+        "subscription.core.clash_yaml_unsupported"
+    );
+    let skipped = serde_json::to_string(&json["skipped"]).unwrap();
+    assert!(!skipped.contains("secret"), "{skipped}");
+
+    // Nothing skipped: neither key is written.
+    let json = serde_json::to_value(import_text(CLASH).unwrap()).unwrap();
+    assert!(json.get("skipped").is_none());
+    assert!(json.get("skipped_count").is_none());
+}
+
+#[test]
+fn surge_profile_with_built_in_policies_imports_with_its_rules() {
+    let text = r#"
+[Proxy]
+DIRECT = direct
+Home = direct, interface=en0
+HY2 = hysteria2, hy2.example.test, 443, password=hy2-secret
+HK = ss, 82.47.34.99, 11111, encrypt-method=aes-256-gcm, password=hk-secret
+
+[Proxy Group]
+Proxy = select, HK, HY2, Home
+
+[Rule]
+DOMAIN-SUFFIX,lan.example,Home
+DOMAIN-SUFFIX,video.example,HY2
+FINAL,Proxy
+"#;
+    let report = import_text(text).unwrap();
+    assert_eq!(report.nodes.len(), 1);
+    assert_eq!(report.nodes[0].protocol, "shadowsocks");
+    assert_eq!(report.skipped_count, 1);
+    assert_eq!(
+        report.skipped[0].code,
+        "subscription.core.surge_proxy_line_unsupported"
+    );
+    let routing = report.routing.expect("the rules import without HY2");
+    let rules = serde_json::to_string(&routing["rules"]).unwrap();
+    assert!(
+        rules.contains("DOMAIN-SUFFIX,lan.example,DIRECT"),
+        "{rules}"
+    );
+    assert!(!rules.contains("video.example"), "{rules}");
+    let warnings = report.routing_warnings.join("\n");
+    assert!(warnings.contains("HY2"), "{warnings}");
+}
+
+#[test]
+fn loon_shadowsocks_2022_keys_keep_their_padding() {
+    let text = r#"
+[Proxy]
+香港 = Shadowsocks,1.2.3.4,443,2022-blake3-aes-128-gcm,"AAAAAAAAAAAAAAAAAAAAAA==",fast-open=false,udp=true
+"#;
+    let report = import_text(text).unwrap();
+    assert_eq!(report.nodes.len(), 1);
+    let outbound = &report.nodes[0].outbound;
+    assert_eq!(outbound["type"], "shadowsocks");
+    assert_eq!(outbound["method"], "2022-blake3-aes-128-gcm");
+    assert_eq!(outbound["password"], "AAAAAAAAAAAAAAAAAAAAAA==");
+}
+
+#[test]
+fn a_list_of_only_bad_entries_is_still_rejected() {
+    assert_eq!(
+        import_text("trojan://trojan-secret@example.com:99999#Bad\nvmess://not-json\n"),
+        Err(ImportError::Unrecognized)
+    );
+}

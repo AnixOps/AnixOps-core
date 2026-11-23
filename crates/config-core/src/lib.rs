@@ -192,7 +192,10 @@ struct RawSubscriptionDocument {
 
 #[derive(Debug, Deserialize)]
 struct RawClashDocument {
-    proxies: Option<Vec<RawClashProxy>>,
+    /// Each entry is read into [`RawClashProxy`] on its own, so one entry
+    /// with a field of an unexpected type is skipped instead of hiding the
+    /// whole list.
+    proxies: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,7 +233,10 @@ struct RawClashSnellObfs {
 
 #[derive(Debug, Deserialize)]
 struct RawSingBoxDocument {
-    outbounds: Option<Vec<RawSingBoxOutbound>>,
+    /// Each entry is read into [`RawSingBoxOutbound`] on its own, so one
+    /// outbound with a field of an unexpected type is skipped instead of
+    /// hiding the whole list.
+    outbounds: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -786,6 +792,149 @@ fn normalize_node(raw: RawNode) -> DomainResult<NodeDescriptor> {
     })
 }
 
+/// Bad entries one subscription format left out, so the entries around them
+/// still import. Each becomes a warning [`Diagnostic`] with the entry's own
+/// error code; the first error is what [`SkippedEntries::finish`] returns
+/// when no entry could be imported at all.
+struct SkippedEntries {
+    /// How the format calls one entry (`clash proxy`, `share link`, ...).
+    entry: &'static str,
+    diagnostics: Vec<Diagnostic>,
+    first_error: Option<DomainError>,
+}
+
+/// Longest entry name a skip warning repeats.
+const MAX_SKIPPED_ENTRY_NAME_CHARS: usize = 64;
+/// Longest entry type a skip warning repeats.
+const MAX_SKIPPED_ENTRY_KIND_LEN: usize = 32;
+
+impl SkippedEntries {
+    fn new(entry: &'static str) -> Self {
+        Self {
+            entry,
+            diagnostics: Vec::new(),
+            first_error: None,
+        }
+    }
+
+    /// Records that entry `index` (counted from 0) was left out. The warning
+    /// names the entry by its position, and by its declared name and type
+    /// when they look like labels, with the error's fixed reason; never by
+    /// the entry's text, which holds its credentials.
+    fn skip(&mut self, index: usize, name: Option<&str>, kind: Option<&str>, error: DomainError) {
+        let position = index + 1;
+        let name = name.map(str::trim).filter(|name| is_entry_label(name));
+        let kind = kind.map(str::trim).filter(|kind| is_entry_kind(kind));
+        let entry = match (name, kind) {
+            (Some(name), Some(kind)) => format!("{} {position} ({name}, type {kind})", self.entry),
+            (Some(name), None) => format!("{} {position} ({name})", self.entry),
+            (None, Some(kind)) => format!("{} {position} (type {kind})", self.entry),
+            (None, None) => format!("{} {position}", self.entry),
+        };
+        self.diagnostics.push(Diagnostic::new(
+            DiagnosticSeverity::Warning,
+            error.code.clone(),
+            format!("{entry} was skipped: {}", error.message),
+            Some(SOURCE_SUBSCRIPTION_CORE.to_string()),
+        ));
+        if self.first_error.is_none() {
+            self.first_error = Some(error);
+        }
+    }
+
+    /// The document of the imported `nodes` with a warning per skipped
+    /// entry, or, when there are none, the first skipped entry's error
+    /// (`none_imported` when no entry failed, as when every entry was a
+    /// built-in policy).
+    fn finish(
+        self,
+        nodes: Vec<NodeDescriptor>,
+        none_imported: impl FnOnce() -> DomainError,
+    ) -> DomainResult<SubscriptionDocument> {
+        if nodes.is_empty() {
+            return Err(self.first_error.unwrap_or_else(none_imported));
+        }
+        Ok(SubscriptionDocument {
+            nodes,
+            rules: Vec::new(),
+            diagnostics: self.diagnostics,
+        })
+    }
+}
+
+/// Whether an entry's declared name can be repeated in a warning: short,
+/// one line, and not shaped like a link or credentials.
+fn is_entry_label(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_SKIPPED_ENTRY_NAME_CHARS
+        && !name.contains("://")
+        && !name.contains('@')
+        && !name.chars().any(char::is_control)
+}
+
+/// Whether an entry's type can be repeated in a warning: one short word.
+fn is_entry_kind(kind: &str) -> bool {
+    !kind.is_empty()
+        && kind.len() <= MAX_SKIPPED_ENTRY_KIND_LEN
+        && kind
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Adds `node` to `nodes`, renaming its id with a `-<n>` suffix when an
+/// earlier node took it.
+fn push_unique_node(
+    nodes: &mut Vec<NodeDescriptor>,
+    seen_ids: &mut BTreeSet<String>,
+    mut node: NodeDescriptor,
+) {
+    if !seen_ids.insert(node.id.clone()) {
+        let base_id = node.id.clone();
+        let mut suffix = seen_ids.len() + 1;
+        loop {
+            node.id = format!("{base_id}-{suffix}");
+            if seen_ids.insert(node.id.clone()) {
+                break;
+            }
+            suffix += 1;
+        }
+    }
+    nodes.push(node);
+}
+
+/// The built-in policy a proxy entry of type `kind` stands for: `DIRECT`,
+/// or `REJECT` and its variants (as [`routing::RejectKind`] names them).
+/// Surge, Loon, Quantumult X and Clash list these beside their nodes (Surge's
+/// `DIRECT = direct`, an alias such as `Home = direct, interface=en0`, a
+/// Clash `type: direct` proxy); they are policies, not nodes, so importing
+/// skips them without a warning and rules may still name them.
+pub(crate) fn builtin_policy(kind: &str) -> Option<&'static str> {
+    let kind = kind.trim();
+    if kind.eq_ignore_ascii_case("direct") {
+        return Some("DIRECT");
+    }
+    let upper = kind.to_ascii_uppercase();
+    if upper == "REJECT" || upper.starts_with("REJECT-") {
+        return Some(routing::RejectKind::parse(kind).unwrap_or_default().name());
+    }
+    None
+}
+
+/// A Surge or Loon `[Proxy]` line that declares a built-in policy
+/// (`Name = direct`, `Name = reject-drop`, ...): its name, the policy, and
+/// whether the line sets options (such as `interface=`) beyond the type.
+pub(crate) fn proxy_line_builtin_policy(line: &str) -> Option<(&str, &'static str, bool)> {
+    let (name, definition) = line.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut parts = definition.split(',');
+    let policy = builtin_policy(parts.next()?)?;
+    let has_options = parts.any(|part| !part.trim().is_empty());
+    Some((name, policy, has_options))
+}
+
 fn parse_link_subscription(
     source_id: &str,
     content: &str,
@@ -834,27 +983,62 @@ fn parse_clash_yaml_subscription(
 
     let mut nodes = Vec::new();
     let mut seen_ids = BTreeSet::new();
-    for proxy in proxies {
-        let mut node = parse_clash_proxy(proxy, source_id)?;
-        if !seen_ids.insert(node.id.clone()) {
-            let base_id = node.id.clone();
-            let mut suffix = seen_ids.len() + 1;
-            loop {
-                node.id = format!("{base_id}-{suffix}");
-                if seen_ids.insert(node.id.clone()) {
-                    break;
-                }
-                suffix += 1;
-            }
+    let mut skipped = SkippedEntries::new("clash proxy");
+    // Whether any entry reads as a Clash proxy; when none does, the text is
+    // not a Clash document and the next format gets it.
+    let mut readable = false;
+    for (index, value) in proxies.into_iter().enumerate() {
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let kind = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if kind.as_deref().is_some_and(is_clash_builtin_proxy_type) {
+            readable = true;
+            continue;
         }
-        nodes.push(node);
+        let raw = match serde_json::from_value::<RawClashProxy>(value) {
+            Ok(raw) => raw,
+            Err(_) => {
+                skipped.skip(
+                    index,
+                    name.as_deref(),
+                    kind.as_deref(),
+                    domain_error(
+                        SUBSCRIPTION_CLASH_YAML_INVALID_CODE,
+                        "clash proxy fields have unexpected types",
+                    ),
+                );
+                continue;
+            }
+        };
+        readable = true;
+        match parse_clash_proxy(raw, source_id) {
+            Ok(node) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Err(error) => skipped.skip(index, name.as_deref(), kind.as_deref(), error),
+        }
+    }
+    if !readable {
+        return Ok(None);
     }
 
-    Ok(Some(SubscriptionDocument {
-        nodes,
-        rules: Vec::new(),
-        diagnostics: Vec::new(),
-    }))
+    skipped
+        .finish(nodes, || {
+            domain_error(
+                SUBSCRIPTION_CLASH_YAML_UNSUPPORTED_CODE,
+                "clash yaml proxies must contain at least one supported proxy",
+            )
+        })
+        .map(Some)
+}
+
+/// Clash proxy types that are policies rather than nodes (mihomo's
+/// `direct`, `reject`, `reject-drop`, `dns`).
+fn is_clash_builtin_proxy_type(kind: &str) -> bool {
+    builtin_policy(kind).is_some() || kind.trim().eq_ignore_ascii_case("dns")
 }
 
 fn parse_clash_proxy(mut raw: RawClashProxy, source_id: &str) -> DomainResult<NodeDescriptor> {
@@ -1152,37 +1336,61 @@ fn parse_sing_box_json_subscription(
 
     let mut nodes = Vec::new();
     let mut seen_ids = BTreeSet::new();
-    for outbound in outbounds {
-        let Some(mut node) = parse_sing_box_outbound(outbound, source_id)? else {
+    let mut skipped = SkippedEntries::new("sing-box outbound");
+    // Whether any entry reads as an outbound; when none does, the text is
+    // not a sing-box document and the next format gets it.
+    let mut readable = false;
+    for (index, value) in outbounds.into_iter().enumerate() {
+        let tag = value
+            .get("tag")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let kind = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if kind
+            .as_deref()
+            .is_some_and(|kind| is_ignored_sing_box_outbound(&normalized_token(kind)))
+        {
+            readable = true;
             continue;
-        };
-        if !seen_ids.insert(node.id.clone()) {
-            let base_id = node.id.clone();
-            let mut suffix = seen_ids.len() + 1;
-            loop {
-                node.id = format!("{base_id}-{suffix}");
-                if seen_ids.insert(node.id.clone()) {
-                    break;
-                }
-                suffix += 1;
-            }
         }
-        nodes.push(node);
+        let outbound = match serde_json::from_value::<RawSingBoxOutbound>(value) {
+            Ok(outbound) => outbound,
+            Err(_) => {
+                skipped.skip(
+                    index,
+                    tag.as_deref(),
+                    kind.as_deref(),
+                    domain_error(
+                        SUBSCRIPTION_SING_BOX_JSON_INVALID_CODE,
+                        "sing-box outbound fields have unexpected types",
+                    ),
+                );
+                continue;
+            }
+        };
+        readable = true;
+        match parse_sing_box_outbound(outbound, source_id) {
+            Ok(Some(node)) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Ok(None) => {}
+            Err(error) => skipped.skip(index, tag.as_deref(), kind.as_deref(), error),
+        }
     }
-
-    if nodes.is_empty() {
-        return Err(domain_error(
-            SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
-            "sing-box json outbounds must contain at least one supported proxy outbound",
-        ));
+    if !readable {
+        return Ok(None);
     }
     resolve_vias(&mut nodes);
 
-    Ok(Some(SubscriptionDocument {
-        nodes,
-        rules: Vec::new(),
-        diagnostics: Vec::new(),
-    }))
+    skipped
+        .finish(nodes, || {
+            domain_error(
+                SUBSCRIPTION_SING_BOX_JSON_UNSUPPORTED_CODE,
+                "sing-box json outbounds must contain at least one supported proxy outbound",
+            )
+        })
+        .map(Some)
 }
 
 /// Turns each node's `detour` tag into the id of the imported node with that
@@ -1839,27 +2047,38 @@ fn parse_quantumult_x_proxy_line_subscription(
 
     let mut nodes = Vec::new();
     let mut seen_ids = BTreeSet::new();
-    for line in proxy_lines {
-        let mut node = parse_quantumult_x_proxy_line(&line, source_id)?;
-        if !seen_ids.insert(node.id.clone()) {
-            let base_id = node.id.clone();
-            let mut suffix = seen_ids.len() + 1;
-            loop {
-                node.id = format!("{base_id}-{suffix}");
-                if seen_ids.insert(node.id.clone()) {
-                    break;
-                }
-                suffix += 1;
+    let mut skipped = SkippedEntries::new("quantumult x server_local line");
+    for (index, line) in proxy_lines.iter().enumerate() {
+        let kind = line.split_once('=').map(|(kind, _)| kind.trim());
+        if kind.and_then(builtin_policy).is_some() {
+            continue;
+        }
+        match parse_quantumult_x_proxy_line(line, source_id) {
+            Ok(node) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Err(error) => {
+                let tag = quantumult_x_proxy_line_tag(line);
+                skipped.skip(index, tag.as_deref(), kind, error);
             }
         }
-        nodes.push(node);
     }
 
-    Ok(Some(SubscriptionDocument {
-        nodes,
-        rules: Vec::new(),
-        diagnostics: Vec::new(),
-    }))
+    skipped
+        .finish(nodes, || {
+            domain_error(
+                SUBSCRIPTION_QUANTUMULT_X_PROXY_LINE_UNSUPPORTED_CODE,
+                "quantumult x server_local section must contain at least one supported proxy",
+            )
+        })
+        .map(Some)
+}
+
+/// The `tag=` of a Quantumult X server line, for naming it in a warning.
+fn quantumult_x_proxy_line_tag(line: &str) -> Option<String> {
+    let (_, definition) = line.split_once('=')?;
+    definition.split(',').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (normalized_token(key) == "tag").then(|| strip_quantumult_x_quotes(value.to_string()))
+    })
 }
 
 fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescriptor> {
@@ -2117,46 +2336,71 @@ fn parse_loon_proxy_line_subscription(
         ));
     }
 
-    let mut parsed_nodes = Vec::new();
-    for line in proxy_lines {
-        let Some(node) = parse_loon_proxy_line(&line, source_id)? else {
-            if parsed_nodes.is_empty() {
-                return Ok(None);
-            }
-            return Err(domain_error(
-                SUBSCRIPTION_LOON_PROXY_LINE_INVALID_CODE,
-                "loon proxy section cannot mix positional lines with other proxy line styles",
-            ));
-        };
-        parsed_nodes.push(node);
-    }
-
-    if parsed_nodes.is_empty() {
-        return Ok(None);
-    }
-
     let mut nodes = Vec::new();
     let mut seen_ids = BTreeSet::new();
-    for mut node in parsed_nodes {
-        if !seen_ids.insert(node.id.clone()) {
-            let base_id = node.id.clone();
-            let mut suffix = seen_ids.len() + 1;
-            loop {
-                node.id = format!("{base_id}-{suffix}");
-                if seen_ids.insert(node.id.clone()) {
-                    break;
-                }
-                suffix += 1;
+    let mut skipped = SkippedEntries::new("loon proxy line");
+    // Lines in another style (Surge's `key=value` options) or of a type the
+    // Loon reader does not know: when no line reads as a Loon node, the
+    // section is not Loon's and the Surge reader gets it.
+    let mut other_style = Vec::new();
+    for (index, line) in proxy_lines.iter().enumerate() {
+        if proxy_line_builtin_policy(line).is_some() {
+            continue;
+        }
+        match parse_loon_proxy_line(line, source_id) {
+            Ok(Some(node)) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Ok(None) => other_style.push(index),
+            Err(error) => {
+                let (name, kind) = proxy_line_name_and_kind(line);
+                skipped.skip(index, name, kind, error);
             }
         }
-        nodes.push(node);
     }
 
-    Ok(Some(SubscriptionDocument {
-        nodes,
-        rules: Vec::new(),
-        diagnostics: Vec::new(),
-    }))
+    if nodes.is_empty() {
+        // Every line was in Loon's positional style yet none could be
+        // imported: report the first one's error rather than letting the
+        // Surge reader misread the section.
+        if other_style.is_empty() {
+            if let Some(error) = skipped.first_error {
+                return Err(error);
+            }
+        }
+        return Ok(None);
+    }
+    for index in other_style {
+        let (name, kind) = proxy_line_name_and_kind(&proxy_lines[index]);
+        skipped.skip(
+            index,
+            name,
+            kind,
+            domain_error(
+                SUBSCRIPTION_LOON_PROXY_LINE_UNSUPPORTED_CODE,
+                "loon proxy line type or option style is not supported for catalog import",
+            ),
+        );
+    }
+
+    skipped
+        .finish(nodes, || {
+            domain_error(
+                SUBSCRIPTION_LOON_PROXY_LINE_UNSUPPORTED_CODE,
+                "loon proxy section must contain at least one supported proxy",
+            )
+        })
+        .map(Some)
+}
+
+/// The name and type of a Surge or Loon `Name = type, server, port, ...`
+/// line, for naming it in a warning.
+fn proxy_line_name_and_kind(line: &str) -> (Option<&str>, Option<&str>) {
+    match line.split_once('=') {
+        Some((name, definition)) => (
+            Some(name.trim()),
+            definition.split(',').next().map(str::trim),
+        ),
+        None => (None, None),
+    }
 }
 
 fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<NodeDescriptor>> {
@@ -2199,9 +2443,7 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
 
     let (protocol, protocol_tag, mut metadata) = match protocol_token.as_str() {
         "ss" | "shadowsocks" => {
-            if loon_proxy_part_looks_like_key_value(&parts, 3)
-                || loon_proxy_part_looks_like_key_value(&parts, 4)
-            {
+            if is_surge_style_proxy_definition(&parts) {
                 return Ok(None);
             }
             let method =
@@ -2224,7 +2466,7 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
             )
         }
         "trojan" => {
-            if loon_proxy_part_looks_like_key_value(&parts, 3) {
+            if is_surge_style_proxy_definition(&parts) {
                 return Ok(None);
             }
             let password =
@@ -2239,7 +2481,7 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
             )
         }
         "vless" => {
-            if loon_proxy_part_looks_like_key_value(&parts, 3) {
+            if is_surge_style_proxy_definition(&parts) {
                 return Ok(None);
             }
             let uuid = required_loon_proxy_part(&parts, 3, "loon vless uuid cannot be empty")?;
@@ -2253,9 +2495,7 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
             )
         }
         "vmess" => {
-            if loon_proxy_part_looks_like_key_value(&parts, 3)
-                || loon_proxy_part_looks_like_key_value(&parts, 4)
-            {
+            if is_surge_style_proxy_definition(&parts) {
                 return Ok(None);
             }
             let uuid = required_loon_proxy_part(&parts, 4, "loon vmess uuid cannot be empty")?;
@@ -2332,11 +2572,40 @@ fn loon_proxy_option(options: &[String], key: &str) -> Option<String> {
     })
 }
 
-fn loon_proxy_part_looks_like_key_value(parts: &[String], index: usize) -> bool {
+/// Whether a `type, server, port, ...` definition is in Surge's style, where
+/// the fields after the port are `key=value` options, rather than Loon's,
+/// where the credentials follow the port as positional fields (the cipher
+/// and password of shadowsocks, the password of trojan, the UUID of vless,
+/// the cipher and UUID of vmess).
+///
+/// Only the first field after the port decides. A positional password or
+/// SS-2022 key may itself contain `=` (base64 padding), so containing `=`
+/// alone does not make a field an option; see [`is_proxy_line_option`].
+fn is_surge_style_proxy_definition(parts: &[String]) -> bool {
     parts
-        .get(index)
-        .map(|part| part.contains('='))
+        .get(3..)
         .unwrap_or_default()
+        .iter()
+        .find(|field| !field.is_empty())
+        .is_some_and(|field| is_proxy_line_option(field))
+}
+
+/// Whether a proxy line field is a `key=value` option: not quoted, a key
+/// that is a word (a letter, then letters, digits, `-` or `_`), and a value
+/// that is more than `=` padding. A base64 value such as `aGVsbG8=` or
+/// `AAAAAAAAAAAAAAAAAAAAAA==` splits into a word and padding only, so it
+/// stays a positional value.
+fn is_proxy_line_option(field: &str) -> bool {
+    if field.starts_with('"') {
+        return false;
+    }
+    let Some((key, value)) = field.split_once('=') else {
+        return false;
+    };
+    let mut key = key.trim().chars();
+    key.next().is_some_and(|first| first.is_ascii_alphabetic())
+        && key.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !value.trim().trim_matches('=').is_empty()
 }
 
 fn required_loon_proxy_part(
@@ -2399,27 +2668,28 @@ fn parse_surge_proxy_line_subscription(
 
     let mut nodes = Vec::new();
     let mut seen_ids = BTreeSet::new();
-    for line in proxy_lines {
-        let mut node = parse_surge_proxy_line(&line, source_id)?;
-        if !seen_ids.insert(node.id.clone()) {
-            let base_id = node.id.clone();
-            let mut suffix = seen_ids.len() + 1;
-            loop {
-                node.id = format!("{base_id}-{suffix}");
-                if seen_ids.insert(node.id.clone()) {
-                    break;
-                }
-                suffix += 1;
+    let mut skipped = SkippedEntries::new("surge proxy line");
+    for (index, line) in proxy_lines.iter().enumerate() {
+        if proxy_line_builtin_policy(line).is_some() {
+            continue;
+        }
+        match parse_surge_proxy_line(line, source_id) {
+            Ok(node) => push_unique_node(&mut nodes, &mut seen_ids, node),
+            Err(error) => {
+                let (name, kind) = proxy_line_name_and_kind(line);
+                skipped.skip(index, name, kind, error);
             }
         }
-        nodes.push(node);
     }
 
-    Ok(Some(SubscriptionDocument {
-        nodes,
-        rules: Vec::new(),
-        diagnostics: Vec::new(),
-    }))
+    skipped
+        .finish(nodes, || {
+            domain_error(
+                SUBSCRIPTION_SURGE_PROXY_LINE_UNSUPPORTED_CODE,
+                "surge proxy section must contain at least one supported proxy",
+            )
+        })
+        .map(Some)
 }
 
 fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescriptor> {
@@ -2682,14 +2952,16 @@ fn required_surge_proxy_option(
 fn parse_proxy_link_lines(source_id: &str, content: &str) -> DomainResult<SubscriptionDocument> {
     let mut nodes = Vec::new();
     let mut seen_ids = BTreeSet::new();
+    let mut skipped = SkippedEntries::new("share link");
     // An AnixOps `#anixops:path=<kind>` line describes the link after it.
     let mut path: Option<String> = None;
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    for (index, line) in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
         if let Some(comment) = line.strip_prefix('#') {
             if let Some(kind) = comment.trim().strip_prefix(ANIXOPS_PATH_MARK) {
                 path = Some(kind.trim().to_string()).filter(|kind| is_path_kind(kind));
@@ -2697,31 +2969,18 @@ fn parse_proxy_link_lines(source_id: &str, content: &str) -> DomainResult<Subscr
             continue;
         }
         let path = path.take();
-        let (line, via) = take_link_via(line)?;
-        let line = line.as_str();
-
-        let mut node = if line.starts_with("ss://") {
-            parse_shadowsocks_link(line)?
-        } else if line.starts_with("trojan://") {
-            parse_trojan_link(line)?
-        } else if line.starts_with("vless://") {
-            parse_vless_link(line)?
-        } else if line.starts_with("vmess://") {
-            parse_vmess_link(line)?
-        } else if line.starts_with("hysteria2://") || line.starts_with("hy2://") {
-            parse_hysteria2_link(line)?
-        } else if line.starts_with("tuic://") {
-            parse_tuic_link(line)?
-        } else if line.starts_with("wireguard://") {
-            parse_wireguard_link(line)?
-        } else if line.starts_with("mierus://") {
-            parse_mieru_link(line)?
-        } else if line.starts_with("iwan://") {
-            parse_iwan_link(line)?
-        } else if line.starts_with("anx://") {
-            parse_anx_link(line)?
-        } else {
+        let Some(parser) = share_link_parser(line) else {
             continue;
+        };
+        let scheme = line.split_once("://").map(|(scheme, _)| scheme);
+        let parsed =
+            take_link_via(line).and_then(|(link, via)| parser(&link).map(|node| (node, via)));
+        let (mut node, via) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                skipped.skip(index, None, scheme, error);
+                continue;
+            }
         };
         if let Some(via) = via {
             node.metadata.push(MetadataEntry {
@@ -2735,37 +2994,49 @@ fn parse_proxy_link_lines(source_id: &str, content: &str) -> DomainResult<Subscr
                 value: path,
             });
         }
-        if !seen_ids.insert(node.id.clone()) {
-            let base_id = node.id.clone();
-            let mut suffix = seen_ids.len() + 1;
-            loop {
-                node.id = format!("{base_id}-{suffix}");
-                if seen_ids.insert(node.id.clone()) {
-                    break;
-                }
-                suffix += 1;
-            }
-        }
         node.metadata.push(MetadataEntry {
             key: "subscription.source_id".to_string(),
             value: source_id.to_string(),
         });
-        nodes.push(node);
-    }
-
-    if nodes.is_empty() {
-        return Err(domain_error(
-            SUBSCRIPTION_LINK_UNSUPPORTED_CODE,
-            "subscription link list did not contain supported proxy links",
-        ));
+        push_unique_node(&mut nodes, &mut seen_ids, node);
     }
     resolve_vias(&mut nodes);
 
-    Ok(SubscriptionDocument {
-        nodes,
-        rules: Vec::new(),
-        diagnostics: Vec::new(),
+    skipped.finish(nodes, || {
+        domain_error(
+            SUBSCRIPTION_LINK_UNSUPPORTED_CODE,
+            "subscription link list did not contain supported proxy links",
+        )
     })
+}
+
+/// The parser for a share link's scheme; `None` for lines of other schemes,
+/// which a link list skips silently.
+fn share_link_parser(line: &str) -> Option<fn(&str) -> DomainResult<NodeDescriptor>> {
+    let parser: fn(&str) -> DomainResult<NodeDescriptor> = if line.starts_with("ss://") {
+        parse_shadowsocks_link
+    } else if line.starts_with("trojan://") {
+        parse_trojan_link
+    } else if line.starts_with("vless://") {
+        parse_vless_link
+    } else if line.starts_with("vmess://") {
+        parse_vmess_link
+    } else if line.starts_with("hysteria2://") || line.starts_with("hy2://") {
+        parse_hysteria2_link
+    } else if line.starts_with("tuic://") {
+        parse_tuic_link
+    } else if line.starts_with("wireguard://") {
+        parse_wireguard_link
+    } else if line.starts_with("mierus://") {
+        parse_mieru_link
+    } else if line.starts_with("iwan://") {
+        parse_iwan_link
+    } else if line.starts_with("anx://") {
+        parse_anx_link
+    } else {
+        return None;
+    };
+    Some(parser)
 }
 
 /// The AnixOps subscription line that marks the next link's path

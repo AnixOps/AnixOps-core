@@ -57,7 +57,7 @@ P3 baseline 源码接入按以下顺序执行：
 
 1. 应用层或 CLI 明确提供订阅 source；在当前阶段只允许 `inline:` source。
 2. `SubscriptionService::fetch` 返回 `RawSubscription`；unsupported source 必须返回稳定 `DomainError`，不得泄漏 URL token、header、credential 或 payload secret。
-3. `SubscriptionService::parse` 返回 `SubscriptionDocument`；解析失败诊断不得包含原始 secret。
+3. `SubscriptionService::parse` 返回 `SubscriptionDocument`；解析失败诊断不得包含原始 secret。逐条容错规则见下文「条目级容错」。
 4. `SubscriptionService::normalize` 返回 `NodeCatalog`。
 5. 运行层对 `NodeCatalog.nodes` 做最小 catalog gate，生成可传给 `RuntimeConfigRequest.nodes` 的 typed nodes。
 6. `RuntimeOrchestrator::start_runtime_with_subscription_catalogs` 或 `reload_runtime_with_subscription_catalogs` 继续把 gated `RuntimeConfigRequest.nodes` 传给 `ProxyEngineConfig.nodes`。
@@ -68,6 +68,33 @@ P3 baseline 源码接入按以下顺序执行：
 
 Current blocked anchors for CI governance: no remote subscription fetching, no file subscription loading,
 no system DNS/TUN mutation, no daemon/control socket.
+
+## 条目级容错
+
+链接列表（明文与 base64）、Clash YAML、sing-box JSON、Quantumult X、Loon 和 Surge 的解析器逐条解析：
+
+- 认出格式后，单个条目无法解析（类型不支持、字段缺失或类型不对、端口非法、链接格式错误）时跳过该条目，
+  在 `SubscriptionDocument.diagnostics` 追加一条 `Warning`，其余条目照常导入。只有一条可用节点都没有时才
+  返回错误，错误是第一个被跳过条目的原错误（code 不变）；只含一条坏链接的输入仍按原 code 失败。
+- 警告的 `code` 沿用该条目原来的错误 code（如 `subscription.core.clash_yaml_unsupported`、
+  `subscription.core.trojan_link_invalid`），`message` 为固定英文：格式、条目序号（从 1 起）、看起来像标签的
+  条目名与类型、原错误说明，例如 `clash proxy 3 (HY2, type hysteria2) was skipped: ...`。不包含条目原文、
+  密码、UUID、密钥或链接；名称含 `://`、`@`、控制字符或超过 64 个字符时省略。`source` 为 `subscription.core`。
+- 内置策略条目不是节点，静默跳过、不计入警告：Surge/Loon `[Proxy]` 的 `DIRECT = direct`、`REJECT = reject`、
+  `X = reject-drop` 等，以及别名 `Home = direct, interface=en0`；Quantumult X 的 `direct`/`reject`；Clash 的
+  `type: direct`/`reject`/`reject-drop`/`dns`；sing-box 的 `direct`/`block`/`dns`/`selector`/`urltest`/`bridge`。
+  规则与策略组引用这些名称时按对应策略导入（见 `routing-policy-group-model.md`「订阅导入」）。
+- 链接列表里不认识的 scheme 一行照旧静默跳过；已知 scheme 的坏链接按上面规则跳过并告警。
+- Loon 与 Surge 共用 `[Proxy]` 段：Loon 解析器只在至少一行按 Loon 位置参数写法解析成节点时认领该段，
+  其余行（Surge 写法或不支持的类型）跳过并告警；没有一行成为 Loon 节点时交给 Surge 解析器，除非每一行都是
+  Loon 位置写法且都失败，此时返回第一行的 Loon 错误。端口后第一个字段决定写法：未加引号、`键=值` 且键为单词、
+  值不只是 `=` 填充时是 Surge 选项，否则是 Loon 位置参数，所以 base64 密码（`"AAAAAAAAAAAAAAAAAAAAAA=="`、
+  未加引号的 `aGVsbG8=`、SS-2022 多用户 `serverKey==:userKey==`）按位置读取并原样保留 `=`。
+- 第一方 TOML 格式保持严格，任一条目错误整体失败。
+
+`node-import::import_text` 把这些警告作为报告顶层的 `skipped`（`[{code, message}]`，最多 32 条）与
+`skipped_count`（总数）输出，没有跳过时两个键都不输出。跳过的条目没有成为节点，不像 `unsupported` 那样关闭
+`routing`；引用它们的规则和组成员按 `routing_warnings` 的既有方式跳过并告警。
 
 ## 去重和优先级
 
