@@ -8,12 +8,9 @@
 use std::io;
 use std::sync::Arc;
 
+use engine_outbound::happy_eyeballs::{self, Schedule};
 use engine_outbound::registry::{parse_settings, BuildError, OutboundFactory, Settings};
-use engine_outbound::{
-    BoxFuture, BoxStream, DatagramRecv, DatagramSend, Dialer, TargetAddr, TcpOutbound, UdpFlow,
-    MAX_DATAGRAM,
-};
-use tokio::net::UdpSocket;
+use engine_outbound::{BoxFuture, BoxStream, Dialer, TargetAddr, TcpOutbound, UdpFlow};
 
 pub const PROTOCOL: &str = "direct";
 
@@ -45,21 +42,22 @@ impl DirectOutbound {
     }
 }
 
-/// The addresses of `target`, a domain resolved by the system.
+/// The addresses of `target` in the order to try them, a domain resolved by
+/// the system ([`happy_eyeballs::resolve`]).
 async fn addresses(target: &TargetAddr) -> io::Result<Vec<std::net::SocketAddr>> {
-    let addresses: Vec<_> = match target {
-        TargetAddr::Ip(address) => vec![*address],
-        TargetAddr::Domain(domain, port) => tokio::net::lookup_host((domain.as_str(), *port))
-            .await?
-            .collect(),
-    };
-    if addresses.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "target did not resolve",
-        ));
+    match target {
+        TargetAddr::Ip(address) => Ok(vec![*address]),
+        TargetAddr::Domain(domain, port) => {
+            happy_eyeballs::resolve(domain, *port)
+                .await
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::NotFound => {
+                        io::Error::new(io::ErrorKind::NotFound, "target did not resolve")
+                    }
+                    _ => error,
+                })
+        }
     }
-    Ok(addresses)
 }
 
 impl TcpOutbound for DirectOutbound {
@@ -73,75 +71,47 @@ impl TcpOutbound for DirectOutbound {
                 let host = target.host();
                 return self.dialer.dial(&host, target.port()).await;
             };
-            let mut last_error = None;
-            for address in addresses(target).await? {
-                match crate::interface::connect_tcp(interface, address).await {
-                    Ok(stream) => {
-                        let _ = stream.set_nodelay(true);
-                        return Ok(Box::new(stream) as BoxStream);
-                    }
-                    // A missing interface is missing for every address.
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
-                    Err(error) => last_error = Some(error),
-                }
+            let addresses = addresses(target).await?;
+            let (address, stream) = happy_eyeballs::connect(&addresses, Schedule::TCP, |address| {
+                crate::interface::connect_tcp(interface, address)
+            })
+            .await?;
+            if let TargetAddr::Domain(domain, _) = target {
+                happy_eyeballs::remember(domain, address);
             }
-            Err(last_error.unwrap_or_else(|| io::Error::from(io::ErrorKind::NotFound)))
+            let _ = stream.set_nodelay(true);
+            Ok(Box::new(stream) as BoxStream)
         })
     }
 
     /// A connected UDP socket of its own; a domain is resolved by the system.
     fn open_udp<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
         Box::pin(async move {
+            // No handshake to race on: the first address in
+            // `happy_eyeballs` order, the family TCP last connected with.
             let address = match target {
                 TargetAddr::Ip(address) => *address,
-                TargetAddr::Domain(domain, port) => {
-                    tokio::net::lookup_host((domain.as_str(), *port))
-                        .await?
-                        .next()
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::NotFound, "udp target did not resolve")
-                        })?
+                TargetAddr::Domain(..) => {
+                    addresses(target)
+                        .await
+                        .map_err(|error| match error.kind() {
+                            io::ErrorKind::NotFound => io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "udp target did not resolve",
+                            ),
+                            _ => error,
+                        })?[0]
                 }
             };
             let socket = match self.interface.as_deref() {
-                Some(interface) => {
-                    Arc::new(crate::interface::connect_udp(interface, address).await?)
-                }
+                Some(interface) => crate::interface::connect_udp(interface, address).await?,
                 None => {
                     let socket = engine_outbound::protect::bind_udp(address)?;
                     socket.connect(address).await?;
-                    Arc::new(socket)
+                    socket
                 }
             };
-            Ok(UdpFlow::new(
-                Box::new(DirectSend(socket.clone())),
-                Box::new(DirectRecv {
-                    socket,
-                    buf: vec![0u8; MAX_DATAGRAM],
-                }),
-            ))
-        })
-    }
-}
-
-struct DirectSend(Arc<UdpSocket>);
-
-impl DatagramSend for DirectSend {
-    fn send<'a>(&'a mut self, payload: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async move { self.0.send(payload).await.map(|_| ()) })
-    }
-}
-
-struct DirectRecv {
-    socket: Arc<UdpSocket>,
-    buf: Vec<u8>,
-}
-
-impl DatagramRecv for DirectRecv {
-    fn recv(&mut self) -> BoxFuture<'_, io::Result<Vec<u8>>> {
-        Box::pin(async move {
-            let n = self.socket.recv(&mut self.buf).await?;
-            Ok(self.buf[..n].to_vec())
+            Ok(UdpFlow::connected_socket(Arc::new(socket)))
         })
     }
 }

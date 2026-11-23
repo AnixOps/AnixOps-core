@@ -289,13 +289,20 @@ impl Hysteria2UdpSession {
     /// Receives the next reply: its length in `buf` (truncated when longer)
     /// and the source `host:port` the server reported.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, String)> {
+        let (payload, source) = self.recv_owned().await?;
+        let n = payload.len().min(buf.len());
+        buf[..n].copy_from_slice(&payload[..n]);
+        Ok((n, source))
+    }
+
+    /// The next reply as the payload the dispatcher already owns, with its
+    /// source: no buffer of the caller's, no copy.
+    pub async fn recv_owned(&self) -> io::Result<(Vec<u8>, String)> {
         let mut replies = self.replies.lock().await;
         tokio::select! {
             reply = replies.recv() => {
                 let (source, payload) = reply.ok_or_else(closed)?;
-                let n = payload.len().min(buf.len());
-                buf[..n].copy_from_slice(&payload[..n]);
-                Ok((n, source))
+                Ok((payload, source))
             }
             _ = self.connection.closed() => Err(closed()),
         }

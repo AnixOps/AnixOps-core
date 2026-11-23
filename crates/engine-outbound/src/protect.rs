@@ -140,25 +140,19 @@ pub async fn connect_tcp(target: SocketAddr) -> io::Result<TcpStream> {
     socket.connect(target).await
 }
 
-/// A TCP connection to `host:port`: each resolved address in turn, like
-/// [`TcpStream::connect`], every attempt protected.
+/// A TCP connection to `host:port`: the resolved addresses raced as RFC
+/// 8305 describes ([`crate::happy_eyeballs`]), every attempt protected.
+/// There is no overall limit here; the caller's connect timeout bounds it,
+/// and dropping the future drops every attempt in flight.
 pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
-    if current().is_none() {
-        return TcpStream::connect((host, port)).await;
-    }
-    let mut last_error = None;
-    for address in tokio::net::lookup_host((host, port)).await? {
-        match connect_tcp(address).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "host did not resolve to an address",
-        )
-    }))
+    crate::happy_eyeballs::connect_host(
+        host,
+        port,
+        crate::happy_eyeballs::Schedule::TCP,
+        connect_tcp,
+    )
+    .await
+    .map(|(_address, stream)| stream)
 }
 
 /// A blocking-API UDP socket bound to `local`, protected for `target`, in
@@ -177,18 +171,19 @@ pub fn bind_udp(target: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(bind_std_udp(unspecified_for(target), target)?)
 }
 
+/// The protector and the path generation are process-wide; tests that
+/// change them, or depend on them staying put, run one at a time, each on
+/// its own runtime so the lock is never held by a task.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
-    // The protector is process-wide; tests that install one run one at a
-    // time, each on its own runtime so the lock is never held by a task.
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     fn serial<F: std::future::Future>(test: F) -> F::Output {
-        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -229,6 +224,44 @@ mod tests {
         assert!(!socket_protector_installed());
         bind_udp(remote).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stalled_address_does_not_hold_up_the_next_one() {
+        serial(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            set_socket_protector(Some(Arc::new(
+                move |_socket: RawSocketHandle, _target: SocketAddr| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let local = listener.local_addr().unwrap();
+            let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+            // A documentation address: it never answers (or fails at once
+            // on a runner without a route); the listener must win either
+            // way, long before a system connect timeout.
+            let blackhole: SocketAddr = "192.0.2.1:9".parse().unwrap();
+            let (winner, _stream) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::happy_eyeballs::connect(
+                    &[blackhole, local],
+                    crate::happy_eyeballs::Schedule::TCP,
+                    connect_tcp,
+                ),
+            )
+            .await
+            .expect("the second address was not tried in time")
+            .unwrap();
+            assert_eq!(winner, local);
+            accept.await.unwrap().unwrap();
+            // One protected attempt for the remote address, none for
+            // loopback.
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            set_socket_protector(None);
+        });
     }
 
     #[test]

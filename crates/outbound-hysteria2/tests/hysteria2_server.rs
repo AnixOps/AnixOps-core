@@ -509,3 +509,34 @@ async fn factory_takes_certificate_pins() {
         assert_eq!(err, "hysteria2 certificate pins are invalid");
     }
 }
+
+/// A server address whose UDP goes nowhere (the first, as an unreachable
+/// IPv6 address would be by the resolver's order) must not use up the
+/// handshake timeout: the next address answers within a few seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_moves_on_from_an_address_that_never_answers() {
+    let server = hysteria2_server().await;
+    // Bound and never read: Initial packets sent there are dropped.
+    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let silent = blackhole.local_addr().unwrap();
+    let mut settings = tls();
+    settings.alpn = vec!["h3".to_owned()];
+    let connector = transport_quic::QuicConnector::new(
+        "hy2.test",
+        server.addr.port(),
+        &settings,
+        &["h3"],
+        transport_quic::Congestion::default(),
+    )
+    .unwrap();
+    let began = std::time::Instant::now();
+    let connection = connector
+        .connect_addresses(&[silent, server.addr])
+        .await
+        .expect("the second address was not tried");
+    assert_eq!(connection.connection.remote_address(), server.addr);
+    // Three seconds on the silent address, then a local handshake; well
+    // below the ten-second handshake timeout.
+    assert!(began.elapsed() < std::time::Duration::from_secs(7));
+    drop(blackhole);
+}

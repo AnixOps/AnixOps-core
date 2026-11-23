@@ -888,8 +888,12 @@ impl Dispatcher {
 
     /// [`TcpOutbound::reset_sessions`] on every outbound flows can take
     /// (the nodes, or the single outbound, and DIRECT), after the device
-    /// changed networks or woke up. Returns the total dropped.
+    /// changed networks or woke up. Returns the total dropped. The address
+    /// family each server last connected with is forgotten too
+    /// ([`engine_outbound::happy_eyeballs::forget_families`]): the new
+    /// network may reach the other family better.
     pub fn reset_sessions(&self) -> usize {
+        engine_outbound::happy_eyeballs::forget_families();
         let direct = if self.routed.is_some() {
             // The routed outbound resets its own DIRECT.
             0

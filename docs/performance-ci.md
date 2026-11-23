@@ -35,7 +35,7 @@ R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR
 
 - R2：1 万条规则 p99 约 35 µs（runner 之间约有 2 倍波动）。
 - F2：5000 并发全部回显成功，redirect / ss2022 回显 p99 约 3 ms，隧道进程约 52 KiB/连接。
-- F3：10 万 UDP 流 RSS 222 MiB（约 2.2 KiB/流）。此前每流两个任务加一个 tokio mpsc 通道，是 4.2 KiB/流、417 MiB；现在每流一个任务、按需分配的队列，打开流的 future 用完即释放。
+- F3：10 万 UDP 流 RSS 222 MiB（约 2.2 KiB/流）。此前每流两个任务加一个 tokio mpsc 通道，是 4.2 KiB/流、417 MiB；现在每流一个任务、按需分配的队列，打开流的 future 用完即释放。该数字用的是不带缓冲的模拟出站，不含真实出站每流的接收缓冲；真实出站（直连、Shadowsocks、SOCKS5、VMess、Hysteria2、TUIC）此前每流常驻 64 KiB，现在空闲时不持有接收缓冲（读取时借用每线程一块的 64 KiB 临时缓冲），见 `crates/engine-outbound/README.md`。
 
 ## 抓包门槛首次结果（2026-11-14，GitHub 托管 ubuntu runner）
 

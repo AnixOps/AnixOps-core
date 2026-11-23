@@ -4,7 +4,10 @@
 //! server inbounds.
 //!
 //! [`QuicConnector`] resolves the server, binds a UDP socket of the matching
-//! family and returns an established [`QuicConnection`]; the protocol crate
+//! family and returns an established [`QuicConnection`]; when the server
+//! has several addresses they are tried one after another in Happy Eyeballs
+//! order ([`engine_outbound::happy_eyeballs`]), so an address family whose
+//! UDP is dropped does not take the whole handshake timeout; the protocol crate
 //! authenticates on it and opens one stream per proxied connection.
 //! [`QuicStream`] turns a bidirectional stream into a [`BoxStream`].
 //! [`QuicConnector::with_salamander`] obfuscates every datagram with
@@ -29,6 +32,13 @@ use transport_tls::TlsSettings;
 pub use quinn;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a handshake with one of the server's addresses may run before
+/// the next address is tried, when there is one. The last address has the
+/// rest of [`HANDSHAKE_TIMEOUT`]. Long enough for a few Initial
+/// retransmissions on a lossy path, short enough that an address family
+/// whose UDP is dropped (IPv6 first, by the resolver's order) leaves most
+/// of the budget to the other.
+const ADDRESS_ATTEMPT_LIMIT: Duration = Duration::from_secs(3);
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
@@ -200,7 +210,9 @@ impl QuicConnector {
     }
 
     /// Resolves the server with the system resolver and completes the QUIC
-    /// handshake on a protected socket of its own, within a timeout.
+    /// handshake on a protected socket of its own, within a timeout. Every
+    /// resolved address is tried ([`QuicConnector::connect_addresses`]),
+    /// and the family that answered goes first next time.
     pub async fn connect(&self) -> io::Result<QuicConnection> {
         tokio::time::timeout(HANDSHAKE_TIMEOUT, self.connect_inner())
             .await
@@ -208,10 +220,53 @@ impl QuicConnector {
     }
 
     async fn connect_inner(&self) -> io::Result<QuicConnection> {
-        let addr = tokio::net::lookup_host((self.server.as_str(), self.port))
-            .await?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "quic server not found"))?;
+        engine_outbound::happy_eyeballs::connect_host(
+            &self.server,
+            self.port,
+            engine_outbound::happy_eyeballs::Schedule::Sequential {
+                limit: ADDRESS_ATTEMPT_LIMIT,
+            },
+            |addr| self.connect_address(addr),
+        )
+        .await
+        .map(|(_addr, connection)| connection)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => {
+                io::Error::new(io::ErrorKind::NotFound, "quic server not found")
+            }
+            _ => error,
+        })
+    }
+
+    /// Completes the QUIC handshake with the first of `addresses` that
+    /// answers, on protected sockets of this connector's own, within a
+    /// timeout. The addresses are tried in the given order, one at a time:
+    /// a handshake that has not finished within a few seconds is dropped
+    /// for the next address, and the last address has the rest of the
+    /// time. [`QuicConnector::connect`] resolves the server and calls this
+    /// with its addresses in Happy Eyeballs order
+    /// ([`engine_outbound::happy_eyeballs`]).
+    pub async fn connect_addresses(
+        &self,
+        addresses: &[std::net::SocketAddr],
+    ) -> io::Result<QuicConnection> {
+        let attempts = engine_outbound::happy_eyeballs::connect(
+            addresses,
+            engine_outbound::happy_eyeballs::Schedule::Sequential {
+                limit: ADDRESS_ATTEMPT_LIMIT,
+            },
+            |addr| self.connect_address(addr),
+        );
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, attempts)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "quic handshake timed out"))?
+            .map(|(_addr, connection)| connection)
+    }
+
+    /// One handshake with `addr`, on a socket of the address's family (the
+    /// protector pins each family to its own interface) with its own
+    /// endpoint, so a dropped attempt takes its socket with it.
+    async fn connect_address(&self, addr: std::net::SocketAddr) -> io::Result<QuicConnection> {
         // An explicit socket instead of `Endpoint::client`, so the host's
         // socket protector keeps it off a packet tunnel.
         let socket = engine_outbound::protect::bind_std_udp(

@@ -36,7 +36,6 @@ use std::sync::{Arc, OnceLock};
 
 use engine_outbound::{
     BoxFuture, BoxStream, DatagramRecv, DatagramSend, TargetAddr, TcpOutbound, UdpFlow,
-    MAX_DATAGRAM,
 };
 use tokio::sync::Mutex;
 use transport_quic::{quic_error, quinn, Congestion, QuicConnection, QuicConnector, QuicStream};
@@ -211,10 +210,7 @@ impl TcpOutbound for TuicOutbound {
                     session: session.clone(),
                     target: target.clone(),
                 }),
-                Box::new(FlowRecv {
-                    session,
-                    buf: vec![0u8; MAX_DATAGRAM],
-                }),
+                Box::new(FlowRecv { session }),
             ))
         })
     }
@@ -233,14 +229,15 @@ impl DatagramSend for FlowSend {
 
 struct FlowRecv {
     session: Arc<TuicUdpSession>,
-    buf: Vec<u8>,
 }
 
 impl DatagramRecv for FlowRecv {
     fn recv(&mut self) -> BoxFuture<'_, io::Result<Vec<u8>>> {
         Box::pin(async move {
-            let (n, _source) = self.session.recv_from(&mut self.buf).await?;
-            Ok(self.buf[..n].to_vec())
+            // The session hands over the payload it owns: an idle flow keeps
+            // no receive buffer.
+            let (payload, _source) = self.session.recv_owned().await?;
+            Ok(payload)
         })
     }
 }
