@@ -351,9 +351,7 @@ impl Captured {
     /// The oldest exchange, taken out when it has ended (one still in
     /// progress is updated by index later, so it stays).
     fn take_oldest_exchange(&mut self) -> Option<HttpExchange> {
-        if self.http.first()?.ended_at_ms.is_none() {
-            return None;
-        }
+        self.http.first()?.ended_at_ms?;
         self.http_base += 1;
         let exchange = self.http.remove(0);
         self.memory = self.memory.saturating_sub(exchange.memory());

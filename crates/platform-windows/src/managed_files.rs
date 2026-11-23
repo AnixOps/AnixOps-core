@@ -126,6 +126,7 @@ pub fn read_managed_file(path: &Path) -> io::Result<Vec<u8>> {
 /// Creates a new file with a random name in the protected `directory` (made
 /// protected first) and returns its path and a handle open for writing that
 /// nobody else can open while it is held.
+#[cfg(windows)]
 pub(crate) fn create_managed_temporary_file(
     directory: &Path,
     stem: &str,

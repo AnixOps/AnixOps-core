@@ -1136,7 +1136,7 @@ struct SentRequest {
 /// one valid cookie list.
 fn plan_header_list(headers: &HeaderMap) -> Vec<(String, String)> {
     let mut list: Vec<(String, String)> = Vec::with_capacity(headers.len());
-    let mut cookie_at = None;
+    let mut cookie_at: Option<usize> = None;
     for (name, value) in header_list(headers) {
         if name != http::header::COOKIE.as_str() {
             list.push((name, value));
