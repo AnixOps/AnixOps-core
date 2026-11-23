@@ -155,13 +155,17 @@ impl<'a> Held<'a> {
 
     /// Takes `bytes` more; `false`, taking nothing, when they do not fit.
     fn grow(&mut self, bytes: usize) -> bool {
-        let taken = self
-            .budget
-            .left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(bytes)
-            })
-            .is_ok();
+        let left = &self.budget.left;
+        let mut current = left.load(Ordering::Acquire);
+        let taken = loop {
+            let Some(rest) = current.checked_sub(bytes) else {
+                break false;
+            };
+            match left.compare_exchange_weak(current, rest, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break true,
+                Err(actual) => current = actual,
+            }
+        };
         if taken {
             self.bytes += bytes;
         }
