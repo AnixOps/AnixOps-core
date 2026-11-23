@@ -6767,6 +6767,11 @@ fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// First pause after an accept error that is not about one connection
+/// (out of file descriptors or buffers); it doubles up to the maximum.
+const ACCEPT_PAUSE_MIN: Duration = Duration::from_millis(50);
+const ACCEPT_PAUSE_MAX: Duration = Duration::from_secs(1);
+
 fn run_loopback_tcp_accept_loop(
     listener: TcpListener,
     shutdown_rx: mpsc::Receiver<()>,
@@ -6777,6 +6782,7 @@ fn run_loopback_tcp_accept_loop(
 ) -> NativeLoopbackTcpAcceptLoopShutdownReport {
     let mut diagnostics = Vec::new();
     let mut connection_workers = Vec::new();
+    let mut accept_pause = ACCEPT_PAUSE_MIN;
 
     loop {
         collect_finished_connection_workers(&mut connection_workers, &mut diagnostics);
@@ -6787,6 +6793,7 @@ fn run_loopback_tcp_accept_loop(
 
         match listener.accept() {
             Ok((stream, _)) => {
+                accept_pause = ACCEPT_PAUSE_MIN;
                 accepted_connections.fetch_add(1, Ordering::SeqCst);
                 if connection_workers.len() >= MAX_CONCURRENT_ACCEPTED_CONNECTIONS {
                     let _ = stream.shutdown(Shutdown::Both);
@@ -6825,7 +6832,23 @@ fn run_loopback_tcp_accept_loop(
                 }));
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                accept_pause = ACCEPT_PAUSE_MIN;
                 thread::sleep(Duration::from_millis(10));
+            }
+            // One client reset its connection before it was accepted.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::Interrupted
+                ) => {}
+            Err(error) if error.kind() != ErrorKind::InvalidInput => {
+                // Out of file descriptors or buffers for a while: wait (the
+                // shutdown request is still checked each round) instead of
+                // stopping the listener for good.
+                thread::sleep(accept_pause);
+                accept_pause = (accept_pause * 2).min(ACCEPT_PAUSE_MAX);
             }
             Err(_) => {
                 diagnostics.push(engine_diagnostic(

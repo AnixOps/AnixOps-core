@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use engine_outbound::accept::{self, AcceptBackoff};
 use engine_outbound::{BoxStream, TargetAddr, TcpOutbound};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -57,6 +58,9 @@ pub struct InboundStats {
     pub accepted: AtomicU64,
     /// Refused because `max_connections` were open.
     pub rejected: AtomicU64,
+    /// Errors of `accept` that the listener survived (see
+    /// [`engine_outbound::accept`]).
+    pub accept_errors: AtomicU64,
     pub active: AtomicU64,
     pub handshake_failed: AtomicU64,
     pub connect_failed: AtomicU64,
@@ -68,7 +72,9 @@ pub struct InboundStats {
     pub bytes_down: AtomicU64,
 }
 
-/// Accepts TCP connections until the listener fails or the task is dropped.
+/// Accepts TCP connections until the listener becomes unusable or the task
+/// is dropped. Errors of one connection and running out of file descriptors
+/// do not end it (see [`engine_outbound::accept`]).
 pub async fn serve(
     listener: TcpListener,
     inbound: Arc<dyn StreamInbound>,
@@ -95,8 +101,14 @@ pub async fn serve_with_udp(
     let _background = background.map(AbortOnDrop);
     let permits = Arc::new(Semaphore::new(settings.max_connections));
     let settings = Arc::new(settings);
+    let mut backoff = AcceptBackoff::default();
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (mut stream, peer) = accept::accept(
+            || listener.accept(),
+            &mut backoff,
+            Some(&stats.accept_errors),
+        )
+        .await?;
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             drop(stream);

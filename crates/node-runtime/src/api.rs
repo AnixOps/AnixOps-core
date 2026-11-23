@@ -92,6 +92,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_inbound::User;
+use engine_outbound::accept::{self, AcceptBackoff};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -104,8 +105,8 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Serves the management API until the listener fails or the task is
-/// dropped.
+/// Serves the management API until the listener becomes unusable or the
+/// task is dropped.
 pub async fn serve(listener: TcpListener, node: Arc<Node>, token: String) -> io::Result<()> {
     if token.is_empty() {
         return Err(io::Error::new(
@@ -114,8 +115,11 @@ pub async fn serve(listener: TcpListener, node: Arc<Node>, token: String) -> io:
         ));
     }
     let token: Arc<str> = token.into();
+    let mut backoff = AcceptBackoff::default();
     loop {
-        let (stream, _) = listener.accept().await?;
+        // A reset client or a moment without file descriptors must not stop
+        // the management API (see [`engine_outbound::accept`]).
+        let (stream, _) = accept::accept(|| listener.accept(), &mut backoff, None).await?;
         let node = node.clone();
         let token = token.clone();
         tokio::spawn(async move {

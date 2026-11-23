@@ -102,6 +102,7 @@
 
 ### Fixed
 
+- 监听器不再因一次瞬时 accept 错误整体退出（engine-outbound 新模块 `accept`，inbound-mixed、engine-inbound、node-runtime 管理接口、engine-native 回环监听）：`serve_intercepted` 等 accept 循环此前用 `accept().await?`，macOS/iOS 上客户端在被接受前 RST（`ECONNABORTED`）、Windows 的 `WSAECONNRESET`、或文件描述符耗尽（`EMFILE`/`ENFILE`，Linux 默认软限制 1024）一次就让本地代理、系统代理、局域网共享和回放代理永久停止，界面仍显示已连接。现在单个连接的错误直接跳过，资源类错误（`EMFILE`、`ENFILE`、`ENOBUFS`、`ENOMEM` 及未知错误）退避 50 ms 起、倍增至 1 s 后重试，不会忙循环；只有监听套接字本身失效（`EINVAL`、`EBADF`、`ENOTSOCK`）才返回错误。重试过的错误计入新计数 `MixedStats::accept_errors` / `InboundStats::accept_errors`（只增字段）。
 - XHTTP 走 HTTP/3 不再绕过 `via` 与宿主拨号器（transport-xhttp、transport-quic、engine-outbound）：VLESS、VMess、Trojan 出站在 TLS ALPN 恰好为 `h3` 时，QUIC 此前总是自己用系统解析器解析服务器、开受保护的 UDP 套接字直连，节点写的 `via` 被静默忽略，落地机看到用户真实 IP，本地网络能看到 SNI 与 DNS 查询。现在 QUIC 连接经出站的拨号器建立（新 `QuicConnector::connect_through`）：只有系统拨号器（新 `Dialer::is_system`，仅 `TcpDialer` 为真）才自己开套接字，其他拨号器的数据报走 `Dialer::open_datagram`，服务器域名交给前置节点或宿主拨号器解析；前置节点不转发 UDP 时连接报 `Unsupported`，不回退直连。
 
 ### Added

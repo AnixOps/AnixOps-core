@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use engine_outbound::accept::{self, AcceptBackoff};
 use engine_outbound::reject::{self, RejectAction};
 use engine_outbound::{udp_unsupported, BoxFuture, BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -220,6 +221,10 @@ pub struct MixedStats {
     pub pages: AtomicU64,
     /// SOCKS5 UDP associations opened.
     pub udp_associations: AtomicU64,
+    /// Errors of `accept` that the listener survived: a client that reset
+    /// before it was accepted, or the process out of file descriptors or
+    /// buffers for a while (see [`engine_outbound::accept`]).
+    pub accept_errors: AtomicU64,
 }
 
 /// What a client asked for.
@@ -335,7 +340,9 @@ impl ClientConnector for AnyClient {
     }
 }
 
-/// Accepts connections until the listener fails or the task is dropped.
+/// Accepts connections until the listener becomes unusable or the task is
+/// dropped. Errors of one connection and running out of file descriptors
+/// do not end it (see [`engine_outbound::accept`]).
 pub async fn serve(
     listener: TcpListener,
     outbound: Arc<dyn TcpOutbound>,
@@ -365,8 +372,14 @@ pub async fn serve_intercepted(
 ) -> io::Result<()> {
     let permits = Arc::new(Semaphore::new(settings.max_connections));
     let settings = Arc::new(settings);
+    let mut backoff = AcceptBackoff::default();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = accept::accept(
+            || listener.accept(),
+            &mut backoff,
+            Some(&stats.accept_errors),
+        )
+        .await?;
         if !settings.peers.allows(peer.ip()) {
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             drop(stream);
