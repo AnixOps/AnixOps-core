@@ -66,9 +66,11 @@ accounting.
   `listen` behind a TLS front); as an exit node, the relays run beside the
   inbounds and always leave directly. Routing applies to every inbound: the
   domain is the requested name, else the TLS SNI / HTTP `Host` of the first
-  bytes (waiting up to 300 ms), else the name a DNS answer relayed through the
-  node gave the address (`domains::DomainCache`, which layer-3 inbounds with
-  their own resolver also fill). Matchers: bare name or `domain:` (with
+  bytes (waiting up to 300 ms), else the name the node's map
+  (`domains::DomainCache`, filled only by inbounds with their own resolver)
+  gives the address. For UDP, a DNS answer the same UDP session relayed is
+  also used (after the node's map), for that session only; relayed answers
+  never reach the node's map, other users or TCP connections. Matchers: bare name or `domain:` (with
   subdomains), `full:`, `keyword:`, `regexp:`.
 - `network`: the network model's device plan (anix-control
   `docs/design/network-model` §6.3, `NetworkPlan` from

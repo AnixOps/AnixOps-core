@@ -389,7 +389,7 @@ mod startup_task_tests {
         let wide: Vec<u16> = xml.encode_utf16().collect();
         let length = i32::try_from(wide.len()).expect("the definition is small");
         let mut ansi = vec![0u8; wide.len() * 4];
-        let mut used_default = 0;
+        let mut used_default: windows_sys::core::BOOL = 0;
         // SAFETY: `wide` holds `length` units and `ansi` has room for
         // four bytes per unit, more than any code page needs.
         let written = unsafe {

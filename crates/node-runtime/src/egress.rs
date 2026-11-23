@@ -26,12 +26,17 @@
 //! 1. the target the client asked for, when it is a name;
 //! 2. for an address target, the TLS SNI or HTTP `Host` of the first bytes
 //!    the client sends (waiting at most [`SNIFF_WAIT`] for them);
-//! 3. the name a DNS answer relayed through the node mapped the address to
-//!    ([`DomainCache`]); only a reply to a query the same UDP session sent
-//!    through the node (same server, transaction id and question) is
-//!    recorded.
+//! 3. the name the node's map (`Egress::domains`, a [`DomainCache`] filled
+//!    only by inbounds with their own resolver, through
+//!    [`DomainCache::record`]) gives the address; for UDP datagrams, then
+//!    the name a DNS answer relayed through the same UDP session gave it
+//!    (that session's own map; only a reply to a query the session sent,
+//!    matched by server, transaction id and question, is recorded).
 //!
-//! UDP datagrams use 1 and 3.
+//! TCP connections use 1, 2 and the node's map. UDP datagrams use 1, the
+//! node's map and then the session's map, so a session's own answers cannot
+//! rename an address the node already knows. Relayed DNS answers never reach
+//! the node's map, other UDP sessions or TCP connections.
 //!
 //! A route may list `fallbacks`: more relays, tried in order when the ones
 //! before fail to connect (for example Japan, then the US, then Germany).
