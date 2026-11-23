@@ -21,7 +21,7 @@ same value: reading a C value that has no Rust variant is undefined
 behaviour. The unit test `rust_enums_mirror_every_c_enumerator` parses
 `include/mitm_anixops.h` and fails when the header gains, loses or renumbers
 an enumerator (it covers `anixops_rewrite_action`, including
-`ANIXOPS_URL_REWRITE_200`, and the other enums and buffer capacities the crate
+`ANIXOPS_REWRITE_URL_REWRITE_200`, and the other enums and buffer capacities the crate
 mirrors), so a submodule bump cannot silently drift from the header.
 
 This crate is intentionally low-level. Safe policy and domain adapter APIs must

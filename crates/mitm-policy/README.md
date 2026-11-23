@@ -90,7 +90,18 @@ The plugin as a whole is graded `full`, `partial`, or `unsupported`.
   the dispatch leaves the core. An `enable` that resolves to `false`, `0`,
   `no` or `off` comments the script out (`script.disabled`, ignored); one
   that names no declared argument keeps the script on and is graded partial
-  (`script.enable_unresolved`).
+  (`script.enable_unresolved`). Attribute values are read exactly as the
+  core reads them: the attributes split at commas outside quotes and
+  brackets, and a quoted value loses its outer quotes only when it starts
+  and ends with the same quote, so the Surge form
+  `argument="{"lang":"{{{Lang}}}","debug":false}"` (inner quotes left
+  unescaped) is read whole. An `argument=` whose written segment reaches the
+  core's 4096-byte attribute buffer is graded partial
+  (`script.argument_too_long`), since the core would cut it.
+- A URL rewrite with the core's `200` action (a transparent rewrite the data
+  plane does not perform) is graded unsupported and commented out, so it
+  does not stop the core's URL rule lookup before a later reject or redirect
+  for the same URL.
 - `[Script]` `http-request` and `http-response` lines (P1) are planned by the
   `mitm_anixops` core and run on desktop in the in-process QuickJS runtime of
   `crates/script-runtime`. `binary-body-mode` is supported: the core reports
