@@ -323,7 +323,9 @@ pub struct EgressStatus {
     /// Route ids, in the order they are tried.
     pub routes: Vec<u64>,
     pub relays: Vec<RelayInfo>,
-    /// Addresses currently mapped to names from DNS answers.
+    /// Addresses the node's map (inbounds' own resolvers) currently maps
+    /// to names. The maps UDP sessions keep of their own relayed answers are
+    /// not counted.
     pub mapped_addresses: usize,
 }
 

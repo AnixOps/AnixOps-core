@@ -158,8 +158,12 @@ fn owned_startup_task_names(csv: &str) -> Vec<String> {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 /// `schtasks /Query /XML` output as text: UTF-16 (with or without a byte
-/// order mark) or UTF-8, whichever it is.
-fn decode_task_xml(bytes: &[u8]) -> String {
+/// order mark) or UTF-8, whichever it is. Anything else was written in a
+/// legacy code page, which the bytes alone do not name, so every plausible
+/// reading is returned: the OEM and then the ANSI code page (Windows only),
+/// and lossy UTF-8 last. The caller accepts the output when one reading
+/// matches what it expects.
+fn decode_task_xml(bytes: &[u8]) -> Vec<String> {
     let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || (bytes.len() >= 2 && bytes[1] == 0);
     if utf16 {
         let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
@@ -167,11 +171,81 @@ fn decode_task_xml(bytes: &[u8]) -> String {
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        String::from_utf16_lossy(&units)
-    } else {
-        String::from_utf8_lossy(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes))
-            .into_owned()
+        return vec![String::from_utf16_lossy(&units)];
     }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if let Ok(text) = std::str::from_utf8(body) {
+        return vec![text.to_owned()];
+    }
+    let mut readings = legacy_code_page_readings(body);
+    readings.push(String::from_utf8_lossy(body).into_owned());
+    readings
+}
+
+/// `bytes` read in the OEM and in the ANSI code page, each that decodes.
+#[cfg(windows)]
+fn legacy_code_page_readings(bytes: &[u8]) -> Vec<String> {
+    use windows_sys::Win32::Globalization::{
+        MultiByteToWideChar, CP_ACP, CP_OEMCP, MB_ERR_INVALID_CHARS,
+    };
+
+    let Ok(length) = i32::try_from(bytes.len()) else {
+        return Vec::new();
+    };
+    if length == 0 {
+        return Vec::new();
+    }
+    let mut readings = Vec::new();
+    for code_page in [CP_OEMCP, CP_ACP] {
+        // SAFETY: `bytes` is valid for `length` bytes; a null output
+        // buffer of size 0 asks only for the length needed.
+        let needed = unsafe {
+            MultiByteToWideChar(
+                code_page,
+                MB_ERR_INVALID_CHARS,
+                bytes.as_ptr(),
+                length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let Ok(capacity) = usize::try_from(needed) else {
+            continue;
+        };
+        if capacity == 0 {
+            continue;
+        }
+        let mut wide = vec![0u16; capacity];
+        // SAFETY: `wide` holds `needed` UTF-16 units.
+        let written = unsafe {
+            MultiByteToWideChar(
+                code_page,
+                MB_ERR_INVALID_CHARS,
+                bytes.as_ptr(),
+                length,
+                wide.as_mut_ptr(),
+                needed,
+            )
+        };
+        let Ok(written) = usize::try_from(written) else {
+            continue;
+        };
+        if written == 0 {
+            continue;
+        }
+        wide.truncate(written);
+        let reading = String::from_utf16_lossy(&wide);
+        if !readings.contains(&reading) {
+            readings.push(reading);
+        }
+    }
+    readings
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn legacy_code_page_readings(_bytes: &[u8]) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -257,11 +331,11 @@ mod startup_task_tests {
         for unit in xml.encode_utf16() {
             utf16.extend_from_slice(&unit.to_le_bytes());
         }
-        assert!(startup_task_matches(&decode_task_xml(&utf16), executable));
-        assert!(startup_task_matches(
-            &decode_task_xml(xml.as_bytes()),
-            executable
-        ));
+        assert_eq!(decode_task_xml(&utf16), vec![xml.clone()]);
+        assert_eq!(decode_task_xml(xml.as_bytes()), vec![xml.clone()]);
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(xml.as_bytes());
+        assert_eq!(decode_task_xml(&with_bom), vec![xml.clone()]);
 
         let other = r"C:\Users\Public\evil.exe";
         assert!(!startup_task_matches(
@@ -285,6 +359,60 @@ mod startup_task_tests {
             "</Exec>\n    <Exec><Command>C:\\evil.exe</Command></Exec>",
         );
         assert!(!startup_task_matches(&second_action, executable));
+    }
+
+    #[test]
+    fn output_in_a_legacy_code_page_still_has_a_reading() {
+        // 0xE9 alone is not UTF-8; the lossy reading is always offered,
+        // after any code page readings.
+        let bytes = b"<Command>C:\\Caf\xE9\\app.exe</Command>";
+        let readings = decode_task_xml(bytes);
+        assert_eq!(
+            readings.last().map(String::as_str),
+            Some("<Command>C:\\Caf\u{FFFD}\\app.exe</Command>")
+        );
+        #[cfg(not(windows))]
+        assert_eq!(readings.len(), 1);
+    }
+
+    /// A non-ASCII install path, printed in the ANSI code page (as a
+    /// redirected console tool may), is still recognised.
+    #[cfg(windows)]
+    #[test]
+    fn registered_task_in_the_ansi_code_page_matches() {
+        use windows_sys::Win32::Globalization::{
+            WideCharToMultiByte, CP_ACP, WC_NO_BEST_FIT_CHARS,
+        };
+
+        let executable = "C:\\Users\\Caf\u{e9}\\AnixOps Net\\anixops-net.exe";
+        let xml = startup_task_xml("S-1-5-21-1-2-3-1001", executable);
+        let wide: Vec<u16> = xml.encode_utf16().collect();
+        let length = i32::try_from(wide.len()).expect("the definition is small");
+        let mut ansi = vec![0u8; wide.len() * 4];
+        let mut used_default = 0;
+        // SAFETY: `wide` holds `length` units and `ansi` has room for
+        // four bytes per unit, more than any code page needs.
+        let written = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                WC_NO_BEST_FIT_CHARS,
+                wide.as_ptr(),
+                length,
+                ansi.as_mut_ptr(),
+                i32::try_from(ansi.len()).expect("the buffer is small"),
+                std::ptr::null(),
+                &mut used_default,
+            )
+        };
+        assert!(written > 0, "the definition converts to the ANSI code page");
+        if used_default != 0 {
+            // This code page has no such letter; nothing to check here.
+            return;
+        }
+        ansi.truncate(usize::try_from(written).expect("a positive length"));
+        assert!(decode_task_xml(&ansi)
+            .iter()
+            .any(|reading| startup_task_matches(reading, executable)));
     }
 
     #[test]
@@ -1275,9 +1403,11 @@ mod native {
             OsStr::new(&name),
             OsStr::new("/XML"),
         ]);
-        let verified = registered
-            .as_ref()
-            .is_ok_and(|output| startup_task_matches(&decode_task_xml(output), &command));
+        let verified = registered.as_ref().is_ok_and(|output| {
+            decode_task_xml(output)
+                .iter()
+                .any(|xml| startup_task_matches(xml, &command))
+        });
         if !verified {
             let _ = run_schtasks(&[
                 OsStr::new("/Delete"),
@@ -2602,6 +2732,10 @@ mod native {
                 with_script.auto_config_url,
                 "http://127.0.0.1:9/anixops-test.pac"
             );
+            // The flat values clients compare to tell whether the proxy is
+            // still theirs.
+            let flat_with_script =
+                read_current_user_system_proxy().expect("the user's proxy should be readable");
 
             let settings = WindowsProxySettings {
                 enabled: true,
@@ -2626,6 +2760,11 @@ mod native {
                 with_script.flags & WININET_PROXY_TYPE_MASK
             );
             assert_eq!(restored.auto_config_url, with_script.auto_config_url);
+            assert_eq!(
+                read_current_user_system_proxy().expect("the user's proxy should be readable"),
+                flat_with_script,
+                "restoring the connection settings puts the flat values back too"
+            );
             assert_eq!(
                 read_winhttp_proxy().expect("WinHTTP is readable"),
                 winhttp_before

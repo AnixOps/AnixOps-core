@@ -2,24 +2,36 @@
 //!
 //! A client that resolves names itself (or a layer-3 inbound such as iWAN)
 //! asks the node for an IP address, so domain egress routes need the name
-//! the address came from. A DNS answer relayed through the node (UDP replies
-//! from port 53) is recorded here only when it answers a query the same
-//! session sent through the node: same server, transaction id and question
-//! ([`PendingQueries`]); unsolicited or spoofed replies are ignored, and one
-//! reply records at most [`MAX_ANSWERS_PER_RESPONSE`] addresses. An inbound
-//! with its own resolver records its answers with [`DomainCache::record`].
+//! the address came from. There are two scopes:
 //!
-//! The map is bounded; when full, the entry recorded longest ago goes first,
-//! in O(1) (amortised), so a flood of answers cannot stall the lookups that
-//! share its lock.
+//! - The node's map ([`crate::Egress::domains`]), which every user's routing
+//!   reads, learns only from an inbound's own resolver
+//!   ([`DomainCache::record`]). A user cannot write to it.
+//! - Each UDP session's own map ([`DomainCache::for_session`]), which learns
+//!   the DNS answers relayed through that session (UDP replies from port 53)
+//!   and routes only that session's datagrams. A reply is recorded only when
+//!   it answers a query the same session sent: same server, transaction id
+//!   and question ([`PendingQueries`]); unsolicited or spoofed replies are
+//!   ignored, and one reply records at most [`MAX_ANSWERS_PER_RESPONSE`]
+//!   addresses. The resolver is whatever the client chose, so its answers
+//!   are trusted for that client's session and nobody else's.
+//!
+//! Both maps are bounded; when full, the entry recorded longest ago goes
+//! first, in O(1) (amortised), so a flood of answers cannot stall the
+//! lookups that share its lock, and a session flooding its own map cannot
+//! evict anything from the node's map or another session's.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Entries kept at most; the one recorded longest ago goes first when full.
+/// Entries the node's map keeps at most; the one recorded longest ago goes
+/// first when full.
 const MAX_ENTRIES: usize = 65_536;
+/// Entries one UDP session's map keeps at most. Every session has one, so
+/// this keeps each one small.
+pub(crate) const SESSION_MAX_ENTRIES: usize = 512;
 /// Clients keep answers a little past their TTL; a short TTL still gets this.
 const MIN_TTL: Duration = Duration::from_secs(60);
 const MAX_TTL: Duration = Duration::from_secs(6 * 3600);
@@ -39,8 +51,9 @@ struct Entry {
     generation: u64,
 }
 
-#[derive(Default)]
 struct Entries {
+    /// Entries kept at most.
+    capacity: usize,
     map: HashMap<IpAddr, Entry>,
     /// Insertion order, oldest first; an item whose generation no longer
     /// matches the map was overwritten or removed and is skipped.
@@ -49,6 +62,15 @@ struct Entries {
 }
 
 impl Entries {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            next_generation: 0,
+        }
+    }
+
     fn insert(&mut self, ip: IpAddr, domain: String, expires: Instant) {
         let generation = self.next_generation;
         self.next_generation += 1;
@@ -61,7 +83,7 @@ impl Entries {
             },
         );
         self.order.push_back((ip, generation));
-        while self.map.len() > MAX_ENTRIES {
+        while self.map.len() > self.capacity {
             let Some((oldest, generation)) = self.order.pop_front() else {
                 break;
             };
@@ -76,7 +98,7 @@ impl Entries {
         // Overwrites leave superseded items behind; drop them once they
         // outnumber the live ones, which keeps the queue bounded at an
         // amortised O(1) per insertion.
-        if self.order.len() > 2 * MAX_ENTRIES {
+        if self.order.len() > 2 * self.capacity {
             let map = &self.map;
             self.order.retain(|(ip, generation)| {
                 map.get(ip)
@@ -86,14 +108,31 @@ impl Entries {
     }
 }
 
-#[derive(Default)]
 pub struct DomainCache {
     entries: Mutex<Entries>,
 }
 
+impl Default for DomainCache {
+    fn default() -> Self {
+        Self::with_capacity(MAX_ENTRIES)
+    }
+}
+
 impl DomainCache {
+    /// The node's map: up to 65,536 entries.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// One UDP session's map: up to [`SESSION_MAX_ENTRIES`] entries.
+    pub(crate) fn for_session() -> Self {
+        Self::with_capacity(SESSION_MAX_ENTRIES)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Mutex::new(Entries::new(capacity)),
+        }
     }
 
     /// Maps `ip` to `domain` for `ttl` (clamped to one minute .. six hours).
@@ -113,6 +152,9 @@ impl DomainCache {
         match entries.map.get(&ip) {
             Some(entry) if entry.expires > Instant::now() => Some(entry.domain.clone()),
             Some(_) => {
+                // The entry's item stays in the eviction queue; its
+                // generation no longer matches, so eviction skips it. With
+                // overwrites this is what leaves superseded items behind.
                 entries.map.remove(&ip);
                 None
             }
@@ -125,7 +167,9 @@ impl DomainCache {
     /// user typed matches; at most [`MAX_ANSWERS_PER_RESPONSE`] of them.
     /// Anything that is not a response is ignored. The caller must have
     /// matched the response to a query it relayed ([`PendingQueries`]);
-    /// this does not check where the response came from.
+    /// this does not check where the response came from, so a relayed
+    /// response belongs in the relaying session's own map
+    /// ([`DomainCache::for_session`]), never the node's.
     pub fn record_response(&self, message: &[u8]) {
         for (ip, domain, ttl) in answers(message)
             .unwrap_or_default()
@@ -153,7 +197,7 @@ impl DomainCache {
 
 /// The DNS queries one UDP session relayed and still waits for, so only a
 /// reply to one of them (same server, transaction id and question) is
-/// recorded in the [`DomainCache`]. A reply is accepted once.
+/// recorded in the session's [`DomainCache`]. A reply is accepted once.
 #[derive(Default)]
 pub(crate) struct PendingQueries {
     /// `(transaction id, question name)` to the server the query went to

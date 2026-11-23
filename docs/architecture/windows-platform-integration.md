@@ -17,7 +17,7 @@
 
 ## 登录启动任务
 
-登录任务以最高可用权限运行客户端，定义 XML 不再写到用户的 `%TEMP%`（同一用户的任何中等完整性进程都能改）：写在 `%ProgramData%\AnixOps\NetworkCore\tmp`（受保护目录）里随机名、独占创建的文件中，`schtasks /Create /XML` 读取期间以不共享写入的方式保持打开，用完删除。注册后用 `schtasks /Query /XML` 读回，命令、参数、运行级别、登录类型必须与定义一致且主体不是 SYSTEM/服务账户/组，否则删除任务并报错（`startup_task_matches`）。
+登录任务以最高可用权限运行客户端，定义 XML 不再写到用户的 `%TEMP%`（同一用户的任何中等完整性进程都能改）：写在 `%ProgramData%\AnixOps\NetworkCore\tmp`（受保护目录）里随机名、独占创建的文件中，`schtasks /Create /XML` 读取期间以不共享写入的方式保持打开，用完删除。注册后用 `schtasks /Query /XML` 读回，命令、参数、运行级别、登录类型必须与定义一致且主体不是 SYSTEM/服务账户/组，否则删除任务并报错（`startup_task_matches`）。读回的输出按 UTF-16 或 UTF-8 解码；两者都不是时（重定向输出用了旧代码页，安装路径含非 ASCII 字符），依次按 OEM、ANSI 代码页和有损 UTF-8 解码，任一读法与定义一致即可（`decode_task_xml`），避免中文等非 ASCII 目录下的安装无法开启登录后启动。
 
 ## 系统代理（`system_integration`）
 

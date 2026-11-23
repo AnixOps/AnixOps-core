@@ -19,6 +19,7 @@ toml = "0.9"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_Rras",
