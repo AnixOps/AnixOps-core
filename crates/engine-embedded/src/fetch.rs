@@ -233,7 +233,9 @@ mod tests {
 
         fn connect<'a>(&'a self, _: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
             Box::pin(async move {
-                // The request is not read: it must fit in the pipe.
+                // The request is not read: it must fit in the pipe, or the
+                // client stalls until the timeout. It is about 120 bytes
+                // plus `url.path`, so keep test URLs short.
                 let (client, mut server) = tokio::io::duplex(self.pipe.max(256));
                 let answer = self.answer.clone();
                 tokio::spawn(async move {
@@ -287,18 +289,34 @@ mod tests {
 
     #[tokio::test]
     async fn a_head_terminator_split_across_reads_is_found() {
-        // A pipe of 256 bytes splits the answers into many reads, so the
-        // terminator straddles reads for some of these paddings.
+        // The test runtime is single-threaded and the pipe holds 256 bytes:
+        // the server fills it, the client drains it, so every read ends at
+        // a multiple of 256. A terminator starting at 253, 254 or 255 has
+        // its first bytes in one read and the rest in the next.
+        const PIPE: usize = 256;
+        let splits = |answer: &[u8]| {
+            let at = answer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap();
+            at % PIPE > PIPE - 4
+        };
+        let mut redirect_split = 0;
+        let mut ok_split = 0;
         for pad in 0..8 {
             let filler = "y".repeat(pad);
+            // The terminator starts at 44 + 206 + pad = 250..257.
             let redirect = format!(
                 "HTTP/1.1 302 Found\r\nLocation: /next\r\nX-Pad: {}{filler}\r\n\r\n{}",
-                "p".repeat(220),
+                "p".repeat(206),
                 "b".repeat(4096)
             );
+            if splits(redirect.as_bytes()) {
+                redirect_split += 1;
+            }
             let outbound = Serve {
                 answer: redirect.into_bytes(),
-                pipe: 256,
+                pipe: PIPE,
             };
             let url = base("http://lists.example/x.list");
             let got = get(&outbound, &url, 1024 * 1024).await;
@@ -307,13 +325,17 @@ mod tests {
                 "{pad}"
             );
 
+            // The terminator starts at 43 + 206 + pad = 249..256.
             let ok = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Pad: {}{filler}\r\n\r\nhello",
-                "p".repeat(220)
+                "p".repeat(206)
             );
+            if splits(ok.as_bytes()) {
+                ok_split += 1;
+            }
             let outbound = Serve {
                 answer: ok.into_bytes(),
-                pipe: 256,
+                pipe: PIPE,
             };
             let got = get(&outbound, &url, 1024 * 1024).await;
             assert!(
@@ -321,6 +343,10 @@ mod tests {
                 "{pad}"
             );
         }
+        // Every split position (one, two or three bytes in the first read)
+        // is covered, so the case cannot quietly drop out of the test.
+        assert_eq!(redirect_split, 3);
+        assert_eq!(ok_split, 3);
     }
 
     fn base(url: &str) -> ProbeUrl {
