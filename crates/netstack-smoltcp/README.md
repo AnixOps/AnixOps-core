@@ -32,8 +32,13 @@ Changes against 0.2.4 are listed here; measure each one with the
   protocols are dropped, as smoltcp drops them.
 - `packet.rs`: an IPv4 header shorter than 20 bytes is refused.
 - `tcp.rs`: sockets are made by the socket loop, one per (app, destination)
-  pair: a SYN the app sends again before the SYN-ACK (or of a connection the
-  loop already has) reaches the socket that took the first one. Upstream
+  pair, and SYN frames reach smoltcp only through that loop (`device.rs`
+  queues them ahead of other frames): a SYN the app sends again before the
+  SYN-ACK, of a connection the loop already has, is dropped (smoltcp ignores
+  it from SYN-RECEIVED on and resends its SYN-ACK itself). Given to smoltcp,
+  it went to the first socket in LISTEN of any source, such as the one just
+  made for another connection to the same destination, which then opened a
+  second connection on the first one's endpoints. Upstream
   made a socket and a `TcpStream` for every SYN, so each retransmitted SYN
   opened a second stream that never got data, and left a socket in LISTEN
   that took the next connection to the same destination from any source.

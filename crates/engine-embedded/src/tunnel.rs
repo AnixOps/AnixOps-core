@@ -1855,6 +1855,12 @@ async fn handle_tcp(
 
     let mut inbound = Counted::new(inbound, activity.clone(), &stats.bytes_up);
     let mut remote = Counted::new(remote, activity.clone(), &stats.bytes_down);
+    // Locals drop in reverse order: moved here, the guard drops before the
+    // stream on every way out below (an error, the idle timeout, or the
+    // future dropped when the connection is closed from the list or to make
+    // room), so the socket loop, possibly on another worker, sees the abort
+    // no later than the drop and sends a RST, never a FIN first.
+    let mut reset = reset;
     let copy = tokio::io::copy_bidirectional_with_sizes(
         &mut inbound,
         &mut remote,

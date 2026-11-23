@@ -114,11 +114,12 @@ struct TcpSocketControl {
     dropped: bool,
 }
 
-/// A SYN that may open a connection, sent to the socket loop right before
-/// its frame is queued for smoltcp.
+/// A SYN that may open a connection, with its frame. Only the socket loop
+/// hands it to smoltcp, and only once it decided the SYN needs a socket.
 struct SynRequest {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    frame: Vec<u8>,
 }
 
 type SharedNotify = Arc<Notify>;
@@ -131,8 +132,12 @@ struct SocketEntry {
     /// loop's connection table: the SYN it was made for, then, once the
     /// socket left LISTEN, the endpoints smoltcp actually connected it to.
     key: (SocketAddr, SocketAddr),
-    /// When the socket was made, for [`LISTEN_GRACE`].
+    /// When the socket was made, or last given a SYN, for [`LISTEN_GRACE`].
     created: Instant,
+    /// The number [`VirtualDevice::queue_syn`] gave the SYN frame queued
+    /// for this socket: smoltcp has read that frame once
+    /// [`VirtualDevice::syn_taken`] reaches it.
+    syn_seq: u64,
     /// Whether its [`TcpStream`] went to the listener. That happens once the
     /// socket left LISTEN, never before: a socket in LISTEN takes a SYN from
     /// any source, so only then are its endpoints known.
@@ -158,6 +163,15 @@ fn close_stream(control: &mut TcpSocketControl) {
 
 fn socket_addr(endpoint: IpEndpoint) -> SocketAddr {
     SocketAddr::new(endpoint.addr.into(), endpoint.port)
+}
+
+/// The (app, destination) pair `socket` is connected to; `None` in LISTEN
+/// and CLOSED.
+fn connected_key(socket: &TcpSocket) -> Option<(SocketAddr, SocketAddr)> {
+    let (Some(remote), Some(local)) = (socket.remote_endpoint(), socket.local_endpoint()) else {
+        return None;
+    };
+    Some((socket_addr(remote), socket_addr(local)))
 }
 
 /// What the socket loop builds sockets and streams with.
@@ -285,15 +299,22 @@ impl TcpListenerRunner {
             let dst_addr = SocketAddr::new(dst_ip, dst_port);
 
             // A SYN may open a connection. The socket loop decides, as the
-            // only owner of the socket set: a retransmitted SYN of a
-            // connection it already has gets no second socket. The request
-            // goes before the frame, and the loop takes every request
-            // before it polls, so the socket is there when smoltcp reads
-            // the SYN.
+            // only owner of the socket set, and queues the frame for smoltcp
+            // itself, right after the socket it made for it. A retransmitted
+            // SYN of a connection it already has never reaches smoltcp: a
+            // socket in LISTEN takes a SYN from any source to its address,
+            // so another connection's socket would take it and open a second
+            // connection on the same endpoints.
             if packet.syn() && !packet.ack() {
                 syn_tx
-                    .send(SynRequest { src_addr, dst_addr })
+                    .send(SynRequest {
+                        src_addr,
+                        dst_addr,
+                        frame,
+                    })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+                notify.notify_one();
+                continue;
             }
 
             // Pipeline tcp stream packet
@@ -334,18 +355,40 @@ impl TcpListenerRunner {
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
         // The socket of each (app, destination) pair, so a SYN the app sent
-        // again (no SYN-ACK within its retransmission timeout) reaches the
-        // socket that took the first one instead of opening a second
-        // connection, and leaving another socket in LISTEN behind.
+        // again (no SYN-ACK within its retransmission timeout) is dropped
+        // instead of opening a second connection: given to smoltcp, it would
+        // go to whichever socket in LISTEN comes first, of any source.
         let mut connections: HashMap<(SocketAddr, SocketAddr), SocketHandle> = HashMap::new();
         loop {
             let now = Instant::now();
-            while let Ok(SynRequest { src_addr, dst_addr }) = syn_rx.try_recv() {
+            while let Ok(SynRequest {
+                src_addr,
+                dst_addr,
+                frame,
+            }) = syn_rx.try_recv()
+            {
                 let key = (src_addr, dst_addr);
                 if let Some(&handle) = connections.get(&key) {
                     let state = socket_set.get::<TcpSocket>(handle).state();
+                    if state == TcpState::Listen {
+                        if let Some(entry) = sockets.get_mut(&handle) {
+                            if !entry.emitted && device.syn_taken() >= entry.syn_seq {
+                                // smoltcp refused the first SYN (a bad
+                                // checksum, say) and the socket still
+                                // listens: this one gets its chance.
+                                entry.syn_seq = device.queue_syn(frame);
+                                entry.created = now;
+                            }
+                        }
+                        // Otherwise the first SYN still waits in the queue
+                        // and the socket takes that one.
+                        continue;
+                    }
                     if !matches!(state, TcpState::Closed | TcpState::TimeWait) {
-                        // A retransmitted SYN: the socket answers it.
+                        // A retransmitted SYN of a connection under way:
+                        // dropped. smoltcp ignores a SYN without an ACK
+                        // from SYN-RECEIVED on, and resends its SYN-ACK on
+                        // its own timer.
                         continue;
                     }
                     // The app reuses the port of a connection that is over:
@@ -357,12 +400,14 @@ impl TcpListenerRunner {
                 };
                 let handle = socket_set.add(socket);
                 connections.insert(key, handle);
+                let syn_seq = device.queue_syn(frame);
                 sockets.insert(
                     handle,
                     SocketEntry {
                         control,
                         key,
                         created: now,
+                        syn_seq,
                         emitted: false,
                         time_wait_until: None,
                         orphan_until: None,
@@ -382,23 +427,28 @@ impl TcpListenerRunner {
             // Check all the sockets' status
             let mut sockets_to_remove = Vec::new();
 
-            // Earliest TIME-WAIT removal or orphan reset still to come, for
-            // the park below.
+            // Earliest TIME-WAIT removal, orphan reset or LISTEN removal
+            // still to come, for the park below.
             let mut next_deadline: Option<Instant> = None;
             // Whether every queued frame has been handed to smoltcp.
-            let ingress_drained = !iface_ingress_tx_avail.load(Ordering::Acquire);
+            let ingress_drained =
+                !iface_ingress_tx_avail.load(Ordering::Acquire) && !device.syn_pending();
 
             for (socket_handle, entry) in sockets.iter_mut() {
                 let socket_handle = *socket_handle;
-                let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
 
                 if !entry.emitted {
+                    let socket = socket_set.get::<TcpSocket>(socket_handle);
                     match socket.state() {
                         TcpState::Listen => {
                             // Its SYN was not taken (another socket listening
                             // on the same address took it, and this one takes
                             // the other SYN in turn) or was refused.
-                            if ingress_drained && before_poll - entry.created >= LISTEN_GRACE {
+                            let until = entry.created + LISTEN_GRACE;
+                            if before_poll < until {
+                                next_deadline =
+                                    Some(next_deadline.map_or(until, |next| next.min(until)));
+                            } else if ingress_drained {
                                 sockets_to_remove.push(socket_handle);
                                 trace!("removed TCP socket that never left LISTEN");
                             }
@@ -411,9 +461,7 @@ impl TcpListenerRunner {
                         }
                         _ => {}
                     }
-                    let (Some(remote), Some(local)) =
-                        (socket.remote_endpoint(), socket.local_endpoint())
-                    else {
+                    let Some(key) = connected_key(socket) else {
                         continue;
                     };
                     // A socket in LISTEN takes a SYN from any source to its
@@ -421,8 +469,25 @@ impl TcpListenerRunner {
                     // each socket may hold the other's. The stream carries
                     // the endpoints the socket is connected to, and the
                     // index follows them.
-                    let key = (socket_addr(remote), socket_addr(local));
                     if key != entry.key {
+                        if let Some(&other) = connections.get(&key) {
+                            if other != socket_handle
+                                && connected_key(socket_set.get::<TcpSocket>(other)) == Some(key)
+                            {
+                                // Another socket is already connected to these
+                                // endpoints: this one took a SYN of that
+                                // connection, which should never have reached
+                                // smoltcp. Removed without a RST (that would
+                                // reset the app's connection) and without a
+                                // stream. (Two SYNs to one destination that
+                                // each socket took the other's of are no
+                                // duplicate: the other socket is connected to
+                                // its own endpoints.)
+                                error!("second TCP socket for {} <-> {}", key.0, key.1);
+                                sockets_to_remove.push(socket_handle);
+                                continue;
+                            }
+                        }
                         if connections.get(&entry.key) == Some(&socket_handle) {
                             connections.remove(&entry.key);
                         }
@@ -441,6 +506,7 @@ impl TcpListenerRunner {
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 }
 
+                let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
                 let mut control = entry.control.lock();
 
                 // Remove the socket only when it is in the closed state.
@@ -663,9 +729,8 @@ impl TcpListenerRunner {
             // that permit when no one is waiting yet, so a wake between the
             // poll and the park is not lost. Upstream re-polled every 5 ms
             // here, about 200 wakeups a second on an idle phone; IDLE_PARK is
-            // only a backstop (and when sockets made for a SYN that never
-            // left LISTEN go).
-            if iface_ingress_tx_avail.load(Ordering::Acquire) {
+            // only a backstop.
+            if iface_ingress_tx_avail.load(Ordering::Acquire) || device.syn_pending() {
                 tokio::task::yield_now().await;
             } else {
                 let mut next_duration = iface
@@ -1021,8 +1086,8 @@ mod tests {
         ack_number: u32,
     }
 
-    /// The next segment the stack sends the app's `port`.
-    async fn segment(stack: &mut Stack, port: u16) -> Seg {
+    /// The next segment the stack sends the app, with the app's port.
+    async fn any_segment(stack: &mut Stack) -> (u16, Seg) {
         loop {
             let frame = tokio::time::timeout(WAIT, stack.next())
                 .await
@@ -1033,16 +1098,27 @@ mod tests {
                 continue;
             };
             if let Some(TransportSlice::Tcp(tcp)) = &sliced.transport {
-                if tcp.destination_port() == port {
-                    return Seg {
+                return (
+                    tcp.destination_port(),
+                    Seg {
                         syn: tcp.syn(),
                         ack: tcp.ack(),
                         rst: tcp.rst(),
                         fin: tcp.fin(),
                         seq: tcp.sequence_number(),
                         ack_number: tcp.acknowledgment_number(),
-                    };
-                }
+                    },
+                );
+            }
+        }
+    }
+
+    /// The next segment the stack sends the app's `port`.
+    async fn segment(stack: &mut Stack, port: u16) -> Seg {
+        loop {
+            let (to, seg) = any_segment(stack).await;
+            if to == port {
+                return seg;
             }
         }
     }
@@ -1054,6 +1130,19 @@ mod tests {
                 return seg;
             }
         }
+    }
+
+    /// Every segment the stack sends the app within `quiet`, with the app's
+    /// port.
+    async fn all_segments_within(stack: &mut Stack, quiet: StdDuration) -> Vec<(u16, Seg)> {
+        let mut segments = Vec::new();
+        let _ = tokio::time::timeout(quiet, async {
+            loop {
+                segments.push(any_segment(stack).await);
+            }
+        })
+        .await;
+        segments
     }
 
     /// Every segment the stack sends the app's `port` within `quiet`.
@@ -1148,6 +1237,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read(&mut second).await, b"second");
+    }
+
+    // A retransmitted SYN never reaches the socket made for another
+    // connection to the same destination. Here that socket sits in a lower
+    // slot than the first connection's, so smoltcp, which hands a SYN to the
+    // first socket in LISTEN, would give it the retransmitted SYN: a second
+    // connection on the first one's endpoints with another ISN, and a RST
+    // for the other connection's own SYN.
+    #[tokio::test]
+    async fn a_retransmitted_syn_is_not_taken_by_another_connection() {
+        let (mut stack, mut listener) = start(64 * 1024);
+        // A connection in the lowest slot, kept until the next one has the
+        // slot after it.
+        let isn = handshake(&mut stack, 40050, 100).await;
+        let (mut lowest, local, _) = accept(&mut listener).await;
+        assert_eq!(local, app(40050));
+
+        stack.send(tcp(40051, 1000, 0, "S", &[])).await.unwrap();
+        let syn_ack = segment_where(&mut stack, 40051, |seg| seg.syn && seg.ack).await;
+        let (mut first, local, _) = accept(&mut listener).await;
+        assert_eq!(local, app(40051));
+
+        // The app resets the connection in the lowest slot: its socket goes,
+        // and the slot is the one the next socket gets.
+        stack
+            .send(tcp(40050, 101, isn.wrapping_add(1), "RA", &[]))
+            .await
+            .unwrap();
+        assert!(read(&mut lowest).await.is_empty(), "the stream ends");
+
+        // The first connection's SYN again, together with another
+        // connection's SYN to the same destination.
+        stack.send(tcp(40051, 1000, 0, "S", &[])).await.unwrap();
+        stack.send(tcp(40052, 2000, 0, "S", &[])).await.unwrap();
+
+        let segments = all_segments_within(&mut stack, StdDuration::from_millis(500)).await;
+        let mut second_syn_ack = None;
+        for (port, seg) in &segments {
+            assert!(!seg.rst, "a RST to {port}: {seg:?}");
+            match *port {
+                40051 => assert!(!seg.syn || seg.seq == syn_ack.seq, "two ISNs: {seg:?}"),
+                40052 if seg.syn && seg.ack => {
+                    assert_eq!(seg.ack_number, 2001);
+                    second_syn_ack = Some(seg.seq);
+                }
+                _ => {}
+            }
+        }
+        let second_isn = second_syn_ack.expect("no SYN-ACK for the second connection");
+
+        let (mut second, local, remote) = accept(&mut listener).await;
+        assert_eq!((local, remote), (app(40052), server()));
+        assert!(
+            no_connection(&mut listener, StdDuration::from_millis(300)).await,
+            "a retransmitted SYN opened a second connection"
+        );
+
+        // Both handshakes complete, each connection's bytes come out of its
+        // own stream, and neither is reset.
+        stack
+            .send(tcp(40051, 1001, syn_ack.seq.wrapping_add(1), "A", b"first"))
+            .await
+            .unwrap();
+        stack
+            .send(tcp(40052, 2001, second_isn.wrapping_add(1), "A", b"second"))
+            .await
+            .unwrap();
+        assert_eq!(read(&mut first).await, b"first");
+        assert_eq!(read(&mut second).await, b"second");
+        for (port, seg) in all_segments_within(&mut stack, StdDuration::from_millis(200)).await {
+            assert!(!seg.rst, "a RST to {port}: {seg:?}");
+        }
     }
 
     // A SYN smoltcp refuses (here: a bad checksum) leaves its socket in
