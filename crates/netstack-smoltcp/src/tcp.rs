@@ -583,8 +583,15 @@ impl TcpListenerRunner {
                 // drained into the smoltcp socket.  Closing earlier transitions
                 // the socket to FIN_WAIT_1, making can_send() return false, so
                 // the send loop below never runs and the remaining data is lost.
+                //
+                // Not in SYN-RECEIVED: smoltcp's close() there goes to
+                // FIN-WAIT-1 counting the SYN as acknowledged, takes the
+                // app's handshake ACK as the ACK of a FIN it never sent and
+                // sits in FIN-WAIT-2 without sending one. The handshake ACK
+                // wakes the loop and the close happens from ESTABLISHED.
                 if matches!(control.send_state, TcpSocketState::Close)
                     && control.send_buffer.is_empty()
+                    && socket.state() != TcpState::SynReceived
                 {
                     trace!("closing TCP Write Half, {:?}", socket.state());
 
