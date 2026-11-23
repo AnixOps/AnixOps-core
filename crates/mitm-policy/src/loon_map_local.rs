@@ -9,7 +9,7 @@
 //! [`inline_remote_data`].
 
 use crate::loon_syntax::{attributes, quote, tokens};
-use crate::policy_cache::{PolicyCache, SharedEngine};
+use crate::policy_cache::{PolicyCache, SharedEngine, POLICY_REVISIONS};
 use crate::{AnixOpsMitmPolicyEngine, MitmPolicyPhase};
 use control_domain::{DomainResult, MetadataEntry};
 
@@ -290,7 +290,7 @@ struct CompiledMapLocal {
 
 /// Map Local rules of the policies in use, released with their policy
 /// ([`crate::CompiledPolicyRelease`]).
-static COMPILED: PolicyCache<CompiledMapLocal> = PolicyCache::new(2);
+static COMPILED: PolicyCache<CompiledMapLocal> = PolicyCache::new(POLICY_REVISIONS);
 
 /// Drops the compiled rules of a policy no longer in use.
 pub(crate) fn release(policy: crate::PolicyFingerprint) {

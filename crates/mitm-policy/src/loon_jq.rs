@@ -9,7 +9,7 @@
 //! loaded source because the core's result value is capped at 2 KiB.
 
 use crate::loon_syntax::tokens;
-use crate::policy_cache::PolicyCache;
+use crate::policy_cache::{PolicyCache, POLICY_REVISIONS};
 use crate::{MitmPolicyBodyRewriteChain, MitmPolicyPhase};
 use jaq_core::load::{Arena, File, Loader};
 use jaq_core::{data, unwrap_valr, Compiler, Ctx, Vars};
@@ -41,7 +41,7 @@ pub fn run_jq(filter: &str, body: &str) -> Option<String> {
 type JqFilter = jaq_core::Filter<data::JustLut<Val>>;
 
 thread_local! {
-    static JQ_COMPILATIONS: Cell<u64> = Cell::new(0);
+    static JQ_COMPILATIONS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// How many jq filters this thread has compiled; tests use it to check that
@@ -144,7 +144,7 @@ fn jq_rules(source: &str) -> Vec<JqRule> {
 
 /// jq rules and their compiled filters, per policy in use; released with
 /// the policy ([`crate::CompiledPolicyRelease`]).
-static JQ_RULES: PolicyCache<Vec<JqRule>> = PolicyCache::new(2);
+static JQ_RULES: PolicyCache<Vec<JqRule>> = PolicyCache::new(POLICY_REVISIONS);
 
 /// Drops the jq rules and compiled filters of a policy no longer in use.
 pub(crate) fn release(policy: crate::PolicyFingerprint) {

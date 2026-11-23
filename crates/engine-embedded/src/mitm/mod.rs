@@ -72,7 +72,7 @@ use engine_outbound::reject::{rejection, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
 use mitm_policy::loon_map_local::MAP_LOCAL_REMOTE_DATA_MAX_BYTES;
 use mitm_policy::loon_plugin::{import_loon_plugin_with_resources, merged_plugin_source};
-use mitm_policy::{AnixOpsMitmPluginService, CompiledPolicyRelease};
+use mitm_policy::{plan_waiting_for_engines, AnixOpsMitmPluginService, CompiledPolicyRelease};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Issuer, KeyPair,
 };
@@ -324,7 +324,9 @@ impl MitmEngine {
     }
 
     /// Runs the rewrite hook. Script dispatches block, so with scripts the
-    /// plan runs on the blocking pool.
+    /// plan runs on the blocking pool, where planning may wait for one of
+    /// the policy's loaded engines instead of loading the whole policy again
+    /// for each parallel message ([`plan_waiting_for_engines`]).
     async fn plan(
         &self,
         message: NativePlainHttpMessage,
@@ -333,9 +335,11 @@ impl MitmEngine {
             return Ok(self.hook.plan_plain_http(&message));
         }
         let hook = self.hook.clone();
-        tokio::task::spawn_blocking(move || hook.plan_plain_http(&message))
-            .await
-            .map_err(|_| io::Error::other("mitm rewrite failed"))
+        tokio::task::spawn_blocking(move || {
+            plan_waiting_for_engines(|| hook.plan_plain_http(&message))
+        })
+        .await
+        .map_err(|_| io::Error::other("mitm rewrite failed"))
     }
 
     /// Replaces the verifying upstream client, e.g. to trust a test origin.

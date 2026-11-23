@@ -178,17 +178,30 @@ the body to the core, so a body the core cannot read never fails the plan:
   trusted engine per revision, `[Map Local]` and header-block rules keep
   their matchers, and jq rules their parsed list and each filter's compiled
   jaq program (compiled on the rule's first match). Planning leases engines
-  from a pool of at most 4 idle engines holding at most 2 MiB of policy text
-  together (one at least), dropping those of a replaced policy first.
+  from a pool. A revision has at most as many planning engines, leased or
+  idle, as fit in 2 MiB of policy text (one at least, 4 at most); at most 4
+  idle engines of all revisions are kept, holding at most 2 MiB together
+  (one at least), and those of a replaced policy go first. Inside
+  `plan_waiting_for_engines` (the embedded data plane plans scripted
+  messages on its blocking pool there) planning waits for a leased engine
+  to come back instead of loading the policy again, so a 3 MiB policy is
+  loaded once however many requests a page makes at the same time.
+  Elsewhere nothing waits: planning at the limit loads an engine for the one
+  message, and `needs_body`, which runs on async threads, uses one shared
+  engine per revision instead.
 - Compiled forms live as long as their policy: the owner keeps a
   `CompiledPolicyRelease` beside the loaded policy (engine-embedded's
   `MitmEngine` does), and dropping it, or calling
   `release_compiled_policy(source)`, frees that revision's idle engines,
-  hostname engine, Map Local, header-block and jq rules. The caches hold at
-  most 2 revisions, which only bounds what a caller that never releases
-  keeps. `policy_loads_on_this_thread()`,
+  hostname and `needs_body` engines, Map Local, header-block and jq rules.
+  The caches hold at most 4 revisions, enough for the current policy, an
+  old one kept by long-lived connections after a reload, a desktop local
+  proxy and temporary probe proxies without evicting one another; the
+  capacity only bounds what a caller that never releases keeps.
+  `policy_loads_on_this_thread()`, `planning_engine_loads()`,
   `loon_jq::jq_compilations_on_this_thread()` and `idle_policy_engines()`
-  are for tests (`tests/policy_cache_contracts.rs`).
+  are for tests (`tests/policy_cache_contracts.rs`,
+  `tests/engine_pool_contracts.rs`).
 
 The corpus in `tests/fixtures/loon-plugins` has an expected level for each
 plugin, and `tests/loon_plugin_contracts.rs` prints the graded report for

@@ -29,6 +29,8 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 pub const SOURCE_MITM_POLICY: &str = "mitm.policy";
 
@@ -877,7 +879,8 @@ impl From<sys::AnixOpsScriptKind> for MitmPolicyScriptKind {
 }
 
 thread_local! {
-    static POLICY_LOADS: Cell<u64> = Cell::new(0);
+    static POLICY_LOADS: Cell<u64> = const { Cell::new(0) };
+    static ENGINE_WAIT_ALLOWED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// How many times this thread has loaded text into an engine
@@ -888,20 +891,135 @@ pub fn policy_loads_on_this_thread() -> u64 {
     POLICY_LOADS.with(Cell::get)
 }
 
+/// Engines loaded for planning ([`MitmPluginService::handle_http_mitm_event`]
+/// and [`AnixOpsMitmPluginService::needs_body`]) by every thread of the
+/// process, pooled or not; tests use it to check that parallel planning
+/// loads a policy at most [`engines_per_revision`] times.
+static PLANNING_ENGINE_LOADS: AtomicU64 = AtomicU64::new(0);
+
+/// Planning engines loaded by the whole process ([`PLANNING_ENGINE_LOADS`]).
+#[doc(hidden)]
+pub fn planning_engine_loads() -> u64 {
+    PLANNING_ENGINE_LOADS.load(Ordering::Relaxed)
+}
+
+/// Runs `f`, in which planning on this thread may wait for a loaded engine
+/// of its policy instead of loading another one.
+///
+/// A revision has at most [`engines_per_revision`] planning engines, leased
+/// or idle. When they are all leased, planning in `f` waits until one comes
+/// back; planning elsewhere loads an engine for the one message instead, so
+/// an async runtime thread never blocks. The data plane runs scripted plans
+/// on its blocking pool inside this, since a page loading many resources at
+/// once would otherwise load a multi-megabyte policy once per parallel
+/// request. Leases are held only while one message is planned (scripts run
+/// after the plan), so a wait is short and cannot deadlock.
+pub fn plan_waiting_for_engines<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ENGINE_WAIT_ALLOWED.with(|allowed| allowed.set(self.0));
+        }
+    }
+    let _restore = Restore(ENGINE_WAIT_ALLOWED.with(|allowed| allowed.replace(true)));
+    f()
+}
+
 /// Loaded engines kept between HTTP events. Loading a policy parses it and
 /// compiles every rule, far more work than planning one message, and a
 /// policy with large plugins runs to megabytes.
-static ENGINE_POOL: std::sync::Mutex<Vec<PooledEngine>> = std::sync::Mutex::new(Vec::new());
-/// Idle engines kept. Scripted messages are planned in parallel on the
-/// blocking pool, so a page loading several resources at once holds several
-/// leases; engines of the current policy are kept before those of an older
-/// one, and the extra ones are dropped afterwards.
+static ENGINE_POOL: Mutex<EnginePool> = Mutex::new(EnginePool {
+    idle: Vec::new(),
+    live: Vec::new(),
+});
+/// Signalled whenever an engine goes back to [`ENGINE_POOL`] or a counted
+/// engine is freed, for planning that waits ([`plan_waiting_for_engines`]).
+static ENGINE_RETURNED: Condvar = Condvar::new();
+/// Idle engines kept, of all revisions together. Engines of the current
+/// policy are kept before those of an older one.
 const ENGINE_POOL_MAX_IDLE: usize = 4;
-/// Policy text the idle engines may hold together. A loaded engine's memory
-/// grows with its policy, so a large policy keeps fewer idle engines (one at
-/// least) and a memory-limited extension does not hold several compiled
+/// Planning engines one revision may have, leased or idle, when its policy
+/// is small.
+const ENGINE_POOL_MAX_PER_REVISION: usize = 4;
+/// Policy text the planning engines of one revision may hold together, and
+/// the idle engines of all revisions (one engine at least). A loaded
+/// engine's memory grows with its policy, so a large policy gets fewer
+/// engines and a memory-limited extension does not hold several compiled
 /// copies of a multi-megabyte policy.
-const ENGINE_POOL_MAX_IDLE_POLICY_BYTES: usize = 2 * 1024 * 1024;
+const ENGINE_POOL_POLICY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Planning engines a revision may have, leased or idle: as many as fit in
+/// [`ENGINE_POOL_POLICY_BYTES`], one at least and
+/// [`ENGINE_POOL_MAX_PER_REVISION`] at most.
+fn engines_per_revision(policy: PolicyFingerprint) -> usize {
+    (ENGINE_POOL_POLICY_BYTES / policy.bytes().max(1)).clamp(1, ENGINE_POOL_MAX_PER_REVISION)
+}
+
+struct EnginePool {
+    idle: Vec<PooledEngine>,
+    /// Counted engines per revision, leased or idle. A revision is listed
+    /// only while it has one.
+    live: Vec<(PolicyFingerprint, usize)>,
+}
+
+impl EnginePool {
+    fn live(&self, policy: PolicyFingerprint) -> usize {
+        self.live
+            .iter()
+            .find(|(key, _)| *key == policy)
+            .map_or(0, |(_, count)| *count)
+    }
+
+    fn add_live(&mut self, policy: PolicyFingerprint) {
+        match self.live.iter_mut().find(|(key, _)| *key == policy) {
+            Some((_, count)) => *count += 1,
+            None => self.live.push((policy, 1)),
+        }
+    }
+
+    fn remove_live(&mut self, policy: PolicyFingerprint) {
+        if let Some(index) = self.live.iter().position(|(key, _)| *key == policy) {
+            self.live[index].1 -= 1;
+            if self.live[index].1 == 0 {
+                self.live.remove(index);
+            }
+        }
+    }
+
+    /// Whether the idle engines exceed [`ENGINE_POOL_MAX_IDLE`] or, two or
+    /// more of them, [`ENGINE_POOL_POLICY_BYTES`].
+    fn idle_over_budget(&self) -> bool {
+        self.idle.len() > ENGINE_POOL_MAX_IDLE
+            || (self.idle.len() > 1
+                && self
+                    .idle
+                    .iter()
+                    .map(|entry| entry.policy.bytes())
+                    .sum::<usize>()
+                    > ENGINE_POOL_POLICY_BYTES)
+    }
+
+    /// Takes the idle engines matching `release` out of the pool; they are
+    /// no longer counted.
+    fn take_idle(&mut self, release: impl Fn(&PooledEngine) -> bool) -> Vec<PooledEngine> {
+        let (released, kept) = std::mem::take(&mut self.idle)
+            .into_iter()
+            .partition::<Vec<_>, _>(|entry| release(entry));
+        self.idle = kept;
+        for entry in &released {
+            self.remove_live(entry.policy);
+        }
+        released
+    }
+}
+
+fn lock_engine_pool() -> MutexGuard<'static, EnginePool> {
+    // Nothing panics while the pool is locked; a poisoned lock still holds
+    // a consistent pool.
+    ENGINE_POOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Policies up to this size are hashed whole; larger ones by samples, so a
 /// multi-megabyte policy costs little per message. The embedded data plane
@@ -915,13 +1033,6 @@ const POLICY_STRIDE_SAMPLE_BYTES: usize = 512;
 /// A policy's identity: its length and a hash of its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PolicyFingerprint(usize, u64);
-
-impl PolicyFingerprint {
-    /// The policy's length in bytes.
-    fn bytes(self) -> usize {
-        self.0
-    }
-}
 
 impl PolicyFingerprint {
     fn of(source: &str) -> Self {
@@ -942,6 +1053,11 @@ impl PolicyFingerprint {
         }
         Self(bytes.len(), hasher.finish())
     }
+
+    /// The policy's length in bytes.
+    fn bytes(self) -> usize {
+        self.0
+    }
 }
 
 struct PooledEngine {
@@ -954,33 +1070,83 @@ struct PooledEngine {
 // pool hands each engine to one thread at a time.
 unsafe impl Send for PooledEngine {}
 
+/// How [`EngineLease::acquire`] gets an engine when its revision already
+/// has [`engines_per_revision`] engines and none is idle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WhenAtLimit {
+    /// Wait until one comes back ([`plan_waiting_for_engines`]).
+    Wait,
+    /// Load one for this message only; it is not pooled.
+    LoadUnpooled,
+    /// Get none ([`EngineLease::acquire`] answers `None`).
+    GiveUp,
+}
+
 /// An engine loaded with one policy, taken from the pool or loaded fresh.
 /// It goes back to the pool only after [`EngineLease::keep`], so an engine
 /// that saw an error is never reused.
 struct EngineLease {
-    pooled: Option<PooledEngine>,
+    policy: PolicyFingerprint,
+    /// Counted in the pool's `live` until dropped.
+    counted: bool,
+    engine: Option<AnixOpsMitmPolicyEngine>,
     keep: bool,
 }
 
 impl EngineLease {
-    fn acquire(source: &str) -> DomainResult<Self> {
+    /// An engine for planning `source` on this thread, waiting for one only
+    /// inside [`plan_waiting_for_engines`].
+    fn for_planning(source: &str) -> DomainResult<Self> {
+        let at_limit = if ENGINE_WAIT_ALLOWED.with(Cell::get) {
+            WhenAtLimit::Wait
+        } else {
+            WhenAtLimit::LoadUnpooled
+        };
+        Ok(Self::acquire(source, at_limit)?.expect("only GiveUp answers None"))
+    }
+
+    fn acquire(source: &str, at_limit: WhenAtLimit) -> DomainResult<Option<Self>> {
         let policy = PolicyFingerprint::of(source);
-        let pooled = ENGINE_POOL.lock().ok().and_then(|mut pool| {
-            let index = pool.iter().rposition(|entry| entry.policy == policy)?;
-            Some(pool.remove(index))
-        });
-        let pooled = match pooled {
-            Some(pooled) => pooled,
-            None => {
-                let mut engine = AnixOpsMitmPolicyEngine::new()?;
-                engine.load_config(source)?;
-                PooledEngine { policy, engine }
+        let limit = engines_per_revision(policy);
+        let mut pool = lock_engine_pool();
+        let counted = loop {
+            if let Some(index) = pool.idle.iter().rposition(|entry| entry.policy == policy) {
+                let pooled = pool.idle.remove(index);
+                return Ok(Some(Self {
+                    policy,
+                    counted: true,
+                    engine: Some(pooled.engine),
+                    keep: false,
+                }));
+            }
+            if pool.live(policy) < limit {
+                pool.add_live(policy);
+                break true;
+            }
+            match at_limit {
+                WhenAtLimit::Wait => {
+                    pool = ENGINE_RETURNED
+                        .wait(pool)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                WhenAtLimit::LoadUnpooled => break false,
+                WhenAtLimit::GiveUp => return Ok(None),
             }
         };
-        Ok(Self {
-            pooled: Some(pooled),
+        drop(pool);
+        // Counted from here on: a failed load drops the lease, which frees
+        // the place for the next caller.
+        let mut lease = Self {
+            policy,
+            counted,
+            engine: None,
             keep: false,
-        })
+        };
+        PLANNING_ENGINE_LOADS.fetch_add(1, Ordering::Relaxed);
+        let mut engine = AnixOpsMitmPolicyEngine::new()?;
+        engine.load_config(source)?;
+        lease.engine = Some(engine);
+        Ok(Some(lease))
     }
 
     fn keep(&mut self) {
@@ -992,47 +1158,53 @@ impl std::ops::Deref for EngineLease {
     type Target = AnixOpsMitmPolicyEngine;
 
     fn deref(&self) -> &Self::Target {
-        &self
-            .pooled
-            .as_ref()
-            .expect("a lease holds its engine")
-            .engine
+        self.engine.as_ref().expect("a lease holds its engine")
     }
 }
 
 impl std::ops::DerefMut for EngineLease {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self
-            .pooled
-            .as_mut()
-            .expect("a lease holds its engine")
-            .engine
+        self.engine.as_mut().expect("a lease holds its engine")
     }
 }
 
 impl Drop for EngineLease {
     fn drop(&mut self) {
-        let Some(pooled) = self.pooled.take().filter(|_| self.keep) else {
+        let engine = self.engine.take();
+        if !self.counted {
             return;
-        };
-        if let Ok(mut pool) = ENGINE_POOL.lock() {
-            let current = pooled.policy;
-            pool.push(pooled);
-            let over_budget = |pool: &[PooledEngine]| {
-                pool.len() > ENGINE_POOL_MAX_IDLE
-                    || (pool.len() > 1
-                        && pool.iter().map(|entry| entry.policy.bytes()).sum::<usize>()
-                            > ENGINE_POOL_MAX_IDLE_POLICY_BYTES)
-            };
-            while over_budget(&pool) {
-                // An engine of a replaced policy goes first, oldest first.
-                let index = pool
-                    .iter()
-                    .position(|entry| entry.policy != current)
-                    .unwrap_or(0);
-                pool.remove(index);
+        }
+        let current = self.policy;
+        let mut pool = lock_engine_pool();
+        // Freed after the lock is released.
+        let mut freed = Vec::new();
+        match (engine, self.keep) {
+            (Some(engine), true) => pool.idle.push(PooledEngine {
+                policy: current,
+                engine,
+            }),
+            (engine, _) => {
+                pool.remove_live(current);
+                freed.extend(engine.map(|engine| PooledEngine {
+                    policy: current,
+                    engine,
+                }));
             }
         }
+        while pool.idle_over_budget() {
+            // An engine of a replaced policy goes first, oldest first.
+            let index = pool
+                .idle
+                .iter()
+                .position(|entry| entry.policy != current)
+                .unwrap_or(0);
+            let evicted = pool.idle.remove(index);
+            pool.remove_live(evicted.policy);
+            freed.push(evicted);
+        }
+        drop(pool);
+        ENGINE_RETURNED.notify_all();
+        drop(freed);
     }
 }
 
@@ -1040,11 +1212,12 @@ impl Drop for EngineLease {
 /// policy leaves none behind.
 #[doc(hidden)]
 pub fn idle_policy_engines() -> usize {
-    ENGINE_POOL.lock().map(|pool| pool.len()).unwrap_or(0)
+    lock_engine_pool().idle.len()
 }
 
 /// Drops every compiled form of `source` the crate keeps between calls:
-/// idle loaded engines, the hostname engine, and the compiled Map Local,
+/// idle loaded engines, the hostname and body-probe engines, and the
+/// compiled Map Local,
 /// header-block and jq rules. Calls that still run with them finish first;
 /// a later call for `source` compiles it again.
 ///
@@ -1057,16 +1230,13 @@ pub fn release_compiled_policy(source: &str) {
 }
 
 fn release_policy(policy: PolicyFingerprint) {
-    let idle = ENGINE_POOL.lock().ok().map(|mut pool| {
-        let (released, kept) = std::mem::take(&mut *pool)
-            .into_iter()
-            .partition::<Vec<_>, _>(|entry| entry.policy == policy);
-        *pool = kept;
-        released
-    });
+    let idle = lock_engine_pool().take_idle(|entry| entry.policy == policy);
+    // Waiting planners of the revision may load in the freed places.
+    ENGINE_RETURNED.notify_all();
     // Engines are freed outside the pool's lock.
     drop(idle);
     HOSTNAME_ENGINES.remove(policy);
+    BODY_PROBE_ENGINES.remove(policy);
     loon_map_local::release(policy);
     loon_header_block::release(policy);
     loon_jq::release(policy);
@@ -1101,7 +1271,31 @@ impl Drop for CompiledPolicyRelease {
 /// the hostname list and are set to a trusted certificate, so they are kept
 /// apart from [`ENGINE_POOL`].
 static HOSTNAME_ENGINES: policy_cache::PolicyCache<policy_cache::SharedEngine> =
-    policy_cache::PolicyCache::new(2);
+    policy_cache::PolicyCache::new(policy_cache::POLICY_REVISIONS);
+
+/// Engines answering [`AnixOpsMitmPluginService::needs_body`] while every
+/// planning engine of the revision is leased, one per policy in use,
+/// released with the policy ([`CompiledPolicyRelease`]). `needs_body` runs on
+/// the data plane's async threads, where it may neither wait for a planning
+/// engine nor load the whole policy for one message; it only plans an empty
+/// body, so sharing one engine holds its lock briefly.
+static BODY_PROBE_ENGINES: policy_cache::PolicyCache<policy_cache::SharedEngine> =
+    policy_cache::PolicyCache::new(policy_cache::POLICY_REVISIONS);
+
+/// Whether a rule reads the body of `url`'s messages in `phase`, planned on
+/// an empty body.
+fn plan_needs_body(
+    engine: &AnixOpsMitmPolicyEngine,
+    url: &str,
+    phase: MitmPolicyPhase,
+) -> DomainResult<bool> {
+    let (plan, _) = engine.build_rewrite_plan(url, phase, "")?;
+    let (_, chain) = engine.apply_body_chain(url, phase, "")?;
+    // `requires_body` covers a body rewrite and a script with
+    // `requires-body=true`. A script without it never sees the body, so
+    // matching one does not hold the body back.
+    Ok(plan.requires_body || !chain.rewrites.is_empty() || chain.truncated)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnixOpsMitmPluginService;
@@ -1125,15 +1319,25 @@ impl AnixOpsMitmPluginService {
         let Some(source) = plugin_instance.loaded_source.as_deref() else {
             return Ok(false);
         };
-        let mut engine = EngineLease::acquire(source)?;
         let phase = policy_phase_from_domain(phase);
-        let (plan, _) = engine.build_rewrite_plan(url, phase, "")?;
-        let (_, chain) = engine.apply_body_chain(url, phase, "")?;
-        engine.keep();
-        // `requires_body` covers a body rewrite and a script with
-        // `requires-body=true`. A script without it never sees the body,
-        // so matching one does not hold the body back.
-        Ok(plan.requires_body || !chain.rewrites.is_empty() || chain.truncated)
+        // This runs on an async thread: take an idle planning engine or
+        // load one while the revision has room, and never wait for one.
+        if let Some(mut engine) = EngineLease::acquire(source, WhenAtLimit::GiveUp)? {
+            let needs_body = plan_needs_body(&engine, url, phase)?;
+            engine.keep();
+            return Ok(needs_body);
+        }
+        let engine = BODY_PROBE_ENGINES.get_or_build(source, |source| {
+            let mut engine = AnixOpsMitmPolicyEngine::new()?;
+            engine.load_config(source)?;
+            Ok(policy_cache::SharedEngine::new(engine))
+        })?;
+        let needs_body = engine.with(|engine| plan_needs_body(engine, url, phase));
+        if needs_body.is_err() {
+            // An engine that saw an error is not used again.
+            BODY_PROBE_ENGINES.remove(PolicyFingerprint::of(source));
+        }
+        needs_body
     }
 }
 
@@ -1321,7 +1525,7 @@ impl MitmPluginService for AnixOpsMitmPluginService {
             });
         }
 
-        let mut engine = EngineLease::acquire(source)?;
+        let mut engine = EngineLease::for_planning(source)?;
         let phase = policy_phase_from_domain(http_event.phase);
         // The URL decides the action, the header rules and the script; the
         // body is never handed to the core here, so a binary body (NUL

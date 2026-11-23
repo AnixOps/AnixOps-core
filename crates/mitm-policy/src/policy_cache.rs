@@ -8,8 +8,8 @@
 //! per policy revision ([`PolicyFingerprint`]) and shared. A new revision
 //! builds its own. The owner of a loaded policy releases its revision when it
 //! stops using it ([`crate::CompiledPolicyRelease`]), so compiled forms live
-//! only as long as their policy; the small capacity only bounds what callers
-//! that never release keep.
+//! only as long as their policy; the capacity ([`POLICY_REVISIONS`]) only
+//! bounds what callers that never release keep.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -42,6 +42,15 @@ impl SharedEngine {
         f(&mut guard.0)
     }
 }
+
+/// Revisions each cache keeps. Every embedded data plane adds a line unique
+/// to it to its policy, so each is its own revision, and several are often
+/// live at once: the current one, an old one kept by long-lived connections
+/// after a reload, a desktop local proxy, and temporary proxies for probes.
+/// Fewer places than live revisions would evict them in turn and compile
+/// the whole policy again for every new host or message. Released revisions
+/// leave at once, so the capacity only bounds callers that never release.
+pub(crate) const POLICY_REVISIONS: usize = 4;
 
 /// Compiled values keyed by policy revision, at most `capacity` revisions,
 /// least recently used first out.

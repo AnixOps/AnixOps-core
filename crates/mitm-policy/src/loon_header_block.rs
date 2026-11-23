@@ -17,7 +17,7 @@
 //! request elsewhere.
 
 use crate::loon_syntax::{quote, tokens};
-use crate::policy_cache::{PolicyCache, SharedEngine};
+use crate::policy_cache::{PolicyCache, SharedEngine, POLICY_REVISIONS};
 use crate::{AnixOpsMitmPolicyEngine, MitmPolicyPhase};
 use control_domain::{
     DomainResult, HttpHeaderMutation, HttpHeaderMutationOperation, HttpMitmPhase, MetadataEntry,
@@ -233,7 +233,7 @@ struct CompiledHeaderBlock {
 
 /// Header-block rules of the policies in use, released with their policy
 /// ([`crate::CompiledPolicyRelease`]).
-static COMPILED: PolicyCache<CompiledHeaderBlock> = PolicyCache::new(2);
+static COMPILED: PolicyCache<CompiledHeaderBlock> = PolicyCache::new(POLICY_REVISIONS);
 
 /// Drops the compiled rules of a policy no longer in use.
 pub(crate) fn release(policy: crate::PolicyFingerprint) {
