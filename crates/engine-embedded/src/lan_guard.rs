@@ -18,10 +18,16 @@
 //!   link-local (`169.254.0.0/16`, `fe80::/10`), multicast and broadcast
 //!   addresses, IPv4-mapped IPv6 forms included;
 //! - the names `localhost` and `*.localhost` (RFC 6761), before any lookup;
-//! - the addresses of this computer's interfaces, except the one the device
-//!   reached the share on: whatever listens there is already open to that
-//!   network, and a phone opening `http://<computer>:3000/` through the proxy
-//!   is the usual way to debug a development server;
+//! - the addresses of this computer's interfaces, the one the device reached
+//!   the share on included: a service bound to all interfaces that the host
+//!   firewall keeps from the network (file sharing, remote management, a
+//!   development server allowed on private networks only) would otherwise be
+//!   one proxy hop away, since the proxy dials it from this computer and the
+//!   firewall never sees the device. The one exception is the share's own
+//!   port on that address ([`LanPeer::share_port`]), which the device
+//!   already reaches directly: a phone that opens the setup page
+//!   `http://<computer>:<port>/` while it uses the proxy is answered by the
+//!   share itself;
 //! - with [`LanPeer::block_private_networks`] (off by default), every private
 //!   destination as well (RFC 1918, `100.64.0.0/10`, IPv6 ULA `fc00::/7`), so
 //!   the device cannot reach other machines of the networks this computer
@@ -31,17 +37,24 @@
 //! share's port) carry no [`LanPeer`] and are not checked; flows through a
 //! proxy node are resolved on the far side and are not checked either. A
 //! `redirects` line that names a new host is the user's own choice and is
-//! not checked.
+//! not checked: it is how a user lets phones reach a development server on
+//! this computer.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// A flow opened by another device on the local network through the LAN
 /// share.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LanPeer {
-    /// This computer's address the device reached the share on.
+    /// This computer's address the device reached the share on. Refused
+    /// like every other interface address of this computer, except on
+    /// [`Self::share_port`].
     pub via: IpAddr,
+    /// The share's own listener port: the only port of [`Self::via`] the
+    /// device may reach through DIRECT, since it reaches it directly anyway
+    /// (the setup page).
+    pub share_port: u16,
     /// Also refuse private destinations; see the module documentation.
     pub block_private_networks: bool,
 }
@@ -66,17 +79,22 @@ pub fn is_local_name(name: &str) -> bool {
     name == "localhost" || name.ends_with(".localhost")
 }
 
-/// Whether `peer` may not reach `address` through DIRECT. `own` tells this
+/// Whether `peer` may not reach `target` through DIRECT. `own` tells this
 /// computer's interface addresses; see [`is_own_address`].
-pub fn refuses(peer: LanPeer, address: IpAddr, own: impl Fn(IpAddr) -> bool) -> bool {
-    let address = address.to_canonical();
+pub fn refuses(peer: LanPeer, target: SocketAddr, own: impl Fn(IpAddr) -> bool) -> bool {
+    let address = target.ip().to_canonical();
     if always_refused(address) {
         return true;
+    }
+    // The share itself, on the address the device reached it on: nothing
+    // the device cannot open without the proxy.
+    if address == peer.via.to_canonical() && target.port() == peer.share_port {
+        return false;
     }
     if peer.block_private_networks && is_private(address) {
         return true;
     }
-    address != peer.via.to_canonical() && own(address)
+    own(address)
 }
 
 /// Loopback, unspecified, link-local, multicast and broadcast addresses.
@@ -181,6 +199,7 @@ mod tests {
     fn peer() -> LanPeer {
         LanPeer {
             via: "192.168.1.5".parse().unwrap(),
+            share_port: 8899,
             block_private_networks: false,
         }
     }
@@ -189,8 +208,13 @@ mod tests {
         false
     }
 
+    /// `address` (an IP address) on port 443.
+    fn at(address: &str) -> SocketAddr {
+        SocketAddr::new(address.parse().unwrap(), 443)
+    }
+
     fn is_refused(address: &str) -> bool {
-        refuses(peer(), address.parse().unwrap(), nothing_own)
+        refuses(peer(), at(address), nothing_own)
     }
 
     #[test]
@@ -247,32 +271,50 @@ mod tests {
             "fd00::8",
             "::ffff:10.1.1.1",
         ] {
-            assert!(
-                refuses(strict, address.parse().unwrap(), nothing_own),
-                "{address}"
-            );
+            assert!(refuses(strict, at(address), nothing_own), "{address}");
         }
         for address in ["8.8.8.8", "100.128.0.1", "2001:db8::1"] {
-            assert!(
-                !refuses(strict, address.parse().unwrap(), nothing_own),
-                "{address}"
-            );
+            assert!(!refuses(strict, at(address), nothing_own), "{address}");
         }
     }
 
     #[test]
-    fn own_addresses_are_refused_except_the_share_address() {
+    fn own_addresses_are_refused_the_share_address_included() {
         let own = |address: IpAddr| {
             ["192.168.1.5", "172.17.0.1", "100.100.1.2", "fd7a::5"]
                 .iter()
                 .any(|own| own.parse::<IpAddr>().unwrap() == address)
         };
-        for address in ["172.17.0.1", "100.100.1.2", "fd7a::5", "::ffff:172.17.0.1"] {
-            assert!(refuses(peer(), address.parse().unwrap(), own), "{address}");
+        let refused = |target: &str| refuses(peer(), target.parse().unwrap(), own);
+        for target in [
+            "172.17.0.1:80",
+            "100.100.1.2:22",
+            "[fd7a::5]:443",
+            "[::ffff:172.17.0.1]:2375",
+            // The address the phone reached: services the host firewall
+            // keeps from the network (SMB, RPC, a development server).
+            "192.168.1.5:445",
+            "192.168.1.5:135",
+            "192.168.1.5:3000",
+            "[::ffff:192.168.1.5]:5985",
+            // The share's port, but on another address of this computer.
+            "172.17.0.1:8899",
+        ] {
+            assert!(refused(target), "{target}");
         }
-        assert!(!refuses(peer(), "192.168.1.5".parse().unwrap(), own));
-        assert!(!refuses(peer(), "::ffff:192.168.1.5".parse().unwrap(), own));
-        assert!(!refuses(peer(), "192.168.213.40".parse().unwrap(), own));
+        // Only the share itself, where the phone reached it.
+        assert!(!refused("192.168.1.5:8899"));
+        assert!(!refused("[::ffff:192.168.1.5]:8899"));
+        assert!(!refused("192.168.213.40:3000"));
+        // Loopback stays refused on the share's port too.
+        assert!(refused("127.0.0.1:8899"));
+        // With private networks refused, the share itself still answers.
+        let strict = LanPeer {
+            block_private_networks: true,
+            ..peer()
+        };
+        assert!(!refuses(strict, "192.168.1.5:8899".parse().unwrap(), own));
+        assert!(refuses(strict, "192.168.1.5:3000".parse().unwrap(), own));
     }
 
     #[test]

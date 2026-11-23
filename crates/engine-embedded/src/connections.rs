@@ -1199,7 +1199,7 @@ impl Dispatcher {
                 .is_some_and(|pool| pool.contains(address))
         };
         if addresses.iter().any(|address| {
-            fake(address.ip()) || lan_guard::refuses(peer, address.ip(), lan_guard::is_own_address)
+            fake(address.ip()) || lan_guard::refuses(peer, *address, lan_guard::is_own_address)
         }) {
             guard.fail(lan_guard::REFUSED);
             return Err(lan_guard::refused());
@@ -1633,6 +1633,7 @@ mod lan_peer_tests {
             },
             lan_peer: Some(LanPeer {
                 via: "192.168.1.5".parse().unwrap(),
+                share_port: 8899,
                 block_private_networks,
             }),
         }
@@ -1781,7 +1782,16 @@ mod lan_peer_tests {
             connect(&dispatcher, &ip("93.184.216.34:443"), phone(true))
                 .await
                 .unwrap();
-            assert_eq!(direct.seen(), ["93.184.216.34:443"]);
+            // The share itself, where the phone reached it (the setup page),
+            // but no other port of that address.
+            connect(&dispatcher, &ip("192.168.1.5:8899"), phone(true))
+                .await
+                .unwrap();
+            let error = connect(&dispatcher, &ip("192.168.1.5:3000"), phone(true))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(direct.seen(), ["93.184.216.34:443", "192.168.1.5:8899"]);
         });
     }
 

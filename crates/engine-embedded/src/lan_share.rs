@@ -11,11 +11,13 @@
 //! ([`PeerFilter::PrivateNetworks`]), optionally with proxy credentials.
 //!
 //! A device's flows that go DIRECT never reach this computer itself: its
-//! loopback (`127.0.0.0/8`, `::1`, `localhost`), its other interface
-//! addresses, link-local addresses and, with `block_private_networks`,
-//! private networks are refused after routing and name resolution, whatever
-//! the rules say; see [`crate::lan_guard`]. The computer's own programs
-//! (loopback clients of the share) are not checked.
+//! loopback (`127.0.0.0/8`, `::1`, `localhost`), every interface address
+//! (the one the device reached the share on included; only the share's own
+//! port there stays open, for the setup page), link-local addresses and,
+//! with `block_private_networks`, private networks are refused after routing
+//! and name resolution, whatever the rules say; see [`crate::lan_guard`].
+//! The computer's own programs (loopback clients of the share) are not
+//! checked.
 //!
 //! The listener also serves a setup page ([`PAGE_HOST`]): opening
 //! `http://<computer>:<port>/` on the phone (what the desktop client puts in
@@ -390,6 +392,7 @@ pub(crate) fn lan_peer(client: ClientAddrs, block_private_networks: bool) -> Opt
     }
     Some(LanPeer {
         via: client.local.ip().to_canonical(),
+        share_port: client.local.port(),
         block_private_networks,
     })
 }
@@ -917,6 +920,7 @@ mod tests {
             lan_peer(phone, true),
             Some(LanPeer {
                 via: "192.168.1.5".parse().unwrap(),
+                share_port: 8899,
                 block_private_networks: true,
             })
         );
@@ -945,7 +949,7 @@ mod tests {
             TargetAddr::Domain("localhost".to_string(), port),
             TargetAddr::Domain("127.0.0.1".to_string(), port),
         ];
-        // This computer's other addresses (not the one the phone reached).
+        // This computer's network addresses.
         targets.extend(
             lan_addresses()
                 .into_iter()
@@ -958,6 +962,21 @@ mod tests {
         runtime.block_on(async {
             for target in &targets {
                 let refused = clients.connect_client(phone, target).await.err();
+                assert_eq!(
+                    refused.map(|error| error.kind()),
+                    Some(io::ErrorKind::PermissionDenied),
+                    "{target}"
+                );
+            }
+            // Nor the address it reached the share on: a service there that
+            // the host firewall keeps from the network stays out of reach.
+            for address in lan_addresses() {
+                let phone = ClientAddrs {
+                    peer: "192.168.1.23:50000".parse().unwrap(),
+                    local: SocketAddr::from((address, 8899)),
+                };
+                let target = TargetAddr::Ip(SocketAddr::from((address, port)));
+                let refused = clients.connect_client(phone, &target).await.err();
                 assert_eq!(
                     refused.map(|error| error.kind()),
                     Some(io::ErrorKind::PermissionDenied),
