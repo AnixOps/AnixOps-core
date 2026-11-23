@@ -6,7 +6,7 @@ use engine_outbound::registry::{parse_settings, BuildError, OutboundFactory, Set
 use engine_outbound::{Dialer, TcpOutbound};
 use serde::Deserialize;
 use transport_grpc::{GrpcConnector, GrpcSettings};
-use transport_tls::{TlsConnector, TlsSettings};
+use transport_tls::{parse_sha256_pins, TlsConnector, TlsSettings};
 use transport_ws::{WsConnector, WsSettings};
 use transport_xhttp::{HttpVersion, Security, XhttpConnector, XhttpSettings, XhttpTarget};
 
@@ -25,9 +25,16 @@ struct TrojanSettings {
     server_name: Option<String>,
     #[serde(default)]
     alpn: Vec<String>,
-    /// Skip certificate verification (`allowInsecure=1`).
+    /// Skip WebPKI verification (`allowInsecure=1`); the pins below still
+    /// apply.
     #[serde(default)]
     insecure: bool,
+    /// SHA-256 digests of the server's leaf certificate in hex (`pcs`).
+    #[serde(default)]
+    pinned_certificate_sha256: Vec<String>,
+    /// SHA-256 digests of the leaf certificate's public key (SPKI) in hex.
+    #[serde(default)]
+    pinned_public_key_sha256: Vec<String>,
     /// `{"type": "ws", "path": ..., "host": ...}`,
     /// `{"type": "grpc", "service_name": ...}` or `{"type": "xhttp", ...}`;
     /// plain TLS when absent.
@@ -97,6 +104,10 @@ impl OutboundFactory for TrojanFactory {
             server_name,
             alpn,
             insecure: settings.insecure,
+            pinned_certificate_sha256: parse_sha256_pins(&settings.pinned_certificate_sha256)
+                .ok_or("trojan certificate pins are invalid")?,
+            pinned_public_key_sha256: parse_sha256_pins(&settings.pinned_public_key_sha256)
+                .ok_or("trojan certificate pins are invalid")?,
         };
         let mut grpc = None;
         let mut xhttp = None;

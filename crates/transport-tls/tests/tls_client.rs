@@ -5,20 +5,37 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use engine_outbound::BoxStream;
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use transport_tls::{TlsConnector, TlsSettings};
 
-/// Echo server over TLS for `localhost` that reports the negotiated ALPN first.
-async fn tls_echo_server() -> SocketAddr {
+struct EchoServer {
+    addr: SocketAddr,
+    /// SHA-256 of the server's certificate (DER).
+    certificate_sha256: [u8; 32],
+    /// SHA-256 of the certificate's SubjectPublicKeyInfo (DER).
+    public_key_sha256: [u8; 32],
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    digest
+}
+
+/// Echo server over TLS for `localhost` that reports the negotiated ALPN
+/// first, with a self-signed certificate.
+async fn tls_echo_server() -> EchoServer {
     let key = KeyPair::generate().unwrap();
     let cert = CertificateParams::new(vec!["localhost".to_string()])
         .unwrap()
         .self_signed(&key)
         .unwrap();
+    let certificate_sha256 = sha256(cert.der());
+    let public_key_sha256 = sha256(&key.subject_public_key_info());
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
@@ -52,7 +69,11 @@ async fn tls_echo_server() -> SocketAddr {
             });
         }
     });
-    addr
+    EchoServer {
+        addr,
+        certificate_sha256,
+        public_key_sha256,
+    }
 }
 
 async fn tcp(addr: SocketAddr) -> BoxStream {
@@ -66,9 +87,10 @@ async fn insecure_mode_accepts_a_self_signed_server_and_negotiates_alpn() {
         server_name: "localhost".into(),
         alpn: vec!["http/1.1".into()],
         insecure: true,
+        ..TlsSettings::default()
     })
     .unwrap();
-    let mut stream = connector.connect(tcp(server).await).await.unwrap();
+    let mut stream = connector.connect(tcp(server.addr).await).await.unwrap();
     let mut len = [0u8; 1];
     stream.read_exact(&mut len).await.unwrap();
     let mut alpn = vec![0u8; usize::from(len[0])];
@@ -88,9 +110,10 @@ async fn verification_rejects_an_untrusted_certificate() {
         server_name: "localhost".into(),
         alpn: Vec::new(),
         insecure: false,
+        ..TlsSettings::default()
     })
     .unwrap();
-    assert!(connector.connect(tcp(server).await).await.is_err());
+    assert!(connector.connect(tcp(server.addr).await).await.is_err());
 }
 
 #[test]
@@ -100,4 +123,71 @@ fn invalid_server_names_are_rejected() {
         ..TlsSettings::default()
     })
     .is_err());
+}
+
+/// Settings for the echo server with `insecure` and pins.
+fn pinned(
+    insecure: bool,
+    certificate_sha256: Vec<[u8; 32]>,
+    public_key_sha256: Vec<[u8; 32]>,
+) -> TlsSettings {
+    TlsSettings {
+        server_name: "localhost".into(),
+        insecure,
+        pinned_certificate_sha256: certificate_sha256,
+        pinned_public_key_sha256: public_key_sha256,
+        ..TlsSettings::default()
+    }
+}
+
+/// Connects and checks that the echo comes back.
+async fn echoes(connector: &TlsConnector, server: &EchoServer) {
+    let mut stream = connector.connect(tcp(server.addr).await).await.unwrap();
+    let mut len = [0u8; 1];
+    stream.read_exact(&mut len).await.unwrap();
+    let mut alpn = vec![0u8; usize::from(len[0])];
+    stream.read_exact(&mut alpn).await.unwrap();
+    stream.write_all(b"pinned").await.unwrap();
+    let mut echoed = [0u8; 6];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"pinned");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insecure_mode_with_pins_takes_only_the_pinned_certificate() {
+    let server = tls_echo_server().await;
+    let by_certificate =
+        TlsConnector::new(&pinned(true, vec![server.certificate_sha256], Vec::new())).unwrap();
+    echoes(&by_certificate, &server).await;
+    let by_public_key =
+        TlsConnector::new(&pinned(true, Vec::new(), vec![server.public_key_sha256])).unwrap();
+    echoes(&by_public_key, &server).await;
+
+    let mut other = server.certificate_sha256;
+    other[0] ^= 1;
+    for settings in [
+        pinned(true, vec![other], Vec::new()),
+        pinned(true, Vec::new(), vec![other]),
+        // Each list holds its own kind of digest.
+        pinned(
+            true,
+            vec![server.public_key_sha256],
+            vec![server.certificate_sha256],
+        ),
+    ] {
+        let connector = TlsConnector::new(&settings).unwrap();
+        assert!(connector.connect(tcp(server.addr).await).await.is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pins_do_not_replace_verification_without_insecure() {
+    let server = tls_echo_server().await;
+    let connector = TlsConnector::new(&pinned(
+        false,
+        vec![server.certificate_sha256],
+        vec![server.public_key_sha256],
+    ))
+    .unwrap();
+    assert!(connector.connect(tcp(server.addr).await).await.is_err());
 }

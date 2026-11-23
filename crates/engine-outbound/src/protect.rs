@@ -12,9 +12,15 @@
 //! passes through it before it connects or sends. Without a protector these
 //! helpers are plain socket calls. Loopback destinations are never handed to
 //! the protector.
+//!
+//! A socket keeps what the protector did to it when it was made. Holders of
+//! long-lived sockets (a WireGuard session keeps one UDP socket) watch
+//! [`path_generation`], which moves whenever the protector changes or the
+//! host reports a new path with [`path_changed`], and open a new socket.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
@@ -48,13 +54,34 @@ where
 }
 
 static PROTECTOR: RwLock<Option<Arc<dyn SocketProtector>>> = RwLock::new(None);
+static PATH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Installs (or with `None`, removes) the process-wide protector.
+/// Installs (or with `None`, removes) the process-wide protector. Either way
+/// the [`path_generation`] moves.
 pub fn set_socket_protector(protector: Option<Arc<dyn SocketProtector>>) {
-    let mut slot = PROTECTOR
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *slot = protector;
+    {
+        let mut slot = PROTECTOR
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = protector;
+    }
+    path_changed();
+}
+
+/// Reports that the path out of the device changed while the protector
+/// stayed, such as when it now pins sockets to another interface. Sockets
+/// made before keep the old interface; long-lived ones move to a new socket
+/// (see [`path_generation`]).
+pub fn path_changed() {
+    PATH_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// A counter that moves on every protector change and every
+/// [`path_changed`]. A holder of a long-lived socket compares it with the
+/// value it read before making the socket, and opens a new one when it
+/// moved.
+pub fn path_generation() -> u64 {
+    PATH_GENERATION.load(Ordering::Acquire)
 }
 
 /// Whether a protector is installed.
@@ -202,6 +229,23 @@ mod tests {
         assert!(!socket_protector_installed());
         bind_udp(remote).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn protector_changes_move_the_path_generation() {
+        serial(async {
+            let before = path_generation();
+            set_socket_protector(Some(Arc::new(
+                |_socket: RawSocketHandle, _target: SocketAddr| Ok(()),
+            )));
+            let installed = path_generation();
+            assert!(installed > before);
+            path_changed();
+            assert!(path_generation() > installed);
+            let changed = path_generation();
+            set_socket_protector(None);
+            assert!(path_generation() > changed);
+        });
     }
 
     #[test]

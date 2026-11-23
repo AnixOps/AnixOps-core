@@ -445,6 +445,7 @@ mod tests {
                 server_name: String::new(),
                 alpn: vec!["http/1.1".to_string()],
                 insecure: false,
+                ..transport_tls::TlsSettings::default()
             })
             .unwrap(),
         )

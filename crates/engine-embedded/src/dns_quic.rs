@@ -268,6 +268,7 @@ mod tests {
                 server_name: "doq.test".to_string(),
                 alpn: vec!["doq".to_string()],
                 insecure: true,
+                ..transport_tls::TlsSettings::default()
             },
             &["doq"],
             transport_quic::Congestion::Cubic,

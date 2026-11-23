@@ -189,6 +189,7 @@ async fn tls(server: SocketAddr, alpn: &[&str]) -> BoxStream {
         server_name: "naive.test".into(),
         alpn: alpn.iter().map(|protocol| (*protocol).to_owned()).collect(),
         insecure: true,
+        ..TlsSettings::default()
     })
     .unwrap()
     .connect(Box::new(tcp))

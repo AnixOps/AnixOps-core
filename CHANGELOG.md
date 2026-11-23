@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+### Security
+
+- 证书固定端到端生效（config-core、node-import、transport-tls 与 TLS/QUIC 出站）：订阅里的证书固定此前到不了引擎。Hysteria2 `pinSHA256` 与 Xray `pcs`（整张证书的摘要）被存进公钥固定的元数据键，sing-box `certificate_public_key_sha256` 存下了却没有代码读取，sing-box `certificate_sha256`、Clash `fingerprint`、Surge `server-cert-fingerprint-sha256`、Loon / Quantumult X `tls-cert-sha256` 与 `tls-pubkey-sha256` 没有解析；node-import 不输出固定，`TlsSettings` 没有固定字段，`insecure` 直接接受任何证书。于是“`insecure=1` + 固定”的自签节点实际不校验证书，路径上的中间人可以冒充服务端，拿到 Hysteria2 密码、TUIC UUID 与令牌、Trojan 密码和 VLESS / VMess UUID。现在：
+  - config-core 新模块 `certificate_pin` 解析两种写法（64 位十六进制，大小写均可、字节间可带 `:` 或 `-`；base64，标准或 URL 字母表、带不带填充）。整张证书的摘要存入新键 `tls.certificate_sha256`（逗号分隔的小写十六进制），公钥（SubjectPublicKeyInfo）摘要存入 `tls.certificate_public_key_sha256`（逗号分隔的标准 base64），上面各格式都解析；不是 SHA-256 摘要的值原样保留，交给导入时拒绝。旧目录在 `tls.certificate_public_key_sha256` 下存的十六进制值仍按整张证书的固定读取。
+  - node-import 把两类固定写成出站的 `pinned_certificate_sha256` / `pinned_public_key_sha256`（十六进制列表；没有固定的节点出站 JSON 与之前相同）。值不是 SHA-256 摘要、或节点没开 TLS 却带固定时，该节点报不支持，不会去掉固定运行。分享链接导出写出 `pcs` / `pinSHA256`；公钥固定没有分享链接写法，导出报错而不是丢掉。
+  - transport-tls：`TlsSettings` 新增 `pinned_certificate_sha256`、`pinned_public_key_sha256` 与 `parse_sha256_pins`，`client_config` 改用 `CertificateCheck` 校验：有固定时叶子证书必须命中其中一个（只认叶子证书，链上其他证书谁都能附上）；不带 `insecure` 时先过 WebPKI 再比固定，带 `insecure` 时固定取代 WebPKI。`insecure` 不带固定仍接受任何证书（握手签名照样校验），构建这样的客户端时记一条 `tracing` 警告，只含服务器名，每个名字每个进程一次。QUIC（Hysteria2、TUIC、XHTTP over HTTP/3）用同一份配置。
+  - `trojan`、`vless` / `vmess` 的 `tls`、`hysteria2`、`tuic` 与 `http`（`"tls": true`）出站接受这两个列表，值不是摘要时构建失败（`<类型> certificate pins are invalid`）；`http` 不开 TLS 却带固定也构建失败。REALITY 不受影响。说明见 `crates/engine-embedded/README.md`「Server certificates」。
+  - 客户端已保存的出站 JSON 是旧导入的结果，不带固定；重新导入订阅后才会带上。
+  - 测试：transport-tls 单元测试（带 / 不带 `insecure` 时固定命中与不命中、只认叶子证书、公钥固定、证书解析失败、摘要解析、警告去重）与真实 TLS 握手测试；Hysteria2、TUIC 进程内服务端验证固定命中时能连、不命中时服务端收不到密码或 UUID，工厂接受与拒绝固定；HTTP 工厂；config-core 各格式的解析；node-import 导入、旧数据兼容、拒绝与分享链接往返。
+
 ### Added
 
 - 节点体检（engine-embedded 新模块 `checkup`，`local-proxy` feature，见 `docs/architecture/node-checkup.md`）：经节点出站测多轮“连接 + TLS 握手”（冷 / 热分开）与 HTTP 请求的中位数、抖动和失败率；可选多连接下载吞吐（每秒曲线、峰值、到量即停）与下载期间的负载下延迟（`bloat_ms`）。口径与 AnixOps Speedtest 一致，只在用户发起时运行，失败只给固定代码。
@@ -88,6 +98,10 @@
 - CI：`protocol-features`（engine-embedded 逐 feature 的 clippy + test）和 `script-runtime-jsc`（macOS）改为与其他 Rust job 相同的改动范围条件，纯文档改动不再运行；PR 上 HTTP/2 MITM fuzz 每个目标 30 秒（main、tag、手动仍为 60 秒）；`push` 触发去掉不存在的 `master`、`develop` 分支。
 - CI：删除 Repository policy 里约 1,600 行内联断言（逐句检查文档和源码字符串是否存在，不验证行为），`policy-fast` 里与 `verify-repository-policy.sh fast` 重复的内联步骤，重复运行 workspace 已有测试且每次冷编译的 `maintenance-contracts` job，以及 `rust-build-test` 在 test 之后多余的 `cargo build`。`ci.yml` 从 2,772 行减到约 1,080 行；iOS 源码/签名材料的检查移入策略脚本。
 - 删除 `crates/platform-ios`：工作区内没有任何 crate 依赖它，iOS 的 FFI 边界在 `engine-embedded`/`node-import`。workspace member、`Cargo.lock` 条目、CI 的文件存在性检查和文档引用一并去掉。
+
+### Fixed
+
+- XHTTP 走 HTTP/3 不再绕过 `via` 与宿主拨号器（transport-xhttp、transport-quic、engine-outbound）：VLESS、VMess、Trojan 出站在 TLS ALPN 恰好为 `h3` 时，QUIC 此前总是自己用系统解析器解析服务器、开受保护的 UDP 套接字直连，节点写的 `via` 被静默忽略，落地机看到用户真实 IP，本地网络能看到 SNI 与 DNS 查询。现在 QUIC 连接经出站的拨号器建立（新 `QuicConnector::connect_through`）：只有系统拨号器（新 `Dialer::is_system`，仅 `TcpDialer` 为真）才自己开套接字，其他拨号器的数据报走 `Dialer::open_datagram`，服务器域名交给前置节点或宿主拨号器解析；前置节点不转发 UDP 时连接报 `Unsupported`，不回退直连。
 
 ### Added
 
@@ -193,7 +207,13 @@
 
 ### Fixed
 
+- `tls-mimic`：Chrome、Edge、Safari 指纹的 `X25519MLKEM768` 混合 key share 改用自己的 X25519 密钥。此前 `KeyShareSecrets` 只有一把 X25519 密钥，混合份额末 32 字节与独立 `X25519` 份额是同一个公钥；而 `tests/data` 里真实 Chrome 157、Edge 157、Safari（macOS 与 iOS 模拟器）的两个份额各用一把密钥，只有 Firefox / Firefox ESR 复用。被动观察者看单个 ClientHello、比较两段字节即可零误报地认出默认指纹（`auto`：苹果平台 Safari、其余 Chrome）下的 REALITY 与 ANX 连接。指纹数据的 `key_share` 新增 `"hybrid_x25519": "separate" | "shared"`（缺省 `separate`，写出时省略），只有 `firefox`、`firefox-esr` 写 `shared`；`shared` 而没有 `X25519MLKEM768` 份额的指纹校验不通过。新增 `ja::Hello::hybrid_x25519` 从首包读出这一关系，`ja::spec_from_hello` 据此生成指纹，浏览器比对测试（含每周的 `browser-fingerprints` workflow）把它与 JA4 / JA3N / JA3 一起比较并列入报告。服务端选中 `X25519MLKEM768` 时，握手改用混合份额自己的 X25519 私钥（新 `KeyShareSecrets::hybrid_x25519_shared` / `hybrid_x25519_public`）；REALITY 的 auth key 与 ANX 外衣经 `HelloContext::x25519_shared` 仍取独立 `X25519` 份额，REALITY / ANX 服务端本就优先读它，互通不变。测试：合同测试改正把复用固定下来的断言（Chrome / Edge / Safari 断言两段不同，Firefox / Firefox ESR 断言相同），与 Safari 抓包的形态比较纳入这一关系；`tls_mimic::server` 内部把密钥交换拆成可替换的一步（对外行为不变，仍只选 X25519），新增服务端选 `X25519MLKEM768` 的完整握手与会话恢复测试（Chrome、Safari、Firefox）；`REALITY interop (Linux)` 新增 Safari 与 Firefox 指纹连 Xray-core / sing-box。指纹包兼容：带 `hybrid_x25519` 的指纹包会被此前的版本整包拒绝（保留原状态）；为旧版本写的 Firefox 指纹（没有这个键）在新版本上按 `separate` 生成，含 Firefox 指纹的包需按接收方版本分别下发。
+
+- 直连模式真正直连，DNS 不再经节点（engine-embedded `profile`/`connections`/`dns_resolver`/`routing`，见 `docs/architecture/embedded-dns.md`「直连模式不经节点」）：`profile::envelope_for_mode` 生成的直连信封此前只把规则换成 `FINAL,DIRECT`、不带 `mode`，引擎仍按规则模式运行，`via: proxy` 的 DNS 上游（包括不写 `dns` 段时内置的 `1.1.1.1:53`）照旧经全局目标选出的节点查询：节点不可用时直连模式下经隧道的查询全部失败，全局路径上带测速的策略组也一直被定期测速。现在直连信封带顶层 `"mode": "direct"`，引擎按直连模式启动，隧道的查询直连各上游，不看分流规则。另外，直连模式下（包括运行中用 `set_mode` 切到直连）Fake-IP 连接还原域名后的解析此前不看模式，`proxy` 上游仍经节点：`DomainResolver` 新增默认方法 `resolve_direct`（缺省即 `resolve`），`Dispatcher` 在直连模式下改用它，`PolicyResolver` 经直连出站问各上游，并按是否经代理分开缓存，切回规则模式后 IP 规则不会用到直连期间的应答；一条连接从分流到解析只读一次模式。客户端升级内核后生效；自己拼直连信封的客户端需改用 `envelope_for_mode` 或补上 `"mode": "direct"`。
+- 远程规则集每次启动都从空集开始（engine-embedded `rule_sets`、`routing`、`config`，新模块 `rule_set_cache`）：内核从不把下载的列表写到磁盘，客户端也不传内联副本，所以每次启动远程集都是空的、要等下载完成才生效；下载失败（列表地址不可达、`via` 节点不通、签名不对）时集一直为空，引用它的 `RULE-SET` 规则一直不命中。新增可选配置 `routing.rule_set_cache_dir`（客户端自有的绝对路径，相对路径整个配置被拒绝）：每次通过全部检查（签名、非空、条目上限）的下载都原子写入该目录（临时文件、fsync、改名替换，写入在阻塞线程池上），启动时在第一个连接之前读回、重新校验摘要并用当前公钥重新校验签名，集以上次成功下载的内容开始，下载失败时继续使用，到那次下载满一个间隔才再下载；没有可用副本时立即下载。副本按 URL（与签名设置）的 SHA-256 命名，与集名无关、不含 URL；没有集使用的副本保留 30 天、合计不超过 64 MiB，目录里的其他文件不动。`rule_sets` 状态新增 `from_cache`、`cache_error`（`cache_write_failed`：写不进时下载照常生效）；`RuleSetStore` 新增 `with_cache`、`cache`、`first_update_delay`、`replace_downloaded`，`rule_sets::MAX_LIST_BYTES` 改为公开。不设该字段的配置行为不变；各客户端在引擎配置里填入该目录后才生效。
+- 包隧道的 UDP 不再因一个坏包整体停摆（`netstack-smoltcp` `udp`/`stack`，新模块 `reassembly`、`stats`；engine-embedded `tunnel`）：用户态协议栈的 UDP 读端遇到一个 UDP 头解析失败的包（截断、长度字段与包不符）就结束整条流，隧道的 UDP 任务随之退出，之后所有 UDP（含 DNS）都不再处理，直到隧道重建；系统把大于 MTU 的 UDP 数据报拆成 IPv4 分片时，第一个分片就会触发这一点，IPv6 分片则一直被静默丢弃。现在解析失败的包丢弃并计数、继续读下一个；同一 UDP 数据报的 IPv4 / IPv6 分片在协议栈里重组后整体送出（同时最多 32 个数据报、256 KiB，每个最多等 15 s，重叠分片整个数据报丢弃），其他协议的分片与畸形分片丢弃并计数；写端遇到无法组成一个 IP 包的回包（超过 IP 包上限，或源与目的地址族不同）也改为丢弃并计数，不再让回包循环退出；IHL 小于 5 的 IPv4 包按无效包拒绝。隧道统计新增 `udp_malformed`、`udp_unsendable`、`ip_fragments_dropped`、`udp_reassembled`（只增字段，旧客户端不受影响）。
 - `mitm_anixops` 子模块升级到 distribution release `v1.4.7`（`ee95223`）：Node 脚本运行器在 Windows 上替换持久化存储文件时，遇到 `EPERM`、`EACCES` 或 `EBUSY`（文件仍被其他进程占用）会短暂重试。`engine-native` 的 `controlled_tls_connect_session_bounds_persistent_exchanges_over_live_sockets` 在 Windows 上偶发未改写请求体，根因是测试给脚本的 1 秒超时短于 Windows runner 上 Node 冷启动的时间：脚本超时改为 5 秒，测试套接字超时相应放宽到 15 秒。
+- WireGuard 换网后自动恢复（整机 WireGuard 隧道与 WireGuard 路由节点）：此前两者都只在启动时解析一次端点、`connect` 一个 UDP socket，之后不再重建。已连接的 socket 固定了当时的源地址（macOS 上还被保护器钉在当时的网卡），Wi-Fi 与蜂窝切换后发包一律失败（`EADDRNOTAVAIL`、`ENETUNREACH`），错误又被忽略，隧道显示已连接却整机断网，只能手动重连；端点 DDNS 换 IP 后同样无法恢复。整机模式对 `reset_network` 一律返回 `INVALID_ARGUMENT`，路由节点的 `reset_sessions` 未实现（恒为 0）。现在两种模式共用 `outbound_wireguard::path::Path`：收到 `reset_network`（换网、唤醒）、`networkcore_ios_set_bound_interface` 换了网卡（`engine_outbound::protect::path_generation` 变化，与 `reset_network` 先后无关）、收发遇到路径错误（`EADDRNOTAVAIL`、Linux 与 Android 上源地址失效时已连接 IPv4 socket 返回的 `EINVAL`、`ENETUNREACH`、`EHOSTUNREACH`、`ENETDOWN`、`EPIPE`、`ENOTCONN`，1 s 起指数退避到 30 s）或握手连续 20 s 无应答（翻倍到 320 s，优先换到域名的其他地址）时，在后台重新解析端点、逐个地址新建并保护 socket，成功后立即发起新握手，让对端随新地址漫游；会话密钥、路由节点的用户态协议栈和已建立的连接都保留，解析失败则继续用旧 socket。保护器被移除期间（macOS 断网）不会换成未保护的 socket，避免流量绕回隧道。整机模式的 `reset_network` 立即返回 `{"reset": 1, "closed": 0, "health_forgotten": 0}`（隧道未运行时 `reset` 为 0），`set_network` 返回 `{"changed": false}`，其他命令仍返回 `INVALID_ARGUMENT`；路由节点运行时计为一次 reset。端点解析结果改为 IPv4 优先、逐个尝试，IPv6 端点可带方括号。见 `crates/outbound-wireguard/src/path.rs`。
 
 ## v0.2.0 - 2026-10-26
 

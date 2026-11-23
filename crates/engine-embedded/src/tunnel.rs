@@ -12,11 +12,15 @@
 //! (see [`crate::fake_ip`]), from the DNS cache, or forwarded to
 //! the upstream the DNS policy picks (over TCP, TLS or HTTPS, on kept
 //! connections; see [`crate::dns_cache`]), and other UDP goes through the
-//! outbound's UDP flows, one per app socket and destination. An outbound
+//! outbound's UDP flows, one per app socket and destination. A UDP datagram
+//! the system split into IP fragments is joined before it goes on; a UDP
+//! packet that does not parse, or a reply too large for one IP packet, is
+//! dropped and counted while the others keep flowing. An outbound
 //! without UDP drops those datagrams; QUIC (UDP 443) is also answered with
 //! ICMP port unreachable so it falls back to TCP at once. A WireGuard
 //! tunnel (`Tunnel::start_wireguard`) skips the stack and seals packets
-//! straight to its peer.
+//! straight to its peer, on a UDP socket that moves to a new one when the
+//! network changes (see the `wireguard` module).
 
 use std::collections::HashMap;
 use std::io;
@@ -48,7 +52,7 @@ use crate::first_payload::{ServerFirst, Wait};
 use crate::routing::FlowSource;
 use crate::sniff;
 #[cfg(feature = "wireguard")]
-use crate::wireguard::{self, WireGuardSettings};
+use crate::wireguard::{self, PathControl, WireGuardSettings};
 
 /// Receives every IP packet the stack emits. Called on a tunnel thread, one
 /// call at a time.
@@ -281,6 +285,8 @@ pub struct TunnelStats {
     pub(crate) mitm_failed: AtomicU64,
     pub(crate) quic_mitm_fallback: AtomicU64,
     pub(crate) tcp_first_wait_skipped: AtomicU64,
+    /// What the userspace stack dropped or rebuilt.
+    pub(crate) stack: Arc<netstack_smoltcp::StackStats>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -318,6 +324,19 @@ pub struct TunnelStatsSnapshot {
     /// bytes: a server-first port, or a destination that stayed silent
     /// before (see [`crate::first_payload`]); counted in `tcp_total` too.
     pub tcp_first_wait_skipped: u64,
+    /// UDP packets from the apps whose UDP header did not parse (cut short,
+    /// or a length that disagrees with the packet); each one is dropped and
+    /// the next one read.
+    pub udp_malformed: u64,
+    /// UDP replies to the apps too large for one IP packet; each one is
+    /// dropped and the next one sent.
+    pub udp_unsendable: u64,
+    /// IP fragments dropped: fragments of other protocols than UDP,
+    /// malformed or repeated ones, and those of UDP datagrams that never
+    /// became whole.
+    pub ip_fragments_dropped: u64,
+    /// UDP datagrams that came in IP fragments and were joined.
+    pub udp_reassembled: u64,
 }
 
 impl TunnelStats {
@@ -346,6 +365,10 @@ impl TunnelStats {
             mitm_failed: get(&self.mitm_failed),
             quic_mitm_fallback: get(&self.quic_mitm_fallback),
             tcp_first_wait_skipped: get(&self.tcp_first_wait_skipped),
+            udp_malformed: self.stack.udp_malformed(),
+            udp_unsendable: self.stack.udp_unsendable(),
+            ip_fragments_dropped: self.stack.ip_fragments_dropped(),
+            udp_reassembled: self.stack.udp_reassembled(),
         }
     }
 }
@@ -422,15 +445,17 @@ impl Tunnel {
     }
 
     /// Starts a WireGuard tunnel to one peer. Resolving the endpoint and
-    /// binding the UDP socket happen before this returns.
+    /// binding the UDP socket happen before this returns; `paths` moves the
+    /// running tunnel to a new socket after a network change.
     #[cfg(feature = "wireguard")]
     pub fn start_wireguard(
         settings: WireGuardSettings,
+        paths: Arc<PathControl>,
         sink: impl PacketWriter,
     ) -> io::Result<Self> {
         let sink: PacketSink = Box::new(move |packet: &[u8]| sink.write(packet));
         Self::launch(1, move |packet_rx, stats| {
-            wireguard::spawn_tasks(settings, sink, packet_rx, stats)
+            wireguard::spawn_tasks(settings, paths, sink, packet_rx, stats)
         })
     }
 
@@ -541,6 +566,7 @@ fn spawn_tasks(
         .mtu(usize::from(settings.mtu))
         .tcp_recv_buffer_size(settings.tcp_window_bytes)
         .tcp_send_buffer_size(settings.tcp_window_bytes)
+        .stats(stats.stack.clone())
         .build()?;
     let runner = runner.ok_or_else(|| io::Error::other("userspace TCP runner is unavailable"))?;
     let udp_socket =
@@ -580,7 +606,8 @@ fn spawn_tasks(
         }
     });
 
-    // TUN -> stack. Invalid packets are rejected by the stack and skipped.
+    // TUN -> stack. Invalid packets are rejected by the stack and skipped;
+    // the IP fragments of a UDP datagram are held there until it is whole.
     tokio::spawn(async move {
         while let Some(packet) = packet_rx.recv().await {
             let _ = stack_sink.send(packet).await;
@@ -634,6 +661,8 @@ fn spawn_tasks(
     });
 
     // UDP: DNS over TCP, everything else through the outbound's UDP flows.
+    // The stack's UDP socket drops (and counts) a packet it cannot read or a
+    // reply it cannot send and goes on, so both loops end with the tunnel.
     let (mut udp_rx, mut udp_tx) = udp_socket.split();
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpMsg>(64);
     tokio::spawn(async move {

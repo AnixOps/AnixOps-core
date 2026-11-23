@@ -3,6 +3,7 @@
 //! This crate parses and normalizes the first minimal TOML configuration shape.
 //! It performs no file I/O, network access, platform probing, or engine work.
 
+pub mod certificate_pin;
 pub mod redirect;
 pub mod routing;
 pub mod routing_import;
@@ -31,8 +32,8 @@ use control_domain::{
     NODE_METADATA_SNELL_OBFS, NODE_METADATA_SNELL_OBFS_HOST, NODE_METADATA_SNELL_OBFS_URI,
     NODE_METADATA_SNELL_PSK, NODE_METADATA_SNELL_REUSE, NODE_METADATA_SNELL_USER_KEY,
     NODE_METADATA_SNELL_VERSION, NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
-    NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_ENABLED,
-    NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+    NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
+    NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
     NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
     NODE_METADATA_TLS_UTLS_FINGERPRINT, NODE_METADATA_TROJAN_PASSWORD,
     NODE_METADATA_TUIC_CONGESTION_CONTROL, NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID,
@@ -216,6 +217,9 @@ struct RawClashProxy {
     port_range: Option<RawClashScalar>,
     /// sing-mux client multiplexing (mihomo).
     smux: Option<serde_json::Value>,
+    /// Certificate pin (mihomo): SHA-256 of the server's certificate in hex.
+    /// The uTLS fingerprint is `client-fingerprint`.
+    fingerprint: Option<RawClashScalar>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,6 +276,9 @@ struct RawSingBoxTls {
     server_name: Option<RawSingBoxScalar>,
     insecure: Option<bool>,
     alpn: Option<RawSingBoxStringList>,
+    /// SHA-256 of the whole leaf certificate, base64 (sing-box 1.15).
+    certificate_sha256: Option<RawSingBoxStringList>,
+    /// SHA-256 of the leaf certificate's SubjectPublicKeyInfo, base64.
     certificate_public_key_sha256: Option<RawSingBoxStringList>,
     utls: Option<RawSingBoxUtls>,
     reality: Option<RawSingBoxReality>,
@@ -1016,6 +1023,12 @@ fn parse_clash_proxy(mut raw: RawClashProxy, source_id: &str) -> DomainResult<No
         }
     };
 
+    if matches!(
+        protocol,
+        Protocol::Trojan | Protocol::Vless | Protocol::Vmess
+    ) {
+        metadata.extend(proxy_line_pin_metadata(text(raw.fingerprint.take()), None));
+    }
     metadata.extend(multiplex_metadata(raw.smux.as_ref()));
     let name_id = sanitize_identifier(&name);
     let name_id = if name_id.is_empty() {
@@ -1500,6 +1513,7 @@ fn sing_box_v2ray_tls_metadata(
         server_name,
         insecure,
         alpn,
+        certificate_sha256,
         certificate_public_key_sha256,
         utls,
         reality,
@@ -1532,15 +1546,10 @@ fn sing_box_v2ray_tls_metadata(
             value: alpn.join(","),
         });
     }
-    if let Some(pins) = normalize_non_empty_metadata_values(
-        certificate_public_key_sha256.map(RawSingBoxStringList::into_values),
-        "sing-box tls certificate_public_key_sha256 values cannot be empty",
-    )? {
-        metadata.push(MetadataEntry {
-            key: NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256.to_string(),
-            value: pins.join(","),
-        });
-    }
+    metadata.extend(sing_box_pin_metadata(
+        certificate_sha256,
+        certificate_public_key_sha256,
+    )?);
     if let Some(utls) = utls.filter(|utls| utls.enabled.unwrap_or(false)) {
         let fingerprint = required_sing_box_scalar_field(
             utls.fingerprint,
@@ -1629,15 +1638,16 @@ fn append_sing_box_v2ray_transport_metadata(
 }
 
 fn sing_box_tls_metadata(raw: Option<RawSingBoxTls>, host: &str) -> DomainResult<Metadata> {
-    let (server_name, insecure, alpn, certificate_public_key_sha256) = match raw {
+    let (server_name, insecure, alpn, certificate_sha256, certificate_public_key_sha256) = match raw
+    {
         Some(raw) => (
             optional_sing_box_scalar_field(raw.server_name).unwrap_or_else(|| host.to_string()),
             raw.insecure.unwrap_or(false),
             raw.alpn.map(RawSingBoxStringList::into_values),
-            raw.certificate_public_key_sha256
-                .map(RawSingBoxStringList::into_values),
+            raw.certificate_sha256,
+            raw.certificate_public_key_sha256,
         ),
-        None => (host.to_string(), false, None, None),
+        None => (host.to_string(), false, None, None, None),
     };
     let mut metadata = vec![
         MetadataEntry {
@@ -1657,16 +1667,30 @@ fn sing_box_tls_metadata(raw: Option<RawSingBoxTls>, host: &str) -> DomainResult
             value: alpn.join(","),
         });
     }
-    if let Some(certificate_public_key_sha256) = normalize_non_empty_metadata_values(
+    metadata.extend(sing_box_pin_metadata(
+        certificate_sha256,
         certificate_public_key_sha256,
-        "sing-box tls certificate_public_key_sha256 values cannot be empty",
-    )? {
-        metadata.push(MetadataEntry {
-            key: NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256.to_string(),
-            value: certificate_public_key_sha256.join(","),
-        });
-    }
+    )?);
     Ok(metadata)
+}
+
+/// The pin entries of a sing-box `tls` object (both lists base64; see
+/// [`certificate_pin_metadata`]).
+fn sing_box_pin_metadata(
+    certificate_sha256: Option<RawSingBoxStringList>,
+    certificate_public_key_sha256: Option<RawSingBoxStringList>,
+) -> DomainResult<Metadata> {
+    let certificate = normalize_non_empty_metadata_values(
+        certificate_sha256.map(RawSingBoxStringList::into_values),
+        "sing-box tls certificate_sha256 values cannot be empty",
+    )?
+    .unwrap_or_default();
+    let public_key = normalize_non_empty_metadata_values(
+        certificate_public_key_sha256.map(RawSingBoxStringList::into_values),
+        "sing-box tls certificate_public_key_sha256 values cannot be empty",
+    )?
+    .unwrap_or_default();
+    Ok(certificate_pin_metadata(&certificate, &public_key))
 }
 
 fn append_sing_box_hysteria2_obfs_metadata(
@@ -1949,6 +1973,15 @@ fn parse_quantumult_x_proxy_line(line: &str, source_id: &str) -> DomainResult<No
             ));
         }
     };
+    if matches!(
+        protocol,
+        Protocol::Trojan | Protocol::Vless | Protocol::Vmess
+    ) {
+        metadata.extend(proxy_line_pin_metadata(
+            optional_quantumult_x_proxy_option(&options, &["tls_cert_sha256"]),
+            optional_quantumult_x_proxy_option(&options, &["tls_pubkey_sha256"]),
+        ));
+    }
 
     let name = optional_quantumult_x_proxy_option(&options, &["tag"]).unwrap_or_else(|| {
         let host_id = sanitize_identifier(&host);
@@ -2244,6 +2277,19 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
         }
         _ => return Ok(None),
     };
+    // Options follow the credentials: the password or uuid, and for vmess
+    // the cipher before the uuid.
+    let first_option = match protocol {
+        Protocol::Trojan | Protocol::Vless => Some(4),
+        Protocol::Vmess => Some(5),
+        _ => None,
+    };
+    if let Some(options) = first_option.and_then(|index| parts.get(index..)) {
+        metadata.extend(proxy_line_pin_metadata(
+            loon_proxy_option(options, "tls_cert_sha256"),
+            loon_proxy_option(options, "tls_pubkey_sha256"),
+        ));
+    }
 
     let name_id = sanitize_identifier(&name);
     let name_id = if name_id.is_empty() {
@@ -2273,6 +2319,17 @@ fn parse_loon_proxy_line(line: &str, source_id: &str) -> DomainResult<Option<Nod
         ],
         metadata,
     }))
+}
+
+/// The value of the `key=value` option named `key` (normalized, as
+/// [`normalized_token`] spells it) among a Loon proxy line's options.
+fn loon_proxy_option(options: &[String], key: &str) -> Option<String> {
+    options.iter().find_map(|option| {
+        let (name, value) = option.split_once('=')?;
+        (normalized_token(name) == key)
+            .then(|| strip_loon_quotes(value.to_string()))
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn loon_proxy_part_looks_like_key_value(parts: &[String], index: usize) -> bool {
@@ -2490,6 +2547,12 @@ fn parse_surge_proxy_line(line: &str, source_id: &str) -> DomainResult<NodeDescr
             ));
         }
     };
+    if matches!(protocol, Protocol::Trojan | Protocol::Vmess) {
+        metadata.extend(proxy_line_pin_metadata(
+            options.get("server_cert_fingerprint_sha256").cloned(),
+            None,
+        ));
+    }
 
     let name_id = sanitize_identifier(&name);
     let name_id = if name_id.is_empty() {
@@ -3525,6 +3588,7 @@ fn parse_vmess_link(link: &str) -> DomainResult<NodeDescriptor> {
         ("alpn", "alpn"),
         ("allowInsecure", "allowinsecure"),
         ("insecure", "insecure"),
+        ("pcs", "pcs"),
         ("fp", "fp"),
         ("pbk", "pbk"),
         ("sid", "sid"),
@@ -4060,14 +4124,72 @@ fn append_query_tls_metadata(
             value: alpn.join(","),
         });
     }
-    if let Some(pins) = query.get("pinsha256").or_else(|| query.get("pcs")) {
-        let pins = split_share_link_list(pins, code, "TLS certificate public-key sha256")?;
-        metadata.push(MetadataEntry {
-            key: NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256.to_string(),
-            value: pins.join(","),
-        });
+    // Hysteria2 `pinSHA256` and Xray `pcs` both pin the whole certificate.
+    let mut pins = Vec::new();
+    for key in ["pinsha256", "pcs"] {
+        if let Some(value) = query.get(key) {
+            pins.extend(split_share_link_list(
+                value,
+                code,
+                "TLS certificate sha256",
+            )?);
+        }
     }
+    metadata.extend(certificate_pin_metadata(&pins, &[]));
     Ok(())
+}
+
+/// Pin entries for certificate digests (`tls.certificate_sha256`, kept in
+/// lowercase hex) and public key digests (`tls.certificate_public_key_sha256`,
+/// kept in base64), each written in hex or base64. A value that is not a
+/// SHA-256 digest is kept as written, so the node import reports that node as
+/// unsupported instead of running it without its pin, and the rest of the
+/// subscription still imports.
+fn certificate_pin_metadata(certificate: &[String], public_key: &[String]) -> Metadata {
+    let mut metadata = Vec::new();
+    metadata.extend(pin_metadata_entry(
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        certificate,
+        certificate_pin::to_hex,
+    ));
+    metadata.extend(pin_metadata_entry(
+        NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+        public_key,
+        certificate_pin::to_base64,
+    ));
+    metadata
+}
+
+fn pin_metadata_entry(
+    key: &str,
+    pins: &[String],
+    spell: fn(&certificate_pin::Sha256Digest) -> String,
+) -> Option<MetadataEntry> {
+    let mut values: Vec<String> = Vec::new();
+    for pin in pins
+        .iter()
+        .map(|pin| pin.trim())
+        .filter(|pin| !pin.is_empty())
+    {
+        let value =
+            certificate_pin::parse(pin).map_or_else(|| pin.to_string(), |digest| spell(&digest));
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    (!values.is_empty()).then(|| MetadataEntry {
+        key: key.to_string(),
+        value: values.join(","),
+    })
+}
+
+/// The pin entries of a Clash, Surge, Loon or Quantumult X proxy, whose
+/// formats name one certificate digest and one public key digest at most.
+fn proxy_line_pin_metadata(certificate: Option<String>, public_key: Option<String>) -> Metadata {
+    certificate_pin_metadata(
+        &certificate.into_iter().collect::<Vec<_>>(),
+        &public_key.into_iter().collect::<Vec<_>>(),
+    )
 }
 
 fn append_v2ray_share_link_metadata(

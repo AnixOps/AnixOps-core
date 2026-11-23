@@ -1,7 +1,9 @@
 //! Each fingerprint against its target: a ClientHello captured from the real
 //! browser must have the same JA4 and sorted-extension JA3 (JA3N) as the one
-//! this crate builds for the same server name and ALPN, and the same JA3 when
-//! the browser does not permute its extensions.
+//! this crate builds for the same server name and ALPN, the same JA3 when the
+//! browser does not permute its extensions, and the same X25519 key in its
+//! X25519MLKEM768 and X25519 key shares exactly when the browser has one key
+//! for both (`Hello::hybrid_x25519`, which JA3 and JA4 do not see).
 //!
 //! Committed captures (`tests/data/<profile>-<version>.hex`) are checked on
 //! every run. `captured_browsers_match_profiles` checks fresh ones from
@@ -11,9 +13,9 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use tls_mimic::fingerprint::build_from_spec;
+use tls_mimic::fingerprint::{build_from_spec, Extension, HybridX25519};
 use tls_mimic::ja::{decode_hex, parse_client_hello, spec_from_hello, Hello};
-use tls_mimic::Fingerprint;
+use tls_mimic::{ClientHelloSpec, Fingerprint};
 
 struct Row {
     profile: &'static str,
@@ -28,6 +30,16 @@ impl Row {
         self.target.ja4() == self.ours.ja4()
             && self.target.ja3n() == self.ours.ja3n()
             && (self.permuted || self.target.ja3() == self.ours.ja3())
+            && self.target.hybrid_x25519() == self.ours.hybrid_x25519()
+    }
+}
+
+/// How a ClientHello's X25519MLKEM768 share gets its X25519 key, for the report.
+fn hybrid_x25519(hello: &Hello) -> &'static str {
+    match hello.hybrid_x25519() {
+        Some(HybridX25519::Separate) => "separate",
+        Some(HybridX25519::Shared) => "shared",
+        None => "-",
     }
 }
 
@@ -60,8 +72,8 @@ fn compare(fingerprint: Fingerprint, source: String, capture: &str) -> Row {
 
 fn report(rows: &[Row]) -> String {
     let mut out = String::from(
-        "| profile | capture | JA4 (browser) | JA4 (ours) | JA3N (browser) | JA3N (ours) | JA3 (browser) | JA3 (ours) | result |\n\
-         |---|---|---|---|---|---|---|---|---|\n",
+        "| profile | capture | JA4 (browser) | JA4 (ours) | JA3N (browser) | JA3N (ours) | JA3 (browser) | JA3 (ours) | hybrid X25519 (browser) | hybrid X25519 (ours) | result |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for row in rows {
         let ja3 = |hello: &Hello| {
@@ -73,7 +85,7 @@ fn report(rows: &[Row]) -> String {
         };
         let _ = writeln!(
             out,
-            "| {} | {} | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | {} |",
+            "| {} | {} | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | {} | {} | {} |",
             row.profile,
             row.source,
             row.target.ja4(),
@@ -82,6 +94,8 @@ fn report(rows: &[Row]) -> String {
             row.ours.ja3n(),
             ja3(&row.target),
             ja3(&row.ours),
+            hybrid_x25519(&row.target),
+            hybrid_x25519(&row.ours),
             if row.matches() {
                 "match"
             } else {
@@ -109,6 +123,11 @@ fn check(rows: Vec<Row>) {
         println!("--- {} ({}) differs", row.profile, row.source);
         println!("browser ja3: {}", row.target.ja3_string());
         println!("ours    ja3: {}", row.ours.ja3_string());
+        println!(
+            "hybrid X25519 key: browser {}, ours {}",
+            hybrid_x25519(&row.target),
+            hybrid_x25519(&row.ours)
+        );
         match spec_from_hello(&row.target, row.permuted) {
             Ok(spec) => println!("profile from the capture: {}", spec.to_json()),
             Err(error) => println!("the capture cannot be reproduced by this build: {error}"),
@@ -156,6 +175,37 @@ fn committed_captures_match_their_profiles() {
     let rows = captures_in(&dir, true);
     assert!(!rows.is_empty());
     check(rows);
+}
+
+fn hybrid_x25519_of(spec: &ClientHelloSpec) -> HybridX25519 {
+    spec.extensions
+        .iter()
+        .find_map(|extension| match extension {
+            Extension::KeyShare { hybrid_x25519, .. } => Some(*hybrid_x25519),
+            _ => None,
+        })
+        .expect("every profile has a key_share")
+}
+
+/// A profile derived from a capture keeps whether the browser reuses its
+/// X25519 key in the hybrid share, so the profile the workflow prints for a
+/// browser that moved reproduces that as well.
+#[test]
+fn profiles_derived_from_committed_captures_keep_the_hybrid_x25519_key() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let rows = captures_in(&dir, true);
+    assert!(!rows.is_empty());
+    for row in rows {
+        let derived = hybrid_x25519_of(&spec_from_hello(&row.target, row.permuted).unwrap());
+        let profile = Fingerprint::from_name(row.profile).unwrap().spec().unwrap();
+        assert_eq!(
+            derived,
+            row.target.hybrid_x25519().unwrap_or_default(),
+            "{}",
+            row.source
+        );
+        assert_eq!(derived, hybrid_x25519_of(&profile), "{}", row.source);
+    }
 }
 
 #[test]

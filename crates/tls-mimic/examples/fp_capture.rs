@@ -4,7 +4,8 @@
 //! `fp_capture <listen address> <output file> [timeout seconds]` accepts
 //! connections until one starts with a ClientHello, writes the handshake
 //! message as hex to the output file, answers with a handshake_failure alert
-//! and prints the JA3 / JA4 and a profile derived from it.
+//! and prints the JA3 / JA4, whether the X25519MLKEM768 key share reuses the
+//! X25519 share's key, and a profile derived from it.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -74,6 +75,7 @@ fn main() {
         println!("ja3:  {} ({})", hello.ja3(), hello.ja3_string());
         println!("ja3n: {}", hello.ja3n());
         println!("ja4:  {}", hello.ja4());
+        println!("hybrid x25519: {:?}", hello.hybrid_x25519());
         match spec_from_hello(&hello, false) {
             Ok(spec) => println!("profile: {}", spec.to_json()),
             Err(error) => println!("profile: not reproducible by this build: {error}"),

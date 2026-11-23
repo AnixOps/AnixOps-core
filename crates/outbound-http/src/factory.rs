@@ -5,7 +5,7 @@ use std::sync::Arc;
 use engine_outbound::registry::{parse_settings, BuildError, OutboundFactory, Settings};
 use engine_outbound::{Dialer, TcpOutbound};
 use serde::Deserialize;
-use transport_tls::TlsSettings;
+use transport_tls::{parse_sha256_pins, TlsSettings};
 
 use crate::{HttpCredentials, HttpOutbound};
 
@@ -26,9 +26,16 @@ struct HttpSettings {
     /// SNI for `tls`; defaults to `server`.
     #[serde(default)]
     server_name: Option<String>,
-    /// Skip certificate verification for `tls`.
+    /// Skip WebPKI verification for `tls`; the pins below still apply.
     #[serde(default)]
     insecure: bool,
+    /// SHA-256 digests of the proxy's leaf certificate in hex, for `tls`.
+    #[serde(default)]
+    pinned_certificate_sha256: Vec<String>,
+    /// SHA-256 digests of the leaf certificate's public key (SPKI) in hex,
+    /// for `tls`.
+    #[serde(default)]
+    pinned_public_key_sha256: Vec<String>,
 }
 
 pub struct HttpFactory;
@@ -53,6 +60,16 @@ impl OutboundFactory for HttpFactory {
             }),
             (None, Some(_)) => return Err("http proxy password is set without a username"),
         };
+        let pinned_certificate_sha256 = parse_sha256_pins(&settings.pinned_certificate_sha256)
+            .ok_or("http proxy certificate pins are invalid")?;
+        let pinned_public_key_sha256 = parse_sha256_pins(&settings.pinned_public_key_sha256)
+            .ok_or("http proxy certificate pins are invalid")?;
+        if !settings.tls
+            && (!pinned_certificate_sha256.is_empty() || !pinned_public_key_sha256.is_empty())
+        {
+            // Without TLS there is no certificate to check the pins against.
+            return Err("http proxy certificate pins need tls");
+        }
         let tls = settings.tls.then(|| TlsSettings {
             server_name: settings
                 .server_name
@@ -60,6 +77,8 @@ impl OutboundFactory for HttpFactory {
                 .unwrap_or_else(|| settings.server.clone()),
             alpn: Vec::new(),
             insecure: settings.insecure,
+            pinned_certificate_sha256,
+            pinned_public_key_sha256,
         });
         let outbound = HttpOutbound::new(
             settings.server,

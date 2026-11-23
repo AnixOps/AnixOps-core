@@ -110,6 +110,17 @@ pub trait Dialer: Send + Sync {
     fn open_datagram<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<UdpFlow>> {
         Box::pin(socket_flow(host, port))
     }
+
+    /// Whether this is the system dialer ([`TcpDialer`]): its connections
+    /// and datagrams are protected system sockets to the address the system
+    /// resolver gives. Only then may a transport that wants a socket of its
+    /// own (QUIC) open one the same way. With any other dialer (a `via`
+    /// chain, a host dialer with its own resolver or interface) it must send
+    /// its datagrams through [`Dialer::open_datagram`] and leave the server
+    /// name to the dialer. The default is `false`.
+    fn is_system(&self) -> bool {
+        false
+    }
 }
 
 /// Default dialer: a plain tokio TCP connection with `TCP_NODELAY`.
@@ -123,6 +134,10 @@ impl Dialer for TcpDialer {
             stream.set_nodelay(true)?;
             Ok(Box::new(stream) as BoxStream)
         })
+    }
+
+    fn is_system(&self) -> bool {
+        true
     }
 }
 
@@ -389,5 +404,24 @@ mod tests {
             TargetAddr::from_host("land.example", 443),
             TargetAddr::Domain("land.example".to_string(), 443)
         );
+    }
+
+    struct NoOutbound;
+
+    impl TcpOutbound for NoOutbound {
+        fn protocol(&self) -> &'static str {
+            "none"
+        }
+
+        fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+            Box::pin(async { Err(io::Error::other("unused")) })
+        }
+    }
+
+    #[test]
+    fn only_the_system_dialer_lets_transports_open_their_own_sockets() {
+        assert!(TcpDialer.is_system());
+        // A `via` chain carries everything itself.
+        assert!(!OutboundDialer(std::sync::Arc::new(NoOutbound)).is_system());
     }
 }

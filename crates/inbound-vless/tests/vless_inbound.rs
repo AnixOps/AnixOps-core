@@ -128,6 +128,7 @@ fn tls() -> TlsSettings {
         server_name: "vless.test".into(),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     }
 }
 

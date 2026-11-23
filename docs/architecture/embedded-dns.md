@@ -54,7 +54,7 @@
 - 主机写成 IP 时，可用 `server_name` 指定 TLS 证书名，例如 `tls://1.1.1.1` 配 `cloudflare-dns.com`。证书始终校验，没有 insecure 选项。
 - `tls://` 和 `https://` 需要 cargo feature `dns-tls`，`quic://` 需要 `dns-quic`（它包含 `dns-tls`）。默认 feature 里都已包含；不带它们构建时，这类配置会被拒绝。
 - `via` 决定怎么连到上游：
-  - `proxy`（默认）：经代理。单出站配置走该出站；规则模式下，规则为上游地址选了某个节点就走那个节点，规则给出 `DIRECT`/`REJECT`（例如名单配置的 `FINAL,DIRECT`、国内解析器命中 `GEOIP,CN,DIRECT`）时改走全局模式的目标，不会因为规则而明文直连；全局模式走全局目标；直连模式下走直连。全局目标本身拒绝时不发查询。
+  - `proxy`（默认）：经代理。单出站配置走该出站；规则模式下，规则为上游地址选了某个节点就走那个节点，规则给出 `DIRECT`/`REJECT`（例如名单配置的 `FINAL,DIRECT`、国内解析器命中 `GEOIP,CN,DIRECT`）时改走全局模式的目标，不会因为规则而明文直连；全局模式走全局目标；直连模式下走直连（隧道自己的查询与 Fake-IP 直连连接的解析都一样，见下文「直连模式不经节点」）。全局目标本身拒绝时不发查询。
   - `direct`：始终直连，适合国内解析器。
   - `system` 上游始终直连，写了 `via` 也不改变。
 - 不写 `servers` 时保留旧行为：`upstream`（默认 `1.1.1.1:53`）经 TCP 走代理。这时不能写 `default`、`fallback` 和 `rules`。
@@ -136,6 +136,24 @@
 
 测试：`tests/dns_leaks.rs`（三条路径各一组）与 `src/dns_policy.rs` 单元测试。
 
+## 直连模式不经节点（2026-11）
+
+直连模式（配置顶层 `"mode": "direct"`，或运行中的 `set_mode`）下，所有流量直连，所有 DNS 上游也直连，`via: proxy` 的上游一样：
+
+- 隧道自己转发的查询直连各上游（`Dispatcher::dns_outbound`），不写 `dns` 段时内置的 `1.1.1.1:53` 也直连。
+- Fake-IP 连接还原出域名后直连，这次解析由 `PolicyResolver` 经直连出站问各上游（`DomainResolver::resolve_direct`）。hosts 照常在本地应答，DNS 规则和 `fallback` 照常选上游，只是不经节点。
+- 这些应答与规则模式分开缓存（隧道的缓存与 `PolicyResolver` 都按“是否经代理”分开）。切回规则模式后，IP 规则不会用到直连期间明文拿到的应答，而是按规则模式重新解析。
+- 直连模式不看分流规则（包括用户自己的规则和插件规则），每个连接都直连；顶层 `redirects` 的目标改写照常生效。
+
+所以节点全部不可用时，直连模式仍能解析和连接；节点不可用正是用户切到直连的常见原因。直连本来就从本机网络发出连接，域名走直连的上游不算泄露。
+
+客户端的「直连」：`engine_embedded::profile::envelope_for_mode(profile, RoutingMode::Direct)` 生成的信封带顶层 `"mode": "direct"`，并把规则换成 `FINAL,DIRECT`、清空规则集，引擎按直连模式启动。
+
+- 修复：此前直连信封只换了规则，引擎仍按规则模式运行。`via: proxy` 的上游不会因为 `FINAL,DIRECT` 改走直连，所以隧道的每个查询（包括内置的 `1.1.1.1:53`）仍经全局目标（`routing.global`，缺省为第一个策略组）选出的节点发出。节点不可用时这些查询全部失败，节点不响应时每个都要等满 `timeout_ms`（缺省 5 秒）；全局路径上带测速的策略组也因此一直算作在用，被定期测速。
+- 修复：此前直连模式下 Fake-IP 连接的解析不看模式，`via: proxy` 的上游仍经规则为它选的节点或全局目标发出，节点不可用时这些连接全部失败。运行中用 `set_mode` 切到直连时同样如此，与信封无关。
+
+测试：`tests/dns_leaks.rs` 的 `the_direct_envelope_needs_no_node_for_dns`（用直连信封经引擎构建的分发器，节点全部不可用：隧道查询和 Fake-IP 连接都只经直连出站）和 `fake_ip_names_resolve_directly_in_the_direct_mode_and_apart`（直连模式直连解析；切回规则模式后重新经节点解析，不用直连时的应答），以及 `tests/profile.rs` 的 `the_direct_envelope_starts_the_engine_in_its_direct_mode`。
+
 ## 不在本次范围
 
 - fake-ip 默认关闭（见下文「fake-ip」）。不开时缓存只缩短真实解析，不省掉首次解析。
@@ -182,7 +200,7 @@
 
 - 域名规则对所有协议生效，不只是能嗅探 SNI / Host 的 TLS、HTTP。连接列表显示 `域名:端口`。
 - 走代理时域名交给节点，在远端解析。
-- 分到 `DIRECT` 时，内核用本节的 DNS 设置（`PolicyResolver`，与 IP 规则解析同一套）解析出真实地址再直连，不用系统解析器——桌面 TUN 的系统 DNS 可能就指向隧道，会拿回假地址。解析结果仍落在 `range` 内时拒绝该连接。单出站配置（没有 `routing`）的直连模式没有 `dns` 段解析器，按域名交给直连拨号器。
+- 分到 `DIRECT` 时，内核用本节的 DNS 设置（`PolicyResolver`，与 IP 规则解析同一套）解析出真实地址再直连，不用系统解析器——桌面 TUN 的系统 DNS 可能就指向隧道，会拿回假地址。解析结果仍落在 `range` 内时拒绝该连接。直连模式下这次解析的每个上游都直连，`via: proxy` 的也一样，结果与规则模式分开缓存（见上文「直连模式不经节点」）。单出站配置（没有 `routing`）的直连模式没有 `dns` 段解析器，按域名交给直连拨号器。
 - MITM 接管的流量同样先还原再连接源站。
 
 映射表由运行时持有，隧道停止再启动（同一进程内）时保留，减少“应用还缓存着旧假地址”的失败。

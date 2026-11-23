@@ -2,6 +2,7 @@
 //! is a peer of the hub, which forwards a packet to the client that owns its
 //! destination address and reflects UDP sent to its own address.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,7 @@ use base64::Engine;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use engine_outbound::registry::{OutboundFactory, Settings};
-use engine_outbound::{TargetAddr, TcpDialer, TcpOutbound};
+use engine_outbound::{BoxStream, TargetAddr, TcpDialer, TcpOutbound};
 use outbound_wireguard::{WireGuardConfig, WireGuardFactory, WireGuardOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -190,6 +191,96 @@ fn reflect_udp(packet: &mut [u8]) -> bool {
         packet.swap(udp + offset, udp + 2 + offset);
     }
     true
+}
+
+/// A UDP relay in front of one hub port that gives each client address its
+/// own upstream socket, like a NAT mapping, so the hub sees a client that
+/// moved as a new address. `cut` drops the paths of every client address
+/// seen so far, in both directions, like a network the device left. A twin
+/// copy lives in `crates/engine-embedded/tests/wireguard_packets.rs`; keep
+/// them in sync.
+struct Relay {
+    port: u16,
+    state: Arc<Mutex<RelayState>>,
+}
+
+#[derive(Default)]
+struct RelayState {
+    /// Client addresses in the order they appeared.
+    clients: Vec<SocketAddr>,
+    cut: Vec<SocketAddr>,
+}
+
+impl Relay {
+    fn start(upstream: SocketAddr) -> Self {
+        let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = front.local_addr().unwrap().port();
+        let state = Arc::new(Mutex::new(RelayState::default()));
+        let shared = state.clone();
+        thread::spawn(move || {
+            let mut mappings: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+            let mut datagram = vec![0u8; 65_536];
+            loop {
+                // Windows reports an ICMP error for an earlier send here.
+                let Ok((len, client)) = front.recv_from(&mut datagram) else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                {
+                    let mut state = shared.lock().unwrap();
+                    if state.cut.contains(&client) {
+                        continue;
+                    }
+                    if !state.clients.contains(&client) {
+                        state.clients.push(client);
+                    }
+                }
+                let mapping = mappings
+                    .entry(client)
+                    .or_insert_with(|| map(&front, client, upstream, shared.clone()));
+                let _ = mapping.send(&datagram[..len]);
+            }
+        });
+        Self { port, state }
+    }
+
+    fn clients(&self) -> Vec<SocketAddr> {
+        self.state.lock().unwrap().clients.clone()
+    }
+
+    fn cut(&self) {
+        let mut state = self.state.lock().unwrap();
+        let clients = state.clients.clone();
+        state.cut.extend(clients);
+    }
+}
+
+/// A new upstream socket for `client`, with a thread that relays the hub's
+/// datagrams back to it until its path is cut.
+fn map(
+    front: &UdpSocket,
+    client: SocketAddr,
+    upstream: SocketAddr,
+    state: Arc<Mutex<RelayState>>,
+) -> UdpSocket {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.connect(upstream).unwrap();
+    let answers = socket.try_clone().unwrap();
+    let front = front.try_clone().unwrap();
+    thread::spawn(move || {
+        let mut datagram = vec![0u8; 65_536];
+        loop {
+            let Ok(len) = answers.recv(&mut datagram) else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            if state.lock().unwrap().cut.contains(&client) {
+                continue;
+            }
+            let _ = front.send_to(&datagram[..len], client);
+        }
+    });
+    socket
 }
 
 fn settings(client: Client, port: u16, extra: serde_json::Value) -> Settings {
@@ -372,4 +463,82 @@ async fn factory_builds_from_settings_and_rejects_bad_ones() {
         Err(message) => message,
     };
     assert!(!message.contains("c2hvcnQ"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_sessions_moves_the_node_to_a_new_socket() {
+    let ports = start_hub(&[A]);
+    let relay = Relay::start(SocketAddr::from(([127, 0, 0, 1], ports[0])));
+    // A name, so that the move resolves it again.
+    let a = outbound(A, relay.port, serde_json::json!({"server": "localhost"}));
+    // No session runs before the first connection: nothing to move.
+    assert_eq!(a.reset_sessions(), 0);
+    udp_echo(&a, HUB_V4, b"before the network change").await;
+    assert_eq!(relay.clients().len(), 1);
+
+    // The device left that network: its old path drops everything.
+    relay.cut();
+    let mut flow = a.open_udp(&target(HUB_V4, 9000)).await.unwrap();
+    flow.send.send(b"lost").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), flow.recv.recv())
+            .await
+            .is_err(),
+        "a cut path still delivered"
+    );
+
+    // The client reports the new network: the node resolves the endpoint
+    // again, moves to a new socket and handshakes there.
+    assert_eq!(a.reset_sessions(), 1);
+    udp_echo(&a, HUB_V4, b"after the network change").await;
+    assert!(relay.clients().len() >= 2, "the node kept its old socket");
+    drop(flow);
+}
+
+async fn echo(stream: &mut BoxStream, payload: &[u8]) {
+    tokio::time::timeout(WAIT, async {
+        stream.write_all(payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+    })
+    .await
+    .expect("echo timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_connections_survive_a_path_move() {
+    let ports = start_hub(&[A, B]);
+    let relay = Relay::start(SocketAddr::from(([127, 0, 0, 1], ports[0])));
+    let a = outbound(A, relay.port, serde_json::json!({}));
+    let b = outbound(B, ports[1], serde_json::json!({}));
+    let accept = {
+        let b = b.clone();
+        tokio::spawn(async move {
+            let mut stream = b.accept_tcp(7100).await.unwrap();
+            let mut buffer = vec![0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..read]).await.unwrap();
+            }
+        })
+    };
+    // Let B listen before A's SYN arrives.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut stream = tokio::time::timeout(WAIT, a.connect(&target(B.v4, 7100)))
+        .await
+        .expect("connect timed out")
+        .unwrap();
+    echo(&mut stream, b"before the network change").await;
+
+    relay.cut();
+    assert_eq!(a.reset_sessions(), 1);
+    // The same connection: the session and the stack outlive the socket.
+    echo(&mut stream, b"after the network change").await;
+    assert!(relay.clients().len() >= 2, "the node kept its old socket");
+    drop(stream);
+    accept.abort();
 }

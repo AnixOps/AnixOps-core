@@ -1,7 +1,9 @@
 use std::{
     net::IpAddr,
     pin::Pin,
+    sync::Arc,
     task::{ready, Context, Poll},
+    time::Instant,
 };
 
 use futures::{Sink, Stream};
@@ -13,7 +15,9 @@ use tracing::{debug, trace};
 use crate::{
     filter::{IpFilter, IpFilters},
     packet::{AnyIpPktFrame, IpPacket},
+    reassembly::{self, Piece, Reassembler},
     runner::Runner,
+    stats::StackStats,
     tcp::TcpListener,
     udp::UdpSocket,
 };
@@ -32,6 +36,7 @@ pub struct StackBuilder {
     tcp_send_buffer_size: u32,
     mtu: usize,
     ip_filters: IpFilters<'static>,
+    stats: Arc<StackStats>,
 }
 
 impl Default for StackBuilder {
@@ -53,6 +58,7 @@ impl Default for StackBuilder {
             tcp_send_buffer_size: 0x3FFF * 20,
             mtu: 1504, // 1500 for Ethernet + 4 for VLAN
             ip_filters: IpFilters::with_non_broadcast(),
+            stats: Arc::default(),
         }
     }
 }
@@ -129,6 +135,14 @@ impl StackBuilder {
         self
     }
 
+    /// Where the stack and its UDP socket count the packets they drop or
+    /// rebuild; see [`StackStats`]. Each stack counts into its own set
+    /// unless one is handed in here.
+    pub fn stats(mut self, stats: Arc<StackStats>) -> Self {
+        self.stats = stats;
+        self
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn build(
         self,
@@ -166,7 +180,8 @@ impl StackBuilder {
             None
         };
 
-        let udp_socket = udp_rx.map(|udp_rx| UdpSocket::new(udp_rx, stack_tx.clone()));
+        let udp_socket =
+            udp_rx.map(|udp_rx| UdpSocket::new(udp_rx, stack_tx.clone(), self.stats.clone()));
 
         let (tcp_runner, tcp_listener) = if let Some(tcp_rx) = tcp_rx {
             let (tcp_runner, tcp_listener) = TcpListener::new(
@@ -188,6 +203,7 @@ impl StackBuilder {
             udp_tx,
             tcp_tx,
             icmp_tx,
+            fragments: Reassembler::new(self.stats),
         };
 
         Ok((stack, tcp_runner, udp_socket, tcp_listener))
@@ -201,6 +217,8 @@ pub struct Stack {
     tcp_tx: Option<PollSender<AnyIpPktFrame>>,
     icmp_tx: Option<PollSender<AnyIpPktFrame>>,
     stack_rx: Receiver<AnyIpPktFrame>,
+    /// UDP datagrams that came in fragments, held until they are whole.
+    fragments: Reassembler,
 }
 
 impl Stack {
@@ -282,6 +300,22 @@ impl Sink<AnyIpPktFrame> for Stack {
         }
 
         let protocol = packet.protocol();
+        // A fragment goes on only as part of its whole datagram: the UDP
+        // socket cannot read one alone, and smoltcp refuses them. Fragments
+        // of UDP datagrams are joined; the others are dropped.
+        let (item, protocol) = match reassembly::classify(item.as_slice(), &packet) {
+            Piece::Whole => (item, protocol),
+            Piece::Udp(fragment) if self.udp_tx.is_some() => {
+                match self.fragments.push(fragment, Instant::now()) {
+                    Some(datagram) => (datagram, IpProtocol::Udp),
+                    None => return Ok(()),
+                }
+            }
+            Piece::Udp(_) | Piece::Other => {
+                self.fragments.refuse();
+                return Ok(());
+            }
+        };
         if matches!(
             protocol,
             IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Icmp | IpProtocol::Icmpv6
@@ -337,5 +371,104 @@ mod tcp_window_tests {
         assert_eq!(b.tcp_send_buffer_size, 2 << 20);
         // The mpsc-depth knob is independent and must not be conflated.
         assert_eq!(b.tcp_buffer_size, 512);
+    }
+}
+
+#[cfg(test)]
+mod udp_tests {
+    use std::{net::SocketAddr, time::Duration};
+
+    use futures::{SinkExt, StreamExt};
+    use smoltcp::wire::IPV6_HEADER_LEN;
+
+    use super::*;
+    use crate::{
+        reassembly::testing::{fragments4, fragments6, udp4, udp6, APP4, APP6, DNS4, DNS6},
+        udp::{ReadHalf, UdpMsg},
+    };
+
+    fn stack() -> (Stack, ReadHalf, Arc<StackStats>) {
+        let stats = Arc::new(StackStats::default());
+        let (stack, _runner, udp, _tcp) = StackBuilder::default()
+            .enable_udp(true)
+            .stats(stats.clone())
+            .build()
+            .unwrap();
+        let (udp, _replies) = udp.unwrap().split();
+        (stack, udp, stats)
+    }
+
+    async fn next(udp: &mut ReadHalf) -> Option<UdpMsg> {
+        tokio::time::timeout(Duration::from_secs(5), udp.next())
+            .await
+            .expect("the UDP socket stalled")
+    }
+
+    // A malformed packet, a datagram missing a fragment and a datagram in
+    // fragments leave the UDP socket reading: the whole datagram comes out,
+    // and so does the DNS query after them.
+    #[tokio::test]
+    async fn bad_and_fragmented_packets_leave_udp_flowing() {
+        let (mut stack, mut udp, stats) = stack();
+        let app = SocketAddr::from((APP4, 5353));
+        let dns = SocketAddr::from((DNS4, 53));
+
+        // A UDP length field that counts more than the packet carries.
+        let mut malformed = udp4(&[0; 100], 1);
+        malformed[24..26].copy_from_slice(&200u16.to_be_bytes());
+        stack.send(malformed).await.unwrap();
+        // The first fragment of a datagram whose other fragment never comes.
+        let orphan = fragments4(&udp4(&[1; 2000], 2), 1480).remove(0);
+        stack.send(orphan).await.unwrap();
+        // A datagram in three fragments, out of order.
+        let big = vec![2; 3000];
+        let fragments = fragments4(&udp4(&big, 3), 1480);
+        for index in [1, 2, 0] {
+            stack.send(fragments[index].clone()).await.unwrap();
+        }
+        stack.send(udp4(b"query", 4)).await.unwrap();
+
+        assert_eq!(next(&mut udp).await, Some((big, app, dns)));
+        assert_eq!(next(&mut udp).await, Some((b"query".to_vec(), app, dns)));
+        assert_eq!(stats.udp_malformed(), 1);
+        assert_eq!(stats.udp_reassembled(), 1);
+        assert_eq!(stats.ip_fragments_dropped(), 0);
+    }
+
+    #[tokio::test]
+    async fn ipv6_fragments_reach_the_udp_socket_whole() {
+        let (mut stack, mut udp, stats) = stack();
+        let app = SocketAddr::from((APP6, 5353));
+        let dns = SocketAddr::from((DNS6, 53));
+
+        let big = vec![3; 3000];
+        for fragment in fragments6(&udp6(&big), 0x0102_0304, 1232).into_iter().rev() {
+            stack.send(fragment).await.unwrap();
+        }
+        // A fragment of TCP is dropped and counted.
+        let mut tcp = fragments6(&udp6(&[0; 2000]), 5, 1232).remove(0);
+        tcp[IPV6_HEADER_LEN] = 6;
+        stack.send(tcp).await.unwrap();
+        stack.send(udp6(b"query")).await.unwrap();
+
+        assert_eq!(next(&mut udp).await, Some((big, app, dns)));
+        assert_eq!(next(&mut udp).await, Some((b"query".to_vec(), app, dns)));
+        assert_eq!(stats.udp_reassembled(), 1);
+        assert_eq!(stats.ip_fragments_dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn fragments_are_dropped_without_udp() {
+        let stats = Arc::new(StackStats::default());
+        let (mut stack, _runner, udp, _tcp) = StackBuilder::default()
+            .stats(stats.clone())
+            .build()
+            .unwrap();
+        assert!(udp.is_none());
+        for fragment in fragments4(&udp4(&[4; 2000], 5), 1480) {
+            stack.send(fragment).await.unwrap();
+        }
+        assert_eq!(stats.ip_fragments_dropped(), 2);
+        assert_eq!(stats.udp_reassembled(), 0);
     }
 }

@@ -18,8 +18,8 @@ use control_domain::{
     NODE_METADATA_HYSTERIA2_OBFS_TYPE, NODE_METADATA_HYSTERIA2_PASSWORD,
     NODE_METADATA_HYSTERIA2_SERVER_PORTS, NODE_METADATA_SHADOWSOCKS_METHOD,
     NODE_METADATA_SHADOWSOCKS_PASSWORD, NODE_METADATA_SOURCE_FORMAT, NODE_METADATA_TLS_ALPN,
-    NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_ENABLED,
-    NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
+    NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256, NODE_METADATA_TLS_CERTIFICATE_SHA256,
+    NODE_METADATA_TLS_ENABLED, NODE_METADATA_TLS_INSECURE, NODE_METADATA_TLS_REALITY_PUBLIC_KEY,
     NODE_METADATA_TLS_REALITY_SHORT_ID, NODE_METADATA_TLS_SERVER_NAME,
     NODE_METADATA_TLS_UTLS_FINGERPRINT, NODE_METADATA_TROJAN_PASSWORD,
     NODE_METADATA_TUIC_CONGESTION_CONTROL, NODE_METADATA_TUIC_PASSWORD, NODE_METADATA_TUIC_UUID,
@@ -30,6 +30,14 @@ use control_domain::{
     NODE_METADATA_WIREGUARD_MTU, NODE_METADATA_WIREGUARD_PEER_PUBLIC_KEY,
     NODE_METADATA_WIREGUARD_PRE_SHARED_KEY, NODE_METADATA_WIREGUARD_PRIVATE_KEY,
 };
+
+/// One SHA-256 digest in the spellings subscriptions use, and another one.
+const PIN_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const PIN_COLONS: &str =
+    "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF";
+const PIN_BASE64: &str = "ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8=";
+const OTHER_PIN_HEX: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+const OTHER_PIN_BASE64: &str = "/ty6mHZUMhD+3LqYdlQyEP7cuph2VDIQ/ty6mHZUMhA=";
 
 #[test]
 fn normalizes_profile_list_from_minimal_toml() {
@@ -575,7 +583,7 @@ fn parses_hysteria2_and_tuic_share_links_with_quic_tls_options() {
     let raw = RawSubscription {
         source_id: "quic-share-links".to_string(),
         content: concat!(
-            "hysteria2://hy2%2Dpassword@edge.example.test:443?mport=2000-2002&sni=cdn.example.test&alpn=h3%2Ch2&insecure=1&pinSHA256=pin-A&obfs=gecko&obfs-password=mask&minPacketSize=512&maxPacketSize=1200#Hysteria%202\n",
+            "hysteria2://hy2%2Dpassword@edge.example.test:443?mport=2000-2002&sni=cdn.example.test&alpn=h3%2Ch2&insecure=1&pinSHA256=01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF&obfs=gecko&obfs-password=mask&minPacketSize=512&maxPacketSize=1200#Hysteria%202\n",
             "tuic://00000000-0000-0000-0000-000000000001:tuic%2Dpassword@tuic.example.test:443?sni=cdn.tuic.example.test&alpn=h3&allowInsecure=1&congestion_control=bbr#TUIC%20Node"
         )
         .to_string(),
@@ -636,10 +644,15 @@ fn parses_hysteria2_and_tuic_share_links_with_quic_tls_options() {
     );
     assert_metadata(&hysteria2.metadata, NODE_METADATA_TLS_INSECURE, "true");
     assert_metadata(&hysteria2.metadata, NODE_METADATA_TLS_ALPN, "h3,h2");
+    // `pinSHA256` pins the whole certificate; kept in lowercase hex.
     assert_metadata(
         &hysteria2.metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        PIN_HEX,
+    );
+    assert_no_metadata(
+        &hysteria2.metadata,
         NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
-        "pin-A",
     );
     assert_metadata(
         &hysteria2.metadata,
@@ -825,7 +838,8 @@ fn parses_hysteria2_and_tuic_sing_box_outbounds_into_node_catalog() {
         "server_name": "cdn.hy2.example.test",
         "insecure": true,
         "alpn": ["h3", "h2"],
-        "certificate_public_key_sha256": ["pin-A"]
+        "certificate_sha256": ["/ty6mHZUMhD+3LqYdlQyEP7cuph2VDIQ/ty6mHZUMhA="],
+        "certificate_public_key_sha256": ["ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8="]
       }
     },
     {
@@ -864,10 +878,17 @@ fn parses_hysteria2_and_tuic_sing_box_outbounds_into_node_catalog() {
         NODE_METADATA_HYSTERIA2_SERVER_PORTS,
         "3000:3002",
     );
+    // Both lists are base64 in sing-box: certificate digests become hex,
+    // public key digests stay base64.
+    assert_metadata(
+        &hysteria2.metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        OTHER_PIN_HEX,
+    );
     assert_metadata(
         &hysteria2.metadata,
         NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
-        "pin-A",
+        PIN_BASE64,
     );
     assert_metadata(
         &hysteria2.metadata,
@@ -1694,6 +1715,244 @@ fn subscription_parse_failure_does_not_leak_secret_values() {
     assert!(!error.message.contains("token ="));
 }
 
+#[test]
+fn share_link_pins_are_kept_as_certificate_digests() {
+    let vmess = base64::engine::general_purpose::STANDARD.encode(format!(
+        r#"{{"v":"2","ps":"VMess Pinned","add":"vmess.example.test","port":"443","id":"00000000-0000-0000-0000-000000000003","aid":"0","net":"tcp","tls":"tls","allowInsecure":"1","pcs":"{PIN_HEX}"}}"#
+    ));
+    let nodes = import_nodes(
+        "pinned-share-links",
+        format!(
+            concat!(
+                "vless://00000000-0000-0000-0000-000000000002@vless.example.test:443?encryption=none&security=tls&allowInsecure=1&pcs={}%2C{}#VLESS%20Pinned\n",
+                "trojan://trojan-password@trojan.example.test:443?security=tls&pinSHA256={}&pcs={}#Trojan%20Pinned\n",
+                "tuic://00000000-0000-0000-0000-000000000001:tuic-password@tuic.example.test:443?allow_insecure=1&pinSHA256=pin-A#TUIC%20Pinned\n",
+                "vmess://{}"
+            ),
+            PIN_COLONS,
+            OTHER_PIN_HEX.to_ascii_uppercase(),
+            PIN_HEX,
+            PIN_COLONS,
+            vmess
+        ),
+    );
+    assert_eq!(nodes.len(), 4);
+    // Xray `pcs` lists keep their order, in lowercase hex.
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        &format!("{PIN_HEX},{OTHER_PIN_HEX}"),
+    );
+    assert_metadata(&nodes[0].metadata, NODE_METADATA_TLS_INSECURE, "true");
+    // The same certificate under both names is one pin.
+    assert_metadata(
+        &nodes[1].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        PIN_HEX,
+    );
+    // A value that is not a SHA-256 digest is kept as written: the node
+    // import then reports the node instead of running it without the pin.
+    assert_metadata(
+        &nodes[2].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        "pin-A",
+    );
+    assert_metadata(&nodes[2].metadata, NODE_METADATA_TLS_INSECURE, "true");
+    assert_metadata(
+        &nodes[3].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        PIN_HEX,
+    );
+    for node in &nodes {
+        assert_no_metadata(
+            &node.metadata,
+            NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+        );
+    }
+}
+
+#[test]
+fn sing_box_pins_keep_certificate_and_public_key_digests_apart() {
+    let nodes = import_nodes(
+        "sing-box-pins",
+        format!(
+            r#"{{
+  "outbounds": [
+    {{
+      "type": "vless",
+      "tag": "VLESS Pinned",
+      "server": "vless.example.test",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000002",
+      "tls": {{
+        "enabled": true,
+        "insecure": true,
+        "certificate_sha256": "{PIN_BASE64}",
+        "certificate_public_key_sha256": ["{OTHER_PIN_HEX}", "{OTHER_PIN_BASE64}"]
+      }}
+    }}
+  ]
+}}"#
+        ),
+    );
+    assert_eq!(nodes.len(), 1);
+    assert_metadata(&nodes[0].metadata, NODE_METADATA_TLS_INSECURE, "true");
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        PIN_HEX,
+    );
+    // Public key digests stay base64 whatever the spelling, so a hex value
+    // under that key always means a certificate pin of an older import.
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+        OTHER_PIN_BASE64,
+    );
+}
+
+#[test]
+fn clash_fingerprint_pins_tls_proxies() {
+    let nodes = import_nodes(
+        "clash-pins",
+        format!(
+            r#"
+proxies:
+  - name: Trojan Pinned
+    type: trojan
+    server: trojan.example.test
+    port: 443
+    password: trojan-password
+    client-fingerprint: chrome
+    fingerprint: "{PIN_COLONS}"
+  - name: SS
+    type: ss
+    server: ss.example.test
+    port: 8388
+    cipher: aes-256-gcm
+    password: ss-password
+    fingerprint: "{PIN_COLONS}"
+"#
+        ),
+    );
+    assert_eq!(nodes.len(), 2);
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        PIN_HEX,
+    );
+    // Shadowsocks has no TLS to pin.
+    assert_no_metadata(&nodes[1].metadata, NODE_METADATA_TLS_CERTIFICATE_SHA256);
+}
+
+#[test]
+fn surge_server_certificate_fingerprints_pin_tls_proxies() {
+    let nodes = import_nodes(
+        "surge-pins",
+        format!(
+            r#"
+[Proxy]
+Trojan Pinned = trojan, trojan.example.test, 443, password=trojan-password, server-cert-fingerprint-sha256={PIN_HEX}
+VMess Pinned = vmess, vmess.example.test, 443, username=00000000-0000-0000-0000-000000000003, tls=true, server-cert-fingerprint-sha256={PIN_COLONS}
+"#
+        ),
+    );
+    assert_eq!(nodes.len(), 2);
+    for node in &nodes {
+        assert_metadata(
+            &node.metadata,
+            NODE_METADATA_TLS_CERTIFICATE_SHA256,
+            PIN_HEX,
+        );
+        assert_no_metadata(
+            &node.metadata,
+            NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+        );
+    }
+}
+
+#[test]
+fn loon_certificate_and_public_key_pins_are_kept() {
+    let nodes = import_nodes(
+        "loon-pins",
+        format!(
+            r#"
+[Proxy]
+Trojan Pinned = trojan, trojan.example.test, 443, "trojan-password", tls-cert-sha256={PIN_COLONS}
+VLESS Pinned = vless, vless.example.test, 443, "00000000-0000-0000-0000-000000000002", tls-pubkey-sha256={PIN_HEX}
+VMess Pinned = vmess, vmess.example.test, 443, aes-128-gcm, "00000000-0000-0000-0000-000000000003", tls-cert-sha256="{OTHER_PIN_HEX}", tls-pubkey-sha256={PIN_HEX}
+"#
+        ),
+    );
+    assert_eq!(nodes.len(), 3);
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        PIN_HEX,
+    );
+    assert_no_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+    );
+    // `tls-pubkey-sha256` is hex in Loon and Quantumult X; it is kept in
+    // base64 like every public key pin.
+    assert_metadata(
+        &nodes[1].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+        PIN_BASE64,
+    );
+    assert_no_metadata(&nodes[1].metadata, NODE_METADATA_TLS_CERTIFICATE_SHA256);
+    assert_metadata(
+        &nodes[2].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        OTHER_PIN_HEX,
+    );
+    assert_metadata(
+        &nodes[2].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+        PIN_BASE64,
+    );
+}
+
+#[test]
+fn quantumult_x_certificate_and_public_key_pins_are_kept() {
+    let nodes = import_nodes(
+        "quantumult-x-pins",
+        format!(
+            r#"
+[server_local]
+trojan=trojan.example.test:443, password=trojan-password, over-tls=true, tls-verification=true, tls-cert-sha256={PIN_HEX}, tag=Trojan Pinned
+vmess=vmess.example.test:443, method=chacha20-poly1305, password=00000000-0000-0000-0000-000000000003, obfs=over-tls, tls-verification=true, tls-pubkey-sha256={PIN_HEX}, tag=VMess Pinned
+"#
+        ),
+    );
+    assert_eq!(nodes.len(), 2);
+    assert_metadata(
+        &nodes[0].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_SHA256,
+        PIN_HEX,
+    );
+    assert_metadata(
+        &nodes[1].metadata,
+        NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256,
+        PIN_BASE64,
+    );
+    assert_no_metadata(&nodes[1].metadata, NODE_METADATA_TLS_CERTIFICATE_SHA256);
+}
+
+fn import_nodes(source_id: &str, content: String) -> Vec<control_domain::NodeDescriptor> {
+    let service = CoreSubscriptionService::new();
+    let raw = RawSubscription {
+        source_id: source_id.to_string(),
+        content,
+    };
+    let document = service.parse(&raw).expect("subscription should parse");
+    service
+        .normalize(&document)
+        .expect("subscription should normalize")
+        .nodes
+}
+
 fn capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         os: OperatingSystem::Linux,
@@ -1716,5 +1975,12 @@ fn assert_metadata(metadata: &[MetadataEntry], key: &str, value: &str) {
             .iter()
             .any(|entry| entry.key == key && entry.value == value),
         "missing metadata {key}={value}: {metadata:?}"
+    );
+}
+
+fn assert_no_metadata(metadata: &[MetadataEntry], key: &str) {
+    assert!(
+        metadata.iter().all(|entry| entry.key != key),
+        "unexpected metadata {key}: {metadata:?}"
     );
 }

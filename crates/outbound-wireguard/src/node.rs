@@ -1,10 +1,13 @@
 //! One WireGuard node at run time: the Noise session (boringtun's `Tunn`) on
-//! one connected UDP socket, and the node's private userspace TCP/IP stack
-//! (smoltcp) that owns the interface addresses.
+//! one connected UDP socket ([`Path`]), and the node's private userspace
+//! TCP/IP stack (smoltcp) that owns the interface addresses.
 //!
 //! The driver task starts with the first connection and stops after the
 //! node has had no connection for [`IDLE_RELEASE`]. The stack and the Noise
 //! state outlive the driver, so a restart only resolves the endpoint again.
+//! While the driver runs, the path moves to a new socket after a network
+//! change ([`Node::reset_path`], from `reset_sessions`) and on its own after
+//! path errors or unanswered handshakes; connections stay open across a move.
 //!
 //! AllowedIPs is applied in both directions: the outbound
 //! refuses connections to other addresses, and packets that come out of the
@@ -26,11 +29,11 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp, AnySocket};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
-use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
 use crate::config::WireGuardSettings;
 use crate::dns;
+use crate::path::{self, Path, Received};
 
 /// boringtun's timers have a 250 ms granularity.
 const TIMER_TICK: Duration = Duration::from_millis(250);
@@ -50,8 +53,6 @@ const DNS_MIN_TTL: u32 = 30;
 const DNS_MAX_TTL: u32 = 600;
 const DNS_CACHE_ENTRIES: usize = 256;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Back-off after a socket error such as ICMP port unreachable.
-const ERROR_BACKOFF: Duration = Duration::from_millis(250);
 const FIRST_LOCAL_PORT: u16 = 49152;
 
 /// Packet queues between the stack and the Noise session.
@@ -216,6 +217,8 @@ pub(crate) struct Node {
     core: Mutex<Core>,
     wake: Notify,
     epoch: Instant,
+    /// Path moves asked for so far; the driver serves each new count once.
+    path_resets: AtomicU64,
 }
 
 impl Node {
@@ -247,6 +250,7 @@ impl Node {
             }),
             wake: Notify::new(),
             epoch,
+            path_resets: AtomicU64::new(0),
         })
     }
 
@@ -272,6 +276,20 @@ impl Node {
     /// Asks the driver to poll the stack, after a socket changed.
     pub(crate) fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    /// Moves a running driver to a new UDP socket after the device changed
+    /// networks or woke up: the endpoint resolves again and a fresh
+    /// handshake goes out on the new socket, while the session, the stack and
+    /// the open connections stay. Returns 1 when a driver runs, else 0 (the
+    /// next one starts on a new socket anyway). Returns at once.
+    pub(crate) fn reset_path(&self) -> usize {
+        if !self.lock().running {
+            return 0;
+        }
+        self.path_resets.fetch_add(1, Ordering::AcqRel);
+        self.wake();
+        1
     }
 
     /// Why the last driver stopped on an error, if it did.
@@ -532,8 +550,9 @@ impl Node {
 
     /// Opens one datagram from the peer. Packets go to the stack when their
     /// source is inside AllowedIPs; replies (handshake responses, packets
-    /// queued behind the handshake) are returned to send.
-    fn receive(&self, datagram: &mut [u8], peer: IpAddr) -> Vec<Vec<u8>> {
+    /// queued behind the handshake) are returned to send, with whether the
+    /// datagram was a message the peer authenticated.
+    fn receive(&self, datagram: &mut [u8], peer: IpAddr) -> (Vec<Vec<u8>>, bool) {
         let reserved = self.settings.reserved;
         if reserved.is_some() && datagram.len() >= 4 {
             datagram[1..4].fill(0);
@@ -543,8 +562,14 @@ impl Node {
         let mut core = self.lock();
         let core = &mut *core;
         let mut input: &[u8] = datagram;
+        let mut heard = false;
         loop {
-            match core.tunn.decapsulate(Some(peer), input, &mut buffer) {
+            let result = core.tunn.decapsulate(Some(peer), input, &mut buffer);
+            if !input.is_empty() && !matches!(result, TunnResult::Err(_)) {
+                // Only the first call carries the datagram; the rest drain.
+                heard = true;
+            }
+            match result {
                 // Handshake replies and queued packets: keep draining with an
                 // empty datagram until boringtun reports it is done.
                 TunnResult::WriteToNetwork(reply) => {
@@ -562,7 +587,7 @@ impl Node {
                 TunnResult::Done | TunnResult::Err(_) => break,
             }
         }
-        replies
+        (replies, heard)
     }
 
     /// Stops the driver `run` after it could not start, failing every
@@ -577,11 +602,13 @@ impl Node {
         core.stack.abort_all();
     }
 
-    /// The first handshake initiation, sent when the driver starts.
-    fn initiation(&self) -> Option<Vec<u8>> {
+    /// A handshake initiation: the first one when the driver starts, and
+    /// with `force` a fresh one after the path moved to a new socket, which
+    /// also tells the peer the new address at once.
+    fn initiation(&self, force: bool) -> Option<Vec<u8>> {
         let mut buffer = vec![0u8; 256];
         let mut core = self.lock();
-        match core.tunn.format_handshake_initiation(&mut buffer, false) {
+        match core.tunn.format_handshake_initiation(&mut buffer, force) {
             TunnResult::WriteToNetwork(datagram) => Some(seal(datagram, self.settings.reserved)),
             _ => None,
         }
@@ -665,23 +692,24 @@ async fn drive(node: Arc<Node>, run: u64) {
         node: node.clone(),
         run,
     };
-    let Some(server) = resolve_server(node.settings()).await else {
+    // A reset that comes while the endpoint resolves moves the new socket
+    // once more: the lookup may have used the old network.
+    let mut served = node.path_resets.load(Ordering::Acquire);
+    let settings = node.settings();
+    let Ok(addresses) = path::resolve(&settings.server, settings.port).await else {
         node.fail(run, "wireguard endpoint did not resolve");
         return;
     };
-    let Ok(socket) = connect_udp(server) else {
+    let Ok(mut path) = Path::connect(&settings.server, settings.port, &addresses) else {
         node.fail(run, "wireguard endpoint is unreachable");
         return;
     };
-    if let Some(initiation) = node.initiation() {
-        let _ = socket.send(&initiation).await;
-    }
+    let mut replies: Vec<Vec<u8>> = node.initiation(false).into_iter().collect();
     let mut datagram = vec![0u8; DATAGRAM_BYTES];
     let mut next_tick = Instant::now() + TIMER_TICK;
-    let mut replies: Vec<Vec<u8>> = Vec::new();
     loop {
         for reply in replies.drain(..) {
-            let _ = socket.send(&reply).await;
+            let _ = path.send(&reply).await;
         }
         let now = Instant::now();
         let timers_due = now >= next_tick;
@@ -690,53 +718,39 @@ async fn drive(node: Arc<Node>, run: u64) {
         }
         let poll = node.poll(run, timers_due);
         for sealed in &poll.datagrams {
-            let _ = socket.send(sealed).await;
+            let _ = path.send(sealed).await;
         }
         if poll.stop {
             return;
         }
+        let requested = node.path_resets.load(Ordering::Acquire);
+        if requested != served {
+            served = requested;
+            path.renew();
+        }
+        path.maintain(Instant::now());
         let wait = poll
             .delay
             .min(next_tick.saturating_duration_since(Instant::now()));
         tokio::select! {
-            received = socket.recv(&mut datagram) => match received {
-                Ok(len) => replies = node.receive(&mut datagram[..len], server.ip()),
-                Err(_) => tokio::time::sleep(ERROR_BACKOFF).await,
+            received = path.recv(&mut datagram) => match received {
+                Received::Datagram(len) => {
+                    let peer = path.endpoint().ip();
+                    let (sealed, heard) = node.receive(&mut datagram[..len], peer);
+                    if heard {
+                        path.heard();
+                    }
+                    replies = sealed;
+                }
+                // A fresh handshake on the new socket moves the peer to the
+                // new address at once and proves the path.
+                Received::Rebound => replies.extend(node.initiation(true)),
+                Received::Failed | Received::Unchanged => {}
             },
             _ = node.wake.notified() => {}
             _ = tokio::time::sleep(wait) => {}
         }
     }
-}
-
-/// A connected UDP socket: the kernel then drops datagrams from any other
-/// source.
-fn connect_udp(server: SocketAddr) -> io::Result<UdpSocket> {
-    let socket = engine_outbound::protect::bind_std_udp(
-        engine_outbound::protect::unspecified_for(server),
-        server,
-    )?;
-    socket.connect(server)?;
-    UdpSocket::from_std(socket)
-}
-
-/// The endpoint address. The engine's own sockets never route through a
-/// tunnel, so the system resolver is safe to use for it.
-async fn resolve_server(settings: &WireGuardSettings) -> Option<SocketAddr> {
-    if let Ok(address) = settings.server.parse::<IpAddr>() {
-        return Some(SocketAddr::new(address, settings.port));
-    }
-    let lookup = tokio::net::lookup_host((settings.server.as_str(), settings.port));
-    let addresses: Vec<SocketAddr> = tokio::time::timeout(RESOLVE_TIMEOUT, lookup)
-        .await
-        .ok()?
-        .ok()?
-        .collect();
-    addresses
-        .iter()
-        .find(|address| address.is_ipv4())
-        .or_else(|| addresses.first())
-        .copied()
 }
 
 fn endpoint(address: SocketAddr) -> IpEndpoint {

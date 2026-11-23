@@ -6,8 +6,10 @@
 //! Trojan the common `vless://` / `trojan://` query form, VMess a v2rayN
 //! `vmess://` JSON link, Hysteria2 and TUIC their `hysteria2://` / `tuic://`
 //! links and Snell, which has no link format, a Surge proxy line. Importing
-//! the result gives the same outbound entry back. Errors are fixed text
-//! without node values.
+//! the result gives the same outbound entry back. Certificate pins go into
+//! `pcs` (VLESS, Trojan, VMess) or `pinSHA256` (Hysteria2, TUIC); public key
+//! pins have no link form, so such a node has no share link rather than one
+//! that checks less. Errors are fixed text without node values.
 
 use serde_json::{json, Value};
 
@@ -146,12 +148,30 @@ fn shadowsocks(name: &str, endpoint: &Endpoint, outbound: &Value) -> Result<Stri
     ))
 }
 
-/// `security`, `sni`, `alpn` and `allowInsecure` of a standard TLS entry.
-fn tls_query(tls: &Value) -> Vec<(&'static str, Option<String>)> {
-    if tls.is_null() {
-        return vec![("security", Some("none".to_string()))];
+/// The certificate pins of a TLS entry (an outbound or its `tls` object),
+/// comma-separated. A link that left public key pins out would check less
+/// than the node does, so those make the node unsharable.
+fn certificate_pins(tls: &Value) -> Result<Option<String>, Unsupported> {
+    if tls["pinned_public_key_sha256"]
+        .as_array()
+        .is_some_and(|pins| !pins.is_empty())
+    {
+        return Err("certificate public key pins have no share link form");
     }
-    vec![
+    let pins: Vec<&str> = tls["pinned_certificate_sha256"]
+        .as_array()
+        .map(|pins| pins.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    Ok((!pins.is_empty()).then(|| pins.join(",")))
+}
+
+/// `security`, `sni`, `alpn`, `allowInsecure` and `pcs` (certificate pins)
+/// of a standard TLS entry.
+fn tls_query(tls: &Value) -> Result<Vec<(&'static str, Option<String>)>, Unsupported> {
+    if tls.is_null() {
+        return Ok(vec![("security", Some("none".to_string()))]);
+    }
+    Ok(vec![
         ("security", Some("tls".to_string())),
         ("sni", text(tls, "server_name").map(str::to_string)),
         ("alpn", alpn(tls)),
@@ -159,7 +179,8 @@ fn tls_query(tls: &Value) -> Vec<(&'static str, Option<String>)> {
             "allowInsecure",
             flag(tls, "insecure").then(|| "1".to_string()),
         ),
-    ]
+        ("pcs", certificate_pins(tls)?),
+    ])
 }
 
 /// `type` and its `path`/`host` or `serviceName`.
@@ -233,7 +254,7 @@ fn vless(name: &str, endpoint: &Endpoint, outbound: &Value) -> Result<String, Un
         ]);
         pairs.extend(transport_query(&outbound["transport"]));
     } else {
-        pairs.extend(tls_query(&outbound["tls"]));
+        pairs.extend(tls_query(&outbound["tls"])?);
         pairs.extend(transport_query(&outbound["transport"]));
     }
     Ok(format!(
@@ -251,7 +272,7 @@ fn trojan(name: &str, endpoint: &Endpoint, outbound: &Value) -> Result<String, U
         .filter(|password| !password.is_empty())
         .ok_or("trojan password is missing")?;
     // Trojan always runs TLS; its TLS fields sit on the outbound itself.
-    let mut pairs = tls_query(outbound);
+    let mut pairs = tls_query(outbound)?;
     pairs.extend(transport_query(&outbound["transport"]));
     Ok(format!(
         "trojan://{}@{}{}{}",
@@ -309,24 +330,29 @@ fn vmess(name: &str, endpoint: &Endpoint, outbound: &Value) -> Result<String, Un
         if flag(tls, "insecure") {
             link["allowInsecure"] = json!("1");
         }
+        if let Some(pins) = certificate_pins(tls)? {
+            link["pcs"] = json!(pins);
+        }
     }
     let link = serde_json::to_string(&link).map_err(|_| "vmess link could not be encoded")?;
     Ok(format!("vmess://{}", base64(link.as_bytes(), false)))
 }
 
-/// `sni`, `alpn` and `insecure` of a QUIC outbound.
+/// `sni`, `alpn`, `insecure` and `pinSHA256` (certificate pins) of a QUIC
+/// outbound.
 fn quic_tls_query(
     outbound: &Value,
     insecure_key: &'static str,
-) -> Vec<(&'static str, Option<String>)> {
-    vec![
+) -> Result<Vec<(&'static str, Option<String>)>, Unsupported> {
+    Ok(vec![
         ("sni", text(outbound, "server_name").map(str::to_string)),
         ("alpn", alpn(outbound)),
         (
             insecure_key,
             flag(outbound, "insecure").then(|| "1".to_string()),
         ),
-    ]
+        ("pinSHA256", certificate_pins(outbound)?),
+    ])
 }
 
 fn hysteria2(name: &str, endpoint: &Endpoint, outbound: &Value) -> Result<String, Unsupported> {
@@ -334,7 +360,7 @@ fn hysteria2(name: &str, endpoint: &Endpoint, outbound: &Value) -> Result<String
         .as_str()
         .filter(|password| !password.is_empty())
         .ok_or("hysteria2 password is missing")?;
-    let mut pairs = quic_tls_query(outbound, "insecure");
+    let mut pairs = quic_tls_query(outbound, "insecure")?;
     let obfs = &outbound["obfs"];
     if !obfs.is_null() {
         pairs.push(("obfs", text(obfs, "type").map(str::to_string)));
@@ -355,7 +381,7 @@ fn tuic(name: &str, endpoint: &Endpoint, outbound: &Value) -> Result<String, Uns
         .as_str()
         .filter(|password| !password.is_empty())
         .ok_or("tuic password is missing")?;
-    let mut pairs = quic_tls_query(outbound, "allow_insecure");
+    let mut pairs = quic_tls_query(outbound, "allow_insecure")?;
     pairs.push((
         "congestion_control",
         text(outbound, "congestion_control").map(str::to_string),

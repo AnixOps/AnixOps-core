@@ -8,6 +8,7 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
+use engine_outbound::Dialer;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf};
 use transport_quic::QuicConnector;
 
@@ -17,10 +18,12 @@ pub(crate) type Sender = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 pub(crate) type SendHalf = h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 pub(crate) type RecvHalf = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
 
-/// Completes the QUIC and HTTP/3 handshakes. The connection lives until the
-/// last clone of the returned sender is dropped.
-pub(crate) async fn connect(quic: &QuicConnector) -> io::Result<Sender> {
-    let connection = quic.connect().await?;
+/// Completes the QUIC and HTTP/3 handshakes with the server reached through
+/// `dialer` (see [`QuicConnector::connect_through`]: a `via` chain carries
+/// the datagrams and resolves the server name). The connection lives until
+/// the last clone of the returned sender is dropped.
+pub(crate) async fn connect(quic: &QuicConnector, dialer: &dyn Dialer) -> io::Result<Sender> {
+    let connection = quic.connect_through(dialer).await?;
     let (mut driver, sender) =
         h3::client::new(h3_quinn::Connection::new(connection.connection.clone()))
             .await

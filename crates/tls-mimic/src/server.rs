@@ -316,7 +316,15 @@ where
         .into_iter()
         .find(|suite| hello.cipher_suites.contains(&suite.id()))
         .ok_or_else(|| invalid_data("no shared TLS 1.3 cipher suite"))?;
-    accept_with(io, hello, suite, identity.alpn, Auth::Certificate(identity)).await
+    accept_with(
+        io,
+        hello,
+        suite,
+        identity.alpn,
+        Auth::Certificate(identity),
+        x25519_exchange,
+    )
+    .await
 }
 
 /// Completes a resumed handshake (`psk_dhe_ke`): no certificate, the server
@@ -342,22 +350,20 @@ where
     {
         return Err(invalid_data("TLS PSK binder verification failed"));
     }
-    accept_with(io, hello, suite, alpn, Auth::Psk(psk)).await
+    accept_with(io, hello, suite, alpn, Auth::Psk(psk), x25519_exchange).await
 }
 
-async fn accept_with<S>(
-    mut io: S,
-    hello: &ClientHelloInfo,
-    suite: CipherSuite,
-    offered_alpn: &[Vec<u8>],
-    auth: Auth<'_>,
-) -> io::Result<TlsStream<S>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    if !hello.tls13 {
-        return Err(invalid_data("client does not offer TLS 1.3"));
-    }
+/// The server's side of the key exchange: the group it selects, its key
+/// share and the shared secret that enters the key schedule.
+struct KeyExchange {
+    group: u16,
+    share: Vec<u8>,
+    shared: Vec<u8>,
+}
+
+/// X25519 with the client's X25519 share, the only exchange this server
+/// runs (see [`ClientHelloInfo::x25519_share`]).
+fn x25519_exchange(hello: &ClientHelloInfo) -> io::Result<KeyExchange> {
     let peer = hello
         .x25519_share
         .ok_or_else(|| invalid_data("client sent no X25519 key share"))?;
@@ -368,17 +374,34 @@ where
             "X25519 produced a non-contributory shared secret",
         ));
     }
+    Ok(KeyExchange {
+        group: GROUP_X25519,
+        share: PublicKey::from(&secret).to_bytes().to_vec(),
+        shared: shared.to_vec(),
+    })
+}
+
+async fn accept_with<S>(
+    mut io: S,
+    hello: &ClientHelloInfo,
+    suite: CipherSuite,
+    offered_alpn: &[Vec<u8>],
+    auth: Auth<'_>,
+    key_exchange: fn(&ClientHelloInfo) -> io::Result<KeyExchange>,
+) -> io::Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if !hello.tls13 {
+        return Err(invalid_data("client does not offer TLS 1.3"));
+    }
+    let exchange = key_exchange(hello)?;
     let alpn = offered_alpn
         .iter()
         .find(|protocol| hello.alpn.contains(protocol))
         .cloned();
 
-    let server_hello = server_hello(
-        hello,
-        suite,
-        &PublicKey::from(&secret).to_bytes(),
-        matches!(auth, Auth::Psk(_)),
-    )?;
+    let server_hello = server_hello(hello, suite, &exchange, matches!(auth, Auth::Psk(_)))?;
     let mut transcript = hello.message.clone();
     transcript.extend_from_slice(&server_hello);
 
@@ -390,7 +413,7 @@ where
         Auth::Certificate(_) => hash.hkdf_extract(&[], &zeros),
     };
     let derived = hash.derive_secret(&early_secret, "derived", &empty_hash);
-    let handshake_secret = hash.hkdf_extract(&derived, &shared);
+    let handshake_secret = hash.hkdf_extract(&derived, &exchange.shared);
     let hello_hash = hash.hash(&transcript);
     let client_hs = hash.derive_secret(&handshake_secret, "c hs traffic", &hello_hash);
     let server_hs = hash.derive_secret(&handshake_secret, "s hs traffic", &hello_hash);
@@ -478,27 +501,27 @@ where
 fn server_hello(
     hello: &ClientHelloInfo,
     suite: CipherSuite,
-    public: &[u8; 32],
+    exchange: &KeyExchange,
     resumed: bool,
 ) -> io::Result<Vec<u8>> {
     let mut random = [0u8; 32];
     fill_random(&mut random)?;
-    let mut body = Vec::with_capacity(128);
+    let mut body = Vec::with_capacity(128 + exchange.share.len());
     put_u16(&mut body, 0x0303);
     body.extend_from_slice(&random);
     body.push(hello.session_id.len() as u8);
     body.extend_from_slice(&hello.session_id);
     put_u16(&mut body, suite.id());
     body.push(0);
-    let mut extensions = Vec::with_capacity(46);
+    let mut extensions = Vec::with_capacity(20 + exchange.share.len());
     put_u16(&mut extensions, 0x002b);
     put_u16(&mut extensions, 2);
     put_u16(&mut extensions, 0x0304);
     put_u16(&mut extensions, 0x0033);
-    put_u16(&mut extensions, 36);
-    put_u16(&mut extensions, GROUP_X25519);
-    put_u16(&mut extensions, 32);
-    extensions.extend_from_slice(public);
+    put_u16(&mut extensions, (exchange.share.len() + 4) as u16);
+    put_u16(&mut extensions, exchange.group);
+    put_u16(&mut extensions, exchange.share.len() as u16);
+    extensions.extend_from_slice(&exchange.share);
     if resumed {
         // pre_shared_key: the first (and only considered) identity.
         put_u16(&mut extensions, 0x0029);
@@ -601,8 +624,181 @@ mod tests {
         assert_eq!(info.server_name.as_deref(), Some("example.com"));
         assert_eq!(info.session_id.len(), 32);
         assert!(info.tls13);
+        // The standalone X25519 share, not the X25519 half of the hybrid
+        // share, which has a key of its own in Chrome's shape.
         assert_eq!(info.x25519_share, Some(hello.secrets.x25519_public()));
+        assert_ne!(info.x25519_share, hello.secrets.hybrid_x25519_public());
         assert!(info.cipher_suites.contains(&0x1301));
+    }
+
+    /// The X25519MLKEM768 exchange of a server that prefers the hybrid group
+    /// when the client offers it, as Go's crypto/tls (and with it Xray's
+    /// REALITY) and the ANX server do: ML-KEM-768 encapsulation to the
+    /// client's key, and X25519 with the X25519 half of the client's hybrid
+    /// share, not with its standalone X25519 share.
+    fn hybrid_exchange(hello: &ClientHelloInfo) -> io::Result<KeyExchange> {
+        use ml_kem::kem::Encapsulate;
+        use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
+        type KemEncapKey = <MlKem768 as KemCore>::EncapsulationKey;
+
+        let parsed = crate::ja::parse_client_hello(&hello.message)?;
+        let shares = parsed
+            .extension(0x0033)
+            .ok_or_else(|| invalid_data("client sent no key_share"))?;
+        let mut hybrid = None;
+        let mut at = 2;
+        while let Some(header) = shares.get(at..at + 4) {
+            let group = u16::from_be_bytes([header[0], header[1]]);
+            let len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+            if group == GROUP_X25519_MLKEM768 {
+                hybrid = shares.get(at + 4..at + 4 + len);
+            }
+            at += 4 + len;
+        }
+        let hybrid = hybrid
+            .filter(|share| share.len() == MLKEM768_ENCAPSULATION_LEN + 32)
+            .ok_or_else(|| invalid_data("client sent no X25519MLKEM768 key share"))?;
+        let encoded = Encoded::<KemEncapKey>::try_from(&hybrid[..MLKEM768_ENCAPSULATION_LEN])
+            .map_err(|_| invalid_data("invalid ML-KEM encapsulation key"))?;
+        let mut rng = rand_core::OsRng;
+        let (ciphertext, mlkem_shared) = KemEncapKey::from_bytes(&encoded)
+            .encapsulate(&mut rng)
+            .map_err(|_| invalid_data("ML-KEM encapsulation failed"))?;
+        let peer: [u8; 32] = hybrid[MLKEM768_ENCAPSULATION_LEN..]
+            .try_into()
+            .map_err(|_| invalid_data("invalid X25519 key share"))?;
+        let secret = StaticSecret::random_from_rng(rng);
+        let x25519_shared = secret.diffie_hellman(&PublicKey::from(peer)).to_bytes();
+        let mut share = ciphertext.as_slice().to_vec();
+        share.extend_from_slice(&PublicKey::from(&secret).to_bytes());
+        let mut shared = mlkem_shared.as_slice().to_vec();
+        shared.extend_from_slice(&x25519_shared);
+        Ok(KeyExchange {
+            group: GROUP_X25519_MLKEM768,
+            share,
+            shared,
+        })
+    }
+
+    /// A server that selects X25519MLKEM768: the client finishes the full
+    /// and the resumed handshake with the key of its hybrid share's X25519
+    /// half, which is not the standalone share's key in Chrome's and Safari's
+    /// shape and is in Firefox's.
+    #[tokio::test]
+    async fn completes_and_resumes_handshakes_in_which_the_server_selects_x25519mlkem768() {
+        use crate::fingerprint::HybridX25519;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (fingerprint, hybrid_x25519) in [
+            (Fingerprint::Chrome, HybridX25519::Separate),
+            (Fingerprint::Safari, HybridX25519::Separate),
+            (Fingerprint::Firefox, HybridX25519::Shared),
+        ] {
+            // Full handshake, in which the server issues a ticket.
+            let (signer, chain) = test_identity();
+            let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+            let server_chain = chain.clone();
+            let server = tokio::spawn(async move {
+                let mut consumed = Vec::new();
+                let message = read_client_hello(&mut server_io, &mut consumed)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    crate::ja::parse_client_hello(&message)
+                        .unwrap()
+                        .hybrid_x25519(),
+                    Some(hybrid_x25519)
+                );
+                let hello = parse_client_hello(&message).unwrap();
+                let suite = SUITES
+                    .into_iter()
+                    .find(|suite| hello.cipher_suites.contains(&suite.id()))
+                    .unwrap();
+                let identity = ServerIdentity {
+                    certificate_chain: &server_chain,
+                    signer: &signer,
+                    alpn: &[b"h2".to_vec()],
+                };
+                let mut tls = accept_with(
+                    server_io,
+                    &hello,
+                    suite,
+                    identity.alpn,
+                    Auth::Certificate(&identity),
+                    hybrid_exchange,
+                )
+                .await
+                .unwrap();
+                assert!(!tls.resumed());
+                let mut buf = [0u8; 5];
+                tls.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello");
+                let psk = tls
+                    .queue_session_ticket(3600, 0x0a0b_0c0d, &[2], TICKET, 0)
+                    .unwrap();
+                tls.write_all(b"world").await.unwrap();
+                tls.flush().await.unwrap();
+                (suite, psk)
+            });
+
+            let config = crate::ClientConfig::new("hybrid.test", fingerprint);
+            let mut hooks = TrustLeaf(chain[0].clone());
+            let mut tls = crate::connect(client_io, &config, &mut hooks)
+                .await
+                .unwrap();
+            assert!(!tls.resumed());
+            assert_eq!(tls.alpn_protocol(), Some(&b"h2"[..]));
+            tls.write_all(b"hello").await.unwrap();
+            tls.flush().await.unwrap();
+            let mut buf = [0u8; 5];
+            tls.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"world");
+            let (suite, psk) = server.await.unwrap();
+            let ticket = tls.take_session_tickets().pop().expect("session ticket");
+            assert_eq!(ticket.psk, psk);
+
+            // Resumption with that ticket; the server selects the hybrid
+            // group again.
+            let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+            let server = tokio::spawn(async move {
+                let mut consumed = Vec::new();
+                let message = read_client_hello(&mut server_io, &mut consumed)
+                    .await
+                    .unwrap();
+                let offer = parse_psk_offer(&message).unwrap().expect("psk offer");
+                assert_eq!(offer.identity, TICKET);
+                assert!(psk_binder_valid(&message, &offer, suite, &psk));
+                let hello = parse_client_hello(&message).unwrap();
+                let mut tls = accept_with(
+                    server_io,
+                    &hello,
+                    suite,
+                    &[b"h2".to_vec()],
+                    Auth::Psk(&psk),
+                    hybrid_exchange,
+                )
+                .await
+                .unwrap();
+                assert!(tls.resumed());
+                let mut buf = [0u8; 5];
+                tls.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"again");
+                tls.write_all(b"again").await.unwrap();
+                tls.flush().await.unwrap();
+            });
+
+            let mut tls =
+                crate::connect_resuming(client_io, &config, &mut NoCertificate, Some(&ticket))
+                    .await
+                    .unwrap();
+            assert!(tls.resumed());
+            tls.write_all(b"again").await.unwrap();
+            tls.flush().await.unwrap();
+            let mut buf = [0u8; 5];
+            tls.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"again");
+            server.await.unwrap();
+        }
     }
 
     #[test]

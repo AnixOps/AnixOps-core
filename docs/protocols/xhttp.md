@@ -58,7 +58,7 @@ XHTTP（旧名 SplitHTTP）是 Xray-core 的 HTTP 传输：把一条代理流拆
 
 入站同时配置 `reality` 和 XHTTP `transport` 时，通过 REALITY 认证的连接交给 XHTTP 服务端（第 3.1 节）处理；未通过认证的连接照常转给 `handshake` 站点。
 
-HTTP/3 时每条代理流建立一条 QUIC 连接（TLS 1.3，ALPN `h3`，复用 `transport-quic`），请求与 HTTP/2 相同；各模式的行为与 HTTP/2 一致。
+HTTP/3 时每条代理流建立一条 QUIC 连接（TLS 1.3，ALPN `h3`，复用 `transport-quic`），请求与 HTTP/2 相同；各模式的行为与 HTTP/2 一致。QUIC 连接经出站的拨号器建立（`QuicConnector::connect_through`）：直连时自己开受保护的 UDP 套接字；节点写了 `via`（或宿主注入了自己的拨号器）时，数据报经 `Dialer::open_datagram` 发出，服务器域名由前置节点（或宿主拨号器）解析。前置节点不转发 UDP 时连接报错，不会改为直连（见 docs/architecture/outbound-via.md）。
 
 服务端在 TCP 上不看 ALPN：连接以 HTTP/2 前言（`PRI * HTTP/2.0…`）开头时按 HTTP/2（含明文 h2c）处理，否则按 HTTP/1.1。入站的 `alpn` 含 `h3` 时，UDP 上的 QUIC 连接按 HTTP/3 处理（第 3.1 节）。
 
@@ -121,7 +121,7 @@ Xray 较新版本的可选混淆参数（填充位置、会话/序号位置、�
 - 服务端：`node-runtime/tests/client_interop.rs` 让 Xray 客户端以同样五种组合连接本内核的 VLESS + XHTTP 入站，回显 256 KB、再开一条连接，并做 XUDP 的 UDP 回显。
 - REALITY：客户端测试另连 Xray 的 VLESS + REALITY + XHTTP 入站，以 `auto`（即 `stream-one`）、`stream-up`、`packet-up` 三种模式各测一次；服务端测试让 Xray 客户端以同样三种模式连接本内核的 VLESS + REALITY + XHTTP 入站。
 - HTTP/3：客户端测试另连 Xray 的 VLESS + XHTTP 入站（TLS ALPN 仅 `h3`，监听 UDP），以 `packet-up`、`stream-up`、`stream-one` 各测一次；服务端测试让 Xray 客户端（ALPN 仅 `h3`）以 `auto`（即 `packet-up`）、`stream-up`、`stream-one` 连接本内核 `alpn` 为 `h3` 的 VLESS + XHTTP 入站（`vless-tls-xhttp-h3*`）。**[待实测]** 这三项尚未在 CI 中跑过。
-- 本地：`transport-xhttp/tests/loopback.rs` 让本实现的客户端与服务端在 h1 `packet-up` 和 h2c 三种模式下互相回显；`inbound-transport/tests/xhttp_http3.rs` 让本实现的客户端以 HTTP/3 三种模式连接入站的 QUIC 一侧，再以 HTTP/2 连接同端口的 TCP 一侧。
+- 本地：`transport-xhttp/tests/loopback.rs` 让本实现的客户端与服务端在 h1 `packet-up` 和 h2c 三种模式下互相回显；`inbound-transport/tests/xhttp_http3.rs` 让本实现的客户端以 HTTP/3 三种模式连接入站的 QUIC 一侧，再以 HTTP/2 连接同端口的 TCP 一侧；另以三种模式经一个只转发 UDP 的前置节点（`OutboundDialer`）连接一个系统解析器解析不了的服务器名，断言 QUIC 走前置节点、域名交给前置节点；前置节点不转发 UDP 时断言连接报 `Unsupported` 而不是直连。
 
 ## 7. 后续
 

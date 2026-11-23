@@ -1,6 +1,7 @@
-//! No path sends a proxied name to a resolver in the clear.
+//! No path sends a proxied name to a resolver in the clear, and the direct
+//! mode sends no DNS query through a node.
 //!
-//! Three paths are checked, each with test outbounds that record every
+//! Four paths are checked, each with test outbounds that record every
 //! connection and answer DNS over TCP:
 //!
 //! 1. a name routed to the proxy goes out by name, and a `proxy` DNS server
@@ -9,7 +10,11 @@
 //!    (proxied unless a DNS rule picks a `direct` server), never the system
 //!    resolver;
 //! 3. only bootstrap names (a `direct` server's own host name) go DIRECT; a
-//!    `proxy` server given by name is handed to the node by name.
+//!    `proxy` server given by name is handed to the node by name;
+//! 4. the direct mode (the desktop clients' direct envelope included) asks
+//!    every server directly, for the tunnel and for the name of a Fake-IP
+//!    flow alike, so it keeps working with every node down; and an answer
+//!    it got in the clear never serves an IP rule afterwards.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -17,12 +22,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use config_core::routing::{PolicyGroupSpec, RouteOutcome, RoutingSpec};
-use engine_embedded::config::{DnsConfig, DnsRuleConfig, DnsServerConfig, DnsVia};
+use engine_embedded::config::{
+    DnsConfig, DnsRuleConfig, DnsServerConfig, DnsVia, FakeIpConfig, RuntimeConfig,
+};
 use engine_embedded::connections::{Dispatcher, Mode};
+use engine_embedded::direct::DirectOutbound;
 use engine_embedded::dns_policy::DnsPolicy;
 use engine_embedded::dns_resolver::PolicyResolver;
+use engine_embedded::fake_ip::FakeIpPool;
+use engine_embedded::profile::{envelope_for_mode, RoutingMode};
 use engine_embedded::routing::{DomainResolver, RoutedOutbound};
-use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound};
+use engine_outbound::registry::{BuildError, OutboundFactory, OutboundRegistry, Settings};
+use engine_outbound::{BoxFuture, BoxStream, Dialer, OutboundDialer, TargetAddr, TcpOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One connection an outbound was asked for: the outbound and the target.
@@ -127,6 +138,18 @@ impl Outbounds {
                 ("www.blocked.example", [198, 51, 100, 9]),
             ]),
         })
+    }
+
+    /// The engine's own DIRECT outbound (what Fake-IP resolution looks for),
+    /// its connections recorded as `direct`.
+    fn direct(&self) -> Arc<dyn TcpOutbound> {
+        Arc::new(DirectOutbound::new(self.dialer()))
+    }
+
+    /// The dialer of [`Self::direct`]: through a recording outbound, so the
+    /// DIRECT connections are recorded and answered like the nodes'.
+    fn dialer(&self) -> Arc<dyn Dialer> {
+        Arc::new(OutboundDialer(self.make("direct")))
     }
 
     fn hits(&self) -> Vec<(&'static str, String)> {
@@ -290,7 +313,7 @@ fn cn_direct(outbounds: &Outbounds) -> Arc<RoutedOutbound> {
     };
     let resolver = PolicyResolver::new(Arc::new(DnsPolicy::from_config(&dns_config()).unwrap()));
     let routed = Arc::new(
-        RoutedOutbound::new(&spec, outbounds.make("direct"), nodes)
+        RoutedOutbound::new(&spec, outbounds.direct(), nodes)
             .unwrap()
             .with_resolver(resolver.clone()),
     );
@@ -372,5 +395,158 @@ fn only_direct_servers_and_their_rule_names_go_direct() {
             outbounds.hits(),
             [("direct", "dns.alidns.com:443".to_string())]
         );
+    });
+}
+
+// Path 4: the direct mode asks every server directly.
+
+/// A node that is down: every connection to it is recorded, then refused.
+struct Down(Hits);
+
+impl TcpOutbound for Down {
+    fn protocol(&self) -> &'static str {
+        "test-node"
+    }
+
+    fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        self.0.lock().unwrap().push(("hk-1", target_string(target)));
+        Box::pin(async { Err(io::ErrorKind::ConnectionRefused.into()) })
+    }
+}
+
+/// Builds every outbound of type `node` as a node that is [`Down`].
+struct DownNodes(Hits);
+
+impl OutboundFactory for DownNodes {
+    fn type_name(&self) -> &'static str {
+        "node"
+    }
+
+    fn build(
+        &self,
+        _settings: &Settings,
+        _dialer: Arc<dyn Dialer>,
+    ) -> Result<Arc<dyn TcpOutbound>, BuildError> {
+        Ok(Arc::new(Down(self.0.clone())))
+    }
+}
+
+/// An imported subscription in miniature: one node behind a select group,
+/// Fake-IP on and no `dns` servers, so DNS goes to the built-in `proxy`
+/// server 1.1.1.1:53.
+fn subscription() -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "profile_id": "subscription",
+        "routing": {
+            "outbounds": { "hk-1": { "type": "node" } },
+            "groups": [{ "id": "Proxy", "type": "select", "members": ["hk-1"] }],
+            "rules": ["FINAL,Proxy"],
+        },
+        "dns": { "fake_ip": { "enabled": true } },
+    })
+    .to_string()
+}
+
+/// The dispatcher the engine builds for `envelope`: its nodes [`Down`], its
+/// DIRECT outbound recorded as `direct`.
+fn engine_dispatcher(envelope: &str, outbounds: &Outbounds) -> Dispatcher {
+    let config = RuntimeConfig::from_json(envelope.as_bytes()).expect("the envelope is valid");
+    let mut registry = OutboundRegistry::new();
+    registry.register(Arc::new(DownNodes(outbounds.hits.clone())));
+    let routed = config
+        .build_routed(&registry, outbounds.dialer())
+        .expect("the routing section builds");
+    config
+        .build_dispatcher(routed, &registry, outbounds.dialer())
+        .expect("the dispatcher builds")
+}
+
+#[test]
+fn the_direct_envelope_needs_no_node_for_dns() {
+    let outbounds = Outbounds::new();
+    let profile = subscription();
+
+    // The rule mode asks the `proxy` server through the node.
+    let rule = engine_dispatcher(
+        &envelope_for_mode(&profile, RoutingMode::Rule).unwrap(),
+        &outbounds,
+    );
+    assert_eq!(rule.mode(), Mode::Rule);
+    runtime().block_on(connect_via(&rule, DnsVia::Proxy, &ip("1.1.1.1:53")));
+    assert_eq!(outbounds.hits(), [("hk-1", "1.1.1.1:53".to_string())]);
+
+    // The direct envelope runs the engine in the direct mode: the tunnel's
+    // query and the name of a Fake-IP flow go to the server directly, so
+    // both work while the node is down.
+    let direct = engine_dispatcher(
+        &envelope_for_mode(&profile, RoutingMode::Direct).unwrap(),
+        &outbounds,
+    );
+    assert_eq!(direct.mode(), Mode::Direct);
+    runtime().block_on(async {
+        connect_via(&direct, DnsVia::Proxy, &ip("1.1.1.1:53")).await;
+        let pool = direct.fake_ip().expect("fake-ip is on");
+        let flow = TargetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(pool.assign("www.blocked.example")),
+            443,
+        ));
+        direct
+            .connect_flow(&flow, None)
+            .await
+            .expect("a direct flow needs no node");
+    });
+    assert_eq!(
+        outbounds.hits(),
+        [
+            ("direct", "1.1.1.1:53".to_string()),
+            ("direct", "1.1.1.1:53".to_string()),
+            ("direct", "198.51.100.9:443".to_string()),
+        ]
+    );
+    assert_eq!(outbounds.asked(), ["www.blocked.example"]);
+}
+
+#[test]
+fn fake_ip_names_resolve_directly_in_the_direct_mode_and_apart() {
+    let outbounds = Outbounds::new();
+    let pool = FakeIpPool::from_config(&FakeIpConfig {
+        enabled: true,
+        ..FakeIpConfig::default()
+    })
+    .unwrap()
+    .unwrap();
+    let dispatcher = Dispatcher::routed(cn_direct(&outbounds)).with_fake_ip(Some(pool.clone()));
+    let flow = TargetAddr::Ip(SocketAddr::new(
+        IpAddr::V4(pool.assign("www.blocked.example")),
+        443,
+    ));
+
+    runtime().block_on(async {
+        // The direct mode asks the `proxy` server directly and dials the
+        // address it gives: the node carries nothing, not even the query.
+        dispatcher.set_mode(Mode::Direct);
+        dispatcher.connect_flow(&flow, None).await.unwrap();
+        assert_eq!(
+            outbounds.hits(),
+            [
+                ("direct", "1.1.1.1:53".to_string()),
+                ("direct", "198.51.100.9:443".to_string()),
+            ]
+        );
+        assert_eq!(outbounds.asked(), ["www.blocked.example"]);
+
+        // Back in the rule mode the IP rule does not take that answer, which
+        // came in the clear: the name is asked again, through the node.
+        dispatcher.set_mode(Mode::Rule);
+        dispatcher.connect_flow(&flow, None).await.unwrap();
+        assert_eq!(
+            outbounds.hits(),
+            [
+                ("hk-1", "1.1.1.1:53".to_string()),
+                ("hk-1", "www.blocked.example:443".to_string()),
+            ]
+        );
+        assert_eq!(outbounds.asked(), ["www.blocked.example"]);
     });
 }

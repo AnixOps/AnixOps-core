@@ -11,6 +11,13 @@
 //! or `system` one through the DIRECT outbound, raced and with the fallback
 //! as [`crate::dns_client`] does, the same way the tunnel forwards an app's
 //! query. Answers are kept for their TTL.
+//!
+//! The direct mode sends nothing through a node: a Fake-IP flow that goes
+//! DIRECT there is resolved with [`DomainResolver::resolve_direct`], which
+//! asks every server through the DIRECT outbound, as the tunnel forwards a
+//! query in that mode. Those answers are kept apart from the others, so an
+//! answer a `proxy` server gave in the clear never reaches an IP rule after
+//! the switch back to the rule mode.
 
 use std::collections::HashMap;
 use std::io;
@@ -40,8 +47,17 @@ pub struct PolicyResolver {
     policy: Arc<DnsPolicy>,
     routed: OnceLock<Weak<RoutedOutbound>>,
     pools: DnsPools,
-    cache: Mutex<HashMap<String, (IpAddr, Instant)>>,
+    cache: Mutex<HashMap<CacheKey, (IpAddr, Instant)>>,
     next_id: AtomicU16,
+}
+
+/// A cached answer: the name, and whether `proxy` servers were reached
+/// through the proxy (`false` in the direct mode, where every server is
+/// asked directly).
+#[derive(PartialEq, Eq, Hash)]
+struct CacheKey {
+    name: String,
+    proxied: bool,
 }
 
 impl PolicyResolver {
@@ -63,10 +79,15 @@ impl PolicyResolver {
         let _ = self.routed.set(Arc::downgrade(routed));
     }
 
-    async fn lookup(&self, domain: &str) -> io::Result<IpAddr> {
-        let name = domain.trim_end_matches('.').to_ascii_lowercase();
+    /// The address of `domain`, with `proxy` servers reached through the
+    /// proxy when `proxied`, else (the direct mode) directly.
+    async fn lookup(&self, domain: &str, proxied: bool) -> io::Result<IpAddr> {
+        let key = CacheKey {
+            name: domain.trim_end_matches('.').to_ascii_lowercase(),
+            proxied,
+        };
         let now = Instant::now();
-        if let Some((address, expires)) = self.cached(&name) {
+        if let Some((address, expires)) = self.cached(&key) {
             if expires > now {
                 return Ok(address);
             }
@@ -77,7 +98,7 @@ impl PolicyResolver {
             })?;
         for qtype in [TYPE_A, TYPE_AAAA] {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let query = dns::query(id, &name, qtype)
+            let query = dns::query(id, &key.name, qtype)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid domain"))?;
             let Some(question) = dns::question(&query) else {
                 return Err(io::Error::new(
@@ -87,10 +108,10 @@ impl PolicyResolver {
             };
             let response = match self.policy.plan(&query, Some(routed.rule_sets())) {
                 Plan::Local(response) => response,
-                Plan::Forward(server) => self.forward(&routed, server, &query).await?,
+                Plan::Forward(server) => self.forward(&routed, server, &query, key.proxied).await?,
             };
             if let Some((address, ttl)) = dns_cache::first_address(&response, &question) {
-                self.remember(name, address, now + ttl.min(MAX_CACHE_TTL));
+                self.remember(key, address, now + ttl.min(MAX_CACHE_TTL));
                 return Ok(address);
             }
         }
@@ -105,12 +126,15 @@ impl PolicyResolver {
         routed: &RoutedOutbound,
         target: usize,
         query: &[u8],
+        proxied: bool,
     ) -> io::Result<Vec<u8>> {
         // Routing that rejects a proxied server gives no outbound for it.
+        // Without `proxied` (the direct mode) every server is asked
+        // directly, as the tunnel does in that mode.
         let outbound_for = |index: usize| -> Option<Arc<dyn TcpOutbound>> {
             let server = &self.policy.servers()[index];
             match (server.via, server.upstream.target()) {
-                (DnsVia::Proxy, Some(address)) => {
+                (DnsVia::Proxy, Some(address)) if proxied => {
                     routed.dns_outbound_as(address, server.upstream.rule_protocol())
                 }
                 _ => Some(routed.direct().clone()),
@@ -121,29 +145,33 @@ impl PolicyResolver {
             .map_err(|failure| io::Error::other(failure.as_str()))
     }
 
-    fn cached(&self, name: &str) -> Option<(IpAddr, Instant)> {
+    fn cached(&self, key: &CacheKey) -> Option<(IpAddr, Instant)> {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(name)
+            .get(key)
             .copied()
     }
 
-    fn remember(&self, name: String, address: IpAddr, expires: Instant) {
+    fn remember(&self, key: CacheKey, address: IpAddr, expires: Instant) {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.len() >= MAX_CACHED && !cache.contains_key(&name) {
+        if cache.len() >= MAX_CACHED && !cache.contains_key(&key) {
             let now = Instant::now();
             cache.retain(|_, (_, expires)| *expires > now);
             if cache.len() >= MAX_CACHED {
                 cache.clear();
             }
         }
-        cache.insert(name, (address, expires));
+        cache.insert(key, (address, expires));
     }
 }
 
 impl DomainResolver for PolicyResolver {
     fn resolve<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>> {
-        Box::pin(self.lookup(domain))
+        Box::pin(self.lookup(domain, true))
+    }
+
+    fn resolve_direct<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>> {
+        Box::pin(self.lookup(domain, false))
     }
 }

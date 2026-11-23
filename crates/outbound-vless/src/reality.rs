@@ -4,7 +4,11 @@
 //! session id:
 //!
 //! * `auth_key = HKDF-SHA256(ikm = X25519(client_ephemeral, server_public),
-//!   salt = random[0..20], info = "REALITY")`
+//!   salt = random[0..20], info = "REALITY")`, where `client_ephemeral` is
+//!   the key of the ClientHello's standalone X25519 key share
+//!   ([`HelloContext::x25519_shared`]): servers read that share before the
+//!   X25519 half of the X25519MLKEM768 share, which has a key of its own
+//!   except in the Firefox fingerprints
 //! * session id plaintext = version (3 bytes), 0, unix time (u32 BE),
 //!   short id (8 bytes)
 //! * session id = AES-256-GCM(auth_key, nonce = random[20..32],

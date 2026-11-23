@@ -208,6 +208,20 @@ pub const NODE_METADATA_TLS_SERVER_NAME: &str = "tls.server_name";
 pub const NODE_METADATA_TLS_ENABLED: &str = "tls.enabled";
 pub const NODE_METADATA_TLS_INSECURE: &str = "tls.insecure";
 pub const NODE_METADATA_TLS_ALPN: &str = "tls.alpn";
+/// Certificate pins: SHA-256 digests of the server's whole leaf certificate
+/// (DER), comma-separated, in lowercase hex (Hysteria2 `pinSHA256`, Xray
+/// `pcs`, sing-box `certificate_sha256`, Clash `fingerprint`, Surge
+/// `server-cert-fingerprint-sha256`, Loon and Quantumult X
+/// `tls-cert-sha256`). The leaf has to match one of these or one of
+/// [`NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256`], with or without
+/// `tls.insecure`.
+pub const NODE_METADATA_TLS_CERTIFICATE_SHA256: &str = "tls.certificate_sha256";
+/// Public key pins: SHA-256 digests of the leaf certificate's
+/// SubjectPublicKeyInfo (DER), comma-separated, in standard base64 (sing-box
+/// `certificate_public_key_sha256`, Loon and Quantumult X
+/// `tls-pubkey-sha256`). Imports before [`NODE_METADATA_TLS_CERTIFICATE_SHA256`]
+/// existed kept share-link certificate pins here in hex; a hex value here is
+/// read as a certificate pin.
 pub const NODE_METADATA_TLS_CERTIFICATE_PUBLIC_KEY_SHA256: &str =
     "tls.certificate_public_key_sha256";
 pub const NODE_METADATA_TLS_UTLS_FINGERPRINT: &str = "tls.utls.fingerprint";

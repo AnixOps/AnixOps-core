@@ -3,9 +3,11 @@
 //!
 //! This is how a fingerprint is checked against its target: capture the real
 //! browser's first flight, build ours for the same server name and ALPN, and
-//! compare their JA4 and JA3 (`.github/workflows/browser-fingerprints.yml`
-//! does it for every browser it can run). [`spec_from_hello`] turns a capture
-//! into a profile, which is how a new browser release is followed.
+//! compare their JA4 and JA3, and whether the X25519MLKEM768 key share reuses
+//! the X25519 share's key ([`Hello::hybrid_x25519`]), which JA3 and JA4 do
+//! not see (`.github/workflows/browser-fingerprints.yml` does it for every
+//! browser it can run). [`spec_from_hello`] turns a capture into a profile,
+//! which is how a new browser release is followed.
 //!
 //! - JA3: `version,ciphers,extensions,groups,point_formats` in decimal, GREASE
 //!   removed, MD5. Chrome permutes its extensions, so its JA3 changes on every
@@ -21,7 +23,10 @@ use std::io;
 use ring::digest;
 
 use crate::crypto::invalid_data;
-use crate::fingerprint::{is_grease, ClientHelloSpec, Code, Extension};
+use crate::fingerprint::{
+    is_grease, ClientHelloSpec, Code, Extension, HybridX25519, GROUP_X25519, GROUP_X25519_MLKEM768,
+    MLKEM768_ENCAPSULATION_KEY_LEN,
+};
 
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_STATUS_REQUEST: u16 = 0x0005;
@@ -211,6 +216,37 @@ impl Hello {
         protocols
     }
 
+    /// Whether the X25519MLKEM768 key share ends with the X25519 share's key
+    /// ([`HybridX25519::Shared`], as Firefox sends it) or with another one
+    /// ([`HybridX25519::Separate`], as Chrome, Edge and Safari do); `None`
+    /// unless the ClientHello has both shares.
+    pub fn hybrid_x25519(&self) -> Option<HybridX25519> {
+        let body = self.extension(EXT_KEY_SHARE)?;
+        let mut hybrid = None;
+        let mut x25519 = None;
+        let mut at = 2;
+        while let Some(header) = body.get(at..at + 4) {
+            let group = u16::from_be_bytes([header[0], header[1]]);
+            let len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+            let share = body.get(at + 4..at + 4 + len)?;
+            match group {
+                GROUP_X25519_MLKEM768 if hybrid.is_none() => hybrid = Some(share),
+                GROUP_X25519 if x25519.is_none() => x25519 = Some(share),
+                _ => {}
+            }
+            at += 4 + len;
+        }
+        let (hybrid, x25519) = (hybrid?, x25519?);
+        if hybrid.len() != MLKEM768_ENCAPSULATION_KEY_LEN + 32 || x25519.len() != 32 {
+            return None;
+        }
+        Some(if hybrid[MLKEM768_ENCAPSULATION_KEY_LEN..] == *x25519 {
+            HybridX25519::Shared
+        } else {
+            HybridX25519::Separate
+        })
+    }
+
     fn groups(&self) -> Vec<u16> {
         self.extension(EXT_SUPPORTED_GROUPS)
             .map(|body| u16_list(body, 2))
@@ -374,8 +410,9 @@ fn codes(values: &[u16]) -> Vec<Code> {
 }
 
 /// A profile that reproduces a captured ClientHello: GREASE values become
-/// `"grease"`, key shares keep only their groups, the server name and ALPN
-/// come from the connection, ECH and padding become the generated
+/// `"grease"`, key shares keep their groups and whether the hybrid share
+/// reuses the X25519 share's key ([`Hello::hybrid_x25519`]), the server name
+/// and ALPN come from the connection, ECH and padding become the generated
 /// extensions, a pre_shared_key (resumption) is dropped, and any extension
 /// this crate has no name for is kept as `raw`. Whether the browser permutes
 /// its extensions cannot be seen in one capture, so the caller says.
@@ -403,7 +440,10 @@ pub fn spec_from_hello(hello: &Hello, permute_extensions: bool) -> io::Result<Cl
                     groups.push(code(u16::from_be_bytes([header[0], header[1]])));
                     at += 4 + usize::from(u16::from_be_bytes([header[2], header[3]]));
                 }
-                Extension::KeyShare(groups)
+                Extension::KeyShare {
+                    groups,
+                    hybrid_x25519: hello.hybrid_x25519().unwrap_or_default(),
+                }
             }
             EXT_PSK_KEY_EXCHANGE_MODES => {
                 Extension::PskKeyExchangeModes(body.get(1..).unwrap_or_default().to_vec())

@@ -25,12 +25,19 @@
 //! 16-bit code points are `"0x…"` strings (plain JSON numbers are accepted
 //! too); `"grease"` in a list is replaced by a GREASE value on every
 //! connection. Extensions without parameters may be written as a bare string.
+//!
+//! `key_share` takes `"hybrid_x25519": "shared"` when the browser uses the
+//! key of its X25519 share for the X25519 half of its X25519MLKEM768 share as
+//! well (Firefox). The default, `"separate"`, gives the hybrid share a key of
+//! its own (Chrome, Edge, Safari); it is left out when a profile is written,
+//! so such profiles stay readable by builds that predate the key. Those
+//! builds reject a profile that has it, and with it the whole bundle.
 
 use std::io;
 
 use serde_json::{json, Map, Value};
 
-use crate::fingerprint::{ClientHelloSpec, Code, Extension};
+use crate::fingerprint::{ClientHelloSpec, Code, Extension, HybridX25519};
 
 /// Largest profile or bundle document accepted.
 pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
@@ -215,6 +222,16 @@ fn parse_hex(value: &Value, what: &str) -> io::Result<Vec<u8>> {
         .collect()
 }
 
+fn parse_hybrid_x25519(value: &Value, what: &str) -> io::Result<HybridX25519> {
+    match value.as_str() {
+        Some("separate") => Ok(HybridX25519::Separate),
+        Some("shared") => Ok(HybridX25519::Shared),
+        _ => Err(bad(format!(
+            "{what}: hybrid_x25519 must be \"separate\" or \"shared\", got {value}"
+        ))),
+    }
+}
+
 /// Looks up one parameter of an extension; a bare string has none.
 fn param<'a>(
     fields: &mut Option<Fields<'a>>,
@@ -265,9 +282,13 @@ fn parse_extension(value: &Value) -> io::Result<Extension> {
             &what,
         )?),
         "signed_certificate_timestamp" => Extension::SignedCertificateTimestamp,
-        "key_share" => {
-            Extension::KeyShare(parse_codes(param(&mut fields, &what, "groups")?, &what)?)
-        }
+        "key_share" => Extension::KeyShare {
+            groups: parse_codes(param(&mut fields, &what, "groups")?, &what)?,
+            hybrid_x25519: match param(&mut fields, &what, "hybrid_x25519") {
+                Ok(value) => parse_hybrid_x25519(value, &what)?,
+                Err(_) => HybridX25519::Separate,
+            },
+        },
         "psk_key_exchange_modes" => {
             Extension::PskKeyExchangeModes(parse_u8s(param(&mut fields, &what, "modes")?, &what)?)
         }
@@ -378,7 +399,19 @@ fn extension_json(extension: &Extension) -> Value {
             json!({ "type": "signature_algorithms", "schemes": codes_json(schemes) })
         }
         Extension::SignedCertificateTimestamp => bare("signed_certificate_timestamp"),
-        Extension::KeyShare(groups) => json!({ "type": "key_share", "groups": codes_json(groups) }),
+        // The default is left out: see the module documentation.
+        Extension::KeyShare {
+            groups,
+            hybrid_x25519: HybridX25519::Separate,
+        } => json!({ "type": "key_share", "groups": codes_json(groups) }),
+        Extension::KeyShare {
+            groups,
+            hybrid_x25519: HybridX25519::Shared,
+        } => json!({
+            "type": "key_share",
+            "groups": codes_json(groups),
+            "hybrid_x25519": "shared",
+        }),
         Extension::PskKeyExchangeModes(modes) => {
             json!({ "type": "psk_key_exchange_modes", "modes": modes })
         }

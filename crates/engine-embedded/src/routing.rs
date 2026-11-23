@@ -343,6 +343,14 @@ type Latencies = BTreeMap<String, BTreeMap<String, u32>>;
 /// Looks up a domain for IP rules that allow resolution.
 pub trait DomainResolver: Send + Sync {
     fn resolve<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>>;
+
+    /// [`Self::resolve`] for the direct mode, where nothing goes through a
+    /// node: a resolver that reaches `proxy` DNS servers through the proxy
+    /// asks every server directly instead. The default is [`Self::resolve`],
+    /// for resolvers that never use the proxy.
+    fn resolve_direct<'a>(&'a self, domain: &'a str) -> BoxFuture<'a, io::Result<IpAddr>> {
+        self.resolve(domain)
+    }
 }
 
 /// The operating system resolver (`getaddrinfo`), first address returned.
@@ -799,10 +807,12 @@ impl RoutedOutbound {
             .collect()
     }
 
-    /// Downloads every remote rule set when it is due, forever: right away
-    /// when it starts empty, then every interval, sooner after a failure or
-    /// when [`RuleSetStore::refresh_now`] asks. Never returns when there are
-    /// no remote sets.
+    /// Downloads every remote rule set when it is due, forever: first as
+    /// [`RuleSetStore::first_update_delay`] says (right away when the set
+    /// starts empty, or an interval after the download the cache directory
+    /// kept), then every interval, sooner after a failure or when
+    /// [`RuleSetStore::refresh_now`] asks. Never returns when there are no
+    /// remote sets.
     #[cfg(feature = "local-proxy")]
     pub async fn run_rule_set_updates(self: Arc<Self>) {
         use crate::rule_sets::RETRY_INTERVAL_SECS;
@@ -816,13 +826,7 @@ impl RoutedOutbound {
         let now = Instant::now();
         let mut due: Vec<Instant> = remotes
             .iter()
-            .map(|remote| {
-                if self.rule_sets.is_empty_set(&remote.name) {
-                    now
-                } else {
-                    now + Duration::from_secs(u64::from(remote.interval_secs))
-                }
-            })
+            .map(|remote| now + self.rule_sets.first_update_delay(remote))
             .collect();
         loop {
             for (remote, due) in remotes.iter().zip(due.iter_mut()) {
@@ -849,17 +853,18 @@ impl RoutedOutbound {
         }
     }
 
-    /// Downloads one remote set through its `via` target and installs it.
+    /// Downloads one remote set through its `via` target and installs it,
+    /// after keeping it in the cache directory when the config names one.
     #[cfg(feature = "local-proxy")]
     async fn update_rule_set(
         &self,
         remote: &crate::rule_sets::RemoteRuleSet,
     ) -> Result<(), &'static str> {
+        use crate::rule_sets::MAX_LIST_BYTES;
         use config_core::rule_set::{RuleSetBuilder, MAX_RULE_SET_ENTRIES};
         use std::time::Duration;
 
         const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
-        const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
 
         let node_ids = self.node_ids();
         let table = self.table();
@@ -876,33 +881,60 @@ impl RoutedOutbound {
         let body = crate::fetch::fetch(&*outbound, &remote.url, FETCH_TIMEOUT, MAX_LIST_BYTES)
             .await
             .map_err(crate::fetch::FetchError::as_str)?;
-        if let Some(signature) = &remote.signature {
-            let detached = crate::fetch::fetch(
-                &*outbound,
-                &signature.url,
-                FETCH_TIMEOUT,
-                crate::rule_sets::MAX_SIGNATURE_BYTES,
-            )
-            .await
-            .map_err(|_| "signature_missing")?;
-            crate::rule_sets::verify_list_signature(&signature.public_key, &body, &detached)?;
-        }
+        let detached = match &remote.signature {
+            Some(signature) => {
+                let detached = crate::fetch::fetch(
+                    &*outbound,
+                    &signature.url,
+                    FETCH_TIMEOUT,
+                    crate::rule_sets::MAX_SIGNATURE_BYTES,
+                )
+                .await
+                .map_err(|_| "signature_missing")?;
+                crate::rule_sets::verify_list_signature(&signature.public_key, &body, &detached)?;
+                Some(detached)
+            }
+            None => None,
+        };
         // Parsed straight into the compact tables; the body goes before they
         // are sorted and packed, so a large list never sits in memory twice.
         let (builder, _) = {
             let text = String::from_utf8_lossy(&body);
             RuleSetBuilder::parse_list(&text, remote.bare)
         };
-        drop(body);
         if builder.is_empty() {
             return Err("empty_list");
         }
         if builder.len() > MAX_RULE_SET_ENTRIES {
             return Err("too_many_entries");
         }
+        // Only a list that passed every check above is kept for the next
+        // start. The write runs on the blocking pool, off the threads that
+        // move packets, and takes the body with it.
+        let fetched_at_ms = crate::rule_sets::unix_millis();
+        let cache_error = match self.rule_sets.cache().cloned() {
+            Some(cache) => {
+                let remote = remote.clone();
+                tokio::task::spawn_blocking(move || {
+                    cache.store(&remote, detached.as_deref(), &body, fetched_at_ms)
+                })
+                .await
+                .unwrap_or(Err(crate::rule_set_cache::WRITE_FAILED))
+                .err()
+            }
+            None => {
+                drop(body);
+                None
+            }
+        };
         let skipped = builder.skipped().clone();
-        self.rule_sets
-            .replace(&remote.name, builder.build(), skipped);
+        self.rule_sets.replace_downloaded(
+            &remote.name,
+            builder.build(),
+            skipped,
+            fetched_at_ms,
+            cache_error,
+        );
         Ok(())
     }
 
@@ -942,7 +974,8 @@ impl RoutedOutbound {
         &self.direct
     }
 
-    /// The resolver of IP rules, also used for Fake-IP flows that go DIRECT.
+    /// The resolver of IP rules, also used for Fake-IP flows that go DIRECT
+    /// ([`DomainResolver::resolve_direct`] in the direct mode).
     pub fn resolver(&self) -> &Arc<dyn DomainResolver> {
         &self.resolver
     }
@@ -1079,7 +1112,8 @@ impl RoutedOutbound {
     /// that sends the server DIRECT (`FINAL,DIRECT` of a list-based config, a
     /// GeoIP rule for a domestic resolver) or REJECT never makes a proxied
     /// query go out in the clear, and a server name is never resolved here.
-    /// `None` when the global target rejects.
+    /// `None` when the global target rejects. This is the rule mode's
+    /// choice: the direct mode reaches every server directly and never asks.
     pub fn dns_outbound(&self, server: &TargetAddr) -> Option<Arc<dyn TcpOutbound>> {
         self.dns_outbound_as(server, None)
     }

@@ -1,7 +1,7 @@
 //! QUIC transport for QUIC-based protocols (Hysteria2, TUIC, ...): quinn
-//! over rustls, with TLS settings, roots and the `insecure` verifier from
-//! `transport-tls` on the client side, and [`server_endpoint`] for server
-//! inbounds.
+//! over rustls, with TLS settings, roots, certificate pins and `insecure`
+//! from `transport-tls` on the client side, and [`server_endpoint`] for
+//! server inbounds.
 //!
 //! [`QuicConnector`] resolves the server, binds a UDP socket of the matching
 //! family and returns an established [`QuicConnection`]; the protocol crate
@@ -10,7 +10,8 @@
 //! [`QuicConnector::with_salamander`] obfuscates every datagram with
 //! [`salamander::Salamander`]. [`QuicConnector::connect_over`] runs the
 //! connection on a proxied [`engine_outbound::UdpFlow`] instead
-//! ([`flow::FlowSocket`]).
+//! ([`flow::FlowSocket`]); [`QuicConnector::connect_through`] picks between
+//! the two by the [`engine_outbound::Dialer`] the caller was given.
 
 pub mod flow;
 pub mod salamander;
@@ -161,8 +162,45 @@ impl QuicConnector {
         })
     }
 
-    /// Resolves the server and completes the QUIC handshake, within a
-    /// timeout.
+    /// Completes the QUIC handshake with the server reached through
+    /// `dialer`, within a timeout. The system dialer
+    /// ([`engine_outbound::Dialer::is_system`]) gets a socket of this
+    /// connector's own, as [`QuicConnector::connect`]. Any other dialer (a
+    /// `via` chain, a host dialer with its own resolver) opens the datagram
+    /// flow ([`engine_outbound::Dialer::open_datagram`]) and resolves the
+    /// server name itself; when it cannot carry UDP the connection fails and
+    /// never falls back to a socket of its own.
+    pub async fn connect_through(
+        &self,
+        dialer: &dyn engine_outbound::Dialer,
+    ) -> io::Result<QuicConnection> {
+        if dialer.is_system() {
+            return self.connect().await;
+        }
+        if self.salamander.is_some() {
+            // `connect_over` does not obfuscate, and the datagrams must not
+            // leave in the clear.
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "quic with salamander cannot run through another dialer",
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        let flow = tokio::time::timeout_at(deadline, dialer.open_datagram(&self.server, self.port))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "quic handshake timed out"))?
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("no udp path to the quic server through the dialer: {error}"),
+                )
+            })?;
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.connect_over(flow, left).await
+    }
+
+    /// Resolves the server with the system resolver and completes the QUIC
+    /// handshake on a protected socket of its own, within a timeout.
     pub async fn connect(&self) -> io::Result<QuicConnection> {
         tokio::time::timeout(HANDSHAKE_TIMEOUT, self.connect_inner())
             .await

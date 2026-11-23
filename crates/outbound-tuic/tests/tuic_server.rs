@@ -13,7 +13,7 @@ use outbound_tuic::{
     auth_token, connect_header, parse_uuid, TuicFactory, TuicOutbound, ADDR_DOMAIN, ADDR_IPV6,
     CMD_AUTHENTICATE, CMD_CONNECT, VERSION,
 };
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
@@ -26,6 +26,12 @@ const PASSWORD: &str = "correct horse";
 struct TestServer {
     addr: SocketAddr,
     connections: Arc<AtomicUsize>,
+    /// Authenticate commands received (UUID and token).
+    auth_commands: Arc<AtomicUsize>,
+    /// SHA-256 of the server's certificate (DER).
+    certificate_sha256: [u8; 32],
+    /// SHA-256 of the certificate's SubjectPublicKeyInfo (DER).
+    public_key_sha256: [u8; 32],
 }
 
 async fn tuic_server() -> TestServer {
@@ -46,29 +52,50 @@ async fn tuic_server() -> TestServer {
     )
     .unwrap();
     crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let certificate_sha256 = sha256(cert.der());
+    let public_key_sha256 = sha256(&key.subject_public_key_info());
     let config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto).unwrap(),
     ));
     let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = endpoint.local_addr().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
+    let auth_commands = Arc::new(AtomicUsize::new(0));
     let counter = connections.clone();
+    let auth_counter = auth_commands.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let counter = counter.clone();
+            let auth_counter = auth_counter.clone();
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
-                serve_connection(connection).await;
+                serve_connection(connection, auth_counter).await;
             });
         }
     });
-    TestServer { addr, connections }
+    TestServer {
+        addr,
+        connections,
+        auth_commands,
+        certificate_sha256,
+        public_key_sha256,
+    }
 }
 
-async fn serve_connection(connection: quinn::Connection) {
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    digest
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn serve_connection(connection: quinn::Connection, auth_commands: Arc<AtomicUsize>) {
     // Connect streams wait until the Authenticate command was checked, as
     // TUIC servers do.
     let (authorized_tx, authorized_rx) = watch::channel(None::<bool>);
@@ -78,7 +105,11 @@ async fn serve_connection(connection: quinn::Connection) {
             return;
         };
         let mut command = [0u8; 2 + 16 + 32];
-        let ok = recv.read_exact(&mut command).await.is_ok() && {
+        let received = recv.read_exact(&mut command).await.is_ok();
+        if received {
+            auth_commands.fetch_add(1, Ordering::SeqCst);
+        }
+        let ok = received && {
             let uuid = parse_uuid(UUID).unwrap();
             let expected = auth_token(&auth_connection, &uuid, PASSWORD.as_bytes()).unwrap();
             command[..2] == [VERSION, CMD_AUTHENTICATE]
@@ -137,6 +168,7 @@ fn tls() -> TlsSettings {
         server_name: "tuic.test".to_owned(),
         alpn: Vec::new(),
         insecure: true,
+        ..TlsSettings::default()
     }
 }
 
@@ -265,4 +297,119 @@ async fn factory_builds_from_settings() {
         };
         assert!(err.starts_with("tuic"));
     }
+}
+
+/// A certificate pin makes `insecure` safe: the pinned certificate (or its
+/// public key) connects, any other one fails the handshake before the UUID
+/// and token leave the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pins_decide_whether_the_credentials_are_sent() {
+    let server = tuic_server().await;
+    let target = || TargetAddr::Domain("echo.test".to_owned(), 80);
+    let pinned_outbound = |tls: &TlsSettings| {
+        TuicOutbound::new(
+            "127.0.0.1",
+            server.addr.port(),
+            parse_uuid(UUID).unwrap(),
+            PASSWORD,
+            tls,
+            Congestion::Cubic,
+        )
+        .unwrap()
+    };
+
+    let pinned = pinned_outbound(&TlsSettings {
+        pinned_certificate_sha256: vec![server.certificate_sha256],
+        ..tls()
+    });
+    assert_eq!(
+        round_trip(&pinned, target(), b"pinned").await,
+        b"echo.test:80|pinned"
+    );
+    let public_key = pinned_outbound(&TlsSettings {
+        pinned_public_key_sha256: vec![server.public_key_sha256],
+        ..tls()
+    });
+    assert_eq!(
+        round_trip(&public_key, target(), b"spki").await,
+        b"echo.test:80|spki"
+    );
+    assert_eq!(server.auth_commands.load(Ordering::SeqCst), 2);
+
+    let mut other = server.public_key_sha256;
+    other[0] ^= 1;
+    for wrong in [
+        TlsSettings {
+            pinned_public_key_sha256: vec![other],
+            ..tls()
+        },
+        TlsSettings {
+            pinned_certificate_sha256: vec![server.public_key_sha256],
+            ..tls()
+        },
+        TlsSettings {
+            insecure: false,
+            pinned_certificate_sha256: vec![server.certificate_sha256],
+            ..tls()
+        },
+    ] {
+        let outbound = pinned_outbound(&wrong);
+        let result = tokio::time::timeout(Duration::from_secs(10), outbound.connect(&target()))
+            .await
+            .expect("the handshake fails");
+        assert!(result.is_err());
+    }
+    assert_eq!(server.auth_commands.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn factory_takes_certificate_pins() {
+    let server = tuic_server().await;
+    let mut registry = OutboundRegistry::new();
+    registry.register(Arc::new(TuicFactory));
+    let settings = |pins: serde_json::Value| {
+        let mut settings = serde_json::json!({
+            "server": "127.0.0.1",
+            "port": server.addr.port(),
+            "uuid": UUID,
+            "password": PASSWORD,
+            "server_name": "tuic.test",
+            "insecure": true,
+        });
+        settings["pinned_public_key_sha256"] = pins;
+        settings
+    };
+
+    let pinned = settings(serde_json::json!([hex(&server.public_key_sha256)]));
+    let outbound = registry
+        .build("tuic", pinned.as_object().unwrap(), Arc::new(TcpDialer))
+        .unwrap();
+    let echoed = round_trip(
+        outbound.as_ref(),
+        TargetAddr::Domain("echo.test".to_owned(), 80),
+        b"factory",
+    )
+    .await;
+    assert_eq!(echoed, b"echo.test:80|factory");
+    assert_eq!(server.auth_commands.load(Ordering::SeqCst), 1);
+
+    let wrong = settings(serde_json::json!([hex(&server.certificate_sha256)]));
+    let outbound = registry
+        .build("tuic", wrong.as_object().unwrap(), Arc::new(TcpDialer))
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        outbound.connect(&TargetAddr::Domain("echo.test".to_owned(), 80)),
+    )
+    .await
+    .expect("the handshake fails");
+    assert!(result.is_err());
+    assert_eq!(server.auth_commands.load(Ordering::SeqCst), 1);
+
+    let invalid = settings(serde_json::json!(["zz".repeat(32)]));
+    let err = match registry.build("tuic", invalid.as_object().unwrap(), Arc::new(TcpDialer)) {
+        Ok(_) => panic!("an invalid pin built"),
+        Err(err) => err,
+    };
+    assert_eq!(err, "tuic certificate pins are invalid");
 }

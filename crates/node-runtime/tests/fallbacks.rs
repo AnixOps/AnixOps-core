@@ -91,6 +91,7 @@ async fn ask(
         server_name: server_name.into(),
         alpn: alpn.iter().map(|protocol| (*protocol).to_owned()).collect(),
         insecure: true,
+        ..TlsSettings::default()
     })
     .unwrap();
     let tcp = TcpStream::connect(server).await.unwrap();

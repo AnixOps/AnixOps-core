@@ -93,7 +93,11 @@ pub struct HelloContext<'a> {
 }
 
 impl HelloContext<'_> {
-    /// X25519 between the ClientHello's ephemeral key and `peer_public`.
+    /// X25519 between the key of the ClientHello's standalone X25519 share
+    /// and `peer_public`. Every profile has that share, and REALITY-style
+    /// servers read it before the X25519 half of an X25519MLKEM768 share
+    /// (whose key is a different one unless the profile shares it), so a key
+    /// derived from this matches theirs whichever group the handshake uses.
     pub fn x25519_shared(&self, peer_public: &[u8; 32]) -> io::Result<[u8; 32]> {
         self.secrets.x25519_shared(peer_public)
     }
@@ -526,7 +530,9 @@ fn shared_secret(secrets: &KeyShareSecrets, group: u16, share: &[u8]) -> io::Res
                 .try_into()
                 .map_err(|_| invalid_data("invalid X25519 key share"))?;
             let mut shared = mlkem_shared.as_slice().to_vec();
-            shared.extend_from_slice(&secrets.x25519_shared(&peer)?);
+            // The server answered the hybrid share, whose X25519 half has its
+            // own key unless the profile reuses the standalone share's.
+            shared.extend_from_slice(&secrets.hybrid_x25519_shared(&peer)?);
             Ok(shared)
         }
         GROUP_SECP256R1 => secrets.secp256r1_shared(share),

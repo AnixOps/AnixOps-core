@@ -18,3 +18,18 @@ Changes against 0.2.4 are listed here; measure each one with the
   `shutdown(SHUT_WR)` does) instead of when the socket reaches CLOSED. Each
   short connection the tunnel closed first kept its relay and both socket
   windows for over 10 s: 600 in a burst peaked at ~88 MiB.
+- `udp.rs`: a UDP packet whose header does not parse is dropped and counted,
+  and the UDP socket reads the next one; upstream ended the socket's stream,
+  so the first such packet stopped all UDP (DNS included) until the stack
+  was rebuilt. A datagram that cannot be built into one IP packet (too large,
+  or addresses of two families) is dropped and counted too instead of failing
+  the write half, which ended the caller's reply loop.
+- `reassembly.rs` (new): IPv4 and IPv6 fragments of a UDP datagram are held
+  until it is whole and go on as one packet (at most 32 datagrams and
+  256 KiB at once, 15 s each; overlapping fragments drop their datagram).
+  Upstream passed IPv4 fragments to the UDP socket one by one, where the
+  first of them ended it, and ignored IPv6 fragments. Fragments of other
+  protocols are dropped, as smoltcp drops them.
+- `packet.rs`: an IPv4 header shorter than 20 bytes is refused.
+- `stats.rs` (new): `StackStats` counts what the above drop or rebuild;
+  `StackBuilder::stats` shares one set with the caller.

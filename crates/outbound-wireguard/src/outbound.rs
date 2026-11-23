@@ -167,6 +167,15 @@ impl TcpOutbound for WireGuardOutbound {
         Box::pin(self.udp_flow(None, target))
     }
 
+    /// Moves the running session to a new UDP socket after the device
+    /// changed networks or woke up: the old socket keeps the source address
+    /// and interface of the old network. The endpoint resolves again and a
+    /// fresh handshake follows; the session's keys and the open connections
+    /// stay. Counts 1 when the session runs.
+    fn reset_sessions(&self) -> usize {
+        self.node.reset_path()
+    }
+
     /// When the last handshake finished and whether the session runs.
     /// Never addresses or keys.
     fn health(&self) -> Option<serde_json::Value> {
