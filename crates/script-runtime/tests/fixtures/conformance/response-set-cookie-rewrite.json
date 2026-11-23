@@ -1,0 +1,17 @@
+{
+  "invocation": {
+    "phase": "response",
+    "request": { "url": "https://api.example.test/login", "method": "POST" },
+    "response": {
+      "status": 200,
+      "headers": [
+        ["Set-Cookie", "a=1"],
+        ["Set-Cookie", "b=2"]
+      ]
+    }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "headers": [["Set-Cookie", "only=1"]] }
+  }
+}

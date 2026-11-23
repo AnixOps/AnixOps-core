@@ -715,3 +715,66 @@ fn source_port_device_name_doh_and_final_dns_failed_route() {
     assert_eq!(test.rule, "IP-CIDR6,2001:db8::/32");
     assert!(test.needs_address);
 }
+
+/// `FINAL,...,dns-continue` (what a Clash subscription imports to): a name
+/// whose lookup fails does not match the IP rules but still matches the
+/// rules after them, as in Clash, instead of being rejected.
+#[test]
+fn final_dns_continue_matches_later_rules_after_a_failed_lookup() {
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let lookups = Arc::new(Mutex::new(Vec::new()));
+    let recording = |name| -> Arc<dyn TcpOutbound> {
+        Arc::new(Recording {
+            name,
+            hits: hits.clone(),
+        })
+    };
+    let nodes = BTreeMap::from([
+        ("hk-1".to_string(), recording("hk-1")),
+        ("jp-1".to_string(), recording("jp-1")),
+    ]);
+    let spec = RoutingSpec {
+        rules: vec![
+            "IP-CIDR,203.0.113.0/24,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,later.example,hk-1".to_string(),
+            "FINAL,jp-1,dns-continue".to_string(),
+        ],
+        groups: vec![],
+    };
+    let outbound = RoutedOutbound::new(&spec, recording("direct"), nodes)
+        .expect("spec should validate")
+        .with_resolver(Arc::new(FixedResolver {
+            lookups: lookups.clone(),
+        }));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let route = |name: &str| {
+        let target = TargetAddr::Domain(name.to_string(), 443);
+        runtime.block_on(outbound.route_flow(&target, None, None))
+    };
+
+    // The lookup fails: the IP rule does not match, the domain rule after
+    // it does.
+    let (later, picked) = route("gone.later.example");
+    assert_eq!(later.rule, "DOMAIN-SUFFIX,later.example");
+    assert_eq!(later.outbound, "hk-1");
+    assert!(picked.is_some());
+    assert_eq!(
+        std::mem::take(&mut *lookups.lock().unwrap()),
+        ["gone.later.example"]
+    );
+    // With nothing else matching, FINAL takes it.
+    let (last, picked) = route("gone.example");
+    assert_eq!(last.rule, "FINAL");
+    assert_eq!(last.outbound, "jp-1");
+    assert!(picked.is_some());
+    // A name that resolves still matches the IP rule.
+    let (direct, _) = route("v4.example");
+    assert_eq!(direct.outbound, "DIRECT");
+    // Without a lookup (the plain route) the IP rule still asks for one.
+    assert_eq!(
+        outbound.route(&TargetAddr::Domain("gone.example".to_string(), 443)),
+        RouteOutcome::Reject(RejectKind::Reject)
+    );
+}

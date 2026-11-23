@@ -384,6 +384,11 @@ pub async fn stream_exchange(
     };
     let started = Instant::now();
     let deadline = started + timeout;
+    // A connection taken or dialed before a network change is not kept
+    // after it (see `UpstreamPool::clear`).
+    let generation = pool.map_or(0, |(pool, _)| {
+        pool.lock().unwrap_or_else(|e| e.into_inner()).generation()
+    });
     let take = |pool: &Mutex<UpstreamPool>, key| {
         pool.lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -395,6 +400,7 @@ pub async fn stream_exchange(
                 key,
                 stream,
                 std::time::Instant::now(),
+                generation,
             );
         }
     };

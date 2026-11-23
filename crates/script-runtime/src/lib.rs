@@ -27,7 +27,7 @@ mod quickjs;
 mod store;
 
 pub use driver::{finish_outcome, run_script, JsEngineContext, JsEngineError};
-pub use host::{ScriptHost, SCRIPT_HOST_FUNCTION, SCRIPT_PRELUDE};
+pub use host::{restore_joined_headers, ScriptHost, SCRIPT_HOST_FUNCTION, SCRIPT_PRELUDE};
 #[cfg(all(feature = "javascriptcore", target_vendor = "apple"))]
 pub use jsc::{JscScriptRuntime, MAX_STUCK_WORKERS};
 #[cfg(feature = "quickjs")]
@@ -350,6 +350,43 @@ impl ScriptOutcome {
 /// Redirects a `$httpClient` request follows at most before the last
 /// redirect is handed to the script as it is.
 pub const SCRIPT_HTTP_CLIENT_MAX_REDIRECTS: usize = 5;
+
+/// Longest `$httpClient` / `$task.fetch` method accepted.
+pub const SCRIPT_HTTP_CLIENT_MAX_METHOD_BYTES: usize = 32;
+
+/// Error a script callback gets for a method that is not an HTTP token.
+pub const SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE: &str =
+    "networkcore: invalid $httpClient method";
+
+/// Whether `method` may go on a request line: a non-empty RFC 9110 token
+/// (section 5.6.2: ASCII letters, digits and ``!#$%&'*+-.^_`|~``) of at
+/// most [`SCRIPT_HTTP_CLIENT_MAX_METHOD_BYTES`]. Anything else (spaces,
+/// CR / LF, NUL, non-ASCII) could end the request line early and smuggle a
+/// second request, so the host refuses it before a connection is made.
+pub fn is_http_method_token(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= SCRIPT_HTTP_CLIENT_MAX_METHOD_BYTES
+        && method.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
 
 /// Request a script made through `$httpClient`.
 #[derive(Debug, Clone, PartialEq, Eq)]

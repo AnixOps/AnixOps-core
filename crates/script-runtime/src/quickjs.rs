@@ -26,8 +26,12 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
 /// Scripts at least this large are compiled once and their bytecode reused;
 /// smaller ones compile faster than a lookup is worth.
 pub const BYTECODE_CACHE_MIN_SOURCE_BYTES: usize = 16 * 1024;
-/// Bytecode kept across runs; past it the cache starts over.
+/// Bytecode kept across runs; past it the cache starts over. iOS keeps
+/// less: the Network Extension's whole memory limit is about 50 MB.
+#[cfg(not(target_os = "ios"))]
 const BYTECODE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "ios")]
+const BYTECODE_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// A script's identity: its length and two independent 64-bit hashes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,6 +83,12 @@ impl BytecodeCache {
         }
     }
 
+    fn clear(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            *entries = CacheEntries::default();
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries
@@ -127,6 +137,12 @@ impl QuickJsScriptRuntime {
 
     pub fn store(&self) -> &Arc<dyn ScriptStore> {
         &self.store
+    }
+
+    /// Drops the bytecode kept for large scripts (the host is short of
+    /// memory); they are compiled again on their next run.
+    pub fn clear_bytecode_cache(&self) {
+        self.bytecode.clear();
     }
 
     pub fn run(
@@ -383,6 +399,20 @@ mod tests {
             event: None,
             rule: None,
         }
+    }
+
+    #[test]
+    fn clearing_the_bytecode_cache_drops_every_entry() {
+        let cache = BytecodeCache::default();
+        cache.insert(SourceKey::of("a"), vec![0; 16]);
+        cache.insert(SourceKey::of("b"), vec![0; 16]);
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(&SourceKey::of("a")).is_none());
+        // It fills again afterwards.
+        cache.insert(SourceKey::of("a"), vec![0; 16]);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

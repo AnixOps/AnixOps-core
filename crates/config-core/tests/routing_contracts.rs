@@ -237,6 +237,7 @@ fn parses_rule_lines() {
         RuleLine::Final {
             target: "Proxy".to_string(),
             dns_failed: false,
+            dns_continue: false,
         }
     );
     assert_eq!(
@@ -244,6 +245,15 @@ fn parses_rule_lines() {
         RuleLine::Final {
             target: "Proxy".to_string(),
             dns_failed: true,
+            dns_continue: false,
+        }
+    );
+    assert_eq!(
+        parse_rule_line("FINAL,Proxy,DNS-Continue").unwrap(),
+        RuleLine::Final {
+            target: "Proxy".to_string(),
+            dns_failed: false,
+            dns_continue: true,
         }
     );
 
@@ -1985,6 +1995,79 @@ fn final_dns_failed_sends_failed_lookups_to_final() {
     assert_eq!(named.matched, RouteMatch::Rule(0));
 
     for line in ["FINAL,hk-1,dns-failed,extra", "FINAL,hk-1,no-resolve"] {
+        assert_eq!(
+            parse_rule_line(line).unwrap_err().code,
+            ROUTING_RULE_LINE_INVALID_CODE,
+            "{line}"
+        );
+    }
+}
+
+/// `dns-continue` (Clash's semantics): once the lookup has failed, IP rules
+/// do not match and the rules after them still do; before the lookup the
+/// decision asks for the address like without the option.
+#[test]
+fn final_dns_continue_matches_on_without_an_address_after_a_failed_lookup() {
+    struct Looked {
+        failed: bool,
+        dns: BTreeMap<String, IpAddr>,
+    }
+    impl RoutingEnvironment for Looked {
+        fn resolve(&self, domain: &str) -> Option<IpAddr> {
+            self.dns.get(domain).copied()
+        }
+        fn resolve_failed(&self) -> bool {
+            self.failed
+        }
+    }
+    let rules = [
+        "DOMAIN,direct.test,DIRECT",
+        "IP-CIDR,10.0.0.0/8,DIRECT",
+        "NOT,((IP-CIDR,192.0.2.0/24)),jp-1",
+        "FINAL,hk-1,dns-continue",
+    ];
+    let model = RoutingModel::from_spec(&spec(&rules, vec![]), &node_ids()).unwrap();
+    assert!(model.final_dns_continue);
+    assert!(!model.final_dns_failed);
+    let dns = BTreeMap::from([("lan.test".to_string(), "10.1.2.3".parse().unwrap())]);
+
+    // No lookup yet: the IP rule asks for one.
+    let before = Looked {
+        failed: false,
+        dns: dns.clone(),
+    };
+    let asked = model.decide(&RouteQuery::domain("gone.test"), &before);
+    assert_eq!(asked.matched, RouteMatch::ResolveFailed(1));
+
+    // The lookup failed: the IP rule does not match, later rules still do
+    // (a NOT of an IP rule matches a connection without an address, as in
+    // Clash), and with none matching FINAL takes it.
+    let after = Looked {
+        failed: true,
+        dns: dns.clone(),
+    };
+    let continued = model.decide(&RouteQuery::domain("gone.test"), &after);
+    assert_eq!(continued.matched, RouteMatch::Rule(2));
+    assert_eq!(continued.outcome, RouteOutcome::Node("jp-1".to_string()));
+    assert_eq!(continued.resolved_ip, None);
+    let without_not =
+        RoutingModel::from_spec(&spec(&[rules[0], rules[1], rules[3]], vec![]), &node_ids())
+            .unwrap();
+    let finished = without_not.decide(&RouteQuery::domain("gone.test"), &after);
+    assert_eq!(finished.matched, RouteMatch::Final);
+    assert_eq!(finished.outcome, RouteOutcome::Node("hk-1".to_string()));
+
+    // A lookup that works, and a rule before the IP rule, are unchanged.
+    let resolved = model.decide(&RouteQuery::domain("lan.test"), &after);
+    assert_eq!(resolved.matched, RouteMatch::Rule(1));
+    assert_eq!(resolved.outcome, RouteOutcome::Direct);
+    let named = model.decide(&RouteQuery::domain("direct.test"), &after);
+    assert_eq!(named.matched, RouteMatch::Rule(0));
+
+    for line in [
+        "FINAL,hk-1,dns-continue,extra",
+        "FINAL,hk-1,dns-failed,dns-continue",
+    ] {
         assert_eq!(
             parse_rule_line(line).unwrap_err().code,
             ROUTING_RULE_LINE_INVALID_CODE,

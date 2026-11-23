@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use engine_native::{
     NativeQuickJsScriptExecutor, NativeScheduledScriptKind, NativeScheduledScriptRun,
+    ScriptMemoryPressure,
 };
 use mitm_policy::loon_cron::{CronSchedule, CronTimer, Zoned};
 use mitm_policy::loon_plugin::{LoonScheduledScript, LoonScheduledTrigger};
@@ -98,6 +99,13 @@ impl ScriptScheduler {
                         0
                     };
                 json!({ "scheduled": scheduled })
+            }
+            ScriptControl::MemoryPressure { level } => {
+                if let Some(level) = level.as_deref().and_then(ScriptMemoryPressure::parse) {
+                    self.executor.set_memory_pressure(level);
+                }
+                let (level, skipped) = self.executor.memory_pressure();
+                json!({ "level": level.as_str(), "skipped_runs": skipped })
             }
             ScriptControl::Run { tag } => {
                 let scheduled = self

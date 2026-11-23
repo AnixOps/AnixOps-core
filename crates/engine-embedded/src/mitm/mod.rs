@@ -92,15 +92,40 @@ use crate::tunnel::{FlowInterceptor, InterceptedFlow, TunnelSettings, TunnelStat
 pub const PLUGIN_ID: &str = "networkcore.ios.mitm";
 /// Largest request or response body the rewrite hook sees.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Body bytes all decrypted connections of one engine hold at once for
+/// rules to read: every HTTP/2 connection's share (`MAX_HELD_BODY_BYTES` in
+/// the `http2` module) and every HTTP/1.1 body come out of it. A body that
+/// finds no room is relayed without rewriting (`busy`) instead of being
+/// held, so many connections reading bodies at once cannot add up past it.
+#[cfg(not(target_os = "ios"))]
+pub const MAX_ENGINE_HELD_BODY_BYTES: usize = 16 * MAX_BODY_BYTES;
+/// The iOS total, within the Network Extension's memory limit of about
+/// 50 MB: each held body is copied a few more times while it is planned.
+#[cfg(target_os = "ios")]
+pub const MAX_ENGINE_HELD_BODY_BYTES: usize = 6 * MAX_BODY_BYTES;
 /// Plugin texts handed to one tunnel, in total.
 const MAX_POLICY_BYTES: usize = 8 * 1024 * 1024;
-/// QuickJS heap per script dispatch; the extension's whole budget is ~50 MB.
-/// A large script gets more (6 bytes per source byte plus 4 MiB, at most
-/// 32 MiB), so a script of a few MiB parses.
+/// QuickJS heap per script dispatch. A large script gets more (6 bytes per
+/// source byte plus 4 MiB), up to the whole [`SCRIPT_MEMORY_BUDGET_BYTES`],
+/// so a script of a few MiB parses.
+#[cfg(not(target_os = "ios"))]
 pub const SCRIPT_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
-/// Heap limits of the dispatches running at once, in total: four ordinary
+/// QuickJS heap per script dispatch on iOS, where the Network Extension's
+/// whole memory limit is about 50 MB and the tunnel, its buffers and
+/// capture need their share.
+#[cfg(target_os = "ios")]
+pub const SCRIPT_MEMORY_LIMIT_BYTES: usize = 6 * 1024 * 1024;
+/// Memory of the dispatches running at once, in total: each holds its heap
+/// limit plus four times its body
+/// (`engine_native::QUICKJS_BODY_COPIES_PER_DISPATCH`). Four ordinary
 /// scripts side by side, or one script of a few MiB alone.
+#[cfg(not(target_os = "ios"))]
 pub const SCRIPT_MEMORY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// The iOS total: two ordinary scripts with small bodies side by side, or
+/// one with a body near [`MAX_BODY_BYTES`]; a script's heap never exceeds
+/// it, so a script above about 2 MiB of source may not parse on iOS.
+#[cfg(target_os = "ios")]
+pub const SCRIPT_MEMORY_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// Upper bound for a script's own `timeout`.
 pub const SCRIPT_MAX_TIMEOUT_MS: usize = 3_000;
 const LEAF_CACHE_ENTRIES: usize = 64;
@@ -191,6 +216,9 @@ pub struct MitmEngine {
     /// What decryption did per host, for `mitm_hosts`.
     outcomes: Mutex<outcomes::HostOutcomes>,
     next_request: AtomicU64,
+    /// Body bytes held for rules across all connections, see
+    /// [`MAX_ENGINE_HELD_BODY_BYTES`].
+    held_bodies: Arc<http2::BodyBudget>,
     /// `[Rule]` lines of the accepted plugins, for the routing model.
     plugin_rules: Vec<config_core::routing::RoutingRule>,
     /// Cron, network-change and generic scripts, and the notifications
@@ -316,6 +344,7 @@ impl MitmEngine {
             decisions: Mutex::new(DecisionCache::default()),
             outcomes: Mutex::new(outcomes::HostOutcomes::default()),
             next_request: AtomicU64::new(1),
+            held_bodies: Arc::new(http2::BodyBudget::new(MAX_ENGINE_HELD_BODY_BYTES)),
             plugin_rules,
             #[cfg(feature = "scripts")]
             scheduler,
@@ -769,9 +798,22 @@ impl MitmEngine {
             // A body no rule reads is forwarded as it arrives, not held whole.
             let stream_request = !self.needs_body(&url, HttpMitmPhase::Request);
             let stream_response = !self.needs_body(&url, HttpMitmPhase::Response);
+            // What this exchange holds of the engine's body budget, until
+            // the exchange ends (the request body is kept for the response
+            // phase).
+            let mut request_held = http2::Held::new(&self.held_bodies);
             let request_body = if stream_request {
                 Vec::new()
             } else {
+                if !request_held.grow(body_reservation(request_framing)) {
+                    // No room to hold the body: it is relayed as it is.
+                    if let Some(recording) = &mut recording {
+                        recording.exchange.note = Some("busy");
+                        recording.exchange.rules_skipped = true;
+                    }
+                    origin.write_all(&request.encode()).await?;
+                    return passthrough(client, origin).await;
+                }
                 match client.read_body(request_framing, MAX_BODY_BYTES).await? {
                     Body::Complete(body) => {
                         if let Some(recording) = &mut recording {
@@ -1051,6 +1093,21 @@ impl MitmEngine {
             }
 
             let mut response_headers = response.headers.clone();
+            let reservation = response_body_reservation(
+                no_body,
+                response.header("Content-Encoding").is_some(),
+                framing,
+            );
+            let mut response_held = http2::Held::new(&self.held_bodies);
+            if !response_held.grow(reservation) {
+                // No room to hold the body: it is relayed as it is.
+                if let Some(recording) = &mut recording {
+                    recording.response(&response, &[], Some("busy"));
+                    recording.exchange.rules_skipped = true;
+                }
+                client.write_all(&response.encode()).await?;
+                return passthrough(client, origin).await;
+            }
             let response_body = match origin.read_body(framing, MAX_BODY_BYTES).await? {
                 Body::Complete(body) => decoded_for_rules(&mut response_headers, body),
                 Body::TooLarge { raw, body, size } => {
@@ -1536,6 +1593,31 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Bytes an HTTP/1.1 exchange takes from the engine's body budget before
+/// it reads a body framed by `framing` for rules: its announced length, or
+/// the most a held body grows to when no length is announced.
+fn body_reservation(framing: Framing) -> usize {
+    match framing {
+        Framing::Length(length) => length.min(MAX_BODY_BYTES),
+        Framing::Chunked | Framing::UntilClose => MAX_BODY_BYTES,
+    }
+}
+
+/// Bytes a response takes from the engine's body budget before rules read
+/// its body. A response that carries no body (`HEAD`, `204`, `304`) takes
+/// nothing, even when it names a `Content-Encoding`; a coded body may
+/// decode to up to [`MAX_BODY_BYTES`], so it takes that much; any other
+/// body takes what [`body_reservation`] gives for its framing.
+fn response_body_reservation(no_body: bool, coded: bool, framing: Framing) -> usize {
+    if no_body {
+        0
+    } else if coded {
+        MAX_BODY_BYTES
+    } else {
+        body_reservation(framing)
+    }
+}
+
 /// A response body a rule reads, decoded when the origin sent it with a
 /// `Content-Encoding` although the request asked for `identity`, so rules
 /// and scripts see the text; the header goes and the body is sent on
@@ -1753,5 +1835,35 @@ mod tests {
         );
         let last = format!("host-{}.example.test", DECISION_CACHE_ENTRIES * 4 - 1);
         assert_eq!(cache.get(&last), Some(false));
+    }
+
+    /// A response with no body (HEAD, 204, 304) takes nothing from the
+    /// engine's body budget, even when it names a Content-Encoding, so it
+    /// never goes busy for bytes it does not carry.
+    #[test]
+    fn bodiless_responses_reserve_no_body_budget() {
+        for framing in [Framing::Length(0), Framing::Chunked, Framing::UntilClose] {
+            assert_eq!(response_body_reservation(true, true, framing), 0);
+            assert_eq!(response_body_reservation(true, false, framing), 0);
+        }
+        assert_eq!(
+            response_body_reservation(false, true, Framing::Length(10)),
+            MAX_BODY_BYTES
+        );
+        assert_eq!(
+            response_body_reservation(false, false, Framing::Length(10)),
+            10
+        );
+        assert_eq!(
+            response_body_reservation(false, false, Framing::Length(MAX_BODY_BYTES * 2)),
+            MAX_BODY_BYTES
+        );
+        assert_eq!(
+            response_body_reservation(false, false, Framing::Chunked),
+            MAX_BODY_BYTES
+        );
+        let budget = http2::BodyBudget::new(0);
+        let mut held = http2::Held::new(&budget);
+        assert!(held.grow(response_body_reservation(true, true, Framing::Length(0))));
     }
 }

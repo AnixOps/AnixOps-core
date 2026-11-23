@@ -14,10 +14,20 @@
 //!   instead of sending it again;
 //! * keeps idle upstream connections in [`UpstreamPool`] for the next query.
 //!
+//! When the network under the engine changes (`reset_network`), the answers
+//! and the kept connections belong to the old network: [`DnsCache::clear`]
+//! and [`DnsPools::clear`] drop them, and an exchange that started before
+//! the reset neither caches its answer nor returns its connection (each
+//! keeps a generation that the clear moves on).
+//!
 //! Only standard answers are kept: `NOERROR` or `NXDOMAIN`, not truncated,
-//! for the question that was asked. No address or name leaves this module.
+//! for the question that was asked, at most [`MAX_CACHED_RESPONSE`] bytes
+//! each and [`MAX_CACHE_BYTES`] together (a longer answer is still forwarded,
+//! only not kept), so a remote server that answers with large records cannot
+//! grow the cache past the network extension's memory budget. No address or
+//! name leaves this module.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -37,6 +47,12 @@ pub const STALE_WINDOW: Duration = Duration::from_secs(3600);
 pub const STALE_TTL: u32 = 30;
 /// Most answers kept.
 pub const MAX_ENTRIES: usize = 4096;
+/// Longest answer kept. Ordinary answers are a few hundred bytes; one longer
+/// than this is forwarded to the app but not cached.
+pub const MAX_CACHED_RESPONSE: usize = 8 * 1024;
+/// Most bytes kept over every answer (responses plus names): the answers
+/// that expire first make room for a new one past it.
+pub const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
 /// Queries that may wait on one exchange in flight.
 pub const MAX_WAITERS: usize = 32;
 
@@ -68,6 +84,20 @@ struct Entry {
     response: Vec<u8>,
     stored: Instant,
     ttl: Duration,
+    /// Tells apart entries that expire at the same instant in
+    /// [`DnsCache::by_expiry`].
+    seq: u64,
+}
+
+impl Entry {
+    fn expiry_key(&self) -> (Instant, u64) {
+        (self.stored + self.ttl, self.seq)
+    }
+}
+
+/// What an entry counts against [`MAX_CACHE_BYTES`].
+fn entry_size(key: &CacheKey, response: &[u8]) -> usize {
+    response.len() + key.name.len()
 }
 
 /// Who asked a query that waits on an exchange in flight.
@@ -83,7 +113,31 @@ pub struct Waiter {
 #[derive(Default)]
 pub struct DnsCache {
     entries: HashMap<CacheKey, Entry>,
+    /// Every entry by when it expires, so eviction takes the one that
+    /// expires first without a pass over the table.
+    by_expiry: BTreeMap<(Instant, u64), CacheKey>,
+    /// [`entry_size`] summed over `entries`.
+    bytes: usize,
+    next_seq: u64,
     inflight: HashMap<CacheKey, Vec<Waiter>>,
+    /// Moves on with every [`DnsCache::clear`].
+    generation: u64,
+}
+
+/// What a `reset_network` dropped from the DNS state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DnsReset {
+    /// Cached answers (and resolved addresses) dropped.
+    pub flushed: usize,
+    /// Kept upstream connections dropped.
+    pub dropped: usize,
+}
+
+impl std::ops::AddAssign for DnsReset {
+    fn add_assign(&mut self, other: Self) {
+        self.flushed += other.flushed;
+        self.dropped += other.dropped;
+    }
 }
 
 impl DnsCache {
@@ -113,49 +167,102 @@ impl DnsCache {
                 None => Lookup::Miss,
             };
         }
-        self.entries.remove(key);
+        self.remove(key);
         Lookup::Miss
     }
 
-    /// Keeps `response` for `key` when it is a cacheable answer to `question`.
+    /// Keeps `response` for `key` when it is a cacheable answer to `question`
+    /// no longer than [`MAX_CACHED_RESPONSE`], replacing the earlier one.
+    /// Past [`MAX_ENTRIES`] or [`MAX_CACHE_BYTES`] the answers that expire
+    /// first (answers past their stale window are among them) make room. An
+    /// answer too long to keep drops the earlier one, so a refresh never
+    /// leaves an outdated answer served as stale.
     pub fn insert(&mut self, key: CacheKey, question: &Question, response: &[u8], now: Instant) {
+        if response.len() > MAX_CACHED_RESPONSE {
+            self.remove(&key);
+            return;
+        }
         let Some(ttl) = cacheable_ttl(response, question) else {
             return;
         };
-        if self.entries.len() >= MAX_ENTRIES && !self.entries.contains_key(&key) {
-            self.evict(now);
+        self.remove(&key);
+        let size = entry_size(&key, response);
+        while self.entries.len() >= MAX_ENTRIES || self.bytes + size > MAX_CACHE_BYTES {
+            if !self.evict_first() {
+                break;
+            }
         }
-        self.entries.insert(
-            key,
-            Entry {
-                response: response.to_vec(),
-                stored: now,
-                ttl,
-            },
-        );
+        let entry = Entry {
+            response: response.to_vec(),
+            stored: now,
+            ttl,
+            seq: self.next_seq,
+        };
+        self.next_seq += 1;
+        self.by_expiry.insert(entry.expiry_key(), key.clone());
+        self.bytes += size;
+        self.entries.insert(key, entry);
     }
 
-    /// Drops answers past their stale window; if none are, the one that
-    /// expires first.
-    fn evict(&mut self, now: Instant) {
-        self.entries.retain(|_, entry| {
-            now.saturating_duration_since(entry.stored) < entry.ttl + STALE_WINDOW
-        });
-        if self.entries.len() < MAX_ENTRIES {
-            return;
+    /// [`Self::insert`], unless the cache was cleared since `generation`
+    /// ([`Self::generation`] when the exchange started): an answer from
+    /// before a network change is not kept for the new network.
+    pub fn insert_since(
+        &mut self,
+        generation: u64,
+        key: CacheKey,
+        question: &Question,
+        response: &[u8],
+        now: Instant,
+    ) {
+        if generation == self.generation {
+            self.insert(key, question, response, now);
         }
-        if let Some(oldest) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.stored + entry.ttl)
-            .map(|(key, _)| key.clone())
-        {
-            self.entries.remove(&oldest);
+    }
+
+    /// Moves on with every [`Self::clear`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Drops every cached answer (the network changed) and returns how many.
+    /// Exchanges in flight keep their waiters, who still get the answer; it
+    /// is only not cached ([`Self::insert_since`]).
+    pub fn clear(&mut self) -> usize {
+        let flushed = self.entries.len();
+        self.entries.clear();
+        self.by_expiry.clear();
+        self.bytes = 0;
+        self.generation += 1;
+        flushed
+    }
+
+    /// Drops the answer kept for `key`, if any.
+    fn remove(&mut self, key: &CacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.by_expiry.remove(&entry.expiry_key());
+            self.bytes -= entry_size(key, &entry.response);
         }
+    }
+
+    /// Drops the answer that expires first; `false` when none is kept.
+    fn evict_first(&mut self) -> bool {
+        let Some((_, key)) = self.by_expiry.pop_first() else {
+            return false;
+        };
+        if let Some(entry) = self.entries.remove(&key) {
+            self.bytes -= entry_size(&key, &entry.response);
+        }
+        true
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Bytes the kept answers count against [`MAX_CACHE_BYTES`].
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 
     pub fn is_empty(&self) -> bool {
@@ -265,9 +372,13 @@ pub fn first_address(response: &[u8], question: &Question) -> Option<(IpAddr, Du
         .map(|address| (address, ttl))
 }
 
-/// A copy of `response` with the QR bit clear, so the question parser takes it.
+/// A copy of the start of `response` with the QR bit clear, so the question
+/// parser takes it. Only the header and the question matter, and the parser
+/// refuses messages longer than a query may be, so a long answer is cut to
+/// that length first (the question always fits inside it).
 fn as_query(response: &[u8]) -> Vec<u8> {
-    let mut query = response.to_vec();
+    let end = response.len().min(crate::dns::MAX_QUERY_LEN);
+    let mut query = response[..end].to_vec();
     query[2] &= 0x07;
     query[3] = 0;
     query
@@ -355,10 +466,26 @@ pub struct DnsPools {
     pub quic: std::sync::Mutex<crate::dns_quic::QuicPool>,
 }
 
+impl DnsPools {
+    /// Drops every kept connection (the network changed) and returns how
+    /// many; DNS over QUIC connections are closed, so a query still on one
+    /// fails at once instead of waiting out half its budget.
+    pub fn clear(&self) -> usize {
+        let tcp = self.tcp.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "dns-quic")]
+        let quic = self.quic.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(not(feature = "dns-quic"))]
+        let quic = 0;
+        tcp + quic
+    }
+}
+
 /// Idle upstream connections, per server and outbound.
 #[derive(Default)]
 pub struct UpstreamPool {
     idle: HashMap<PoolKey, Vec<(BoxStream, Instant)>>,
+    /// Moves on with every [`UpstreamPool::clear`].
+    generation: u64,
 }
 
 /// A server index and the outbound (by address) its connections run through.
@@ -381,12 +508,40 @@ impl UpstreamPool {
         None
     }
 
-    pub fn put(&mut self, key: PoolKey, stream: BoxStream, now: Instant) {
+    /// Keeps `stream` for `key`, unless the pool was cleared since
+    /// `generation` ([`Self::generation`] before the stream was taken or
+    /// dialed): a connection from before a network change is dropped.
+    pub fn put(&mut self, key: PoolKey, stream: BoxStream, now: Instant, generation: u64) {
+        if generation != self.generation {
+            return;
+        }
         let idle = self.idle.entry(key).or_default();
         idle.retain(|(_, since)| now.saturating_duration_since(*since) < MAX_IDLE);
         if idle.len() < MAX_IDLE_PER_UPSTREAM {
             idle.push((stream, now));
         }
+    }
+
+    /// Moves on with every [`Self::clear`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Drops every idle connection and returns how many.
+    pub fn clear(&mut self) -> usize {
+        let dropped = self.idle.values().map(Vec::len).sum();
+        self.idle.clear();
+        self.generation += 1;
+        dropped
+    }
+
+    /// Idle connections kept now.
+    pub fn len(&self) -> usize {
+        self.idle.values().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -526,6 +681,111 @@ mod tests {
         assert!(!cache.begin(&key("a"), Some(waiter)));
         assert_eq!(cache.finish(&key("a")).len(), 2);
         assert!(cache.begin(&key("a"), None));
+    }
+
+    /// An answer to `query` with one TXT record of `ttl` carrying `len`
+    /// bytes of data.
+    fn large_answer(query: &[u8], ttl: u32, len: usize) -> Vec<u8> {
+        let mut response = query.to_vec();
+        response[2] |= 0x80;
+        response[3] = 0x80;
+        response[7] = 1; // ancount
+        response.extend_from_slice(&[0xC0, 0x0C, 0, 16, 0, 1]);
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&(len as u16).to_be_bytes());
+        response.resize(response.len() + len, b'x');
+        response
+    }
+
+    fn name_query(name: &str) -> Vec<u8> {
+        let mut wire = vec![name.len() as u8];
+        wire.extend_from_slice(name.as_bytes());
+        wire.push(0);
+        query(1, &wire)
+    }
+
+    #[test]
+    fn answers_too_long_to_keep_are_not_cached() {
+        let q = name_query("big");
+        let question = crate::dns::question(&q).unwrap();
+        let mut cache = DnsCache::default();
+        let now = Instant::now();
+        let big = large_answer(&q, 300, MAX_CACHED_RESPONSE);
+        assert!(big.len() > MAX_CACHED_RESPONSE);
+        assert!(cacheable_ttl(&big, &question).is_some());
+        cache.insert(key("big"), &question, &big, now);
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
+
+        let fits = large_answer(&q, 300, MAX_CACHED_RESPONSE - q.len() - 12);
+        assert_eq!(fits.len(), MAX_CACHED_RESPONSE);
+        cache.insert(key("big"), &question, &fits, now);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), fits.len() + "big".len());
+
+        // A refresh that comes back too long replaces the kept answer with
+        // nothing, rather than leaving the old one to be served as stale.
+        cache.insert(key("big"), &question, &big, now);
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn the_byte_budget_evicts_the_answers_that_expire_first() {
+        let mut cache = DnsCache::default();
+        let now = Instant::now();
+        let mut inserted = 0usize;
+        // Well past the budget in answers just under the per-answer limit.
+        let count = MAX_CACHE_BYTES / (MAX_CACHED_RESPONSE / 2) + 64;
+        for i in 0..count {
+            let name = format!("n{i}");
+            let q = name_query(&name);
+            let question = crate::dns::question(&q).unwrap();
+            let answer = large_answer(&q, 60 + i as u32, MAX_CACHED_RESPONSE / 2);
+            cache.insert(key(&name), &question, &answer, now);
+            inserted += 1;
+            assert!(cache.bytes() <= MAX_CACHE_BYTES, "{}", cache.bytes());
+        }
+        assert!(cache.len() < inserted);
+        let lookup = |cache: &mut DnsCache, name: &str| {
+            let q = name_query(name);
+            let end = crate::dns::question(&q).unwrap().end;
+            cache.lookup(&key(name), &q, end, now)
+        };
+        assert_eq!(lookup(&mut cache, "n0"), Lookup::Miss, "expires first");
+        let last = format!("n{}", count - 1);
+        assert!(matches!(lookup(&mut cache, &last), Lookup::Fresh(_)));
+    }
+
+    #[test]
+    fn byte_accounting_follows_replacement_and_expiry() {
+        let mut cache = DnsCache::default();
+        let now = Instant::now();
+        let q = name_query("a");
+        let question = crate::dns::question(&q).unwrap();
+        let small = answer(&q, 60, 0);
+        let large = large_answer(&q, 60, 1000);
+        cache.insert(key("a"), &question, &small, now);
+        assert_eq!(cache.bytes(), small.len() + 1);
+        cache.insert(key("a"), &question, &large, now);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.bytes(),
+            large.len() + 1,
+            "the replaced answer no longer counts"
+        );
+        // Past its stale window the lookup drops the answer and its bytes.
+        assert_eq!(
+            cache.lookup(
+                &key("a"),
+                &q,
+                question.end,
+                now + Duration::from_secs(60) + STALE_WINDOW
+            ),
+            Lookup::Miss
+        );
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
     }
 
     #[test]

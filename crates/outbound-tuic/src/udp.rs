@@ -345,6 +345,9 @@ pub struct TuicUdpSession {
     dispatch: Arc<Dispatch>,
     replies: tokio::sync::Mutex<mpsc::Receiver<Reply>>,
     next_packet_id: AtomicU16,
+    /// Keeps the shared connection open while the session lives (a
+    /// `transport_quic::shared::Hold`).
+    _hold: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl TuicUdpSession {
@@ -356,7 +359,15 @@ impl TuicUdpSession {
             dispatch,
             replies: tokio::sync::Mutex::new(replies),
             next_packet_id: AtomicU16::new(random_packet_id()),
+            _hold: None,
         })
+    }
+
+    /// Keeps `hold` until the session is dropped, so a retired connection
+    /// stays open for it.
+    pub(crate) fn holding(mut self, hold: impl std::any::Any + Send + Sync) -> Self {
+        self._hold = Some(Box::new(hold));
+        self
     }
 
     /// Sends one datagram to `target`, in fragments when it is larger than
@@ -385,13 +396,20 @@ impl TuicUdpSession {
     /// Receives the next reply: its length in `buf` (truncated when longer)
     /// and its source address.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, TargetAddr)> {
+        let (payload, source) = self.recv_owned().await?;
+        let n = payload.len().min(buf.len());
+        buf[..n].copy_from_slice(&payload[..n]);
+        Ok((n, source))
+    }
+
+    /// The next reply as the payload the dispatcher already owns, with its
+    /// source: no buffer of the caller's, no copy.
+    pub async fn recv_owned(&self) -> io::Result<(Vec<u8>, TargetAddr)> {
         let mut replies = self.replies.lock().await;
         tokio::select! {
             reply = replies.recv() => {
                 let (source, payload) = reply.ok_or_else(closed)?;
-                let n = payload.len().min(buf.len());
-                buf[..n].copy_from_slice(&payload[..n]);
-                Ok((n, source))
+                Ok((payload, source))
             }
             _ = self.connection.closed() => Err(closed()),
         }

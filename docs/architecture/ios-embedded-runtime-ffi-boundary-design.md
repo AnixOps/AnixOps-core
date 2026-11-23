@@ -128,7 +128,7 @@ struct 必须采用 C-compatible layout，字段必须固定大小、对齐和 o
 
 整机 WireGuard 隧道（配置只有一个 `wireguard` 出站）没有连接可管理，只接受两条命令：`reset_network` 让运行中的隧道在后台重新解析端点、
 换到一个新建并经保护器处理的 UDP socket，并立即发起新握手（会话密钥保留，对端随新源地址漫游），应答
-`{"reset": 1, "closed": 0, "health_forgotten": 0}`（隧道未运行时 `reset` 为 0）；`set_network` 只做校验并应答 `{"changed": false}`。
+`{"reset": 1, "closed": 0, "health_forgotten": 0, "first_wait_forgotten": 0, "dns_flushed": 0, "dns_connections_dropped": 0}`（隧道未运行时 `reset` 为 0）；`set_network` 只做校验并应答 `{"changed": false}`。
 其他命令返回 `NETWORKCORE_IOS_ERR_INVALID_ARGUMENT`。路由配置里的 WireGuard 节点在 `reset_network` 时同样换 socket，运行中计为一次
 reset。`networkcore_ios_set_bound_interface` 换了网卡时，运行中的 WireGuard 隧道和节点也会换到新网卡上的 socket，与 `reset_network`
 到达的先后无关；发包遇到源地址或路由失效的错误、握手持续无应答时，内核也会自己换 socket，规则见
@@ -156,7 +156,7 @@ select 组选择只保留到 runtime 停止，客户端应把它们写回 profil
 UDP 每个数据报一块，每条连接最多 512 块），连接列表里这类连接带 `"captured": true`。被 MITM 接管的连接不保留重新加密后的字节，
 改为保留解密后的 HTTP/1.1 请求（应用发出的原样）与响应（应用收到的），body 各保留前 64 KiB，每条连接最多 64 次交换，
 `note` 标出 `answered_locally`（改写规则直接应答）、`streaming`（升级或事件流，不留 body）、`too_large`（之后不再解密）、
-`unparsed`（响应头读不懂，之后原样透传；或分帧冲突，回 502）、`busy`（同一 HTTP/2 连接持有的待改写正文已到上限，本条原样转发）。
+`unparsed`（响应头读不懂，之后原样透传；或分帧冲突，回 502）、`busy`（同一 HTTP/2 连接或整个引擎持有的待改写正文已到上限，本条原样转发；HTTP/1.1 之后整条连接透传）。
 全部内容共用一个内存预算（缺省 2 MiB，`max_total_bytes` 可设 64 KiB–16 MiB），Network Extension 不会因此超出内存上限。
 单条连接最多占预算的一半：超出时先放掉它自己最早的已结束交换的正文（行保留，正文标 `truncated`），再放掉最早的已结束交换；
 原始字节超出份额的部分只计数不保留。整体超预算时依次丢弃：加载的会话连接、已关闭的连接（最早的先丢）、其他打开连接的正文，

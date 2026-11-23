@@ -1,0 +1,11 @@
+{
+  "invocation": {
+    "phase": "response",
+    "request": { "url": "https://api.example.test/", "method": "GET" },
+    "response": { "status": 200, "body": "" }
+  },
+  "expect": {
+    "status": "done",
+    "mutation": { "body": "error:networkcore: invalid $httpClient method" }
+  }
+}

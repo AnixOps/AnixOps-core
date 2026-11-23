@@ -43,6 +43,33 @@ pub struct WsSettings {
     pub headers: Vec<(String, String)>,
 }
 
+/// The TLS ALPN list for a WebSocket connection, from the configured one.
+///
+/// The opening handshake is an HTTP/1.1 `Upgrade` request; WebSocket over
+/// HTTP/2 (RFC 8441) is not spoken here. A server that negotiates `h2`
+/// would read the request as a broken HTTP/2 preface and the connection
+/// would fail, so protocols other than HTTP/1.x (`h2`, `h3`) are dropped,
+/// as Xray does for WebSocket. A list left with nothing becomes
+/// `["http/1.1"]`; an empty list stays empty (no ALPN extension, which
+/// servers answer with HTTP/1.1). Share links often carry
+/// `alpn=h2,http/1.1` for the node's other transports.
+pub fn alpn_for_websocket(configured: Vec<String>) -> Vec<String> {
+    if configured.is_empty() {
+        return configured;
+    }
+    let kept: Vec<String> = configured
+        .into_iter()
+        .filter(|protocol| {
+            protocol.eq_ignore_ascii_case("http/1.1") || protocol.eq_ignore_ascii_case("http/1.0")
+        })
+        .collect();
+    if kept.is_empty() {
+        vec!["http/1.1".to_owned()]
+    } else {
+        kept
+    }
+}
+
 pub struct WsConnector {
     request_target: String,
     host: String,
@@ -69,6 +96,8 @@ impl WsConnector {
         if host.is_empty() || !is_header_safe(host) || host.contains(' ') {
             return Err(invalid("websocket host is invalid"));
         }
+        // `Host: 2001:db8::1` is malformed (RFC 7230 §5.4); bracket it.
+        let host = engine_outbound::uri_host(host);
         for (name, value) in &settings.headers {
             let name_ok = !name.is_empty()
                 && name
@@ -80,7 +109,7 @@ impl WsConnector {
         }
         Ok(Self {
             request_target: path.to_owned(),
-            host: host.to_owned(),
+            host: host.into_owned(),
             headers: settings.headers.clone(),
             random: SystemRandom::new(),
         })
@@ -522,4 +551,42 @@ fn invalid(message: &'static str) -> io::Error {
 
 fn protocol_error(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(protocols: &[&str]) -> Vec<String> {
+        protocols.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    #[test]
+    fn websocket_alpn_offers_http1_only() {
+        assert_eq!(
+            alpn_for_websocket(list(&["h2", "http/1.1"])),
+            list(&["http/1.1"])
+        );
+        assert_eq!(alpn_for_websocket(list(&["h2"])), list(&["http/1.1"]));
+        assert_eq!(alpn_for_websocket(list(&["h3", "h2"])), list(&["http/1.1"]));
+        assert_eq!(alpn_for_websocket(list(&["http/1.1"])), list(&["http/1.1"]));
+        assert!(alpn_for_websocket(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn ipv6_literal_hosts_are_bracketed() {
+        let connector = WsConnector::new(&WsSettings::default(), "2001:db8::1").unwrap();
+        assert_eq!(connector.host, "[2001:db8::1]");
+        let named = WsConnector::new(&WsSettings::default(), "edge.example").unwrap();
+        assert_eq!(named.host, "edge.example");
+        let explicit = WsConnector::new(
+            &WsSettings {
+                host: "2001:db8::2".into(),
+                ..WsSettings::default()
+            },
+            "edge.example",
+        )
+        .unwrap();
+        assert_eq!(explicit.host, "[2001:db8::2]");
+    }
 }

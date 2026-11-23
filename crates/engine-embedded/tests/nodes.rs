@@ -811,7 +811,7 @@ fn subscription_routing_leaves_out_only_the_nodes_that_cannot_run() {
         json["routing"]["rules"],
         serde_json::json!([
             format!("DOMAIN,socks.example.org,{}", id("Socks")),
-            "FINAL,Proxy"
+            "FINAL,Proxy,dns-continue"
         ])
     );
     assert_eq!(

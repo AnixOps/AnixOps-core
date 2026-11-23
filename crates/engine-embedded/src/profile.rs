@@ -195,14 +195,19 @@ fn choice(group: &Value) -> Option<String> {
         .or_else(|| members.into_iter().next())
 }
 
+/// FINAL's target, parsed the way the routing model parses it so options
+/// after the target (`FINAL,<target>,dns-failed`) are not taken as part of
+/// the name.
 fn final_target(routing: &Value) -> Option<String> {
-    routing
+    let rule = routing
         .get("rules")
         .and_then(Value::as_array)
         .and_then(|rules| rules.last())
-        .and_then(Value::as_str)
-        .and_then(|rule| rule.strip_prefix("FINAL,"))
-        .map(|target| target.trim().to_string())
+        .and_then(Value::as_str)?;
+    match config_core::routing::parse_rule_line(rule).ok()? {
+        config_core::routing::RuleLine::Final { target, .. } => Some(target),
+        config_core::routing::RuleLine::Rule { .. } => None,
+    }
 }
 
 /// The groups FINAL passes through and the target it ends at.

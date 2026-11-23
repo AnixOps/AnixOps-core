@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use smoltcp::{
@@ -14,6 +17,13 @@ use crate::packet::AnyIpPktFrame;
 pub(super) struct VirtualDevice {
     in_buf_avail: Arc<AtomicBool>,
     in_buf: UnboundedReceiver<Vec<u8>>,
+    /// SYN frames the TCP socket loop queued itself, once it decided they
+    /// may open a connection; handed to smoltcp before `in_buf`.
+    syn_buf: VecDeque<Vec<u8>>,
+    /// How many frames went into `syn_buf` so far.
+    syn_queued: u64,
+    /// How many of them smoltcp has taken so far.
+    syn_taken: u64,
     out_buf: Sender<AnyIpPktFrame>,
     mtu: usize,
 }
@@ -29,12 +39,34 @@ impl VirtualDevice {
             Self {
                 in_buf_avail: iface_ingress_tx_avail.clone(),
                 in_buf: iface_ingress_rx,
+                syn_buf: VecDeque::new(),
+                syn_queued: 0,
+                syn_taken: 0,
                 out_buf: iface_egress_tx,
                 mtu,
             },
             iface_ingress_tx,
             iface_ingress_tx_avail,
         )
+    }
+
+    /// Queues a SYN frame for smoltcp, ahead of the frames in `in_buf`.
+    /// Returns its number: smoltcp has read it once [`Self::syn_taken`]
+    /// reaches that number.
+    pub(super) fn queue_syn(&mut self, frame: Vec<u8>) -> u64 {
+        self.syn_buf.push_back(frame);
+        self.syn_queued += 1;
+        self.syn_queued
+    }
+
+    /// How many queued SYN frames smoltcp has read so far.
+    pub(super) fn syn_taken(&self) -> u64 {
+        self.syn_taken
+    }
+
+    /// Whether a queued SYN frame still waits for smoltcp.
+    pub(super) fn syn_pending(&self) -> bool {
+        !self.syn_buf.is_empty()
     }
 }
 
@@ -49,6 +81,11 @@ impl Device for VirtualDevice {
         let Ok(permit) = self.out_buf.try_reserve() else {
             return None;
         };
+
+        if let Some(buffer) = self.syn_buf.pop_front() {
+            self.syn_taken += 1;
+            return Some((Self::RxToken { buffer }, Self::TxToken { permit }));
+        }
 
         let Ok(buffer) = self.in_buf.try_recv() else {
             self.in_buf_avail.store(false, Ordering::Release);

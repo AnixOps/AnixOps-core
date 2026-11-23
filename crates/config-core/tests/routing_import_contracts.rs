@@ -165,6 +165,7 @@ fn surge_profile_imports_supported_rules_and_groups() {
     assert_eq!(model.final_target, PolicyTarget::Group("Proxy".to_string()));
     // Surge `FINAL,<policy>,dns-failed` keeps its option.
     assert!(model.final_dns_failed);
+    assert!(!model.final_dns_continue);
 
     let ids = model
         .groups
@@ -292,6 +293,10 @@ fn clash_yaml_imports_rules_groups_and_match() {
     assert_eq!(model.rules[1].target, PolicyTarget::Node(jp.clone()));
     assert!(model.rules[1].no_resolve);
     assert_eq!(model.final_target, PolicyTarget::Group("Proxy".to_string()));
+    // Clash's MATCH: a failed lookup for an IP rule matches on, as in Clash,
+    // instead of rejecting.
+    assert!(model.final_dns_continue);
+    assert!(!model.final_dns_failed);
     assert_eq!(
         model.group("Proxy").unwrap().members,
         vec![
@@ -500,7 +505,7 @@ rules:
             "AND,((RULE-SET,reject),(DST-PORT,443)),Proxy".to_string(),
             "OR,((DOMAIN,a.example),(IP-CIDR,10.0.0.0/8,no-resolve)),DIRECT,no-resolve".to_string(),
             "NOT,((DOMAIN-SUFFIX,example.org)),Proxy".to_string(),
-            "FINAL,Proxy".to_string(),
+            "FINAL,Proxy,dns-continue".to_string(),
         ]
     );
     assert_eq!(
@@ -783,6 +788,8 @@ FINAL,Proxy
     );
     let model = imported.routing.expect("the rules should build");
     assert!(!model.final_dns_failed);
+    // Surge keeps rejecting a failed lookup without `dns-failed`.
+    assert!(!model.final_dns_continue);
     // PROTOCOL,DOH3 is not supported: skipped with its reason, not silently.
     let messages = imported
         .diagnostics
@@ -960,7 +967,7 @@ rules:
             "AND,((RULE-SET,LAN),(DST-PORT,445)),REJECT".to_string(),
             "OR,((RULE-SET,LAN),(GEOIP,CN)),DIRECT".to_string(),
             "GEOIP,CN,DIRECT".to_string(),
-            "FINAL,Proxy".to_string(),
+            "FINAL,Proxy,dns-continue".to_string(),
         ]
     );
     // The built-in set, never the rule provider that happens to be called LAN.

@@ -819,4 +819,133 @@ mod remote {
         assert_eq!(tampered.route(&domain("x.evil.test", 443)), proxied());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Serves `body` at `/ads.list` and `signature` at `/ads.list.sig`, and
+    /// redirects to them: `/abs` with an absolute `Location`, `/dir/rel` with
+    /// a relative one (to `/dir/moved`, which sends an absolute path on),
+    /// `/old.list` and `/old.list.sig` with `307` / `308`, `/loop` to itself
+    /// and `/nowhere` without a `Location`.
+    fn redirecting_server(body: &'static [u8], signature: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let own = base.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 1024];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let line = String::from_utf8_lossy(&request[..read]);
+                let path = line.split(' ').nth(1).unwrap_or_default().to_string();
+                let redirect = |status: &str, location: Option<&str>| {
+                    let location =
+                        location.map_or(String::new(), |to| format!("Location: {to}\r\n"));
+                    format!(
+                        "HTTP/1.1 {status}\r\n{location}Content-Length: 5\r\nConnection: close\r\n\r\nmoved"
+                    )
+                    .into_bytes()
+                };
+                let reply: Vec<u8> = match path.as_str() {
+                    "/ads.list" | "/ads.list.sig" => {
+                        let content = if path == "/ads.list" {
+                            body.to_vec()
+                        } else {
+                            signature.as_bytes().to_vec()
+                        };
+                        let mut reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            content.len()
+                        )
+                        .into_bytes();
+                        reply.extend_from_slice(&content);
+                        reply
+                    }
+                    "/abs" => redirect("302 Found", Some(format!("{own}/ads.list").as_str())),
+                    "/dir/rel" => redirect("302 Found", Some("moved")),
+                    "/dir/moved" => redirect("301 Moved Permanently", Some("/ads.list")),
+                    "/old.list" => redirect("307 Temporary Redirect", Some("/ads.list")),
+                    "/old.list.sig" => redirect("308 Permanent Redirect", Some("/ads.list.sig")),
+                    "/loop" => redirect("302 Found", Some("/loop")),
+                    "/nowhere" => redirect("302 Found", None),
+                    _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                };
+                let _ = stream.write_all(&reply);
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn redirected_downloads_install() {
+        let base = redirecting_server(b"DOMAIN-SUFFIX,ads.test\n", String::new());
+        for path in ["/abs", "/dir/rel", "/old.list"] {
+            let routed = routed(
+                r#""RULE-SET,ads,REJECT","FINAL,hk""#,
+                &format!(r#""ads":{{"url":"{base}{path}"}}"#),
+            )
+            .unwrap();
+            let runtime = updating(&routed);
+            wait_until(|| {
+                let status = &routed.rule_sets().status()[0];
+                status.updated_at_ms.is_some() || status.last_error.is_some()
+            });
+            let status = &routed.rule_sets().status()[0];
+            assert_eq!(status.last_error, None, "{path}");
+            assert_eq!(status.entries, 1, "{path}");
+            assert_eq!(
+                routed.route(&domain("x.ads.test", 443)),
+                rejected(),
+                "{path}"
+            );
+            runtime.shutdown_background();
+        }
+    }
+
+    #[test]
+    fn redirect_loops_and_redirects_without_a_location_fail() {
+        let base = redirecting_server(b"DOMAIN-SUFFIX,ads.test\n", String::new());
+        for (path, error) in [("/loop", "too_many_redirects"), ("/nowhere", "http_status")] {
+            let routed = routed(
+                r#""RULE-SET,ads,REJECT","FINAL,hk""#,
+                &format!(r#""ads":{{"url":"{base}{path}"}}"#),
+            )
+            .unwrap();
+            let runtime = updating(&routed);
+            wait_until(|| routed.rule_sets().status()[0].last_error.is_some());
+            assert_eq!(
+                routed.rule_sets().status()[0].last_error,
+                Some(error),
+                "{path}"
+            );
+            assert_eq!(routed.route(&domain("x.ads.test", 443)), proxied());
+            runtime.shutdown_background();
+        }
+    }
+
+    #[test]
+    fn signed_sets_verify_after_redirects() {
+        use base64::Engine as _;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        const LIST: &[u8] = b"DOMAIN-SUFFIX,ads.test\n";
+        let rng = ring::rand::SystemRandom::new();
+        let pair =
+            Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref())
+                .unwrap();
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        // `<url>.sig` comes from the configured URL (`/old.list.sig`), which
+        // redirects to the signature of the list it redirects to.
+        let base = redirecting_server(LIST, encode(pair.sign(LIST).as_ref()));
+        let routed = signed_routed(
+            &format!("{base}/old.list"),
+            &encode(pair.public_key().as_ref()),
+        );
+        let runtime = run_once(&routed);
+        wait_until(|| {
+            let status = &routed.rule_sets().status()[0];
+            status.updated_at_ms.is_some() || status.last_error.is_some()
+        });
+        assert_eq!(routed.rule_sets().status()[0].last_error, None);
+        assert_eq!(routed.route(&domain("x.ads.test", 443)), rejected());
+        runtime.shutdown_background();
+    }
 }

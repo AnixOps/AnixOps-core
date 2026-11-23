@@ -4,7 +4,7 @@
 //! DOMAIN/DOMAIN-SUFFIX/DOMAIN-KEYWORD/IP-CIDR/GEOIP/GEOSITE/DST-PORT/
 //! SRC-IP/SRC-PORT/IN-PORT/PROCESS-NAME/HOSTNAME-TYPE/SUBNET/DEVICE-NAME/
 //! CELLULAR-RADIO/RULE-SET/SCRIPT rules and AND/OR/NOT combinations of them, a
-//! mandatory FINAL target (optionally `dns-failed`), and
+//! mandatory FINAL target (optionally `dns-failed` or `dns-continue`), and
 //! select/url-test/fallback policy groups. In-process engines call
 //! [`RoutingModel::decide`] directly, and snapshot tests pin its results. The module performs no DNS, GeoIP database, health check,
 //! or network work; those inputs come from a [`RoutingEnvironment`].
@@ -758,6 +758,13 @@ pub struct RoutingModel {
     /// `FINAL,<target>,dns-failed`: a connection whose domain cannot be
     /// resolved for an IP rule goes to FINAL instead of being rejected.
     pub final_dns_failed: bool,
+    /// `FINAL,<target>,dns-continue` (what Clash subscriptions import to): a
+    /// connection whose domain cannot be resolved for an IP rule is matched
+    /// on without an address, so IP rules do not match it and the rules
+    /// after them still do, as in Clash and mihomo. Needs an environment
+    /// that reports the failed lookup ([`RoutingEnvironment::resolve_failed`]);
+    /// until then the rule asks for the address as without the option.
+    pub final_dns_continue: bool,
     pub groups: Vec<PolicyGroup>,
 }
 
@@ -773,6 +780,8 @@ pub enum RuleLine {
         target: String,
         /// `dns-failed`: see [`RoutingModel::final_dns_failed`].
         dns_failed: bool,
+        /// `dns-continue`: see [`RoutingModel::final_dns_continue`].
+        dns_continue: bool,
     },
 }
 
@@ -815,6 +824,7 @@ pub fn parse_rule_line(line: &str) -> DomainResult<RuleLine> {
             [_, target] if !target.is_empty() => Ok(RuleLine::Final {
                 target: (*target).to_string(),
                 dns_failed: false,
+                dns_continue: false,
             }),
             [_, target, option]
                 if !target.is_empty() && option.eq_ignore_ascii_case("dns-failed") =>
@@ -822,11 +832,21 @@ pub fn parse_rule_line(line: &str) -> DomainResult<RuleLine> {
                 Ok(RuleLine::Final {
                     target: (*target).to_string(),
                     dns_failed: true,
+                    dns_continue: false,
+                })
+            }
+            [_, target, option]
+                if !target.is_empty() && option.eq_ignore_ascii_case("dns-continue") =>
+            {
+                Ok(RuleLine::Final {
+                    target: (*target).to_string(),
+                    dns_failed: false,
+                    dns_continue: true,
                 })
             }
             _ => Err(routing_error(
                 ROUTING_RULE_LINE_INVALID_CODE,
-                "FINAL rule must have exactly one target, optionally followed by dns-failed",
+                "FINAL rule must have exactly one target, optionally followed by dns-failed or dns-continue",
             )),
         };
     }
@@ -1225,6 +1245,7 @@ impl RoutingModel {
         let mut rules = Vec::with_capacity(spec.rules.len());
         let mut final_target = None;
         let mut final_dns_failed = false;
+        let mut final_dns_continue = false;
         for (index, line) in spec.rules.iter().enumerate() {
             if final_target.is_some() {
                 return Err(routing_error(
@@ -1244,13 +1265,18 @@ impl RoutingModel {
                         .map_err(|error| with_rule_index(error, index))?,
                     no_resolve,
                 }),
-                RuleLine::Final { target, dns_failed } => {
+                RuleLine::Final {
+                    target,
+                    dns_failed,
+                    dns_continue,
+                } => {
                     final_target = Some(
                         names
                             .resolve(&target)
                             .map_err(|error| with_rule_index(error, index))?,
                     );
                     final_dns_failed = dns_failed;
+                    final_dns_continue = dns_continue;
                 }
             }
         }
@@ -1265,6 +1291,7 @@ impl RoutingModel {
             rules,
             final_target,
             final_dns_failed,
+            final_dns_continue,
             groups,
         })
     }
@@ -1282,7 +1309,12 @@ impl RoutingModel {
     /// later IP rule and is reported in the result. As in sing-box, a failed
     /// resolution rejects the connection instead of falling through to FINAL,
     /// unless FINAL says `dns-failed` (Surge): the connection then goes to
-    /// FINAL's target, reported as [`RouteMatch::FinalAfterResolveFailed`].
+    /// FINAL's target, reported as [`RouteMatch::FinalAfterResolveFailed`];
+    /// or `dns-continue` (Clash): once the environment reports the failed
+    /// lookup ([`RoutingEnvironment::resolve_failed`]) the IP rules do not
+    /// match and the later rules are tried without an address. Before that,
+    /// the rule reports [`RouteMatch::ResolveFailed`] so the caller looks
+    /// the name up.
     pub fn decide(
         &self,
         query: &RouteQuery,
@@ -1394,7 +1426,11 @@ impl RoutingModel {
                             environment,
                         );
                     }
-                    if resolved_ip.is_none() {
+                    // `dns-continue` after a failed lookup (Clash): the
+                    // address stays unknown, so no IP rule matches and the
+                    // other rules still do.
+                    let continues = self.final_dns_continue && environment.resolve_failed();
+                    if resolved_ip.is_none() && !continues {
                         return RouteResolution {
                             matched: RouteMatch::ResolveFailed(index),
                             target: PolicyTarget::Reject(RejectKind::Reject),
@@ -1728,9 +1764,18 @@ pub trait RoutingEnvironment {
     }
 
     /// Resolves a domain for IP rules that allow resolution; `None` means the
-    /// lookup failed and the connection is rejected.
+    /// lookup failed (or was not made yet) and the connection is rejected,
+    /// unless FINAL says `dns-failed` or `dns-continue`.
     fn resolve(&self, _domain: &str) -> Option<IpAddr> {
         None
+    }
+
+    /// Whether the lookup [`Self::resolve`] stands for was made for this
+    /// connection and failed, so `dns-continue` matches on without an
+    /// address. `false` (the default) when no lookup was made yet: the
+    /// decision then asks for one ([`RouteMatch::ResolveFailed`]).
+    fn resolve_failed(&self) -> bool {
+        false
     }
 
     /// Member name currently chosen in a select group.

@@ -23,6 +23,8 @@ const PASSWORD: &str = "correct horse";
 struct TestServer {
     addr: SocketAddr,
     connections: Arc<AtomicUsize>,
+    /// Authenticated connections that have ended.
+    closed: Arc<AtomicUsize>,
     /// Authentication requests received, password included.
     auth_requests: Arc<AtomicUsize>,
     /// SHA-256 of the server's certificate (DER).
@@ -81,24 +83,31 @@ async fn hysteria2_server_with(obfs: Option<&str>) -> TestServer {
     let addr = endpoint.local_addr().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
     let auth_requests = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicUsize::new(0));
     let counter = connections.clone();
     let auth_counter = auth_requests.clone();
+    let closed_counter = closed.clone();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let counter = counter.clone();
             let auth_counter = auth_counter.clone();
+            let closed_counter = closed_counter.clone();
             tokio::spawn(async move {
                 let Ok(connection) = incoming.await else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
+                let watched = connection.clone();
                 serve_connection(connection, auth_counter).await;
+                watched.closed().await;
+                closed_counter.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
     TestServer {
         addr,
         connections,
+        closed,
         auth_requests,
         certificate_sha256,
         public_key_sha256,
@@ -508,4 +517,89 @@ async fn factory_takes_certificate_pins() {
         };
         assert_eq!(err, "hysteria2 certificate pins are invalid");
     }
+}
+
+/// A server address whose UDP goes nowhere (the first, as an unreachable
+/// IPv6 address would be by the resolver's order) must not use up the
+/// handshake timeout: the next address answers within a few seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quic_moves_on_from_an_address_that_never_answers() {
+    let server = hysteria2_server().await;
+    // Bound and never read: Initial packets sent there are dropped.
+    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let silent = blackhole.local_addr().unwrap();
+    let mut settings = tls();
+    settings.alpn = vec!["h3".to_owned()];
+    let connector = transport_quic::QuicConnector::new(
+        "hy2.test",
+        server.addr.port(),
+        &settings,
+        &["h3"],
+        transport_quic::Congestion::default(),
+    )
+    .unwrap();
+    let began = std::time::Instant::now();
+    let connection = connector
+        .connect_addresses(&[silent, server.addr])
+        .await
+        .expect("the second address was not tried");
+    assert_eq!(connection.connection.remote_address(), server.addr);
+    // Three seconds on the silent address, then a local handshake; well
+    // below the ten-second handshake timeout.
+    assert!(began.elapsed() < std::time::Duration::from_secs(7));
+    drop(blackhole);
+}
+
+/// Waits until `counter` reaches `expected`, for at most five seconds.
+async fn wait_for(counter: &AtomicUsize, expected: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while counter.load(Ordering::SeqCst) != expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {expected}, still {}",
+            counter.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// After a short sleep the engine resets sessions without closing flows
+/// (`close_connections: false`): streams already open keep working on the
+/// old connection, new flows get a new one, and the old connection closes
+/// with its last stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_retires_the_connection_without_breaking_open_streams() {
+    let server = hysteria2_server().await;
+    let outbound =
+        Hysteria2Outbound::new("127.0.0.1", server.addr.port(), PASSWORD, &tls()).unwrap();
+    let target = TargetAddr::Domain("echo.test".to_owned(), 80);
+
+    let mut open = outbound.connect(&target).await.unwrap();
+    open.write_all(b"one").await.unwrap();
+    let mut echoed = [0u8; 16];
+    open.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"echo.test:80|one");
+
+    assert_eq!(outbound.reset_sessions(), 1);
+    open.write_all(b"two").await.unwrap();
+    let mut again = [0u8; 3];
+    open.read_exact(&mut again).await.unwrap();
+    assert_eq!(&again, b"two");
+
+    let echoed = round_trip(&outbound, target.clone(), b"new").await;
+    assert_eq!(echoed, b"echo.test:80|new");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(server.closed.load(Ordering::SeqCst), 0);
+
+    drop(open);
+    wait_for(&server.closed, 1).await;
+
+    // Nothing holds the current connection: a reset closes it at once.
+    assert_eq!(outbound.reset_sessions(), 1);
+    wait_for(&server.closed, 2).await;
+    // Repeated resets with nothing open leak nothing and dial nothing.
+    for _ in 0..5 {
+        assert_eq!(outbound.reset_sessions(), 0);
+    }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 2);
 }

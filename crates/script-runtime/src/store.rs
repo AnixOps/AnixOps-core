@@ -1,10 +1,11 @@
 //! `$persistentStore` backends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, SystemTime};
 
 pub const SCRIPT_STORE_MAX_KEY_BYTES: usize = 256;
 pub const SCRIPT_STORE_MAX_VALUE_BYTES: usize = 512 * 1024;
@@ -83,7 +84,9 @@ impl ScriptStore for MemoryScriptStore {
 }
 
 /// Store persisted as one JSON object. Every successful write replaces the
-/// file through a temporary sibling, so a crash never leaves partial JSON.
+/// file through a temporary sibling of its own (unique per process and
+/// write), so a crash never leaves partial JSON and two writers never write
+/// into one temporary file.
 #[derive(Debug)]
 pub struct JsonFileScriptStore {
     path: PathBuf,
@@ -101,6 +104,7 @@ impl JsonFileScriptStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error),
         };
+        remove_stale_temporaries(&path);
         Ok(Self {
             path,
             entries: Mutex::new(entries),
@@ -118,7 +122,7 @@ impl JsonFileScriptStore {
         let Ok(json) = serde_json::to_vec(entries) else {
             return false;
         };
-        let temporary = sibling(&self.path, ".tmp");
+        let temporary = sibling(&self.path, &temporary_suffix());
         let written = std::fs::File::create(&temporary).and_then(|mut file| {
             file.write_all(&json)?;
             file.sync_all()
@@ -154,19 +158,34 @@ pub enum ScriptStoreRecovery {
 /// (truncated, edited by hand, empty) is moved aside to
 /// `<path>.corrupt`, replacing an older copy, and the store starts empty.
 /// When the file cannot be read or moved, scripts get an in-memory store
-/// and the file is never overwritten. The recovery never names the store's
-/// contents, which may hold tokens.
+/// and the file is never overwritten. Within one process every caller that
+/// opens the same file while an earlier store of it is still in use gets
+/// that store (reported as [`ScriptStoreRecovery::Opened`]). The recovery
+/// never names the store's contents, which may hold tokens.
 pub fn open_script_store(path: impl Into<PathBuf>) -> (Arc<dyn ScriptStore>, ScriptStoreRecovery) {
     let path = path.into();
+    let key = store_key(&path);
+    let mut stores = open_stores()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    stores.retain(|_, store| store.strong_count() > 0);
+    if let Some(store) = stores.get(&key).and_then(Weak::upgrade) {
+        return (store, ScriptStoreRecovery::Opened);
+    }
+    let mut share = |store: JsonFileScriptStore| {
+        let store = Arc::new(store);
+        stores.insert(key.clone(), Arc::downgrade(&store));
+        store
+    };
     match JsonFileScriptStore::open(&path) {
-        Ok(store) => (Arc::new(store), ScriptStoreRecovery::Opened),
+        Ok(store) => (share(store), ScriptStoreRecovery::Opened),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
             let backup = sibling(&path, SCRIPT_STORE_QUARANTINE_SUFFIX);
             // `rename` does not replace an existing file on every platform.
             let _ = std::fs::remove_file(&backup);
             if replace_with_retry(&path, &backup).is_ok() {
                 if let Ok(store) = JsonFileScriptStore::open(&path) {
-                    return (Arc::new(store), ScriptStoreRecovery::Quarantined { backup });
+                    return (share(store), ScriptStoreRecovery::Quarantined { backup });
                 }
             }
             (
@@ -179,6 +198,92 @@ pub fn open_script_store(path: impl Into<PathBuf>) -> (Arc<dyn ScriptStore>, Scr
             ScriptStoreRecovery::InMemory,
         ),
     }
+}
+
+/// Temporary files of [`JsonFileScriptStore::persist`] are named
+/// `<store>.tmp-<pid>-<n>`.
+const TEMPORARY_INFIX: &str = ".tmp";
+
+/// A temporary sibling older than this is left over from a crash; a live
+/// write finishes with it within milliseconds.
+const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(60);
+
+fn temporary_suffix() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{TEMPORARY_INFIX}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Removes temporary siblings a crash left behind: the fixed `<store>.tmp`
+/// of older versions, and `<store>.tmp-*` files no write has touched for
+/// [`STALE_TEMPORARY_AGE`] (a younger one may belong to a live writer in
+/// another process).
+fn remove_stale_temporaries(path: &Path) {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let legacy = format!("{name}{TEMPORARY_INFIX}");
+    let prefix = format!("{name}{TEMPORARY_INFIX}-");
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let stale = if file_name == legacy {
+            true
+        } else if file_name.starts_with(&prefix) {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= STALE_TEMPORARY_AGE)
+        } else {
+            false
+        };
+        if stale && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The stores [`open_script_store`] handed out that are still in use, by
+/// path. Two runtimes of one process (a reload, or the tunnel and a local
+/// proxy side by side) that open one file share one store, so neither
+/// writes back a copy that drops the other's changes.
+fn open_stores() -> &'static Mutex<HashMap<PathBuf, Weak<JsonFileScriptStore>>> {
+    static STORES: OnceLock<Mutex<HashMap<PathBuf, Weak<JsonFileScriptStore>>>> = OnceLock::new();
+    STORES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `path` with its directory resolved, so two spellings of one file meet in
+/// [`open_stores`]; the file itself need not exist yet.
+fn store_key(path: &Path) -> PathBuf {
+    let resolved = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            std::fs::canonicalize(parent)
+                .ok()
+                .map(|parent| parent.join(name))
+        }
+        _ => None,
+    };
+    resolved.unwrap_or_else(|| path.to_path_buf())
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {

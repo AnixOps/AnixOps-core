@@ -7,8 +7,27 @@ use serde::Deserialize;
 use crate::client::{ClientConfig, DEFAULT_MTU, MAX_MTU, MIN_MTU};
 use crate::packet::MAX_USERNAME_LEN;
 
-/// Default send and receive buffer of each private-stack TCP connection.
+/// Default send buffer of each private-stack TCP connection, and the
+/// receive buffer an explicit `tcp_buffer_bytes` replaces both with.
 pub const DEFAULT_TCP_BUFFER: u32 = 64 * 1024;
+/// Default receive buffer of each private-stack TCP connection. It bounds
+/// the window one connection advertises, so one connection's download is at
+/// most this much per round trip: 64 KiB is about 3.5 Mbit/s at 150 ms.
+/// Desktop systems take 512 KiB (about 28 Mbit/s at 150 ms); Android 256
+/// KiB; iOS keeps 64 KiB, as the Network Extension's memory budget
+/// (about 50 MB, up to 128 connections) cannot hold more. The send buffer
+/// stays at [`DEFAULT_TCP_BUFFER`]: the private stack runs no congestion
+/// control, and a larger one would only send larger bursts.
+#[cfg(target_os = "ios")]
+pub const DEFAULT_TCP_RECEIVE_BUFFER: u32 = 64 * 1024;
+/// Default receive buffer of each private-stack TCP connection (see the
+/// iOS value for the trade-off).
+#[cfg(target_os = "android")]
+pub const DEFAULT_TCP_RECEIVE_BUFFER: u32 = 256 * 1024;
+/// Default receive buffer of each private-stack TCP connection (see the
+/// iOS value for the trade-off).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub const DEFAULT_TCP_RECEIVE_BUFFER: u32 = 512 * 1024;
 pub const MIN_TCP_BUFFER: u32 = 4 * 1024;
 pub const MAX_TCP_BUFFER: u32 = 1024 * 1024;
 const MAX_PIPE_ID: u16 = 0x7FFF;
@@ -33,17 +52,15 @@ pub struct IwanConfig {
     /// Replaces the DNS servers from OPENACK.
     #[serde(default)]
     pub dns: Vec<Ipv4Addr>,
-    /// Per-connection TCP send and receive buffer of the private stack.
-    #[serde(default = "default_tcp_buffer")]
-    pub tcp_buffer_bytes: u32,
+    /// Per-connection TCP send and receive buffer of the private stack,
+    /// both directions. Absent: [`DEFAULT_TCP_RECEIVE_BUFFER`] and
+    /// [`DEFAULT_TCP_BUFFER`].
+    #[serde(default)]
+    pub tcp_buffer_bytes: Option<u32>,
 }
 
 fn default_mtu() -> u16 {
     DEFAULT_MTU
-}
-
-fn default_tcp_buffer() -> u32 {
-    DEFAULT_TCP_BUFFER
 }
 
 /// Validated settings. Has no `Debug`: it holds the password.
@@ -53,7 +70,10 @@ pub struct IwanSettings {
     pub port: u16,
     pub client: ClientConfig,
     pub dns: Vec<Ipv4Addr>,
-    pub tcp_buffer_bytes: u32,
+    /// Receive buffer of each private-stack TCP connection.
+    pub tcp_receive_buffer_bytes: u32,
+    /// Send buffer of each private-stack TCP connection.
+    pub tcp_send_buffer_bytes: u32,
 }
 
 impl IwanConfig {
@@ -81,9 +101,13 @@ impl IwanConfig {
         if self.dns.len() > 2 || self.dns.iter().any(Ipv4Addr::is_unspecified) {
             return Err("iwan dns must be at most two IPv4 addresses");
         }
-        if !(MIN_TCP_BUFFER..=MAX_TCP_BUFFER).contains(&self.tcp_buffer_bytes) {
-            return Err("iwan tcp buffer is out of range");
-        }
+        let (tcp_receive_buffer_bytes, tcp_send_buffer_bytes) = match self.tcp_buffer_bytes {
+            Some(bytes) if !(MIN_TCP_BUFFER..=MAX_TCP_BUFFER).contains(&bytes) => {
+                return Err("iwan tcp buffer is out of range");
+            }
+            Some(bytes) => (bytes, bytes),
+            None => (DEFAULT_TCP_RECEIVE_BUFFER, DEFAULT_TCP_BUFFER),
+        };
         let resolve = server.parse::<Ipv4Addr>().is_err();
         Ok(IwanSettings {
             server: server.to_owned(),
@@ -98,7 +122,8 @@ impl IwanConfig {
                 resolve,
             },
             dns: self.dns,
-            tcp_buffer_bytes: self.tcp_buffer_bytes,
+            tcp_receive_buffer_bytes,
+            tcp_send_buffer_bytes,
         })
     }
 }
@@ -123,7 +148,25 @@ mod tests {
         assert!(!settings.client.encrypt);
         assert!(!settings.client.resolve);
         assert!(settings.dns.is_empty());
-        assert_eq!(settings.tcp_buffer_bytes, 64 * 1024);
+        assert_eq!(
+            settings.tcp_receive_buffer_bytes,
+            DEFAULT_TCP_RECEIVE_BUFFER
+        );
+        assert_eq!(settings.tcp_send_buffer_bytes, DEFAULT_TCP_BUFFER);
+        #[cfg(target_os = "ios")]
+        assert_eq!(DEFAULT_TCP_RECEIVE_BUFFER, 64 * 1024);
+        #[cfg(target_os = "android")]
+        assert_eq!(DEFAULT_TCP_RECEIVE_BUFFER, 256 * 1024);
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        assert_eq!(DEFAULT_TCP_RECEIVE_BUFFER, 512 * 1024);
+        // An explicit size sets both directions, as before.
+        let explicit = parse(serde_json::json!({
+            "server": "198.51.100.7", "port": 4567, "username": "u", "password": "p",
+            "tcp_buffer_bytes": 16384
+        }))
+        .unwrap();
+        assert_eq!(explicit.tcp_receive_buffer_bytes, 16384);
+        assert_eq!(explicit.tcp_send_buffer_bytes, 16384);
         let named = parse(serde_json::json!({
             "server": "iwan.example", "port": 4567, "username": "u", "password": "p",
             "encrypt": true, "pipe_id": 7, "pipe_idx": 1, "dns": ["1.1.1.1"]

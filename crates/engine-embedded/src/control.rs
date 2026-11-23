@@ -25,7 +25,8 @@
 //! | `scripts` | | `{"scripts": [`[`ScheduledScriptView`]`]}` |
 //! | `script_notifications` | | `{"notifications": [`[`ScriptNotificationView`]`]}`, each returned once |
 //! | `network_changed` | | `{"scheduled": network-change script count}` |
-//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped}` |
+//! | `memory_pressure` | optional `level` (`normal` \| `warning` \| `critical`) | `{"level", "skipped_runs"}`: the iOS extension forwards the system's memory pressure. `warning` drops the cached script sources and bytecode and runs HTTP scripts one at a time; `critical` also stops new script runs (messages pass unchanged, scheduled runs are skipped and counted in `skipped_runs`) until `normal` or `warning` |
+//! | `reset_network` | `close_connections` (default `true`) | `{"reset": dropped sessions, "closed": closed connections, "health_forgotten": groups whose check results were dropped, "first_wait_forgotten": destinations no longer connected without the first-payload wait, "dns_flushed": DNS answers and resolved addresses dropped, "dns_connections_dropped": kept upstream DNS connections dropped}` |
 //! | `set_network` | optional `type` (`wifi` \| `wired` \| `cellular`), `ssid`, `bssid`, `router`, `addresses` (IPs of the default interface), `radio` (cellular radio technology such as `LTE` or `NR`) | `{"changed": bool}`: the network subnet groups and `SUBNET` / `CELLULAR-RADIO` rules match; all fields absent means unknown |
 //! | `devices` | | `{"devices": {ip: name}}` |
 //! | `set_devices` | `devices` (`{ip: name}`, at most 256) | `{"changed": bool}`: the names `DEVICE-NAME` rules match, replacing the earlier ones |
@@ -88,15 +89,26 @@
 //!
 //! `reset_network` is what the client sends when the network under the
 //! engine changed (another Wi-Fi, Wi-Fi to cellular, the default interface
-//! moved) or the device woke from a long sleep: every outbound drops the
-//! sessions it keeps between flows (see
-//! [`engine_outbound::TcpOutbound::reset_sessions`]) and, unless
+//! moved) or the device woke from a long sleep: every outbound stops
+//! reusing the sessions it keeps between flows (see
+//! [`engine_outbound::TcpOutbound::reset_sessions`]; a shared QUIC
+//! connection that still carries flows is retired and closes with its last
+//! flow), the address family each server last connected with is forgotten,
+//! and, unless
 //! `close_connections` is `false`, the open connections are closed so the
 //! apps behind them reconnect at once instead of waiting for a dead path to
 //! time out. It works with or without plugin scripts. It also forgets every
 //! policy group health check result, which says nothing about the new
 //! network: a group is checked again as soon as a connection goes through
-//! it (see [`crate::routing`]). A running WireGuard node moves its session to
+//! it (see [`crate::routing`]), and every destination the packet tunnel
+//! learned to connect without waiting for the app's first bytes (see
+//! [`crate::first_payload`]). It drops the DNS answers the tunnel cached,
+//! the addresses kept for IP rules and Fake-IP DIRECT flows, and every
+//! upstream DNS connection kept for reuse
+//! ([`crate::connections::Dispatcher::reset_dns`]): answers from the old
+//! network (split-horizon names, a carrier's CDN) no longer fit, and a kept
+//! connection over the old path would cost the next query half its budget.
+//! Fake-IP mappings stay. A running WireGuard node moves its session to
 //! a new UDP socket and counts as one reset.
 //!
 //! A whole-device WireGuard tunnel (a config whose single `outbound` is
@@ -192,6 +204,10 @@ enum ControlRequest {
     Scripts,
     ScriptNotifications,
     NetworkChanged,
+    MemoryPressure {
+        #[serde(default)]
+        level: Option<String>,
+    },
     ResetNetwork {
         #[serde(default = "default_true")]
         close_connections: bool,
@@ -318,7 +334,14 @@ pub enum ScriptControl {
     Scripts,
     Notifications,
     NetworkChanged,
-    Run { tag: String },
+    Run {
+        tag: String,
+    },
+    /// Sets the scripts' memory pressure level (`normal`, `warning` or
+    /// `critical`) when given; answers the level in force.
+    MemoryPressure {
+        level: Option<String>,
+    },
 }
 
 /// A cron, network-change or generic plugin script.
@@ -564,6 +587,18 @@ pub fn handle_with_interceptor(
             Ok(script(interceptor, ScriptControl::Notifications)?)
         }
         ControlRequest::NetworkChanged => Ok(script(interceptor, ScriptControl::NetworkChanged)?),
+        ControlRequest::MemoryPressure { level } => {
+            if level
+                .as_deref()
+                .is_some_and(|level| !matches!(level, "normal" | "warning" | "critical"))
+            {
+                return Err(invalid("level must be normal, warning or critical"));
+            }
+            Ok(script(
+                interceptor,
+                ScriptControl::MemoryPressure { level },
+            )?)
+        }
         ControlRequest::SetNetwork {
             kind,
             ssid,
@@ -601,12 +636,24 @@ pub fn handle_with_interceptor(
                 .routed_outbound()
                 .map_or(0, |routed| routed.forget_health());
             let reset = dispatcher.reset_sessions();
+            // What stayed silent on the old network says nothing about the
+            // new one (another path, another middlebox, another server
+            // behind the address): every destination is sniffed again.
+            let first_wait_forgotten = dispatcher.server_first().clear();
+            let dns = dispatcher.reset_dns();
             let closed = if close_connections {
                 tracker.close_all()
             } else {
                 0
             };
-            Ok(json!({ "reset": reset, "closed": closed, "health_forgotten": health_forgotten }))
+            Ok(json!({
+                "reset": reset,
+                "closed": closed,
+                "health_forgotten": health_forgotten,
+                "first_wait_forgotten": first_wait_forgotten,
+                "dns_flushed": dns.flushed,
+                "dns_connections_dropped": dns.dropped,
+            }))
         }
         ControlRequest::RunScript { tag } => Ok(script(interceptor, ScriptControl::Run { tag })?),
         ControlRequest::MitmHosts => Ok(mitm_hosts(interceptor, false)),
@@ -896,8 +943,9 @@ fn decode_key(key_base64: &str) -> Result<Vec<u8>, RuntimeError> {
 /// Answers a request to a whole-device WireGuard tunnel, which has no flows
 /// to control. `reset_network` moves the running tunnel to a new UDP socket
 /// ([`crate::wireguard::PathControl::reset`]): `reset` is 1 when a tunnel
-/// runs, `closed` and `health_forgotten` are 0. `set_network` is checked and
-/// changes nothing (`"changed": false`). Every other command is refused.
+/// runs, `closed`, `health_forgotten`, `first_wait_forgotten` and the DNS
+/// counts are 0. `set_network` is checked and changes nothing
+/// (`"changed": false`). Every other command is refused.
 #[cfg(feature = "wireguard")]
 pub(crate) fn handle_wireguard(
     paths: &crate::wireguard::PathControl,
@@ -910,7 +958,14 @@ pub(crate) fn handle_wireguard(
         .map_err(|_| invalid("control request is not a known command"))?;
     let answer = match request {
         ControlRequest::ResetNetwork { .. } => {
-            json!({ "reset": paths.reset(), "closed": 0, "health_forgotten": 0 })
+            json!({
+                "reset": paths.reset(),
+                "closed": 0,
+                "health_forgotten": 0,
+                "first_wait_forgotten": 0,
+                "dns_flushed": 0,
+                "dns_connections_dropped": 0,
+            })
         }
         ControlRequest::SetNetwork {
             kind,

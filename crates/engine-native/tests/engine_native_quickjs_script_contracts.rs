@@ -8,7 +8,8 @@ use control_domain::{
 };
 use engine_native::{
     scaled_memory_limit, NativeHttpMitmPluginHook, NativePlainHttpMessage,
-    NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig, ScriptStoreRecovery,
+    NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig, NativeScheduledScriptKind,
+    NativeScheduledScriptRun, ScriptMemoryPressure, ScriptStoreRecovery,
     ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE,
     ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE,
     ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_FAILED_CODE, QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES,
@@ -247,6 +248,112 @@ fn quickjs_response_script_reads_the_request_it_answers() {
 }
 
 #[test]
+fn quickjs_header_script_keeps_every_set_cookie_field() {
+    let dir = temp_dir("set-cookie");
+    let script = dir.join("strip-csp.js");
+    std::fs::write(
+        &script,
+        "var headers = $response.headers; delete headers['Content-Security-Policy'];\
+         $done({ headers: headers });",
+    )
+    .unwrap();
+    let hook = hook(executor(&script, None), 1000);
+    let mut response = message(HttpMitmPhase::Response, "{}");
+    let entry = |key: &str, value: &str| MetadataEntry {
+        key: key.to_string(),
+        value: value.to_string(),
+    };
+    response.headers = vec![
+        entry("Set-Cookie", "sid=1; Path=/; HttpOnly"),
+        entry("Content-Security-Policy", "default-src 'self'"),
+        entry(
+            "Set-Cookie",
+            "theme=dark; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
+        ),
+        entry("Set-Cookie", "lang=en"),
+    ];
+
+    let report = hook.plan_plain_http(&response);
+
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+    let cookies = report
+        .headers
+        .iter()
+        .filter(|header| header.key == "Set-Cookie")
+        .map(|header| header.value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cookies,
+        [
+            "sid=1; Path=/; HttpOnly",
+            "theme=dark; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
+            "lang=en"
+        ]
+    );
+    assert!(!report
+        .headers
+        .iter()
+        .any(|header| header.key == "Content-Security-Policy"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn critical_memory_pressure_skips_scripts_until_it_eases() {
+    let dir = temp_dir("pressure");
+    let script = dir.join("pressure.js");
+    std::fs::write(&script, "$done({ body: 'changed' });").unwrap();
+    let executor = executor(&script, None).with_memory_budget(16 * 1024 * 1024);
+    let hook = hook(executor.clone(), 1000);
+    assert_eq!(
+        executor.memory_pressure(),
+        (ScriptMemoryPressure::Normal, 0)
+    );
+
+    executor.set_memory_pressure(ScriptMemoryPressure::Critical);
+    let report = hook.plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
+    assert!(!report.script_dispatch_executed);
+    assert!(report.script_dispatch_deferred, "{:?}", report.diagnostics);
+    assert_eq!(report.body, b"{}");
+    let scheduled = executor.execute_scheduled(&NativeScheduledScriptRun {
+        script_url: SCRIPT_URL.to_string(),
+        tag: "contract".to_string(),
+        argument: String::new(),
+        kind: NativeScheduledScriptKind::Generic,
+        timeout_secs: 1,
+    });
+    assert!(!scheduled.executed);
+    assert_eq!(scheduled.status, "memory_pressure");
+    assert_eq!(
+        executor.memory_pressure(),
+        (ScriptMemoryPressure::Critical, 2)
+    );
+
+    // A warning still runs scripts, one at a time.
+    executor.set_memory_pressure(ScriptMemoryPressure::Warning);
+    let report = hook.plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+    assert_eq!(report.body, b"changed");
+    executor.set_memory_pressure(ScriptMemoryPressure::Normal);
+    let report = hook.plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
+    assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_dispatch_heap_never_exceeds_the_memory_budget() {
+    let dir = temp_dir("budget-heap");
+    let script = dir.join("small.js");
+    std::fs::write(&script, "$done({});").unwrap();
+    let source_len = 3 * 1024 * 1024;
+    // Without a budget a large script is raised past 16 MiB.
+    let unbudgeted = executor(&script, None);
+    assert!(unbudgeted.dispatch_memory_limit(source_len) > 16 * 1024 * 1024);
+    let budgeted = executor(&script, None).with_memory_budget(16 * 1024 * 1024);
+    assert_eq!(budgeted.dispatch_memory_limit(source_len), 16 * 1024 * 1024);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn quickjs_binary_body_mode_passes_bytes_both_ways() {
     let dir = temp_dir("binary");
     let script = dir.join("binary.js");
@@ -389,27 +496,39 @@ fn a_script_of_a_few_mib_runs_under_a_small_configured_heap() {
         format!("var s = \"{filler}\";\n$done({{ body: String(s.length) }});"),
     )
     .unwrap();
-    let mut script_assets = BTreeMap::new();
-    script_assets.insert(SCRIPT_URL.to_string(), script.display().to_string());
-    let executor = NativeQuickJsScriptExecutor::new(NativeQuickJsScriptRuntimeConfig {
-        script_assets,
-        persistent_store_path: None,
-        max_timeout_ms: 5000,
-        max_body_bytes: 4096,
-        memory_limit_bytes: 8 * MIB,
-    })
-    .unwrap()
-    // Smaller than the dispatch's limit: it still runs, alone.
-    .with_memory_budget(MIB);
-    let hook = hook(executor, 5000);
+    let executor = |budget: usize| {
+        let mut script_assets = BTreeMap::new();
+        script_assets.insert(SCRIPT_URL.to_string(), script.display().to_string());
+        NativeQuickJsScriptExecutor::new(NativeQuickJsScriptRuntimeConfig {
+            script_assets,
+            persistent_store_path: None,
+            max_timeout_ms: 5000,
+            max_body_bytes: 4096,
+            memory_limit_bytes: 8 * MIB,
+        })
+        .unwrap()
+        .with_memory_budget(budget)
+    };
 
-    let report = hook.plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
-
+    // The heap grows past the configured 8 MiB to fit the source, within
+    // the budget.
+    let roomy = executor(32 * MIB);
+    assert_eq!(roomy.dispatch_memory_limit(3 * MIB), 22 * MIB);
+    let report = hook(roomy, 5000).plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
     assert!(report.script_dispatch_executed, "{:?}", report.diagnostics);
     assert_eq!(
         String::from_utf8(report.body).unwrap(),
         (3 * MIB).to_string()
     );
+
+    // The budget caps the heap QuickJS enforces, so a script that needs more
+    // fails cleanly and the message passes unchanged.
+    let tight = executor(MIB);
+    assert_eq!(tight.dispatch_memory_limit(3 * MIB), MIB);
+    let report = hook(tight, 5000).plan_plain_http(&message(HttpMitmPhase::Response, "{}"));
+    assert!(!report.script_dispatch_executed, "{:?}", report.diagnostics);
+    assert!(report.script_dispatch_failed);
+    assert_eq!(String::from_utf8(report.body).unwrap(), "{}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

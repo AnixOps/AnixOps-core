@@ -44,9 +44,10 @@ pub use quickjs_script::scaled_memory_limit;
 #[cfg(feature = "quickjs")]
 pub use quickjs_script::{
     NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig, NativeScheduledScriptKind,
-    NativeScheduledScriptReport, NativeScheduledScriptRun,
-    ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE, QUICKJS_MAX_PENDING_NOTIFICATIONS,
-    QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES, QUICKJS_MAX_SCHEDULED_TIMEOUT_SECS,
+    NativeScheduledScriptReport, NativeScheduledScriptRun, ScriptMemoryPressure,
+    ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE, QUICKJS_BODY_COPIES_PER_DISPATCH,
+    QUICKJS_MAX_PENDING_NOTIFICATIONS, QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES,
+    QUICKJS_MAX_SCHEDULED_TIMEOUT_SECS,
 };
 /// Types an embedder needs to give scripts network access
 /// ([`NativeQuickJsScriptExecutor::with_http_client`]).
@@ -360,6 +361,15 @@ pub const ENGINE_NATIVE_RUNTIME_UDP_MITM_ALLOWED_CODE: &str =
     "engine.native.runtime.udp_mitm_allowed";
 pub const ENGINE_NATIVE_RUNTIME_UDP_MITM_POLICY_FAILED_CODE: &str =
     "engine.native.runtime.udp_mitm_policy_failed";
+/// An explicit proxy CONNECT to a host outside the plugin's `[MITM]`
+/// hostname list was relayed without decryption.
+pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_HOSTNAME_BYPASSED_CODE: &str =
+    "engine.native.runtime.http_proxy_tls_mitm_hostname_bypassed";
+/// An explicit proxy CONNECT to a `[MITM]` host could not be terminated
+/// (no or another SNI, not TLS, no leaf certificate) and was relayed
+/// without decryption instead of being closed.
+pub const ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_PASSTHROUGH_CODE: &str =
+    "engine.native.runtime.http_proxy_tls_mitm_passthrough";
 
 /// UDP port that carries HTTP/3 over QUIC.
 pub const QUIC_HTTPS_UDP_PORT: u16 = 443;
@@ -1074,7 +1084,7 @@ impl NativeNodeScriptExecutor {
         };
         let headers = match result.headers {
             Some(headers) => match script_headers_from_map(headers) {
-                Some(headers) => Some(headers),
+                Some(headers) => Some(restore_joined_script_headers(&message.headers, headers)),
                 None => {
                     return script_execution_failed(
                         "native HTTP script runtime returned invalid headers",
@@ -1261,6 +1271,23 @@ impl NativeHttpMitmPluginHook {
 
     pub fn script_executor_enabled(&self) -> bool {
         self.script_executor.is_some()
+    }
+
+    /// Whether TLS to `host` is decrypted: the plugin's `[MITM]` hostname
+    /// list (wildcards and `-` exclusions included) intercepts it. A host
+    /// outside the list, and a list that cannot be evaluated, is not
+    /// decrypted.
+    pub fn intercepts_tls_host(&self, host: &str) -> bool {
+        let hostname = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        matches!(
+            self.plugin_service
+                .evaluate_mitm_hostname(&self.plugin_instance, &hostname, false),
+            Ok(MitmHostnameDecision::Intercept)
+        )
     }
 
     /// `node` or `quickjs-ng` when a script executor is configured.
@@ -1584,6 +1611,26 @@ fn script_headers_to_map(headers: &[MetadataEntry]) -> BTreeMap<String, String> 
         }
     }
     values
+}
+
+/// The fields [`script_headers_to_map`] joined, given back where the
+/// script returned them unchanged (see
+/// [`script_runtime::restore_joined_headers`]), so several `Set-Cookie`
+/// fields are not merged into one.
+fn restore_joined_script_headers(
+    original: &[MetadataEntry],
+    returned: Vec<MetadataEntry>,
+) -> Vec<MetadataEntry> {
+    let pairs = |entries: Vec<MetadataEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect::<Vec<_>>()
+    };
+    script_runtime::restore_joined_headers(&pairs(original.to_vec()), pairs(returned))
+        .into_iter()
+        .map(|(key, value)| MetadataEntry { key, value })
+        .collect()
 }
 
 fn script_headers_from_map(headers: BTreeMap<String, String>) -> Option<Vec<MetadataEntry>> {
@@ -4202,80 +4249,210 @@ where
     read_report
 }
 
+/// Reads one upstream response as the answer to a `GET`. See
+/// [`read_plain_http_proxy_response_for_request`].
 pub fn read_plain_http_proxy_response<R>(reader: &mut R) -> NativePlainHttpProxyResponseReadReport
 where
     R: Read,
 {
-    let header_bytes = match read_http_header_bytes(reader) {
-        Some(header_bytes) => header_bytes,
-        None => {
-            return NativePlainHttpProxyResponseReadReport {
-                response: None,
-                diagnostics: vec![runtime_warning(
-                    ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
-                    "native plain HTTP proxy upstream response could not be read",
-                )],
-            };
+    read_plain_http_proxy_response_for_request(reader, "GET")
+}
+
+/// Reads the final upstream response to a `request_method` request, framed
+/// as RFC 9112 section 6.3 says: no body for `HEAD` and for 1xx, 204 and
+/// 304 answers; then `Transfer-Encoding: chunked`, then `Content-Length`;
+/// with neither, the body runs to the end of the connection, up to the
+/// body limit (a longer one fails rather than being cut short). Interim
+/// 1xx answers (other than 101) are skipped; see
+/// [`read_plain_http_proxy_response_with_interim`] to forward them.
+pub fn read_plain_http_proxy_response_for_request<R>(
+    reader: &mut R,
+    request_method: &str,
+) -> NativePlainHttpProxyResponseReadReport
+where
+    R: Read,
+{
+    read_plain_http_proxy_response_with_interim(reader, request_method).0
+}
+
+/// Interim (1xx) answers an upstream may send before its final one.
+const HTTP_PROXY_MAX_INTERIM_RESPONSES: usize = 8;
+
+/// [`read_plain_http_proxy_response_for_request`], also returning the raw
+/// heads of the interim 1xx answers before the final one (`100 Continue`,
+/// `103 Early Hints`), to be forwarded to the client first.
+fn read_plain_http_proxy_response_with_interim<R>(
+    reader: &mut R,
+    request_method: &str,
+) -> (NativePlainHttpProxyResponseReadReport, Vec<u8>)
+where
+    R: Read,
+{
+    let mut interim = Vec::new();
+    for _ in 0..=HTTP_PROXY_MAX_INTERIM_RESPONSES {
+        let head = match read_plain_http_proxy_response_head(reader) {
+            Ok(head) => head,
+            Err(report) => return (*report, interim),
+        };
+        if (100..200).contains(&head.status_code) {
+            // A protocol switch cannot be relayed as HTTP/1.1 messages.
+            if head.status_code == 101 {
+                return (plain_http_proxy_response_read_failed(), interim);
+            }
+            interim.extend_from_slice(&head.raw);
+            interim.extend_from_slice(b"\r\n\r\n");
+            continue;
         }
+        let body = if response_has_no_body(request_method, head.status_code) {
+            Ok(Vec::new())
+        } else if http_message_has_length(&head.headers) {
+            read_http_body(reader, &head.headers, HTTP_PROXY_MAX_BODY_BYTES)
+        } else {
+            read_http_body_to_end(reader, HTTP_PROXY_MAX_BODY_BYTES)
+        };
+        let Ok(body) = body else {
+            return (plain_http_proxy_response_read_failed(), interim);
+        };
+        return (
+            NativePlainHttpProxyResponseReadReport {
+                response: Some(NativePlainHttpProxyResponse {
+                    version: head.version,
+                    status_code: head.status_code,
+                    reason_phrase: head.reason_phrase,
+                    headers: head.headers,
+                    body,
+                }),
+                diagnostics: vec![runtime_info(
+                    ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_CODE,
+                    "native plain HTTP proxy upstream response was read",
+                )],
+            },
+            interim,
+        );
+    }
+    (plain_http_proxy_response_read_failed(), interim)
+}
+
+/// The head of one upstream response, with its raw bytes (without the
+/// blank line) for relaying an interim answer as it came.
+struct NativePlainHttpProxyResponseHead {
+    raw: Vec<u8>,
+    version: String,
+    status_code: u16,
+    reason_phrase: String,
+    headers: Vec<MetadataEntry>,
+}
+
+fn read_plain_http_proxy_response_head<R>(
+    reader: &mut R,
+) -> Result<NativePlainHttpProxyResponseHead, Box<NativePlainHttpProxyResponseReadReport>>
+where
+    R: Read,
+{
+    let Some(raw) = read_http_header_bytes(reader) else {
+        return Err(Box::new(NativePlainHttpProxyResponseReadReport {
+            response: None,
+            diagnostics: vec![runtime_warning(
+                ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
+                "native plain HTTP proxy upstream response could not be read",
+            )],
+        }));
     };
-    let header_text = match String::from_utf8(header_bytes) {
-        Ok(header_text) => header_text,
-        Err(_) => {
-            return NativePlainHttpProxyResponseReadReport {
-                response: None,
-                diagnostics: vec![runtime_warning(
-                    ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
-                    "native plain HTTP proxy upstream response header must be valid UTF-8",
-                )],
-            };
-        }
+    let Ok(header_text) = std::str::from_utf8(&raw) else {
+        return Err(Box::new(NativePlainHttpProxyResponseReadReport {
+            response: None,
+            diagnostics: vec![runtime_warning(
+                ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
+                "native plain HTTP proxy upstream response header must be valid UTF-8",
+            )],
+        }));
     };
-    let (status_line, headers) = match parse_http_start_line_and_headers(&header_text) {
-        Some(parsed) => parsed,
-        None => {
-            return NativePlainHttpProxyResponseReadReport {
-                response: None,
-                diagnostics: vec![runtime_warning(
-                    ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
-                    "native plain HTTP proxy upstream response header is invalid",
-                )],
-            };
-        }
+    let Some((status_line, headers)) = parse_http_start_line_and_headers(header_text) else {
+        return Err(Box::new(NativePlainHttpProxyResponseReadReport {
+            response: None,
+            diagnostics: vec![runtime_warning(
+                ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_FAILED_CODE,
+                "native plain HTTP proxy upstream response header is invalid",
+            )],
+        }));
     };
     let mut status_parts = status_line.splitn(3, ' ');
     let Some(version) = status_parts.next() else {
-        return plain_http_proxy_response_read_failed();
+        return Err(Box::new(plain_http_proxy_response_read_failed()));
     };
     let Some(status_code) = status_parts
         .next()
         .and_then(|value| value.parse::<u16>().ok())
     else {
-        return plain_http_proxy_response_read_failed();
+        return Err(Box::new(plain_http_proxy_response_read_failed()));
     };
     if !version.starts_with("HTTP/") {
-        return plain_http_proxy_response_read_failed();
+        return Err(Box::new(plain_http_proxy_response_read_failed()));
     }
     if version != "HTTP/1.0" && version != "HTTP/1.1" {
-        return plain_http_proxy_response_http_version_unsupported();
+        return Err(Box::new(
+            plain_http_proxy_response_http_version_unsupported(),
+        ));
     }
+    let version = version.to_string();
     let reason_phrase = status_parts.next().unwrap_or("").to_string();
-    let body = match read_http_body(reader, &headers, HTTP_PROXY_MAX_BODY_BYTES) {
-        Ok(body) => body,
-        Err(()) => return plain_http_proxy_response_read_failed(),
-    };
+    Ok(NativePlainHttpProxyResponseHead {
+        raw,
+        version,
+        status_code,
+        reason_phrase,
+        headers,
+    })
+}
 
-    NativePlainHttpProxyResponseReadReport {
-        response: Some(NativePlainHttpProxyResponse {
-            version: version.to_string(),
-            status_code,
-            reason_phrase,
-            headers,
-            body,
-        }),
-        diagnostics: vec![runtime_info(
-            ENGINE_NATIVE_RUNTIME_HTTP_PROXY_PLAIN_UPSTREAM_RESPONSE_READ_CODE,
-            "native plain HTTP proxy upstream response was read",
-        )],
+/// A response to `request_method` with `status_code` that never has a
+/// body (RFC 9112 section 6.3, items 1 and 2).
+fn response_has_no_body(request_method: &str, status_code: u16) -> bool {
+    request_method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status_code)
+        || status_code == 204
+        || status_code == 304
+}
+
+fn http_message_has_length(headers: &[MetadataEntry]) -> bool {
+    headers.iter().any(|header| {
+        header.key.eq_ignore_ascii_case("Content-Length")
+            || header.key.eq_ignore_ascii_case("Transfer-Encoding")
+    })
+}
+
+/// Whether `response`, the answer to `request_method`, ends only when the
+/// upstream closes: it has a body and no length of its own. Such a
+/// connection cannot carry another exchange.
+fn response_is_close_delimited(
+    request_method: &str,
+    response: &NativePlainHttpProxyResponse,
+) -> bool {
+    !response_has_no_body(request_method, response.status_code)
+        && !http_message_has_length(&response.headers)
+}
+
+/// A body that runs to the end of the connection. A clean end (`Ok(0)`)
+/// ends it; a timeout or error fails, never cutting the body short, and so
+/// does a body over `max_len`.
+fn read_http_body_to_end<R>(reader: &mut R, max_len: usize) -> Result<Vec<u8>, ()>
+where
+    R: Read,
+{
+    let mut body = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(body),
+            Ok(read) => {
+                if read > max_len.saturating_sub(body.len()) {
+                    return Err(());
+                }
+                body.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return Err(()),
+        }
     }
 }
 
@@ -4318,6 +4495,9 @@ fn serialize_explicit_http_proxy_request_for_upstream_with_connection(
     });
     let mut headers = rewrite_report.headers.clone();
     headers.retain(|header| !header.key.eq_ignore_ascii_case("Proxy-Connection"));
+    // The proxy holds the whole body before it sends the request, so the
+    // upstream has no reason to answer `100 Continue` first.
+    remove_plain_http_header(&mut headers, "Expect");
     remove_plain_http_header(&mut headers, "Transfer-Encoding");
     remove_plain_http_header(&mut headers, "Content-Length");
     set_plain_http_header(
@@ -4354,19 +4534,30 @@ pub fn serialize_plain_http_proxy_response(
     version: &str,
     rewrite_report: &NativePlainHttpRewriteReport,
 ) -> Vec<u8> {
-    serialize_plain_http_proxy_response_with_connection(version, rewrite_report, true)
+    serialize_plain_http_proxy_response_with_connection(version, rewrite_report, true, "GET")
 }
 
+/// Serializes the response to a `request_method` request. A response that
+/// has no body (to `HEAD`, or 1xx, 204, 304) is written without one: a
+/// `HEAD` or 304 answer keeps the `Content-Length` it came with (the size
+/// the full response would have), 1xx and 204 get none.
 fn serialize_plain_http_proxy_response_with_connection(
     version: &str,
     rewrite_report: &NativePlainHttpRewriteReport,
     close_connection: bool,
+    request_method: &str,
 ) -> Vec<u8> {
     let status_code = rewrite_report.final_status_code.unwrap_or(200);
+    let bodiless = response_has_no_body(request_method, status_code);
     let mut headers = rewrite_report.headers.clone();
     if let Some(location) = &rewrite_report.redirect_location {
         set_plain_http_header(&mut headers, "Location", location);
     }
+    let announced_length = headers
+        .iter()
+        .find(|header| header.key.eq_ignore_ascii_case("Content-Length"))
+        .map(|header| header.value.trim().to_string())
+        .filter(|_| !(100..200).contains(&status_code) && status_code != 204);
     remove_plain_http_header(&mut headers, "Transfer-Encoding");
     remove_plain_http_header(&mut headers, "Content-Length");
     remove_plain_http_header(&mut headers, "Connection");
@@ -4379,11 +4570,15 @@ fn serialize_plain_http_proxy_response_with_connection(
             "keep-alive"
         },
     );
-    set_plain_http_header(
-        &mut headers,
-        "Content-Length",
-        &rewrite_report.body.len().to_string(),
-    );
+    if !bodiless {
+        set_plain_http_header(
+            &mut headers,
+            "Content-Length",
+            &rewrite_report.body.len().to_string(),
+        );
+    } else if let Some(length) = announced_length {
+        set_plain_http_header(&mut headers, "Content-Length", &length);
+    }
 
     let mut bytes = format!(
         "{} {} {}\r\n",
@@ -4394,7 +4589,9 @@ fn serialize_plain_http_proxy_response_with_connection(
     .into_bytes();
     write_http_headers_to_bytes(&mut bytes, &headers);
     bytes.extend_from_slice(b"\r\n");
-    bytes.extend_from_slice(&rewrite_report.body);
+    if !bodiless {
+        bytes.extend_from_slice(&rewrite_report.body);
+    }
     bytes
 }
 
@@ -7059,8 +7256,12 @@ fn handle_plain_http_proxy_accepted_connection(
             record_plain_http_live_rewrite_diagnostic(&mut diagnostics, &request_rewrite_report);
 
             if request_rewrite_report.terminal_action.is_some() {
-                let response =
-                    serialize_plain_http_proxy_response(&request.version, &request_rewrite_report);
+                let response = serialize_plain_http_proxy_response_with_connection(
+                    &request.version,
+                    &request_rewrite_report,
+                    true,
+                    &request.method,
+                );
                 let write_report = write_plain_http_proxy_client_response(&mut stream, response);
                 connection_handled = diagnostics_contain_code(
                     &write_report.diagnostics,
@@ -7163,10 +7364,24 @@ fn forward_plain_http_proxy_request_via_socks_outbound(
                         );
                         diagnostics.extend(upstream_write_report.diagnostics);
                         if upstream_request_written {
-                            let response_read_report =
-                                read_plain_http_proxy_response(&mut outbound_stream);
+                            // The socket's short connect timeout would cut a
+                            // slow answer or one that arrives in pieces; the
+                            // whole read gets the session's time instead.
+                            let (response_read_report, interim) = {
+                                let mut bounded_reader = NativeBoundedRead::new(
+                                    &mut outbound_stream,
+                                    Duration::from_millis(CONTROLLED_TLS_SESSION_TIMEOUT_MS),
+                                );
+                                read_plain_http_proxy_response_with_interim(
+                                    &mut bounded_reader,
+                                    &request.method,
+                                )
+                            };
                             let upstream_response = response_read_report.response;
                             diagnostics.extend(response_read_report.diagnostics);
+                            if upstream_response.is_some() && !interim.is_empty() {
+                                let _ = client_stream.write_all(&interim);
+                            }
                             if let Some(upstream_response) = upstream_response.as_ref() {
                                 let response_message =
                                     plain_http_proxy_response_to_plain_http_message(
@@ -7183,10 +7398,13 @@ fn forward_plain_http_proxy_request_via_socks_outbound(
                                     &mut diagnostics,
                                     &response_rewrite_report,
                                 );
-                                let client_response = serialize_plain_http_proxy_response(
-                                    &upstream_response.version,
-                                    &response_rewrite_report,
-                                );
+                                let client_response =
+                                    serialize_plain_http_proxy_response_with_connection(
+                                        &upstream_response.version,
+                                        &response_rewrite_report,
+                                        true,
+                                        &request.method,
+                                    );
                                 let client_write_report = write_plain_http_proxy_client_response(
                                     client_stream,
                                     client_response,
@@ -7353,9 +7571,11 @@ where
         record_plain_http_live_rewrite_diagnostic(diagnostics, &request_rewrite_report);
 
         if request_rewrite_report.terminal_action.is_some() {
-            let client_response = serialize_plain_http_proxy_response(
+            let client_response = serialize_plain_http_proxy_response_with_connection(
                 &decrypted_request.version,
                 &request_rewrite_report,
+                true,
+                &decrypted_request.method,
             );
             let client_write_report =
                 write_plain_http_proxy_client_response(downstream_tls, client_response);
@@ -7386,16 +7606,27 @@ where
             return Err("controlled TLS upstream request write failed".to_string());
         }
 
-        let upstream_response_report = {
+        let (upstream_response_report, interim) = {
             let mut bounded_reader = NativeBoundedRead::new(upstream_tls, session_timeout);
-            read_plain_http_proxy_response(&mut bounded_reader)
+            read_plain_http_proxy_response_with_interim(
+                &mut bounded_reader,
+                &decrypted_request.method,
+            )
         };
         diagnostics.extend(upstream_response_report.diagnostics.clone());
         let upstream_response = upstream_response_report.response.ok_or_else(|| {
             "controlled TLS upstream session could not read a bounded HTTP response".to_string()
         })?;
+        if !interim.is_empty() {
+            downstream_tls
+                .write_all(&interim)
+                .map_err(|_| "controlled TLS downstream interim response write failed")?;
+        }
+        // A body that ran to the upstream's close leaves no connection for
+        // another exchange.
         let response_close = request_close
-            || http_message_requests_close(&upstream_response.version, &upstream_response.headers);
+            || http_message_requests_close(&upstream_response.version, &upstream_response.headers)
+            || response_is_close_delimited(&decrypted_request.method, &upstream_response);
         let response_message =
             plain_http_proxy_response_to_plain_http_message(&decrypted_request, &upstream_response);
         let response_rewrite_report = http_mitm_hook
@@ -7407,6 +7638,7 @@ where
             &upstream_response.version,
             &response_rewrite_report,
             response_close,
+            &decrypted_request.method,
         );
         let client_write_report =
             write_plain_http_proxy_client_response(downstream_tls, client_response);
@@ -7496,6 +7728,22 @@ fn forward_http_connect_tunnel_via_socks_outbound(
                         );
                         diagnostics.extend(connect_response.diagnostics);
                         if tunnel_established {
+                            // Only `[MITM]` hosts are decrypted, as on the
+                            // other data planes; the rest are relayed.
+                            let tls_mitm_ca_material = tls_mitm_ca_material.filter(|_| {
+                                let intercept = http_mitm_hook.is_some_and(|hook| {
+                                    hook.intercepts_tls_host(&request.target_host)
+                                });
+                                if !intercept {
+                                    diagnostics.push(engine_diagnostic(
+                                        DiagnosticSeverity::Info,
+                                        ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_HOSTNAME_BYPASSED_CODE,
+                                        "native explicit HTTP proxy relayed CONNECT to a host outside the MITM hostname list",
+                                        SOURCE_ENGINE_NATIVE_MITM,
+                                    ));
+                                }
+                                intercept
+                            });
                             let wait_for_complete_client_hello = tls_mitm_ca_material.is_some();
                             let client_hello_report =
                                 observe_http_connect_tls_client_hello_from_stream(
@@ -7521,43 +7769,44 @@ fn forward_http_connect_tunnel_via_socks_outbound(
                                         tls_mitm_ca_material.private_key_pem(),
                                     );
                                 diagnostics.extend(leaf_certificate_report.diagnostics.clone());
-                                let Some(leaf_certificate_material) =
-                                    leaf_certificate_report.material.as_ref()
-                                else {
-                                    let _ = outbound_stream.shutdown(Shutdown::Both);
-                                    return (false, diagnostics);
-                                };
-                                let downstream_config_report =
-                                    build_controlled_tls_termination_server_config(
-                                        leaf_certificate_material,
-                                    );
-                                diagnostics.extend(downstream_config_report.diagnostics.clone());
-                                let Some(downstream_server_config) =
-                                    downstream_config_report.server_config
-                                else {
-                                    let _ = outbound_stream.shutdown(Shutdown::Both);
-                                    return (false, diagnostics);
-                                };
-                                let upstream_config_report =
-                                    build_controlled_tls_upstream_client_config();
-                                diagnostics.extend(upstream_config_report.diagnostics.clone());
-                                let Some(upstream_client_config) =
-                                    upstream_config_report.client_config
-                                else {
-                                    let _ = outbound_stream.shutdown(Shutdown::Both);
-                                    return (false, diagnostics);
-                                };
-                                let (exchange_completed, exchange_diagnostics) =
-                                    run_controlled_tls_connect_http_exchange(
-                                        client_stream,
-                                        outbound_stream,
-                                        request,
-                                        downstream_server_config,
-                                        upstream_client_config,
-                                        http_mitm_hook,
-                                    );
-                                diagnostics.extend(exchange_diagnostics);
-                                return (exchange_completed, diagnostics);
+                                // The ClientHello was only peeked at, so until
+                                // the handshake starts the connection can still
+                                // be relayed as it is: a host that cannot be
+                                // terminated (no SNI or another one, ECH's
+                                // outer name, not TLS, no leaf) passes through
+                                // instead of being closed.
+                                let configs =
+                                    leaf_certificate_report.material.as_ref().and_then(|leaf| {
+                                        let downstream =
+                                            build_controlled_tls_termination_server_config(leaf);
+                                        diagnostics.extend(downstream.diagnostics.clone());
+                                        let downstream = downstream.server_config?;
+                                        let upstream =
+                                            build_controlled_tls_upstream_client_config();
+                                        diagnostics.extend(upstream.diagnostics.clone());
+                                        Some((downstream, upstream.client_config?))
+                                    });
+                                if let Some((downstream_server_config, upstream_client_config)) =
+                                    configs
+                                {
+                                    let (exchange_completed, exchange_diagnostics) =
+                                        run_controlled_tls_connect_http_exchange(
+                                            client_stream,
+                                            outbound_stream,
+                                            request,
+                                            downstream_server_config,
+                                            upstream_client_config,
+                                            http_mitm_hook,
+                                        );
+                                    diagnostics.extend(exchange_diagnostics);
+                                    return (exchange_completed, diagnostics);
+                                }
+                                diagnostics.push(engine_diagnostic(
+                                    DiagnosticSeverity::Warning,
+                                    ENGINE_NATIVE_RUNTIME_HTTP_PROXY_TLS_MITM_PASSTHROUGH_CODE,
+                                    "native explicit HTTP proxy relayed a CONNECT it could not terminate without decryption",
+                                    SOURCE_ENGINE_NATIVE_MITM,
+                                ));
                             }
                             let relay_report = relay_socks5_outbound_connect_tcp_streams(
                                 client_stream,
@@ -8895,5 +9144,258 @@ mod controlled_tls_session_tests {
                 .with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Arc::new(config)
+    }
+}
+
+#[cfg(test)]
+mod http1_response_framing_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn read(bytes: &[u8], method: &str) -> (Option<NativePlainHttpProxyResponse>, Vec<u8>, u64) {
+        let mut cursor = Cursor::new(bytes.to_vec());
+        let (report, interim) = read_plain_http_proxy_response_with_interim(&mut cursor, method);
+        (report.response, interim, cursor.position())
+    }
+
+    #[test]
+    fn a_response_without_length_runs_to_the_close() {
+        let (response, _, _) = read(
+            b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nhello from an old server",
+            "GET",
+        );
+        assert_eq!(response.unwrap().body, b"hello from an old server");
+
+        // Past the body limit it fails instead of being cut short.
+        let mut long = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+        long.extend(vec![b'x'; HTTP_PROXY_MAX_BODY_BYTES + 1]);
+        assert!(read(&long, "GET").0.is_none());
+
+        // A read that times out is no end of the body.
+        struct TimesOut(Cursor<Vec<u8>>);
+        impl Read for TimesOut {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.read(buffer)? {
+                    0 => Err(std::io::Error::from(ErrorKind::TimedOut)),
+                    read => Ok(read),
+                }
+            }
+        }
+        let mut reader = TimesOut(Cursor::new(b"HTTP/1.1 200 OK\r\n\r\npartial".to_vec()));
+        assert!(
+            read_plain_http_proxy_response_for_request(&mut reader, "GET")
+                .response
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn head_204_and_304_answers_have_no_body() {
+        let next = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        for (head, method) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"[..],
+                "HEAD",
+            ),
+            (
+                &b"HTTP/1.1 304 Not Modified\r\nContent-Length: 1000\r\n\r\n"[..],
+                "GET",
+            ),
+            (&b"HTTP/1.1 204 No Content\r\n\r\n"[..], "GET"),
+        ] {
+            let mut bytes = head.to_vec();
+            bytes.extend_from_slice(next);
+            let (response, _, position) = read(&bytes, method);
+            assert!(response.unwrap().body.is_empty());
+            // Nothing past the head was read: the next message is intact.
+            assert_eq!(position, head.len() as u64);
+        }
+    }
+
+    #[test]
+    fn interim_answers_are_kept_for_the_client_and_the_final_one_is_returned() {
+        let (response, interim, _) = read(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\ndone",
+            "POST",
+        );
+        let response = response.unwrap();
+        assert_eq!(response.status_code, 201);
+        assert_eq!(response.body, b"done");
+        assert_eq!(
+            interim,
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n"
+        );
+        // A protocol switch cannot be relayed.
+        assert!(read(b"HTTP/1.1 101 Switching Protocols\r\n\r\n", "GET")
+            .0
+            .is_none());
+    }
+
+    fn report_for(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> NativePlainHttpRewriteReport {
+        passthrough_plain_http_rewrite_report(&NativePlainHttpMessage {
+            request_id: "framing".to_string(),
+            url: "http://example.test/".to_string(),
+            method: Some("GET".to_string()),
+            phase: HttpMitmPhase::Response,
+            status_code: Some(status),
+            headers: headers
+                .iter()
+                .map(|(key, value)| MetadataEntry {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
+            body: body.to_vec(),
+            request_headers: Vec::new(),
+            request_body: None,
+        })
+    }
+
+    #[test]
+    fn bodiless_answers_keep_their_announced_length_and_send_no_body() {
+        let head = |status, headers: &[(&str, &str)], method| {
+            String::from_utf8(serialize_plain_http_proxy_response_with_connection(
+                "HTTP/1.1",
+                &report_for(status, headers, b""),
+                false,
+                method,
+            ))
+            .unwrap()
+        };
+        let text = head(200, &[("Content-Length", "1000")], "HEAD");
+        assert!(text.contains("Content-Length: 1000\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\n"), "{text}");
+        let text = head(304, &[("Content-Length", "1000")], "GET");
+        assert!(text.contains("Content-Length: 1000\r\n"), "{text}");
+        let text = head(204, &[("Content-Length", "0")], "GET");
+        assert!(!text.contains("Content-Length"), "{text}");
+        // A body for a HEAD request is never written.
+        let text = String::from_utf8(serialize_plain_http_proxy_response_with_connection(
+            "HTTP/1.1",
+            &report_for(200, &[("Content-Length", "4")], b"body"),
+            false,
+            "HEAD",
+        ))
+        .unwrap();
+        assert!(text.ends_with("Content-Length: 4\r\n\r\n"), "{text}");
+    }
+
+    /// Reads from `input` and keeps what is written.
+    struct Pipe {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Pipe {
+        fn new(input: &[u8]) -> Self {
+            Self {
+                input: Cursor::new(input.to_vec()),
+                output: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for Pipe {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buffer)
+        }
+    }
+
+    impl Write for Pipe {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn connect_request() -> NativeExplicitHttpProxyRequest {
+        read_explicit_http_proxy_request(&mut Cursor::new(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n".to_vec(),
+        ))
+        .request
+        .expect("test CONNECT request should parse")
+    }
+
+    #[test]
+    fn a_head_exchange_keeps_the_next_exchange_on_the_same_connection_in_step() {
+        let mut downstream = Pipe::new(
+            b"HEAD /a HTTP/1.1\r\nHost: example.com\r\n\r\nGET /b HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        );
+        let mut upstream = Pipe::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        );
+        let mut diagnostics = Vec::new();
+        let written = run_controlled_tls_http1_exchanges(
+            &mut downstream,
+            &mut upstream,
+            &connect_request(),
+            None,
+            Duration::from_secs(1),
+            &mut diagnostics,
+        )
+        .expect("both exchanges complete");
+        assert!(written);
+        let client = String::from_utf8(downstream.output).unwrap();
+        let responses = client
+            .split("HTTP/1.1 200 OK\r\n")
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2, "{client}");
+        assert!(responses[0].contains("Content-Length: 5\r\n"), "{client}");
+        assert!(responses[0].ends_with("\r\n\r\n"), "{client}");
+        assert!(responses[1].ends_with("\r\n\r\nok"), "{client}");
+        let origin = String::from_utf8(upstream.output).unwrap();
+        assert!(origin.starts_with("HEAD /a HTTP/1.1\r\n"), "{origin}");
+        assert!(origin.contains("GET /b HTTP/1.1\r\n"), "{origin}");
+    }
+
+    #[test]
+    fn a_close_delimited_answer_ends_the_session() {
+        let mut downstream = Pipe::new(
+            b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\nGET /b HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+        let mut upstream = Pipe::new(b"HTTP/1.1 200 OK\r\n\r\nall of it");
+        let mut diagnostics = Vec::new();
+        run_controlled_tls_http1_exchanges(
+            &mut downstream,
+            &mut upstream,
+            &connect_request(),
+            None,
+            Duration::from_secs(1),
+            &mut diagnostics,
+        )
+        .expect("the first exchange completes");
+        let client = String::from_utf8(downstream.output).unwrap();
+        assert!(client.contains("Connection: close\r\n"), "{client}");
+        assert!(client.contains("Content-Length: 9\r\n"), "{client}");
+        assert!(client.ends_with("\r\n\r\nall of it"), "{client}");
+        let origin = String::from_utf8(upstream.output).unwrap();
+        assert!(!origin.contains("GET /b"), "{origin}");
+    }
+
+    #[test]
+    fn expect_is_not_sent_upstream() {
+        let request = read_explicit_http_proxy_request(&mut Cursor::new(
+            b"POST http://example.com/up HTTP/1.1\r\nHost: example.com\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi"
+                .to_vec(),
+        ))
+        .request
+        .expect("test request should parse");
+        let message = explicit_http_proxy_request_to_plain_http_message(&request);
+        let bytes = serialize_explicit_http_proxy_request_for_upstream(
+            &request,
+            &passthrough_plain_http_rewrite_report(&message),
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("expect:"), "{text}");
+        assert!(text.ends_with("\r\n\r\nhi"), "{text}");
     }
 }

@@ -61,20 +61,35 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/conformance")
 }
 
+/// A header list: an object (`{"name": "value"}`) or, to repeat a name, an
+/// array of pairs (`[["Set-Cookie", "a=1"], ["Set-Cookie", "b=2"]]`).
 fn headers(value: Option<&Value>) -> Vec<(String, String)> {
-    value
-        .and_then(Value::as_object)
-        .map(|object| {
-            object
-                .iter()
-                .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+    match value {
+        Some(Value::Object(object)) => object
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_string()))
+            .collect(),
+        Some(Value::Array(pairs)) => pairs
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].as_str().unwrap().to_string(),
+                    pair[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
-fn header_map(headers: &[(String, String)]) -> BTreeMap<String, String> {
-    headers.iter().cloned().collect()
+/// Headers compared regardless of order between names; repeated names
+/// keep every field, in their order.
+fn header_map(headers: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut map = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        map.entry(name.clone()).or_default().push(value.clone());
+    }
+    map
 }
 
 fn text(value: Option<&Value>) -> Option<String> {
@@ -508,6 +523,56 @@ fn a_corrupt_store_file_is_set_aside_and_the_store_starts_empty() {
             .collect(),
         "no temporary file or older copy is left behind"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn runtimes_opening_one_store_file_share_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-script-store-shared-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.json");
+    // A temporary file an older version left behind is cleaned up.
+    std::fs::write(dir.join("store.json.tmp"), b"{\"half").unwrap();
+
+    let (first, _) = script_runtime::open_script_store(&path);
+    // Another spelling of the same file, as a second runtime would open it.
+    let (second, recovery) = script_runtime::open_script_store(dir.join(".").join("store.json"));
+    assert_eq!(recovery, script_runtime::ScriptStoreRecovery::Opened);
+    assert!(first.write("a", "1"));
+    assert!(second.write("b", "2"));
+    assert_eq!(first.read("b").as_deref(), Some("2"));
+
+    // Writers on several threads never tear the file or leave temporaries.
+    std::thread::scope(|scope| {
+        for thread in 0..4 {
+            let store = if thread % 2 == 0 { &first } else { &second };
+            scope.spawn(move || {
+                for round in 0..25 {
+                    assert!(store.write(&format!("k{thread}"), &round.to_string()));
+                }
+            });
+        }
+    });
+    drop(first);
+    drop(second);
+    let reopened = script_runtime::JsonFileScriptStore::open(&path).expect("valid JSON");
+    assert_eq!(reopened.read("a").as_deref(), Some("1"));
+    assert_eq!(reopened.read("b").as_deref(), Some("2"));
+    for thread in 0..4 {
+        assert_eq!(reopened.read(&format!("k{thread}")).as_deref(), Some("24"));
+    }
+    let names = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["store.json"], "no temporary file is left behind");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

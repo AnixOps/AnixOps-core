@@ -36,6 +36,17 @@
 //! The first 256 addresses of the range (e.g. `198.18.0.0/24` of the default
 //! `198.18.0.0/15`) are never handed out: the clients put the tunnel's own
 //! interface and DNS addresses there. The same holds for `range6`.
+//!
+//! Rebuilding the runtime (a node or group switch, a DNS change) must not
+//! give an address an app still holds to another name: a flow without a
+//! sniffed name (server-first TCP, UDP, QUIC) would silently go to the wrong
+//! server. So the runtime takes its pool from [`FakeIpPool::retained`]: the
+//! process keeps the last table, and a new runtime with the same `range`,
+//! `range6` and `max_entries` goes on with it (same names, same addresses).
+//! A new table (first runtime of the process, or other ranges) starts its
+//! slots at a random position of the range, so an address left over from
+//! an earlier table or process most likely maps to no name and is refused
+//! (`misses`) instead of being read as another name.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -44,6 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::config::FakeIpConfig;
 use crate::dns::{self, TYPE_A, TYPE_AAAA};
@@ -197,12 +210,50 @@ struct Table {
     hand: usize,
 }
 
+/// The table and where its slots sit in the range; shared by the pools of
+/// successive runtimes with the same ranges (see [`FakeIpPool::retained`]).
+struct Shared {
+    /// Position in the usable range (`0..usable`) of slot 0; slot `i` is at
+    /// `(offset + i) % usable`, for IPv4 and IPv6 alike.
+    offset: u32,
+    table: Mutex<Table>,
+}
+
+impl Shared {
+    fn new(offset: u32) -> Arc<Self> {
+        Arc::new(Self {
+            offset,
+            table: Mutex::new(Table {
+                by_name: HashMap::new(),
+                slots: Vec::new(),
+                hand: 0,
+            }),
+        })
+    }
+}
+
+/// What a table was built for: a new runtime reuses the retained table only
+/// when all of these are the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableKey {
+    network: u32,
+    prefix: u8,
+    v6: Option<(u128, u8)>,
+    capacity: usize,
+}
+
+/// The table of the last runtime built in this process; see
+/// [`FakeIpPool::retained`].
+static RETAINED: Mutex<Option<(TableKey, Arc<Shared>)>> = Mutex::new(None);
+
 /// The name ↔ address table; see the module docs. Shared by the tunnel's
-/// DNS path and the dispatcher, and kept across tunnel restarts of one
-/// runtime.
+/// DNS path and the dispatcher, kept across tunnel restarts of one runtime
+/// and, through [`FakeIpPool::retained`], across runtimes of one process.
 pub struct FakeIpPool {
     /// First address handed out.
     first: u32,
+    /// Addresses after the reserved block, without the last one.
+    usable: u32,
     /// Network and prefix length of the whole range.
     network: u32,
     prefix: u8,
@@ -210,7 +261,7 @@ pub struct FakeIpPool {
     v6: Option<Range6>,
     capacity: usize,
     filter: Vec<Pattern>,
-    table: Mutex<Table>,
+    shared: Arc<Shared>,
     assigned: AtomicU64,
     recycled: AtomicU64,
     recycled_young: AtomicU64,
@@ -224,6 +275,7 @@ impl std::fmt::Debug for FakeIpPool {
         f.debug_struct("FakeIpPool")
             .field("prefix", &self.prefix)
             .field("capacity", &self.capacity)
+            .field("offset", &self.shared.offset)
             .field("filter", &self.filter.len())
             .finish()
     }
@@ -248,8 +300,67 @@ pub enum FakeAnswer {
 
 impl FakeIpPool {
     /// The pool of a `dns.fake_ip` section, `None` when it is off, or why the
-    /// section is refused (a fixed message without names).
+    /// section is refused (a fixed message without names). The pool has a
+    /// table of its own whose first name gets the first address after the
+    /// reserved block; it touches no state of the process, so it suits
+    /// checking a config. A runtime takes [`Self::retained`] instead.
     pub fn from_config(config: &FakeIpConfig) -> Result<Option<Arc<Self>>, &'static str> {
+        Ok(Self::build(config)?.map(Arc::new))
+    }
+
+    /// The pool of a runtime built from `config`: like [`Self::from_config`]
+    /// (the filter and counters are new), but with the table the last
+    /// runtime of the process used when its `range`, `range6` and
+    /// `max_entries` are the same, so the names keep their addresses across
+    /// the rebuild. Otherwise the pool gets a new table whose slots start at
+    /// a random position of the range, and that table is the one kept.
+    ///
+    /// The kept table stays in memory (at most `max_entries` names) until
+    /// another one replaces it or [`Self::release_retained`] drops it. Names
+    /// the new filter excludes stay mapped until the CLOCK hand recycles
+    /// them, so an app holding their address still reaches them.
+    pub fn retained(config: &FakeIpConfig) -> Result<Option<Arc<Self>>, &'static str> {
+        let Some(mut pool) = Self::build(config)? else {
+            return Ok(None);
+        };
+        let key = pool.key();
+        let mut retained = RETAINED.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = match &*retained {
+            Some((kept, shared)) if *kept == key => Some(shared.clone()),
+            _ => None,
+        };
+        pool.shared = match kept {
+            Some(shared) => shared,
+            None => {
+                let shared = Shared::new(random_offset(pool.usable));
+                *retained = Some((key, shared.clone()));
+                shared
+            }
+        };
+        Ok(Some(Arc::new(pool)))
+    }
+
+    /// Drops the table [`Self::retained`] keeps for the next runtime (pools
+    /// that use it keep it alive); the next runtime starts a new table.
+    /// Returns whether there was one.
+    pub fn release_retained() -> bool {
+        RETAINED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some()
+    }
+
+    fn key(&self) -> TableKey {
+        TableKey {
+            network: self.network,
+            prefix: self.prefix,
+            v6: self.v6.map(|range| (range.network, range.prefix)),
+            capacity: self.capacity,
+        }
+    }
+
+    fn build(config: &FakeIpConfig) -> Result<Option<Self>, &'static str> {
         if !config.enabled {
             return Ok(None);
         }
@@ -286,25 +397,23 @@ impl FakeIpPool {
         if filter.len() > MAX_FILTER_PATTERNS {
             return Err("dns fake_ip filter has too many patterns");
         }
-        Ok(Some(Arc::new(Self {
+        Ok(Some(Self {
             first: network + RESERVED_ADDRESSES,
+            // At most 2^24 - 257 for a /8.
+            usable: usable as u32,
             network,
             prefix,
             v6,
             capacity,
             filter,
-            table: Mutex::new(Table {
-                by_name: HashMap::new(),
-                slots: Vec::new(),
-                hand: 0,
-            }),
+            shared: Shared::new(0),
             assigned: AtomicU64::new(0),
             recycled: AtomicU64::new(0),
             recycled_young: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             recovered: AtomicU64::new(0),
             conflicts: AtomicU64::new(0),
-        })))
+        }))
     }
 
     /// Most names the table holds.
@@ -374,13 +483,14 @@ impl FakeIpPool {
     /// it one if it has none; `None` without `range6`.
     pub fn assign6(&self, name: &str) -> Option<Ipv6Addr> {
         let range = self.v6?;
-        Some(Ipv6Addr::from(range.first + u128::from(self.slot(name))))
+        let position = self.position(self.slot(name));
+        Some(Ipv6Addr::from(range.first + u128::from(position)))
     }
 
     /// The slot of `name`, taking one if it has none.
     fn slot(&self, name: &str) -> u32 {
         let now = Instant::now();
-        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let mut table = self.shared.table.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&index) = table.by_name.get(name) {
             let slot = &mut table.slots[index as usize];
             slot.referenced = true;
@@ -432,11 +542,12 @@ impl FakeIpPool {
         if !self.contains(address) {
             return None;
         }
-        let index = match address {
-            IpAddr::V4(v4) => u32::from(v4).checked_sub(self.first)? as usize,
-            IpAddr::V6(v6) => usize::try_from(u128::from(v6).checked_sub(self.v6?.first)?).ok()?,
+        let position = match address {
+            IpAddr::V4(v4) => u32::from(v4).checked_sub(self.first)?,
+            IpAddr::V6(v6) => u32::try_from(u128::from(v6).checked_sub(self.v6?.first)?).ok()?,
         };
-        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let index = self.index_at(position)? as usize;
+        let mut table = self.shared.table.lock().unwrap_or_else(|e| e.into_inner());
         let slot = table.slots.get_mut(index)?;
         let name = slot.name.clone()?;
         slot.referenced = true;
@@ -473,6 +584,7 @@ impl FakeIpPool {
 
     pub fn stats(&self) -> FakeIpStats {
         let entries = self
+            .shared
             .table
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -492,8 +604,31 @@ impl FakeIpPool {
     }
 
     fn address_of(&self, index: u32) -> Ipv4Addr {
-        Ipv4Addr::from(self.first + index)
+        Ipv4Addr::from(self.first + self.position(index))
     }
+
+    /// Where slot `index` (below the capacity) sits in the usable range.
+    fn position(&self, index: u32) -> u32 {
+        ((u64::from(self.shared.offset) + u64::from(index)) % u64::from(self.usable)) as u32
+    }
+
+    /// The slot at `position` of the usable range, `None` past its end.
+    fn index_at(&self, position: u32) -> Option<u32> {
+        if position >= self.usable {
+            return None;
+        }
+        let usable = u64::from(self.usable);
+        Some(((u64::from(position) + usable - u64::from(self.shared.offset)) % usable) as u32)
+    }
+}
+
+/// A random position in `0..usable`, `0` if the system has no randomness.
+fn random_offset(usable: u32) -> u32 {
+    let mut bytes = [0u8; 4];
+    if SystemRandom::new().fill(&mut bytes).is_err() {
+        return 0;
+    }
+    u32::from_be_bytes(bytes) % usable
 }
 
 /// `x::/len` with 8 <= len <= 96, the network address aligned.
@@ -685,6 +820,50 @@ mod tests {
         assert!(!v4_only.has_ipv6());
         assert!(!v4_only.contains(IpAddr::V6(fake)));
         assert_eq!(v4_only.assign6("www.example.com"), None);
+    }
+
+    #[test]
+    fn an_offset_table_wraps_around_the_usable_range() {
+        let mut pool = FakeIpPool::build(&FakeIpConfig {
+            range: "10.90.0.0/22".to_string(),
+            range6: Some("fc00::/96".to_string()),
+            ..config(16)
+        })
+        .unwrap()
+        .unwrap();
+        // 1024 addresses: 256 reserved, the last one never handed out.
+        assert_eq!(pool.usable, 767);
+        pool.shared = Shared::new(766);
+        let a = pool.assign("a.example");
+        let b = pool.assign("b.example");
+        assert_eq!(
+            a,
+            Ipv4Addr::new(10, 90, 3, 254),
+            "slot 0 at the last position"
+        );
+        assert_eq!(b, Ipv4Addr::new(10, 90, 1, 0), "slot 1 wraps to the first");
+        assert_eq!(pool.lookup(IpAddr::V4(a)).as_deref(), Some("a.example"));
+        assert_eq!(pool.lookup(IpAddr::V4(b)).as_deref(), Some("b.example"));
+        assert_eq!(
+            pool.assign6("b.example"),
+            Some("fc00::100".parse().unwrap()),
+            "IPv6 uses the same position"
+        );
+        let a6: Ipv6Addr = "fc00::3fe".parse().unwrap();
+        assert_eq!(pool.assign6("a.example"), Some(a6));
+        assert_eq!(pool.lookup(IpAddr::V6(a6)).as_deref(), Some("a.example"));
+        // Positions no slot holds, the last address and the reserved block
+        // map to no name.
+        for unused in [
+            Ipv4Addr::new(10, 90, 1, 1),
+            Ipv4Addr::new(10, 90, 3, 253),
+            Ipv4Addr::new(10, 90, 3, 255),
+            Ipv4Addr::new(10, 90, 0, 7),
+        ] {
+            assert_eq!(pool.lookup(IpAddr::V4(unused)), None, "{unused}");
+        }
+        assert_eq!(pool.lookup(IpAddr::V6("fc00::3ff".parse().unwrap())), None);
+        assert_eq!(pool.stats().entries, 2);
     }
 
     fn pool_with_names(names: &[&str]) -> Arc<FakeIpPool> {

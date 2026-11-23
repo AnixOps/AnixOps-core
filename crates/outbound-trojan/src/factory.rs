@@ -7,7 +7,7 @@ use engine_outbound::{Dialer, TcpOutbound};
 use serde::Deserialize;
 use transport_grpc::{GrpcConnector, GrpcSettings};
 use transport_tls::{parse_sha256_pins, TlsConnector, TlsSettings};
-use transport_ws::{WsConnector, WsSettings};
+use transport_ws::{alpn_for_websocket, WsConnector, WsSettings};
 use transport_xhttp::{HttpVersion, Security, XhttpConnector, XhttpSettings, XhttpTarget};
 
 use crate::TrojanOutbound;
@@ -99,6 +99,12 @@ impl OutboundFactory for TrojanFactory {
                 || xhttp_version == Some(HttpVersion::Http2))
         {
             alpn.push("h2".to_owned());
+        }
+        // WebSocket offers HTTP/1.1 only. This TLS layer carries the
+        // WebSocket and nothing else (XHTTP, which reads the configured
+        // ALPN above, is another transport).
+        if matches!(settings.transport, Some(TransportSettings::Ws { .. })) {
+            alpn = alpn_for_websocket(alpn);
         }
         let tls = TlsSettings {
             server_name,

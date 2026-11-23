@@ -1276,6 +1276,131 @@ fn answers_within(rx: &Receiver<Vec<u8>>, quiet: Duration) -> bool {
     false
 }
 
+/// Test outbound whose connection answers `partial` and then breaks, like a
+/// node that drops in the middle of a response.
+struct BreaksMidResponse;
+
+impl TcpOutbound for BreaksMidResponse {
+    fn protocol(&self) -> &'static str {
+        "test-breaks"
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async { Ok(Box::new(BrokenStream { answered: false }) as BoxStream) })
+    }
+}
+
+struct BrokenStream {
+    answered: bool,
+}
+
+impl tokio::io::AsyncRead for BrokenStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.answered {
+            return std::task::Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+        }
+        self.answered = true;
+        buf.put_slice(b"partial");
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for BrokenStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Whether the tunnel ends the flow to `app_port` with a RST (rather than
+/// a FIN).
+fn ends_with_reset(rx: &Receiver<Vec<u8>>, app_port: u16) -> bool {
+    wait_for(rx, |sliced| match &sliced.transport {
+        Some(TransportSlice::Tcp(tcp))
+            if tcp.destination_port() == app_port && (tcp.fin() || tcp.rst()) =>
+        {
+            Some(tcp.rst())
+        }
+        _ => None,
+    })
+}
+
+/// A flow whose outbound breaks is reset: with a FIN the app would take the
+/// cut response (one that ends with the connection) as whole.
+#[test]
+fn a_flow_whose_outbound_breaks_is_reset() {
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(BreaksMidResponse), sink).unwrap();
+    open_tcp(&tunnel, &rx, 80, b"GET /file HTTP/1.0\r\n\r\n");
+    assert!(
+        ends_with_reset(&rx, 40100),
+        "the broken flow ended with a FIN"
+    );
+    tunnel.stop();
+}
+
+/// A flow whose outbound cannot connect is reset too.
+#[test]
+fn a_flow_whose_outbound_fails_is_reset() {
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(
+        settings(),
+        Arc::new(UdpRedirect(start_udp_echo_server())),
+        sink,
+    )
+    .unwrap();
+    open_tcp(&tunnel, &rx, 80, b"GET / HTTP/1.1\r\n\r\n");
+    assert!(
+        ends_with_reset(&rx, 40100),
+        "the failed flow ended with a FIN"
+    );
+    tunnel.stop();
+}
+
+/// A SYN the app sent again before the SYN-ACK came opens one flow, not a
+/// second one that would wait for a first payload that never comes.
+#[test]
+fn a_retransmitted_syn_opens_one_flow() {
+    let echo = start_echo_server();
+    let (sink, rx) = capture();
+    let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(echo)), sink).unwrap();
+    tcp_syn(&tunnel, 41200);
+    let client_isn = tcp_syn(&tunnel, 41200);
+    let server_isn = wait_for(&rx, |sliced| syn_ack(sliced, 41200));
+    tcp_send(
+        &tunnel,
+        41200,
+        client_isn + 1,
+        server_isn.wrapping_add(1),
+        b"once",
+    );
+    assert_eq!(wait_for(&rx, |sliced| tcp_payload(sliced, 41200)), b"once");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(tunnel.stats().tcp_total, 1);
+    tunnel.stop();
+}
+
 #[test]
 fn reject_tinygif_answers_plain_http_in_the_tunnel() {
     let (sink, rx) = capture();
@@ -1422,14 +1547,18 @@ fn a_destination_that_stayed_silent_is_connected_at_once_next_time() {
     let (sink, rx) = capture();
     let mut tunnel = Tunnel::start(settings(), Arc::new(Redirect(server)), sink).unwrap();
 
-    // Unknown port: the first flow waits for the app, then learns.
+    // Unknown port: the first flow waits for the app. One silent wait (a
+    // busy or preconnecting app) is not enough to learn the destination.
     assert_eq!(greeting(&tunnel, &rx, 42000, 2525), b"220 ready\r\n");
     assert_eq!(tunnel.stats().tcp_first_wait_skipped, 0);
-    // The next flow to the same destination does not wait.
+    // The second flow waits too, and stays silent again: learned.
     assert_eq!(greeting(&tunnel, &rx, 42001, 2525), b"220 ready\r\n");
+    assert_eq!(tunnel.stats().tcp_first_wait_skipped, 0);
+    // The next flow to the same destination does not wait.
+    assert_eq!(greeting(&tunnel, &rx, 42002, 2525), b"220 ready\r\n");
     assert_eq!(tunnel.stats().tcp_first_wait_skipped, 1);
     // Another port on the same address is still sniffed.
-    assert_eq!(greeting(&tunnel, &rx, 42002, 2526), b"220 ready\r\n");
+    assert_eq!(greeting(&tunnel, &rx, 42003, 2526), b"220 ready\r\n");
     assert_eq!(tunnel.stats().tcp_first_wait_skipped, 1);
     tunnel.stop();
 }
@@ -1696,6 +1825,8 @@ fn an_active_tcp_connection_is_not_closed_for_a_new_one() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(tunnel.stats().tcp_evicted, 0);
+    // Refused with a RST, as from a full listen queue.
+    assert!(ends_with_reset(&rx, 41101));
 
     // The first connection still relays.
     tcp_send(&tunnel, 41100, seq, ack, b"again");

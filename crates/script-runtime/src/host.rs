@@ -42,6 +42,10 @@ pub(crate) struct HostResults {
 pub struct ScriptHost {
     context_json: String,
     phase: ScriptPhase,
+    /// The header list of the message the script may change (the request
+    /// in the request phase, the response in the response phase), to give
+    /// fields joined for the script back as they were.
+    phase_headers: Vec<(String, String)>,
     binary_body: bool,
     default_store_key: String,
     max_output_bytes: usize,
@@ -65,6 +69,15 @@ impl ScriptHost {
         Self {
             context_json: context_json(invocation),
             phase: invocation.phase,
+            phase_headers: match invocation.phase {
+                ScriptPhase::Request => invocation.request.headers.clone(),
+                ScriptPhase::Response => invocation
+                    .response
+                    .as_ref()
+                    .map(|response| response.headers.clone())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            },
             binary_body: invocation.binary_body,
             default_store_key: format!("networkcore.script.{}", invocation.script_name),
             max_output_bytes: limits.max_output_bytes,
@@ -87,12 +100,15 @@ impl ScriptHost {
             "context" => Some(self.context_json.clone()),
             "done" => {
                 if self.done.is_none() {
-                    self.done = Some(parse_done(
-                        self.phase,
-                        payload,
-                        self.max_output_bytes,
-                        self.binary_body,
-                    ));
+                    let mut done =
+                        parse_done(self.phase, payload, self.max_output_bytes, self.binary_body);
+                    if let Ok(mutation) = done.as_mut() {
+                        if let Some(headers) = mutation.headers.take() {
+                            mutation.headers =
+                                Some(restore_joined_headers(&self.phase_headers, headers));
+                        }
+                    }
+                    self.done = Some(done);
                 }
                 None
             }
@@ -308,11 +324,7 @@ pub(crate) fn headers_object(headers: &[(String, String)]) -> Value {
     for (name, value) in headers {
         match object.get_mut(name) {
             Some(Value::String(existing)) => {
-                existing.push_str(if name.eq_ignore_ascii_case("cookie") {
-                    "; "
-                } else {
-                    ", "
-                });
+                existing.push_str(header_join_separator(name));
                 existing.push_str(value);
             }
             _ => {
@@ -321,6 +333,50 @@ pub(crate) fn headers_object(headers: &[(String, String)]) -> Value {
         }
     }
     Value::Object(object)
+}
+
+/// What [`headers_object`] puts between repeated fields of `name`.
+fn header_join_separator(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("cookie") {
+        "; "
+    } else {
+        ", "
+    }
+}
+
+/// Gives back the fields [`headers_object`] joined for a script, for the
+/// header list the script returns with `$done({headers})`. A name that
+/// `original` holds more than once, returned with exactly the joined value
+/// (the script did not change it), becomes the original fields again, in
+/// their order: several `Set-Cookie` fields cannot be joined into one
+/// (their `Expires` dates hold commas), so a script that only removes
+/// another header must not merge them. A value the script changed stays
+/// one field; names the script removed stay removed.
+pub fn restore_joined_headers(
+    original: &[(String, String)],
+    returned: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut restored = Vec::with_capacity(returned.len());
+    for (name, value) in returned {
+        let mut fields = original.iter().filter(|(field, _)| *field == name);
+        let first = fields.next();
+        let joined = first.and_then(|(_, first)| {
+            let mut joined = first.clone();
+            let mut repeated = false;
+            for (_, next) in fields {
+                repeated = true;
+                joined.push_str(header_join_separator(&name));
+                joined.push_str(next);
+            }
+            repeated.then_some(joined)
+        });
+        if joined.as_deref() == Some(value.as_str()) {
+            restored.extend(original.iter().filter(|(field, _)| *field == name).cloned());
+        } else {
+            restored.push((name, value));
+        }
+    }
+    restored
 }
 
 fn present<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
@@ -531,11 +587,14 @@ fn parse_body(value: &Value, max_output_bytes: usize, binary: bool) -> Result<St
 fn parse_http_request(payload: &str) -> Result<ScriptHttpClientRequest, String> {
     let value = serde_json::from_str::<Value>(payload)
         .map_err(|_| "networkcore: invalid $httpClient options".to_string())?;
-    let method = value
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("GET")
-        .to_ascii_uppercase();
+    // Checked here, in Rust: a script controls the whole payload (it can
+    // replace `String.prototype.toUpperCase` or `JSON.stringify`), so the
+    // prelude cannot be trusted to have passed a fixed method name.
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("GET");
+    if !crate::is_http_method_token(method) {
+        return Err(crate::SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE.to_string());
+    }
+    let method = method.to_ascii_uppercase();
     let url = value.get("url").and_then(Value::as_str).unwrap_or("");
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("networkcore: $httpClient needs an http or https URL".to_string());
@@ -639,6 +698,127 @@ mod tests {
         .expect("mixed parse");
         assert_eq!(mutation.body.as_deref(), Some("\u{c3}\u{a9}"));
         assert!(mutation.binary_bodies);
+    }
+
+    #[test]
+    fn http_client_methods_must_be_tokens() {
+        let parse = |method: &str| {
+            parse_http_request(
+                &json!({"url": "http://127.0.0.1:6379/", "method": method}).to_string(),
+            )
+        };
+        let too_long = "A".repeat(crate::SCRIPT_HTTP_CLIENT_MAX_METHOD_BYTES + 1);
+        for bad in [
+            "GET\r\nX",
+            "FLUSHALL\r\nQUIT\r\nX",
+            "G ET",
+            "GET\u{0}",
+            "",
+            "GÉT",
+            "GET/",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                parse(bad).unwrap_err(),
+                crate::SCRIPT_HTTP_CLIENT_INVALID_METHOD_MESSAGE,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(parse("get").unwrap().method, "GET");
+        assert_eq!(parse("PATCH").unwrap().method, "PATCH");
+        assert_eq!(parse("propfind").unwrap().method, "PROPFIND");
+        // No method is a GET.
+        let request = parse_http_request(r#"{"url":"https://example.test/"}"#).unwrap();
+        assert_eq!(request.method, "GET");
+    }
+
+    #[test]
+    fn unchanged_repeated_fields_come_back_as_they_were() {
+        let pairs = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let original = pairs(&[
+            ("Set-Cookie", "a=1; Path=/"),
+            ("Content-Security-Policy", "default-src 'self'"),
+            ("Set-Cookie", "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("Set-Cookie", "c=3"),
+            ("Vary", "Accept"),
+        ]);
+        let object = headers_object(&original);
+        // The script deletes one header and hands the rest back unchanged.
+        let mut returned = parse_headers(&object).unwrap();
+        returned.retain(|(name, _)| name != "Content-Security-Policy");
+        let restored = restore_joined_headers(&original, returned);
+        let cookies = restored
+            .iter()
+            .filter(|(name, _)| name == "Set-Cookie")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cookies,
+            [
+                "a=1; Path=/",
+                "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT",
+                "c=3"
+            ]
+        );
+        assert!(restored.contains(&("Vary".to_string(), "Accept".to_string())));
+        assert!(!restored
+            .iter()
+            .any(|(name, _)| name == "Content-Security-Policy"));
+
+        // A changed value stays one field; a removed name stays removed.
+        let restored = restore_joined_headers(
+            &original,
+            pairs(&[("Set-Cookie", "only=1"), ("Vary", "Accept")]),
+        );
+        assert_eq!(
+            restored,
+            pairs(&[("Set-Cookie", "only=1"), ("Vary", "Accept")])
+        );
+        let restored = restore_joined_headers(&original, pairs(&[("Vary", "Accept")]));
+        assert_eq!(restored, pairs(&[("Vary", "Accept")]));
+    }
+
+    #[test]
+    fn done_headers_keep_unchanged_set_cookie_fields() {
+        let store: Arc<dyn ScriptStore> = Arc::new(crate::MemoryScriptStore::new());
+        let invocation = ScriptInvocation {
+            phase: ScriptPhase::Response,
+            script_name: "test".to_string(),
+            argument: String::new(),
+            request: crate::ScriptRequest {
+                url: "https://example.test/".to_string(),
+                method: "GET".to_string(),
+                headers: Vec::new(),
+                body: None,
+            },
+            response: Some(ScriptResponse {
+                status: 200,
+                headers: vec![
+                    ("Set-Cookie".to_string(), "a=1".to_string()),
+                    ("Set-Cookie".to_string(), "b=2".to_string()),
+                ],
+                body: None,
+            }),
+            binary_body: false,
+            body_is_bytes: false,
+            event: None,
+            rule: None,
+        };
+        let mut host = ScriptHost::new(&invocation, &ScriptLimits::default(), store);
+        host.call("done", r#"{"headers":{"Set-Cookie":"a=1, b=2","X":"1"}}"#);
+        let mutation = host.take_results().done.unwrap().unwrap();
+        assert_eq!(
+            mutation.headers.unwrap(),
+            vec![
+                ("Set-Cookie".to_string(), "a=1".to_string()),
+                ("Set-Cookie".to_string(), "b=2".to_string()),
+                ("X".to_string(), "1".to_string()),
+            ]
+        );
     }
 
     #[test]

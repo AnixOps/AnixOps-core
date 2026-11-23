@@ -795,7 +795,16 @@ fn build_routing(source: RoutingSource, nodes: &[NodeDescriptor]) -> ImportedRou
         .unwrap_or(source_rules.len());
     source_rules.splice(final_index..final_index, source.remote_rules);
     let mut rule_sets = RuleSetCollector::new(&source.providers);
-    let rules = import_rules(&mut importer, source_rules, &group_ids, &mut rule_sets);
+    // Clash and mihomo match on when a lookup for an IP rule fails; Surge
+    // and Loon reject unless FINAL says `dns-failed`.
+    let clash = source.format == "clash";
+    let rules = import_rules(
+        &mut importer,
+        source_rules,
+        &group_ids,
+        &mut rule_sets,
+        clash,
+    );
 
     let spec = RoutingSpec { rules, groups };
     let node_ids = nodes
@@ -1154,13 +1163,17 @@ fn resolve_member(
         .ok_or("no imported node or group has this name")
 }
 
-/// Rewrites rule targets to model names and keeps only supported rules up to
-/// and including the first FINAL (Clash `MATCH`).
+/// The rule lines of `rules` the engine runs: targets rewritten to model
+/// names, only supported rules kept, up to and including the first FINAL
+/// (Clash `MATCH`). With `clash`, that FINAL gets `dns-continue`, so a domain
+/// whose lookup for an IP rule fails still matches the later rules, as in
+/// Clash, instead of being rejected.
 fn import_rules(
     importer: &mut Importer,
     rules: Vec<String>,
     group_ids: &BTreeSet<String>,
     rule_sets: &mut RuleSetCollector,
+    clash: bool,
 ) -> Vec<String> {
     let mut imported = Vec::new();
     let mut skipped = BTreeMap::<String, usize>::new();
@@ -1189,6 +1202,7 @@ fn import_rules(
                 .any(|option| option.eq_ignore_ascii_case("dns-failed"));
             match resolve_rule_target(importer, group_ids, target) {
                 Some(target) if dns_failed => imported.push(format!("FINAL,{target},dns-failed")),
+                Some(target) if clash => imported.push(format!("FINAL,{target},dns-continue")),
                 Some(target) => imported.push(format!("FINAL,{target}")),
                 None => importer.warn(
                     ROUTING_IMPORT_RULE_SKIPPED_CODE,

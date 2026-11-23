@@ -117,12 +117,13 @@
 
 网页一次要解析多个域名，原来每个查询都经代理新建一条上游连接（DoT / DoH 还要一次 TLS 握手），一次解析约 2–3 个代理 RTT。现在（`crates/engine-embedded/src/dns_cache.rs`）：
 
-- 按 `(域名, 类型, 上游组, 是否经代理)` 缓存应答。TTL 取应答与权威段记录的最小值，限制在 30 秒到 1 小时；NXDOMAIN 与空应答最多 60 秒。只缓存 NOERROR / NXDOMAIN、未截断、问题与查询一致的应答，SERVFAIL 不缓存。最多 4096 条，满了先丢过期很久的，再丢最早过期的。
+- 按 `(域名, 类型, 上游组, 是否经代理)` 缓存应答。TTL 取应答与权威段记录的最小值，限制在 30 秒到 1 小时；NXDOMAIN 与空应答最多 60 秒。只缓存 NOERROR / NXDOMAIN、未截断、问题与查询一致的应答，SERVFAIL 不缓存。单条应答超过 8 KiB 的照常转发给应用但不缓存；最多 4096 条、合计 2 MiB（应答加域名），超出时按到期时间从最早的开始淘汰（过期很久的最先），远端用超大应答撑不爆网络扩展的内存。
 - 命中时改写成该查询的 id 与问题（保留应用的大小写），记录 TTL 改为剩余秒数。
 - 过期后 1 小时内仍先回旧应答（TTL 30 秒），同时在后台刷新一次（RFC 8767 serve-stale），应用不等上游。
 - 同一问题已有查询在途时，新查询并入等待，不再重复发送（每个问题最多 32 个等待者）。
 - TCP / DoT / DoH 连接按 `(上游, 出站)` 保留（DoQ 见上文），每个最多 4 条空闲、空闲超过 20 秒不再复用。复用的连接若已被对端关闭，最多花一半超时时间就改用新连接。DoH 改为 HTTP/1.1 keep-alive，只有 `Content-Length` 定长、无多余字节、未要求 `Connection: close` 的应答才保留连接。
 - 缓存只在隧道生命周期内，停止隧道即清空；切换节点不清缓存，但空闲连接按出站区分，不会走到旧节点。
+- 换网（控制命令 `reset_network`：换 Wi-Fi、Wi-Fi 与蜂窝互切、休眠唤醒）时清空隧道缓存的全部应答、IP 规则与 Fake-IP 直连流解析出的地址（`PolicyResolver`），并丢弃所有保留的 TCP / DoT / DoH 连接，DoQ 连接直接关闭（`Dispatcher::reset_dns`）。旧网络的分区 DNS（split-horizon）与运营商 CDN 应答在新网络上不再适用，经旧路径保留的连接也会让下一次查询先白等一半超时。复位时仍在进行的查询照常应答应用，但结果不写入缓存、连接不放回池（缓存与连接池各带一个代数，复位时递增）。Fake-IP 映射保留：应用手里还拿着这些地址。应答里新增 `dns_flushed`（丢弃的应答与地址条数）和 `dns_connections_dropped`（丢弃的连接数）。
 
 ## DNS 泄露核对（2026-11）
 
@@ -180,7 +181,7 @@
 ```
 
 - `range`：IPv4 网段，`/8` 到 `/22`，须按前缀对齐。前 256 个地址（默认即 `198.18.0.0/24`）永不分配：客户端把隧道接口地址 `198.18.0.1` 和 DNS `198.18.0.2` 放在这里。最后一个地址也不分配。
-- `range6`（可选）：IPv6 网段，`/8` 到 `/96`，须按前缀对齐。写了它，`AAAA` 查询也回假地址；一个名字在两个网段里用同一个槽位（`range6` 起点 + 256 + 槽位号），回收也一起回收。前 256 个地址同样不分配。只有客户端把这个网段路由进隧道时才写（各客户端的隧道已路由 `::/0`）；不写时 `AAAA` 回空应答，与之前相同。
+- `range6`（可选）：IPv6 网段，`/8` 到 `/96`，须按前缀对齐。写了它，`AAAA` 查询也回假地址；一个名字在两个网段里用同一个槽位，即同一个位置（`range6` 起点 + 256 + 位置，位置见下文「重建运行时」），回收也一起回收。前 256 个地址同样不分配。只有客户端把这个网段路由进隧道时才写（各客户端的隧道已路由 `::/0`）；不写时 `AAAA` 回空应答，与之前相同。
 - `max_entries`：表中最多保留的域名数，默认 65536，上限 1048576，并且不超过网段可用地址数（`/15` 为 130815）。
 - `filter`：额外的例外名单，命中的名字照常转发给上游、拿真实地址。写法：`name`（精确）、`+.name`（它和所有子域名）、带 `*` 的模式（每个 `*` 恰好代表一级标签，如 `time.*.com`）。最多 1024 条（含内置）。
 - `default_filter`：是否启用内置例外名单 `fake_ip::DEFAULT_FILTER`（默认 `true`）：`.lan`/`.local`/`.home.arpa` 等局域网名、`localhost`、NTP（`time.*.com`、`+.ntp.org` 等）、STUN（`stun.*.*`、PlayStation/Xbox/Nintendo）、captive portal 与连通性检测（`captive.apple.com`、`+.msftconnecttest.com`）、Apple 推送（`+.push.apple.com`）、QQ 本地登录。
@@ -205,6 +206,18 @@
 
 映射表由运行时持有，隧道停止再启动（同一进程内）时保留，减少“应用还缓存着旧假地址”的失败。
 
+#### 重建运行时
+
+切节点、切策略组、改 DNS 设置时，客户端会销毁旧运行时、在同一个 TUN 接口上建新运行时。应用收不到网络变化，手里的假地址、已连接的 UDP socket 和 JVM 等的 DNS 缓存都还在。此前每个运行时都建一张空表，槽位从 0 开始顺序分配：重建后最先查询的名字拿到旧地址，没有嗅探名的连接（服务器先发言的 TCP，如 SSH、SMTP；以及隧道里全部 UDP，包括 QUIC）会按新名字出站，静默发往错误的服务器和规则。
+
+现在运行时经 `RuntimeConfig::runtime_fake_ip_pool`（即 `FakeIpPool::retained`）取池：
+
+- 进程保留最后一个运行时用的表。新运行时的 `range`、`range6`、`max_entries` 都相同时，接着用这张表：名字保持原地址。例外名单与计数器按新配置重建；已在表里、但新例外名单排除的名字仍可经旧地址连接，直到被回收。
+- 网段或表大小变了（或进程里第一个运行时、iOS / Android 进程被重启后），新表的槽位从网段内一个随机位置开始（槽位 `i` 在可用地址中的位置为 `(偏移 + i) mod 可用数`，IPv4 与 IPv6 相同，跳过保留块和最后一个地址）。旧地址大概率落在空槽位，按 `misses` 拒绝，而不是被错当成别的名字。
+- 只校验配置（`RuntimeConfig::from_json`、`validate`、`fake_ip_pool`）不碰保留的表；`fake_ip_pool` 和 `FakeIpPool::from_config` 仍建一张独立的空表，第一个名字拿网段保留块之后的第一个地址。
+- 保留的表最多占 `max_entries` 个表项的内存（默认 65536 条约 10 MB 以内），直到被另一张表替换或 `FakeIpPool::release_retained` 释放。同一进程里同时运行的两个运行时（如 Windows 的 TUN 与本地代理）配置相同时共用一张表，`entries` 为共用表的条数，其他计数仍按运行时分开。
+- 进程重启后的映射仍会丢失；持久化映射表（类似 mihomo `store-fake-ip`）留作后续。
+
 ### 内存与回收
 
 每个表项约 100 字节加域名本身。表满后用 CLOCK 算法（近似 LRU，无需链表）回收：最近被查询或被连接过的地址会被跳过一轮，回收的是一圈内都没用过的名字。
@@ -223,7 +236,7 @@
 
 另有 `entries`、`capacity`、`assigned`、`recycled`。
 
-测试：`src/fake_ip.rs` 单元测试（分配、回收顺序、冲突、应答格式、例外名单、配置校验）、`tests/fake_ip.rs`（经 Dispatcher 还原、域名规则、DIRECT 用 dns 段解析、未命中拒绝与恢复、配置）、`tests/tunnel_packets.rs` 的 `fake_ip_answers_dns_and_sends_the_flow_by_name`（包级：DNS 拿假地址，非 TLS 的 TCP 连接按域名出站）、`tests/fake_ip_memory.rs`；`range6`：`src/fake_ip.rs` 的 `range6_answers_aaaa_from_the_same_slot` 与 `tests/fake_ip.rs` 的 `a_fake_ipv6_address_goes_out_by_name`。
+测试：`src/fake_ip.rs` 单元测试（分配、回收顺序、冲突、应答格式、例外名单、配置校验、带偏移的表回绕 `an_offset_table_wraps_around_the_usable_range`）、`tests/fake_ip.rs` 的 `a_rebuilt_runtime_keeps_the_names_of_its_fake_addresses`（同配置重建后旧地址仍映射原名字；表大小变了旧地址按 misses 拒绝；只校验配置不保留表；释放后重新开始）、`tests/fake_ip.rs`（经 Dispatcher 还原、域名规则、DIRECT 用 dns 段解析、未命中拒绝与恢复、配置）、`tests/tunnel_packets.rs` 的 `fake_ip_answers_dns_and_sends_the_flow_by_name`（包级：DNS 拿假地址，非 TLS 的 TCP 连接按域名出站）、`tests/fake_ip_memory.rs`；`range6`：`src/fake_ip.rs` 的 `range6_answers_aaaa_from_the_same_slot` 与 `tests/fake_ip.rs` 的 `a_fake_ipv6_address_goes_out_by_name`。
 
 ### 当初的评估（2026-10）
 

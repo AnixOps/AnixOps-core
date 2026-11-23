@@ -52,13 +52,18 @@ GitHub Actions 完整 E2E/security 验证前仍保持 `tls-decryption-blocked`�
 - accept loop 会为每个已接受连接启动独立 worker，并在 shutdown 时汇总 worker diagnostics；同时在
   loopback listener 上限制最多 64 个并发连接，达到上限只关闭新连接并记录 stable diagnostic，避免单一
   TLS/HTTP session 阻塞后续 proxy traffic 或无限制创建 worker。
-- `read_explicit_http_proxy_request` 与 `read_plain_http_proxy_response` 只支持 bounded HTTP/1.0/1.1；absolute-form `http://` request target、origin-form + `Host`、`Content-Length` body 和标准 `Transfer-Encoding: chunked` body 仅在该版本边界内解析。HTTP/2.0 request line 或 upstream status line 必须以 `engine.native.runtime.http_proxy_plain_http_version_unsupported` 拒绝。客户端 ClientHello 未提供 `h2` 时下游/上游 TLS ALPN 均只提供 `http/1.1`；提供 `h2` 时按 `docs/architecture/http2-mitm-design.md` 先与上游协商再镜像给客户端，HTTP/2 stream 由独立的 `h2` 数据面处理，上游只支持 `http/1.1` 时仍回到本 HTTP/1.1 路径。chunk extensions/trailers 会被有界消费，超过 body 上限、重复 `Content-Length`、未知 transfer coding、streaming body、HTTP/2 binary framing 和 request smuggling 场景继续不承诺。
+- `read_explicit_http_proxy_request` 与 `read_plain_http_proxy_response` 只支持 bounded HTTP/1.0/1.1；absolute-form `http://` request target、origin-form + `Host`、`Content-Length` body 和标准 `Transfer-Encoding: chunked` body 仅在该版本边界内解析。HTTP/2.0 request line 或 upstream status line 必须以 `engine.native.runtime.http_proxy_plain_http_version_unsupported` 拒绝。客户端 ClientHello 未提供 `h2` 时下游/上游 TLS ALPN 均只提供 `http/1.1`；提供 `h2` 时按 `docs/architecture/http2-mitm-design.md` 先与上游协商再镜像给客户端，HTTP/2 stream 由独立的 `h2` 数据面处理，上游只支持 `http/1.1` 时仍回到本 HTTP/1.1 路径。上游响应按 RFC 9112 §6.3 分帧（`read_plain_http_proxy_response_for_request` 带请求方法）：`HEAD` 请求与 1xx/204/304 响应没有 body，其次 chunked、再次 `Content-Length`，两者都没有时读到上游关闭为止（受 64 KiB body 上限约束，超出或读超时一律失败，不截断），这种响应之后不再复用连接；`100 Continue`、`103 Early Hints` 等临时响应原样转发给客户端后继续读最终响应，`101` 不支持；转发给客户端时 `HEAD` 与 304 保留上游的 `Content-Length` 且不写 body，1xx 与 204 不写 `Content-Length`；代理已持有完整请求 body，转发上游时去掉 `Expect`；明文路径读取上游响应使用会话时长的有界读取，而不是 100 ms 的连接超时。chunk extensions/trailers 会被有界消费，超过 body 上限、重复 `Content-Length`、未知 transfer coding、streaming body、HTTP/2 binary framing 和 request smuggling 场景继续不承诺。
 - controlled CONNECT live path 最多处理 4 次 bounded HTTP/1.1 request/response exchange；明确的
   `Connection: close`、HTTP/1.0 默认关闭、terminal rewrite、解析失败或预算耗尽会结束 TLS session，
   未声明关闭时使用 `Content-Length` framing 保持下一次交换边界。
 - `CONNECT` target 在 HTTP listener 中会先生成 `NativeTlsMitmFoundationReport`，再经既有
   SOCKS outbound CONNECT primitive 建立 tunnel；成功后写标准空 body `200 Connection Established`
-  response。未配置 CA material 时继续进行有限 TCP relay；配置 material 时进入受控 TLS path。
+  response。未配置 CA material 时继续进行有限 TCP relay；配置 material 时只有 CONNECT host 命中用户插件
+  `[MITM]` hostname 列表（`NativeHttpMitmPluginHook::intercepts_tls_host`，含通配与 `-` 排除；与客户端数据面
+  同一判定）才进入受控 TLS path，其余 host 不等待 ClientHello、原样 relay，并记
+  `engine.native.runtime.http_proxy_tls_mitm_hostname_bypassed`。命中列表但无法终止（无 SNI、SNI 与 authority
+  不一致如 ECH 外层名、非 TLS、leaf 签发或 TLS 配置失败）时，因 ClientHello 只被 peek，连接在握手开始前
+  原样 relay（`engine.native.runtime.http_proxy_tls_mitm_passthrough`），不再直接关闭。
 - `CONNECT` relay 前会通过 `observe_explicit_http_connect_tls_client_hello` 对已到达 bytes 做
   bounded `peek`，生成 `NativeTlsClientHelloObservationReport`；可观察 TLS record/handshake
   version 和 SNI hostname，但不消费 client bytes，也不终止 TLS。未启用 CA material 的 pass-through

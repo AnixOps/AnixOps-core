@@ -75,7 +75,7 @@ App ──iWAN──▶ Panabit 入口（国内）══IPLC══▶ Panabit NA
   - `OutboundConfig` 增加 `via` 字段。
   - `build_routed` 按依赖顺序构建节点，并检查成环和链长；节点用 `OutboundDialer(前置节点)` 作为拨号器。
   - 单出站模式只接受内联 `via`。
-- 吞吐：iWAN 私有协议栈每条 TCP 的缓冲默认 64 KiB。跨境 30 ms RTT 下，单连接约 17 Mbps。线路节点应设置 `tcp_buffer_bytes`（上限 1 MiB）；iOS NE 内存有限，默认值不变。
+- 吞吐：iWAN 与 WireGuard 私有协议栈每条 TCP 的接收缓冲按平台默认：macOS / Windows / Linux 512 KiB（30 ms RTT 下单连接约 140 Mbps），Android 256 KiB，iOS 64 KiB（NE 内存有限，跨境 30 ms RTT 下单连接约 17 Mbps）；发送缓冲默认 64 KiB。线路节点仍可设置 `tcp_buffer_bytes`（上限 1 MiB，收发两个方向都用该值）。
 
 ## 以后再做
 

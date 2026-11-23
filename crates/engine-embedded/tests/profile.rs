@@ -124,3 +124,27 @@ fn groups_report_their_choice_and_select_groups_switch() {
     set_group_default(&mut profile, "Proxy", "DIRECT").unwrap();
     assert_eq!(selected_node(&profile), None);
 }
+
+#[test]
+fn a_final_rule_with_dns_failed_still_names_its_group() {
+    // Surge's `FINAL,<target>,dns-failed` keeps its option after import; the
+    // option is not part of the group name.
+    let mut profile = routed();
+    profile["routing"]["rules"] =
+        json!(["DOMAIN-SUFFIX,example.org,DIRECT", "FINAL,Proxy,dns-failed"]);
+    assert_eq!(selected_node(&profile).as_deref(), Some("jp"));
+    assert_eq!(
+        switch_group_for_node(&profile, "hk").as_deref(),
+        Some("Proxy")
+    );
+    set_group_default(&mut profile, "Proxy", "hk").unwrap();
+    assert_eq!(selected_node(&profile).as_deref(), Some("hk"));
+
+    // The rule mode hands the option to the engine unchanged.
+    let rendered = render(&profile, RoutingMode::Rule);
+    assert_eq!(
+        rendered["routing"]["rules"],
+        json!(["DOMAIN-SUFFIX,example.org,DIRECT", "FINAL,Proxy,dns-failed"])
+    );
+    RuntimeConfig::from_json(rendered.to_string().as_bytes()).unwrap();
+}

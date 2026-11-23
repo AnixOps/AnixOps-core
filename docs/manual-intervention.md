@@ -420,6 +420,16 @@ run URL 和状态，以 `task_state: pending_ci`、`next_action: resume_after_ci
 - Tauri 退出（`RunEvent::Exit` / 关机）时先恢复系统代理、关闭 TUN，再退出进程；WFP 过滤器在进程退出时由系统移除，WinINet 设置不会自动恢复。
 - 发布说明提示：Windows 连接不再修改机器级 WinHTTP 代理；TUN 模式下显式查询局域网 DNS（如 `nslookup name 192.168.1.1`）会被阻止。
 
+## 客户端跟进：iOS 脚本内存预算与内存压力（fix/k6-scripts-mitm）
+
+内核在 iOS 上把 MITM 脚本的内存预算降到 16 MiB（单次调度堆 6 MiB，大脚本的堆不超过预算总额），调度连同正文副本（正文的 4 倍）一起计入预算，字节码缓存与源码缓存各降到 2 MiB，并新增运行时控制 `memory_pressure`。以下事项需在客户端（AnixOps/anixops-net）完成：
+
+- 升级客户端固定的内核 rev 到包含本分支的提交。
+- iOS `PacketTunnelProvider.watchMemoryPressure`：收到 `DispatchSource` 的 `.warning` / `.critical` 时经 `networkcore_ios_runtime_control` 发送 `{"cmd":"memory_pressure","level":"warning"}` / `"critical"`，压力解除（或之后一段时间没有新事件）时发送 `"normal"`；目前只记日志。配置没有插件脚本时内核返回 `this config runs no plugin scripts`，客户端忽略即可。
+- `critical` 期间脚本不运行、报文原样放行（`skipped_runs` 计数），客户端可在脚本诊断里显示该计数与当前级别；文案进 iOS 字符串目录（简中、繁中、英文）。
+- iOS 上源码超过约 2 MiB 的脚本可能因堆上限解析失败（失败码 `script.memory_limit`），App 仍接受最多 4 MiB 的脚本（`MitmScript.swift`）：导入时提示该脚本在 iOS 上可能无法运行，文案进字符串目录。
+- 真机验收：开启 4 个改写约 1 MiB JSON 响应的 `requires-body` 脚本，同时触发 4 个响应，记录 NE 的峰值 phys_footprint，确认低于系统限制且不被 jetsam 结束；在 Xcode 的 Simulate Memory Warning 下确认脚本暂停、恢复后照常运行。
+
 ## 后续预计人工事项
 
 iOS/macOS（Apple Developer、App Store Connect、TestFlight、App Review）与 Windows 代码签名相关的人工事项随客户端在 AnixOps/anixops-net 跟踪。

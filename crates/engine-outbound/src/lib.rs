@@ -16,6 +16,7 @@
 //! credentials (UUIDs, passwords, private keys) out of error messages.
 
 pub mod accept;
+pub mod happy_eyeballs;
 pub mod mux;
 pub mod protect;
 pub mod quic_sniff;
@@ -101,6 +102,17 @@ impl fmt::Display for TargetAddr {
     }
 }
 
+/// `host` as it goes in a URI authority or an HTTP `Host` header: an IPv6
+/// address literal in brackets (RFC 3986 §3.2.2), anything else (a name, an
+/// IPv4 address, an already bracketed address, a `host:port`) unchanged.
+pub fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
 /// Opens the underlying transport connection to a proxy server.
 pub trait Dialer: Send + Sync {
     fn dial<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<BoxStream>>;
@@ -157,22 +169,23 @@ impl Dialer for OutboundDialer {
     }
 }
 
-/// A system UDP socket connected to `host:port`, as a flow.
+/// A system UDP socket connected to `host:port`, as a flow. UDP has no
+/// handshake to race the resolved addresses on, so it takes the first in
+/// [`happy_eyeballs::resolve`] order for UDP: the family QUIC last
+/// connected to the host with, else the family TCP did, else the
+/// resolver's first.
 async fn socket_flow(host: &str, port: u16) -> io::Result<UdpFlow> {
-    let addr = tokio::net::lookup_host((host, port))
-        .await?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "proxy server not found"))?;
+    let addr = happy_eyeballs::resolve(host, port, happy_eyeballs::Transport::Udp)
+        .await
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => {
+                io::Error::new(io::ErrorKind::NotFound, "proxy server not found")
+            }
+            _ => error,
+        })?[0];
     let socket = protect::bind_udp(addr)?;
     socket.connect(addr).await?;
-    let socket = std::sync::Arc::new(socket);
-    Ok(UdpFlow::new(
-        Box::new(SocketSend(socket.clone())),
-        Box::new(SocketRecv {
-            socket,
-            buf: vec![0u8; MAX_DATAGRAM],
-        }),
-    ))
+    Ok(UdpFlow::connected_socket(std::sync::Arc::new(socket)))
 }
 
 struct SocketSend(std::sync::Arc<UdpSocket>);
@@ -183,18 +196,46 @@ impl DatagramSend for SocketSend {
     }
 }
 
+/// Receives from a connected UDP socket without a buffer of its own: an
+/// idle flow (and there may be hundreds) holds no receive buffer. Each
+/// datagram is read into a per-thread scratch buffer of [`MAX_DATAGRAM`]
+/// bytes once the socket is readable, and copied out at its length.
 struct SocketRecv {
     socket: std::sync::Arc<UdpSocket>,
-    buf: Vec<u8>,
 }
 
 impl DatagramRecv for SocketRecv {
     fn recv(&mut self) -> BoxFuture<'_, io::Result<Vec<u8>>> {
         Box::pin(async move {
-            let n = self.socket.recv(&mut self.buf).await?;
-            Ok(self.buf[..n].to_vec())
+            loop {
+                self.socket.readable().await?;
+                match read_with_scratch(|buf| self.socket.try_recv(buf)) {
+                    Ok(datagram) => return Ok(datagram),
+                    // Readiness can be spurious; it is not the end of the
+                    // flow.
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
+            }
         })
     }
+}
+
+/// Runs `read` on this thread's scratch buffer of [`MAX_DATAGRAM`] bytes and
+/// returns what it read as an owned datagram. `read` must not wait: the
+/// buffer is borrowed for its call only, and a task may move to another
+/// thread at any await. The buffer is the full datagram size, so nothing is
+/// truncated (or, on Windows, refused as too large).
+fn read_with_scratch(read: impl FnOnce(&mut [u8]) -> io::Result<usize>) -> io::Result<Vec<u8>> {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Box<[u8]>> =
+            std::cell::RefCell::new(vec![0u8; MAX_DATAGRAM].into_boxed_slice());
+    }
+    SCRATCH.with(|scratch| {
+        let mut buf = scratch.borrow_mut();
+        let n = read(&mut buf)?;
+        Ok(buf[..n].to_vec())
+    })
 }
 
 /// A TCP-capable outbound protocol.
@@ -261,12 +302,15 @@ pub trait TcpOutbound: Send + Sync {
         false
     }
 
-    /// Drops the connections this outbound keeps between flows (a shared
-    /// QUIC connection, a pool of idle streams), after the device changed
-    /// networks or woke from sleep: they still use the old path and would
-    /// stall the next flows until they time out. The next flow dials afresh.
-    /// Returns how many sessions or idle connections were dropped; the
-    /// default keeps none. Flows already open are left alone.
+    /// Stops reusing the connections this outbound keeps between flows (a
+    /// shared QUIC connection, a pool of idle streams), after the device
+    /// changed networks or woke from sleep: they may still use the old path
+    /// and would stall the next flows until they time out. The next flow
+    /// dials afresh. Returns how many sessions or idle connections were
+    /// dropped or retired; the default keeps none. Flows already open are
+    /// left alone: a connection that carries open flows is retired, not
+    /// closed, and closes when its last flow ends (the engine closes the
+    /// flows itself when it means to).
     fn reset_sessions(&self) -> usize {
         0
     }
@@ -341,16 +385,24 @@ impl UdpFlow {
         Self { send, recv }
     }
 
+    /// A flow over a UDP socket already connected to its destination. The
+    /// flow keeps no receive buffer while it waits.
+    pub fn connected_socket(socket: std::sync::Arc<UdpSocket>) -> Self {
+        Self::new(
+            Box::new(SocketSend(socket.clone())),
+            Box::new(SocketRecv { socket }),
+        )
+    }
+
     /// A flow over a stream where each write carries one datagram and each
-    /// read returns one, such as a VMess UDP session.
+    /// read returns one, such as a VMess UDP session. A read takes up to
+    /// [`MAX_DATAGRAM`] bytes, allocated for that read only (not zeroed), so
+    /// an idle flow holds no buffer.
     pub fn message_stream(stream: BoxStream) -> Self {
         let (reader, writer) = tokio::io::split(stream);
         Self::new(
             Box::new(MessageSend(writer)),
-            Box::new(MessageRecv {
-                reader,
-                buf: vec![0u8; MAX_DATAGRAM],
-            }),
+            Box::new(MessageRecv { reader }),
         )
     }
 }
@@ -368,17 +420,20 @@ impl DatagramSend for MessageSend {
 
 struct MessageRecv {
     reader: ReadHalf<BoxStream>,
-    buf: Vec<u8>,
 }
 
 impl DatagramRecv for MessageRecv {
     fn recv(&mut self) -> BoxFuture<'_, io::Result<Vec<u8>>> {
         Box::pin(async move {
-            let n = self.reader.read(&mut self.buf).await?;
+            // One read is one datagram, so the buffer must hold the largest;
+            // it is spare capacity, written only as far as the read goes.
+            let mut buf = Vec::with_capacity(MAX_DATAGRAM);
+            let n = self.reader.read_buf(&mut buf).await?;
             if n == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
-            Ok(self.buf[..n].to_vec())
+            buf.shrink_to_fit();
+            Ok(buf)
         })
     }
 }
@@ -386,6 +441,17 @@ impl DatagramRecv for MessageRecv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uri_hosts_bracket_ipv6_literals_only() {
+        assert_eq!(uri_host("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(uri_host("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(uri_host("::1"), "[::1]");
+        assert_eq!(uri_host("198.51.100.20"), "198.51.100.20");
+        assert_eq!(uri_host("cdn.example"), "cdn.example");
+        assert_eq!(uri_host("cdn.example:8443"), "cdn.example:8443");
+        assert_eq!(uri_host("[2001:db8::1]:8443"), "[2001:db8::1]:8443");
+    }
 
     #[test]
     fn from_host_tells_addresses_from_names() {

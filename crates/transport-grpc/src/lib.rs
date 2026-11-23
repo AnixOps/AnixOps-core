@@ -59,6 +59,8 @@ impl GrpcConnector {
         } else {
             settings.authority.as_str()
         };
+        // A server given as a bare IPv6 address needs its brackets here.
+        let authority = engine_outbound::uri_host(authority);
         let scheme = if tls { "https" } else { "http" };
         let uri = format!("{scheme}://{authority}{path}")
             .parse::<http::Uri>()
@@ -457,5 +459,33 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn ipv6_literal_authorities_are_bracketed() {
+        let settings = GrpcSettings {
+            service_name: "grpc-svc".into(),
+            authority: String::new(),
+        };
+        // No SNI and no authority: the server address is the authority.
+        let connector = GrpcConnector::new(&settings, "2001:db8::1", true).unwrap();
+        assert_eq!(
+            connector.uri.authority().map(|a| a.as_str()),
+            Some("[2001:db8::1]")
+        );
+        assert_eq!(connector.path(), "/grpc-svc/Tun");
+        let explicit = GrpcConnector::new(
+            &GrpcSettings {
+                service_name: "grpc-svc".into(),
+                authority: "2001:db8::2".into(),
+            },
+            "a.example",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.uri.authority().map(|a| a.as_str()),
+            Some("[2001:db8::2]")
+        );
     }
 }

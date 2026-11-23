@@ -430,6 +430,7 @@ pub fn routing_model_with_plugin_rules(
         final_target: model.final_target.clone(),
         groups: model.groups.clone(),
         final_dns_failed: model.final_dns_failed,
+        final_dns_continue: model.final_dns_continue,
     }
 }
 
