@@ -52,6 +52,8 @@ An outbound may set `via`: the id of another node in `routing.outbounds` (nodes 
 
 `routing.rule_sets` carries named lists for `RULE-SET,<name>,<target>` rules: `{"china": {"domain_suffix": [...], "ip_cidr": [...]}}`, up to 16 sets and 500,000 entries in all. A set is one rule, matched by a hash lookup per domain suffix and a binary search over merged networks, so a list the size of the mainland China domains costs the same per connection as a short one. Its networks match only a destination that is already an address; a domain is never resolved for them. A rule naming a set the envelope does not carry is rejected.
 
+A set with a `url` is downloaded by the engine itself (`local-proxy` feature) and refreshed every `interval_secs`. With `routing.rule_set_cache_dir`, an absolute directory the client owns, every download that passed its checks is also kept there (written to a temporary file, synced, then renamed), so after a restart the set starts with its last good download instead of empty, keeps it while downloads fail, and is downloaded again an interval after it. Copies are read back only when their digest and, for a signed set, their signature still verify; see `src/rule_set_cache.rs` and `docs/architecture/routing-policy-group-model.md`.
+
 ## HTTPS decryption (MITM)
 
 The default `mitm` feature lets the packet tunnel decrypt HTTPS for host names listed in a plugin's `[MITM]` section. Add an optional `mitm` object to the config envelope:

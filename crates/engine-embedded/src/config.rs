@@ -30,6 +30,7 @@ use crate::dns_policy::DnsPolicy;
 use crate::dns_resolver::PolicyResolver;
 use crate::fake_ip::FakeIpPool;
 use crate::routing::RoutedOutbound;
+use crate::rule_set_cache::RuleSetCache;
 use crate::rule_sets::{
     RemoteRuleSet, RuleSetStore, DEFAULT_UPDATE_INTERVAL_SECS, MIN_UPDATE_INTERVAL_SECS,
 };
@@ -48,6 +49,8 @@ const MAX_UDP_FLOWS_LIMIT: usize = 1_000_000;
 // Shared with the importer, which only offers routing that fits.
 use node_import::{MAX_POLICY_GROUPS, MAX_ROUTED_OUTBOUNDS, MAX_ROUTING_RULES};
 const MAX_RULE_SETS: usize = 32;
+/// Longest `routing.rule_set_cache_dir`, in bytes.
+const MAX_CACHE_DIR_LEN: usize = 4096;
 /// Longest `via` chain, the outbound itself included.
 const MAX_VIA_CHAIN: usize = 4;
 
@@ -188,6 +191,14 @@ pub struct RoutingConfig {
     /// Lists named by `RULE-SET,<name>,<target>` rules.
     #[serde(default)]
     pub rule_sets: BTreeMap<String, RuleSetConfig>,
+    /// Directory the remote rule sets' downloads are kept in between runs
+    /// (see [`crate::rule_set_cache`]): an absolute path the client owns and
+    /// uses for nothing else, created when missing. A remote set then starts
+    /// with its last good download instead of empty, keeps it while
+    /// downloads fail, and is downloaded again an interval after it. Absent:
+    /// nothing is written and every run downloads every remote set again.
+    #[serde(default)]
+    pub rule_set_cache_dir: Option<String>,
     /// Rule scripts named by `SCRIPT,<name>,<target>` rules (see
     /// [`crate::rule_scripts`]); needs the `scripts` feature.
     #[serde(default)]
@@ -245,7 +256,8 @@ impl RuleScriptConfig {
 /// One rule set. `RULE-SET,<name>` rules match it by name; the sets named
 /// `geosite-<category>` and `geoip-<cc>` back `GEOSITE` and `GEOIP` rules.
 /// With a `url` the engine downloads the list itself every `interval_secs`
-/// (see [`crate::rule_sets`]); the inline entries are its starting content.
+/// (see [`crate::rule_sets`]); the inline entries are its starting content
+/// unless `routing.rule_set_cache_dir` kept a download of it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleSetConfig {
@@ -848,6 +860,13 @@ impl RuntimeConfig {
                         "rule set names must be 1-128 characters of [A-Za-z0-9._-]",
                     ));
                 }
+                if routing.rule_set_cache_dir.as_deref().is_some_and(|dir| {
+                    dir.len() > MAX_CACHE_DIR_LEN || !std::path::Path::new(dir).is_absolute()
+                }) {
+                    return Err(rejected(
+                        "routing rule_set_cache_dir must be an absolute path",
+                    ));
+                }
                 if !routing.outbounds.keys().all(|id| is_identifier(id)) {
                     return Err(rejected(
                         "routing outbound ids must be 1-128 characters of [A-Za-z0-9._-]",
@@ -1010,13 +1029,15 @@ impl RuntimeConfig {
         for (name, set) in &routing.rule_sets {
             remotes.extend(set.remote(name)?);
         }
+        // Kept downloads are read here, before the first connection is
+        // routed, so the sets are in force from the start.
+        let store = RuleSetStore::with_cache(
+            rule_sets,
+            remotes,
+            routing.rule_set_cache_dir.as_deref().map(RuleSetCache::new),
+        );
         let direct = Arc::new(DirectOutbound::new(dialer));
-        let mut routed = RoutedOutbound::with_rule_set_store(
-            &spec,
-            direct,
-            nodes,
-            RuleSetStore::new(rule_sets, remotes),
-        )?;
+        let mut routed = RoutedOutbound::with_rule_set_store(&spec, direct, nodes, store)?;
         if let Some(global) = &routing.global {
             routed = routed.with_global(global)?;
         }

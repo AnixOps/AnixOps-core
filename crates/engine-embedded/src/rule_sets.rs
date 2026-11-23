@@ -4,10 +4,17 @@
 //! `RULE-SET,<name>` rules match the set `<name>`; `GEOSITE,<category>` rules
 //! the set `geosite-<category>` and `GEOIP,<CC>` rules the set `geoip-<cc>`
 //! (lower case), so a client supplies GeoSite and GeoIP data as ordinary
-//! lists. A remote set starts with its inline entries (the client's cached
-//! copy, possibly empty), is downloaded right away when it starts empty, and
-//! is replaced atomically after each successful download; a failed one keeps
-//! the previous entries and is retried sooner. URLs never appear in status.
+//! lists. A remote set is replaced atomically after each successful
+//! download; a failed one keeps the previous entries and is retried sooner.
+//! URLs never appear in status.
+//!
+//! With a cache directory (`routing.rule_set_cache_dir`, see
+//! [`crate::rule_set_cache`]) every successful download is also kept on
+//! disk, and a remote set starts with its last good download instead of
+//! empty: it is downloaded again an interval after that download, right
+//! away when there is no usable copy. Without one a remote set starts with
+//! its inline entries (possibly empty), is downloaded right away when they
+//! are empty and an interval later when they are not.
 //!
 //! A remote set may carry an Ed25519 `public_key`: each download then also
 //! fetches the detached signature (`signature_url`, `<url>.sig` by default)
@@ -23,17 +30,21 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config_core::rule_set::{BareDomain, RuleSet, LAN_RULE_SET};
 use serde::Serialize;
 use tokio::sync::Notify;
+
+use crate::rule_set_cache::RuleSetCache;
 
 /// Shortest refresh interval accepted for a remote set.
 pub const MIN_UPDATE_INTERVAL_SECS: u32 = 600;
 pub const DEFAULT_UPDATE_INTERVAL_SECS: u32 = 86_400;
 /// How soon a failed download is tried again, at most.
 pub const RETRY_INTERVAL_SECS: u32 = 300;
+/// Largest list accepted from a download or the cache directory.
+pub const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
 
 /// A list the engine downloads itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +120,9 @@ pub struct RuleSetStatus {
     /// `inline` or `remote`.
     pub source: &'static str,
     pub entries: usize,
-    /// Unix milliseconds of the last successful download.
+    /// Unix milliseconds of the last successful download; with
+    /// `from_cache`, the download (of an earlier run) the kept copy comes
+    /// from.
     pub updated_at_ms: Option<u64>,
     /// Why the last download failed, cleared by the next success.
     pub last_error: Option<&'static str>,
@@ -119,11 +132,21 @@ pub struct RuleSetStatus {
     /// (such as `IP-ASN` or `SCRIPT`; `INVALID` for malformed lines, `OTHER`
     /// past sixteen types). Empty when nothing was skipped.
     pub skipped: BTreeMap<String, usize>,
+    /// Whether the entries in force are the copy the cache directory kept,
+    /// loaded at start; cleared by the next successful download. A remote
+    /// set with neither this nor `updated_at_ms` was never downloaded.
+    pub from_cache: bool,
+    /// Why the last successful download could not be kept in the cache
+    /// directory (`cache_write_failed`); cleared by the next one that was.
+    /// Always `None` without a cache directory.
+    pub cache_error: Option<&'static str>,
 }
 
 pub struct RuleSetStore {
     sets: RwLock<BTreeMap<String, Arc<RuleSet>>>,
     remotes: Vec<RemoteRuleSet>,
+    /// Where downloads are kept between runs (`routing.rule_set_cache_dir`).
+    cache: Option<RuleSetCache>,
     status: Mutex<BTreeMap<String, RuleSetStatus>>,
     refresh: Notify,
     /// Whether some set holds a `PROCESS-NAME` rule, or a `URL-REGEX` or
@@ -135,6 +158,18 @@ pub struct RuleSetStore {
 
 impl RuleSetStore {
     pub fn new(sets: BTreeMap<String, RuleSet>, remotes: Vec<RemoteRuleSet>) -> Self {
+        Self::with_cache(sets, remotes, None)
+    }
+
+    /// As [`RuleSetStore::new`], keeping downloads in `cache` between runs:
+    /// a remote set with a usable copy ([`RuleSetCache::load`]) starts with
+    /// it instead of its inline entries, and copies no set uses are pruned
+    /// ([`RuleSetCache::prune`]).
+    pub fn with_cache(
+        sets: BTreeMap<String, RuleSet>,
+        remotes: Vec<RemoteRuleSet>,
+        cache: Option<RuleSetCache>,
+    ) -> Self {
         let mut sets: BTreeMap<String, Arc<RuleSet>> = sets
             .into_iter()
             .map(|(name, set)| (name, Arc::new(set)))
@@ -154,6 +189,8 @@ impl RuleSetStore {
                     last_error: None,
                     signed: remote.is_some_and(|remote| remote.signature.is_some()),
                     skipped: BTreeMap::new(),
+                    from_cache: false,
+                    cache_error: None,
                 };
                 (name.clone(), status)
             })
@@ -164,11 +201,27 @@ impl RuleSetStore {
         let store = Self {
             sets: RwLock::new(sets),
             remotes,
+            cache,
             status: Mutex::new(status),
             refresh: Notify::new(),
             uses_process: AtomicBool::new(false),
             uses_request: AtomicBool::new(false),
         };
+        if let Some(cache) = &store.cache {
+            // One list at a time, so only one sits in memory as text.
+            for remote in &store.remotes {
+                if let Some(copy) = cache.load(remote) {
+                    store.install(
+                        &remote.name,
+                        copy.set,
+                        copy.skipped,
+                        copy.fetched_at_ms,
+                        true,
+                    );
+                }
+            }
+            cache.prune(&store.remotes);
+        }
         store.update_uses(&store.read());
         store
     }
@@ -208,6 +261,35 @@ impl RuleSetStore {
         &self.remotes
     }
 
+    /// Where downloads are kept between runs, when the config names a
+    /// directory.
+    pub fn cache(&self) -> Option<&RuleSetCache> {
+        self.cache.as_ref()
+    }
+
+    /// How long after the updater starts it first downloads `remote`. With
+    /// a cache directory: what is left of the interval since the kept copy
+    /// was downloaded, nothing when there is no copy. Without one: nothing
+    /// when the set starts empty, the whole interval when it starts with
+    /// inline entries.
+    pub fn first_update_delay(&self, remote: &RemoteRuleSet) -> Duration {
+        let interval = Duration::from_secs(u64::from(remote.interval_secs));
+        if self.cache.is_none() {
+            return if self.is_empty_set(&remote.name) {
+                Duration::ZERO
+            } else {
+                interval
+            };
+        }
+        let kept_at = lock(&self.status)
+            .get(&remote.name)
+            .filter(|status| status.from_cache)
+            .and_then(|status| status.updated_at_ms);
+        kept_at.map_or(Duration::ZERO, |kept_at| {
+            interval.saturating_sub(Duration::from_millis(unix_millis().saturating_sub(kept_at)))
+        })
+    }
+
     /// Every set with its entry count and download state, by name.
     pub fn status(&self) -> Vec<RuleSetStatus> {
         lock(&self.status).values().cloned().collect()
@@ -230,6 +312,37 @@ impl RuleSetStore {
     /// Installs a downloaded set for every later connection, with the
     /// lines its list held that it could not ([`RuleSetStatus::skipped`]).
     pub fn replace(&self, name: &str, set: RuleSet, skipped: BTreeMap<String, usize>) {
+        self.install(name, set, skipped, unix_millis(), false);
+    }
+
+    /// As [`RuleSetStore::replace`] for a list downloaded at
+    /// `fetched_at_ms`, with how keeping it in the cache directory went:
+    /// `cache_error` says why it could not be kept, `None` when it was or
+    /// there is no directory ([`RuleSetStatus::cache_error`]).
+    pub fn replace_downloaded(
+        &self,
+        name: &str,
+        set: RuleSet,
+        skipped: BTreeMap<String, usize>,
+        fetched_at_ms: u64,
+        cache_error: Option<&'static str>,
+    ) {
+        self.install(name, set, skipped, fetched_at_ms, false);
+        if let Some(status) = lock(&self.status).get_mut(name) {
+            status.cache_error = cache_error;
+        }
+    }
+
+    /// Puts `set` in force; `updated_at_ms` is when its list was
+    /// downloaded, `from_cache` whether it is the kept copy of a download.
+    fn install(
+        &self,
+        name: &str,
+        set: RuleSet,
+        skipped: BTreeMap<String, usize>,
+        updated_at_ms: u64,
+        from_cache: bool,
+    ) {
         let entries = set.len();
         {
             let mut sets = self
@@ -241,9 +354,10 @@ impl RuleSetStore {
         }
         if let Some(status) = lock(&self.status).get_mut(name) {
             status.entries = entries;
-            status.updated_at_ms = Some(unix_millis());
+            status.updated_at_ms = Some(updated_at_ms);
             status.last_error = None;
             status.skipped = skipped;
+            status.from_cache = from_cache;
         }
     }
 
@@ -264,7 +378,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))

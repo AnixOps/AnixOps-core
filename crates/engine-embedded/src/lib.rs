@@ -83,6 +83,7 @@ pub mod reject;
 pub mod replay_proxy;
 pub mod routing;
 pub mod rule_scripts;
+pub mod rule_set_cache;
 pub mod rule_sets;
 #[cfg(feature = "local-proxy")]
 pub mod system_proxy;
