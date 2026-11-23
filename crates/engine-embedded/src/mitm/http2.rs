@@ -11,9 +11,10 @@
 //!   body a rule reads is held whole up to [`MAX_BODY_BYTES`], and a
 //!   larger one is relayed without rewriting (`too_large`). All streams of
 //!   one connection hold at most [`MAX_HELD_BODY_BYTES`] of such bodies at
-//!   once; a body that finds no room is relayed without rewriting too
-//!   (`busy`), never waited for, since a stream that waits holds flow
-//!   control window the others need.
+//!   once, and all connections of the engine (HTTP/1.1 ones included) at
+//!   most [`super::MAX_ENGINE_HELD_BODY_BYTES`]; a body that finds no room
+//!   is relayed without rewriting too (`busy`), never waited for, since a
+//!   stream that waits holds flow control window the others need.
 //! - `text/event-stream` responses are relayed as they arrive
 //!   (`streaming`).
 //! - A request for another authority than the intercepted host gets
@@ -127,55 +128,97 @@ fn reset_reason(error: &io::Error) -> (Reason, bool) {
     }
 }
 
-/// The body bytes the streams of one connection may still hold for rules
-/// (see [`MAX_HELD_BODY_BYTES`]).
-struct BodyBudget {
+/// Body bytes that may still be held for rules: those of the streams of
+/// one connection (see [`MAX_HELD_BODY_BYTES`]), or, as the parent of every
+/// connection's budget and of HTTP/1.1 exchanges, those of the whole engine
+/// (see [`super::MAX_ENGINE_HELD_BODY_BYTES`]).
+pub(super) struct BodyBudget {
     left: AtomicUsize,
+    /// A budget every byte is also taken from.
+    parent: Option<Arc<BodyBudget>>,
 }
 
 impl BodyBudget {
-    fn new(bytes: usize) -> Self {
+    pub(super) fn new(bytes: usize) -> Self {
         Self {
             left: AtomicUsize::new(bytes),
+            parent: None,
         }
+    }
+
+    /// A budget of `bytes` whose bytes are also taken from `parent`.
+    pub(super) fn within(bytes: usize, parent: Arc<BodyBudget>) -> Self {
+        Self {
+            left: AtomicUsize::new(bytes),
+            parent: Some(parent),
+        }
+    }
+
+    /// Takes `bytes` from this budget alone; `false`, taking nothing, when
+    /// they do not fit.
+    fn take(&self, bytes: usize) -> bool {
+        let mut current = self.left.load(Ordering::Acquire);
+        loop {
+            let Some(rest) = current.checked_sub(bytes) else {
+                return false;
+            };
+            match self.left.compare_exchange_weak(
+                current,
+                rest,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn give(&self, bytes: usize) {
+        self.left.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(super) fn left(&self) -> usize {
+        self.left.load(Ordering::Acquire)
     }
 }
 
-/// What one stream holds of a [`BodyBudget`], given back when dropped,
-/// whichever way the stream ends.
-struct Held<'a> {
+/// What one stream or exchange holds of a [`BodyBudget`] (and its
+/// parent), given back when dropped, whichever way it ends.
+pub(super) struct Held<'a> {
     budget: &'a BodyBudget,
     bytes: usize,
 }
 
 impl<'a> Held<'a> {
-    fn new(budget: &'a BodyBudget) -> Self {
+    pub(super) fn new(budget: &'a BodyBudget) -> Self {
         Self { budget, bytes: 0 }
     }
 
-    /// Takes `bytes` more; `false`, taking nothing, when they do not fit.
-    fn grow(&mut self, bytes: usize) -> bool {
-        let left = &self.budget.left;
-        let mut current = left.load(Ordering::Acquire);
-        let taken = loop {
-            let Some(rest) = current.checked_sub(bytes) else {
-                break false;
-            };
-            match left.compare_exchange_weak(current, rest, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break true,
-                Err(actual) => current = actual,
-            }
-        };
-        if taken {
-            self.bytes += bytes;
+    /// Takes `bytes` more from the budget and its parent; `false`, taking
+    /// nothing, when they do not fit in either.
+    pub(super) fn grow(&mut self, bytes: usize) -> bool {
+        if !self.budget.take(bytes) {
+            return false;
         }
-        taken
+        if let Some(parent) = &self.budget.parent {
+            if !parent.take(bytes) {
+                self.budget.give(bytes);
+                return false;
+            }
+        }
+        self.bytes += bytes;
+        true
     }
 }
 
 impl Drop for Held<'_> {
     fn drop(&mut self) {
-        self.budget.left.fetch_add(self.bytes, Ordering::AcqRel);
+        self.budget.give(self.bytes);
+        if let Some(parent) = &self.budget.parent {
+            parent.give(self.bytes);
+        }
     }
 }
 
@@ -237,7 +280,9 @@ impl MitmEngine {
             drivers: driver_tx,
             going_away: AtomicBool::new(false),
         };
-        let budget = BodyBudget::new(MAX_HELD_BODY_BYTES);
+        // Bounded per connection and, with every other connection, by the
+        // engine's budget.
+        let budget = BodyBudget::within(MAX_HELD_BODY_BYTES, self.held_bodies.clone());
         let mut drivers = FuturesUnordered::new();
         let mut upstream = pin!(upstream);
         let mut upstream_done = false;
@@ -833,7 +878,8 @@ impl Tap {
 enum Collected {
     Complete(Vec<u8>, Option<HeaderMap>),
     /// Not held whole: what was read so far, and why (`too_large` past the
-    /// limit, `busy` when the connection's [`BodyBudget`] had no room).
+    /// limit, `busy` when the connection's or the engine's [`BodyBudget`]
+    /// had no room).
     Partial(Vec<u8>, &'static str),
 }
 
@@ -1391,6 +1437,28 @@ mod tests {
         assert_eq!(left(), 0);
         drop(first);
         assert_eq!(left(), 100);
+    }
+
+    #[test]
+    fn connections_share_the_engines_budget_and_give_it_back() {
+        let engine = Arc::new(BodyBudget::new(100));
+        let first = BodyBudget::within(80, engine.clone());
+        let second = BodyBudget::within(80, engine.clone());
+        let mut a = Held::new(&first);
+        assert!(a.grow(70));
+        let mut b = Held::new(&second);
+        // The second connection has room of its own, the engine does not:
+        // nothing is taken from either.
+        assert!(!b.grow(40));
+        assert_eq!((second.left(), engine.left()), (80, 30));
+        assert!(b.grow(30));
+        assert_eq!((first.left(), second.left(), engine.left()), (10, 50, 0));
+        // A connection's own limit still holds while the engine has room.
+        drop(b);
+        assert!(!a.grow(11));
+        assert_eq!((first.left(), engine.left()), (10, 30));
+        drop(a);
+        assert_eq!((first.left(), second.left(), engine.left()), (80, 80, 100));
     }
 
     #[test]

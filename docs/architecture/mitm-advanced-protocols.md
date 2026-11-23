@@ -106,6 +106,12 @@ HTTP/2 / HTTP/1.1 解密。其余主机的 QUIC 照常放行，不影响非解�
 - HTTP/2 一条连接上同时为规则持有的正文合计不超过 2 MiB（`MAX_HELD_BODY_BYTES`，
   每个持有的正文在规划时大约还有两份拷贝）：放不下的那条不等待（等待的流占着流控窗口，
   会卡住持有额度的流），按原样转发，条目写 `note: "busy"`、`rules_skipped: true`。
+- 整个引擎所有解密连接同时为规则持有的正文另有总上限（`MAX_ENGINE_HELD_BODY_BYTES`，
+  iOS 6 MiB，其他平台 16 MiB）：每条 HTTP/2 连接的额度从中扣，HTTP/1.1 在读正文前按
+  `Content-Length`（不超过 1 MiB；分块、读到关闭或带 `Content-Encoding` 的按 1 MiB）预留。
+  预留不到时同样不等待：HTTP/2 这条流按原样转发，HTTP/1.1 这条消息按原样转发并且之后整条
+  连接透传（与 `too_large` 相同），条目写 `note: "busy"`、`rules_skipped: true`。
+  多条连接同时读正文时内存因此有界，不会叠加到 Network Extension 的内存上限。
 - 源站 HTTP/2 连接发 GOAWAY 或关闭时，App 一侧也优雅关闭：App 收到 GOAWAY，
   进行中的流继续转完（最多 `idle_timeout`），源站没有处理的流回 `REFUSED_STREAM`
   （App 可以在新连接上安全重试），源站 RST_STREAM 的原因原样转给 App。

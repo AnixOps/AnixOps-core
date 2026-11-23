@@ -92,6 +92,17 @@ use crate::tunnel::{FlowInterceptor, InterceptedFlow, TunnelSettings, TunnelStat
 pub const PLUGIN_ID: &str = "networkcore.ios.mitm";
 /// Largest request or response body the rewrite hook sees.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Body bytes all decrypted connections of one engine hold at once for
+/// rules to read: every HTTP/2 connection's share (`MAX_HELD_BODY_BYTES` in
+/// the `http2` module) and every HTTP/1.1 body come out of it. A body that
+/// finds no room is relayed without rewriting (`busy`) instead of being
+/// held, so many connections reading bodies at once cannot add up past it.
+#[cfg(not(target_os = "ios"))]
+pub const MAX_ENGINE_HELD_BODY_BYTES: usize = 16 * MAX_BODY_BYTES;
+/// The iOS total, within the Network Extension's memory limit of about
+/// 50 MB: each held body is copied a few more times while it is planned.
+#[cfg(target_os = "ios")]
+pub const MAX_ENGINE_HELD_BODY_BYTES: usize = 6 * MAX_BODY_BYTES;
 /// Plugin texts handed to one tunnel, in total.
 const MAX_POLICY_BYTES: usize = 8 * 1024 * 1024;
 /// QuickJS heap per script dispatch. A large script gets more (6 bytes per
@@ -205,6 +216,9 @@ pub struct MitmEngine {
     /// What decryption did per host, for `mitm_hosts`.
     outcomes: Mutex<outcomes::HostOutcomes>,
     next_request: AtomicU64,
+    /// Body bytes held for rules across all connections, see
+    /// [`MAX_ENGINE_HELD_BODY_BYTES`].
+    held_bodies: Arc<http2::BodyBudget>,
     /// `[Rule]` lines of the accepted plugins, for the routing model.
     plugin_rules: Vec<config_core::routing::RoutingRule>,
     /// Cron, network-change and generic scripts, and the notifications
@@ -330,6 +344,7 @@ impl MitmEngine {
             decisions: Mutex::new(DecisionCache::default()),
             outcomes: Mutex::new(outcomes::HostOutcomes::default()),
             next_request: AtomicU64::new(1),
+            held_bodies: Arc::new(http2::BodyBudget::new(MAX_ENGINE_HELD_BODY_BYTES)),
             plugin_rules,
             #[cfg(feature = "scripts")]
             scheduler,
@@ -783,9 +798,22 @@ impl MitmEngine {
             // A body no rule reads is forwarded as it arrives, not held whole.
             let stream_request = !self.needs_body(&url, HttpMitmPhase::Request);
             let stream_response = !self.needs_body(&url, HttpMitmPhase::Response);
+            // What this exchange holds of the engine's body budget, until
+            // the exchange ends (the request body is kept for the response
+            // phase).
+            let mut request_held = http2::Held::new(&self.held_bodies);
             let request_body = if stream_request {
                 Vec::new()
             } else {
+                if !request_held.grow(body_reservation(request_framing)) {
+                    // No room to hold the body: it is relayed as it is.
+                    if let Some(recording) = &mut recording {
+                        recording.exchange.note = Some("busy");
+                        recording.exchange.rules_skipped = true;
+                    }
+                    origin.write_all(&request.encode()).await?;
+                    return passthrough(client, origin).await;
+                }
                 match client.read_body(request_framing, MAX_BODY_BYTES).await? {
                     Body::Complete(body) => {
                         if let Some(recording) = &mut recording {
@@ -1065,6 +1093,22 @@ impl MitmEngine {
             }
 
             let mut response_headers = response.headers.clone();
+            // A coded body may decode to up to MAX_BODY_BYTES for rules.
+            let reservation = if response.header("Content-Encoding").is_some() {
+                MAX_BODY_BYTES
+            } else {
+                body_reservation(framing)
+            };
+            let mut response_held = http2::Held::new(&self.held_bodies);
+            if !response_held.grow(reservation) {
+                // No room to hold the body: it is relayed as it is.
+                if let Some(recording) = &mut recording {
+                    recording.response(&response, &[], Some("busy"));
+                    recording.exchange.rules_skipped = true;
+                }
+                client.write_all(&response.encode()).await?;
+                return passthrough(client, origin).await;
+            }
             let response_body = match origin.read_body(framing, MAX_BODY_BYTES).await? {
                 Body::Complete(body) => decoded_for_rules(&mut response_headers, body),
                 Body::TooLarge { raw, body, size } => {
@@ -1556,6 +1600,16 @@ fn reason(status: u16) -> &'static str {
 /// decoded (the caller sets its length). A body that does not decode whole
 /// within [`MAX_BODY_BYTES`] and the extension's window limit is left as it
 /// came, with its header.
+/// Bytes an HTTP/1.1 exchange takes from the engine's body budget before
+/// it reads a body framed by `framing` for rules: its announced length, or
+/// the most a held body grows to when no length is announced.
+fn body_reservation(framing: Framing) -> usize {
+    match framing {
+        Framing::Length(length) => length.min(MAX_BODY_BYTES),
+        Framing::Chunked | Framing::UntilClose => MAX_BODY_BYTES,
+    }
+}
+
 fn decoded_for_rules(headers: &mut Vec<(String, String)>, body: Vec<u8>) -> Vec<u8> {
     use crate::capture::decode::{codings, decode_body, DecodeLimits};
 
