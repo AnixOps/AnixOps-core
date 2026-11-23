@@ -15,9 +15,10 @@ use control_domain::{
     MetadataEntry,
 };
 use script_runtime::{
-    binary_body_bytes, binary_body_string, DisabledScriptHttpClient, JsonFileScriptStore,
+    binary_body_bytes, binary_body_string, open_script_store, DisabledScriptHttpClient,
     MemoryScriptStore, QuickJsScriptRuntime, ScriptHttpClient, ScriptInvocation, ScriptLimits,
     ScriptNotification, ScriptPhase, ScriptRequest, ScriptResponse, ScriptRunStatus, ScriptStore,
+    ScriptStoreRecovery,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -89,6 +90,8 @@ pub struct NativeQuickJsScriptExecutor {
     config: NativeQuickJsScriptRuntimeConfig,
     script_asset_hashes: BTreeMap<String, String>,
     store: Arc<dyn ScriptStore>,
+    /// How the persistent store was opened (a broken file is set aside).
+    store_recovery: ScriptStoreRecovery,
     runtime: QuickJsScriptRuntime,
     notifications: Arc<Mutex<VecDeque<ScriptNotification>>>,
     /// Shared cap on the heap limits of dispatches running at once.
@@ -156,6 +159,9 @@ impl std::fmt::Debug for NativeQuickJsScriptExecutor {
 
 impl NativeQuickJsScriptExecutor {
     /// Pins every mapped script by SHA-256 and opens the persistent store.
+    /// A store file that cannot be read never fails the runtime: it is set
+    /// aside or replaced by an in-memory store (see
+    /// [`Self::persistent_store_recovery`]).
     pub fn new(config: NativeQuickJsScriptRuntimeConfig) -> DomainResult<Self> {
         let mut script_asset_hashes = BTreeMap::new();
         for (url, path) in &config.script_assets {
@@ -166,15 +172,18 @@ impl NativeQuickJsScriptExecutor {
             };
             script_asset_hashes.insert(url.clone(), hash);
         }
-        let store: Arc<dyn ScriptStore> = match config.persistent_store_path.as_deref() {
-            Some(path) => Arc::new(JsonFileScriptStore::open(path).map_err(|_| {
-                config_invalid("QuickJS persistent store must be a JSON object file or absent")
-            })?),
-            None => Arc::new(MemoryScriptStore::new()),
-        };
+        let (store, store_recovery): (Arc<dyn ScriptStore>, _) =
+            match config.persistent_store_path.as_deref() {
+                Some(path) => open_script_store(path),
+                None => (
+                    Arc::new(MemoryScriptStore::new()),
+                    ScriptStoreRecovery::Opened,
+                ),
+            };
         Ok(Self {
             config,
             script_asset_hashes,
+            store_recovery,
             runtime: QuickJsScriptRuntime::new(store.clone(), Arc::new(DisabledScriptHttpClient)),
             store,
             notifications: Arc::default(),
@@ -204,6 +213,12 @@ impl NativeQuickJsScriptExecutor {
 
     pub fn script_asset_hashes(&self) -> &BTreeMap<String, String> {
         &self.script_asset_hashes
+    }
+
+    /// Whether the persistent store file had to be set aside or replaced by
+    /// an in-memory store when the executor was built.
+    pub fn persistent_store_recovery(&self) -> &ScriptStoreRecovery {
+        &self.store_recovery
     }
 
     pub fn execute(

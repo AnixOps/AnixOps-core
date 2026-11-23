@@ -33,8 +33,9 @@ pub use jsc::{JscScriptRuntime, MAX_STUCK_WORKERS};
 #[cfg(feature = "quickjs")]
 pub use quickjs::QuickJsScriptRuntime;
 pub use store::{
-    JsonFileScriptStore, MemoryScriptStore, ScriptStore, SCRIPT_STORE_MAX_KEY_BYTES,
-    SCRIPT_STORE_MAX_TOTAL_BYTES, SCRIPT_STORE_MAX_VALUE_BYTES,
+    open_script_store, JsonFileScriptStore, MemoryScriptStore, ScriptStore, ScriptStoreRecovery,
+    SCRIPT_STORE_MAX_KEY_BYTES, SCRIPT_STORE_MAX_TOTAL_BYTES, SCRIPT_STORE_MAX_VALUE_BYTES,
+    SCRIPT_STORE_QUARANTINE_SUFFIX,
 };
 
 use std::time::Duration;

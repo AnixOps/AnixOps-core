@@ -8,7 +8,7 @@ use control_domain::{
 };
 use engine_native::{
     scaled_memory_limit, NativeHttpMitmPluginHook, NativePlainHttpMessage,
-    NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig,
+    NativeQuickJsScriptExecutor, NativeQuickJsScriptRuntimeConfig, ScriptStoreRecovery,
     ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE,
     ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_BODY_IGNORED_CODE,
     ENGINE_NATIVE_RUNTIME_HTTP_SCRIPT_FAILED_CODE, QUICKJS_MAX_SCALED_MEMORY_LIMIT_BYTES,
@@ -393,7 +393,7 @@ fn quickjs_script_source_is_read_and_hashed_once_while_the_file_is_unchanged() {
 }
 
 #[test]
-fn quickjs_executor_rejects_missing_assets_and_corrupt_stores() {
+fn quickjs_executor_rejects_missing_assets() {
     let dir = temp_dir("config");
     let mut script_assets = BTreeMap::new();
     script_assets.insert(
@@ -413,19 +413,53 @@ fn quickjs_executor_rejects_missing_assets_and_corrupt_stores() {
         ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn quickjs_executor_sets_a_corrupt_store_aside_and_starts() {
+    let dir = temp_dir("corrupt-store");
     let store = dir.join("store.json");
-    std::fs::write(&store, "not json").unwrap();
-    let corrupt = NativeQuickJsScriptExecutor::new(NativeQuickJsScriptRuntimeConfig {
-        script_assets: BTreeMap::new(),
-        persistent_store_path: Some(store.display().to_string()),
-        max_timeout_ms: 1000,
-        max_body_bytes: 1024,
-        memory_limit_bytes: 0,
-    })
-    .expect_err("corrupt store must be rejected");
+    // A truncated write and a hand edit with a number value.
+    for broken in ["{\"token\":\"ab", "{\"count\":1}"] {
+        std::fs::write(&store, broken).unwrap();
+        let executor = NativeQuickJsScriptExecutor::new(NativeQuickJsScriptRuntimeConfig {
+            script_assets: BTreeMap::new(),
+            persistent_store_path: Some(store.display().to_string()),
+            max_timeout_ms: 1000,
+            max_body_bytes: 1024,
+            memory_limit_bytes: 0,
+        })
+        .expect("a corrupt store must not stop the script runtime");
+        let backup = dir.join("store.json.corrupt");
+        assert_eq!(
+            executor.persistent_store_recovery(),
+            &ScriptStoreRecovery::Quarantined {
+                backup: backup.clone()
+            }
+        );
+        // The broken file is kept aside, not overwritten.
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), broken);
+        assert!(!store.exists());
+    }
     assert_eq!(
-        corrupt.code,
-        ENGINE_NATIVE_QUICKJS_SCRIPT_CONFIG_INVALID_CODE
+        std::fs::read_dir(&dir).unwrap().count(),
+        1,
+        "only the latest broken copy is kept"
     );
+
+    // The runtime keeps working on a fresh store at the original path.
+    let script = dir.join("store.js");
+    std::fs::write(&script, "$persistentStore.write('fresh', 'k'); $done({});").unwrap();
+    let executor = executor(&script, Some(&store));
+    assert_eq!(
+        executor.persistent_store_recovery(),
+        &ScriptStoreRecovery::Opened
+    );
+    let report = hook(executor, 1000).plan_plain_http(&message(HttpMitmPhase::Request, "x"));
+    assert!(report.script_dispatch_executed);
+    let saved: BTreeMap<String, String> =
+        serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
+    assert_eq!(saved.get("k").map(String::as_str), Some("fresh"));
     let _ = std::fs::remove_dir_all(&dir);
 }

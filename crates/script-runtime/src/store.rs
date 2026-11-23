@@ -1,9 +1,10 @@
 //! `$persistentStore` backends.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub const SCRIPT_STORE_MAX_KEY_BYTES: usize = 256;
 pub const SCRIPT_STORE_MAX_VALUE_BYTES: usize = 512 * 1024;
@@ -110,22 +111,125 @@ impl JsonFileScriptStore {
         &self.path
     }
 
+    /// Writes `entries` to a temporary sibling, flushes it to disk and moves
+    /// it over the store, so the file on disk is always either the old or
+    /// the new store, never a torn one.
     fn persist(&self, entries: &BTreeMap<String, String>) -> bool {
         let Ok(json) = serde_json::to_vec(entries) else {
             return false;
         };
-        let mut temporary = self.path.clone().into_os_string();
-        temporary.push(".tmp");
-        let temporary = PathBuf::from(temporary);
-        if std::fs::write(&temporary, json).is_err() {
-            return false;
-        }
-        if std::fs::rename(&temporary, &self.path).is_err() {
+        let temporary = sibling(&self.path, ".tmp");
+        let written = std::fs::File::create(&temporary).and_then(|mut file| {
+            file.write_all(&json)?;
+            file.sync_all()
+        });
+        if written.is_err() || replace_with_retry(&temporary, &self.path).is_err() {
             let _ = std::fs::remove_file(&temporary);
             return false;
         }
+        sync_parent_directory(&self.path);
         true
     }
+}
+
+/// Suffix of the copy a store that cannot be read is moved to. Only the most
+/// recent copy is kept, so a store that keeps breaking does not pile up files.
+pub const SCRIPT_STORE_QUARANTINE_SUFFIX: &str = ".corrupt";
+
+/// How [`open_script_store`] opened the persistent store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptStoreRecovery {
+    /// The file was read (or was missing, an empty store).
+    Opened,
+    /// The file was not a JSON object of strings. It was moved to `backup`
+    /// and the store starts empty at the original path.
+    Quarantined { backup: PathBuf },
+    /// The file could neither be read nor moved aside. Scripts get an
+    /// in-memory store for this run, and the file is left as it is.
+    InMemory,
+}
+
+/// Opens the persistent store at `path` for a runtime that must start
+/// whatever the file holds. A file that is not a JSON object of strings
+/// (truncated, edited by hand, empty) is moved aside to
+/// `<path>.corrupt`, replacing an older copy, and the store starts empty.
+/// When the file cannot be read or moved, scripts get an in-memory store
+/// and the file is never overwritten. The recovery never names the store's
+/// contents, which may hold tokens.
+pub fn open_script_store(path: impl Into<PathBuf>) -> (Arc<dyn ScriptStore>, ScriptStoreRecovery) {
+    let path = path.into();
+    match JsonFileScriptStore::open(&path) {
+        Ok(store) => (Arc::new(store), ScriptStoreRecovery::Opened),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            let backup = sibling(&path, SCRIPT_STORE_QUARANTINE_SUFFIX);
+            // `rename` does not replace an existing file on every platform.
+            let _ = std::fs::remove_file(&backup);
+            if replace_with_retry(&path, &backup).is_ok() {
+                if let Ok(store) = JsonFileScriptStore::open(&path) {
+                    return (Arc::new(store), ScriptStoreRecovery::Quarantined { backup });
+                }
+            }
+            (
+                Arc::new(MemoryScriptStore::new()),
+                ScriptStoreRecovery::InMemory,
+            )
+        }
+        Err(_) => (
+            Arc::new(MemoryScriptStore::new()),
+            ScriptStoreRecovery::InMemory,
+        ),
+    }
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut sibling = path.as_os_str().to_os_string();
+    sibling.push(suffix);
+    PathBuf::from(sibling)
+}
+
+/// Moves `from` over `to`. Windows refuses the move while another process
+/// (an indexer, an antivirus scanner) briefly holds the target open, so a
+/// refused move is retried a few times with a short backoff.
+fn replace_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt + 1 < ATTEMPTS && is_transient_rename_error(&error) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_rename_error(error: &io::Error) -> bool {
+    if cfg!(windows) {
+        // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
+        // ERROR_LOCK_VIOLATION (33).
+        error.kind() == io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32 | 33))
+    } else {
+        false
+    }
+}
+
+/// Makes the rename itself durable where the platform allows it.
+fn sync_parent_directory(path: &Path) {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 impl ScriptStore for JsonFileScriptStore {
@@ -139,6 +243,10 @@ impl ScriptStore for JsonFileScriptStore {
         };
         if !write_allowed(&entries, key, value) {
             return false;
+        }
+        if entries.get(key).is_some_and(|existing| existing == value) {
+            // Nothing changes, so nothing is written.
+            return true;
         }
         let previous = entries.insert(key.to_string(), value.to_string());
         if self.persist(&entries) {

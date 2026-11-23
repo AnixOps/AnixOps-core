@@ -10,7 +10,7 @@ The `$`-API is implemented once in Rust (`ScriptHost`):
 | `$request`, `$response` | URL, method, headers (object), UTF-8 body when `requires-body=true`; response status. |
 | `$argument` | The line's `argument=` value. |
 | `$done(value)` | First call wins. Request phase: `url`, `headers`, `body`, or `response: {status, headers, body}` to answer without the origin. Response phase: `status` (number or status line), `headers`, `body`. `$done()` keeps the message. String bodies only. |
-| `$persistentStore.read/write/remove` | Shared key-value store; key ≤ 256 B, value ≤ 512 KiB, total ≤ 8 MiB. A missing key uses `networkcore.script.<tag>`. |
+| `$persistentStore.read/write/remove` | Shared key-value store; key ≤ 256 B, value ≤ 512 KiB, total ≤ 8 MiB. A missing key uses `networkcore.script.<tag>`. The file store (`JsonFileScriptStore`) writes a temporary sibling, flushes it to disk and renames it over the store (retried briefly when Windows holds the file); a write that changes nothing is skipped. `open_script_store` never fails a runtime: a file that is not a JSON object of strings is moved to `<path>.corrupt` (only the latest copy is kept) and the store starts empty; a file that cannot be read or moved leaves scripts an in-memory store. |
 | `$notification.post` | Collected in the outcome (16 at most). |
 | `$httpClient.get/post/...` | Goes to a `ScriptHttpClient`; `DisabledScriptHttpClient` (the default) returns an error to the callback. |
 | `$prefs.valueForKey/setValueForKey/removeValueForKey` | Quantumult X names for `$persistentStore`; same store. `removeAllValues` returns `false`. |

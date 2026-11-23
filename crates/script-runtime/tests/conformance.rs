@@ -406,6 +406,92 @@ fn json_file_store_persists_and_refuses_oversized_values() {
 }
 
 #[test]
+fn a_corrupt_store_file_is_set_aside_and_the_store_starts_empty() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-script-store-recover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.json");
+    let backup = dir.join(format!(
+        "store.json{}",
+        script_runtime::SCRIPT_STORE_QUARANTINE_SUFFIX
+    ));
+
+    // A healthy file opens as it is.
+    std::fs::write(&path, br#"{"token":"abc"}"#).unwrap();
+    let (store, recovery) = script_runtime::open_script_store(&path);
+    assert_eq!(recovery, script_runtime::ScriptStoreRecovery::Opened);
+    assert_eq!(store.read("token").as_deref(), Some("abc"));
+    drop(store);
+
+    // Truncated JSON and a non-string value are both set aside; only the
+    // latest copy is kept.
+    for broken in [&br#"{"token":"ab"#[..], &br#"{"count":1}"#[..], &b""[..]] {
+        std::fs::write(&path, broken).unwrap();
+        let (store, recovery) = script_runtime::open_script_store(&path);
+        assert_eq!(
+            recovery,
+            script_runtime::ScriptStoreRecovery::Quarantined {
+                backup: backup.clone()
+            }
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), broken);
+        assert_eq!(store.read("token"), None);
+        assert!(store.write("token", "fresh"));
+        drop(store);
+        let reopened = script_runtime::JsonFileScriptStore::open(&path).expect("fresh store");
+        assert_eq!(reopened.read("token").as_deref(), Some("fresh"));
+    }
+    let names = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        ["store.json", "store.json.corrupt"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        "no temporary file or older copy is left behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn json_file_store_skips_writes_that_change_nothing() {
+    let dir = std::env::temp_dir().join(format!(
+        "networkcore-script-store-same-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("store.json");
+    let store = script_runtime::JsonFileScriptStore::open(&path).expect("missing file is empty");
+    assert!(store.write("token", "abc"));
+    // Replace the file behind the store's back: an unchanged write must not
+    // rewrite it.
+    std::fs::write(&path, br#"{"token":"abc","marker":"kept"}"#).unwrap();
+    assert!(store.write("token", "abc"));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        br#"{"token":"abc","marker":"kept"}"#.to_vec()
+    );
+    assert!(store.write("token", "def"));
+    let reopened = script_runtime::JsonFileScriptStore::open(&path).expect("store reopens");
+    assert_eq!(reopened.read("token").as_deref(), Some("def"));
+    assert_eq!(reopened.read("marker"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn concurrent_dispatches_share_only_the_store() {
     let store = Arc::new(MemoryScriptStore::new());
     let runtime = QuickJsScriptRuntime::new(

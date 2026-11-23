@@ -53,6 +53,7 @@ pub use quickjs_script::{
 #[cfg(feature = "quickjs")]
 pub use script_runtime::{
     ScriptHttpClient, ScriptHttpClientRequest, ScriptNotification, ScriptResponse,
+    ScriptStoreRecovery,
 };
 
 pub use h2_mitm::{
