@@ -174,9 +174,12 @@ impl DnsCache {
     /// Keeps `response` for `key` when it is a cacheable answer to `question`
     /// no longer than [`MAX_CACHED_RESPONSE`], replacing the earlier one.
     /// Past [`MAX_ENTRIES`] or [`MAX_CACHE_BYTES`] the answers that expire
-    /// first (answers past their stale window are among them) make room.
+    /// first (answers past their stale window are among them) make room. An
+    /// answer too long to keep drops the earlier one, so a refresh never
+    /// leaves an outdated answer served as stale.
     pub fn insert(&mut self, key: CacheKey, question: &Question, response: &[u8], now: Instant) {
         if response.len() > MAX_CACHED_RESPONSE {
+            self.remove(&key);
             return;
         }
         let Some(ttl) = cacheable_ttl(response, question) else {
@@ -715,6 +718,12 @@ mod tests {
         cache.insert(key("big"), &question, &fits, now);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.bytes(), fits.len() + "big".len());
+
+        // A refresh that comes back too long replaces the kept answer with
+        // nothing, rather than leaving the old one to be served as stale.
+        cache.insert(key("big"), &question, &big, now);
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
     }
 
     #[test]

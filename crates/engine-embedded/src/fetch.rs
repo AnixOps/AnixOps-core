@@ -100,12 +100,23 @@ async fn get(
         if read == 0 {
             break;
         }
+        // Only the new bytes (and the three before them, for a terminator
+        // split across reads) are searched, so a head that never ends costs
+        // linear time, not a rescan of everything per read.
+        let from = raw.len().saturating_sub(3);
         raw.extend_from_slice(&buf[..read]);
         // A redirect is decided by its head; its body is not read.
-        if !head_checked && raw.windows(4).any(|window| window == b"\r\n\r\n") {
-            head_checked = true;
-            if let Some(location) = redirect_location(&raw) {
-                return Ok(Answer::Redirect(location));
+        if !head_checked {
+            if raw[from..].windows(4).any(|window| window == b"\r\n\r\n") {
+                head_checked = true;
+                if let Some(location) = redirect_location(&raw) {
+                    return Ok(Answer::Redirect(location));
+                }
+            } else if raw.len() > MAX_HEAD_BYTES + 4 {
+                // A terminator from here on would end a head longer than
+                // MAX_HEAD_BYTES: never a redirect, and `parse_response`
+                // refuses it.
+                head_checked = true;
             }
         }
         if raw.len() > MAX_HEAD_BYTES + max_bytes {
@@ -205,6 +216,112 @@ fn resolve_location(base: &ProbeUrl, location: &str) -> Option<ProbeUrl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use engine_outbound::{BoxFuture, TargetAddr};
+
+    /// Answers every connection with `answer`, then closes; the pipe holds
+    /// at most `pipe` bytes, so no read returns more.
+    struct Serve {
+        answer: Vec<u8>,
+        pipe: usize,
+    }
+
+    impl TcpOutbound for Serve {
+        fn protocol(&self) -> &'static str {
+            "serve"
+        }
+
+        fn connect<'a>(&'a self, _: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+            Box::pin(async move {
+                // The request is not read: it must fit in the pipe.
+                let (client, mut server) = tokio::io::duplex(self.pipe.max(256));
+                let answer = self.answer.clone();
+                tokio::spawn(async move {
+                    // The client may stop reading early; that ends the write.
+                    let _ = server.write_all(&answer).await;
+                    let _ = server.shutdown().await;
+                });
+                Ok(Box::new(client) as BoxStream)
+            })
+        }
+    }
+
+    /// A status line, then bare-LF header lines up to `len` bytes: no
+    /// `\r\n\r\n` ever.
+    fn endless_head(len: usize) -> Vec<u8> {
+        let mut answer = b"HTTP/1.1 200 OK\n".to_vec();
+        while answer.len() < len {
+            answer.extend_from_slice(b"x-filler: 0123456789abcdef\n");
+        }
+        answer
+    }
+
+    #[tokio::test]
+    async fn a_head_that_never_ends_is_read_in_linear_time() {
+        // 24 MiB arrives in about 1,500 reads. Searching everything after
+        // each read (tens of billions of comparisons) would run past the
+        // timeout and fail as `timeout`; one pass takes well under a second.
+        let outbound = Serve {
+            answer: endless_head(24 * 1024 * 1024),
+            pipe: 64 * 1024,
+        };
+        let result = fetch(
+            &outbound,
+            "http://lists.example/x.list",
+            Duration::from_secs(10),
+            32 * 1024 * 1024,
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::BadResponse));
+
+        // Past the size limit it stops reading.
+        let result = fetch(
+            &outbound,
+            "http://lists.example/x.list",
+            Duration::from_secs(10),
+            1024 * 1024,
+        )
+        .await;
+        assert_eq!(result, Err(FetchError::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn a_head_terminator_split_across_reads_is_found() {
+        // A pipe of 256 bytes splits the answers into many reads, so the
+        // terminator straddles reads for some of these paddings.
+        for pad in 0..8 {
+            let filler = "y".repeat(pad);
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: /next\r\nX-Pad: {}{filler}\r\n\r\n{}",
+                "p".repeat(220),
+                "b".repeat(4096)
+            );
+            let outbound = Serve {
+                answer: redirect.into_bytes(),
+                pipe: 256,
+            };
+            let url = base("http://lists.example/x.list");
+            let got = get(&outbound, &url, 1024 * 1024).await;
+            assert!(
+                matches!(got, Ok(Answer::Redirect(ref location)) if location == "/next"),
+                "{pad}"
+            );
+
+            let ok = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Pad: {}{filler}\r\n\r\nhello",
+                "p".repeat(220)
+            );
+            let outbound = Serve {
+                answer: ok.into_bytes(),
+                pipe: 256,
+            };
+            let got = get(&outbound, &url, 1024 * 1024).await;
+            assert!(
+                matches!(got, Ok(Answer::Body(ref body)) if body == b"hello"),
+                "{pad}"
+            );
+        }
+    }
 
     fn base(url: &str) -> ProbeUrl {
         ProbeUrl::parse(url).unwrap()

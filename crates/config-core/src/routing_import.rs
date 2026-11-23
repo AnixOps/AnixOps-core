@@ -1163,12 +1163,11 @@ fn resolve_member(
         .ok_or("no imported node or group has this name")
 }
 
-/// Rewrites rule targets to model names and keeps only supported rules up to
-/// and including the first FINAL (Clash `MATCH`).
-/// The rule lines of `rules` the engine runs. With `clash`, FINAL (Clash's
-/// `MATCH`) gets `dns-continue`, so a domain whose lookup for an IP rule
-/// fails still matches the later rules, as in Clash, instead of being
-/// rejected.
+/// The rule lines of `rules` the engine runs: targets rewritten to model
+/// names, only supported rules kept, up to and including the first FINAL
+/// (Clash `MATCH`). With `clash`, that FINAL gets `dns-continue`, so a domain
+/// whose lookup for an IP rule fails still matches the later rules, as in
+/// Clash, instead of being rejected.
 fn import_rules(
     importer: &mut Importer,
     rules: Vec<String>,
