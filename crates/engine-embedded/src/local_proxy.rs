@@ -474,7 +474,7 @@ impl ClientInterceptor for Decrypting {
                 target: flow_addr(target),
             };
             self.interceptor
-                .serve(flow, &outbound, &self.settings, &*self.stats)
+                .serve(flow, &outbound, &self.settings, &self.stats)
                 .await;
         })
     }
