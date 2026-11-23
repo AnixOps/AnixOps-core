@@ -31,3 +31,9 @@
 - `apply_current_user_system_proxy` / `restore_current_user_system_proxy` 只读写 LAN 的三个平铺值，不处理 PAC、自动检测和拨号 / VPN 条目，保留给旧调用方。
 
 测试：`proxy_ownership_tests`（WinHTTP 只在仍是写入值时恢复、残留清为无代理；用户改过的连接不被覆盖；生效代理被 PAC / 自动检测 / 其他代理覆盖时判为不经过；旧快照 JSON 可读）；Windows CI 用例在真实用户设置上先写入 PAC，再应用、检查 PAC 关闭且 WinHTTP 不变、恢复后 PAC 回来、应用后用户改过的连接不被恢复覆盖（测试结束由守卫写回原值）；`managed_integration_contracts.rs` 的新快照字段往返。
+
+## TUN 模式的 DNS（`tun`、`dns_guard`）
+
+TUN 网卡同时设置 IPv4 DNS（`dns`）与 IPv6 DNS（`dns6`，网卡 IPv6 子网内的另一个地址，由隧道应答）。`block_outside_dns`（默认开启）在网卡打开期间用 Windows 筛选平台的动态会话阻止经其他网卡发往 53 端口的连接，只放行经 TUN 网卡、本进程（引擎的上游查询）与回环的查询；过滤器在网卡关闭前移除，进程意外退出时由系统随会话移除，不会留下“DNS 全部被阻止”的状态。安装失败时隧道照常工作，`WindowsTun::outside_dns_blocked` 为假、`outside_dns_block_error` 给出原因，客户端应提示用户。详见 `crates/platform-windows/README.md`「TUN mode」。
+
+测试：`tun` 的跨平台用例（IPv6 DNS 地址校验与默认值）；Windows CI 用例（`dns_guard`：守卫存在期间另一进程直接查询 1.1.1.1 失败、本进程仍可查询，移除后恢复；两个守卫互不冲突）。Wintun 网卡本身只能在真机验收，见 `docs/manual-intervention.md`。
