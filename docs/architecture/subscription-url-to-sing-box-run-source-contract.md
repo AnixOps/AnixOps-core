@@ -238,6 +238,14 @@ Surge/Loon/Quantumult X line, or the share link for that node:
 | `flow` | `flow` | – | `flow=` | `vless-flow=` |
 | VMess `scy`, `aid` | `cipher`, `alterId` | `encrypt-method=` | positional cipher, `alterId=` | `method=` |
 
+The uTLS fingerprint (`fp`) is kept but applied to REALITY only. Standard TLS
+(Trojan, VMess, VLESS `security=tls`, HTTP over TLS) and QUIC (Hysteria2,
+TUIC) send the engine's own ClientHello whatever `fp` says; the importer
+lists such a node with `notes: ["tls_fingerprint_not_applied"]` so a client
+can tell the user, and the outbound carries no fingerprint field. Over
+WebSocket the TLS ALPN offers HTTP/1.1 only (`h2` and `h3` are dropped when
+the engine builds the outbound; the stored node keeps the source's list).
+
 Trojan runs TLS unless the source turns it off; vmess and VLESS run TLS only
 when the source says so, and a node whose source does not ask for TLS stays a
 plaintext node, as `security=none` does. VMess `none`/`zero` security is not

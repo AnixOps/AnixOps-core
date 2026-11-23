@@ -261,6 +261,44 @@ pub struct ImportedNode {
     /// by default (anx FUTURE-IMPROVEMENTS F-51). Absent for other nodes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Settings of the node that import kept but the engine does not apply,
+    /// as fixed codes a client shows in its own words (see
+    /// [`NOTE_TLS_FINGERPRINT_NOT_APPLIED`]). The node runs; the user
+    /// should know it does not run as the subscription describes. Left out
+    /// when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<&'static str>,
+}
+
+/// [`ImportedNode::notes`] code: the node names a browser TLS fingerprint
+/// (`fp`, `client-fingerprint`, sing-box `utls`) for standard TLS, which
+/// the engine does not imitate. Standard TLS (and QUIC) always sends the
+/// engine's own ClientHello; only REALITY applies the fingerprint.
+pub const NOTE_TLS_FINGERPRINT_NOT_APPLIED: &str = "tls_fingerprint_not_applied";
+
+/// The [`ImportedNode::notes`] of `node`, given the outbound built for it.
+fn node_notes(node: &NodeDescriptor, outbound: &Value) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    let names_fingerprint = metadata(node, NODE_METADATA_TLS_UTLS_FINGERPRINT)
+        .is_some_and(|name| !name.trim().is_empty());
+    if names_fingerprint && uses_standard_tls(outbound) {
+        notes.push(NOTE_TLS_FINGERPRINT_NOT_APPLIED);
+    }
+    notes
+}
+
+/// Whether `outbound` connects with the engine's standard TLS (rustls), not
+/// REALITY or a protocol of its own that applies `fp` itself.
+fn uses_standard_tls(outbound: &Value) -> bool {
+    if outbound.get("reality").is_some() {
+        return false;
+    }
+    match outbound["type"].as_str() {
+        Some("trojan" | "hysteria2" | "tuic") => true,
+        Some("vless" | "vmess") => outbound["tls"].is_object(),
+        Some("http") => outbound["tls"] == Value::Bool(true),
+        _ => false,
+    }
 }
 
 /// A node that was recognized but cannot run, with a fixed reason.
@@ -699,6 +737,7 @@ pub fn report(nodes: &[NodeDescriptor]) -> ImportReport {
     for node in nodes {
         match outbound_json(node) {
             Ok(outbound) => report.nodes.push(ImportedNode {
+                notes: node_notes(node, &outbound),
                 id: node.id.clone(),
                 legacy_id: config_core::node_id::legacy_node_id(node).map(str::to_string),
                 name: node.name.clone(),

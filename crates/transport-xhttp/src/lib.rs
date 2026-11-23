@@ -51,7 +51,12 @@ pub use settings::{
     DEFAULT_MIN_POSTS_INTERVAL_MS, DEFAULT_PADDING_BYTES, MIN_EACH_POST_BYTES,
 };
 
-/// `User-Agent` unless `headers` sets one.
+/// `User-Agent` unless `headers` sets one, when the connection's handshake
+/// imitates a browser ([`Security::Custom`], such as REALITY). Over plain
+/// HTTP, standard TLS and QUIC (whose ClientHello is the engine's own, not
+/// a browser's) no `User-Agent` is sent unless `headers` sets one: a
+/// browser's name over a ClientHello no browser sends would mark the
+/// connection, not hide it.
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
      AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 const STREAM_WINDOW: u32 = 1024 * 1024;
@@ -192,9 +197,11 @@ impl XhttpConnector {
                 headers.push((name, value));
             }
         }
-        if !headers
-            .iter()
-            .any(|(name, _)| name == http::header::USER_AGENT)
+        let imitates_browser = matches!(target.security, Security::Custom(_));
+        if imitates_browser
+            && !headers
+                .iter()
+                .any(|(name, _)| name == http::header::USER_AGENT)
         {
             headers.push((
                 http::header::USER_AGENT,
@@ -203,15 +210,17 @@ impl XhttpConnector {
         }
         let default_port = if secure { 443 } else { 80 };
         let authority = if !settings.host.is_empty() {
-            settings.host.clone()
+            engine_outbound::uri_host(&settings.host).into_owned()
         } else if let Some(host) = header_host.filter(|host| !host.is_empty()) {
             host
         } else if target.port == default_port {
-            target.default_host.clone()
-        } else if target.default_host.contains(':') && !target.default_host.starts_with('[') {
-            format!("[{}]:{}", target.default_host, target.port)
+            engine_outbound::uri_host(&target.default_host).into_owned()
         } else {
-            format!("{}:{}", target.default_host, target.port)
+            format!(
+                "{}:{}",
+                engine_outbound::uri_host(&target.default_host),
+                target.port
+            )
         };
         let path = settings.normalized_path();
         let probe = format!("{scheme}://{authority}{path}");
@@ -819,7 +828,8 @@ mod tests {
             String::from_utf8(xhttp.inner.h1_request("POST", "/xh/abc/0?k=v", Some(5))).unwrap();
         assert!(request.starts_with("POST /xh/abc/0?k=v HTTP/1.1\r\nHost: edge.example:8080\r\n"));
         assert!(request.contains("\r\nx-edge: 1\r\n"));
-        assert!(request.contains("\r\nuser-agent: Mozilla/5.0"));
+        // No browser handshake, no browser name.
+        assert!(!request.to_ascii_lowercase().contains("user-agent"));
         assert!(request.contains("\r\nContent-Length: 5\r\n\r\n"));
         let referer = request
             .lines()
@@ -870,5 +880,71 @@ mod tests {
             ..XhttpSettings::default()
         };
         assert!(connector(&bad_header, 80, HttpVersion::Http11).is_err());
+    }
+
+    #[test]
+    fn ipv6_literal_servers_are_bracketed_in_the_authority() {
+        let target = |port: u16| XhttpTarget {
+            server: "2001:db8::1".into(),
+            port,
+            default_host: "2001:db8::1".into(),
+            security: Security::None,
+            version: HttpVersion::Http11,
+            dialer: Arc::new(TcpDialer),
+        };
+        let default_port = XhttpConnector::new(&XhttpSettings::default(), target(80)).unwrap();
+        assert_eq!(default_port.authority(), "[2001:db8::1]");
+        let other_port = XhttpConnector::new(&XhttpSettings::default(), target(8080)).unwrap();
+        assert_eq!(other_port.authority(), "[2001:db8::1]:8080");
+        let host = XhttpConnector::new(
+            &XhttpSettings {
+                host: "2001:db8::2".into(),
+                ..XhttpSettings::default()
+            },
+            target(80),
+        )
+        .unwrap();
+        assert_eq!(host.authority(), "[2001:db8::2]");
+    }
+
+    #[test]
+    fn only_a_browser_handshake_gets_the_browser_user_agent() {
+        struct Imitation;
+        impl Handshake for Imitation {
+            fn handshake(&self, stream: BoxStream) -> BoxFuture<'_, io::Result<BoxStream>> {
+                Box::pin(async move { Ok(stream) })
+            }
+        }
+        let target = |security: Security| XhttpTarget {
+            server: "127.0.0.1".into(),
+            port: 443,
+            default_host: "edge.example".into(),
+            security,
+            version: HttpVersion::Http11,
+            dialer: Arc::new(TcpDialer),
+        };
+        let request = |connector: &XhttpConnector| {
+            String::from_utf8(connector.inner.h1_request("POST", "/", Some(1)))
+                .unwrap()
+                .to_ascii_lowercase()
+        };
+        let imitating = XhttpConnector::new(
+            &XhttpSettings::default(),
+            target(Security::Custom(Arc::new(Imitation))),
+        )
+        .unwrap();
+        assert!(request(&imitating).contains("\r\nuser-agent: mozilla/5.0"));
+        let plain = XhttpConnector::new(&XhttpSettings::default(), target(Security::None)).unwrap();
+        assert!(!request(&plain).contains("user-agent"));
+        // A configured User-Agent is always sent.
+        let configured = XhttpConnector::new(
+            &XhttpSettings {
+                headers: [("User-Agent".to_string(), "edge-probe/1".to_string())].into(),
+                ..XhttpSettings::default()
+            },
+            target(Security::None),
+        )
+        .unwrap();
+        assert!(request(&configured).contains("\r\nuser-agent: edge-probe/1\r\n"));
     }
 }

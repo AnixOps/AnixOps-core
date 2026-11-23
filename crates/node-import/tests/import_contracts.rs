@@ -2065,3 +2065,41 @@ trojan://pw@198.51.100.26:443?security=tls&via=Outer#Outermost\n";
         ]
     );
 }
+/// `fp` only shapes REALITY's ClientHello. A standard TLS node that names
+/// one imports and runs, with a note saying the fingerprint is not applied,
+/// and its outbound claims no fingerprint.
+#[test]
+fn tls_fingerprints_outside_reality_are_noted_not_applied() {
+    for link in [
+        "vless://00000000-0000-0000-0000-000000000007@t.example.test:443?security=tls&sni=t.example.test&fp=chrome&type=ws&path=%2Fws#VT",
+        "vless://00000000-0000-0000-0000-000000000007@t.example.test:443?security=tls&sni=t.example.test&fp=chrome&type=grpc&serviceName=g#VG",
+        "trojan://secret@t.example.test:443?sni=t.example.test&fp=firefox#T",
+    ] {
+        let report = import_text(link).unwrap();
+        assert_eq!(report.nodes.len(), 1, "{link}");
+        let node = &report.nodes[0];
+        assert_eq!(
+            node.notes,
+            vec![node_import::NOTE_TLS_FINGERPRINT_NOT_APPLIED],
+            "{link}"
+        );
+        assert!(!node.outbound.to_string().contains("fingerprint"), "{link}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["nodes"][0]["notes"],
+            serde_json::json!(["tls_fingerprint_not_applied"])
+        );
+    }
+    // REALITY applies the fingerprint; no fingerprint, nothing to note.
+    for link in [
+        "vless://00000000-0000-0000-0000-000000000006@c.example.test:443?security=reality&sni=www.example.com&pbk=KEY&sid=ab12&fp=chrome&flow=xtls-rprx-vision&type=tcp#R",
+        "vless://00000000-0000-0000-0000-000000000007@t.example.test:443?security=tls&sni=t.example.test&type=ws&path=%2Fws#VT",
+        "vless://00000000-0000-0000-0000-000000000007@t.example.test:443?security=none&fp=chrome&type=ws#Plain",
+    ] {
+        let report = import_text(link).unwrap();
+        assert_eq!(report.nodes.len(), 1, "{link}");
+        assert!(report.nodes[0].notes.is_empty(), "{link}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["nodes"][0].get("notes").is_none(), "{link}");
+    }
+}

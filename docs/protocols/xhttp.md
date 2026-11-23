@@ -99,7 +99,7 @@ Xray 较新版本的可选混淆参数（填充位置、会话/序号位置、�
 ## 5. 请求头
 
 - `Host`/`:authority`：`host`，否则 `headers` 中的 `Host`，否则 TLS 服务器名或服务器地址（非默认端口时带端口）。
-- `User-Agent`：默认为桌面 Chrome 的 UA，可由 `headers` 覆盖。
+- `User-Agent`：可由 `headers` 设置。未设置时，只有握手模仿浏览器的连接（REALITY 等 `Security::Custom`）默认带桌面 Chrome 的 UA；明文 HTTP、标准 TLS 与 HTTP/3（QUIC）的 ClientHello 是内核自己的（rustls），不是浏览器的，默认不发 `User-Agent`，避免浏览器 UA 与非浏览器 TLS 指纹同时出现。节点的 `fp`（uTLS 指纹）只对 REALITY 生效，见 `crates/node-import` 的 `tls_fingerprint_not_applied` 提示。
 - `headers` 中的其他头原样发送；`Content-Length`、`Transfer-Encoding`、`Connection`、`Referer` 由传输自己生成，配置中的同名项被忽略。
 
 ## 5.1 订阅链接
