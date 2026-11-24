@@ -8,6 +8,7 @@
 | F2 并发连接 | 5000 条 TCP 同时建立并各回显 1 字节（PR 测 redirect、ss2022；手动 `scale_outbounds=all` 测全部 9 种出站，门槛相同） | `tunnel_bench scale` | `perf.yml` / Tunnel scale | 同上 |
 | F3 UDP 会话 | 10 万个 UDP 流同时打开，进程 RSS ≤ 300 MiB | `tunnel_bench udp-sessions` | `perf.yml` / Tunnel scale | 同上 |
 | F7 长稳 | 预热后 RSS 斜率 ≤ 1 MiB/h，连接失败率 ≤ 0.1%，结束无残留流与 fd | `tunnel_bench soak` | `soak.yml` | 每周六 5.5 h（托管 runner）；24 h 手动选自托管 runner；改动 soak 本身的 PR 跑 30 min 冒烟（斜率门槛放宽到 20 MiB/h） |
+| F9 桌面本地代理长稳 | Linux、macOS、Windows 各跑一次：本地代理（SOCKS5/HTTP，出站 Shadowsocks 2022）持续承受短连接、保持连接轮换与 4 MiB 突发；预热后 RSS 斜率 ≤ 1 MiB/h、描述符/句柄斜率 ≤ 10/h，连接失败率 ≤ 0.1%，负载停止 10 s 后无活动连接、描述符/句柄不超过负载前 + 8 | `crates/engine-embedded/examples/proxy_soak.rs` + `.github/scripts/proxy_soak.py` | `soak.yml` / Proxy soak | 每周六每个平台 2 h（托管 runner）；手动按 `hours`；改动 proxy soak 本身的 PR 跑 20 min 冒烟（斜率门槛放宽到 20 MiB/h、200/h） |
 | I3 HTTPS 解密成功率 | `testdata/capture-sites.txt` 的 60 个真实站点，直连可达的站点里，经隧道解密后状态码类别一致且交换进了抓包（HAR）的 ≥ 95% | `capture_bench` + `.github/scripts/capture-gates.py` | `capture-gates.yml` | 改动 engine-embedded / mitm-policy / netstack 等的 PR、main、手动；`release.yml` 发布前必跑 |
 | I4 抓包吞吐 | 同一隧道进程里抓包开 / 关相邻成对下载 256 MiB 共 10 对（raw TCP、明文 HTTP、HTTPS 解密），每对吞吐比的中位数下降 ≤ 15% | 同上 | 同上 | 同上 |
 | I4 抓包内存 | 抓包关 / 开各 3 个新进程，600 条短连接（16 并发，默认 2 MiB 预算），峰值 RSS（VmHWM）中位数增加 ≤ 10 MiB | 同上 | 同上 | 同上 |
