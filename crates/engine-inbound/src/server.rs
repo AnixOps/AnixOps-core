@@ -14,6 +14,7 @@ use engine_outbound::{BoxStream, TargetAddr, TcpOutbound};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::destinations::StreamDestination;
 use crate::limit::Throttle;
@@ -74,7 +75,9 @@ pub struct InboundStats {
 
 /// Accepts TCP connections until the listener becomes unusable or the task
 /// is dropped. Errors of one connection and running out of file descriptors
-/// do not end it (see [`engine_outbound::accept`]).
+/// do not end it (see [`engine_outbound::accept`]). The connections it
+/// accepted run as its tasks: when it ends or is dropped, they are aborted
+/// and their permits, counters and online entries released.
 pub async fn serve(
     listener: TcpListener,
     inbound: Arc<dyn StreamInbound>,
@@ -102,6 +105,10 @@ pub async fn serve_with_udp(
     let permits = Arc::new(Semaphore::new(settings.max_connections));
     let settings = Arc::new(settings);
     let mut backoff = AcceptBackoff::default();
+    // Every connection task belongs to this set: dropping the serve future
+    // (removing the inbound, stopping the node) aborts them all, so no
+    // connection outlives its inbound.
+    let mut connections = JoinSet::new();
     loop {
         let (mut stream, peer) = accept::accept(
             || listener.accept(),
@@ -109,6 +116,9 @@ pub async fn serve_with_udp(
             Some(&stats.accept_errors),
         )
         .await?;
+        // Reap finished tasks; a panic in one ends only that connection,
+        // whose guards have already released its permit and counter.
+        while connections.try_join_next().is_some() {}
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             drop(stream);
@@ -120,10 +130,10 @@ pub async fn serve_with_udp(
         let udp = udp.clone();
         let settings = settings.clone();
         let stats = stats.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
+            let _active = ActiveConnection::new(&stats);
             let _ = stream.set_nodelay(true);
-            stats.active.fetch_add(1, Ordering::Relaxed);
             match endpoints(&mut stream, peer, &settings).await {
                 Ok((peer, local)) => {
                     run(
@@ -142,8 +152,27 @@ pub async fn serve_with_udp(
                     stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            stats.active.fetch_sub(1, Ordering::Relaxed);
         });
+    }
+}
+
+/// Counts one connection in [`InboundStats::active`] while it lives: the
+/// count drops when the guard does, so also when the connection's task is
+/// aborted or panics.
+pub struct ActiveConnection<'a> {
+    stats: &'a InboundStats,
+}
+
+impl<'a> ActiveConnection<'a> {
+    pub fn new(stats: &'a InboundStats) -> Self {
+        stats.active.fetch_add(1, Ordering::Relaxed);
+        Self { stats }
+    }
+}
+
+impl Drop for ActiveConnection<'_> {
+    fn drop(&mut self) {
+        self.stats.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -176,9 +205,8 @@ pub async fn handle_connection(
     settings: &ServeSettings,
     stats: &Arc<InboundStats>,
 ) {
-    stats.active.fetch_add(1, Ordering::Relaxed);
+    let _active = ActiveConnection::new(stats);
     run(stream, peer, None, inbound, outbound, None, settings, stats).await;
-    stats.active.fetch_sub(1, Ordering::Relaxed);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -242,9 +270,8 @@ pub async fn relay_accepted(
     settings: &ServeSettings,
     stats: &Arc<InboundStats>,
 ) {
-    stats.active.fetch_add(1, Ordering::Relaxed);
+    let _active = ActiveConnection::new(stats);
     relay(accepted, peer, outbound, None, settings, stats).await;
-    stats.active.fetch_sub(1, Ordering::Relaxed);
 }
 
 async fn relay(

@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use engine_inbound::registry::BuildError;
-use engine_inbound::server::{ConnectionContext, InboundStats, ServeSettings};
+use engine_inbound::server::{ActiveConnection, ConnectionContext, InboundStats, ServeSettings};
 use engine_inbound::udp::{DatagramInbound, UdpOutbound};
 use engine_inbound::{Accepted, PacketInbound, Rejected, StreamInbound, UserStore};
 use engine_outbound::{BoxFuture, BoxStream, TcpOutbound};
@@ -436,7 +436,7 @@ impl XhttpQuicInbound {
                 })
             }
         };
-        stats.active.fetch_add(1, Ordering::Relaxed);
+        let _active = ActiveConnection::new(&stats);
         let served = self
             .xhttp
             .server
@@ -444,7 +444,6 @@ impl XhttpQuicInbound {
         if served.await.is_err() {
             stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
         }
-        stats.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
