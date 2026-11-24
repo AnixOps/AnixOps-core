@@ -185,9 +185,7 @@ pub async fn serve_with_limits(
         // the management API (see [`engine_outbound::accept`]).
         let (stream, _) = accept::accept(|| listener.accept(), &mut backoff, None).await?;
         let Ok(slot) = connections.clone().try_acquire_owned() else {
-            // The answer fits in a fresh socket's send buffer, so this never
-            // waits on the client; the stream closes when dropped.
-            let _ = stream.try_write(BUSY_RESPONSE);
+            answer_busy(stream);
             continue;
         };
         let node = node.clone();
@@ -201,6 +199,17 @@ pub async fn serve_with_limits(
                 tokio::time::timeout(REQUEST_TIMEOUT, connection(stream, &node, &token, &budget))
                     .await;
         });
+    }
+}
+
+/// Answers 503 on a connection past the limit and closes it, without a
+/// task and without waiting: the answer is written straight to the
+/// non-blocking socket, whose fresh send buffer holds it.
+fn answer_busy(stream: TcpStream) {
+    use std::io::Write;
+    if let Ok(mut stream) = stream.into_std() {
+        let _ = stream.write_all(BUSY_RESPONSE);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
     }
 }
 
