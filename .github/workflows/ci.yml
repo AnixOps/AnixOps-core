@@ -770,7 +770,7 @@ jobs:
   rust-h2-mitm-fuzz:
     name: HTTP/2 MITM fuzz
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     needs:
       - changes
       - policy-fast
@@ -841,6 +841,37 @@ jobs:
             -rss_limit_mb=2048 \
             -timeout=20
 
+      # Server side of VLESS, Trojan, VMess and Shadowsocks: the first bytes
+      # a client sends, with and without a valid credential in front.
+      - name: Run inbound handshake fuzz target
+        shell: bash
+        working-directory: crates/engine-inbound
+        run: |
+          set -euo pipefail
+          cargo fuzz run --target x86_64-unknown-linux-gnu inbound_handshakes -- \
+            -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
+            -max_len=4096 \
+            -rss_limit_mb=2048 \
+            -timeout=20
+
+      # Text from outside the app: subscriptions and share links, config
+      # documents, rule lines and rule sets, Loon plugins.
+      - name: Run import fuzz targets
+        shell: bash
+        working-directory: crates/node-import
+        run: |
+          set -euo pipefail
+          for target in subscription_import config_document rule_text loon_plugin; do
+            echo "::group::cargo fuzz run ${target}"
+            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
+              -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
+              -dict=fuzz/dict/import_text.dict \
+              -max_len=16384 \
+              -rss_limit_mb=2048 \
+              -timeout=20
+            echo "::endgroup::"
+          done
+
       - name: Upload fuzz crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -849,6 +880,8 @@ jobs:
           path: |
             crates/engine-native/fuzz/artifacts
             crates/engine-embedded/fuzz/artifacts
+            crates/engine-inbound/fuzz/artifacts
+            crates/node-import/fuzz/artifacts
           if-no-files-found: ignore
 
   ios-runtime-static-libs:
