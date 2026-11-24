@@ -13,6 +13,8 @@
 | I4 抓包内存 | 抓包关 / 开各 3 个新进程，600 条短连接（16 并发，默认 2 MiB 预算），峰值 RSS（VmHWM）中位数增加 ≤ 10 MiB | 同上 | 同上 | 同上 |
 | F8 短连接风暴 | 抓包关，600 条短连接（raw / HTTP / HTTPS 解密各 200，16 并发）峰值 RSS（3 个进程中位数）≤ 32 MiB；每阶段结束 2 s 后没有仍打开的转发 | 同上 | `capture-gates.yml` | 同 I3/I4 |
 | C4 IPC 模糊测试 | `networkcore_ios_runtime_control` 不 panic、回答必为 JSON 对象、错误码在文档集合内 | `crates/engine-embedded/fuzz` 的 `runtime_control` | `ci.yml` / HTTP/2 MITM fuzz | 每个 Rust PR（30 s）、main（60 s） |
+| C5 入站握手模糊测试 | VLESS、Trojan、VMess、Shadowsocks AEAD / 2022 服务端读取客户端首包不 panic、不越界、不超 2 GiB RSS；VLESS、Trojan 一半输入带有效凭据，覆盖认证后的命令、地址与附加字段解析 | `crates/engine-inbound/fuzz` 的 `inbound_handshakes` | `ci.yml` / HTTP/2 MITM fuzz | 每个 Rust PR（30 s）、main（60 s） |
+| C6 导入文本模糊测试 | 订阅与分享链接（含随附分流）、TOML 配置文档、规则行与规则集、Loon 插件的解析不 panic、不超 2 GiB RSS | `crates/node-import/fuzz` 的 `subscription_import`、`config_document`、`rule_text`、`loon_plugin`（字典 `fuzz/dict/import_text.dict`） | 同上 | 同上 |
 
 R2 的门槛是绝对值，而托管 runner 的 CPU 快慢相差约 1.5 倍：PR 上 head 超出门槛时，会在同一台 runner 上再测 base；head 不比 base 慢 15% 以上就只告警（runner 偏慢，不是回归），否则失败。
 

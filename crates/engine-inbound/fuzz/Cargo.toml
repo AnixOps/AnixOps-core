@@ -1,0 +1,36 @@
+[package]
+name = "engine-inbound-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "cargo-fuzz targets for inbound protocol handshakes (bytes a client sends before authentication)."
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: the fuzz crate needs nightly sanitizers and is built
+# only by the CI fuzz job, never by the locked stable workspace matrix.
+[workspace]
+members = ["."]
+
+[dependencies]
+engine-inbound = { path = ".." }
+engine-outbound = { path = "../../engine-outbound" }
+inbound-shadowsocks = { path = "../../inbound-shadowsocks" }
+inbound-trojan = { path = "../../inbound-trojan" }
+inbound-vless = { path = "../../inbound-vless" }
+inbound-vmess = { path = "../../inbound-vmess" }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+# `test-util` pauses time: handshake timers then fire as soon as the
+# handshake has nothing else to do, so a stalled handshake ends the input
+# instead of running into the libFuzzer timeout.
+tokio = { version = "1", default-features = false, features = ["io-util", "rt", "time", "test-util"] }
+
+[[bin]]
+name = "inbound_handshakes"
+path = "fuzz_targets/inbound_handshakes.rs"
+test = false
+doc = false
+bench = false

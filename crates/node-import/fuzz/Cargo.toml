@@ -1,0 +1,49 @@
+[package]
+name = "node-import-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "cargo-fuzz targets for imported text: subscriptions, config documents, rule lines and rule sets, Loon plugins."
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: the fuzz crate needs nightly sanitizers and is built
+# only by the CI fuzz job, never by the locked stable workspace matrix.
+[workspace]
+members = ["."]
+
+[dependencies]
+config-core = { path = "../../config-core" }
+libfuzzer-sys = "0.4"
+mitm-policy = { path = "../../mitm-policy" }
+node-import = { path = ".." }
+
+[[bin]]
+name = "subscription_import"
+path = "fuzz_targets/subscription_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_document"
+path = "fuzz_targets/config_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_text"
+path = "fuzz_targets/rule_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "loon_plugin"
+path = "fuzz_targets/loon_plugin.rs"
+test = false
+doc = false
+bench = false
