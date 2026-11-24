@@ -58,8 +58,8 @@ use std::fmt::Write as _;
 mod core_translation;
 mod parser;
 
-pub use core_translation::*;
-pub use parser::*;
+pub(crate) use core_translation::*;
+pub(crate) use parser::*;
 
 pub const LOON_PLUGIN_MAX_BYTES: usize = 8 * 1024 * 1024;
 

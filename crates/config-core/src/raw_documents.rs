@@ -209,7 +209,7 @@ pub(crate) struct RawSingBoxUtls {
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawSingBoxReality {
     pub(crate) enabled: Option<bool>,
-    public_key: Option<RawSingBoxScalar>,
+    pub(crate) public_key: Option<RawSingBoxScalar>,
     pub(crate) short_id: Option<RawSingBoxScalar>,
 }
 

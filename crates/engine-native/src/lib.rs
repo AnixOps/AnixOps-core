@@ -73,14 +73,14 @@ mod tls_mitm;
 mod validation;
 mod wire;
 
-pub use accept_loop::*;
+pub(crate) use accept_loop::*;
 pub use http_proxy::*;
 pub use listeners::*;
 pub use scripts::*;
 pub use service::*;
 pub use socks5::*;
 pub use tls_mitm::*;
-pub use validation::*;
+pub(crate) use validation::*;
 pub use wire::*;
 
 pub const DEFAULT_NATIVE_ENGINE_ID: &str = "native";

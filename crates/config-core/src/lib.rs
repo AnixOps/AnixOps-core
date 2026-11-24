@@ -66,15 +66,15 @@ mod share_links;
 mod sing_box_json;
 mod surge_lines;
 
-pub use clash_yaml::*;
+pub(crate) use clash_yaml::*;
 pub use config_document::*;
-pub use loon_lines::*;
-pub use proxy_line_options::*;
-pub use quantumult_x_lines::*;
-pub use raw_documents::*;
-pub use share_links::*;
-pub use sing_box_json::*;
-pub use surge_lines::*;
+pub(crate) use loon_lines::*;
+pub(crate) use proxy_line_options::*;
+pub(crate) use quantumult_x_lines::*;
+pub(crate) use raw_documents::*;
+pub(crate) use share_links::*;
+pub(crate) use sing_box_json::*;
+pub(crate) use surge_lines::*;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 

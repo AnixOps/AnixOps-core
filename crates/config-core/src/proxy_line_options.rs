@@ -16,7 +16,7 @@ pub(crate) struct PlainProxyFields {
     pub(crate) server_name: Option<String>,
     pub(crate) insecure: bool,
     pub(crate) certificate_sha256: Option<String>,
-    public_key_sha256: Option<String>,
+    pub(crate) public_key_sha256: Option<String>,
     /// An option the node needs that no node field carries (one of the
     /// `NODE_UNSUPPORTED_OPTION_*` codes).
     pub(crate) unsupported: Option<&'static str>,

@@ -26,7 +26,7 @@ pub use lifecycle_commands::*;
 pub use managed_session::*;
 pub use mitm_commands::*;
 pub use output::*;
-pub use output_json::*;
+pub(crate) use output_json::*;
 pub use persistence::*;
 pub use platform_io::*;
 pub use service_commands::*;
