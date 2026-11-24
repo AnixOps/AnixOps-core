@@ -1,4 +1,4 @@
-//! Fuzzes Loon plugin import (`mitm_policy::import_loon_plugin`): sections,
+//! Fuzzes Loon plugin import (`mitm_policy::loon_plugin::import_loon_plugin`): sections,
 //! rules, rewrites, header and body edits, Map Local, scripts and MITM host
 //! lists, with the HTTP rewrite lines the MITM core grades.
 //!
@@ -11,5 +11,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
-    let _ = mitm_policy::import_loon_plugin(&text);
+    let _ = mitm_policy::loon_plugin::import_loon_plugin(&text);
 });
