@@ -1,7 +1,7 @@
 use platform_windows::managed::{
     read_managed_config, validate_managed_file_references, windows_managed_data_directory,
-    WindowsConnectionProxySnapshot, WindowsDriverPackageConfig, WindowsManagedConfig,
-    WindowsManagedEmbeddedConfig, WindowsManagedNativeMitmConfig,
+    write_managed_config, WindowsConnectionProxySnapshot, WindowsDriverPackageConfig,
+    WindowsManagedConfig, WindowsManagedEmbeddedConfig, WindowsManagedNativeMitmConfig,
     WindowsManagedNativeMitmScriptRuntimeConfig, WindowsManagedState, WindowsProxySettings,
     WindowsProxySnapshot, WindowsSystemProxyOwner, WINDOWS_MANAGED_CONFIG_INVALID_CODE,
     WINDOWS_MANAGED_CONFIG_SCHEMA_VERSION, WINDOWS_MANAGED_EMBEDDED_CONFIG_INVALID_CODE,
@@ -231,6 +231,87 @@ fn managed_configuration_accepts_native_https_mitm_with_explicit_socks_upstream(
     let legacy: WindowsManagedConfig = serde_json::from_value(json)
         .expect("a config saved with the removed Bilibili switch remains readable");
     assert!(legacy.native_mitm.is_some());
+}
+
+/// What the Windows desktop client writes when HTTPS decryption is turned on:
+/// the window owns the system proxy and the embedded engine decrypts in
+/// process. The service-era rule refused it, so decryption could not be
+/// turned on ("enabled native HTTPS MITM requires service-owned system proxy
+/// lifecycle").
+fn desktop_decrypting_config() -> WindowsManagedConfig {
+    let data = windows_managed_data_directory();
+    WindowsManagedConfig {
+        schema_version: WINDOWS_MANAGED_CONFIG_SCHEMA_VERSION,
+        system_proxy: Some(WindowsProxySettings {
+            enabled: true,
+            server: "127.0.0.1:7890".to_string(),
+            bypass: "<local>".to_string(),
+        }),
+        system_proxy_owner: WindowsSystemProxyOwner::Desktop,
+        root_certificate_path: None,
+        driver_package: None,
+        native_mitm: Some(WindowsManagedNativeMitmConfig {
+            enabled: true,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 7890,
+            upstream_socks_host: "127.0.0.1".to_string(),
+            upstream_socks_port: 7891,
+            ca_certificate_path: data.join("mitm").join("root-ca.pem"),
+            ca_private_key_path: data.join("mitm").join("root-ca-key.pem"),
+            log_path: data.join("logs").join("native-mitm.log"),
+            script_runtime: None,
+        }),
+        embedded: Some(WindowsManagedEmbeddedConfig {
+            enabled: true,
+            envelope_path: data.join("embedded").join("envelope.json"),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 7891,
+        }),
+    }
+}
+
+#[test]
+fn desktop_owned_https_mitm_with_an_embedded_engine_is_valid_and_round_trips() {
+    let config = desktop_decrypting_config();
+    config
+        .validate()
+        .expect("the window runs the engine that decrypts and restores the proxy");
+    validate_managed_file_references(&config).expect("every file is in the managed directory");
+
+    let path = std::env::temp_dir().join(format!(
+        "networkcore-managed-config-desktop-mitm-{}.json",
+        std::process::id()
+    ));
+    write_managed_config(&path, &config).expect("turning decryption on saves");
+    assert_eq!(read_managed_config(&path).expect("and reads back"), config);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn desktop_owned_https_mitm_without_an_embedded_engine_is_refused() {
+    let refused = |config: &WindowsManagedConfig| {
+        let error = config
+            .validate()
+            .expect_err("nothing decrypts or restores the proxy");
+        assert_eq!(error.code, WINDOWS_MANAGED_CONFIG_INVALID_CODE);
+        assert!(error.message.contains("native HTTPS MITM"));
+    };
+    let mut no_engine = desktop_decrypting_config();
+    no_engine.embedded = None;
+    refused(&no_engine);
+    let mut engine_off = desktop_decrypting_config();
+    engine_off.embedded.as_mut().unwrap().enabled = false;
+    refused(&engine_off);
+
+    // Decryption off, or the service as owner, is unaffected by the engine.
+    let mut decryption_off = no_engine.clone();
+    decryption_off.native_mitm.as_mut().unwrap().enabled = false;
+    decryption_off.validate().expect("no decryption, no rule");
+    let mut service_owned = no_engine;
+    service_owned.system_proxy_owner = WindowsSystemProxyOwner::Service;
+    service_owned
+        .validate()
+        .expect("the service restores the proxy");
 }
 
 #[test]

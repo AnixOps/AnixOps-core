@@ -273,13 +273,33 @@ impl WindowsManagedConfig {
         }
         if let Some(native_mitm) = &self.native_mitm {
             native_mitm.validate()?;
-            if native_mitm.enabled && !self.system_proxy_owner.is_service_managed() {
+            if native_mitm.enabled && !self.native_mitm_has_proxy_lifecycle() {
                 return Err(config_error(
-                    "enabled native HTTPS MITM requires service-owned system proxy lifecycle",
+                    "enabled native HTTPS MITM requires service-owned system proxy lifecycle or a desktop-owned embedded engine",
                 ));
             }
         }
         Ok(())
+    }
+
+    /// Whether someone runs enabled HTTPS decryption and puts the system
+    /// proxy back afterwards.
+    ///
+    /// - `Service`: the service runs the decryption listener and restores the
+    ///   proxy snapshot it took.
+    /// - `Desktop`: the window runs the embedded engine, which decrypts in
+    ///   process on the system proxy port, and restores the per-user proxy
+    ///   snapshot it took. That needs an enabled embedded block; a
+    ///   desktop-owned file without one has nothing that decrypts or restores
+    ///   the proxy for it, so it is still refused.
+    fn native_mitm_has_proxy_lifecycle(&self) -> bool {
+        match self.system_proxy_owner {
+            WindowsSystemProxyOwner::Service => true,
+            WindowsSystemProxyOwner::Desktop => self
+                .embedded
+                .as_ref()
+                .is_some_and(|embedded| embedded.enabled),
+        }
     }
 }
 
