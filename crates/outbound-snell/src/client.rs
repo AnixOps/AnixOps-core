@@ -379,6 +379,11 @@ pub struct SnellStream {
     request: Option<Vec<u8>>,
     out: Vec<u8>,
     out_pos: usize,
+    /// The request has not fully left yet. Until it has, a read
+    /// waits for it (the server answers only after it); afterwards reads
+    /// never wait on queued writes, so a full send buffer cannot stall the
+    /// download while the server waits for us to read.
+    request_unsent: bool,
     reply: ReplyState,
     plain: Vec<u8>,
     plain_pos: usize,
@@ -399,6 +404,7 @@ impl SnellStream {
             request: Some(request),
             out: Vec::new(),
             out_pos: 0,
+            request_unsent: true,
             reply: ReplyState::Waiting,
             plain: Vec::new(),
             plain_pos: 0,
@@ -438,6 +444,8 @@ impl SnellStream {
         }
         self.out.clear();
         self.out_pos = 0;
+        // Empty `out` with the request still pending means nothing was sent.
+        self.request_unsent = self.request.is_some();
         Poll::Ready(Ok(()))
     }
 
@@ -584,7 +592,9 @@ impl AsyncRead for SnellStream {
             // Reading before the first write: send the request alone.
             this.queue_request()?;
         }
-        std::task::ready!(this.poll_drain(cx))?;
+        if this.request_unsent {
+            std::task::ready!(this.poll_drain(cx))?;
+        }
         loop {
             if this.plain_pos < this.plain.len() {
                 let available = &this.plain[this.plain_pos..];

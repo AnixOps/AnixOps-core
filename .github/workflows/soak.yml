@@ -11,6 +11,13 @@ name: Tunnel soak
 # - Weekly: 5.5 h on a GitHub-hosted runner (a hosted job stops at 6 h).
 # - Manual: any length; 24 h needs runner=self-hosted, a Linux runner with
 #   passwordless sudo that this repository may use (docs/manual-intervention.md).
+#
+# The desktop local proxy soak (F9) runs beside it on Linux, macOS and
+# Windows: proxy_soak keeps a LocalProxy with a Shadowsocks 2022 outbound
+# busy and .github/scripts/proxy_soak.py fails when its memory or handle
+# count trends upward after warm-up, connections fail, or connections or
+# handles are left over. Weekly 2 h per platform; pull requests that change
+# it run 20 min with the loose smoke slope.
 
 on:
   pull_request:
@@ -18,6 +25,8 @@ on:
       - ".github/workflows/soak.yml"
       - ".github/scripts/soak.sh"
       - "crates/engine-embedded/examples/tunnel_bench.rs"
+      - ".github/scripts/proxy_soak.py"
+      - "crates/engine-embedded/examples/proxy_soak.rs"
   schedule:
     - cron: "17 18 * * 6"
   workflow_dispatch:
@@ -139,6 +148,110 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tunnel-soak
+          path: results
+          retention-days: 30
+          if-no-files-found: ignore
+
+  proxy:
+    name: Proxy soak (${{ matrix.os }})
+    if: github.event_name != 'workflow_dispatch' || inputs.runner == 'github-hosted'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 355
+    env:
+      # Hours: 2 weekly, 20 min for a pull request, as asked when manual.
+      PROXY_SOAK_HOURS: ${{ github.event_name == 'schedule' && '2' || github.event_name == 'pull_request' && '0.34' || inputs.hours }}
+      # A 20 min smoke run is too short for a handle trend, as for memory.
+      MAX_HANDLE_SLOPE_PER_H: ${{ github.event_name == 'pull_request' && '200' || '10' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # mitm-anixops-sys builds only for the GNU target on Windows, as in ci.yml.
+      - name: Setup Windows C toolchain
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-libsystre
+
+      - name: Configure Windows Rust GNU target
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $MsysRoot = "${{ steps.msys2.outputs.msys2-location }}"
+          $MingwPrefix = Join-Path $MsysRoot "mingw64"
+          "$MingwPrefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "MSYS2_LOCATION=$MsysRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MINGW_PREFIX=$MingwPrefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_BUILD_TARGET=x86_64-pc-windows-gnu" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CC_x86_64_pc_windows_gnu=$MingwPrefix\bin\gcc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "AR_x86_64_pc_windows_gnu=$MingwPrefix\bin\ar.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$MingwPrefix\bin\gcc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Setup Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            rustup target add x86_64-pc-windows-gnu
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check duration and install psutil
+        shell: bash
+        run: |
+          python -c "import sys; h = float(sys.argv[1]); sys.exit(0 if 0 < h <= 5.5 else 1)" "${PROXY_SOAK_HOURS}" \
+            || { echo "::error::GitHub-hosted jobs stop at 6 h; at most 5.5 h of soak"; exit 1; }
+          python -m pip install --disable-pip-version-check psutil==7.0.0
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os == 'Windows' && 'windows-gnu' || '' }}
+          save-if: false
+
+      - name: Build
+        shell: bash
+        run: cargo build --locked --release -p engine-embedded --example proxy_soak
+
+      - name: Soak
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULTS}"
+          binary=target/release/examples/proxy_soak
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            binary=target/x86_64-pc-windows-gnu/release/examples/proxy_soak.exe
+          fi
+          python .github/scripts/proxy_soak.py \
+            --binary "${binary}" \
+            --hours "${PROXY_SOAK_HOURS}" \
+            --max-slope-mb-per-h "${MAX_SLOPE_MB_PER_H}" \
+            --max-handle-slope-per-h "${MAX_HANDLE_SLOPE_PER_H}" \
+            --json "${RESULTS}/proxy-soak.json"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-soak-${{ matrix.os }}
           path: results
           retention-days: 30
           if-no-files-found: ignore

@@ -153,6 +153,11 @@ required-features = ["http", "shadowsocks", "socks", "trojan", "vless", "vmess",
 name = "capture_bench"
 required-features = ["mitm"]
 
+# Desktop local proxy soak on Linux, macOS and Windows (.github/workflows/soak.yml).
+[[example]]
+name = "proxy_soak"
+required-features = ["local-proxy", "shadowsocks"]
+
 [lib]
 path = "src/lib.rs"
 crate-type = ["lib", "staticlib"]
