@@ -40,6 +40,8 @@ impl StreamInbound for LineInbound {
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
             reader.read_line(&mut line).await?;
+            // Stands for a bug in a protocol handler.
+            assert_ne!(line.trim_end(), "panic", "the handler panicked");
             let Some(user) = self.users.get(line.trim_end()) else {
                 return Err(Rejected::hold("unknown user", Box::new(reader)));
             };
@@ -84,6 +86,15 @@ async fn start_echo_server() -> SocketAddr {
 }
 
 async fn start_server() -> (SocketAddr, Arc<UserStore>, Arc<InboundStats>) {
+    let (addr, users, stats, _serve) = start_server_with(ServeSettings::default()).await;
+    (addr, users, stats)
+}
+
+type ServeTask = tokio::task::JoinHandle<io::Result<()>>;
+
+async fn start_server_with(
+    settings: ServeSettings,
+) -> (SocketAddr, Arc<UserStore>, Arc<InboundStats>, ServeTask) {
     let echo = start_echo_server().await;
     let users = Arc::new(UserStore::default());
     users.add(User::with_password("alice", "unused")).unwrap();
@@ -96,16 +107,26 @@ async fn start_server() -> (SocketAddr, Arc<UserStore>, Arc<InboundStats>) {
     let stats = Arc::new(InboundStats::default());
     let settings = ServeSettings {
         reject_hold: Duration::from_millis(300),
-        ..ServeSettings::default()
+        ..settings
     };
-    tokio::spawn(serve(
+    let task = tokio::spawn(serve(
         listener,
         inbound,
         Arc::new(Direct),
         settings,
         stats.clone(),
     ));
-    (addr, users, stats)
+    (addr, users, stats, task)
+}
+
+async fn active_drops_to_zero(stats: &InboundStats) {
+    tokio::time::timeout(TIMEOUT, async {
+        while stats.active.load(Ordering::Relaxed) != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the active count should drop to zero");
 }
 
 async fn round_trip(stream: &mut TcpStream, payload: &[u8]) {
@@ -245,4 +266,46 @@ async fn background_work_gets_the_udp_egress() {
         assert_eq!(got, Some(expected));
         server.abort();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_the_serve_loop_closes_its_connections() {
+    let (addr, users, stats, serve) = start_server_with(ServeSettings::default()).await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(b"alice\n").await.unwrap();
+    round_trip(&mut client, b"ping").await;
+    assert_eq!(stats.active.load(Ordering::Relaxed), 1);
+
+    // Removing an inbound drops its serve loop: no connection outlives it.
+    serve.abort();
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(TIMEOUT, client.read(&mut buf))
+        .await
+        .expect("the connection should close with its serve loop");
+    assert!(matches!(read, Ok(0) | Err(_)));
+    active_drops_to_zero(&stats).await;
+    assert!(users.online().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_connection_releases_its_slot_and_count() {
+    let (addr, _users, stats, _serve) = start_server_with(ServeSettings {
+        max_connections: 1,
+        ..ServeSettings::default()
+    })
+    .await;
+    let mut crashing = TcpStream::connect(addr).await.unwrap();
+    crashing.write_all(b"panic\n").await.unwrap();
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(TIMEOUT, crashing.read(&mut buf))
+        .await
+        .expect("the panicked connection should close");
+    assert!(matches!(read, Ok(0) | Err(_)));
+    active_drops_to_zero(&stats).await;
+
+    // The only slot is free again and the loop still serves.
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(b"alice\n").await.unwrap();
+    round_trip(&mut client, b"after the panic").await;
+    assert_eq!(stats.active.load(Ordering::Relaxed), 1);
 }

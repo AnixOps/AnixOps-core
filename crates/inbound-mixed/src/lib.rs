@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_outbound::accept::{self, AcceptBackoff};
+use engine_outbound::gauge::Gauge;
 use engine_outbound::reject::{self, RejectAction};
 use engine_outbound::{udp_unsupported, BoxFuture, BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -401,8 +402,8 @@ pub async fn serve_intercepted(
         let stats = stats.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _active = Gauge::hold(&stats.active);
             let _ = stream.set_nodelay(true);
-            stats.active.fetch_add(1, Ordering::Relaxed);
             handle(
                 stream,
                 client,
@@ -412,7 +413,6 @@ pub async fn serve_intercepted(
                 &stats,
             )
             .await;
-            stats.active.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }

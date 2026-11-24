@@ -32,6 +32,7 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
+use engine_outbound::gauge::Gauge;
 use engine_outbound::reject::{rejection, RejectAction};
 use engine_outbound::{BoxFuture, BoxStream, TargetAddr, TcpOutbound, UdpFlow};
 use futures::{FutureExt, SinkExt, StreamExt};
@@ -749,7 +750,7 @@ fn spawn_tasks(
                 bump(&stats.tcp_total);
                 let activity = Arc::new(LastActive::new());
                 let live = shared.live.register(activity.clone());
-                stats.tcp_active.fetch_add(1, Ordering::Relaxed);
+                let _active = Gauge::hold(&stats.tcp_active);
                 tokio::select! {
                     () = handle_tcp(
                         stream,
@@ -764,7 +765,6 @@ fn spawn_tasks(
                     // Closed to make room: dropping the flow closes both sides.
                     () = live.evicted() => {}
                 }
-                stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
             });
         }
     });
