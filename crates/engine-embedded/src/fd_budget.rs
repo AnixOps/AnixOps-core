@@ -14,7 +14,10 @@
 //! the hard one once (on Apple platforms at most `kern.maxfilesperproc`,
 //! since `setrlimit` refuses more there) and then caps the connection and
 //! flow limits to what the resulting budget holds, keeping a reserve for
-//! everything else the process opens. Windows has no such per-process limit
+//! everything else the process opens. The caps are sized for the tunnel and
+//! the system proxy running in the same process with every connection
+//! open, so `tunnel TCP + UDP + 2 x proxy TCP + reserve` never passes the
+//! budget (see [`clamp_to_budget`]). Windows has no such per-process limit
 //! and keeps the configured values.
 
 use crate::config::Limits;
@@ -25,32 +28,91 @@ use crate::config::Limits;
 const RESERVED_MIN: usize = 64;
 const RESERVED_MAX: usize = 512;
 
-/// The tunnel's and system proxy's TCP connection cap and the tunnel's UDP
-/// flow cap for `limits`, lowered to the process's descriptor budget where
-/// there is one (see [`clamp_to_budget`]). This applies to values set in the
-/// config too: a cap above the budget cannot be reached anyway, and below it
-/// idle connections make room instead of new ones failing.
-pub(crate) fn connection_limits(limits: &Limits) -> (usize, usize) {
+/// Connection caps that fit the process's descriptor budget together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionCaps {
+    /// TCP connections relayed by the tunnel: one descriptor each (the
+    /// outbound socket; the app's side lives in the user-space stack).
+    pub tunnel_tcp: usize,
+    /// UDP flows relayed by the tunnel: one descriptor each.
+    pub udp: usize,
+    /// Connections of the system proxy: two descriptors each (the app's
+    /// and the outbound one). It can run in the same process as the tunnel
+    /// (the Apple providers register it with the tunnel's settings).
+    pub proxy_tcp: usize,
+}
+
+impl ConnectionCaps {
+    /// Descriptors these caps hold at most, all of them full at once.
+    #[cfg(test)]
+    fn descriptors(&self) -> usize {
+        self.tunnel_tcp + self.udp + 2 * self.proxy_tcp
+    }
+}
+
+/// The tunnel's TCP and UDP caps and the system proxy's connection cap for
+/// `limits`, lowered to the process's descriptor budget where there is one
+/// (see [`clamp_to_budget`]). This applies to values set in the config too:
+/// a cap above the budget cannot be reached anyway, and below it idle
+/// connections make room instead of new ones failing.
+pub(crate) fn connection_limits(limits: &Limits) -> ConnectionCaps {
     match descriptor_budget() {
         Some(descriptors) => clamp_to_budget(
             limits.max_tcp_connections,
             limits.max_udp_flows,
             descriptors,
         ),
-        None => (limits.max_tcp_connections, limits.max_udp_flows),
+        None => ConnectionCaps {
+            tunnel_tcp: limits.max_tcp_connections,
+            udp: limits.max_udp_flows,
+            proxy_tcp: limits.max_tcp_connections,
+        },
     }
 }
 
-/// `(tcp, udp)` lowered so that, with `descriptors` open files allowed,
-/// a reserve stays free: TCP gets at most half of the rest (a system-proxy
-/// connection uses two descriptors), UDP at most what TCP leaves. Both stay
-/// at least 1.
-pub(crate) fn clamp_to_budget(tcp: usize, udp: usize, descriptors: usize) -> (usize, usize) {
-    let reserve = (descriptors / 4).clamp(RESERVED_MIN, RESERVED_MAX);
+/// Caps for a TCP cap `tcp` (the tunnel's and the system proxy's) and a UDP
+/// cap `udp`, lowered so that with `descriptors` open files allowed, the
+/// tunnel, the system proxy and the reserve all fit at once:
+/// `tunnel_tcp + udp + 2 * proxy_tcp + reserve <= descriptors`.
+///
+/// Caps that fit together are kept. Otherwise what is left after the
+/// reserve is split in three equal parts, one for the tunnel's TCP, one for
+/// the proxy (two descriptors per connection) and one for UDP; a part a cap
+/// does not use goes to UDP, then to the tunnel's TCP. Every cap stays at
+/// least 1, so a budget too small for even that (under about 70
+/// descriptors) is the only case where the sum can pass it.
+pub(crate) fn clamp_to_budget(tcp: usize, udp: usize, descriptors: usize) -> ConnectionCaps {
+    let reserve = reserve_for(descriptors);
     let available = descriptors.saturating_sub(reserve);
-    let tcp = tcp.min(available / 2).max(1);
-    let udp = udp.min(available.saturating_sub(tcp)).max(1);
-    (tcp, udp)
+    let wanted = ConnectionCaps {
+        tunnel_tcp: tcp,
+        udp,
+        proxy_tcp: tcp,
+    };
+    if wanted
+        .tunnel_tcp
+        .checked_add(wanted.udp)
+        .and_then(|sum| sum.checked_add(wanted.proxy_tcp.checked_mul(2)?))
+        .is_some_and(|sum| sum <= available)
+    {
+        return wanted;
+    }
+    let part = available / 3;
+    let tunnel_tcp = tcp.min(part);
+    let proxy_tcp = tcp.min(part / 2);
+    let udp = udp.min(available - tunnel_tcp - 2 * proxy_tcp);
+    let left = available - tunnel_tcp - 2 * proxy_tcp - udp;
+    let tunnel_tcp = tunnel_tcp + (tcp - tunnel_tcp).min(left);
+    ConnectionCaps {
+        tunnel_tcp: tunnel_tcp.max(1),
+        udp: udp.max(1),
+        proxy_tcp: proxy_tcp.max(1),
+    }
+}
+
+/// Descriptors kept back from a budget of `descriptors`.
+fn reserve_for(descriptors: usize) -> usize {
+    (descriptors / 4).clamp(RESERVED_MIN, RESERVED_MAX)
 }
 
 /// The soft open-file limit after raising it once for the process, or
@@ -164,39 +226,60 @@ fn to_usize<T: TryInto<usize>>(value: T) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn caps_fit_a_small_descriptor_budget() {
-        // macOS's usual 256: 64 kept back, TCP half of the rest, UDP the rest.
-        assert_eq!(clamp_to_budget(1024, 4096, 256), (96, 96));
-        // Linux's usual 1024: 256 kept back.
-        assert_eq!(clamp_to_budget(1024, 4096, 1024), (384, 384));
-        // A smaller TCP cap leaves more for UDP.
-        assert_eq!(clamp_to_budget(100, 4096, 1024), (100, 668));
-        // Caps that fit are kept.
-        assert_eq!(clamp_to_budget(128, 256, 1024), (128, 256));
-        assert_eq!(clamp_to_budget(1024, 4096, 1 << 20), (1024, 4096));
-        // Never zero, even with almost no descriptors.
-        assert_eq!(clamp_to_budget(1024, 4096, 16), (1, 1));
+    fn caps(tunnel_tcp: usize, udp: usize, proxy_tcp: usize) -> ConnectionCaps {
+        ConnectionCaps {
+            tunnel_tcp,
+            udp,
+            proxy_tcp,
+        }
     }
 
     #[test]
-    fn the_caps_and_the_reserve_never_exceed_the_budget() {
-        for descriptors in [100, 256, 1000, 1024, 4096, 10240, 65536] {
-            let (tcp, udp) = clamp_to_budget(usize::MAX, usize::MAX, descriptors);
-            let reserve = (descriptors / 4).clamp(RESERVED_MIN, RESERVED_MAX);
-            // A system-proxy connection holds two descriptors.
-            assert!(2 * tcp + reserve <= descriptors, "{descriptors}");
-            assert!(tcp + udp + reserve <= descriptors, "{descriptors}");
+    fn caps_fit_a_small_descriptor_budget() {
+        // macOS's usual 256: 64 kept back, 192 split in three parts of 64.
+        assert_eq!(clamp_to_budget(1024, 4096, 256), caps(64, 64, 32));
+        // Linux's usual 1024: 256 kept back, three parts of 256.
+        assert_eq!(clamp_to_budget(1024, 4096, 1024), caps(256, 256, 128));
+        // A smaller TCP cap leaves its part to UDP.
+        assert_eq!(clamp_to_budget(100, 4096, 1024), caps(100, 468, 100));
+        // A smaller UDP cap leaves its part to the tunnel's TCP.
+        assert_eq!(clamp_to_budget(1024, 16, 1024), caps(496, 16, 128));
+        // Caps that fit together are kept.
+        assert_eq!(clamp_to_budget(128, 256, 1024), caps(128, 256, 128));
+        assert_eq!(clamp_to_budget(1024, 4096, 1 << 20), caps(1024, 4096, 1024));
+        // Never zero, even with almost no descriptors.
+        assert_eq!(clamp_to_budget(1024, 4096, 16), caps(1, 1, 1));
+    }
+
+    #[test]
+    fn mixed_caps_and_the_reserve_never_exceed_the_budget() {
+        let requests = [1, 2, 16, 100, 128, 256, 512, 1000, 1024, 4096, usize::MAX];
+        for descriptors in (70..=70_000).step_by(37).chain([256, 1024, 10240, 65536]) {
+            let reserve = reserve_for(descriptors);
+            for tcp in requests {
+                for udp in requests {
+                    let caps = clamp_to_budget(tcp, udp, descriptors);
+                    // Tunnel TCP, tunnel UDP and the system proxy's two
+                    // descriptors per connection, all full at once.
+                    assert!(
+                        caps.descriptors() + reserve <= descriptors,
+                        "{descriptors} {tcp} {udp}: {caps:?}"
+                    );
+                    assert!(caps.tunnel_tcp >= 1 && caps.udp >= 1 && caps.proxy_tcp >= 1);
+                    assert!(caps.tunnel_tcp <= tcp && caps.proxy_tcp <= tcp && caps.udp <= udp);
+                }
+            }
         }
     }
 
     #[test]
     fn the_budget_holds_the_default_caps_or_lowers_them() {
-        let (tcp, udp) = connection_limits(&Limits::default());
-        assert!((1..=crate::tunnel::DEFAULT_MAX_TCP_CONNECTIONS).contains(&tcp));
-        assert!((1..=crate::tunnel::DEFAULT_MAX_UDP_FLOWS).contains(&udp));
+        let caps = connection_limits(&Limits::default());
+        assert!((1..=crate::tunnel::DEFAULT_MAX_TCP_CONNECTIONS).contains(&caps.tunnel_tcp));
+        assert!((1..=crate::tunnel::DEFAULT_MAX_TCP_CONNECTIONS).contains(&caps.proxy_tcp));
+        assert!((1..=crate::tunnel::DEFAULT_MAX_UDP_FLOWS).contains(&caps.udp));
         if let Some(descriptors) = descriptor_budget() {
-            assert!(tcp + udp < descriptors);
+            assert!(caps.descriptors() + reserve_for(descriptors) <= descriptors);
         }
     }
 }

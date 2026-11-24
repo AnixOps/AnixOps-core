@@ -469,7 +469,7 @@ impl EmbeddedRuntime {
                 as_interceptor(decrypting(local_proxy::ClientProcess::Local)?),
                 system_proxy::SystemProxyOptions {
                     port,
-                    max_connections: fd_budget::connection_limits(&self.config.limits).0,
+                    max_connections: fd_budget::connection_limits(&self.config.limits).proxy_tcp,
                 },
             )
         });
@@ -518,7 +518,8 @@ pub(crate) fn tunnel_settings(config: &RuntimeConfig) -> Result<TunnelSettings, 
     let limits = &config.limits;
     // Lowered to the descriptor budget, so idle connections make room
     // before the process runs out of file descriptors.
-    let (max_tcp_connections, max_udp_flows) = fd_budget::connection_limits(limits);
+    let caps = fd_budget::connection_limits(limits);
+    let (max_tcp_connections, max_udp_flows) = (caps.tunnel_tcp, caps.udp);
     Ok(TunnelSettings {
         mtu: config.mtu,
         tcp_window_bytes: limits.tcp_window_bytes,
