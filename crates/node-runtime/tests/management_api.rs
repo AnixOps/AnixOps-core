@@ -466,3 +466,141 @@ async fn private_targets_are_refused_by_default() {
         .await
         .is_err());
 }
+
+async fn start_api_with_limits(limits: api::ApiLimits) -> SocketAddr {
+    let node = Arc::new(Node::new(default_registry(), false));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(api::serve_with_limits(
+        listener,
+        node,
+        TOKEN.to_owned(),
+        limits,
+    ));
+    addr
+}
+
+/// Sends a request head (and whatever part of the body is given), then
+/// reads the answer's status. The connection is kept open for writing, so
+/// the server must answer without waiting for the rest of the body.
+async fn status_of_head(api: SocketAddr, head: &str, body: &[u8]) -> u16 {
+    let mut stream = TcpStream::connect(api).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    read_status(&mut stream).await
+}
+
+async fn read_status(stream: &mut TcpStream) -> u16 {
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 1024];
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed without an answer");
+            response.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await
+    .expect("the api did not answer before the body was sent");
+    let response = String::from_utf8_lossy(&response);
+    response.split(' ').nth(1).unwrap().parse().unwrap()
+}
+
+fn head(method: &str, path: &str, token: &str, content_length: usize) -> String {
+    format!(
+        "{method} {path} HTTP/1.1\r\nHost: node\r\nAuthorization: Bearer {token}\r\nContent-Length: {content_length}\r\n\r\n"
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_before_reading_the_body() {
+    let api = start_api(false).await;
+    // A wrong token is refused from the head alone, whatever body it claims.
+    let status = status_of_head(api, &head("PUT", "/v1/rules", "wrong", 30 << 20), b"{").await;
+    assert_eq!(status, 401);
+    // So is an unknown endpoint, and a body past the endpoint's limit.
+    let status = status_of_head(api, &head("PUT", "/v1/nothing", TOKEN, 1 << 20), b"").await;
+    assert_eq!(status, 404);
+    let status = status_of_head(api, &head("GET", "/v1/status", TOKEN, 1 << 20), b"").await;
+    assert_eq!(status, 413);
+    let status = status_of_head(api, &head("PUT", "/v1/network", TOKEN, 5 << 20), b"").await;
+    assert_eq!(status, 413);
+    let status = status_of_head(api, &head("PUT", "/v1/rules", TOKEN, 33 << 20), b"").await;
+    assert_eq!(status, 413);
+    // Conflicting lengths and repeated credentials are refused.
+    let conflicting = format!(
+        "PUT /v1/rules HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n"
+    );
+    assert_eq!(status_of_head(api, &conflicting, b"").await, 400);
+    let repeated = format!(
+        "GET /v1/status HTTP/1.1\r\nAuthorization: Bearer wrong\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+    );
+    assert_eq!(status_of_head(api, &repeated, b"").await, 400);
+    // A body within the limit is still served.
+    let (status, _) = call(api, "PUT", "/v1/egress", Some(json!({}))).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_limit_answers_busy() {
+    let api = start_api_with_limits(api::ApiLimits {
+        max_connections: 2,
+        ..api::ApiLimits::default()
+    })
+    .await;
+    let idle_a = TcpStream::connect(api).await.unwrap();
+    let idle_b = TcpStream::connect(api).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut third = TcpStream::connect(api).await.unwrap();
+    assert_eq!(read_status(&mut third).await, 503);
+    drop((idle_a, idle_b));
+    // The slots come back once the server sees the clients go.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = status_of_head(api, &head("GET", "/v1/status", TOKEN, 0), b"").await;
+        if status == 200 {
+            break;
+        }
+        assert_eq!(status, 503);
+        assert!(tokio::time::Instant::now() < deadline, "slots never freed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_budget_is_shared() {
+    const LENGTH: usize = 40 * 1024;
+    let api = start_api_with_limits(api::ApiLimits {
+        body_budget: 64 * 1024,
+        ..api::ApiLimits::default()
+    })
+    .await;
+    let mut body = b"{}".to_vec();
+    body.resize(LENGTH, b' ');
+    // The first request (egress routes are per node, unlike the block
+    // ranges) reserves its body and sends only the start of it.
+    let mut first = TcpStream::connect(api).await.unwrap();
+    first
+        .write_all(head("PUT", "/v1/egress", TOKEN, LENGTH).as_bytes())
+        .await
+        .unwrap();
+    first.write_all(&body[..16]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A second body does not fit beside it.
+    let status = status_of_head(api, &head("PUT", "/v1/egress", TOKEN, LENGTH), b"").await;
+    assert_eq!(status, 503);
+    // Bodyless requests still fit.
+    let (status, _) = call(api, "GET", "/v1/status", None).await;
+    assert_eq!(status, 200);
+    // Once the first finishes, its reservation is returned.
+    first.write_all(&body[16..]).await.unwrap();
+    assert_eq!(read_status(&mut first).await, 200);
+    drop(first);
+    let mut second = TcpStream::connect(api).await.unwrap();
+    second
+        .write_all(head("PUT", "/v1/egress", TOKEN, LENGTH).as_bytes())
+        .await
+        .unwrap();
+    second.write_all(&body).await.unwrap();
+    assert_eq!(read_status(&mut second).await, 200);
+}
