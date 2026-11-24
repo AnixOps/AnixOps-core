@@ -43,19 +43,75 @@ fn render(profile: &Value, mode: RoutingMode) -> Value {
 }
 
 #[test]
-fn only_rule_and_direct_modes_exist() {
-    for mode in [RoutingMode::Direct, RoutingMode::Rule] {
-        assert_eq!(RoutingMode::parse(mode.as_str()), Some(mode));
+fn the_rule_global_and_direct_modes_exist() {
+    // All three stay offered on every desktop and Android client
+    // (docs/platform-parity.md, 分流模式); losing one fails here.
+    assert_eq!(
+        RoutingMode::ALL,
+        [RoutingMode::Rule, RoutingMode::Global, RoutingMode::Direct]
+    );
+    for (mode, name) in RoutingMode::ALL
+        .into_iter()
+        .zip(["rule", "global", "direct"])
+    {
+        assert_eq!(mode.as_str(), name);
+        assert_eq!(RoutingMode::parse(name), Some(mode));
         assert_eq!(
             serde_json::to_value(mode).unwrap(),
-            Value::String(mode.as_str().to_string())
+            Value::String(name.to_string())
         );
     }
     // No preset list modes (docs/no-presets.md).
-    for removed in ["preset_list", "global"] {
-        assert_eq!(RoutingMode::parse(removed), None, "{removed}");
-    }
+    assert_eq!(RoutingMode::parse("preset_list"), None);
     assert_eq!(RoutingMode::default(), RoutingMode::Rule);
+}
+
+#[test]
+fn the_global_envelope_starts_the_engine_in_its_global_mode_on_final_s_group() {
+    let profile = routed();
+    let global = render(&profile, RoutingMode::Global);
+    assert_eq!(global["mode"], "global");
+    // FINAL,Proxy: the global mode follows the Proxy group, so choosing
+    // another node in it keeps working.
+    assert_eq!(global["routing"]["global"], "Proxy");
+    // The rules are kept for switching back in place; the engine ignores them.
+    assert_eq!(global["routing"]["rules"], profile["routing"]["rules"]);
+    let config = RuntimeConfig::from_json(global.to_string().as_bytes()).unwrap();
+    assert_eq!(config.mode, Mode::Global);
+
+    // FINAL straight at a node.
+    let mut to_node = routed();
+    to_node["routing"]["rules"] = json!(["FINAL,hk"]);
+    assert_eq!(
+        render(&to_node, RoutingMode::Global)["routing"]["global"],
+        "hk"
+    );
+
+    // FINAL,DIRECT does not make the global mode direct: the engine's own
+    // default (the first group) is used.
+    let mut to_direct = routed();
+    to_direct["routing"]["rules"] = json!(["FINAL,DIRECT"]);
+    let rendered = render(&to_direct, RoutingMode::Global);
+    assert_eq!(rendered["mode"], "global");
+    assert!(rendered["routing"].get("global").is_none());
+
+    // A global target the profile names is kept.
+    let mut named = routed();
+    named["routing"]["global"] = json!("Auto");
+    assert_eq!(
+        render(&named, RoutingMode::Global)["routing"]["global"],
+        "Auto"
+    );
+
+    // A single-node profile keeps its one outbound.
+    let single_global = render(&single(), RoutingMode::Global);
+    assert_eq!(single_global["mode"], "global");
+    assert_eq!(single_global["outbound"], single()["outbound"]);
+    assert!(single_global.get("routing").is_none());
+    let config = RuntimeConfig::from_json(single_global.to_string().as_bytes()).unwrap();
+    assert_eq!(config.mode, Mode::Global);
+
+    assert!(envelope_for_mode("[]", RoutingMode::Global).is_err());
 }
 
 #[test]
@@ -89,6 +145,7 @@ fn the_direct_envelope_starts_the_engine_in_its_direct_mode() {
     for profile in [routed(), single()] {
         assert_eq!(engine_mode(&profile, RoutingMode::Direct), Mode::Direct);
         assert_eq!(engine_mode(&profile, RoutingMode::Rule), Mode::Rule);
+        assert_eq!(engine_mode(&profile, RoutingMode::Global), Mode::Global);
     }
 
     // A mode the profile carries gives way to the direct one.

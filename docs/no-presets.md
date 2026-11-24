@@ -4,7 +4,7 @@
 
 ## 内核里去掉的
 
-- `engine-embedded::profile`：`RoutingMode` 只剩 `rule` 和 `direct`，去掉三种预设名单分流模式和 `RuleList`（Loyalsoldier / gaoyifan 列表地址）。`envelope_for_mode(profile, mode)` 不再接收列表。
+- `engine-embedded::profile`：`RoutingMode` 是 `rule`、`global`、`direct`（`global` 于 2026-11-24 加上，桌面与 Android 和 iOS 一样有全局模式），去掉三种预设名单分流模式和 `RuleList`（Loyalsoldier / gaoyifan 列表地址）。`envelope_for_mode(profile, mode)` 不再接收列表。
 - `mitm-policy`：去掉内置的 `networkcore.adblock` 和 Bilibili 网页去广告插件。用户插件用 `user_plugin_package(text)` 加载，id 为 `user`。
 - `platform-windows`：去掉 `WindowsManagedNativeMitmConfig.bilibili_web_ad_block_enabled`。带这个字段的旧配置仍能读取。
 - `networkcore-linux`：
