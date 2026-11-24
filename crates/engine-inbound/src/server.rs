@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use engine_outbound::accept::{self, AcceptBackoff};
+use engine_outbound::gauge::Gauge;
 use engine_outbound::{BoxStream, TargetAddr, TcpOutbound};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -160,19 +161,14 @@ pub async fn serve_with_udp(
 /// count drops when the guard does, so also when the connection's task is
 /// aborted or panics.
 pub struct ActiveConnection<'a> {
-    stats: &'a InboundStats,
+    _gauge: Gauge<'a>,
 }
 
 impl<'a> ActiveConnection<'a> {
     pub fn new(stats: &'a InboundStats) -> Self {
-        stats.active.fetch_add(1, Ordering::Relaxed);
-        Self { stats }
-    }
-}
-
-impl Drop for ActiveConnection<'_> {
-    fn drop(&mut self) {
-        self.stats.active.fetch_sub(1, Ordering::Relaxed);
+        Self {
+            _gauge: Gauge::hold(&stats.active),
+        }
     }
 }
 
