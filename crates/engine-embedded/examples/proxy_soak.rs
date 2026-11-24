@@ -41,11 +41,11 @@ fn main() {
 
 #[cfg(all(feature = "local-proxy", feature = "shadowsocks"))]
 mod soak {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::io::{self, BufRead, Write};
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use base64::Engine as _;
@@ -148,15 +148,46 @@ mod soak {
         opened: AtomicU64,
         failed: AtomicU64,
         bytes: AtomicU64,
+        /// Why connections failed, by load and reason; the first few are
+        /// also written to stderr with their details.
+        reasons: Mutex<BTreeMap<String, u64>>,
     }
 
     impl Counts {
+        fn fail(&self, load: &str, error: &io::Error) {
+            let failed = self.failed.fetch_add(1, Ordering::Relaxed);
+            let reason = format!("{load}: {}", reason(error));
+            if failed < 20 {
+                eprintln!("proxy_soak: {reason}: {error}");
+            }
+            *self
+                .reasons
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(reason)
+                .or_default() += 1;
+        }
+
         fn json(&self) -> serde_json::Value {
+            let reasons = self
+                .reasons
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             json!({
                 "opened": self.opened.load(Ordering::Relaxed),
                 "failed": self.failed.load(Ordering::Relaxed),
                 "bytes": self.bytes.load(Ordering::Relaxed),
+                "reasons": reasons,
             })
+        }
+    }
+
+    /// A short, fixed name for what went wrong.
+    fn reason(error: &io::Error) -> String {
+        match error.kind() {
+            io::ErrorKind::Other => error.to_string(),
+            kind => format!("{kind:?}"),
         }
     }
 
@@ -222,7 +253,9 @@ mod soak {
             tokio::select! {
                 _ = short.tick() => {
                     let counts = counts.clone();
-                    tasks.spawn(async move { counted(&counts, echo_once(proxy, echo, 64)).await });
+                    tasks.spawn(async move {
+                        counted(&counts, "short", echo_once(proxy, echo, 64)).await
+                    });
                 }
                 _ = turn.tick() => {
                     // Closing the oldest held connection, opening a new one.
@@ -232,15 +265,14 @@ mod soak {
                     counts.opened.fetch_add(1, Ordering::Relaxed);
                     match tokio::time::timeout(IO_TIMEOUT, open(proxy, echo)).await {
                         Ok(Ok(stream)) => pool.push_back(stream),
-                        _ => {
-                            counts.failed.fetch_add(1, Ordering::Relaxed);
-                        }
+                        Ok(Err(error)) => counts.fail("pool", &error),
+                        Err(_) => counts.fail("pool", &io::ErrorKind::TimedOut.into()),
                     }
                 }
                 _ = burst.tick() => {
                     let counts = counts.clone();
                     tasks.spawn(async move {
-                        counted(&counts, echo_once(proxy, echo, BURST_BYTES)).await
+                        counted(&counts, "burst", echo_once(proxy, echo, BURST_BYTES)).await
                     });
                 }
                 _ = report.tick() => {
@@ -266,15 +298,18 @@ mod soak {
         Ok(())
     }
 
-    async fn counted(counts: &Counts, run: impl std::future::Future<Output = io::Result<usize>>) {
+    async fn counted(
+        counts: &Counts,
+        load: &str,
+        run: impl std::future::Future<Output = io::Result<usize>>,
+    ) {
         counts.opened.fetch_add(1, Ordering::Relaxed);
         match tokio::time::timeout(IO_TIMEOUT, run).await {
             Ok(Ok(bytes)) => {
                 counts.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
             }
-            _ => {
-                counts.failed.fetch_add(1, Ordering::Relaxed);
-            }
+            Ok(Err(error)) => counts.fail(load, &error),
+            Err(_) => counts.fail(load, &io::ErrorKind::TimedOut.into()),
         }
     }
 
@@ -320,9 +355,14 @@ mod soak {
         let (sent, received) = tokio::join!(send, receive);
         sent?;
         let received = received?;
-        let expected = (0..len).map(|i| i as u8);
-        if received.len() != len || !received.iter().copied().eq(expected) {
-            return Err(io::Error::other("echo mismatch"));
+        if received.len() != len {
+            return Err(io::Error::other(format!(
+                "echo returned {} of {len} bytes",
+                received.len()
+            )));
+        }
+        if !received.iter().copied().eq((0..len).map(|i| i as u8)) {
+            return Err(io::Error::other("echo returned other bytes"));
         }
         Ok(len)
     }
