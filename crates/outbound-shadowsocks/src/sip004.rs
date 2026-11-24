@@ -188,6 +188,11 @@ struct AeadStream {
     decryptor: Option<Cipher>,
     out: Vec<u8>,
     out_pos: usize,
+    /// The request header has not fully left yet. Until it has, a read
+    /// waits for it (the server answers only after it); afterwards reads
+    /// never wait on queued writes, so a full send buffer cannot stall the
+    /// download while the server waits for us to read.
+    header_unsent: bool,
     read_state: ReadState,
     rbuf: Vec<u8>,
     rfilled: usize,
@@ -215,6 +220,7 @@ impl AeadStream {
             decryptor: None,
             out: Vec::new(),
             out_pos: 0,
+            header_unsent: true,
             read_state: ReadState::Salt,
             rbuf: Vec::new(),
             rfilled: 0,
@@ -250,6 +256,8 @@ impl AeadStream {
         }
         self.out.clear();
         self.out_pos = 0;
+        // Empty `out` with the address still pending means nothing was sent.
+        self.header_unsent = self.pending_address.is_some();
         Poll::Ready(Ok(()))
     }
 
@@ -383,7 +391,9 @@ impl AsyncRead for AeadStream {
             // Reading before the first write: send the address on its own.
             this.encode_chunk(&[])?;
         }
-        ready!(this.poll_drain(cx))?;
+        if this.header_unsent {
+            ready!(this.poll_drain(cx))?;
+        }
         if this.plain_pos >= this.plain.len() {
             ready!(this.poll_next_plaintext(cx))?;
         }
@@ -422,5 +432,56 @@ mod tests {
         );
         assert!(AeadMethod::parse("aes-128-cfb").is_err());
         assert!(AeadMethod::parse("2022-blake3-aes-128-gcm").is_err());
+    }
+
+    /// Once the request header has left, a read must not wait for queued
+    /// writes: when the send buffer is full and the server answers before it
+    /// reads on, waiting stalls both sides (4 MiB echoes through a local
+    /// proxy timed out this way on Windows).
+    #[tokio::test]
+    async fn reads_do_not_wait_for_queued_writes() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let method = AeadMethod::Aes128Gcm;
+        let key: Arc<[u8]> = Arc::from(evp_bytes_to_key(b"soak", method.key_len()));
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let target = TargetAddr::Domain("example.com".into(), 80);
+        let mut stream = AeadStream::new(
+            Box::new(client_io),
+            method,
+            key.clone(),
+            encode_address(&target).unwrap(),
+        )
+        .unwrap();
+        stream.write_all(&[1u8; 64]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // The server takes the request salt and answers 64 bytes.
+        let mut request_salt = vec![0u8; method.key_len()];
+        server_io.read_exact(&mut request_salt).await.unwrap();
+        let response_salt = [6u8; 16];
+        let mut encryptor = method.session_cipher(&key, &response_salt).unwrap();
+        let mut response = response_salt.to_vec();
+        encryptor
+            .seal_into(&mut response, &64u16.to_be_bytes())
+            .unwrap();
+        encryptor.seal_into(&mut response, &[2u8; 64]).unwrap();
+        server_io.write_all(&response).await.unwrap();
+
+        // Fill the send side until a write cannot complete; the server
+        // reads nothing more, so the rest stays queued in the stream.
+        let payload = vec![3u8; MAX_CHUNK];
+        while let Ok(written) =
+            tokio::time::timeout(Duration::from_millis(100), stream.write(&payload)).await
+        {
+            written.unwrap();
+        }
+        let mut answer = [0u8; 64];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut answer))
+            .await
+            .expect("the read waited for queued writes")
+            .unwrap();
+        assert_eq!(answer, [2u8; 64]);
     }
 }
