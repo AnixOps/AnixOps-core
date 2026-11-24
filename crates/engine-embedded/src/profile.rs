@@ -26,6 +26,11 @@ pub enum RoutingMode {
     /// sends everything through its node.
     #[default]
     Rule,
+    /// Everything through the node the rule mode's `FINAL` takes: the engine
+    /// starts in its global mode ([`Mode::Global`]) with the routing's
+    /// `global` target set to `FINAL`'s group (or node), so switching that
+    /// group's choice still changes the node. Rules are kept but not used.
+    Global,
 }
 
 impl RoutingMode {
@@ -33,24 +38,74 @@ impl RoutingMode {
         match self {
             RoutingMode::Direct => "direct",
             RoutingMode::Rule => "rule",
+            RoutingMode::Global => "global",
         }
     }
 
+    /// Every mode, in the order clients list them.
+    pub const ALL: [RoutingMode; 3] = [RoutingMode::Rule, RoutingMode::Global, RoutingMode::Direct];
+
     pub fn parse(value: &str) -> Option<Self> {
-        [RoutingMode::Direct, RoutingMode::Rule]
-            .into_iter()
-            .find(|mode| mode.as_str() == value)
+        Self::ALL.into_iter().find(|mode| mode.as_str() == value)
     }
 }
 
 /// The envelope `profile` runs with in `mode`: rule mode keeps the profile;
-/// direct mode starts the engine in its direct mode (top-level `"mode":
-/// "direct"`) and replaces the rules with `FINAL,DIRECT`.
+/// global mode starts the engine in its global mode (top-level `"mode":
+/// "global"`) aimed at `FINAL`'s target; direct mode starts the engine in its
+/// direct mode (top-level `"mode": "direct"`) and replaces the rules with
+/// `FINAL,DIRECT`.
 pub fn envelope_for_mode(profile: &str, mode: RoutingMode) -> Result<String, String> {
-    if mode == RoutingMode::Rule {
-        validate(profile)?;
-        return Ok(profile.to_string());
+    match mode {
+        RoutingMode::Rule => {
+            validate(profile)?;
+            Ok(profile.to_string())
+        }
+        RoutingMode::Global => global_envelope(profile),
+        RoutingMode::Direct => direct_envelope(profile),
     }
+}
+
+/// A single-node profile's engine sends everything to its one outbound; a
+/// routed profile's to `FINAL`'s first group, or its node. A `global` the
+/// profile already names is kept. When `FINAL` ends at `DIRECT` or `REJECT`
+/// nothing is set and the engine picks its default (the first group, else
+/// the first node), so the global mode never quietly goes direct.
+fn global_envelope(profile: &str) -> Result<String, String> {
+    let mut envelope: Value = serde_json::from_str(profile).map_err(|error| error.to_string())?;
+    let target = global_target(&envelope);
+    let object = envelope
+        .as_object_mut()
+        .ok_or("the profile must be a JSON object")?;
+    if let (Some(target), Some(routing)) = (
+        target,
+        object.get_mut("routing").and_then(Value::as_object_mut),
+    ) {
+        routing
+            .entry("global")
+            .or_insert_with(|| Value::String(target));
+    }
+    object.insert("mode".to_string(), json!(Mode::Global));
+    let rendered = envelope.to_string();
+    validate(&rendered)?;
+    Ok(rendered)
+}
+
+/// `FINAL`'s first group, else the node it names; nothing for `DIRECT`,
+/// `REJECT` or a name the profile does not define.
+fn global_target(profile: &Value) -> Option<String> {
+    let (chain, target) = final_chain(profile);
+    chain.into_iter().next().or_else(|| {
+        target.filter(|id| {
+            profile
+                .pointer("/routing/outbounds")
+                .and_then(Value::as_object)
+                .is_some_and(|outbounds| outbounds.contains_key(id))
+        })
+    })
+}
+
+fn direct_envelope(profile: &str) -> Result<String, String> {
     let mut envelope: Value = serde_json::from_str(profile).map_err(|error| error.to_string())?;
     let object = envelope
         .as_object_mut()

@@ -153,6 +153,8 @@
 - 修复：此前直连信封只换了规则，引擎仍按规则模式运行。`via: proxy` 的上游不会因为 `FINAL,DIRECT` 改走直连，所以隧道的每个查询（包括内置的 `1.1.1.1:53`）仍经全局目标（`routing.global`，缺省为第一个策略组）选出的节点发出。节点不可用时这些查询全部失败，节点不响应时每个都要等满 `timeout_ms`（缺省 5 秒）；全局路径上带测速的策略组也因此一直算作在用，被定期测速。
 - 修复：此前直连模式下 Fake-IP 连接的解析不看模式，`via: proxy` 的上游仍经规则为它选的节点或全局目标发出，节点不可用时这些连接全部失败。运行中用 `set_mode` 切到直连时同样如此，与信封无关。
 
+客户端的「全局」：`envelope_for_mode(profile, RoutingMode::Global)` 生成的信封带顶层 `"mode": "global"`，规则保留但引擎不使用；路由配置的 `global` 目标设为 `FINAL` 经过的第一个策略组（或 `FINAL` 直接指向的节点），切换该组的选择仍能换节点；配置自己写了 `global` 时保留。`FINAL` 指向 `DIRECT` / `REJECT` 时不设 `global`，由引擎取缺省（第一个策略组，否则第一个节点），全局模式不会悄悄变成直连。单节点配置保留唯一出站，全部流量走它。
+
 测试：`tests/dns_leaks.rs` 的 `the_direct_envelope_needs_no_node_for_dns`（用直连信封经引擎构建的分发器，节点全部不可用：隧道查询和 Fake-IP 连接都只经直连出站）和 `fake_ip_names_resolve_directly_in_the_direct_mode_and_apart`（直连模式直连解析；切回规则模式后重新经节点解析，不用直连时的应答），以及 `tests/profile.rs` 的 `the_direct_envelope_starts_the_engine_in_its_direct_mode`。
 
 ## 不在本次范围
