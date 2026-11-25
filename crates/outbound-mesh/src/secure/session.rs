@@ -19,7 +19,9 @@
 //! the reference behaviour (spec §8.4 rule 2): every session dropped leaves
 //! a record of the epochs it used, by the digest of its root key, and a
 //! Sync of a recorded root key that would make this node send in an epoch
-//! it used before is refused.
+//! it used before is refused. Without a record the peer's epoch comes from
+//! its first packet, and for a minute any packet that authenticates may
+//! move it ahead.
 //!
 //! A direct session is bound to the static key of the peer that set it up.
 //! A handshake with another key under the same node ID cannot take over a
@@ -60,6 +62,9 @@ pub const MAX_RECORDS: usize = 4096;
 /// in. 0 until the reference server's receive base is measured (spec §23
 /// T21).
 pub const SYNC_SKIP_LIMIT: u32 = 0;
+/// After a Sync without a record, packets that authenticate may move the
+/// receive epoch any distance ahead for this long (spec §8.4 rule 2).
+pub const SYNC_RELAX_PERIOD: Duration = Duration::from_secs(60);
 /// A pending relay session that no packet decrypts under within this is
 /// dropped (spec §9).
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -176,6 +181,8 @@ pub struct Session {
     pub receiver: Receiver,
     connections: usize,
     idle_since: Instant,
+    /// Until when the receiver follows the peer any distance ahead.
+    relaxed_until: Option<Instant>,
 }
 
 impl Session {
@@ -361,8 +368,14 @@ impl Sessions {
             .get(key)
             .map(|remembered| remembered.last)
             .max(self.generation(key));
-        let next = match last {
-            Some(last) => last.checked_add(1).ok_or(SessionError::Full)?,
+        let next = match last.map(|last| last.checked_add(1)) {
+            Some(Some(next)) => next,
+            // Never wraps: the installed session goes, and a new random
+            // start follows (spec §8.1).
+            Some(None) => {
+                self.retire(key);
+                random_generation(rng)?
+            }
             None => random_generation(rng)?,
         };
         if !self.generations.contains_key(key) && self.generations.len() >= MAX_GENERATIONS {
@@ -568,6 +581,7 @@ impl Sessions {
             receiver,
             connections: usize::from(key.namespace == Namespace::Direct),
             idle_since: now,
+            relaxed_until: None,
         })
     }
 
@@ -642,7 +656,7 @@ impl Sessions {
                     key.peer_id,
                     agreement.initial_epoch,
                 )?;
-                let session = Self::new_session(
+                let mut session = Self::new_session(
                     &key,
                     agreement,
                     local_id,
@@ -652,6 +666,11 @@ impl Sessions {
                     agreement.initial_epoch,
                     now,
                 )?;
+                // The other connections of the replaced session go on with
+                // this one (spec §8.1).
+                if let Some(old) = self.map.get(&key) {
+                    session.connections += old.connections;
+                }
                 self.retire(&key);
                 self.map.insert(key, session);
                 Ok(())
@@ -664,6 +683,7 @@ impl Sessions {
                 if !self.map.contains_key(&key) && self.map.len() >= MAX_SESSIONS {
                     return Err(SessionError::Full);
                 }
+                let carried = self.map.get(&key).map_or(0, |old| old.connections);
                 self.retire(&key);
                 let digest = root_digest(&agreement.root_key);
                 let record = self.take_record(&key, &digest);
@@ -693,10 +713,11 @@ impl Sessions {
                         agreement.root_key,
                         local_id,
                         key.peer_id,
-                        agreement.initial_epoch.saturating_sub(1),
+                        0,
                     )?,
                 };
-                let session = Self::new_session(
+                let relaxed_until = record.is_none().then(|| now + SYNC_RELAX_PERIOD);
+                let mut session = Self::new_session(
                     &key,
                     agreement,
                     local_id,
@@ -706,6 +727,8 @@ impl Sessions {
                     send_epoch,
                     now,
                 )?;
+                session.connections += carried;
+                session.relaxed_until = relaxed_until;
                 self.map.insert(key, session);
                 Ok(())
             }
@@ -880,10 +903,11 @@ impl Sessions {
     ) -> Result<(), SessionError> {
         self.drop_expired_pending(key, now);
         let original = (self.pending_len(key) > 0).then(|| payload.clone());
-        let current = self
-            .map
-            .get_mut(key)
-            .map(|session| session.receiver.open_uncounted(payload));
+        let current = self.map.get_mut(key).map(|session| {
+            let relaxed = session.relaxed_until.is_some_and(|until| now < until);
+            session.receiver.relax_ahead(relaxed);
+            session.receiver.open_uncounted(payload)
+        });
         if let Some(Ok(())) = current {
             if let Some(session) = self.map.get_mut(key) {
                 session.idle_since = now;
@@ -1247,18 +1271,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions.get(&key).unwrap().sender.epoch(), 7);
-        // Older epochs, replayed or not, are dropped without counting.
-        for _ in 0..MAX_FAILURES + 1 {
-            let mut old = from_peer(3, 2, now);
-            assert_eq!(
-                sessions.open(&key, &mut old, now),
-                Err(SessionError::Traffic(TrafficError::StaleEpoch))
-            );
-        }
-        let mut packet = from_peer(3, 6, now);
+        // The peer kept its own epoch, far below the agreed one.
+        let mut packet = from_peer(3, 2, now);
         sessions.open(&key, &mut packet, now).unwrap();
         assert_eq!(packet, b"p");
-        assert_eq!(sessions.get(&key).unwrap().receiver.newest(), 6);
+        assert_eq!(sessions.get(&key).unwrap().receiver.newest(), 2);
+        // That may have been a replay: for a minute, the real epoch still
+        // gets through however far ahead.
+        let mut packet = from_peer(3, 20, now);
+        sessions.open(&key, &mut packet, now).unwrap();
+        assert_eq!(sessions.get(&key).unwrap().receiver.newest(), 20);
+        let later = now + SYNC_RELAX_PERIOD;
+        let mut packet = from_peer(3, 30, later);
+        assert_eq!(
+            sessions.open(&key, &mut packet, later),
+            Err(SessionError::Traffic(TrafficError::EpochTooFarAhead))
+        );
         assert_eq!(
             sessions.install(
                 key.clone(),
@@ -1272,6 +1300,82 @@ mod tests {
             Err(SessionError::NothingToJoin),
             "a server never installs a Sync"
         );
+    }
+
+    #[test]
+    fn a_replacing_create_keeps_the_other_connections() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let key = key(Namespace::Direct);
+        let first = sessions
+            .server_choice(&key, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions
+            .install(
+                key.clone(),
+                &first,
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                Side::Server,
+                now,
+            )
+            .unwrap();
+        let join = sessions
+            .server_choice(&key, Some(first.generation), c(AES, AES), &rng)
+            .unwrap();
+        sessions
+            .install(
+                key.clone(),
+                &join,
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                Side::Server,
+                now,
+            )
+            .unwrap();
+        let next = sessions
+            .server_choice(&key, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions
+            .install(
+                key.clone(),
+                &next,
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                Side::Server,
+                now,
+            )
+            .unwrap();
+        assert_eq!(sessions.get(&key).unwrap().connections(), 3);
+        assert_eq!(sessions.generation(&key), Some(next.generation));
+    }
+
+    #[test]
+    fn generations_do_not_wrap() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let key = key(Namespace::Direct);
+        sessions
+            .install(
+                key.clone(),
+                &agreement(Action::Create, u32::MAX, 1, 0),
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                Side::Server,
+                now,
+            )
+            .unwrap();
+        let next = sessions
+            .server_choice(&key, None, c(AES, AES), &rng)
+            .unwrap();
+        assert!((1..1 << 31).contains(&next.generation));
+        assert!(sessions.get(&key).is_none(), "the old session went first");
     }
 
     #[test]

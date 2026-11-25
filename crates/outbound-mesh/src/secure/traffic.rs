@@ -293,6 +293,10 @@ pub struct Receiver {
     /// record of the session (spec §8.4 rule 2) the first packet that
     /// authenticates sets it.
     anchored: bool,
+    /// Whether a packet that authenticates may move the newest epoch more
+    /// than [`MAX_EPOCHS_AHEAD`] at once: for a while after such a Sync, so
+    /// a replayed old packet that came first cannot hold the peer back.
+    relaxed: bool,
     /// Keys and windows of the newest epoch and the one before it, so
     /// packets in flight across a rotation still arrive.
     epochs: BTreeMap<u32, (LessSafeKey, ReplayWindow)>,
@@ -319,6 +323,7 @@ impl Receiver {
             newest: initial_epoch,
             floor: 0,
             anchored: true,
+            relaxed: false,
             epochs,
             failures: 0,
         })
@@ -326,7 +331,8 @@ impl Receiver {
 
     /// A receiver that does not know the peer's epoch yet: the first packet
     /// that authenticates in `floor` or later sets it, and earlier packets
-    /// are dropped without counting as failures (spec §8.4 rule 2).
+    /// are dropped without counting as failures. After a Sync without a
+    /// record the floor is 0 (spec §8.4 rule 2).
     pub fn unanchored(
         cipher: Cipher,
         root_key: [u8; ROOT_KEY_LEN],
@@ -342,6 +348,7 @@ impl Receiver {
             newest: floor,
             floor,
             anchored: false,
+            relaxed: false,
             epochs: BTreeMap::new(),
             failures: 0,
         })
@@ -368,6 +375,13 @@ impl Receiver {
 
     pub fn ended(&self) -> bool {
         self.failures >= MAX_FAILURES
+    }
+
+    /// Lets a packet that authenticates move the newest epoch however far
+    /// ahead it is, with a new window, while `relaxed` (spec §8.4 rule 2:
+    /// the first 60 seconds after a Sync without a record).
+    pub fn relax_ahead(&mut self, relaxed: bool) {
+        self.relaxed = relaxed;
     }
 
     /// The newest epoch a packet authenticated in, or the initial one.
@@ -426,7 +440,7 @@ impl Receiver {
         }
         if self.anchored {
             if epoch > self.newest {
-                if epoch - self.newest > MAX_EPOCHS_AHEAD {
+                if epoch - self.newest > MAX_EPOCHS_AHEAD && !self.relaxed {
                     return Err((TrafficError::EpochTooFarAhead, true));
                 }
             } else if self.newest - epoch > 1 {
@@ -717,6 +731,22 @@ mod tests {
         );
         assert!(keys_equal(&root(), &root()));
         assert!(!keys_equal(&root(), &[0; 32]));
+    }
+
+    #[test]
+    fn a_relaxed_receiver_follows_the_peer_far_ahead() {
+        let now = Instant::now();
+        let mut receiver = Receiver::unanchored(Cipher::Aes128Gcm, root(), 9, 3, 0).unwrap();
+        // A replayed old packet came first and set the epoch low.
+        receiver.open(&mut sealed(1, now)).unwrap();
+        receiver.relax_ahead(true);
+        receiver.open(&mut sealed(30, now)).unwrap();
+        assert_eq!(receiver.newest(), 30);
+        receiver.relax_ahead(false);
+        assert_eq!(
+            receiver.open(&mut sealed(40, now)),
+            Err(TrafficError::EpochTooFarAhead)
+        );
     }
 
     #[test]
