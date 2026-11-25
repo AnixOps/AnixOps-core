@@ -64,6 +64,7 @@ mkdir -p /var/run/ubus /var/lock
 
 # owner FILE: numeric owner:group (stat is not in every BusyBox build).
 owner() {
+	# shellcheck disable=SC2012 # BusyBox find has no -printf
 	ls -lnd "$1" | awk '{ print $3 ":" $4 }'
 }
 
@@ -189,14 +190,18 @@ chmod 0755 /tmp/fakebin/ubus
 step "procd service definition"
 rm -f /tmp/fakebin/calls
 PATH="/tmp/fakebin:${PATH}" /etc/init.d/anixops-mesh start
-if calls | grep -q '"instances"'; then
+# procd_open_service always sends an "instances" object; an instance
+# would add its command.
+if calls | grep -q '"command"'; then
 	fail "disabled service must not start an instance"
 fi
 uci set anixops-mesh.main.enabled=1
 uci commit anixops-mesh
 rm -f /tmp/fakebin/calls
 PATH="/tmp/fakebin:${PATH}" /etc/init.d/anixops-mesh start
-if calls | grep -q '"instances"'; then
+# procd_open_service always sends an "instances" object; an instance
+# would add its command.
+if calls | grep -q '"command"'; then
 	fail "service without a device token must not start an instance"
 fi
 mkdir -p /etc/anixops-mesh

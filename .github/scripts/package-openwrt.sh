@@ -107,9 +107,8 @@ luci_refresh() {
 [ -n "${IPKG_INSTROOT}" ] || {
 	rm -f /tmp/luci-indexcache.*
 	rm -rf /tmp/luci-modulecache/
-	killall -HUP rpcd 2>/dev/null
+	killall -HUP rpcd 2>/dev/null || true
 }
-exit 0
 EOF
 }
 
@@ -149,8 +148,9 @@ build_ipk() {
   ipk_postinst > "${stage}/control/postinst"
   ipk_prerm > "${stage}/control/prerm"
   if [ "${luci}" = 1 ]; then
-    # postinst-pkg runs inside default_postinst; it must not exit.
-    luci_refresh | sed '/^exit 0$/d' > "${stage}/control/postinst-pkg"
+    # postinst-pkg runs inside default_postinst, whose result is its
+    # result: it must not exit and must succeed when rpcd is not running.
+    luci_refresh > "${stage}/control/postinst-pkg"
     chmod 0755 "${stage}/control/postinst-pkg"
   fi
   chmod 0755 "${stage}/control/postinst" "${stage}/control/prerm"

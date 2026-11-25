@@ -307,8 +307,12 @@ jobs:
         if: ${{ matrix.emulate }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support
-          sudo update-binfmts --enable qemu-aarch64
+          # Static emulators registered with the F (fix binary) flag, so
+          # they work inside containers.
+          sudo apt-get install -y --no-install-recommends qemu-user-binfmt
+          sudo systemctl restart systemd-binfmt || true
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+          grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
 
       - name: Install and test in the OpenWrt root file system
         shell: bash
