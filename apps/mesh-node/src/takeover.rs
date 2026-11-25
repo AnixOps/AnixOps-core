@@ -93,6 +93,9 @@ pub enum Action {
         uid: Option<u32>,
         #[serde(default)]
         gid: Option<u32>,
+        /// Its supplementary groups.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<u32>>,
         /// `false` for processes a service manager restarts on rollback.
         restart: bool,
         killed: bool,
@@ -194,7 +197,7 @@ impl std::fmt::Display for TakeoverError {
         match self {
             TakeoverError::Locked(path) => write!(
                 f,
-                "another takeover or rollback is running ({} exists)",
+                "another takeover or rollback is running (it holds {})",
                 path.display()
             ),
             TakeoverError::Io(error) => write!(f, "{error}"),
@@ -223,51 +226,20 @@ impl<'a> Lock<'a> {
         host.create_dir_all(state, 0o700)
             .map_err(|error| TakeoverError::Io(format!("{}: {error}", state.display())))?;
         let path = state.join(LOCK);
-        let pid = host.own_pid().to_string();
-        for attempt in 0..2 {
-            match host.create_new(&path, pid.as_bytes()) {
-                Ok(true) => return Ok(Lock { host, path }),
-                // A lock left by a run that was killed or lost power is
-                // removed once; a live holder keeps it.
-                Ok(false) if attempt == 0 && lock_is_stale(host, &path) => {
-                    host.remove_file(&path).map_err(|error| {
-                        TakeoverError::Io(format!("{}: {error}", path.display()))
-                    })?;
-                }
-                Ok(false) => return Err(TakeoverError::Locked(path)),
-                Err(error) => {
-                    return Err(TakeoverError::Io(format!("{}: {error}", path.display())))
-                }
-            }
+        // An advisory lock on a fixed file: the kernel releases it when the
+        // holder exits, so there is no stale lock to judge or remove, and two
+        // runs can never both hold it.
+        match host.try_lock(&path, &host.own_pid().to_string()) {
+            Ok(true) => Ok(Lock { host, path }),
+            Ok(false) => Err(TakeoverError::Locked(path)),
+            Err(error) => Err(TakeoverError::Io(format!("{}: {error}", path.display()))),
         }
-        Err(TakeoverError::Locked(path))
-    }
-}
-
-/// The lock names a process that no longer runs this program.
-fn lock_is_stale(host: &dyn Host, path: &Path) -> bool {
-    let Ok(text) = host.read_to_string(path) else {
-        return false;
-    };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        // Not written by us (or cut short): treat as stale.
-        return true;
-    };
-    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
-    if !host.exists(&proc_dir) {
-        return true;
-    }
-    // A reused pid running another program does not hold the lock.
-    let own = PathBuf::from(format!("/proc/{}/exe", host.own_pid()));
-    match (host.read_link(&proc_dir.join("exe")), host.read_link(&own)) {
-        (Ok(holder), Ok(own)) => holder != own,
-        _ => false,
     }
 }
 
 impl Drop for Lock<'_> {
     fn drop(&mut self) {
-        let _ = self.host.remove_file(&self.path);
+        self.host.unlock(&self.path);
     }
 }
 
@@ -676,6 +648,7 @@ fn end_processes(
             cwd: process.cwd.clone(),
             uid: process.uid,
             gid: process.gid,
+            groups: process.groups.clone(),
             // Only our own services start it again on rollback; a process
             // started by hand, rc.local or cron is restarted as it was.
             restart: process.unit.is_none(),
@@ -783,6 +756,18 @@ pub fn takeover(
             break;
         }
     }
+    // Units that are not the program's own but run it (cron, rc-local, a
+    // wrapper the profile does not name). Only their process is ended; if
+    // one restarts it, that shows only after its restart delay.
+    let host_units: BTreeSet<String> = {
+        let mut processes = scan_processes(host, profile);
+        classify_units(&mut processes, &owned_units);
+        processes
+            .into_iter()
+            .filter(|process| !process.contained)
+            .filter_map(|process| process.host_unit)
+            .collect()
+    };
     if failure.is_none() {
         for result in end_processes(host, profile, &owned_units) {
             match result {
@@ -805,13 +790,34 @@ pub fn takeover(
         }
     }
     if failure.is_none() {
+        match restart_wait_ms(host, &host_units) {
+            Ok(wait) if wait > 0 => host.sleep_ms(wait),
+            Ok(_) => {}
+            Err(error) => {
+                report.steps.push(StepReport {
+                    step: "verify".into(),
+                    ok: false,
+                    detail: Some(error.clone()),
+                });
+                failure = Some(error);
+            }
+        }
+    }
+    if failure.is_none() {
         let left: Vec<u32> = scan_processes(host, profile)
             .iter()
             .filter(|process| !process.contained)
             .map(|process| process.pid)
             .collect();
         if !left.is_empty() {
-            let error = format!("processes still running after takeover: {left:?}");
+            let error = if host_units.is_empty() {
+                format!("processes still running after takeover: {left:?}")
+            } else {
+                format!(
+                    "processes still running after takeover: {left:?}; if {} starts the program again, name it in the profile's detect.services",
+                    host_units.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
             report.steps.push(StepReport {
                 step: "verify".into(),
                 ok: false,
@@ -953,6 +959,7 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             cwd,
             uid,
             gid,
+            groups,
             restart,
             pid,
             ..
@@ -968,10 +975,125 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
                     cwd: cwd.clone(),
                     uid: *uid,
                     gid: *gid,
+                    groups: groups.clone(),
                 })
                 .map_err(|error| format!("restarting process {pid}: {error}"))?;
-            Ok(format!("restarted process {pid} as {new_pid}"))
+            Ok(match own_scope(host, new_pid) {
+                Ok(Some(scope)) => format!("restarted process {pid} as {new_pid} in {scope}"),
+                Ok(None) => format!("restarted process {pid} as {new_pid}"),
+                // Running, only still in our cgroup: worth knowing, not a failure.
+                Err(error) => format!(
+                    "restarted process {pid} as {new_pid}; it stays in this program's cgroup ({error})"
+                ),
+            })
         }
+    }
+}
+
+/// The longest restart delay a host unit may have; a takeover does not wait
+/// longer to see whether the program comes back.
+const MAX_RESTART_WAIT_MS: u64 = 60_000;
+/// Margin after a unit's restart delay before the final check.
+const RESTART_MARGIN_MS: u64 = 2_000;
+
+/// How long to wait before the final check so that a host unit that
+/// restarts the program has done so. A unit whose delay is unknown or too
+/// long fails the takeover rather than report it done on a guess.
+fn restart_wait_ms(host: &dyn Host, units: &BTreeSet<String>) -> Result<u64, String> {
+    let mut wait = 0;
+    for unit in units {
+        let output = host
+            .run(
+                "systemctl",
+                &["show", unit.as_str(), "-p", "Restart", "-p", "RestartUSec"],
+            )
+            .map_err(|error| format!("systemctl show {unit}: {error}"))?;
+        if !output.success() {
+            return Err(format!("systemctl show {unit} failed"));
+        }
+        let value = |key: &str| {
+            output
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                .map(str::trim)
+        };
+        match value("Restart") {
+            Some("no") => continue,
+            Some(_) => {}
+            None => return Err(format!("{unit}: restart setting unknown")),
+        }
+        let delay = value("RestartUSec")
+            .and_then(timespan_ms)
+            .filter(|delay| *delay <= MAX_RESTART_WAIT_MS)
+            .ok_or_else(|| {
+                format!("{unit} restarts what it runs after an unknown or long delay; name it in the profile's detect.services")
+            })?;
+        wait = wait.max(delay + RESTART_MARGIN_MS);
+    }
+    Ok(wait)
+}
+
+/// Parses a systemd time span as `systemctl show` prints it: `100ms`,
+/// `5s`, `1min 30s`, `0`.
+fn timespan_ms(text: &str) -> Option<u64> {
+    let mut total_us: u64 = 0;
+    for part in text.split_whitespace() {
+        let digits = part
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(part.len());
+        let (number, unit) = part.split_at(digits);
+        let number: u64 = number.parse().ok()?;
+        let scale: u64 = match unit {
+            "" | "s" | "sec" => 1_000_000,
+            "us" | "usec" => 1,
+            "ms" | "msec" => 1_000,
+            "min" | "m" => 60_000_000,
+            "h" | "hr" => 3_600_000_000,
+            _ => return None,
+        };
+        total_us = total_us.checked_add(number.checked_mul(scale)?)?;
+    }
+    Some(total_us.div_ceil(1_000))
+}
+
+/// On systemd hosts, moves a restarted process into a transient scope of
+/// its own, so it does not live in the cgroup of whoever ran the rollback
+/// (an SSH session, the Agent's service) and end with it.
+fn own_scope(host: &dyn Host, pid: u32) -> Result<Option<String>, String> {
+    if !host.exists(Path::new("/run/systemd/system")) {
+        return Ok(None);
+    }
+    let scope = format!("anixops-mesh-restored-{pid}.scope");
+    let pid_text = pid.to_string();
+    let output = host
+        .run(
+            "busctl",
+            &[
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartTransientUnit",
+                "ssa(sv)a(sa(sv))",
+                &scope,
+                "fail",
+                "2",
+                "PIDs",
+                "au",
+                "1",
+                &pid_text,
+                "CollectMode",
+                "s",
+                "inactive-or-failed",
+                "0",
+            ],
+        )
+        .map_err(|error| format!("busctl: {error}"))?;
+    if output.success() {
+        Ok(Some(scope))
+    } else {
+        Err(format!("busctl exited with {:?}", output.code))
     }
 }
 
@@ -1156,13 +1278,21 @@ mod tests {
                 ..
             }
         )));
-        // The lock is released.
-        assert!(!host.exists(&Path::new(STATE).join(LOCK)));
+        // The lock is released (its file stays).
+        assert!(host.locks.borrow().is_empty());
 
         host.ran.borrow_mut().clear();
         let rollback = rollback(&host, Path::new(STATE)).unwrap();
         assert!(rollback.ok, "{rollback:?}");
-        let ran = host.ran.borrow().clone();
+        let mut ran = host.ran.borrow().clone();
+        // The restarted process gets a scope of its own first.
+        let scope = ran.remove(0);
+        assert!(
+            scope.starts_with("busctl call org.freedesktop.systemd1")
+                && scope.contains("StartTransientUnit")
+                && scope.contains("PIDs au 1 "),
+            "{scope}"
+        );
         assert_eq!(
             ran,
             vec![
@@ -1232,10 +1362,9 @@ mod tests {
     #[test]
     fn a_second_run_is_refused_while_locked() {
         let host = machine();
-        // Pid 99 runs this program (the fake's own pid is 1).
-        host.link("/proc/1/exe", "/usr/local/bin/anixops-mesh");
-        host.link("/proc/99/exe", "/usr/local/bin/anixops-mesh");
-        host.file(&format!("{STATE}/{LOCK}"), "99");
+        host.held_by_others
+            .borrow_mut()
+            .insert(Path::new(STATE).join(LOCK));
         assert!(matches!(
             takeover(&host, &demo(), Path::new(STATE), false),
             Err(TakeoverError::Locked(_))
@@ -1247,19 +1376,18 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_lock_is_removed() {
+    fn a_lock_file_left_behind_does_not_block() {
         let host = machine();
         host.signal(100, Signal::Kill).unwrap();
-        host.link("/proc/1/exe", "/usr/local/bin/anixops-mesh");
-        // Left by a run that was killed: pid 4242 is gone.
+        // Left by a run that was killed: the file stays, its lock went with
+        // the process.
         host.file(&format!("{STATE}/{LOCK}"), "4242");
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::Done, "{report:?}");
-        assert!(!host.exists(&Path::new(STATE).join(LOCK)));
-        // A reused pid running something else does not hold it either.
-        host.link("/proc/77/exe", "/usr/sbin/sshd");
-        host.file(&format!("{STATE}/{LOCK}"), "77");
+        // Released after the run, and the next run takes it again.
+        assert!(host.locks.borrow().is_empty());
         assert!(rollback(&host, Path::new(STATE)).unwrap().ok);
+        assert!(host.locks.borrow().is_empty());
     }
 
     #[test]
@@ -1275,7 +1403,7 @@ mod tests {
         );
         host.file(
             "/proc/200/status",
-            "Name:\tdemo-meshd\nUid:\t1000\t1000\t1000\t1000\nGid:\t100\t100\t100\t100\n",
+            "Name:\tdemo-meshd\nUid:\t1000\t1000\t1000\t1000\nGid:\t100\t100\t100\t100\nGroups:\t27 100 998 \n",
         );
         host.file(
             "/lib/systemd/system/rc-local.service",
@@ -1285,6 +1413,11 @@ mod tests {
             "systemctl show rc-local.service -p LoadState -p FragmentPath -p DropInPaths -p UnitFileState -p ActiveState",
             0,
             "LoadState=loaded\nFragmentPath=/lib/systemd/system/rc-local.service\nDropInPaths=\nUnitFileState=static\nActiveState=active\n",
+        );
+        host.answer(
+            "systemctl show rc-local.service -p Restart -p RestartUSec",
+            0,
+            "Restart=no\nRestartUSec=100ms\n",
         );
         host.signal(100, Signal::Kill).unwrap();
         host.signals.borrow_mut().clear();
@@ -1306,10 +1439,78 @@ mod tests {
         assert_eq!(spawned.len(), 1);
         assert_eq!(spawned[0].uid, Some(1000));
         assert_eq!(spawned[0].gid, Some(100));
+        assert_eq!(spawned[0].groups, Some(vec![27, 100, 998]));
         assert!(spawned[0].clear_env);
         assert!(spawned[0]
             .env
             .contains(&("PATH".to_string(), "/usr/bin".to_string())));
+    }
+
+    #[test]
+    fn parses_restart_delays() {
+        assert_eq!(timespan_ms("100ms"), Some(100));
+        assert_eq!(timespan_ms("5s"), Some(5_000));
+        assert_eq!(timespan_ms("1min 30s"), Some(90_000));
+        assert_eq!(timespan_ms("0"), Some(0));
+        assert_eq!(timespan_ms("1w"), None);
+    }
+
+    #[test]
+    fn a_host_unit_that_restarts_the_program_fails_the_takeover() {
+        let host = machine();
+        host.signal(100, Signal::Kill).unwrap();
+        // A wrapper unit the profile does not name runs the program.
+        host.process(
+            300,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab"],
+            &[],
+            "0::/system.slice/office-vpn.service\n",
+        );
+        host.answer(
+            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            0,
+            "Restart=always\nRestartUSec=5s\n",
+        );
+        // It comes back after the delay.
+        host.respawn_after_sleep.borrow_mut().push((
+            301,
+            "/opt/demo-meshd".into(),
+            "0::/system.slice/office-vpn.service\n".into(),
+        ));
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(host.slept.borrow().iter().any(|ms| *ms >= 7_000));
+        let verify = report
+            .steps
+            .iter()
+            .find(|step| step.step == "verify")
+            .unwrap();
+        assert!(verify
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("office-vpn.service"));
+    }
+
+    #[test]
+    fn a_host_unit_with_a_long_restart_delay_is_not_guessed() {
+        let host = machine();
+        host.signal(100, Signal::Kill).unwrap();
+        host.process(
+            300,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab"],
+            &[],
+            "0::/system.slice/office-vpn.service\n",
+        );
+        host.answer(
+            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            0,
+            "Restart=on-failure\nRestartUSec=5min\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
     }
 
     #[test]
