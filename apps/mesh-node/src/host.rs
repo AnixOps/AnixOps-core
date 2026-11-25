@@ -125,6 +125,84 @@ pub trait Host {
     fn spawn_detached(&self, spawn: &Spawn, hold: Option<Hold<'_>>) -> io::Result<Spawned>;
     fn sleep_ms(&self, ms: u64);
     fn own_pid(&self) -> u32;
+    /// Every process id, where processes are not files under `/proc`
+    /// (macOS, Windows). Elsewhere the program reads `/proc` instead.
+    fn list_pids(&self) -> io::Result<Vec<u32>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no process table on this system",
+        ))
+    }
+    /// What a process runs and as whom, where processes are not files
+    /// under `/proc` (macOS, Windows). `NotFound` once it is gone.
+    fn process_info(&self, _pid: u32) -> io::Result<ProcInfo> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no process table on this system",
+        ))
+    }
+}
+
+/// Environment variables as name and value, in order.
+pub type Environ = Vec<(String, String)>;
+
+/// A process as the system's process table describes it (macOS and
+/// Windows).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcInfo {
+    /// The program file; `None` when it cannot be read.
+    pub exe: Option<String>,
+    /// Full argv; empty when it cannot be read.
+    pub argv: Vec<String>,
+    pub environ: Vec<(String, String)>,
+    /// Real user and group; `None` when they cannot be read.
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// The user's groups, as a login gives them.
+    pub groups: Option<Vec<u32>>,
+    pub cwd: Option<String>,
+    /// The parent process (Windows).
+    pub ppid: Option<u32>,
+    /// The account it runs as, as a SID string (Windows), where there are
+    /// no user ids.
+    pub sid: Option<String>,
+}
+
+#[cfg(windows)]
+fn split_windows_command_line_of(line: &str) -> Vec<String> {
+    crate::cmdline::split_windows_command_line(line)
+}
+
+/// Splits the `KERN_PROCARGS2` buffer of a macOS process: the argument
+/// count (a native-endian 32-bit integer), the program path, padding, then
+/// the arguments and the environment, each ending in NUL. `None` when the
+/// buffer is shorter than its own count says.
+pub fn parse_procargs2(buffer: &[u8]) -> Option<(Vec<String>, Environ)> {
+    let count = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let count = usize::try_from(count).ok()?;
+    let mut rest = &buffer[4..];
+    // The program path, then the NULs that pad it.
+    let end = rest.iter().position(|byte| *byte == 0)?;
+    rest = &rest[end..];
+    let start = rest.iter().position(|byte| *byte != 0)?;
+    rest = &rest[start..];
+    let mut strings = rest.split(|byte| *byte == 0);
+    let mut argv = Vec::with_capacity(count);
+    for _ in 0..count {
+        argv.push(String::from_utf8_lossy(strings.next()?).into_owned());
+    }
+    let mut environ = Vec::new();
+    for string in strings {
+        // The environment ends at the first empty string.
+        if string.is_empty() {
+            break;
+        }
+        let text = String::from_utf8_lossy(string);
+        if let Some((name, value)) = text.split_once('=') {
+            environ.push((name.to_string(), value.to_string()));
+        }
+    }
+    Some((argv, environ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,11 +688,38 @@ impl Host for RealHost {
         }
     }
 
-    #[cfg(not(unix))]
+    /// Windows has no signals: TERM asks the process to close
+    /// (`taskkill` without `/F`, which reaches programs with a window),
+    /// KILL ends it with `TerminateProcess`.
+    #[cfg(windows)]
+    fn signal(&self, pid: u32, signal: Signal) -> io::Result<bool> {
+        if pid <= 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to end a system process",
+            ));
+        }
+        match signal {
+            Signal::Terminate => {
+                if windows::process_info(pid)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                {
+                    return Ok(false);
+                }
+                // A program with no window cannot be asked; the caller then
+                // waits and ends it.
+                let _ = self.run("taskkill", &["/PID", &pid.to_string()]);
+                Ok(true)
+            }
+            Signal::Kill => windows::terminate(pid),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn signal(&self, _pid: u32, _signal: Signal) -> io::Result<bool> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "process signals are only implemented on Unix",
+            "process signals are not implemented on this system",
         ))
     }
 
@@ -640,6 +745,14 @@ impl Host for RealHost {
         }
         if let Some(cwd) = &spawn.cwd {
             command.current_dir(cwd);
+        }
+        // Not tied to this program's console, and not ended with it.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
         #[cfg(target_os = "linux")]
         let handshake = match hold {
@@ -709,6 +822,597 @@ impl Host for RealHost {
 
     fn own_pid(&self) -> u32 {
         std::process::id()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn list_pids(&self) -> io::Result<Vec<u32>> {
+        darwin::list_pids()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_info(&self, pid: u32) -> io::Result<ProcInfo> {
+        darwin::process_info(pid)
+    }
+
+    #[cfg(windows)]
+    fn list_pids(&self) -> io::Result<Vec<u32>> {
+        windows::list_pids()
+    }
+
+    #[cfg(windows)]
+    fn process_info(&self, pid: u32) -> io::Result<ProcInfo> {
+        windows::process_info(pid)
+    }
+}
+
+/// The Windows process table: the program path, the command line, and the
+/// working directory and environment read from the process's own
+/// parameters block, so a restart on rollback is exact.
+#[cfg(windows)]
+mod windows {
+    use super::{split_windows_command_line_of, Environ, ProcInfo};
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem::{size_of, MaybeUninit};
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation,
+    };
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE,
+        UNICODE_STRING,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE, PROCESS_VM_READ,
+    };
+
+    /// Closes the handle when dropped.
+    struct Handle(HANDLE);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is open and owned here.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// `NotFound` for a process that is gone, the OS error otherwise.
+    fn open_error() -> io::Error {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            io::Error::from(io::ErrorKind::NotFound)
+        } else {
+            error
+        }
+    }
+
+    fn open(pid: u32, access: u32) -> io::Result<Handle> {
+        // SAFETY: OpenProcess has no memory-safety preconditions.
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle.is_null() {
+            return Err(open_error());
+        }
+        Ok(Handle(handle))
+    }
+
+    fn snapshot() -> io::Result<Vec<PROCESSENTRY32W>> {
+        // SAFETY: no pointers are passed.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = Handle(snapshot);
+        let mut entries = Vec::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `entry` is a PROCESSENTRY32W with dwSize set.
+        let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+        while more {
+            entries.push(entry);
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+        }
+        Ok(entries)
+    }
+
+    pub(super) fn list_pids() -> io::Result<Vec<u32>> {
+        Ok(snapshot()?
+            .into_iter()
+            .map(|entry| entry.th32ProcessID)
+            // The idle and system processes.
+            .filter(|pid| *pid > 4)
+            .collect())
+    }
+
+    fn program_path(process: &Handle) -> Option<String> {
+        let mut buffer = vec![0u16; 32 * 1024];
+        let mut len = buffer.len() as u32;
+        // SAFETY: the buffer holds `len` UTF-16 units.
+        let ok = unsafe {
+            QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len)
+        };
+        if ok == 0 {
+            return None;
+        }
+        String::from_utf16(&buffer[..len as usize]).ok()
+    }
+
+    fn command_line(process: &Handle) -> Option<String> {
+        let mut needed = 0u32;
+        // SAFETY: a zero-length query only reports the size.
+        unsafe {
+            NtQueryInformationProcess(
+                process.0,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        if (needed as usize) < size_of::<UNICODE_STRING>() || needed > 1 << 20 {
+            return None;
+        }
+        // u64 words keep the UNICODE_STRING at its alignment.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: the buffer holds `needed` bytes.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process.0,
+                ProcessCommandLineInformation,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if status < 0 {
+            return None;
+        }
+        // SAFETY: on success the buffer starts with a UNICODE_STRING whose
+        // text lies inside the same buffer.
+        let text = unsafe {
+            let string = &*(buffer.as_ptr() as *const UNICODE_STRING);
+            if string.Buffer.is_null() {
+                return Some(String::new());
+            }
+            std::slice::from_raw_parts(string.Buffer, string.Length as usize / 2)
+        };
+        String::from_utf16(text).ok()
+    }
+
+    /// PROCESS_BASIC_INFORMATION.
+    #[repr(C)]
+    struct BasicInformation {
+        exit_status: i32,
+        peb: *mut c_void,
+        affinity_mask: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        inherited_from: usize,
+    }
+
+    /// Reads `len` bytes of another process at `address`.
+    fn read_memory(process: &Handle, address: usize, len: usize) -> Option<Vec<u8>> {
+        let mut buffer = vec![0u8; len];
+        let mut read = 0usize;
+        // SAFETY: the buffer holds `len` bytes; the address is in the
+        // other process and only read through the system.
+        let ok = unsafe {
+            ReadProcessMemory(
+                process.0,
+                address as *const c_void,
+                buffer.as_mut_ptr().cast(),
+                len,
+                &mut read,
+            )
+        };
+        (ok != 0 && read == len).then_some(buffer)
+    }
+
+    fn word(bytes: &[u8], offset: usize) -> Option<usize> {
+        Some(usize::from_ne_bytes(
+            bytes
+                .get(offset..offset + size_of::<usize>())?
+                .try_into()
+                .ok()?,
+        ))
+    }
+
+    fn utf16(bytes: &[u8]) -> Option<String> {
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_ne_bytes(*pair))
+            .collect();
+        String::from_utf16(&units).ok()
+    }
+
+    // Offsets in the 64-bit PEB and RTL_USER_PROCESS_PARAMETERS, stable
+    // since Windows Vista; only 64-bit builds are released.
+    const PEB_PROCESS_PARAMETERS: usize = 0x20;
+    const PARAMETERS_CURRENT_DIRECTORY: usize = 0x38;
+    const PARAMETERS_ENVIRONMENT: usize = 0x80;
+    const PARAMETERS_ENVIRONMENT_SIZE: usize = 0x3F0;
+    const PARAMETERS_LEN: usize = 0x3F8;
+    /// Larger environments are not read.
+    const MAX_ENVIRONMENT: usize = 1 << 20;
+
+    /// The working directory and environment from the process parameters.
+    #[cfg(target_pointer_width = "64")]
+    fn parameters(process: &Handle) -> Option<(Option<String>, Environ)> {
+        let mut info = MaybeUninit::<BasicInformation>::zeroed();
+        let mut len = 0u32;
+        // SAFETY: the buffer is a BasicInformation.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process.0,
+                ProcessBasicInformation,
+                info.as_mut_ptr().cast(),
+                size_of::<BasicInformation>() as u32,
+                &mut len,
+            )
+        };
+        if status < 0 {
+            return None;
+        }
+        // SAFETY: the query succeeded and filled the structure.
+        let info = unsafe { info.assume_init() };
+        let peb = read_memory(process, info.peb as usize, PEB_PROCESS_PARAMETERS + 8)?;
+        let parameters = word(&peb, PEB_PROCESS_PARAMETERS)?;
+        let block = read_memory(process, parameters, PARAMETERS_LEN)?;
+        let cwd_len = u16::from_ne_bytes(
+            block
+                .get(PARAMETERS_CURRENT_DIRECTORY..PARAMETERS_CURRENT_DIRECTORY + 2)?
+                .try_into()
+                .ok()?,
+        ) as usize;
+        let cwd_buffer = word(&block, PARAMETERS_CURRENT_DIRECTORY + 8)?;
+        let cwd = read_memory(process, cwd_buffer, cwd_len)
+            .and_then(|bytes| utf16(&bytes))
+            .map(|path| trim_directory(&path));
+        let environment = word(&block, PARAMETERS_ENVIRONMENT)?;
+        let size = word(&block, PARAMETERS_ENVIRONMENT_SIZE)?;
+        let environ = if size == 0 || size > MAX_ENVIRONMENT {
+            Vec::new()
+        } else {
+            let bytes = read_memory(process, environment, size)?;
+            let text = utf16(&bytes[..bytes.len() & !1])?;
+            text.split('\0')
+                .take_while(|entry| !entry.is_empty())
+                // Entries such as `=C:=C:\x` keep per-drive directories.
+                .filter(|entry| !entry.starts_with('='))
+                .filter_map(|entry| entry.split_once('='))
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect()
+        };
+        Some((cwd, environ))
+    }
+
+    #[cfg(not(target_pointer_width = "64"))]
+    fn parameters(_process: &Handle) -> Option<(Option<String>, Environ)> {
+        None
+    }
+
+    /// `C:\dir\` as `C:\dir`; a drive root keeps its separator.
+    fn trim_directory(path: &str) -> String {
+        let trimmed = path.trim_end_matches('\\');
+        if trimmed.len() == 2 && trimmed.ends_with(':') {
+            format!("{trimmed}\\")
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn account(process: &Handle) -> Option<String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `token` receives a handle we then own.
+        if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let token = Handle(token);
+        let mut buffer = vec![0u64; 64];
+        let mut len = 0u32;
+        // SAFETY: the buffer holds 512 bytes, aligned for TOKEN_USER.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        // SAFETY: on success the buffer starts with a TOKEN_USER.
+        let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` points into `buffer`; `text` is allocated by the
+        // system and freed below.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return None;
+        }
+        // SAFETY: `text` is a NUL-terminated wide string.
+        let string = unsafe {
+            let mut len = 0;
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16(std::slice::from_raw_parts(text, len)).ok()
+        };
+        // SAFETY: allocated by ConvertSidToStringSidW.
+        unsafe { LocalFree(text.cast()) };
+        string
+    }
+
+    pub(super) fn process_info(pid: u32) -> io::Result<ProcInfo> {
+        let ppid = snapshot()?
+            .into_iter()
+            .find(|entry| entry.th32ProcessID == pid)
+            .map(|entry| entry.th32ParentProcessID)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let limited = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let exe = program_path(&limited);
+        let line = command_line(&limited);
+        let sid = account(&limited);
+        // Reading the parameters block needs more access; without it the
+        // working directory and environment stay unknown.
+        let (cwd, environ) = open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
+            .ok()
+            .and_then(|full| parameters(&full))
+            .unwrap_or_default();
+        Ok(ProcInfo {
+            exe,
+            argv: line
+                .map(|line| split_windows_command_line_of(&line))
+                .unwrap_or_default(),
+            environ,
+            uid: None,
+            gid: None,
+            groups: None,
+            cwd,
+            ppid: Some(ppid),
+            sid,
+        })
+    }
+
+    pub(super) fn terminate(pid: u32) -> io::Result<bool> {
+        let process = match open(pid, PROCESS_TERMINATE) {
+            Ok(process) => process,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        // SAFETY: the handle has PROCESS_TERMINATE.
+        if unsafe { TerminateProcess(process.0, 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(true)
+    }
+}
+
+/// The macOS process table, read through libproc and sysctl: the program
+/// path, arguments and environment exactly as the kernel holds them.
+#[cfg(target_os = "macos")]
+mod darwin {
+    use super::{parse_procargs2, Environ, ProcInfo};
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::mem::{size_of, MaybeUninit};
+
+    fn pid_arg(pid: u32) -> io::Result<libc::c_int> {
+        libc::c_int::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))
+    }
+
+    /// `NotFound` for a process that is gone, the OS error otherwise.
+    fn os_error() -> io::Error {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            io::Error::from(io::ErrorKind::NotFound)
+        } else {
+            error
+        }
+    }
+
+    pub(super) fn list_pids() -> io::Result<Vec<u32>> {
+        // SAFETY: a null buffer asks only for the count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Room for processes started since the count.
+        let mut pids: Vec<libc::c_int> = vec![0; count as usize + 256];
+        let bytes = libc::c_int::try_from(pids.len() * size_of::<libc::c_int>())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many processes"))?;
+        // SAFETY: the buffer holds `bytes` bytes.
+        let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        pids.truncate((got as usize).min(pids.len()));
+        Ok(pids
+            .into_iter()
+            .filter_map(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .collect())
+    }
+
+    fn bsd_info(pid: libc::c_int) -> io::Result<libc::proc_bsdinfo> {
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer is a proc_bsdinfo of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if got != size {
+            return Err(os_error());
+        }
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        Ok(unsafe { info.assume_init() })
+    }
+
+    fn program_path(pid: libc::c_int) -> Option<String> {
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the buffer holds PROC_PIDPATHINFO_MAXSIZE bytes.
+        let len =
+            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if len <= 0 {
+            return None;
+        }
+        buffer.truncate(len as usize);
+        String::from_utf8(buffer).ok()
+    }
+
+    fn arguments(pid: libc::c_int) -> Option<(Vec<String>, Environ)> {
+        let mut max: libc::c_int = 0;
+        let mut size = size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `max` is a c_int and `size` its size.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut max as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || max <= 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; max as usize];
+        let mut size = buffer.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: the buffer holds `size` bytes; sysctl writes at most that
+        // and sets `size` to what it wrote.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        buffer.truncate(size);
+        parse_procargs2(&buffer)
+    }
+
+    fn working_directory(pid: libc::c_int) -> Option<String> {
+        let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+        let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: the buffer is a proc_vnodepathinfo of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if got != size {
+            return None;
+        }
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        let info = unsafe { info.assume_init() };
+        let bytes: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .iter()
+            .flatten()
+            .map(|byte| *byte as u8)
+            .take_while(|byte| *byte != 0)
+            .collect();
+        if bytes.is_empty() {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    /// The groups a login as this user gets, which is what launchd and a
+    /// shell started as the user give its processes.
+    fn login_groups(uid: u32, gid: u32) -> Option<Vec<u32>> {
+        let mut record = MaybeUninit::<libc::passwd>::zeroed();
+        let mut text = vec![0 as libc::c_char; 16 * 1024];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every buffer outlives the call and has the size passed.
+        let result = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                text.as_mut_ptr(),
+                text.len(),
+                &mut found,
+            )
+        };
+        if result != 0 || found.is_null() {
+            return None;
+        }
+        // SAFETY: getpwuid_r succeeded, so the record and its name are set.
+        let name: CString = unsafe { CStr::from_ptr((*found).pw_name) }.to_owned();
+        let mut count: libc::c_int = 64;
+        loop {
+            let mut groups: Vec<libc::c_int> = vec![0; count as usize];
+            let mut got = count;
+            // SAFETY: `groups` holds `got` entries.
+            let result = unsafe {
+                libc::getgrouplist(
+                    name.as_ptr(),
+                    gid as libc::c_int,
+                    groups.as_mut_ptr(),
+                    &mut got,
+                )
+            };
+            if result == 0 {
+                groups.truncate((got as usize).min(groups.len()));
+                return Some(groups.into_iter().map(|group| group as u32).collect());
+            }
+            if count >= 4096 {
+                return None;
+            }
+            count *= 4;
+        }
+    }
+
+    pub(super) fn process_info(pid: u32) -> io::Result<ProcInfo> {
+        let pid = pid_arg(pid)?;
+        let info = bsd_info(pid)?;
+        let (argv, environ) = arguments(pid).unwrap_or_default();
+        let (uid, gid) = (info.pbi_ruid, info.pbi_rgid);
+        Ok(ProcInfo {
+            exe: program_path(pid),
+            argv,
+            environ,
+            uid: Some(uid),
+            gid: Some(gid),
+            groups: login_groups(uid, gid),
+            cwd: working_directory(pid),
+            ppid: Some(info.pbi_ppid),
+            sid: None,
+        })
     }
 }
 
@@ -1022,6 +1726,9 @@ pub(crate) mod fake {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
 
+    /// A launchd job: job file, process, loaded.
+    pub(crate) type FakeJob = (String, Option<u32>, bool);
+
     #[derive(Default)]
     pub(crate) struct FakeHost {
         pub files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
@@ -1049,6 +1756,12 @@ pub(crate) mod fake {
         /// Processes (pid, argv, cgroup) that appear at the next wait of a
         /// second or more.
         pub respawn_after_sleep: RefCell<Vec<(u32, Vec<String>, String)>>,
+        /// A process table instead of `/proc` (macOS), when set.
+        pub table: RefCell<Option<BTreeMap<u32, ProcInfo>>>,
+        /// launchd jobs by "domain/label": job file, process, loaded.
+        pub launchd: RefCell<BTreeMap<String, FakeJob>>,
+        /// Processes that exit when a command runs ("program arg arg").
+        pub exits_on: RefCell<BTreeMap<String, Vec<u32>>>,
     }
 
     impl FakeHost {
@@ -1099,6 +1812,100 @@ pub(crate) mod fake {
             self.alive.borrow_mut().insert(pid);
         }
 
+        /// A running process in the process table (macOS), run by `uid`.
+        pub fn table_process(&self, pid: u32, exe: &str, argv: &[&str], env: &[&str], uid: u32) {
+            let info = ProcInfo {
+                exe: Some(exe.to_string()),
+                argv: argv.iter().map(|arg| arg.to_string()).collect(),
+                environ: env
+                    .iter()
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+                uid: Some(uid),
+                gid: Some(20),
+                groups: Some(vec![20]),
+                cwd: Some("/".into()),
+                ppid: Some(1),
+                sid: None,
+            };
+            self.table
+                .borrow_mut()
+                .get_or_insert_with(BTreeMap::new)
+                .insert(pid, info);
+            self.alive.borrow_mut().insert(pid);
+        }
+
+        /// A running process in the process table (Windows), run by the
+        /// account `sid` and started by `ppid`.
+        pub fn windows_process(&self, pid: u32, exe: &str, argv: &[&str], sid: &str, ppid: u32) {
+            let info = ProcInfo {
+                exe: Some(exe.to_string()),
+                argv: argv.iter().map(|arg| arg.to_string()).collect(),
+                environ: vec![("SystemRoot".into(), r"C:\Windows".into())],
+                cwd: Some(r"C:\".into()),
+                ppid: Some(ppid),
+                sid: Some(sid.to_string()),
+                ..ProcInfo::default()
+            };
+            self.table
+                .borrow_mut()
+                .get_or_insert_with(BTreeMap::new)
+                .insert(pid, info);
+            self.alive.borrow_mut().insert(pid);
+        }
+
+        /// launchctl for the jobs in `launchd`; `None` for anything else.
+        fn launchctl(&self, program: &str, args: &[&str]) -> Option<CommandOutput> {
+            if program != "launchctl" {
+                return None;
+            }
+            let done = |code: i32, stdout: String| {
+                Some(CommandOutput {
+                    code: Some(code),
+                    stdout,
+                    stderr: String::new(),
+                })
+            };
+            match args {
+                ["print", target] => {
+                    let jobs = self.launchd.borrow();
+                    let (_, pid, loaded) = jobs.get(*target)?;
+                    if !loaded {
+                        return done(113, String::new());
+                    }
+                    let pid = pid
+                        .map(|pid| format!("\tpid = {pid}\n"))
+                        .unwrap_or_default();
+                    done(0, format!("{target} = {{\n\tstate = running\n{pid}}}\n"))
+                }
+                ["bootout", target] => {
+                    let pid = {
+                        let mut jobs = self.launchd.borrow_mut();
+                        let job = jobs.get_mut(*target)?;
+                        if !job.2 {
+                            return done(113, String::new());
+                        }
+                        job.2 = false;
+                        job.1.take()
+                    };
+                    if let Some(pid) = pid {
+                        self.remove_process(pid);
+                    }
+                    done(0, String::new())
+                }
+                ["bootstrap", domain, plist] => {
+                    let mut jobs = self.launchd.borrow_mut();
+                    let (_, job) = jobs.iter_mut().find(|(target, job)| {
+                        target.starts_with(&format!("{domain}/")) && job.0 == *plist
+                    })?;
+                    job.2 = true;
+                    done(0, String::new())
+                }
+                _ => None,
+            }
+        }
+
         fn add_parents(&self, path: &Path) {
             let mut dirs = self.dirs.borrow_mut();
             let mut current = path.parent();
@@ -1118,6 +1925,9 @@ pub(crate) mod fake {
                 .retain(|path, _| !path.starts_with(&base));
             self.dirs.borrow_mut().remove(&base);
             self.alive.borrow_mut().remove(&pid);
+            if let Some(table) = self.table.borrow_mut().as_mut() {
+                table.remove(&pid);
+            }
         }
     }
 
@@ -1230,6 +2040,13 @@ pub(crate) mod fake {
                 key.push_str(arg);
             }
             self.ran.borrow_mut().push(key.clone());
+            let exiting = self.exits_on.borrow_mut().remove(&key).unwrap_or_default();
+            for pid in exiting {
+                self.remove_process(pid);
+            }
+            if let Some(output) = self.launchctl(program, args) {
+                return Ok(output);
+            }
             // systemd moving a process into a new scope.
             if program == "busctl" && args.contains(&"StartTransientUnit") {
                 if let (Some(scope), Some(pid)) = (args.get(6), args.get(12)) {
@@ -1295,5 +2112,105 @@ pub(crate) mod fake {
         fn own_pid(&self) -> u32 {
             1
         }
+
+        fn list_pids(&self) -> io::Result<Vec<u32>> {
+            match self.table.borrow().as_ref() {
+                Some(table) => Ok(table.keys().copied().collect()),
+                None => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            }
+        }
+
+        fn process_info(&self, pid: u32) -> io::Result<ProcInfo> {
+            match self.table.borrow().as_ref() {
+                Some(table) => table
+                    .get(&pid)
+                    .cloned()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)),
+                None => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod procargs_tests {
+    use super::parse_procargs2;
+
+    fn buffer(count: i32, rest: &[u8]) -> Vec<u8> {
+        let mut out = count.to_ne_bytes().to_vec();
+        out.extend_from_slice(rest);
+        out
+    }
+
+    #[test]
+    fn arguments_and_environment_are_split_exactly() {
+        let bytes = buffer(
+            3,
+            b"/usr/local/bin/demo\0\0\0\0demo\0-c\0/etc/a b.toml\0HOME=/var/root\0A=1=2\0\0junk\0",
+        );
+        let (argv, environ) = parse_procargs2(&bytes).unwrap();
+        assert_eq!(argv, ["demo", "-c", "/etc/a b.toml"]);
+        assert_eq!(
+            environ,
+            [
+                ("HOME".to_string(), "/var/root".to_string()),
+                ("A".to_string(), "1=2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_buffer_is_not_guessed() {
+        assert_eq!(parse_procargs2(&buffer(3, b"/bin/x\0\0x\0")), None);
+        assert_eq!(parse_procargs2(b"\x01\x00"), None);
+        assert_eq!(parse_procargs2(&buffer(-1, b"/bin/x\0\0x\0")), None);
+    }
+}
+
+/// The real Windows process table, read for a child we start.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::{Host, RealHost, Signal};
+    use std::process::Command;
+
+    #[test]
+    fn a_child_process_is_read_exactly() {
+        let dir = std::env::temp_dir().join(format!("mesh-node-proc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .env("MESH_NODE_TEST", "a b=c")
+            .current_dir(&dir)
+            .spawn()
+            .unwrap();
+        let host = RealHost::default();
+        let pid = child.id();
+        assert!(host.list_pids().unwrap().contains(&pid));
+        let info = host.process_info(pid).unwrap();
+        let exe = info.exe.unwrap().to_ascii_lowercase();
+        assert!(exe.ends_with(r"\cmd.exe"), "{exe}");
+        assert_eq!(info.argv[1..], ["/d", "/c", "ping -n 30 127.0.0.1 >nul"]);
+        assert!(info
+            .environ
+            .contains(&("MESH_NODE_TEST".to_string(), "a b=c".to_string())));
+        let cwd = info.cwd.unwrap().to_ascii_lowercase();
+        let expected = dir.display().to_string().to_ascii_lowercase();
+        assert_eq!(cwd.trim_end_matches('\\'), expected.trim_end_matches('\\'));
+        assert_eq!(info.ppid, Some(std::process::id()));
+        // Run by the same account as this test.
+        let own = host.process_info(std::process::id()).unwrap();
+        assert!(info.sid.is_some());
+        assert_eq!(info.sid, own.sid);
+
+        assert!(host.signal(pid, Signal::Kill).unwrap());
+        child.wait().unwrap();
+        // Our handle keeps the ended process's object; let it go.
+        drop(child);
+        assert_eq!(
+            host.process_info(pid).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!host.signal(pid, Signal::Kill).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

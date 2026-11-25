@@ -11,8 +11,8 @@
 | `capabilities` | 输出版本和本构建支持的子命令（JSON）。安装器只有在列表含 `run` 时才执行接管 | 0 |
 | `detect --profile F` | 列出本机的现有安装（服务、启动脚本、自启行、手动进程、容器）。只输出参数名，不输出任何取值 | 0；2 用法错误 |
 | `import --profile F [--out-dir D] [--report R] [--allow-unencrypted] [--address CIDR] [-- ARGS…]` | 按检测结果（或 `--` 后手动给出的命令行）生成我方配置和导入报告 | 0 全部可用；3 未发现；5 有需确认项；6 有无法自动迁移的实例 |
-| `takeover --profile F --state-dir S [--dry-run] [--report R]` | 停用并停止现有安装，记录到 `S/takeover.json` | 0 完成或无事可做；1 失败且已回滚；7 失败且回滚也失败 |
-| `rollback --state-dir S [--report R]` | 按记录逆序恢复 | 0；7 部分步骤失败 |
+| `takeover --profile F --state-dir S [--dry-run] [--report R]` | 停用并停止现有安装，记录到 `S/takeover.json`。`--dry-run` 只列计划，但同样做改动前的检查 | 0 完成、已计划或无事可做；1 失败且已回滚，或在任何改动之前拒绝（`outcome` 为 `refused`，不写记录）；7 失败且回滚也失败 |
+| `rollback --state-dir S [--forget-process PID… --confirm] [--report R]` | 按记录逆序恢复；`--forget-process` 见下文 | 0；7 部分步骤失败或记录无法保存 |
 
 用法错误、数据文件错误和状态目录错误的退出码为 2，标准错误最后一行是一行 JSON：`{"error":"<类别>","detail":"…"}`。`detail` 只给人看。
 
@@ -29,6 +29,30 @@
 命令行优先取自正在运行的进程（最准确），其次取自服务定义。服务定义里有无法确定的变量展开、或服务启动的是包装脚本时，该实例标为「无法确定启动参数」，需人工处理；报告只给出参数位置，不输出参数取值。
 
 读取的配置文件、单元文件和脚本单个不超过 1 MiB，配置目录不超过 64 个文件；超出时该文件或目录记为无法读取。
+
+## 检测（macOS）
+
+macOS 没有 `/proc`，进程从系统进程表读取：程序路径用 `proc_pidpath`，命令行与环境变量用 `KERN_PROCARGS2`（与内核保存的完全一致），实际用户与组用 `proc_pidinfo`，附加组按该用户登录时的组（`getgrouplist`，与 launchd 和登录 shell 给进程的组一致）。进程表中没有容器、cgroup 与网络命名空间，相关检查在 macOS 上不适用。
+
+| 来源 | 方法 |
+| --- | --- |
+| 系统守护进程 | `/Library/LaunchDaemons/*.plist`，域 `system` |
+| 用户代理 | `/Users/<用户>/Library/LaunchAgents/*.plist`（按用户安装的软件包管理器把服务放在这里），域为文件属主的 `gui/<uid>`；属主为 root 的文件忽略 |
+| 所有用户共用的代理 | `/Library/LaunchAgents/*.plist`：每个登录用户各加载一份，只报告，不接管，列入需人工处理 |
+| 手动进程 | 进程表中程序名匹配、且不属于以上任何任务的进程 |
+
+任务文件用 `plutil -convert json` 读取（XML 与二进制格式都支持），读不出的文件跳过。`Program` 或 `ProgramArguments[0]` 的文件名在 `detect.executables` 里、`sh`/`bash`/`zsh`/`dash -c` 的命令以该程序开头、或 `Label` 在 `detect.services` 里时视为该程序的任务。是否已加载及其进程取自 `launchctl print <域>/<Label>`；是否被关闭取自 `launchctl print-disabled <域>`（`launchctl disable`/`enable` 的覆盖值优先于任务文件的 `Disabled` 键）。命令行优先取自任务的进程，其次取自任务文件。任务的进程是 launchd 给出的 pid，以及任务已加载时命令行与任务完全相同的进程（shell 启动的子进程）。
+
+## 检测（Windows）
+
+进程从系统进程表读取：`CreateToolhelp32Snapshot` 列出进程与父进程，程序路径用 `QueryFullProcessImageNameW`，命令行用 `NtQueryInformationProcess`（按 C 运行库规则拆分），工作目录与完整环境变量从进程参数块读取（64 位），运行账户取自进程令牌（SID）。程序名比较不区分大小写，`name.exe` 与 `name` 相同。
+
+| 来源 | 方法 |
+| --- | --- |
+| 服务 | 一次 PowerShell 查询 `Win32_Service`（名称、命令行、启动方式、状态、进程）。命令行运行该程序、或服务名在 `detect.services` 里（以包装程序启动的服务）时视为该程序的服务；服务的进程是服务进程及其子进程 |
+| 手动进程 | 进程表中程序名匹配、且不属于任何服务的进程 |
+
+计划任务、注册表 `Run` 自启项与启动文件夹在下一步加入；在此之前，它们启动的进程按手动进程处理，接管后如被再次拉起，最后的确认会失败并回滚。
 
 ## 导入（R13、R14、R15）
 
@@ -52,6 +76,8 @@
 | `routing.system_routes` | 只保留内网网段（规范化为网络地址）；其他网段需确认 |
 
 原版节点（未换成我方内核的节点）一律留在 `legacy` 网络，经我方桥接节点与区域网络互通；换成我方内核之后，才能加入 `managed` 网络。部署层不提供跳过桥接、把原版节点直接加入 `managed` 网络的做法。
+
+换成我方内核的节点加入区域网络时，在面板把本机的静态公钥列入该网络的 `native_keys` 之前，该网络处于 `native_keys_pending`（见 `docs/architecture/mesh-status.md`）：不建立链路，但 `anixops-mesh run` 不退出，服务保持运行。部署层、安装脚本与运维不应据此判定安装失败或回滚；以面板列入公钥后网络转为正常为准。
 
 数据文件 `drop` 列出的设置按原因归类：出口、端口转发、本机代理、VPN 接入网关、访问规则为需确认；远程配置服务器和凭据入网为无法迁移；管理接口、压缩、原有内网域名、打洞、限速等只记录。数据文件未覆盖的键、参数和带 `env_prefix` 的环境变量一律列为需确认，不会被默默忽略。位置参数只按位置报告，不输出取值。报告中的对端和监听地址去掉用户名、密码和主机端口之后的部分。
 
@@ -91,18 +117,31 @@ OpenRC 服务只在有运行中的进程时才计划停止。宿主单元的 `Re
 
 `rollback` 逆序恢复：重新启用并启动服务、恢复运行级别、恢复自启行（文件在接管后未被改动、且备份可读时从备份恢复，否则只还原被注释的那一行；该行已被手工还原时视为已恢复）、按原命令行、环境变量和身份（用户、组与附加组）重启手动进程；宿主单元（如 `cron.service`）不会再次启动它，因此宿主单元中的进程同样由本程序重启。systemd 主机上重启的进程在执行程序之前就放入独立的临时 scope（`anixops-mesh-restored-<pid>.scope`，新进程先等待，确认已进入 scope 后才继续），它和它派生的子进程都不随执行回滚的 SSH 会话或 Agent 服务一起结束；无法创建 scope 时进程照常运行，结果中注明。同一程序以相同命令行、相同用户、在容器之外且与原进程同一网络命名空间（接管时记录；旧记录与 PID 1 比较）中已在运行时（例如宿主单元已把它重新拉起）不再启动第二份。挂载命名空间不比较：带 `PrivateTmp=`、`ProtectSystem=` 等选项的单元，以及执行回滚的服务本身，都可能在独立的挂载命名空间中。命令行相同、但程序、用户、cgroup 或网络命名空间读不到（例如安全模块限制）的进程无法判断是否为副本，此时不启动，该步骤保留，之后的 `rollback` 重试。
 
-在其他网络命名空间中运行的进程（例如用 `ip netns exec` 启动）不会被结束：回滚只能在主机网络中重新启动程序，无法放回原命名空间。这项检查在第一步改动之前完成：发现这种进程时报告该进程并直接失败（退出码 1），不备份、不停用服务、不结束任何进程；需要接管时先手工停止它。
+macOS 上的顺序：备份任务文件 → 已加载的任务先 `launchctl bootout <域>/<Label>`（停止并卸载，有的系统版本卸载成功也报错，以 `launchctl print` 确认已不再加载为准）→ 开机仍会加载的任务再 `launchctl disable <域>/<Label>`（已被关闭、或覆盖值不存在且任务文件 `Disabled` 为真时跳过）→ 结束剩余进程。先卸载后关闭，是因为回滚逆序执行，而 launchd 不加载被关闭的任务：回滚先 `launchctl enable`，再 `launchctl bootstrap <域> <任务文件>`（已加载时跳过）。原来没有覆盖值的任务回滚后留下 `enable` 覆盖值，开机行为与原来一致（只有任务文件未关闭时才会被关闭）。属于已接管任务的进程由重新加载任务启动，回滚时不再单独启动；其他进程按原命令行、环境变量与身份重启。结束了任何进程后，先等 launchd 的默认限流间隔 10 秒再加 2 秒，确认没有未列入数据文件的任务把程序重新拉起。用户代理的 `bootstrap` 需要该用户已登录图形会话，否则该步骤保留，之后的 `rollback` 重试。
 
-回滚的某一步始终无法自动完成（例如安全模块一直隐藏同名进程，或旧记录中的进程曾在其他网络命名空间运行）时，`rollback` 每次都以退出码 7 结束并保留记录。此时由操作员手工处理：按报告中的命令行、用户和网络命名空间手工启动该进程（或确认已有副本在运行），然后执行 `anixops-mesh rollback --state-dir S --forget-process <原 pid> --confirm`。该命令把这一记录移除而不启动，再照常撤销其余步骤；不带 `--confirm` 时拒绝执行，原 pid 不在记录中时报错且不做任何改动。移除的进程（pid、程序、命令行、用户、时间）保留在 `takeover.json` 的 `forgotten` 列表里；执行时应同时加 `--report` 保存报告，供事后核对。执行回滚前先停止我方节点。全部恢复后清空记录。
+Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（最长 30 秒）→ 自动、延迟自动或手动启动的服务再 `sc.exe config <名称> start= disabled` → 结束剩余进程（先 `taskkill` 请求关闭，10 秒后 `TerminateProcess`）。先停止后关闭，是因为 Windows 不启动被禁用的服务：回滚先恢复原启动方式，再 `sc.exe start`。驱动类服务（`boot`、`system`）只报告。服务的进程（含包装程序的子进程）由重新启动服务恢复，不单独重启；手动进程按原命令行、工作目录与环境变量重启。Windows 无法在没有密码的情况下以其他账户启动进程，因此由其他账户运行、或读不出运行账户的手动进程不会被结束：这项检查在第一步改动之前完成，发现即失败，由操作员手工停止。结束了任何进程后同样先等 12 秒再确认。
+
+在其他网络命名空间中运行的手动进程（例如用 `ip netns exec` 启动）不会被结束：回滚只能在主机网络中重新启动程序，无法放回原命名空间。程序自身服务中的进程不在此列（例如单元带 `NetworkNamespacePath=`、`PrivateNetwork=`，或 init 脚本以 `ip netns exec` 启动）：它们由服务管理器停止，回滚时由服务管理器在原命名空间重新启动。改动前的检查还包括：Windows 上其他账户运行的手动进程（见上文），以及记录大小，即把所有将被结束的进程（含完整环境变量）写入记录后是否仍在 1 MiB 读取上限内（留 64 KiB 余量），否则回滚无法读回。这些检查在第一步改动之前完成，`--dry-run` 也做：不通过时报告原因并以退出码 1 结束（`outcome` 为 `refused`），不备份、不停用服务、不结束任何进程，也不写记录；需要接管时先手工停止相应进程。安装脚本在写入任何文件之前先以 `--dry-run` 运行这些检查，不通过即终止并保存 `takeover-check.json`。
+
+回滚的某一步始终无法自动完成（例如安全模块一直隐藏同名进程，或旧记录中的进程曾在其他网络命名空间运行）时，`rollback` 每次都以退出码 7 结束并保留记录。此时由操作员手工处理：按报告中的命令行、用户和网络命名空间手工启动该进程（或确认已有副本在运行），然后执行 `anixops-mesh rollback --state-dir S --forget-process <原 pid> --confirm`。该命令把这一记录移除而不启动，再照常撤销其余步骤；不带 `--confirm` 时拒绝执行，原 pid 不在记录中时报错且不做任何改动。移除的进程（pid、程序、命令行、用户、时间）保留在 `takeover.json` 的 `forgotten` 列表里；执行时应同时加 `--report` 保存报告，供事后核对。执行回滚前先停止我方节点。全部恢复后清空记录中的步骤与运行次数，`takeover.json` 本身与 `forgotten` 列表保留（只保留最近 64 条，更早的以各次 `--report` 保存的报告为准）。接管撤销后或回滚后记录无法保存时（例如超过上限），报告中有一条 `ok` 为假的「save record」步骤，退出码 7，此时以本次报告为准手工核对。
 
 ## 安装（Linux）
 
 [`apps/mesh-node/install/install-linux.sh`](../../apps/mesh-node/install/install-linux.sh) 是一条命令安装脚本：下载程序并校验 SHA-256（值由面板生成的安装命令给出），可选下载并校验接管数据文件，执行导入预检；程序支持 `run` 时才接管、注册 systemd 或 OpenRC 服务并启动，启动失败自动停止我方服务并回滚接管。`--uninstall` 停止并删除我方服务后回滚接管。下载只走 https：curl 限定 `--proto =https`，GNU wget 加 `--https-only`（BusyBox wget 不支持跳转限制，由哈希校验兜底）。CI 对脚本做 `sh -n` 与 shellcheck 检查。
 
+## 安装（macOS）
+
+[`apps/mesh-node/install/install-macos.sh`](../../apps/mesh-node/install/install-macos.sh) 与 Linux 脚本流程相同（以 root 运行）：下载并以 `shasum -a 256` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，写入 launchd 系统守护进程 `/Library/LaunchDaemons/com.anixops.mesh.plist`（`plutil -lint` 校验；非正常退出时重启），`launchctl enable` 后 `bootstrap` 启动，5 秒后仍未运行则卸载我方守护进程并回滚接管。`--uninstall` 卸载并删除守护进程后回滚接管。macOS 的 `/etc`、`/var`、`/tmp` 是符号链接，状态目录不能经过链接，因此程序、配置和状态放在 `/usr/local/bin/anixops-mesh` 与 `/Library/AnixOps/mesh`（root 所有，0700），日志写入 `/Library/Logs/anixops-mesh.log`。CI 对脚本做 `sh -n` 与 shellcheck 检查。macOS 程序的发布产物随 Windows 一起加入发布流程。
+
+## 安装（Windows）
+
+[`apps/mesh-node/install/install-windows.ps1`](../../apps/mesh-node/install/install-windows.ps1) 以管理员身份运行，流程与 Linux 脚本相同：下载并以 `Get-FileHash` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，注册服务 `AnixOpsMesh`（自动启动，失败后 5 秒重启），启动 5 秒后仍未运行则删除我方服务并回滚接管。`-Uninstall` 停止并删除服务后回滚接管。程序放在 `%ProgramFiles%\AnixOps\Mesh`，配置与状态放在 `%ProgramData%\AnixOps\Mesh`，后者以 `icacls` 去掉继承、只允许 SYSTEM 与 Administrators 访问。CI 用 PowerShell 解析器检查脚本语法。
+
 ### 尚未覆盖的安全项
 
 - 程序与数据文件只校验面板给出的 SHA-256，尚未校验发布签名；面板应以构建证明（`actions/attest`）核对发布产物后再生成安装命令。签名校验与一次性入网凭据流程在内核 0.4 与上报一起设计。
 - `run` 启动前与现有程序的端口、网卡冲突检查属于节点运行侧（退出码 3），见 outbound mesh 的运行文档。
+- Windows 上状态目录的访问控制由安装脚本设置，程序自身尚不像 Unix 那样逐级检查目录的属主与权限；手工运行 `takeover` 时状态目录应放在只有 SYSTEM 与 Administrators 可写的位置。
 
 ### 发布产物
 
@@ -152,5 +191,5 @@ OpenRC 服务只在有运行中的进程时才计划停止。宿主单元的 `Re
 | 版本 | 内容 |
 | --- | --- |
 | 内核 0.3 / 客户端 1.1 | 本文的检测、导入、接管与回滚（Linux）；Linux 安装脚本 |
-| 内核 0.4 / 客户端 1.2 | Windows 服务与 macOS launchd 的检测、接管与安装；只读上报在线与延迟 |
+| 内核 0.4 / 客户端 1.2 | macOS launchd 的检测、接管与安装；Windows 服务的检测、接管与安装；只读上报在线与延迟 |
 | 内核 0.5 / 客户端 1.3 | OpenWrt 软件包（musl 静态、procd、UCI）与网页插件；软件包安装方式的检测与停用 |

@@ -2066,6 +2066,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::detect::{classify_units, detect, in_container, real_id, scan_processes, Found, Origin};
+use crate::detect::{
+    classify_units, detect, in_container, real_id, scan_processes, uses_process_table, Found,
+    Origin, Process,
+};
 use crate::host::{Hold, Host, Signal, Spawn};
 use crate::profile::Profile;
 
@@ -23,6 +26,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// Prefix of a line this program turned into a comment.
 pub const COMMENT_MARKER: &str = "#[anixops-mesh takeover] ";
 const MANIFEST: &str = "takeover.json";
+/// How many forgotten processes the record keeps.
+const MAX_FORGOTTEN: usize = 64;
 const LOCK: &str = "takeover.lock";
 /// How long a process gets to exit after TERM.
 const TERM_WAIT_MS: u64 = 10_000;
@@ -76,6 +81,30 @@ pub enum Action {
         /// backup only if nothing else changed the file since.
         sha256_after: String,
     },
+    /// `launchctl disable` (macOS).
+    LaunchdDisable {
+        domain: String,
+        label: String,
+        /// `enabled` when `launchctl enable` was set before, `none` when the
+        /// job file decided.
+        previous: String,
+    },
+    /// `launchctl bootout`: the job stopped and unloaded (macOS).
+    LaunchdBootout {
+        domain: String,
+        label: String,
+        plist: String,
+    },
+    /// `sc.exe stop`, waited for (Windows).
+    WinServiceStop {
+        name: String,
+    },
+    /// `sc.exe config start= disabled` (Windows).
+    WinServiceDisable {
+        name: String,
+        /// The start type before: `auto`, `delayed-auto` or `demand`.
+        previous: String,
+    },
     /// A process ended with TERM or KILL.
     Terminate {
         pid: u32,
@@ -120,6 +149,16 @@ impl Action {
             Action::ScriptDisable { name, tool, .. } => format!("{tool} disable {name}"),
             Action::ScriptStop { script, .. } => format!("{script} stop"),
             Action::CommentLine { file, line, .. } => format!("comment out {file}:{line}"),
+            Action::LaunchdDisable { domain, label, .. } => {
+                format!("launchctl disable {domain}/{label}")
+            }
+            Action::LaunchdBootout { domain, label, .. } => {
+                format!("launchctl bootout {domain}/{label}")
+            }
+            Action::WinServiceStop { name } => format!("sc.exe stop {name}"),
+            Action::WinServiceDisable { name, previous } => {
+                format!("sc.exe config {name} start= disabled (was {previous})")
+            }
             Action::Terminate {
                 pid, exe, killed, ..
             } => format!(
@@ -182,6 +221,9 @@ pub enum Outcome {
     RolledBack,
     /// A step failed and undoing it failed too: manual work needed.
     RollbackFailed,
+    /// Refused before any change (a process that could not be put back,
+    /// or a record that could not be saved); nothing was done.
+    Refused,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,7 +241,7 @@ impl TakeoverReport {
     pub fn exit_code(&self) -> i32 {
         match self.outcome {
             Outcome::NothingFound | Outcome::Planned | Outcome::Done => 0,
-            Outcome::RolledBack => 1,
+            Outcome::RolledBack | Outcome::Refused => 1,
             Outcome::RollbackFailed => 7,
         }
     }
@@ -328,6 +370,21 @@ enum Planned {
         file: String,
         line: usize,
     },
+    LaunchdDisable {
+        domain: String,
+        label: String,
+        previous: String,
+    },
+    LaunchdBootout {
+        domain: String,
+        label: String,
+        plist: String,
+    },
+    WinServiceStop(String),
+    WinServiceDisable {
+        name: String,
+        previous: String,
+    },
 }
 
 fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
@@ -409,6 +466,67 @@ fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
                     line: *line,
                 });
             }
+            Origin::Launchd {
+                label,
+                plist,
+                domain,
+                override_off,
+                disabled_key,
+                loaded,
+            } => {
+                let Some(domain) = domain else {
+                    manual.push(format!("login item {label} ({plist})"));
+                    continue;
+                };
+                backup(plist, &mut backups);
+                // Unloaded first, then turned off: a rollback turns it on
+                // again before loading it, as launchd loads no job that is
+                // turned off.
+                if *loaded {
+                    disables.push(Planned::LaunchdBootout {
+                        domain: domain.clone(),
+                        label: label.clone(),
+                        plist: plist.clone(),
+                    });
+                }
+                let off_at_boot = match override_off {
+                    Some(off) => *off,
+                    None => *disabled_key,
+                };
+                if !off_at_boot {
+                    disables.push(Planned::LaunchdDisable {
+                        domain: domain.clone(),
+                        label: label.clone(),
+                        previous: if override_off.is_some() {
+                            "enabled".into()
+                        } else {
+                            "none".into()
+                        },
+                    });
+                }
+            }
+            Origin::WinService {
+                name,
+                start,
+                running,
+            } => {
+                // Stopped first, then turned off: a rollback turns it on
+                // again before starting it, as Windows starts no service
+                // that is turned off.
+                if *running {
+                    disables.push(Planned::WinServiceStop(name.clone()));
+                }
+                match start.as_str() {
+                    "auto" | "delayed-auto" | "demand" => {
+                        disables.push(Planned::WinServiceDisable {
+                            name: name.clone(),
+                            previous: start.clone(),
+                        })
+                    }
+                    "disabled" => {}
+                    _ => manual.push(format!("service {name} (starts as {start})")),
+                }
+            }
             Origin::Process { .. } => {}
             Origin::Container { id, image } => {
                 manual.push(format!("container {id} {image}").trim_end().to_string());
@@ -433,6 +551,16 @@ fn describe_planned(planned: &Planned) -> String {
         Planned::ScriptDisable { name, .. } => format!("disable init script {name}"),
         Planned::ScriptStop { script, .. } => format!("{script} stop"),
         Planned::CommentLine { file, line } => format!("comment out {file}:{line}"),
+        Planned::LaunchdDisable { domain, label, .. } => {
+            format!("launchctl disable {domain}/{label}")
+        }
+        Planned::LaunchdBootout { domain, label, .. } => {
+            format!("launchctl bootout {domain}/{label}")
+        }
+        Planned::WinServiceStop(name) => format!("sc.exe stop {name}"),
+        Planned::WinServiceDisable { name, previous } => {
+            format!("sc.exe config {name} start= disabled (now {previous})")
+        }
     }
 }
 
@@ -610,10 +738,64 @@ fn execute(
                 sha256_after: sha256_hex(updated.as_bytes()),
             }])
         }
+        Planned::LaunchdDisable {
+            domain,
+            label,
+            previous,
+        } => {
+            run_ok(
+                host,
+                "launchctl",
+                &["disable", &format!("{domain}/{label}")],
+            )?;
+            Ok(vec![Action::LaunchdDisable {
+                domain: domain.clone(),
+                label: label.clone(),
+                previous: previous.clone(),
+            }])
+        }
+        Planned::LaunchdBootout {
+            domain,
+            label,
+            plist,
+        } => {
+            let target = format!("{domain}/{label}");
+            let result = run_ok(host, "launchctl", &["bootout", &target]);
+            // Some versions report an error for a job they did unload: what
+            // counts is that it is no longer loaded.
+            if let Err(error) = result {
+                if crate::launchd::loaded(host, domain, label).0 {
+                    return Err(error);
+                }
+            }
+            Ok(vec![Action::LaunchdBootout {
+                domain: domain.clone(),
+                label: label.clone(),
+                plist: plist.clone(),
+            }])
+        }
+        Planned::WinServiceStop(name) => {
+            crate::winsvc::stop(host, name)?;
+            Ok(vec![Action::WinServiceStop { name: name.clone() }])
+        }
+        Planned::WinServiceDisable { name, previous } => {
+            crate::winsvc::set_start(host, name, "disabled")?;
+            Ok(vec![Action::WinServiceDisable {
+                name: name.clone(),
+                previous: previous.clone(),
+            }])
+        }
     }
 }
 
 fn alive(host: &dyn Host, pid: u32, exe: &str) -> bool {
+    if uses_process_table(host) {
+        return match host.process_info(pid) {
+            // A reused pid running something else counts as gone.
+            Ok(info) => info.exe.as_deref().is_none_or(|path| path == exe),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        };
+    }
     let base = PathBuf::from(format!("/proc/{pid}"));
     if !host.exists(&base) {
         return false;
@@ -652,6 +834,9 @@ fn running_copy(
     uid: Option<u32>,
     net_ns: Option<&str>,
 ) -> CopyCheck {
+    if uses_process_table(host) {
+        return running_copy_in_table(host, exe, argv, uid);
+    }
     let Ok(entries) = host.list_dir(Path::new("/proc")) else {
         return CopyCheck::None;
     };
@@ -683,6 +868,43 @@ fn running_copy(
             Some(true) => return CopyCheck::Running(pid),
             Some(false) => {}
             None => unknown = unknown.or(Some(pid)),
+        }
+    }
+    unknown.map_or(CopyCheck::None, CopyCheck::Unknown)
+}
+
+/// [`running_copy`] where processes are read from the process table
+/// (macOS): there are no containers or network namespaces to compare.
+fn running_copy_in_table(
+    host: &dyn Host,
+    exe: &str,
+    argv: &[String],
+    uid: Option<u32>,
+) -> CopyCheck {
+    let Ok(pids) = host.list_pids() else {
+        return CopyCheck::None;
+    };
+    let own = host.own_pid();
+    let mut unknown = None;
+    for pid in pids.into_iter().filter(|pid| *pid != own) {
+        // As with `/proc`: a process whose arguments we cannot read is not
+        // one we could have ended.
+        let Ok(info) = host.process_info(pid) else {
+            continue;
+        };
+        if info.argv != argv {
+            continue;
+        }
+        let same_program = info.exe.as_deref().map(|path| path == exe);
+        let same_user = match (uid, info.uid) {
+            (Some(uid), Some(theirs)) => Some(uid == theirs),
+            (Some(_), None) => None,
+            (None, _) => Some(true),
+        };
+        match (same_program, same_user) {
+            (Some(true), Some(true)) => return CopyCheck::Running(pid),
+            (Some(false), _) | (_, Some(false)) => {}
+            _ => unknown = unknown.or(Some(pid)),
         }
     }
     unknown.map_or(CopyCheck::None, CopyCheck::Unknown)
@@ -723,16 +945,59 @@ fn copy_matches(
 
 /// One message for each process of the program running in another network
 /// namespace than the host's.
-fn foreign_network_processes(host: &dyn Host, profile: &Profile) -> Vec<String> {
+fn foreign_network_processes(
+    host: &dyn Host,
+    profile: &Profile,
+    service_pids: &BTreeSet<u32>,
+) -> Vec<String> {
     let Some(host_network) = net_namespace(host, 1) else {
         return Vec::new();
     };
     scan_processes(host, profile)
         .into_iter()
         .filter(|process| !process.contained)
+        // A service's process is stopped by its service manager and started
+        // again by it, in its own namespace.
+        .filter(|process| !service_pids.contains(&process.pid))
         .filter_map(|process| {
             let theirs = net_namespace(host, process.pid)?;
             (theirs != host_network).then(|| foreign_network_message(process.pid, &theirs))
+        })
+        .collect()
+}
+
+/// One message for each process of the program, other than a taken-over
+/// service's, that runs as another account than this program (Windows,
+/// where a process cannot be started again as another account without its
+/// password), or whose account cannot be read.
+fn foreign_account_processes(
+    host: &dyn Host,
+    profile: &Profile,
+    service_pids: &BTreeSet<u32>,
+) -> Vec<String> {
+    if !uses_process_table(host) {
+        return Vec::new();
+    }
+    let Some(own) = host
+        .process_info(host.own_pid())
+        .ok()
+        .and_then(|info| info.sid)
+    else {
+        return Vec::new();
+    };
+    scan_processes(host, profile)
+        .into_iter()
+        .filter(|process| !service_pids.contains(&process.pid))
+        .filter_map(|process| match &process.sid {
+            Some(sid) if *sid == own => None,
+            Some(sid) => Some(format!(
+                "process {} runs as another account ({sid}); stop it by hand, and start it again by hand to undo",
+                process.pid
+            )),
+            None => Some(format!(
+                "cannot tell which account runs process {}; stop it by hand, and start it again by hand to undo",
+                process.pid
+            )),
         })
         .collect()
 }
@@ -766,6 +1031,7 @@ fn end_processes(
     host: &dyn Host,
     profile: &Profile,
     owned_units: &BTreeSet<String>,
+    service_pids: &BTreeSet<u32>,
 ) -> Vec<Result<Action, String>> {
     let mut out = Vec::new();
     let mut processes = scan_processes(host, profile);
@@ -802,28 +1068,93 @@ fn end_processes(
                 continue;
             }
         };
-        out.push(Ok(Action::Terminate {
-            pid: process.pid,
-            exe: process.exe.clone(),
-            argv: process.argv.clone(),
-            full_env: !process.environ.is_empty(),
-            env: if process.environ.is_empty() {
-                process.env.clone().into_iter().collect()
-            } else {
-                process.environ.clone()
-            },
-            cwd: process.cwd.clone(),
-            uid: process.uid,
-            gid: process.gid,
-            groups: process.groups.clone(),
-            // Only our own services start it again on rollback; a process
-            // started by hand, rc.local or cron is restarted as it was.
-            restart: process.unit.is_none(),
-            killed,
-            net_ns,
-        }));
+        out.push(Ok(terminate_action(&process, service_pids, killed, net_ns)));
     }
     out
+}
+
+/// The record of ending a process.
+fn terminate_action(
+    process: &Process,
+    service_pids: &BTreeSet<u32>,
+    killed: bool,
+    net_ns: Option<String>,
+) -> Action {
+    Action::Terminate {
+        pid: process.pid,
+        exe: process.exe.clone(),
+        argv: process.argv.clone(),
+        full_env: !process.environ.is_empty(),
+        env: if process.environ.is_empty() {
+            process.env.clone().into_iter().collect()
+        } else {
+            process.environ.clone()
+        },
+        cwd: process.cwd.clone(),
+        uid: process.uid,
+        gid: process.gid,
+        groups: process.groups.clone(),
+        // Only our own services start it again on rollback; a process
+        // started by hand, rc.local or cron is restarted as it was.
+        restart: process.unit.is_none() && !service_pids.contains(&process.pid),
+        killed,
+        net_ns,
+    }
+}
+
+/// Room left in the record for the steps other than ended processes
+/// (backups, services, lines), which are short.
+const RECORD_MARGIN: u64 = 64 * 1024;
+
+/// Reasons to refuse a takeover before anything is changed: processes that
+/// could not be put back where they ran, and a record that would grow too
+/// large to save once the processes are ended (their environments can be
+/// large), which would leave a rollback without them.
+fn refusals(
+    host: &dyn Host,
+    profile: &Profile,
+    service_pids: &BTreeSet<u32>,
+    manifest: Option<&Manifest>,
+) -> Vec<String> {
+    let mut out: Vec<String> = foreign_network_processes(host, profile, service_pids)
+        .into_iter()
+        .chain(foreign_account_processes(host, profile, service_pids))
+        .collect();
+    let mut estimate = manifest.cloned().unwrap_or_else(empty_manifest);
+    for process in scan_processes(host, profile)
+        .iter()
+        .filter(|process| !process.contained)
+    {
+        estimate.steps.push(Step {
+            action: terminate_action(
+                process,
+                service_pids,
+                true,
+                net_namespace(host, process.pid),
+            ),
+            at: host.now_unix(),
+            run: estimate.runs + 1,
+        });
+    }
+    let size = serde_json::to_string_pretty(&estimate)
+        .map(|text| text.len() as u64)
+        .unwrap_or(u64::MAX);
+    if size + RECORD_MARGIN > crate::host::MAX_TEXT_FILE {
+        out.push(format!(
+            "the record of the processes to end would be about {size} bytes, more than the {} a rollback can read; stop them by hand",
+            crate::host::MAX_TEXT_FILE - RECORD_MARGIN
+        ));
+    }
+    out
+}
+
+fn empty_manifest() -> Manifest {
+    Manifest {
+        manifest_version: MANIFEST_VERSION,
+        steps: Vec::new(),
+        runs: 0,
+        forgotten: Vec::new(),
+    }
 }
 
 /// Turns off and stops every installation the profile describes.
@@ -841,6 +1172,23 @@ pub fn takeover(
             _ => None,
         })
         .collect();
+    // Processes of the services taken over: their service manager stops
+    // them, and starting the service again on rollback starts them, so they
+    // are never started a second time.
+    let service_pids: BTreeSet<u32> = found
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.origin,
+                Origin::Systemd { .. }
+                    | Origin::Openrc { .. }
+                    | Origin::Sysv { .. }
+                    | Origin::Launchd { .. }
+                    | Origin::WinService { .. }
+            )
+        })
+        .flat_map(|entry| entry.processes.iter().map(|process| process.pid))
+        .collect();
     let (planned, manual) = plan(host, &found);
     let has_processes = scan_processes(host, profile)
         .iter()
@@ -857,6 +1205,22 @@ pub fn takeover(
         return Ok(report);
     }
     if dry_run {
+        // The same checks as a real run, so a dry run as a precheck sees a
+        // refusal before anything is installed.
+        let existing = load_manifest(host, state).ok().flatten();
+        let refused = refusals(host, profile, &service_pids, existing.as_ref());
+        if !refused.is_empty() {
+            report.outcome = Outcome::Refused;
+            report.steps = refused
+                .into_iter()
+                .map(|error| StepReport {
+                    step: "check".into(),
+                    ok: false,
+                    detail: Some(error),
+                })
+                .collect();
+            return Ok(report);
+        }
         report.outcome = Outcome::Planned;
         report.steps = planned
             .iter()
@@ -877,12 +1241,24 @@ pub fn takeover(
     }
 
     let _lock = Lock::take(host, state)?;
-    let mut manifest = load_manifest(host, state)?.unwrap_or(Manifest {
-        manifest_version: MANIFEST_VERSION,
-        steps: Vec::new(),
-        runs: 0,
-        forgotten: Vec::new(),
-    });
+    let mut manifest = load_manifest(host, state)?.unwrap_or_else(empty_manifest);
+    // Checked before anything is changed, and nothing is recorded: a
+    // process in another network namespace or run by another account is
+    // never ended (a rollback could not put it back), so finding one later
+    // would only interrupt the network for nothing.
+    let refused = refusals(host, profile, &service_pids, Some(&manifest));
+    if !refused.is_empty() {
+        report.outcome = Outcome::Refused;
+        report.steps = refused
+            .into_iter()
+            .map(|error| StepReport {
+                step: "check".into(),
+                ok: false,
+                detail: Some(error),
+            })
+            .collect();
+        return Ok(report);
+    }
     manifest.runs += 1;
     let run = manifest.runs;
     let first_new = manifest.steps.len();
@@ -902,17 +1278,6 @@ pub fn takeover(
         save_manifest(host, state, manifest)
     };
 
-    // Checked before anything is changed: a process in another network
-    // namespace is never ended (a rollback could not put it back there), so
-    // finding one later would only interrupt the network for nothing.
-    for error in foreign_network_processes(host, profile) {
-        report.steps.push(StepReport {
-            step: "check networks".into(),
-            ok: false,
-            detail: Some(error.clone()),
-        });
-        failure.get_or_insert(error);
-    }
     for (index, step) in planned.iter().enumerate() {
         if failure.is_some() {
             break;
@@ -973,9 +1338,16 @@ pub fn takeover(
         // Every process that was ended is recorded before any failure is
         // handled: one that could not be ended must not hide those ended
         // after it, or the undo would never start them again.
-        let (ended, failed): (Vec<_>, Vec<_>) = end_processes(host, profile, &owned_units)
-            .into_iter()
-            .partition(Result::is_ok);
+        let (ended, failed): (Vec<_>, Vec<_>) =
+            end_processes(host, profile, &owned_units, &service_pids)
+                .into_iter()
+                .partition(Result::is_ok);
+        // On macOS a launchd job the profile does not name may keep the
+        // program alive; it starts it again only after its throttle
+        // interval, so wait that out before the final check.
+        if !ended.is_empty() && uses_process_table(host) {
+            restart_wait = restart_wait.max(LAUNCHD_RESTART_WAIT_MS);
+        }
         for action in ended.into_iter().flatten() {
             // `record` keeps the step in memory even when saving fails, so
             // the undo below still starts it again.
@@ -1041,7 +1413,16 @@ pub fn takeover(
             // steps already undone are never repeated.
             manifest.steps.extend(remaining);
         }
-        let _ = save_manifest(host, state, &manifest);
+        // A record that cannot be saved leaves a later rollback without
+        // what is still to undo: say so, and count it as manual work.
+        if let Err(error) = save_manifest(host, state, &manifest) {
+            report.rollback.push(StepReport {
+                step: "save record".into(),
+                ok: false,
+                detail: Some(error),
+            });
+            report.outcome = Outcome::RollbackFailed;
+        }
     }
     Ok(report)
 }
@@ -1154,6 +1535,32 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             .map_err(|error| format!("{file}: {error}"))?;
             Ok(format!("uncommented {file}:{}", index + 1))
         }
+        Action::LaunchdDisable { domain, label, .. } => {
+            // Turned on whether or not an override was set before: the job
+            // was only turned off here when its file did not turn it off,
+            // so an explicit "on" starts it at boot exactly as before.
+            run_ok(host, "launchctl", &["enable", &format!("{domain}/{label}")])?;
+            Ok(format!("launchctl enable {domain}/{label}"))
+        }
+        Action::LaunchdBootout {
+            domain,
+            label,
+            plist,
+        } => {
+            if crate::launchd::loaded(host, domain, label).0 {
+                return Ok(format!("{domain}/{label} is already loaded"));
+            }
+            run_ok(host, "launchctl", &["bootstrap", domain, plist])?;
+            Ok(format!("launchctl bootstrap {domain} {plist}"))
+        }
+        Action::WinServiceStop { name } => {
+            crate::winsvc::start(host, name)?;
+            Ok(format!("sc.exe start {name}"))
+        }
+        Action::WinServiceDisable { name, previous } => {
+            crate::winsvc::set_start(host, name, previous)?;
+            Ok(format!("sc.exe config {name} start= {previous}"))
+        }
         Action::Terminate {
             argv,
             env,
@@ -1235,6 +1642,9 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
 const MAX_RESTART_WAIT_MS: u64 = 60_000;
 /// Margin after a unit's restart delay before the final check.
 const RESTART_MARGIN_MS: u64 = 2_000;
+/// launchd's default throttle interval (10 s) plus the margin: how long
+/// a job that keeps the program alive takes to start it again.
+const LAUNCHD_RESTART_WAIT_MS: u64 = 10_000 + RESTART_MARGIN_MS;
 
 /// How long to wait before the final check so that a host unit that
 /// restarts the program has done so. A unit whose delay is unknown or too
@@ -1501,6 +1911,10 @@ pub fn rollback_forgetting(
         // Kept in the record (owner only, like the steps) so what the
         // operator dropped stays visible after the steps are gone.
         manifest.forgotten.append(&mut dropped);
+        // The most recent ones; older ones are in the reports saved with
+        // `--report`.
+        let excess = manifest.forgotten.len().saturating_sub(MAX_FORGOTTEN);
+        manifest.forgotten.drain(..excess);
         forgotten.push(StepReport {
             step: format!("forget process {pid}"),
             ok: true,
@@ -1509,14 +1923,22 @@ pub fn rollback_forgetting(
     }
     let (mut steps, remaining) = undo(host, &manifest.steps);
     forgotten.append(&mut steps);
-    let steps = forgotten;
-    let ok = remaining.is_empty();
+    let mut steps = forgotten;
+    let mut ok = remaining.is_empty();
     // A later rollback retries only what is left.
     manifest.steps = remaining;
     if ok {
         manifest.runs = 0;
     }
-    save_manifest(host, state, &manifest).map_err(TakeoverError::Io)?;
+    // What was undone is reported even when the record cannot be saved.
+    if let Err(error) = save_manifest(host, state, &manifest) {
+        steps.push(StepReport {
+            step: "save record".into(),
+            ok: false,
+            detail: Some(error),
+        });
+        ok = false;
+    }
     Ok(RollbackReport {
         report_version: crate::report::REPORT_VERSION,
         ok,
@@ -2076,8 +2498,15 @@ mod tests {
         host.link("/proc/100/ns/net", "net:[1]");
         // Started with `ip netns exec`: a rollback could not put it back.
         host.link("/proc/200/ns/net", "net:[7]");
+        // A dry run, which the installers run first, refuses it too.
+        let dry = takeover(&host, &demo(), Path::new(STATE), true).unwrap();
+        assert_eq!(dry.outcome, Outcome::Refused, "{dry:?}");
+        assert_eq!(dry.exit_code(), 1);
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
-        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert_eq!(report.outcome, Outcome::Refused, "{report:?}");
+        assert_eq!(report.exit_code(), 1);
+        // Nothing done, nothing recorded.
+        assert!(!host.exists(&Path::new(STATE).join(MANIFEST)));
         assert!(report.steps.iter().any(|step| !step.ok
             && step.detail.as_deref().is_some_and(
                 |detail| detail.starts_with("process 200 runs in another network namespace")
@@ -2094,6 +2523,97 @@ mod tests {
             command.starts_with("systemctl stop") || command.starts_with("systemctl disable")
         }));
         assert!(!host.text("/etc/rc.local").unwrap().contains(COMMENT_MARKER));
+    }
+
+    #[test]
+    fn a_services_process_in_another_network_namespace_is_taken_over() {
+        let host = machine();
+        host.link("/proc/1/ns/net", "net:[1]");
+        // The program's own unit runs it in a namespace of its own; its
+        // service manager stops it and starts it there again.
+        host.link("/proc/100/ns/net", "net:[7]");
+        host.link("/proc/200/ns/net", "net:[1]");
+        host.exits_on
+            .borrow_mut()
+            .insert("systemctl stop demo-meshd.service".into(), vec![100]);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        assert!(host
+            .ran
+            .borrow()
+            .contains(&"systemctl stop demo-meshd.service".to_string()));
+        assert_eq!(*host.signals.borrow(), vec![(200, Signal::Terminate)]);
+    }
+
+    #[test]
+    fn a_record_that_would_be_too_large_is_refused_before_any_change() {
+        let host = machine();
+        let large = format!(
+            "DEMO_PAD={}",
+            "x".repeat(crate::host::MAX_TEXT_FILE as usize)
+        );
+        host.process(
+            300,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "other"],
+            &[large.as_str()],
+            "0::/user.slice\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Refused, "{report:?}");
+        assert!(report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("the record of the processes to end"))));
+        assert!(host.signals.borrow().is_empty());
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|command| command.starts_with("systemctl")
+                && !command.starts_with("systemctl show")));
+        assert!(!host.text("/etc/rc.local").unwrap().contains(COMMENT_MARKER));
+    }
+
+    #[test]
+    fn only_the_most_recent_forgotten_processes_are_kept() {
+        let host = FakeHost::default();
+        let old = Forgotten {
+            pid: 1,
+            exe: "/opt/demo-meshd".into(),
+            argv: vec!["/opt/demo-meshd".into()],
+            uid: Some(0),
+            at: 0,
+        };
+        let manifest = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            steps: vec![Step {
+                action: Action::Terminate {
+                    pid: 200,
+                    exe: "/opt/demo-meshd".into(),
+                    argv: vec!["/opt/demo-meshd".into()],
+                    env: Vec::new(),
+                    full_env: true,
+                    cwd: None,
+                    uid: Some(0),
+                    gid: Some(0),
+                    groups: None,
+                    restart: true,
+                    killed: false,
+                    net_ns: None,
+                },
+                at: 0,
+                run: 1,
+            }],
+            runs: 1,
+            forgotten: vec![old; MAX_FORGOTTEN],
+        };
+        save_manifest(&host, Path::new(STATE), &manifest).unwrap();
+        let done = rollback_forgetting(&host, Path::new(STATE), &[200]).unwrap();
+        assert!(done.ok, "{done:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert_eq!(manifest.forgotten.len(), MAX_FORGOTTEN);
+        assert_eq!(manifest.forgotten.last().unwrap().pid, 200);
     }
 
     #[test]
@@ -2248,5 +2768,396 @@ mod tests {
         let host = FakeHost::default();
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::NothingFound);
+    }
+
+    const DAEMON: &str = "/Library/LaunchDaemons/com.example.demo.plist";
+
+    /// A Mac: a system daemon running the program, and a copy a user
+    /// started by hand.
+    fn mac() -> FakeHost {
+        let mut host = FakeHost::default();
+        host.programs.insert("launchctl".into());
+        host.programs.insert("plutil".into());
+        host.file(DAEMON, "<plist/>");
+        host.answer(
+            &format!("plutil -convert json -o - -- {DAEMON}"),
+            0,
+            r#"{"Label":"com.example.demo","ProgramArguments":["/usr/local/bin/demo-meshd","-c","/etc/demo/a.toml"],"KeepAlive":true}"#,
+        );
+        host.answer(
+            "launchctl print-disabled system",
+            0,
+            "disabled services = {\n}\n",
+        );
+        host.launchd.borrow_mut().insert(
+            "system/com.example.demo".into(),
+            (DAEMON.into(), Some(300), true),
+        );
+        host.table_process(
+            300,
+            "/usr/local/bin/demo-meshd",
+            &["/usr/local/bin/demo-meshd", "-c", "/etc/demo/a.toml"],
+            &[],
+            0,
+        );
+        host.table_process(
+            400,
+            "/Users/alice/bin/demo-meshd",
+            &["/Users/alice/bin/demo-meshd", "--net-name", "lab"],
+            &["DEMO_NET_SECRET=x", "HOME=/Users/alice"],
+            501,
+        );
+        host
+    }
+
+    #[test]
+    fn a_launchd_job_is_unloaded_then_turned_off_and_restored_in_reverse() {
+        let host = mac();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert_eq!(
+            steps[1..],
+            [
+                "launchctl bootout system/com.example.demo",
+                "launchctl disable system/com.example.demo",
+                "end process 400 (/Users/alice/bin/demo-meshd) with TERM",
+            ]
+        );
+        assert!(steps[0].starts_with(&format!("backup {DAEMON} -> ")));
+        // Only the copy started by hand was signalled; launchd ended its own.
+        assert_eq!(*host.signals.borrow(), vec![(400, Signal::Terminate)]);
+        // A job launchd keeps alive comes back only after its throttle
+        // interval: waited out before the final check.
+        assert!(host.slept.borrow().contains(&LAUNCHD_RESTART_WAIT_MS));
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        let restart = manifest.steps.iter().find_map(|step| match &step.action {
+            Action::Terminate { pid, restart, .. } => Some((*pid, *restart)),
+            _ => None,
+        });
+        assert_eq!(restart, Some((400, true)));
+
+        let rollback = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback.ok, "{rollback:?}");
+        let ran = host.ran.borrow();
+        let enable = ran
+            .iter()
+            .position(|line| line == "launchctl enable system/com.example.demo")
+            .expect("turned on again");
+        let bootstrap = ran
+            .iter()
+            .position(|line| *line == format!("launchctl bootstrap system {DAEMON}"))
+            .expect("loaded again");
+        // launchd loads no job that is turned off.
+        assert!(enable < bootstrap);
+        let spawned = host.spawned.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].argv[0], "/Users/alice/bin/demo-meshd");
+        assert_eq!(spawned[0].uid, Some(501));
+        assert!(spawned[0].clear_env);
+    }
+
+    #[test]
+    fn a_launchd_job_already_off_at_boot_is_only_unloaded() {
+        let host = mac();
+        host.answer(
+            "launchctl print-disabled system",
+            0,
+            "disabled services = {\n\t\"com.example.demo\" => disabled\n}\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), true).unwrap();
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        let backup = format!("backup {DAEMON}");
+        assert_eq!(
+            steps,
+            vec![
+                backup.as_str(),
+                "launchctl bootout system/com.example.demo",
+                "end remaining processes",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_users_agent_is_taken_over_in_that_users_session() {
+        let host = mac();
+        let agent = "/Users/alice/Library/LaunchAgents/local.demo.plist";
+        host.file(agent, "<plist/>");
+        host.stats.borrow_mut().insert(
+            PathBuf::from(agent),
+            crate::host::FileStat {
+                mode: 0o644,
+                uid: 501,
+                gid: 20,
+            },
+        );
+        host.answer(
+            &format!("plutil -convert json -o - -- {agent}"),
+            0,
+            r#"{"Label":"local.demo","ProgramArguments":["/bin/sh","-c","exec /Users/alice/bin/demo-meshd --net-name lab"]}"#,
+        );
+        host.answer("launchctl print-disabled gui/501", 0, "");
+        host.launchd
+            .borrow_mut()
+            .insert("gui/501/local.demo".into(), (agent.into(), None, true));
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert!(steps.contains(&"launchctl bootout gui/501/local.demo"));
+        assert!(steps.contains(&"launchctl disable gui/501/local.demo"));
+        // The agent's shell runs the copy: loading the agent again starts
+        // it, so the rollback does not start it a second time.
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().all(|step| !matches!(
+            step.action,
+            Action::Terminate {
+                pid: 400,
+                restart: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn an_agent_every_user_loads_is_left_to_the_operator() {
+        let host = mac();
+        let shared = "/Library/LaunchAgents/com.example.demo-ui.plist";
+        host.file(shared, "<plist/>");
+        host.answer(
+            &format!("plutil -convert json -o - -- {shared}"),
+            0,
+            r#"{"Label":"com.example.demo-ui","Program":"/usr/local/bin/demo-meshd"}"#,
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), true).unwrap();
+        assert_eq!(
+            report.manual,
+            vec![format!("login item com.example.demo-ui ({shared})")]
+        );
+        assert!(report
+            .steps
+            .iter()
+            .all(|step| !step.step.contains("com.example.demo-ui")));
+    }
+
+    #[test]
+    fn a_failed_unload_is_put_back() {
+        let host = mac();
+        // Turning the job off fails after it was unloaded.
+        host.answer("launchctl disable system/com.example.demo", 1, "");
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(host
+            .ran
+            .borrow()
+            .contains(&format!("launchctl bootstrap system {DAEMON}")));
+        assert!(host.signals.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_copy_in_the_process_table_is_not_started_twice() {
+        let host = mac();
+        let argv: Vec<String> = ["/Users/alice/bin/demo-meshd", "--net-name", "lab"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            running_copy(&host, "/Users/alice/bin/demo-meshd", &argv, Some(501), None),
+            CopyCheck::Running(400)
+        );
+        // Another user's copy is not ours.
+        assert_eq!(
+            running_copy(&host, "/Users/alice/bin/demo-meshd", &argv, Some(502), None),
+            CopyCheck::None
+        );
+        // A copy whose program cannot be read may be ours.
+        host.table
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .get_mut(&400)
+            .unwrap()
+            .exe = None;
+        assert_eq!(
+            running_copy(&host, "/Users/alice/bin/demo-meshd", &argv, Some(501), None),
+            CopyCheck::Unknown(400)
+        );
+    }
+
+    const ADMIN: &str = "S-1-5-21-9-500";
+    const SYSTEM: &str = "S-1-5-18";
+
+    /// A Windows machine: a service running the program, a copy the
+    /// administrator started by hand, and this program run by the
+    /// administrator.
+    fn windows(services_json: &str) -> FakeHost {
+        let mut host = FakeHost::default();
+        host.programs.insert("powershell.exe".into());
+        host.answer(
+            &format!(
+                "powershell.exe -NoProfile -NonInteractive -Command {}",
+                crate::winsvc::SERVICES_QUERY
+            ),
+            0,
+            services_json,
+        );
+        host.answer(
+            "sc.exe query DemoMesh",
+            0,
+            "SERVICE_NAME: DemoMesh\r\n        STATE              : 1  STOPPED\r\n",
+        );
+        host.windows_process(
+            1,
+            r"C:\anixops\anixops-mesh.exe",
+            &["anixops-mesh"],
+            ADMIN,
+            9,
+        );
+        host.windows_process(
+            500,
+            r"C:\Program Files\Demo\demo-meshd.exe",
+            &[
+                r"C:\Program Files\Demo\demo-meshd.exe",
+                "-c",
+                r"C:\demo\a.toml",
+            ],
+            SYSTEM,
+            600,
+        );
+        host.windows_process(
+            700,
+            r"C:\Users\admin\demo-meshd.exe",
+            &[r"C:\Users\admin\demo-meshd.exe", "--net-name", "lab"],
+            ADMIN,
+            800,
+        );
+        host.exits_on
+            .borrow_mut()
+            .insert("sc.exe stop DemoMesh".into(), vec![500]);
+        host
+    }
+
+    const DEMO_SERVICE: &str = r#"[{"Name":"DemoMesh","PathName":"\"C:\\Program Files\\Demo\\demo-meshd.exe\" -c C:\\demo\\a.toml","StartMode":"Auto","State":"Running","ProcessId":500,"DelayedAutoStart":true},{"Name":"Spooler","PathName":"C:\\Windows\\System32\\spoolsv.exe","StartMode":"Auto","State":"Running","ProcessId":40,"DelayedAutoStart":false}]"#;
+
+    #[test]
+    fn a_windows_service_is_stopped_then_turned_off_and_restored_in_reverse() {
+        let host = windows(DEMO_SERVICE);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert_eq!(
+            steps,
+            vec![
+                "sc.exe stop DemoMesh",
+                "sc.exe config DemoMesh start= disabled (was delayed-auto)",
+                r"end process 700 (C:\Users\admin\demo-meshd.exe) with TERM",
+            ]
+        );
+        // The service's own process was ended by the service manager.
+        assert_eq!(*host.signals.borrow(), vec![(700, Signal::Terminate)]);
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.contains("Spooler")));
+
+        let rollback = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback.ok, "{rollback:?}");
+        let ran = host.ran.borrow();
+        let config = ran
+            .iter()
+            .position(|line| line == "sc.exe config DemoMesh start= delayed-auto")
+            .expect("start type restored");
+        let start = ran
+            .iter()
+            .position(|line| line == "sc.exe start DemoMesh")
+            .expect("started again");
+        // Windows starts no service that is turned off.
+        assert!(config < start);
+        let spawned = host.spawned.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].argv[0], r"C:\Users\admin\demo-meshd.exe");
+        assert_eq!(spawned[0].cwd.as_deref(), Some(r"C:\"));
+        assert!(spawned[0].clear_env);
+    }
+
+    #[test]
+    fn a_process_of_another_windows_account_is_left_to_the_operator() {
+        let host = windows(DEMO_SERVICE);
+        host.windows_process(
+            701,
+            r"C:\Users\bob\demo-meshd.exe",
+            &[r"C:\Users\bob\demo-meshd.exe"],
+            "S-1-5-21-9-1001",
+            800,
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Refused, "{report:?}");
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail
+                    .contains("process 701 runs as another account (S-1-5-21-9-1001)"))));
+        // Nothing was changed.
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.starts_with("sc.exe")));
+        assert!(host.signals.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_wrapper_service_named_in_the_profile_is_taken_over_with_its_child() {
+        let host = windows(
+            r#"[{"Name":"demo-meshd","PathName":"C:\\tools\\wrapper.exe","StartMode":"Manual","State":"Running","ProcessId":900,"DelayedAutoStart":false}]"#,
+        );
+        // Only the wrapper service runs the program here.
+        host.table.borrow_mut().as_mut().unwrap().remove(&500);
+        host.windows_process(
+            900,
+            r"C:\tools\wrapper.exe",
+            &[r"C:\tools\wrapper.exe"],
+            SYSTEM,
+            600,
+        );
+        host.windows_process(
+            901,
+            r"C:\opt\Demo-Meshd.EXE",
+            &[r"C:\opt\Demo-Meshd.EXE", "--net-name", "lab"],
+            SYSTEM,
+            900,
+        );
+        host.answer(
+            "sc.exe query demo-meshd",
+            0,
+            "        STATE              : 1  STOPPED\r\n",
+        );
+        host.exits_on
+            .borrow_mut()
+            .insert("sc.exe stop demo-meshd".into(), vec![900, 901]);
+        let found = detect(&host, &demo());
+        let service = found
+            .iter()
+            .find(|entry| matches!(entry.origin, Origin::WinService { .. }))
+            .unwrap();
+        assert_eq!(service.processes.len(), 1);
+        assert_eq!(service.processes[0].pid, 901);
+        assert_eq!(
+            service.invocation.as_ref().unwrap().args,
+            vec!["--net-name".to_string(), "lab".to_string()]
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert!(steps.contains(&"sc.exe config demo-meshd start= disabled (was demand)"));
+        // The service's child runs as another account but is the
+        // service's: no account check, and not restarted on its own.
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest
+            .steps
+            .iter()
+            .all(|step| !matches!(step.action, Action::Terminate { pid: 901, .. })));
     }
 }

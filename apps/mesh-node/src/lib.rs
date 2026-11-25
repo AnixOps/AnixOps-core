@@ -15,11 +15,13 @@ pub mod convert;
 pub mod detect;
 pub mod host;
 pub mod import;
+pub mod launchd;
 pub mod net;
 pub mod profile;
 pub mod report;
 pub mod source;
 pub mod takeover;
+pub mod winsvc;
 
 /// Version of this program.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

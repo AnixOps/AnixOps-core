@@ -52,7 +52,7 @@ pub struct Detect {
     /// Executable file names (no directory).
     pub executables: Vec<String>,
     /// Service names: systemd unit stems (`name` for `name.service` and the
-    /// template `name@.service`), init script names.
+    /// template `name@.service`), init script names, launchd labels.
     #[serde(default)]
     pub services: Vec<String>,
     /// Package names, for the package-manager check.
