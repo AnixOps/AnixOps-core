@@ -55,6 +55,9 @@ ip -n extnet addr add 100.100.0.5/24 dev x0
 ip -n extnet addr add 100.100.0.6/24 dev x0
 ip -n extnet link set x0 up
 
+# A new namespace may inherit forwarding from the host (devconf_inherit_init_net);
+# start from off so the check below shows the bridge turned it on.
+ip netns exec bridge sysctl -qw net.ipv4.ip_forward=0
 [[ "$(ip netns exec bridge cat /proc/sys/net/ipv4/ip_forward)" == 0 ]] || fail "forwarding starts off"
 expect_blocked member -I 10.150.0.2 100.100.0.5
 

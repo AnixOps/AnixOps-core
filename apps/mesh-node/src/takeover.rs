@@ -105,6 +105,26 @@ pub enum Action {
         /// The start type before: `auto`, `delayed-auto` or `demand`.
         previous: String,
     },
+    /// `schtasks.exe /End`, waited for (Windows).
+    TaskEnd {
+        name: String,
+    },
+    /// `schtasks.exe /Change /DISABLE` (Windows).
+    TaskDisable {
+        name: String,
+        /// The task's definition before (`schtasks.exe /Query /XML`),
+        /// compared after rollback; `None` when it could not be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        definition: Option<String>,
+    },
+    /// A logon entry turned off with its `StartupApproved` value (Windows).
+    LogonDisable {
+        /// The `StartupApproved` key, as `reg.exe` takes it.
+        key: String,
+        name: String,
+        /// The value before, in hexadecimal; `None` when there was none.
+        previous: Option<String>,
+    },
     /// A process ended with TERM or KILL.
     Terminate {
         pid: u32,
@@ -132,6 +152,10 @@ pub enum Action {
         /// it; a rollback looks for a copy already running there.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         net_ns: Option<String>,
+        /// The account it ran as (Windows), as a SID; a rollback run by
+        /// another account does not start it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sid: Option<String>,
     },
 }
 
@@ -158,6 +182,13 @@ impl Action {
             Action::WinServiceStop { name } => format!("sc.exe stop {name}"),
             Action::WinServiceDisable { name, previous } => {
                 format!("sc.exe config {name} start= disabled (was {previous})")
+            }
+            Action::TaskEnd { name } => format!("schtasks.exe /End /TN {name}"),
+            Action::TaskDisable { name, .. } => {
+                format!("schtasks.exe /Change /TN {name} /DISABLE")
+            }
+            Action::LogonDisable { key, name, .. } => {
+                format!("turn off logon entry {name} ({key})")
             }
             Action::Terminate {
                 pid, exe, killed, ..
@@ -385,6 +416,13 @@ enum Planned {
         name: String,
         previous: String,
     },
+    TaskEnd(String),
+    TaskDisable(String),
+    LogonDisable {
+        key: String,
+        name: String,
+        previous: Option<String>,
+    },
 }
 
 fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
@@ -527,6 +565,39 @@ fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
                     _ => manual.push(format!("service {name} (starts as {start})")),
                 }
             }
+            Origin::WinTask {
+                name,
+                enabled,
+                running,
+            } => {
+                // Ended first, then turned off: a rollback turns it on
+                // again before running it.
+                if *running {
+                    disables.push(Planned::TaskEnd(name.clone()));
+                }
+                if *enabled {
+                    disables.push(Planned::TaskDisable(name.clone()));
+                }
+            }
+            Origin::WinLogon {
+                place,
+                name,
+                approved,
+                previous,
+                disabled,
+            } => {
+                if *disabled {
+                    continue;
+                }
+                match approved {
+                    Some(key) => disables.push(Planned::LogonDisable {
+                        key: key.clone(),
+                        name: name.clone(),
+                        previous: previous.clone(),
+                    }),
+                    None => manual.push(format!("logon entry {name} in {place}")),
+                }
+            }
             Origin::Process { .. } => {}
             Origin::Container { id, image } => {
                 manual.push(format!("container {id} {image}").trim_end().to_string());
@@ -560,6 +631,11 @@ fn describe_planned(planned: &Planned) -> String {
         Planned::WinServiceStop(name) => format!("sc.exe stop {name}"),
         Planned::WinServiceDisable { name, previous } => {
             format!("sc.exe config {name} start= disabled (now {previous})")
+        }
+        Planned::TaskEnd(name) => format!("schtasks.exe /End /TN {name}"),
+        Planned::TaskDisable(name) => format!("schtasks.exe /Change /TN {name} /DISABLE"),
+        Planned::LogonDisable { key, name, .. } => {
+            format!("turn off logon entry {name} ({key})")
         }
     }
 }
@@ -781,6 +857,41 @@ fn execute(
         Planned::WinServiceDisable { name, previous } => {
             crate::winsvc::set_start(host, name, "disabled")?;
             Ok(vec![Action::WinServiceDisable {
+                name: name.clone(),
+                previous: previous.clone(),
+            }])
+        }
+        Planned::TaskEnd(name) => {
+            crate::winstart::end(host, name)?;
+            Ok(vec![Action::TaskEnd { name: name.clone() }])
+        }
+        Planned::TaskDisable(name) => {
+            // Kept to compare after rollback: turning a task off and on
+            // registers it again.
+            let definition = crate::winstart::definition(host, name);
+            crate::winstart::set_enabled(host, name, false)?;
+            Ok(vec![Action::TaskDisable {
+                name: name.clone(),
+                definition,
+            }])
+        }
+        Planned::LogonDisable {
+            key,
+            name,
+            previous,
+        } => {
+            // The value read again: recorded is what is replaced.
+            crate::winstart::with_settings(host, key, |at| {
+                let now = crate::winstart::read_approved(host, at, name)?;
+                if now != *previous {
+                    return Err(format!(
+                        "logon entry {name} ({key}) changed since detection"
+                    ));
+                }
+                crate::winstart::write_approved(host, at, name, crate::winstart::APPROVED_OFF)
+            })?;
+            Ok(vec![Action::LogonDisable {
+                key: key.clone(),
                 name: name.clone(),
                 previous: previous.clone(),
             }])
@@ -1010,6 +1121,9 @@ fn foreign_network_message(pid: u32, namespace: &str) -> String {
 
 /// The network namespace a process is in, as `/proc/<pid>/ns/net` names it.
 fn net_namespace(host: &dyn Host, pid: u32) -> Option<String> {
+    if host.os() != crate::host::Os::Linux {
+        return None;
+    }
     host.read_link(&PathBuf::from(format!("/proc/{pid}/ns/net")))
         .ok()
         .map(|link| link.display().to_string())
@@ -1099,6 +1213,7 @@ fn terminate_action(
         restart: process.unit.is_none() && !service_pids.contains(&process.pid),
         killed,
         net_ns,
+        sid: process.sid.clone(),
     }
 }
 
@@ -1185,6 +1300,7 @@ pub fn takeover(
                     | Origin::Sysv { .. }
                     | Origin::Launchd { .. }
                     | Origin::WinService { .. }
+                    | Origin::WinTask { .. }
             )
         })
         .flat_map(|entry| entry.processes.iter().map(|process| process.pid))
@@ -1561,6 +1677,51 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             crate::winsvc::set_start(host, name, previous)?;
             Ok(format!("sc.exe config {name} start= {previous}"))
         }
+        Action::TaskEnd { name } => {
+            crate::winstart::run(host, name)?;
+            Ok(format!("schtasks.exe /Run /TN {name}"))
+        }
+        Action::TaskDisable { name, definition } => {
+            crate::winstart::set_enabled(host, name, true)?;
+            let done = format!("schtasks.exe /Change /TN {name} /ENABLE");
+            let now = crate::winstart::definition(host, name);
+            Ok(match (definition, now) {
+                (Some(before), Some(now))
+                    if !crate::winstart::same_definition(before, &now) =>
+                {
+                    format!(
+                        "{done}; the task's definition differs from the one saved at takeover, check it by hand"
+                    )
+                }
+                (Some(_), None) => format!(
+                    "{done}; the task's definition could not be read to compare with the one saved at takeover"
+                ),
+                _ => done,
+            })
+        }
+        Action::LogonDisable {
+            key,
+            name,
+            previous,
+        } => {
+            // A user who has logged off: their settings are loaded for the
+            // change, or the step fails and is kept. Changed since by
+            // someone else (turned on again, or removed): their choice
+            // stands.
+            crate::winstart::with_settings(host, key, |at| {
+                let now = crate::winstart::read_approved(host, at, name)?;
+                if now.as_deref() != Some(crate::winstart::APPROVED_OFF) {
+                    return Ok(format!(
+                        "logon entry {name} ({key}) changed since; left as it is"
+                    ));
+                }
+                match previous {
+                    Some(hex) => crate::winstart::write_approved(host, at, name, hex)?,
+                    None => crate::winstart::delete_approved(host, at, name)?,
+                }
+                Ok(format!("logon entry {name} ({key}) restored"))
+            })
+        }
         Action::Terminate {
             argv,
             env,
@@ -1573,10 +1734,27 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             pid,
             exe,
             net_ns,
+            sid,
             ..
         } => {
             if !*restart {
                 return Ok(format!("process {pid} is started by its service"));
+            }
+            // Started again only as the account it ran as: the takeover
+            // ended only processes of the account that ran it, and a
+            // rollback run by another (an Agent running as the system)
+            // would otherwise start the program with that account's rights.
+            if let Some(theirs) = sid {
+                let ours = host
+                    .process_info(host.own_pid())
+                    .ok()
+                    .and_then(|info| info.sid);
+                if ours.as_deref() != Some(theirs.as_str()) {
+                    return Err(format!(
+                        "process {pid} ran as {theirs}, and this rollback runs as {}; run the rollback as that account, or start it by hand and then rollback --forget-process {pid} --confirm",
+                        ours.as_deref().unwrap_or("an unknown account")
+                    ));
+                }
             }
             // A unit that restarts what it runs may already have started it
             // again; a second copy would fight it for ports, the virtual
@@ -1616,7 +1794,8 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             // On systemd hosts the new process moves into a scope of its own
             // before it runs anything, so neither it nor a child it forks
             // stays in the cgroup of whoever ran the rollback.
-            let systemd = host.exists(Path::new("/run/systemd/system"));
+            let systemd = host.os() == crate::host::Os::Linux
+                && host.exists(Path::new("/run/systemd/system"));
             let scope = |new_pid: u32| own_scope(host, new_pid);
             let spawned = host
                 .spawn_detached(&spawn, systemd.then_some(&scope as Hold<'_>))
@@ -1687,7 +1866,9 @@ fn restart_wait_ms(host: &dyn Host, units: &BTreeSet<String>) -> Result<u64, Str
             None => return Err(format!("{unit}: restart setting unknown")),
         }
         let unknown = || {
-            format!("{unit} restarts what it runs after an unknown or long delay; name it in the profile's detect.services")
+            format!(
+                "{unit} restarts what it runs after an unknown or long delay; name it in the profile's detect.services"
+            )
         };
         // With RestartSteps= (systemd 254+) each restart waits longer, up to
         // RestartMaxDelayUSec=; RestartUSecNext= is the next one. Older
@@ -2294,10 +2475,11 @@ mod tests {
         // The process outside any unit is restarted as before.
         assert_eq!(spawned.len(), 1);
         assert_eq!(spawned[0].argv, ["/opt/demo-meshd", "--net-name", "lab"]);
-        assert!(report.rollback.iter().any(|step| step
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("already runs again as 301"))));
+        assert!(report.rollback.iter().any(|step| {
+            step.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("already runs again as 301"))
+        }));
     }
 
     #[test]
@@ -2508,9 +2690,9 @@ mod tests {
         // Nothing done, nothing recorded.
         assert!(!host.exists(&Path::new(STATE).join(MANIFEST)));
         assert!(report.steps.iter().any(|step| !step.ok
-            && step.detail.as_deref().is_some_and(
-                |detail| detail.starts_with("process 200 runs in another network namespace")
-            )));
+            && step.detail.as_deref().is_some_and(|detail| {
+                detail.starts_with("process 200 runs in another network namespace")
+            })));
         assert!(host.spawned.borrow().is_empty());
         // Found before anything changed: no service stopped or turned off,
         // no line commented, no process signalled.
@@ -2561,10 +2743,11 @@ mod tests {
         );
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::Refused, "{report:?}");
-        assert!(report.steps.iter().any(|step| step
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.starts_with("the record of the processes to end"))));
+        assert!(report.steps.iter().any(|step| {
+            step.detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("the record of the processes to end"))
+        }));
         assert!(host.signals.borrow().is_empty());
         assert!(!host
             .ran
@@ -2601,6 +2784,7 @@ mod tests {
                     restart: true,
                     killed: false,
                     net_ns: None,
+                    sid: None,
                 },
                 at: 0,
                 run: 1,
@@ -2776,6 +2960,7 @@ mod tests {
     /// started by hand.
     fn mac() -> FakeHost {
         let mut host = FakeHost::default();
+        host.os.set(crate::host::Os::Macos);
         host.programs.insert("launchctl".into());
         host.programs.insert("plutil".into());
         host.file(DAEMON, "<plist/>");
@@ -2897,9 +3082,10 @@ mod tests {
             r#"{"Label":"local.demo","ProgramArguments":["/bin/sh","-c","exec /Users/alice/bin/demo-meshd --net-name lab"]}"#,
         );
         host.answer("launchctl print-disabled gui/501", 0, "");
+        // The shell execs the program: launchd's process is the copy.
         host.launchd
             .borrow_mut()
-            .insert("gui/501/local.demo".into(), (agent.into(), None, true));
+            .insert("gui/501/local.demo".into(), (agent.into(), Some(400), true));
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::Done, "{report:?}");
         let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
@@ -2990,6 +3176,7 @@ mod tests {
     /// administrator.
     fn windows(services_json: &str) -> FakeHost {
         let mut host = FakeHost::default();
+        host.os.set(crate::host::Os::Windows);
         host.programs.insert("powershell.exe".into());
         host.answer(
             &format!(
@@ -3159,5 +3346,426 @@ mod tests {
             .steps
             .iter()
             .all(|step| !matches!(step.action, Action::Terminate { pid: 901, .. })));
+    }
+
+    const USER_RUN: &str = r"HKU\S-1-5-21-9-500\Software\Microsoft\Windows\CurrentVersion\Run";
+    const USER_APPROVED: &str = r"HKU\S-1-5-21-9-500\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+    /// A machine where a scheduled task runs the program as the system
+    /// (process 500, a child of the Task Scheduler, 600), the
+    /// administrator's `Run` key starts the copy 700, and the Startup
+    /// folder of a user who is not logged on holds a shortcut to it.
+    fn windows_startup() -> FakeHost {
+        let host = windows("[]");
+        host.answer(
+            &format!(
+                "powershell.exe -NoProfile -NonInteractive -Command {}",
+                crate::winstart::TASKS_QUERY
+            ),
+            0,
+            r#"{"Schedule":600,"Tasks":[{"Path":"\\","Name":"DemoTask","State":"Running","Actions":[{"Execute":"\"C:\\Program Files\\Demo\\demo-meshd.exe\"","Arguments":"-c C:\\demo\\a.toml","WorkingDirectory":null}]},{"Path":"\\Microsoft\\Windows\\","Name":"Defrag","State":"Ready","Actions":[{"Execute":"%windir%\\system32\\defrag.exe","Arguments":"-c","WorkingDirectory":null}]}]}"#,
+        );
+        host.answer(
+            &format!(
+                "powershell.exe -NoProfile -NonInteractive -Command {}",
+                crate::winstart::LOGON_QUERY
+            ),
+            0,
+            &serde_json::json!([
+                {"Kind": "run", "Place": USER_RUN, "Name": "demo",
+                 "Line": r#""C:\Users\admin\demo-meshd.exe" --net-name lab"#,
+                 "Approved": USER_APPROVED, "Previous": "020000000000000000000000"},
+                {"Kind": "shortcut", "Place": r"C:\Users\bob\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
+                 "Name": "demo.lnk", "Target": r"C:\bob\demo-meshd.exe", "Arguments": "", "WorkingDirectory": "",
+                 "Approved": null, "Previous": null},
+                {"Kind": "shortcut", "Place": r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp",
+                 "Name": "notes.lnk", "Target": r"C:\Windows\notepad.exe",
+                 "Approved": r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+                 "Previous": null}
+            ])
+            .to_string(),
+        );
+        host.answer(
+            &format!(
+                "powershell.exe -NoProfile -NonInteractive -Command {}",
+                crate::winstart::task_state_query(r"\DemoTask")
+            ),
+            0,
+            "Ready\r\n",
+        );
+        host.answer(
+            &format!("reg.exe query {USER_APPROVED} /v demo"),
+            0,
+            &format!(
+                "\r\n{USER_APPROVED}\r\n    demo    REG_BINARY    020000000000000000000000\r\n"
+            ),
+        );
+        host.exits_on
+            .borrow_mut()
+            .insert(r"schtasks.exe /End /TN \DemoTask".into(), vec![500]);
+        host
+    }
+
+    #[test]
+    fn a_scheduled_task_and_a_logon_entry_are_turned_off_and_restored() {
+        let host = windows_startup();
+        let found = detect(&host, &demo());
+        let task = found
+            .iter()
+            .find(|entry| matches!(entry.origin, Origin::WinTask { .. }))
+            .expect("the task is found");
+        assert_eq!(task.processes.len(), 1);
+        assert_eq!(task.processes[0].pid, 500);
+        assert!(found
+            .iter()
+            .all(|entry| !entry.origin.id().contains("Defrag")
+                && !entry.origin.id().contains("notes")));
+
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        let logon = format!("turn off logon entry demo ({USER_APPROVED})");
+        assert_eq!(
+            steps,
+            vec![
+                r"schtasks.exe /End /TN \DemoTask",
+                r"schtasks.exe /Change /TN \DemoTask /DISABLE",
+                logon.as_str(),
+                r"end process 700 (C:\Users\admin\demo-meshd.exe) with TERM",
+            ]
+        );
+        // The task's process, run by the system, was ended by the Task
+        // Scheduler: no account check and no restart of its own.
+        assert_eq!(*host.signals.borrow(), vec![(700, Signal::Terminate)]);
+        assert!(report
+            .manual
+            .iter()
+            .any(|line| line.starts_with("logon entry demo.lnk in ")));
+        assert!(host.ran.borrow().contains(&format!(
+            "reg.exe add {USER_APPROVED} /v demo /t REG_BINARY /d {} /f",
+            crate::winstart::APPROVED_OFF
+        )));
+
+        host.answer(
+            &format!("reg.exe query {USER_APPROVED} /v demo"),
+            0,
+            &format!(
+                "    demo    REG_BINARY    {}\r\n",
+                crate::winstart::APPROVED_OFF.to_ascii_uppercase()
+            ),
+        );
+        let rollback = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback.ok, "{rollback:?}");
+        let ran = host.ran.borrow();
+        let position = |wanted: &str| {
+            ran.iter()
+                .position(|line| line == wanted)
+                .unwrap_or_else(|| panic!("{wanted} not run"))
+        };
+        assert!(
+            position(r"schtasks.exe /Change /TN \DemoTask /ENABLE")
+                < position(r"schtasks.exe /Run /TN \DemoTask")
+        );
+        position(&format!(
+            "reg.exe add {USER_APPROVED} /v demo /t REG_BINARY /d 020000000000000000000000 /f"
+        ));
+        let spawned = host.spawned.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].argv[0], r"C:\Users\admin\demo-meshd.exe");
+    }
+
+    #[test]
+    fn a_logon_entry_of_a_user_who_logged_off_is_restored_or_kept() {
+        let mounted =
+            USER_APPROVED.replace(r"HKU\S-1-5-21-9-500", r"HKU\anixops-mesh-S-1-5-21-9-500");
+        let logged_off = |host: &FakeHost| {
+            host.answer(r"reg.exe query HKU\S-1-5-21-9-500", 1, "");
+            host.answer(&format!("reg.exe query {USER_APPROVED} /v demo"), 1, "");
+            host.answer(
+                &format!(
+                    "powershell.exe -NoProfile -NonInteractive -Command {}",
+                    crate::winstart::profile_query("S-1-5-21-9-500")
+                ),
+                0,
+                "C:\\Users\\admin\r\n",
+            );
+            host.answer(
+                &format!("reg.exe query {mounted} /v demo"),
+                0,
+                &format!(
+                    "    demo    REG_BINARY    {}\r\n",
+                    crate::winstart::APPROVED_OFF
+                ),
+            );
+        };
+        let load = r"reg.exe load HKU\anixops-mesh-S-1-5-21-9-500 C:\Users\admin\NTUSER.DAT";
+
+        // The user's settings are loaded under our own name, the value is
+        // put back there, and they are unloaded again.
+        let host = windows_startup();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        logged_off(&host);
+        let rollback_report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback_report.ok, "{rollback_report:?}");
+        assert!(rollback_report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.ends_with("restored"))));
+        {
+            let ran = host.ran.borrow();
+            let position = |wanted: &str| {
+                ran.iter()
+                    .position(|line| line == wanted)
+                    .unwrap_or_else(|| panic!("{wanted} not run"))
+            };
+            let add = position(&format!(
+                "reg.exe add {mounted} /v demo /t REG_BINARY /d 020000000000000000000000 /f"
+            ));
+            assert!(position(load) < add);
+            assert!(add < position(r"reg.exe unload HKU\anixops-mesh-S-1-5-21-9-500"));
+        }
+
+        // Settings that cannot be loaded: the step fails and is kept for
+        // the next rollback, never taken as changed by someone else.
+        let host = windows_startup();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        logged_off(&host);
+        host.answer(load, 1, "");
+        let rollback_report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!rollback_report.ok, "{rollback_report:?}");
+        assert!(!rollback_report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.ends_with("left as it is"))));
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.starts_with("reg.exe add") && line.contains("/d 0200")));
+        let kept = |report: &RollbackReport| {
+            report.steps.iter().any(|step| {
+                !step.ok
+                    && step
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("could not be loaded"))
+            })
+        };
+        assert!(kept(&rollback_report), "{rollback_report:?}");
+        let again = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!again.ok && kept(&again), "{again:?}");
+    }
+
+    #[test]
+    fn a_task_whose_definition_changed_is_reported_after_rollback() {
+        let host = windows_startup();
+        host.answer(
+            r"schtasks.exe /Query /XML /TN \DemoTask",
+            0,
+            "<Task>\r\n<Settings><Enabled>true</Enabled></Settings>\r\n</Task>\r\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        host.answer(
+            r"schtasks.exe /Query /XML /TN \DemoTask",
+            0,
+            "<Task>\r\n<Settings><Enabled>true</Enabled><RunOnlyIfLoggedOn>true</RunOnlyIfLoggedOn></Settings>\r\n</Task>\r\n",
+        );
+        host.answer(
+            &format!("reg.exe query {USER_APPROVED} /v demo"),
+            0,
+            &format!(
+                "    demo    REG_BINARY    {}\r\n",
+                crate::winstart::APPROVED_OFF
+            ),
+        );
+        let rollback_report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback_report.ok, "{rollback_report:?}");
+        assert!(rollback_report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.ends_with("check it by hand"))));
+    }
+
+    #[test]
+    fn a_logon_entry_changed_since_is_left_alone() {
+        let host = windows_startup();
+        // Turned off by the operator between detection and the takeover.
+        let report = {
+            host.answer(
+                &format!("reg.exe query {USER_APPROVED} /v demo"),
+                0,
+                "    demo    REG_BINARY    070000000000000000000000\r\n",
+            );
+            takeover(&host, &demo(), Path::new(STATE), false).unwrap()
+        };
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.starts_with("reg.exe add")));
+
+        // Turned on again by the operator after the takeover: rollback
+        // keeps their choice.
+        let host = windows_startup();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        host.answer(&format!("reg.exe query {USER_APPROVED} /v demo"), 1, "");
+        let rollback = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback.ok, "{rollback:?}");
+        assert!(rollback.steps.iter().any(|step| {
+            step.detail
+                .as_deref()
+                .is_some_and(|detail| detail.ends_with("left as it is"))
+        }));
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.starts_with("reg.exe delete")
+                || line.ends_with("/d 020000000000000000000000 /f")));
+    }
+
+    #[test]
+    fn windows_never_reads_unix_paths_a_user_may_create() {
+        // On Windows these are C:\proc and C:\etc, which any user may
+        // create: a planted process and autostart line are ignored.
+        let host = windows(DEMO_SERVICE);
+        host.process(
+            900,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "planted"],
+            &[],
+            "0::/user.slice\n",
+        );
+        let crontab = "* * * * * root /opt/demo-meshd --net-name planted\n";
+        host.file("/etc/crontab", crontab);
+        host.file("/run/systemd/system/.keep", "");
+        let found = detect(&host, &demo());
+        assert!(found.iter().all(|entry| !matches!(
+            entry.origin,
+            Origin::Autostart { .. } | Origin::Systemd { .. }
+        )));
+        assert!(found
+            .iter()
+            .all(|entry| entry.processes.iter().all(|process| process.pid != 900)));
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        assert_eq!(host.text("/etc/crontab").as_deref(), Some(crontab));
+        assert!(host.signals.borrow().iter().all(|(pid, _)| *pid != 900));
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest
+            .steps
+            .iter()
+            .all(|step| !matches!(step.action, Action::Terminate { pid: 900, .. })));
+    }
+
+    #[test]
+    fn a_windows_rollback_by_another_account_does_not_start_the_process() {
+        let host = windows(DEMO_SERVICE);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().any(|step| matches!(
+            &step.action,
+            Action::Terminate { pid: 700, sid: Some(sid), .. } if sid == ADMIN
+        )));
+        // The rollback runs as the system (an Agent), not as the
+        // administrator who ran the takeover.
+        let set_own = |sid: &str| {
+            host.table
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .get_mut(&1)
+                .unwrap()
+                .sid = Some(sid.into());
+        };
+        set_own(SYSTEM);
+        let report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!report.ok);
+        assert!(report.steps.iter().any(|step| !step.ok
+            && step
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("ran as S-1-5-21-9-500"))));
+        assert!(host.spawned.borrow().is_empty());
+        // Kept for a rollback by the right account.
+        set_own(ADMIN);
+        let report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(report.ok, "{report:?}");
+        assert_eq!(host.spawned.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_saved_is_reported() {
+        // The takeover: the first step cannot be recorded, so it is undone,
+        // and the record of that cannot be saved either.
+        let host = windows(DEMO_SERVICE);
+        let record = Path::new(STATE).join(MANIFEST);
+        host.fail_writes.borrow_mut().insert(record.clone());
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RollbackFailed, "{report:?}");
+        assert!(report
+            .rollback
+            .iter()
+            .any(|step| step.step == "save record" && !step.ok));
+        assert!(host
+            .ran
+            .borrow()
+            .contains(&"sc.exe start DemoMesh".to_string()));
+
+        // The rollback: what was undone is reported, and so is the record
+        // that could not be saved.
+        let host = windows(DEMO_SERVICE);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        host.fail_writes.borrow_mut().insert(record);
+        let report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!report.ok);
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.step == "sc.exe stop DemoMesh" && step.ok));
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.step == "save record" && !step.ok));
+    }
+
+    #[test]
+    fn a_copy_with_the_job_command_line_is_not_the_jobs() {
+        // Started by hand with the daemon's exact command line, by the same
+        // account (root): the job's own process is only the one launchd
+        // names, so this copy is ended and started again on rollback.
+        let host = mac();
+        host.table_process(
+            500,
+            "/usr/local/bin/demo-meshd",
+            &["/usr/local/bin/demo-meshd", "-c", "/etc/demo/a.toml"],
+            &[],
+            0,
+        );
+        let found = detect(&host, &demo());
+        let job = found
+            .iter()
+            .find(|entry| matches!(entry.origin, Origin::Launchd { .. }))
+            .unwrap();
+        let pids: Vec<u32> = job.processes.iter().map(|process| process.pid).collect();
+        assert_eq!(pids, vec![300]);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().any(|step| matches!(
+            step.action,
+            Action::Terminate {
+                pid: 500,
+                restart: true,
+                ..
+            }
+        )));
     }
 }

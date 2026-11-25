@@ -13,9 +13,10 @@ permissions:
   contents: read
 
 # Superseded pull request runs are cancelled. Runs on main, tags and manual dispatch
-# always finish so every merged commit has a complete result.
+# always finish so every merged commit has a complete result; outside pull requests
+# each commit has its own group, so a merge does not wait for the previous merge's run.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -621,6 +622,66 @@ jobs:
             echo "::endgroup::"
           done
 
+  mesh-node-desktop:
+    name: Mesh node desktop build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: "0"
+    needs:
+      - changes
+      - policy-fast
+      - detect-projects
+    # The release form of anixops-mesh for macOS and Windows, built with the
+    # script the release workflow uses.
+    if: >-
+      ${{
+        needs.detect-projects.outputs.rust == 'true' &&
+        (
+          needs.changes.outputs.full_matrix == 'true' ||
+          needs.changes.outputs.rust == 'true' ||
+          needs.changes.outputs.windows == 'true' ||
+          needs.changes.outputs.linux == 'true' ||
+          needs.changes.outputs.apple == 'true' ||
+          needs.changes.outputs.ios == 'true'
+        )
+      }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: aarch64-apple-darwin
+          - os: macos-26
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mesh-node-${{ matrix.target }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Build anixops-mesh
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          .github/scripts/build-mesh-node.sh "${TARGET}" ci dist/mesh-node
+
   mesh-bridge-netns:
     name: Mesh external bridge (nftables)
     runs-on: ubuntu-latest
@@ -899,7 +960,7 @@ jobs:
           sudo env "RUNNER_TEMP=${RUNNER_TEMP}" bash .github/scripts/iwan-tun-interop.sh logs
 
   rust-h2-mitm-fuzz:
-    name: HTTP/2 MITM fuzz
+    name: HTTP/2 MITM fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     needs:
@@ -918,6 +979,28 @@ jobs:
           needs.changes.outputs.ios == 'true'
         )
       }}
+    strategy:
+      # Every target runs to the end, so one crash does not hide another.
+      fail-fast: false
+      matrix:
+        include:
+          # HTTP/2 MITM: TLS ClientHello ALPN, frames after a valid preface, requests.
+          - { target: tls_client_hello_alpn, crate: crates/engine-native, max_len: 4096, dict: "" }
+          - { target: h2_mitm_frames, crate: crates/engine-native, max_len: 4096, dict: "" }
+          - { target: h2_mitm_requests, crate: crates/engine-native, max_len: 4096, dict: "" }
+          # Runtime control JSON through the iOS C entry point; the dictionary
+          # holds the command and field names. Inputs above the 4 KiB request
+          # limit are generated on purpose to reach the size check.
+          - { target: runtime_control, crate: crates/engine-embedded, max_len: 8192, dict: fuzz/dict/runtime_control.dict }
+          # Server side of VLESS, Trojan, VMess and Shadowsocks: the first bytes
+          # a client sends, with and without a valid credential in front.
+          - { target: inbound_handshakes, crate: crates/engine-inbound, max_len: 4096, dict: "" }
+          # Text from outside the app: subscriptions and share links, config
+          # documents, rule lines and rule sets, Loon plugins.
+          - { target: subscription_import, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
+          - { target: config_document, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
+          - { target: rule_text, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
+          - { target: loon_plugin, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
     env:
       CARGO_INCREMENTAL: "0"
       # Pull requests fuzz each target for 30 s; main, tags and manual runs for 60 s.
@@ -940,79 +1023,36 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      - name: Run fuzz targets
+      # One fuzz target per machine (see the matrix); the time per target, input
+      # sizes, dictionaries and limits are the same as when they ran one after another.
+      - name: Run fuzz target
         shell: bash
-        working-directory: crates/engine-native
+        working-directory: ${{ matrix.crate }}
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_MAX_LEN: ${{ matrix.max_len }}
+          FUZZ_DICT: ${{ matrix.dict }}
         run: |
           set -euo pipefail
+          dict=()
+          if [ -n "${FUZZ_DICT}" ]; then
+            dict=("-dict=${FUZZ_DICT}")
+          fi
           # The prebuilt cargo-fuzz binary is musl-linked and would default to
           # the musl target, which ASan cannot instrument.
-          for target in tls_client_hello_alpn h2_mitm_frames h2_mitm_requests; do
-            echo "::group::cargo fuzz run ${target}"
-            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
-              -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-              -max_len=4096 \
-              -rss_limit_mb=2048 \
-              -timeout=20
-            echo "::endgroup::"
-          done
-
-      # Runtime control JSON through the iOS C entry point; the dictionary
-      # holds the command and field names. Inputs above the 4 KiB request
-      # limit are generated on purpose to reach the size check.
-      - name: Run runtime control fuzz target
-        shell: bash
-        working-directory: crates/engine-embedded
-        run: |
-          set -euo pipefail
-          cargo fuzz run --target x86_64-unknown-linux-gnu runtime_control -- \
+          cargo fuzz run --target x86_64-unknown-linux-gnu "${FUZZ_TARGET}" -- \
             -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-            -dict=fuzz/dict/runtime_control.dict \
-            -max_len=8192 \
+            ${dict[@]+"${dict[@]}"} \
+            -max_len="${FUZZ_MAX_LEN}" \
             -rss_limit_mb=2048 \
             -timeout=20
-
-      # Server side of VLESS, Trojan, VMess and Shadowsocks: the first bytes
-      # a client sends, with and without a valid credential in front.
-      - name: Run inbound handshake fuzz target
-        shell: bash
-        working-directory: crates/engine-inbound
-        run: |
-          set -euo pipefail
-          cargo fuzz run --target x86_64-unknown-linux-gnu inbound_handshakes -- \
-            -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-            -max_len=4096 \
-            -rss_limit_mb=2048 \
-            -timeout=20
-
-      # Text from outside the app: subscriptions and share links, config
-      # documents, rule lines and rule sets, Loon plugins.
-      - name: Run import fuzz targets
-        shell: bash
-        working-directory: crates/node-import
-        run: |
-          set -euo pipefail
-          for target in subscription_import config_document rule_text loon_plugin; do
-            echo "::group::cargo fuzz run ${target}"
-            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
-              -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-              -dict=fuzz/dict/import_text.dict \
-              -max_len=16384 \
-              -rss_limit_mb=2048 \
-              -timeout=20
-            echo "::endgroup::"
-          done
 
       - name: Upload fuzz crash artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: h2-mitm-fuzz-artifacts-${{ github.sha }}
-          path: |
-            crates/engine-native/fuzz/artifacts
-            crates/engine-embedded/fuzz/artifacts
-            crates/engine-inbound/fuzz/artifacts
-            crates/node-import/fuzz/artifacts
+          name: h2-mitm-fuzz-artifacts-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ matrix.crate }}/fuzz/artifacts
           if-no-files-found: ignore
 
   ios-runtime-static-libs:
@@ -1093,6 +1133,7 @@ jobs:
       - rust-h2-mitm-fuzz
       - protocol-features
       - mesh-node-static
+      - mesh-node-desktop
       - mesh-bridge-netns
       - script-runtime-jsc
       - ios-runtime-static-libs
@@ -1129,6 +1170,7 @@ jobs:
           RESULT_REALITY_INTEROP: ${{ needs.reality-interop.result }}
           RESULT_PROTOCOL_FEATURES: ${{ needs.protocol-features.result }}
           RESULT_MESH_NODE_STATIC: ${{ needs.mesh-node-static.result }}
+          RESULT_MESH_NODE_DESKTOP: ${{ needs.mesh-node-desktop.result }}
           RESULT_MESH_BRIDGE_NETNS: ${{ needs.mesh-bridge-netns.result }}
           RESULT_SCRIPT_RUNTIME_JSC: ${{ needs.script-runtime-jsc.result }}
           RESULT_IOS_RUNTIME_LIBS: ${{ needs.ios-runtime-static-libs.result }}
@@ -1213,6 +1255,7 @@ jobs:
           record_job "REALITY interop (Linux)" "${RESULT_REALITY_INTEROP}" "${reality_interop_required}"
           record_job "Protocol feature matrix" "${RESULT_PROTOCOL_FEATURES}" "${rust_required}"
           record_job "Mesh node static build" "${RESULT_MESH_NODE_STATIC}" "${rust_required}"
+          record_job "Mesh node desktop build" "${RESULT_MESH_NODE_DESKTOP}" "${rust_required}"
           record_job "Mesh external bridge (nftables)" "${RESULT_MESH_BRIDGE_NETNS}" "${rust_required}"
           record_job "JavaScriptCore script conformance" "${RESULT_SCRIPT_RUNTIME_JSC}" "${rust_required}"
           record_job "iOS runtime static libraries" "${RESULT_IOS_RUNTIME_LIBS}" "${ios_runtime_required}"
@@ -1280,6 +1323,7 @@ jobs:
             echo "| HTTP/2 MITM fuzz | ${rust_required} | ${RESULT_RUST_H2_FUZZ} |"
             echo "| Protocol feature matrix | ${rust_required} | ${RESULT_PROTOCOL_FEATURES} |"
             echo "| Mesh node static build | ${rust_required} | ${RESULT_MESH_NODE_STATIC} |"
+            echo "| Mesh node desktop build | ${rust_required} | ${RESULT_MESH_NODE_DESKTOP} |"
             echo "| Mesh external bridge (nftables) | ${rust_required} | ${RESULT_MESH_BRIDGE_NETNS} |"
             echo "| JavaScriptCore script conformance | ${rust_required} | ${RESULT_SCRIPT_RUNTIME_JSC} |"
             echo "| iOS runtime static libraries | ${ios_runtime_required} | ${RESULT_IOS_RUNTIME_LIBS} |"

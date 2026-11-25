@@ -231,8 +231,14 @@ fi
 
 if [ -n "$profile_url" ]; then
   log "taking over the existing installation"
+  status=0
   "$BIN" takeover --profile "$PROFILE" --state-dir "$STATE/takeover" --report "$STATE/takeover-report.json" >/dev/null \
-    || die "takeover failed and was rolled back; see $STATE/takeover-report.json"
+    || status=$?
+  case "$status" in
+    0) ;;
+    7) die "takeover failed and could not be fully undone; see $STATE/takeover-report.json, then run: $BIN rollback --state-dir $STATE/takeover" ;;
+    *) die "takeover failed or was refused; nothing it changed is left changed; see $STATE/takeover-report.json" ;;
+  esac
 fi
 
 started=0
