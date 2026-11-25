@@ -10,12 +10,16 @@
 //! ```json
 //! {
 //!   "config_version": 1,
-//!   "network": { "name": "office", "secret": "…", "secure_mode": false, "cipher": "aes-gcm" },
-//!   "node": { "address": "10.144.144.5/24", "role": "full", "listen": [{ "transport": "tcp" }] },
+//!   "network": { "name": "office", "secret": "…", "kind": "managed", "secure_mode": true },
+//!   "node": {
+//!     "address": "10.144.144.5/24", "role": "full", "hostname": "build-01",
+//!     "mtu": 1380, "relay": true, "listen": [{ "transport": "tcp" }]
+//!   },
 //!   "peers": [{ "server": "peer.example.com", "port": 11010, "transport": "tcp" }],
 //!   "subnets": { "accept": ["192.168.0.0/16"], "advertise": ["192.168.10.0/24"] },
 //!   "routing": {
 //!     "policy": "hops",
+//!     "system_routes": ["192.168.10.0/24"],
 //!     "paths": [{ "to_peer": "10.144.144.7", "via": ["10.144.144.3"] }]
 //!   }
 //! }
@@ -45,11 +49,22 @@ pub const MAX_PATHS: usize = 256;
 pub const MAX_WAYPOINTS: usize = 6;
 /// Default TCP and UDP port (spec §2.4).
 pub const DEFAULT_PORT: u16 = 11010;
+/// Default virtual interface MTU (spec §2.4).
+pub const DEFAULT_MTU: u16 = 1380;
+/// Smallest accepted MTU: the IPv6 minimum.
+pub const MIN_MTU: u16 = 1280;
+/// Largest accepted MTU.
+pub const MAX_MTU: u16 = 9000;
+/// Longest host name: one DNS label.
+pub const MAX_HOSTNAME_BYTES: usize = 63;
 
 /// One mesh node as it appears in the config. The secret is injected from
 /// the Keychain like the other protocols' passwords. Has no `Debug`: it
 /// holds the secret.
+/// The outbound's own fields; the registration layer removes the outbound
+/// `type` and `tag` before parsing, so anything else unknown is an error.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshConfig {
     pub config_version: u32,
     pub network: NetworkConfig,
@@ -68,15 +83,34 @@ pub struct NetworkConfig {
     /// Used byte for byte in the network digest (spec §6.3).
     pub name: String,
     pub secret: String,
-    /// `false`, the default: the default handshake, without forward secrecy.
-    /// `true`: the secure mode. All nodes of a network use the same mode and
-    /// there is no fallback (spec §5.2).
+    /// `managed`, the default: one of our region networks, which always use
+    /// the secure mode (spec §5.2, §15.11, requirement R30). `legacy`: an
+    /// existing network joined during migration, typically the old-network
+    /// instance of a bridge node; only this kind may use the default mode or
+    /// no encryption.
     #[serde(default)]
-    pub secure_mode: bool,
+    pub kind: NetworkKind,
+    /// The secure mode (`true`) or the default handshake without forward
+    /// secrecy (`false`). All nodes of a network use the same mode and there
+    /// is no fallback (spec §5.2). Absent: `true` for managed networks,
+    /// `false` for legacy ones.
+    #[serde(default)]
+    pub secure_mode: Option<bool>,
     /// Cipher of the default handshake mode (spec §7.1). `none` turns
     /// encryption off and must be chosen explicitly.
     #[serde(default)]
     pub cipher: Cipher,
+}
+
+/// Who runs a network (spec §15.11).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkKind {
+    /// Ours: secure mode only, never unencrypted.
+    #[default]
+    Managed,
+    /// An existing network kept during migration.
+    Legacy,
 }
 
 /// This node.
@@ -95,6 +129,18 @@ pub struct NodeConfig {
     /// Listening sockets; full nodes only.
     #[serde(default)]
     pub listen: Vec<ListenConfig>,
+    /// The name other nodes and the intranet DNS show (requirement R28): one
+    /// DNS label. Absent: the system host name, read when the node starts.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Virtual interface MTU, [`MIN_MTU`] to [`MAX_MTU`]. Absent: [`DEFAULT_MTU`].
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    /// Whether this node relays for other nodes. Absent: `true` on full
+    /// nodes. Access nodes never relay, so `true` is refused there. A node
+    /// that does not relay is still reachable as a destination.
+    #[serde(default)]
+    pub relay: Option<bool>,
 }
 
 /// What a node does for others (spec §1.3, requirement R10).
@@ -107,19 +153,33 @@ pub enum Role {
     Access,
 }
 
+/// Whether this build runs on a phone, where nodes are access nodes only
+/// (requirement R10).
+pub const IS_PHONE: bool = cfg!(any(target_os = "ios", target_os = "android"));
+
 impl Role {
     /// The role of this platform when the config names none.
     pub fn platform_default() -> Self {
-        if cfg!(any(target_os = "ios", target_os = "android")) {
+        Self::default_for(IS_PHONE)
+    }
+
+    /// Whether this platform may run as a full node.
+    pub fn platform_allows_full() -> bool {
+        Self::allowed(Role::Full, IS_PHONE)
+    }
+
+    /// The role when the config names none, on a phone or elsewhere.
+    pub fn default_for(phone: bool) -> Self {
+        if phone {
             Role::Access
         } else {
             Role::Full
         }
     }
 
-    /// Whether this platform may run as a full node.
-    pub fn platform_allows_full() -> bool {
-        Self::platform_default() == Role::Full
+    /// Whether `role` may run on a phone or elsewhere.
+    pub fn allowed(role: Role, phone: bool) -> bool {
+        role == Role::Access || !phone
     }
 }
 
@@ -161,7 +221,8 @@ pub enum Transport {
 }
 
 /// Cipher of the default handshake mode (spec §7.1). The unauthenticated
-/// XOR mode is not offered: a config naming it fails to parse.
+/// XOR mode is not offered: a config naming it fails validation with a
+/// message saying it is insecure.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 pub enum Cipher {
     /// No encryption at all (spec §7.1, requirement R14). Only when the
@@ -185,6 +246,10 @@ pub enum Cipher {
         alias = "openssl-chacha20-poly1305"
     )]
     ChaCha20Poly1305,
+    /// The unauthenticated XOR mode (spec §7.1). Recognised only so that
+    /// validation can say why it is refused; never used.
+    #[serde(rename = "xor", alias = "openssl-xor")]
+    Xor,
 }
 
 #[derive(Default, Deserialize)]
@@ -204,6 +269,11 @@ pub struct SubnetsConfig {
 pub struct RoutingConfig {
     #[serde(default)]
     pub policy: RoutePolicy,
+    /// Limits which routes go into the operating system's routing table.
+    /// Absent: every accepted route. Present: only routes inside one of
+    /// these networks; the others still work inside the mesh and are shown.
+    #[serde(default)]
+    pub system_routes: Option<Vec<String>>,
     #[serde(default)]
     pub paths: Vec<PathConfig>,
 }
@@ -286,12 +356,18 @@ impl MeshSettings {
 pub struct MeshSettings {
     pub network_name: String,
     pub network_secret: String,
+    pub kind: NetworkKind,
     pub security: SecurityMode,
     pub cipher: Cipher,
     /// This node's IPv4 address; [`IpNet::trunc`] is the virtual subnet.
     pub address: IpNet,
     pub address_v6: Option<IpNet>,
     pub role: Role,
+    /// `None`: the system host name.
+    pub hostname: Option<String>,
+    pub mtu: u16,
+    /// Whether this node relays for others; always `false` on access nodes.
+    pub relay: bool,
     pub listen: Vec<ListenConfig>,
     pub peers: Vec<PeerEndpoint>,
     /// Masked networks; empty means no extra limit.
@@ -299,6 +375,8 @@ pub struct MeshSettings {
     /// Masked networks this node advertises.
     pub advertise_subnets: Vec<IpNet>,
     pub route_policy: RoutePolicy,
+    /// `None`: every accepted route goes into the system routing table.
+    pub system_routes: Option<Vec<IpNet>>,
     pub paths: Vec<CustomPath>,
 }
 
@@ -320,7 +398,7 @@ impl MeshSettings {
     fn in_virtual_subnet(&self, address: IpAddr) -> bool {
         self.virtual_subnets()
             .iter()
-            .any(|subnet| subnet.contains(address) && subnet.network() != address)
+            .any(|subnet| subnet.is_host(address))
     }
 }
 
@@ -343,7 +421,16 @@ impl MeshConfig {
         if network.secret.is_empty() {
             return Err("mesh network secret is empty");
         }
-        if network.secure_mode && network.cipher == Cipher::None {
+        if network.cipher == Cipher::Xor {
+            return Err("mesh cipher xor is insecure (no authentication) and is not supported");
+        }
+        let secure_mode = network
+            .secure_mode
+            .unwrap_or(network.kind == NetworkKind::Managed);
+        if network.kind == NetworkKind::Managed && !secure_mode {
+            return Err("mesh managed networks always use secure_mode");
+        }
+        if secure_mode && network.cipher == Cipher::None {
             return Err(
                 "mesh secure_mode always encrypts; cipher none applies to the default mode only",
             );
@@ -370,11 +457,25 @@ impl MeshConfig {
         };
 
         let role = node.role.unwrap_or_else(Role::platform_default);
-        if role == Role::Full && !Role::platform_allows_full() {
+        if !Role::allowed(role, IS_PHONE) {
             return Err("mesh full nodes are not available on this platform");
         }
         if role == Role::Access && !node.listen.is_empty() {
             return Err("mesh access nodes do not listen");
+        }
+        let relay = match (role, node.relay) {
+            (Role::Access, Some(true)) => return Err("mesh access nodes do not relay"),
+            (Role::Access, _) => false,
+            (Role::Full, relay) => relay.unwrap_or(true),
+        };
+        let mtu = node.mtu.unwrap_or(DEFAULT_MTU);
+        if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
+            return Err("mesh node mtu is out of range");
+        }
+        if let Some(hostname) = &node.hostname {
+            if !is_dns_label(hostname) {
+                return Err("mesh node hostname is not a DNS label");
+            }
         }
         let mut seen = HashSet::new();
         for listen in &node.listen {
@@ -386,8 +487,10 @@ impl MeshConfig {
             }
         }
 
-        if self.peers.is_empty() {
-            return Err("mesh needs at least one peer");
+        // A full node that listens may wait for others to connect (a hub);
+        // every other node needs somewhere to connect to.
+        if self.peers.is_empty() && (role == Role::Access || node.listen.is_empty()) {
+            return Err("mesh needs at least one peer, or a full node that listens");
         }
         if self.peers.len() > MAX_PEERS {
             return Err("mesh lists too many peers");
@@ -414,11 +517,16 @@ impl MeshConfig {
         if role == Role::Access && !advertise_subnets.is_empty() {
             return Err("mesh access nodes do not advertise subnets");
         }
+        let system_routes = match &self.routing.system_routes {
+            None => None,
+            Some(texts) => Some(intranet_subnets(texts, "mesh routing.system_routes")?),
+        };
 
         let mut settings = MeshSettings {
             network_name: network.name,
             network_secret: network.secret,
-            security: if network.secure_mode {
+            kind: network.kind,
+            security: if secure_mode {
                 SecurityMode::ForwardSecrecy
             } else {
                 SecurityMode::Default
@@ -427,11 +535,15 @@ impl MeshConfig {
             address,
             address_v6,
             role,
+            hostname: node.hostname,
+            mtu,
+            relay,
             listen: node.listen,
             peers,
             accept_subnets,
             advertise_subnets,
             route_policy: self.routing.policy,
+            system_routes,
             paths: Vec::new(),
         };
         if advertise_subnets_overlap_virtual(&settings) {
@@ -516,6 +628,16 @@ fn intranet_subnets(texts: &[String], what: &'static str) -> Result<Vec<IpNet>, 
         .collect()
 }
 
+/// One DNS label (RFC 1123): letters, digits and hyphens, not starting or
+/// ending with a hyphen.
+fn is_dns_label(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_HOSTNAME_BYTES
+        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !text.starts_with('-')
+        && !text.ends_with('-')
+}
+
 fn advertise_subnets_overlap_virtual(settings: &MeshSettings) -> bool {
     let virtual_subnets = settings.virtual_subnets();
     settings
@@ -554,7 +676,7 @@ mod tests {
     fn base() -> Value {
         json!({
             "config_version": 1,
-            "network": {"name": "office", "secret": "s3cret"},
+            "network": {"name": "office", "secret": "s3cret", "kind": "legacy"},
             "node": {"address": "10.144.144.5/24", "role": "access"},
             "peers": [{"server": "peer.example", "port": 40000}],
         })
@@ -595,6 +717,10 @@ mod tests {
         assert!(settings.encrypted());
         assert_eq!(settings.route_policy, RoutePolicy::Hops);
         assert_eq!(settings.role, Role::Access);
+        assert_eq!(settings.hostname, None);
+        assert_eq!(settings.mtu, DEFAULT_MTU);
+        assert!(!settings.relay);
+        assert_eq!(settings.system_routes, None);
         assert!(settings.paths.is_empty());
         assert_eq!(
             settings.peers,
@@ -630,6 +756,44 @@ mod tests {
     }
 
     #[test]
+    fn managed_networks_always_use_the_secure_mode() {
+        let mut managed = base();
+        managed["network"].as_object_mut().unwrap().remove("kind");
+        let settings = validate(managed.clone()).unwrap();
+        assert_eq!(settings.kind, NetworkKind::Managed);
+        assert_eq!(settings.security, SecurityMode::ForwardSecrecy);
+        managed["network"]["secure_mode"] = json!(false);
+        assert_eq!(
+            validate(managed.clone()).err(),
+            Some("mesh managed networks always use secure_mode")
+        );
+        managed["network"]["secure_mode"] = json!(true);
+        managed["network"]["cipher"] = json!("none");
+        assert!(validate(managed).is_err());
+        // Legacy networks default to the default mode.
+        let settings = validate(base()).unwrap();
+        assert_eq!(settings.kind, NetworkKind::Legacy);
+        assert_eq!(settings.security, SecurityMode::Default);
+        assert!(parse(with("network.kind", json!("other"))).is_err());
+    }
+
+    #[test]
+    fn roles_by_platform() {
+        assert_eq!(Role::default_for(true), Role::Access);
+        assert_eq!(Role::default_for(false), Role::Full);
+        assert!(!Role::allowed(Role::Full, true));
+        assert!(Role::allowed(Role::Access, true));
+        assert!(Role::allowed(Role::Full, false));
+        assert!(Role::allowed(Role::Access, false));
+        assert_eq!(Role::platform_default(), Role::default_for(IS_PHONE));
+    }
+
+    #[test]
+    fn top_level_unknown_fields_are_rejected() {
+        assert!(parse(with("exit", json!(true))).is_err());
+    }
+
+    #[test]
     fn ciphers_and_their_aliases() {
         for (name, cipher) in [
             ("aes-gcm", Cipher::Aes128Gcm),
@@ -650,8 +814,16 @@ mod tests {
         let mut secure_plain = with("network.cipher", json!("none"));
         secure_plain["network"]["secure_mode"] = json!(true);
         assert!(validate(secure_plain).is_err());
-        // XOR has no authentication and is refused (spec §7.1).
-        for name in ["xor", "openssl-xor", "AES-GCM", "", "None", "plain"] {
+        // XOR has no authentication and is refused with that reason
+        // (spec §7.1).
+        for name in ["xor", "openssl-xor"] {
+            assert_eq!(
+                validate(with("network.cipher", json!(name))).err(),
+                Some("mesh cipher xor is insecure (no authentication) and is not supported"),
+                "{name}"
+            );
+        }
+        for name in ["AES-GCM", "", "None", "plain"] {
             assert!(
                 parse(with("network.cipher", json!(name))).is_err(),
                 "{name}"
@@ -743,6 +915,73 @@ mod tests {
     }
 
     #[test]
+    fn hostname_and_mtu() {
+        let mut config = with("node.hostname", json!("build-01"));
+        config["node"]["mtu"] = json!(1420);
+        let settings = validate(config).unwrap();
+        assert_eq!(settings.hostname.as_deref(), Some("build-01"));
+        assert_eq!(settings.mtu, 1420);
+        let long = "a".repeat(64);
+        for bad in ["", "-a", "a-", "a.b", "a b", "例子", long.as_str()] {
+            assert!(
+                validate(with("node.hostname", json!(bad))).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(validate(with("node.hostname", json!("A1-b"))).is_ok());
+        for mtu in [MIN_MTU, MAX_MTU] {
+            assert!(validate(with("node.mtu", json!(mtu))).is_ok(), "{mtu}");
+        }
+        for mtu in [0, 1279, 9001] {
+            assert!(validate(with("node.mtu", json!(mtu))).is_err(), "{mtu}");
+        }
+        assert!(parse(with("node.mtu", json!(70000))).is_err());
+    }
+
+    #[test]
+    fn access_nodes_never_relay() {
+        assert!(!validate(with("node.relay", json!(false))).unwrap().relay);
+        assert_eq!(
+            validate(with("node.relay", json!(true))).err(),
+            Some("mesh access nodes do not relay")
+        );
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[test]
+    fn full_nodes_relay_unless_told_not_to() {
+        assert!(validate(with("node.role", json!("full"))).unwrap().relay);
+        let mut config = with("node.role", json!("full"));
+        config["node"]["relay"] = json!(false);
+        assert!(!validate(config).unwrap().relay);
+    }
+
+    #[test]
+    fn system_routes_are_intranet_networks() {
+        let settings = validate(with(
+            "routing.system_routes",
+            json!(["192.168.10.9/24", "10.20.0.0/16"]),
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.system_routes,
+            Some(vec![
+                IpNet::parse("192.168.10.0/24").unwrap(),
+                IpNet::parse("10.20.0.0/16").unwrap(),
+            ])
+        );
+        // Present but empty: nothing goes into the system routing table.
+        let settings = validate(with("routing.system_routes", json!([]))).unwrap();
+        assert_eq!(settings.system_routes, Some(Vec::new()));
+        for bad in ["0.0.0.0/0", "8.8.8.0/24", "bogus"] {
+            assert!(
+                validate(with("routing.system_routes", json!([bad]))).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn accept_subnets_cannot_widen_the_intranet() {
         for subnet in ["0.0.0.0/0", "1.1.1.0/24", "::/0", "bogus"] {
             assert!(
@@ -750,6 +989,34 @@ mod tests {
                 "{subnet}"
             );
         }
+    }
+
+    #[test]
+    fn a_listening_full_node_may_have_no_peers() {
+        // An access node always needs a peer.
+        assert!(validate(with("peers", json!([]))).is_err());
+        let mut hub = with("peers", json!([]));
+        hub["node"]["role"] = json!("full");
+        // A full node that does not listen cannot be reached either.
+        assert!(validate(hub.clone()).is_err());
+        hub["node"]["listen"] = json!([{"transport": "tcp"}]);
+        if Role::platform_allows_full() {
+            assert!(validate(hub).unwrap().peers.is_empty());
+        }
+    }
+
+    #[test]
+    fn broadcast_addresses_are_not_nodes() {
+        let path = with(
+            "routing",
+            json!({"paths": [{"to_peer": "10.144.144.255", "via": ["10.144.144.3"]}]}),
+        );
+        assert!(validate(path).is_err());
+        let via = with(
+            "routing",
+            json!({"paths": [{"to_peer": "10.144.144.7", "via": ["10.144.144.255"]}]}),
+        );
+        assert!(validate(via).is_err());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! bytes (spec §12.3), so [`RoutePeerInfo`] holds them next to the decoded
 //! fields.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::wire::pb::{PbError, Reader, Writer};
@@ -281,6 +282,12 @@ impl RoutePeerInfo {
     }
 }
 
+/// Most nodes one connection graph may list. The spec sets no limit; ours
+/// bounds the work a peer can cause (a bitmap of `n²` bits).
+pub const MAX_GRAPH_NODES: usize = 4096;
+/// Most edges one connection graph may carry.
+pub const MAX_GRAPH_EDGES: usize = 262_144;
+
 /// Which nodes each listed node is directly connected to (spec §12.4).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnGraph {
@@ -324,29 +331,44 @@ impl ConnGraph {
     }
 
     /// Decodes the bitmap form. A bitmap too short for its node list is
-    /// malformed.
+    /// malformed; more than [`MAX_GRAPH_NODES`] nodes or
+    /// [`MAX_GRAPH_EDGES`] edges are refused.
     pub fn decode_bitmap(message: &[u8]) -> Result<Self, PbError> {
         let mut peers = Vec::new();
         let mut bitmap: &[u8] = &[];
         let mut reader = Reader::new(message);
         while let Some((field, value)) = reader.next()? {
             match field {
-                1 => peers.push(Self::decode_peer_version(value.bytes(field)?)?),
+                1 => {
+                    if peers.len() == MAX_GRAPH_NODES {
+                        return Err(PbError::TooMany(1));
+                    }
+                    peers.push(Self::decode_peer_version(value.bytes(field)?)?);
+                }
                 2 => bitmap = value.bytes(field)?,
                 _ => {}
             }
         }
         let n = peers.len();
-        if bitmap.len() * 8 < n * n {
+        // At most 4096² bits, so this cannot overflow even on 32-bit targets;
+        // checked anyway so the bound above is the only assumption.
+        let bits = n.checked_mul(n).ok_or(PbError::TooMany(1))?;
+        if bitmap.len() < bits.div_ceil(8) {
             return Err(PbError::BadValue(2));
         }
         let mut edges = Vec::new();
-        for row in 0..n {
-            for col in 0..n {
-                let bit = row * n + col;
-                if bitmap[bit / 8] & (1 << (bit % 8)) != 0 {
-                    edges.push((row, col));
+        for (index, &byte) in bitmap[..bits.div_ceil(8)].iter().enumerate() {
+            let mut byte = byte;
+            while byte != 0 {
+                let bit = index * 8 + byte.trailing_zeros() as usize;
+                byte &= byte - 1;
+                if bit >= bits {
+                    break;
                 }
+                if edges.len() == MAX_GRAPH_EDGES {
+                    return Err(PbError::TooMany(2));
+                }
+                edges.push((bit / n, bit % n));
             }
         }
         Ok(Self { peers, edges })
@@ -354,51 +376,67 @@ impl ConnGraph {
 
     /// Decodes the list form (field 7): each item names a node and the
     /// nodes it is directly connected to. Neighbours missing from the list
-    /// become rows of their own with version 0.
+    /// become rows of their own with version 0. The same limits as the
+    /// bitmap form apply.
     pub fn decode_list(message: &[u8]) -> Result<Self, PbError> {
         let mut rows: Vec<((u32, u32), Vec<u32>)> = Vec::new();
+        let mut edge_count = 0usize;
         let mut reader = Reader::new(message);
         while let Some((field, value)) = reader.next()? {
             if field != 1 {
                 continue;
             }
+            if rows.len() == MAX_GRAPH_NODES {
+                return Err(PbError::TooMany(1));
+            }
             let mut head = (0, 0);
             let mut neighbours = Vec::new();
             let mut item = Reader::new(value.bytes(field)?);
             while let Some((f, v)) = item.next()? {
+                let mut push = |id: u64| -> Result<(), PbError> {
+                    if edge_count == MAX_GRAPH_EDGES {
+                        return Err(PbError::TooMany(2));
+                    }
+                    edge_count += 1;
+                    neighbours.push(u32::try_from(id).map_err(|_| PbError::BadValue(2))?);
+                    Ok(())
+                };
                 match (f, v) {
                     (1, v) => head = Self::decode_peer_version(v.bytes(f)?)?,
                     (2, crate::wire::pb::Value::Bytes(packed)) => {
                         // Packed repeated uint32.
                         let mut packed = Reader::new(packed);
                         while let Some(id) = packed.next_varint()? {
-                            neighbours.push(u32::try_from(id).map_err(|_| PbError::BadValue(2))?);
+                            push(id)?;
                         }
                     }
-                    (2, v) => neighbours.push(v.u32(f)?),
+                    (2, v) => push(u64::from(v.u32(f)?))?,
                     _ => {}
                 }
             }
             rows.push((head, neighbours));
         }
         let mut graph = ConnGraph::default();
-        let index = |graph: &mut ConnGraph, id: u32| -> usize {
-            match graph.peers.iter().position(|(peer, _)| *peer == id) {
-                Some(i) => i,
-                None => {
-                    graph.peers.push((id, 0));
-                    graph.peers.len() - 1
-                }
+        let mut positions: HashMap<u32, usize> = HashMap::new();
+        let mut index = |graph: &mut ConnGraph, id: u32| -> Result<usize, PbError> {
+            if let Some(&i) = positions.get(&id) {
+                return Ok(i);
             }
+            if graph.peers.len() == MAX_GRAPH_NODES {
+                return Err(PbError::TooMany(1));
+            }
+            graph.peers.push((id, 0));
+            positions.insert(id, graph.peers.len() - 1);
+            Ok(graph.peers.len() - 1)
         };
         for ((id, version), _) in &rows {
-            let i = index(&mut graph, *id);
+            let i = index(&mut graph, *id)?;
             graph.peers[i].1 = *version;
         }
         for ((id, _), neighbours) in rows {
-            let row = index(&mut graph, id);
+            let row = index(&mut graph, id)?;
             for neighbour in neighbours {
-                let col = index(&mut graph, neighbour);
+                let col = index(&mut graph, neighbour)?;
                 graph.edges.push((row, col));
             }
         }
@@ -616,6 +654,71 @@ mod tests {
         }
         writer.bytes(2, &[0xff]);
         assert!(ConnGraph::decode_bitmap(&writer.finish()).is_err());
+    }
+
+    #[test]
+    fn graph_limits() {
+        // One node too many in the bitmap form, with no bitmap at all: the
+        // node count is refused before any n² work.
+        let mut writer = Writer::new();
+        for id in 0..=MAX_GRAPH_NODES as u32 {
+            let mut item = Writer::new();
+            item.u32(1, id);
+            writer.message(1, &item.finish());
+        }
+        assert_eq!(
+            ConnGraph::decode_bitmap(&writer.finish()),
+            Err(PbError::TooMany(1))
+        );
+
+        // A full bitmap of 600 nodes has 360,000 edges: above the limit.
+        let n = 600usize;
+        let mut writer = Writer::new();
+        for id in 0..n as u32 {
+            let mut item = Writer::new();
+            item.u32(1, id);
+            writer.message(1, &item.finish());
+        }
+        writer.bytes(2, &vec![0xff; (n * n).div_ceil(8)]);
+        assert_eq!(
+            ConnGraph::decode_bitmap(&writer.finish()),
+            Err(PbError::TooMany(2))
+        );
+
+        // Padding bits past n² are ignored.
+        let graph = ConnGraph {
+            peers: vec![(1, 1), (2, 1), (3, 1)],
+            edges: vec![(2, 2)],
+        };
+        let mut encoded = Writer::new();
+        for &(peer, version) in &graph.peers {
+            let mut item = Writer::new();
+            item.u32(1, peer).u32(2, version);
+            encoded.message(1, &item.finish());
+        }
+        encoded.bytes(2, &[0, 0xff]);
+        assert_eq!(ConnGraph::decode_bitmap(&encoded.finish()).unwrap(), graph);
+
+        // The list form: too many distinct neighbours.
+        let mut head = Writer::new();
+        head.u32(1, 1);
+        let mut item = Writer::new();
+        item.message(1, &head.finish());
+        let packed: Vec<u8> = (0..=MAX_GRAPH_NODES as u64)
+            .flat_map(|id| {
+                let mut writer = Writer::new();
+                writer.u64(1, id + 2);
+                // Strip the tag byte: what remains is the varint.
+                writer.finish()[1..].to_vec()
+            })
+            .collect();
+        item.opt_bytes(2, &packed);
+        let mut message = Writer::new();
+        message.message(1, &item.finish());
+        assert_eq!(
+            ConnGraph::decode_list(&message.finish()),
+            Err(PbError::TooMany(1))
+        );
     }
 
     #[test]

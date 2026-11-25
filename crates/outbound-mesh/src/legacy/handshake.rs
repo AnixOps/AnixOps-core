@@ -102,7 +102,7 @@ pub fn server_reply(
     own_name: &str,
     own_digest: &[u8; DIGEST_LEN],
 ) -> HandshakeMessage {
-    let digest = if client.network_name == own_name && &client.digest == own_digest {
+    let digest = if client.network_name == own_name && digests_equal(&client.digest, own_digest) {
         *own_digest
     } else {
         [0; DIGEST_LEN]
@@ -122,7 +122,16 @@ pub fn same_network(
     peer: &HandshakeMessage,
 ) -> bool {
     peer.network_name == own_name
-        && (&peer.digest == own_digest || peer.has_zero_digest() || own_digest == &[0; DIGEST_LEN])
+        && (digests_equal(&peer.digest, own_digest)
+            || peer.has_zero_digest()
+            || own_digest == &[0; DIGEST_LEN])
+}
+
+/// Compares two digests in time independent of where they differ, so a
+/// peer cannot learn a digest byte by byte from response timing.
+pub fn digests_equal(a: &[u8; DIGEST_LEN], b: &[u8; DIGEST_LEN]) -> bool {
+    let difference = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(difference) == 0
 }
 
 #[cfg(test)]

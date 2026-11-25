@@ -15,6 +15,10 @@ pub const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 pub const FETCH_INTERVAL: Duration = Duration::from_secs(15);
 /// The centre drops a node not heard from for this long (spec §13.3).
 pub const ENTRY_TTL: Duration = Duration::from_secs(180);
+/// Most nodes the centre keeps; reports from further nodes are dropped.
+pub const MAX_ENTRIES: usize = 4096;
+/// Most neighbours one report may list; the rest are dropped.
+pub const MAX_REPORTED_PEERS: usize = 1024;
 
 /// Service name and method numbers (spec §11.4).
 pub const SERVICE: &str = "PeerCenterRpc";
@@ -176,8 +180,16 @@ impl CentreServer {
         Self::default()
     }
 
-    pub fn report(&mut self, report: ReportPeers, now: Instant) {
-        self.entries.insert(report.my_peer_id, (report.peers, now));
+    /// Records a report. Returns `false` when the centre is full and the
+    /// node is new; a report listing more than [`MAX_REPORTED_PEERS`]
+    /// neighbours keeps the first ones only.
+    pub fn report(&mut self, report: ReportPeers, now: Instant) -> bool {
+        if !self.entries.contains_key(&report.my_peer_id) && self.entries.len() >= MAX_ENTRIES {
+            return false;
+        }
+        let peers = report.peers.into_iter().take(MAX_REPORTED_PEERS).collect();
+        self.entries.insert(report.my_peer_id, (peers, now));
+        true
     }
 
     /// Drops nodes not heard from for [`ENTRY_TTL`].
@@ -263,6 +275,21 @@ mod tests {
         let second = server.get(digest);
         assert_eq!(second.map.len(), 2);
         assert_ne!(second.digest, Some(digest));
+    }
+
+    #[test]
+    fn server_is_bounded() {
+        let now = Instant::now();
+        let mut server = CentreServer::new();
+        for peer in 0..MAX_ENTRIES as u32 {
+            assert!(server.report(report(peer, &[]), now));
+        }
+        assert!(!server.report(report(u32::MAX, &[]), now));
+        // A known node may still report.
+        assert!(server.report(report(0, &[(1, 5)]), now));
+        let many: Vec<(u32, i32)> = (0..2000).map(|peer| (peer, 1)).collect();
+        assert!(server.report(report(1, &many), now));
+        assert_eq!(server.get(0).map[&1].len(), MAX_REPORTED_PEERS);
     }
 
     #[test]

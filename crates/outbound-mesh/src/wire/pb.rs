@@ -18,6 +18,8 @@ pub enum PbError {
     /// A value is out of range for its field (for example a `uint32` above
     /// `u32::MAX`, or a string that is not UTF-8).
     BadValue(u32),
+    /// A repeated field has more entries than this node accepts.
+    TooMany(u32),
 }
 
 impl fmt::Display for PbError {
@@ -29,6 +31,7 @@ impl fmt::Display for PbError {
             PbError::FieldZero => f.write_str("protobuf field number 0"),
             PbError::WrongType(n) => write!(f, "protobuf field {n} has the wrong wire type"),
             PbError::BadValue(n) => write!(f, "protobuf field {n} has an invalid value"),
+            PbError::TooMany(n) => write!(f, "protobuf field {n} has too many entries"),
         }
     }
 }
