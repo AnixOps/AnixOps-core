@@ -23,6 +23,8 @@
 | `self` | `addressManaged`、`region`、`regionBasis`、`regionState`、`hostMode` | 0.4 |
 | `members[]` | `id`、`name`、`role`、`state`、`address`、`domain`、`connection`、`hops`、`transport`、`latencyMs`、`path`、`pathState`、`unreachable`、`subnets`、`duplicateOf` | 0.3 |
 | `members[]` | `region`、`addressManaged`、`vms` | 0.4 |
+| `network` | `kind`、`limitations` | 0.3 |
+| `members[]` | `implementation` | 0.3 |
 | `subnets[]` | `cidr`、`advertisers[{member,inUse}]`、`latencyMs`、`path`、`state`、`overlaps`、`localOverlap`、`route` | 0.3 |
 | `subnets[]` | `region` | 0.4 |
 | `tunnel` | `routes`、`routesVersion`、`dns` | 0.3 |
@@ -35,6 +37,9 @@
 |---|---|
 | `network.state` | `joined`、`joining`、`partial`（部分成员不可达）、`not_joined`、`failed` |
 | `network.security` | `forward_secrecy`（安全模式）、`standard`（默认模式，未启用前向保密）、`none`（显式选择的不加密，需求 R14） |
+| `network.kind` | `managed`、`legacy`（配置里的 `network.kind`，规范 §5.2） |
+| `network.limitations` | 字符串列表，空列表表示没有限制。`reference_peers`：有原版实现的成员以安全模式参与本网络，与它们之间的会话保密性以参考实现为上限（规范 §19.2 第 5 条），界面显示「含原版节点，保密性受限」 |
+| `members[].implementation` | `native`（我方节点程序）、`reference`（原版实现）、`unknown`（尚不能判断）。受管网络中，成员的静态公钥与面板登记的我方节点公钥一致即为 `native`，否则为 `reference`；没有面板数据时为 `unknown`，界面按 `reference` 对待 |
 | `network.failure` | `null` 或 `{ "code", "detail" }`，`code` 见下表；`detail` 只给人看 |
 | `network.joining` | `null` 或 `{ "stage": "connecting" \| "assigning_address" \| "measuring_regions", "peersConnected" }` |
 | `routingPolicy` | `hops`、`latency` |
