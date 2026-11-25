@@ -43,7 +43,7 @@
 
 ### Added
 
-- anixops-mesh 无 Agent 设备与面板交换的数据层（mesh-node `device`，R31）：接入与读取配置的应答按固定字段白名单整份校验（多余字段、非 `managed` 网络、名称不是 `mesh-<地区>` 一律拒绝，拒绝原因只含字段名与规则）；面板网络转为与 Agent 相同的 `PUT /v1/mesh` 分层配置（按本机能力决定 `dns` 与 `resolver_address`）；上报体由受管组网状态生成（`tag` 换回地区代码、按网络名附静态公钥、顶层 `features`、不报入区申请）；`--control` 只接受 `https://主机[:端口]`；凭据、令牌、时延参数校验；失败退避 60 秒起至 10 分钟与 `Retry-After`。传输与常驻服务随后接入。
+- anixops-mesh 无 Agent 设备与面板交换的数据层（mesh-node `device`，R31）：接入与读取配置的应答按固定字段白名单整份校验（多余字段、非 `managed` 网络、名称不是 `mesh-<地区>` 一律拒绝，拒绝原因只含字段名与规则）；面板网络转为与 Agent 相同的 `PUT /v1/mesh` 分层配置（按本机能力决定 `dns` 与 `resolver_address`）；上报体由受管组网状态生成（`tag` 换回地区代码、按网络名附静态公钥、顶层 `features`、不报入区申请）；`--control` 只接受 `https://主机[:端口]`；凭据、令牌、时延参数校验；失败退避 60 秒起至 10 分钟与 `Retry-After`；通告网段申请体（至多 16 个内网网段，主机位非零拒绝，不做规范化）与已批准网段（各网络 `subnets.advertise` 的并集）。传输与常驻服务随后接入。
 
 - anixops-mesh 接管支持 Windows（mesh-node `winsvc`、`detect`、`takeover`、`host`、`cmdline`，R12/R32 内核 0.4）：进程从系统进程表读取（命令行、工作目录、完整环境变量与运行账户），检测以该程序运行或在数据文件中点名的服务；接管先 `sc.exe stop` 再禁用，回滚逆序恢复启动方式后启动，服务进程不单独重启；其他账户运行的手动进程在任何改动之前报告并失败。新增 `install-windows.ps1`（服务 `AnixOpsMesh`，数据目录仅 SYSTEM 与 Administrators 可访问）。
 - anixops-mesh 接管支持 macOS（mesh-node `launchd`、`detect`、`takeover`、`host`，R12/R32 内核 0.4）：进程从系统进程表读取（`proc_pidpath`、`KERN_PROCARGS2`、`proc_pidinfo`），检测 `/Library/LaunchDaemons` 与各用户 `~/Library/LaunchAgents` 的 launchd 任务；接管先 `launchctl bootout` 再 `disable`，回滚逆序 `enable` 后 `bootstrap`，任务自己的进程不再单独重启；所有用户共用的代理只报告。新增 `install-macos.sh`（launchd 系统守护进程，状态放在不经符号链接的 `/Library/AnixOps/mesh`）。

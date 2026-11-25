@@ -247,6 +247,58 @@ pub fn enroll_request(
     }))
 }
 
+/// Most networks in one `subnet-request`.
+pub const MAX_SUBNET_REQUEST: usize = 16;
+
+/// The `POST /api/v5/mesh/device/subnet-request` body: the local networks
+/// a full node asks to advertise, for an administrator to approve. Each
+/// must be an intranet network written with its host bits clear (it is not
+/// rounded, so the request is what the owner typed); none is a withdrawal.
+pub fn subnet_request(cidrs: &[String]) -> Result<Value, Rejection> {
+    if cidrs.len() > MAX_SUBNET_REQUEST {
+        return Err(Rejection::new("cidr", "at most 16 networks"));
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(cidrs.len());
+    for (index, text) in cidrs.iter().enumerate() {
+        let field = format!("cidr[{index}]");
+        let Some(cidr) = crate::net::Cidr::parse(text) else {
+            return Err(Rejection::new(
+                field,
+                "must be an address with a prefix length",
+            ));
+        };
+        if cidr.network() != cidr.address {
+            return Err(Rejection::new(field, "has host bits set"));
+        }
+        if !crate::net::is_intranet(&cidr) {
+            return Err(Rejection::new(field, "is outside the intranet ranges"));
+        }
+        let canonical = cidr.network_text();
+        if !seen.insert(canonical.clone()) {
+            return Err(Rejection::new(field, "is given twice"));
+        }
+        out.push(canonical);
+    }
+    Ok(json!({ "cidrs": out }))
+}
+
+/// The networks Control approved for this device: the union of the
+/// accepted networks' `subnets.advertise`, sorted, without repeats.
+pub fn approved_advertise(networks: &[Network]) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for network in networks {
+        if let Some(list) = network
+            .get("subnets")
+            .and_then(|subnets| subnets.get("advertise"))
+            .and_then(Value::as_array)
+        {
+            out.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// One network of a device answer, checked against the fixed field set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Network {
@@ -874,6 +926,49 @@ mod tests {
         let body = enroll_request("mse_a", "k", &BTreeMap::new(), &["mesh"]).expect("ok");
         assert!(body.get("static_key").is_none());
         assert_eq!(body["latencies"], json!({}));
+    }
+
+    #[test]
+    fn subnet_requests_take_intranet_networks_as_written() {
+        let cidrs = |list: &[&str]| list.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            subnet_request(&cidrs(&["192.168.1.0/24", "fd00:1::/64"])).expect("ok"),
+            json!({ "cidrs": ["192.168.1.0/24", "fd00:1::/64"] })
+        );
+        assert_eq!(
+            subnet_request(&[]).expect("withdraw"),
+            json!({ "cidrs": [] })
+        );
+        for (bad, rule) in [
+            ("192.168.1.5/24", "has host bits set"),
+            ("8.8.8.0/24", "is outside the intranet ranges"),
+            ("192.168.1.0", "must be an address with a prefix length"),
+            ("10.0.0.0/33", "must be an address with a prefix length"),
+        ] {
+            assert_eq!(subnet_request(&cidrs(&[bad])).expect_err(bad).rule, rule);
+        }
+        assert_eq!(
+            subnet_request(&cidrs(&["10.1.0.0/16", "10.1.0.0/16"]))
+                .expect_err("twice")
+                .field,
+            "cidr[1]"
+        );
+        let many: Vec<String> = (0..17).map(|i| format!("10.{i}.0.0/16")).collect();
+        assert!(subnet_request(&many).is_err());
+    }
+
+    #[test]
+    fn approved_networks_are_the_union_of_advertise() {
+        let mut cn = network("cn");
+        cn["subnets"]["advertise"] = json!(["192.168.2.0/24", "192.168.1.0/24"]);
+        let mut eu = network("eu");
+        eu["subnets"]["advertise"] = json!(["192.168.1.0/24"]);
+        let networks = parse_config(&config(vec![cn, eu])).expect("valid");
+        assert_eq!(
+            approved_advertise(&networks),
+            ["192.168.1.0/24", "192.168.2.0/24"]
+        );
+        assert!(approved_advertise(&[]).is_empty());
     }
 
     #[test]
