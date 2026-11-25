@@ -26,6 +26,9 @@
 //!   around a [`node::Node`].
 //! - [`node`]: one node of one network without I/O: connections,
 //!   keep-alive, RPC, route synchronisation, forwarding and traffic checks.
+//! - [`status`]: what a node agent reads and writes through the kernel's
+//!   management API (`/v1/mesh`), and the trait that API drives the mesh
+//!   through.
 
 pub mod config;
 #[cfg(feature = "runtime")]
@@ -40,6 +43,7 @@ pub mod routes;
 pub mod rpc;
 pub mod scope;
 pub mod secure;
+pub mod status;
 pub mod wire;
 
 pub use config::{
