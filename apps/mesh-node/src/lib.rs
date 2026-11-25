@@ -5,7 +5,9 @@
 //! program on the machine, importing its configuration into ours with a
 //! report, and taking it over with a recorded, reversible procedure. The
 //! node itself (`run`, Linux only) drives the mesh module's socket driver
-//! over a TUN interface ([`serve`], [`tun`]).
+//! over a TUN interface ([`serve`], [`tun`]). The kernel's management API
+//! runs the networks a node agent sends through [`managed`] the same way,
+//! one interface each.
 //!
 //! Nothing here names another program. What identifies one, and how its
 //! configuration is written, comes from a profile file maintained in the
@@ -17,6 +19,8 @@ pub mod detect;
 pub mod host;
 pub mod import;
 pub mod launchd;
+#[cfg(target_os = "linux")]
+pub mod managed;
 pub mod net;
 pub mod profile;
 pub mod report;

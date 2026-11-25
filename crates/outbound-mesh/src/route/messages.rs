@@ -262,8 +262,21 @@ impl RoutePeerInfo {
             ..Self::default()
         };
         let mut reader = Reader::new(message);
+        let (mut groups, mut trusted) = (0usize, 0usize);
         while let Some((field, value)) = reader.next()? {
             match field {
+                // Kept only in the raw bytes, but bounded (spec §12.3).
+                16 | 19 => {
+                    let count = if field == 16 {
+                        &mut groups
+                    } else {
+                        &mut trusted
+                    };
+                    *count += 1;
+                    if *count > MAX_INFO_LIST_ITEMS {
+                        return Err(PbError::TooMany(field));
+                    }
+                }
                 1 => info.peer_id = value.u32(field)?,
                 2 => info.inst_id = Uuid::decode(value.bytes(field)?)?,
                 3 => info.cost = value.u32(field)?,
@@ -311,16 +324,18 @@ impl RoutePeerInfo {
     }
 }
 
-/// Largest encoded node information accepted. The spec sets no limit;
-/// ours bounds what one member can make every node store and forward.
-pub const MAX_INFO_LEN: usize = 16 * 1024;
+/// Largest encoded node information accepted (spec §12.3).
+pub const MAX_INFO_LEN: usize = 8 * 1024;
+/// Most groups (field 16) and trusted keys (field 19) in one node's
+/// information (spec §12.3).
+pub const MAX_INFO_LIST_ITEMS: usize = 16;
 /// Most advertised subnets in one node's information (the route table takes
 /// at most [`crate::routes::MAX_SUBNETS_PER_PEER`]).
 pub const MAX_INFO_SUBNETS: usize = 256;
 /// Longest advertised subnet text.
 pub const MAX_CIDR_LEN: usize = 64;
-/// Longest host name (a DNS name).
-pub const MAX_HOSTNAME_LEN: usize = 253;
+/// Longest host name (spec §12.3).
+pub const MAX_HOSTNAME_LEN: usize = 255;
 /// Longest software version string.
 pub const MAX_VERSION_STRING_LEN: usize = 64;
 
@@ -497,6 +512,12 @@ pub struct SyncRouteRequest {
     pub conn_graph: Option<ConnGraph>,
     /// Field 6, kept as received and passed on unchanged (spec §16.3).
     pub foreign_network_infos: Option<Vec<u8>>,
+    /// Decoding only: node information items dropped for breaking a limit
+    /// or being malformed (spec §12.3). Never encoded.
+    pub skipped_infos: u32,
+    /// Decoding only: a connection graph over the limits or malformed was
+    /// dropped; the node information still counts (spec §12.4).
+    pub graph_dropped: bool,
 }
 
 impl SyncRouteRequest {
@@ -540,17 +561,31 @@ impl SyncRouteRequest {
                     while let Some((f, v)) = items.next()? {
                         // One oversized or malformed item is skipped; the
                         // rest of the request still counts.
-                        if f == 1 && request.peer_infos.len() < MAX_GRAPH_NODES {
-                            if let Ok(info) = RoutePeerInfo::decode(v.bytes(f)?) {
-                                request.peer_infos.push(info);
+                        if f != 1 {
+                            continue;
+                        }
+                        let decoded = v.bytes(f).and_then(RoutePeerInfo::decode);
+                        match decoded {
+                            Ok(info) if request.peer_infos.len() < MAX_GRAPH_NODES => {
+                                request.peer_infos.push(info)
                             }
+                            _ => request.skipped_infos += 1,
                         }
                     }
                 }
-                5 => request.conn_graph = Some(ConnGraph::decode_bitmap(value.bytes(field)?)?),
-                7 => {
-                    if request.conn_graph.is_none() {
-                        request.conn_graph = Some(ConnGraph::decode_list(value.bytes(field)?)?);
+                5 | 7 => {
+                    if request.conn_graph.is_some() {
+                        continue;
+                    }
+                    let bytes = value.bytes(field)?;
+                    let graph = if field == 5 {
+                        ConnGraph::decode_bitmap(bytes)
+                    } else {
+                        ConnGraph::decode_list(bytes)
+                    };
+                    match graph {
+                        Ok(graph) => request.conn_graph = Some(graph),
+                        Err(_) => request.graph_dropped = true,
                     }
                 }
                 6 => request.foreign_network_infos = Some(value.bytes(field)?.to_vec()),
@@ -876,5 +911,72 @@ mod tests {
         let decoded = SyncRouteRequest::decode(&request.encode()).unwrap();
         assert_eq!(decoded.peer_infos.len(), 1);
         assert_eq!(decoded.peer_infos[0].peer_id, 1);
+        assert_eq!(decoded.skipped_infos, 3);
+    }
+
+    #[test]
+    fn node_information_limits_follow_the_spec() {
+        let base = RoutePeerInfo {
+            peer_id: 1,
+            version: 1,
+            ..RoutePeerInfo::default()
+        }
+        .encode();
+        // 16 trusted keys (field 19) pass, 17 do not; the same for groups.
+        for field in [16u32, 19] {
+            let with = |count: usize| {
+                let mut writer = Writer::new();
+                for _ in 0..count {
+                    writer.bytes(field, &[7; 32]);
+                }
+                let mut message = base.clone();
+                message.extend_from_slice(&writer.finish());
+                message
+            };
+            assert!(RoutePeerInfo::decode(&with(MAX_INFO_LIST_ITEMS)).is_ok());
+            assert!(RoutePeerInfo::decode(&with(MAX_INFO_LIST_ITEMS + 1)).is_err());
+        }
+        // A 255-byte host name passes; 8 KiB in all is the limit.
+        let named = RoutePeerInfo {
+            peer_id: 1,
+            version: 1,
+            hostname: Some("h".repeat(255)),
+            ..RoutePeerInfo::default()
+        };
+        assert!(RoutePeerInfo::decode(&named.encode()).is_ok());
+        let mut big = base.clone();
+        let mut writer = Writer::new();
+        writer.bytes(99, &vec![0; MAX_INFO_LEN]);
+        big.extend_from_slice(&writer.finish());
+        assert!(RoutePeerInfo::decode(&big).is_err());
+    }
+
+    #[test]
+    fn a_bad_connection_graph_is_dropped_alone() {
+        let info = RoutePeerInfo {
+            peer_id: 1,
+            version: 1,
+            ..RoutePeerInfo::default()
+        };
+        let mut graph = Writer::new();
+        for id in 1..=3u32 {
+            let mut item = Writer::new();
+            item.u32(1, id);
+            graph.message(1, &item.finish());
+        }
+        graph.bytes(2, &[0xff]);
+        let mut message = SyncRouteRequest {
+            my_peer_id: 9,
+            peer_infos: vec![info],
+            ..SyncRouteRequest::default()
+        }
+        .encode();
+        let mut writer = Writer::new();
+        writer.message(5, &graph.finish());
+        message.extend_from_slice(&writer.finish());
+        let decoded = SyncRouteRequest::decode(&message).unwrap();
+        assert!(decoded.graph_dropped);
+        assert!(decoded.conn_graph.is_none());
+        assert_eq!(decoded.peer_infos.len(), 1);
     }
 }

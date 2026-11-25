@@ -11,6 +11,11 @@ node-runtime = { path = "../../crates/node-runtime" }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["net", "rt", "rt-multi-thread", "signal", "macros"] }
 
+# The managed mesh networks of `PUT /v1/mesh`: one virtual interface and
+# socket driver per network, as the standalone mesh node runs them.
+[target.'cfg(target_os = "linux")'.dependencies]
+mesh-node = { path = "../mesh-node" }
+
 [[bin]]
 name = "anixcore"
 path = "src/main.rs"
