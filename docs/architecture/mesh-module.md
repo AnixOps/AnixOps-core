@@ -86,7 +86,7 @@
 | `network.name` / `secret` | 网络名按原样参与摘要（不去空格）；密钥由钥匙串注入 |
 | `network.kind` | `managed`（默认，区域网络，只能安全模式）或 `legacy`（迁移中的旧网） |
 | `network.secure_mode` | `true` 安全模式，`false` 旧模式；省略时按 `kind`；全网一致（规范 §5.2） |
-| `network.native_keys` | 我方节点在本网络的安全模式静态公钥清单，每项为 32 字节 X25519 公钥的标准 base64（RFC 4648 §4，带填充），与状态接口的 `self.staticKey` / `static_key` 同一编码；由面板汇总（来源见规范 §8.3.1 第 7 条），经 Agent 下发。`kind = managed` 时必填且不能为空，缺少时整份配置被拒（`invalid_argument`）；用于准入：不在清单中的对端握手被拒（规范 §8.3.1，失败原因 `peer_not_native`），同时用于状态接口的 `members[].implementation` 判定。`legacy` 网络可省略，只用于判定，不影响认证与互通 |
+| `network.native_keys` | 我方节点在本网络的安全模式静态公钥清单，每项为 32 字节 X25519 公钥的标准 base64（RFC 4648 §4，带填充），与状态接口的 `self.staticKey` / `static_key` 同一编码；由面板汇总（来源见规范 §8.3.1 第 7 条），经 Agent 下发。`kind = managed` 时，缺省、为空或不含本机在该网络的公钥则该网络暂缓（不建链路、不启动虚拟网卡，状态失败原因 `native_keys_pending`，其他网络不受影响，静态公钥照常生成并在状态中给出），只有某项不是合法 base64 或解码后不是 32 字节时整份配置被拒（`invalid_argument`）；用于准入：不在清单中的对端握手被拒（规范 §8.3.1，失败原因 `peer_not_native`），同时用于状态接口的 `members[].implementation` 判定。`legacy` 网络可省略，只用于判定，不影响认证与互通 |
 | `network.cipher` | 旧模式算法：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；不提供异或。`none` 为不加密，只有显式写出才生效，不能与安全模式同用，界面标出“未加密”（需求 R14）；未选择时本节点丢弃不加密网络的明文流量 |
 | `node.address` | IPv4 虚拟地址与前缀（/8–/30），前缀即虚拟网段 |
 | `node.role` | `full` 或 `access`；缺省按平台：桌面与服务器 `full`，iOS、Android 只能 `access`（R10） |
