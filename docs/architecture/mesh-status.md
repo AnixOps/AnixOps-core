@@ -38,8 +38,8 @@
 | `network.state` | `joined`、`joining`、`partial`（部分成员不可达）、`not_joined`、`failed` |
 | `network.security` | `forward_secrecy`（安全模式）、`standard`（默认模式，未启用前向保密）、`none`（显式选择的不加密，需求 R14） |
 | `network.kind` | `managed`、`legacy`（配置里的 `network.kind`，规范 §5.2） |
-| `network.limitations` | 字符串列表，空列表表示没有限制。`reference_peers`：至少一个在线成员的 `implementation` 为 `reference`，且本网络为安全模式；与这些成员之间的会话保密性以参考实现为上限（规范 §19.2 第 5 条），界面显示「含原版节点，保密性受限」。`unverified_peers`：没有 `reference` 成员，但至少一个在线成员为 `unknown`；界面显示较弱的提示「无法确认对端实现」，不显示「保密性受限」 |
-| `members[].implementation` | `native`（我方节点程序）、`reference`（原版实现）、`unknown`（尚不能判断）。判定依据是该成员在路由信息字段 18 中的安全模式静态公钥（规范 §12.3），与配置 `network.native_keys`（面板经 Agent 下发的我方节点静态公钥清单，见 `mesh-module.md`）比较：在清单中为 `native`；清单存在但不在其中为 `reference`；配置没有该清单（例如 `legacy` 网络或独立节点）时为 `unknown`。旧模式网络没有静态公钥，一律为 `unknown`，`limitations` 不据此报 `reference_peers` |
+| `network.limitations` | 字符串列表，空列表表示没有限制；只在安全模式网络上给出，旧模式网络为空列表（旧模式另由 `security` 标出）。`reference_peers`：`network.kind` 为 `legacy`（旧网本来就由原版节点组成），或至少一个在线成员的 `implementation` 为 `reference`；与这些成员之间的会话保密性以参考实现为上限（规范 §19.2 第 5 条），界面显示「含原版节点，保密性受限」。`unverified_peers`：`managed` 网络中没有 `reference` 成员，但至少一个在线成员为 `unknown`；界面显示较弱的提示「无法确认对端实现」 |
+| `members[].implementation` | `native`（我方节点程序）、`reference`（原版实现）、`unknown`（尚不能判断）。判定用的是**经握手认证**的对端静态公钥：直连邻居取 Noise XX 握手中认证的静态公钥，经中继的成员取已建立的中继会话（Noise IK）中认证的静态公钥；还没有会话的成员只有路由信息字段 18 中的自报公钥，一律为 `unknown`。认证后的公钥与配置 `network.native_keys`（面板经 Agent 下发的我方节点静态公钥清单，见 `mesh-module.md`）比较：在清单中为 `native`；清单存在但不在其中为 `reference`；配置没有该清单（独立节点等）时为 `unknown`。旧模式网络没有静态公钥认证，一律为 `unknown` |
 | `network.failure` | `null` 或 `{ "code", "detail" }`，`code` 见下表；`detail` 只给人看 |
 | `network.joining` | `null` 或 `{ "stage": "connecting" \| "assigning_address" \| "measuring_regions", "peersConnected" }` |
 | `routingPolicy` | `hops`、`latency` |
