@@ -2,6 +2,7 @@
 members = [
     "apps/anixcore",
     "apps/linux-cli",
+    "apps/mesh-node",
     "apps/windows-cli",
     "crates/config-core",
     "crates/control-domain",

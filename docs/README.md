@@ -30,6 +30,7 @@
 - [出站多路复用（`multiplex`）与连接复用](architecture/outbound-multiplex.md)
 - [Pro 版开关（`engine-embedded::pro`）](architecture/pro-edition.md)
 - [Public Core Client Reference](architecture/public-core-client-reference.md)
+- [组网节点部署：接管、导入与安装](deploy/mesh-node.md)：`anixops-mesh` 的检测、导入报告、接管与回滚、Linux 一条命令安装和接管数据文件格式
 
 ## 协议规格
 

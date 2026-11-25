@@ -1,0 +1,98 @@
+{
+  "profile_version": 1,
+  "label": "现有组网程序",
+  "source_version": "1.0",
+  "detect": {
+    "executables": ["demo-meshd"],
+    "services": ["demo-meshd"],
+    "packages": ["demo-meshd"],
+    "images": ["demo/meshd"]
+  },
+  "config": {
+    "file_flags": ["-c", "--config-file"],
+    "file_env": "DEMO_CONFIG_FILE",
+    "dir_flags": ["--config-dir"],
+    "dir_env": "DEMO_CONFIG_DIR",
+    "stdin_name": "-",
+    "env_prefix": "DEMO_",
+    "ignore_file_keys": ["instance_id"]
+  },
+  "fields": {
+    "network_name": { "file": "identity.name", "flags": ["--net-name"], "env": "DEMO_NET_NAME" },
+    "network_secret": { "file": "identity.secret", "flags": ["--net-secret"], "env": "DEMO_NET_SECRET" },
+    "secure_mode": { "file": "secure.enabled", "flags": ["--secure"], "env": "DEMO_SECURE" },
+    "secure_private_key": { "file": "secure.private_key", "flags": ["--private-key"] },
+    "encryption": {
+      "file": "options.encrypt",
+      "set": [{ "flags": ["-u", "--no-crypto"], "env": "DEMO_NO_CRYPTO", "value": false }]
+    },
+    "cipher": { "file": "options.cipher", "flags": ["--cipher"], "env": "DEMO_CIPHER" },
+    "ipv4": { "file": "ipv4", "flags": ["-i", "--ipv4"], "env": "DEMO_IPV4" },
+    "ipv6": { "file": "ipv6", "flags": ["--ipv6"] },
+    "auto_address": { "file": "auto_ip", "flags": ["-d", "--auto-ip"], "env": "DEMO_AUTO_IP" },
+    "listeners": {
+      "file": "listen",
+      "flags": ["-l", "--listen"],
+      "env": "DEMO_LISTEN",
+      "split": ",",
+      "greedy": true,
+      "set": [{ "flags": ["--no-listen"], "value": [] }]
+    },
+    "peers": {
+      "file": "peer",
+      "file_item": "uri",
+      "file_item_confirm": ["public_key"],
+      "flags": ["-p", "--peers", "-e", "--public-node"],
+      "env": "DEMO_PEERS",
+      "split": ",",
+      "greedy": true,
+      "merge": "append"
+    },
+    "subnets": {
+      "file": "subnet",
+      "file_item": "cidr",
+      "file_item_mapped": "mapped_cidr",
+      "file_item_confirm": ["allow"],
+      "flags": ["-n", "--subnets"],
+      "env": "DEMO_SUBNETS",
+      "split": ",",
+      "greedy": true,
+      "mapped_separator": "->",
+      "merge": "append"
+    },
+    "latency_first": { "file": "options.latency_first", "flags": ["--latency-first"] },
+    "relay_disabled": { "file": "options.no_relay", "flags": ["--no-relay"] },
+    "system_routes": { "file": "routes", "flags": ["--routes"], "split": "," },
+    "mtu": { "file": "options.mtu", "flags": ["--mtu"] },
+    "enable_ipv6": {
+      "file": "options.ipv6",
+      "set": [{ "flags": ["--no-ipv6"], "value": false }]
+    },
+    "hostname": { "file": "hostname", "flags": ["--hostname"] },
+    "instance_name": { "file": "instance_name", "flags": ["-m", "--instance-name"] }
+  },
+  "listener_shorthand": {
+    "default_port": 20010,
+    "transports": [
+      { "name": "tcp", "offset": 0 },
+      { "name": "udp", "offset": 0 },
+      { "name": "ws", "offset": 1 }
+    ]
+  },
+  "default_listeners": ["20010"],
+  "default_peer_ports": { "tcp": 20010, "udp": 20010, "ws": 80 },
+  "drop": [
+    { "file": ["exit_nodes"], "flags": ["--exit-nodes"], "takes_value": true, "reason": "exit_node" },
+    { "file": ["options.exit"], "flags": ["--exit"], "reason": "exit_node" },
+    { "file": ["forward"], "flags": ["--forward"], "takes_value": true, "reason": "port_forward" },
+    { "file": ["socks"], "flags": ["--socks"], "takes_value": true, "reason": "local_proxy" },
+    { "file": ["manage_port"], "flags": ["-r", "--manage-port"], "env": ["DEMO_MANAGE_PORT"], "takes_value": true, "reason": "management_port" },
+    { "flags": ["-w", "--config-server"], "env": ["DEMO_CONFIG_SERVER"], "takes_value": true, "reason": "remote_config" },
+    { "file": ["credential_file"], "flags": ["--credential"], "takes_value": true, "reason": "credential_mode" },
+    { "file": ["options.compress"], "flags": ["--compress"], "takes_value": true, "reason": "compression" },
+    { "file": ["acl"], "reason": "access_rules" },
+    { "file": ["options.punch_off"], "flags": ["--punch-off"], "reason": "nat_traversal" },
+    { "file": ["old_portal"], "reason": "obsolete" },
+    { "flags": ["--log-level"], "takes_value": true, "reason": "logging" }
+  ]
+}
