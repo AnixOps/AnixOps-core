@@ -2337,6 +2337,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "x25519-dalek",
 ]
 
 [[package]]

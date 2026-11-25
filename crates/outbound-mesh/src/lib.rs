@@ -18,6 +18,8 @@
 //!   encryption and the handshake message.
 //! - [`rpc`]: peer RPC packets, pieces, requests and responses.
 //! - [`route`]: route synchronisation messages, topology and path choice.
+//! - [`secure`]: the secure mode: Noise handshakes, the secret proof,
+//!   traffic keys, rotation and the replay window.
 
 pub mod config;
 pub mod legacy;
@@ -27,6 +29,7 @@ pub mod route;
 pub mod routes;
 pub mod rpc;
 pub mod scope;
+pub mod secure;
 pub mod wire;
 
 pub use config::{
