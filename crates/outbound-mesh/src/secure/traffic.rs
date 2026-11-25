@@ -287,6 +287,16 @@ pub struct Receiver {
     root_key: [u8; ROOT_KEY_LEN],
     dir: u8,
     newest: u32,
+    /// Packets of an earlier epoch are refused.
+    floor: u32,
+    /// Whether a packet has set the newest epoch. After a Sync without a
+    /// record of the session (spec §8.4 rule 2) the first packet that
+    /// authenticates sets it.
+    anchored: bool,
+    /// Whether a packet that authenticates may move the newest epoch more
+    /// than [`MAX_EPOCHS_AHEAD`] at once: for a while after such a Sync, so
+    /// a replayed old packet that came first cannot hold the peer back.
+    relaxed: bool,
     /// Keys and windows of the newest epoch and the one before it, so
     /// packets in flight across a rotation still arrive.
     epochs: BTreeMap<u32, (LessSafeKey, ReplayWindow)>,
@@ -311,13 +321,67 @@ impl Receiver {
             root_key,
             dir,
             newest: initial_epoch,
+            floor: 0,
+            anchored: true,
+            relaxed: false,
             epochs,
             failures: 0,
         })
     }
 
+    /// A receiver that does not know the peer's epoch yet: the first packet
+    /// that authenticates in `floor` or later sets it, and earlier packets
+    /// are dropped without counting as failures. After a Sync without a
+    /// record the floor is 0 (spec §8.4 rule 2).
+    pub fn unanchored(
+        cipher: Cipher,
+        root_key: [u8; ROOT_KEY_LEN],
+        local_id: u32,
+        peer_id: u32,
+        floor: u32,
+    ) -> Result<Self, TrafficError> {
+        aead_key(cipher, &root_key, floor, 0).ok_or(TrafficError::Cipher)?;
+        Ok(Self {
+            cipher,
+            root_key,
+            dir: direction(peer_id, local_id),
+            newest: floor,
+            floor,
+            anchored: false,
+            relaxed: false,
+            epochs: BTreeMap::new(),
+            failures: 0,
+        })
+    }
+
+    /// A receiver that goes on from a record of the same root key: `newest`
+    /// and its window as they were, and nothing earlier than `newest`
+    /// (spec §8.4 rule 2).
+    pub fn restored(
+        cipher: Cipher,
+        root_key: [u8; ROOT_KEY_LEN],
+        local_id: u32,
+        peer_id: u32,
+        newest: u32,
+        window: ReplayWindow,
+    ) -> Result<Self, TrafficError> {
+        let mut receiver = Self::new(cipher, root_key, local_id, peer_id, newest)?;
+        receiver.floor = newest;
+        if let Some(entry) = receiver.epochs.get_mut(&newest) {
+            entry.1 = window;
+        }
+        Ok(receiver)
+    }
+
     pub fn ended(&self) -> bool {
         self.failures >= MAX_FAILURES
+    }
+
+    /// Lets a packet that authenticates move the newest epoch however far
+    /// ahead it is, with a new window, while `relaxed` (spec §8.4 rule 2:
+    /// the first 60 seconds after a Sync without a record).
+    pub fn relax_ahead(&mut self, relaxed: bool) {
+        self.relaxed = relaxed;
     }
 
     /// The newest epoch a packet authenticated in, or the initial one.
@@ -325,22 +389,12 @@ impl Receiver {
         self.newest
     }
 
-    /// Expects the peer from `epoch` on, as after a Sync to that epoch
-    /// (spec §8.4); keeps the epoch before it for packets in flight. Never
-    /// moves backwards.
-    pub fn advance_to(&mut self, epoch: u32) -> Result<(), TrafficError> {
-        if epoch <= self.newest {
-            return Ok(());
-        }
-        if !self.epochs.contains_key(&epoch) {
-            let key = aead_key(self.cipher, &self.root_key, epoch, self.dir)
-                .ok_or(TrafficError::Cipher)?;
-            self.epochs.insert(epoch, (key, ReplayWindow::default()));
-        }
-        self.newest = epoch;
-        let oldest_kept = epoch - 1;
-        self.epochs.retain(|&kept, _| kept >= oldest_kept);
-        Ok(())
+    /// The replay window of the newest epoch, for a record of the session.
+    pub fn newest_window(&self) -> ReplayWindow {
+        self.epochs
+            .get(&self.newest)
+            .map(|(_, window)| window.clone())
+            .unwrap_or_default()
     }
 
     fn fail(&mut self, error: TrafficError) -> TrafficError {
@@ -352,26 +406,46 @@ impl Receiver {
         }
     }
 
+    /// Counts a failure [`Receiver::open_uncounted`] left uncounted.
+    pub fn count_failure(&mut self, error: TrafficError) -> TrafficError {
+        self.fail(error)
+    }
+
     /// Decrypts a sealed payload in place, removing the tail. Only a packet
     /// that authenticates moves the window or the newest epoch.
     pub fn open(&mut self, payload: &mut Vec<u8>) -> Result<(), TrafficError> {
+        match self.open_uncounted(payload) {
+            Ok(()) => Ok(()),
+            Err((error, true)) => Err(self.fail(error)),
+            Err((error, false)) => Err(error),
+        }
+    }
+
+    /// Like [`Receiver::open`], but a failure is returned with whether it
+    /// counts towards [`MAX_FAILURES`] instead of being counted.
+    pub fn open_uncounted(&mut self, payload: &mut Vec<u8>) -> Result<(), (TrafficError, bool)> {
         if self.ended() {
-            return Err(TrafficError::SessionEnded);
+            return Err((TrafficError::SessionEnded, false));
         }
         if payload.len() < TAIL_LEN {
-            return Err(self.fail(TrafficError::Truncated));
+            return Err((TrafficError::Truncated, true));
         }
         let nonce_at = payload.len() - NONCE_LEN;
         let nonce: [u8; NONCE_LEN] = payload[nonce_at..].try_into().expect("NONCE_LEN bytes");
         let epoch = u32::from_be_bytes(nonce[..4].try_into().expect("4 bytes"));
         let seq = u64::from_be_bytes(nonce[4..].try_into().expect("8 bytes"));
 
-        if epoch > self.newest {
-            if epoch - self.newest > MAX_EPOCHS_AHEAD {
-                return Err(self.fail(TrafficError::EpochTooFarAhead));
+        if epoch < self.floor {
+            return Err((TrafficError::StaleEpoch, false));
+        }
+        if self.anchored {
+            if epoch > self.newest {
+                if epoch - self.newest > MAX_EPOCHS_AHEAD && !self.relaxed {
+                    return Err((TrafficError::EpochTooFarAhead, true));
+                }
+            } else if self.newest - epoch > 1 {
+                return Err((TrafficError::StaleEpoch, false));
             }
-        } else if self.newest - epoch > 1 {
-            return Err(TrafficError::StaleEpoch);
         }
 
         let fresh = if self.epochs.contains_key(&epoch) {
@@ -379,14 +453,14 @@ impl Receiver {
         } else {
             Some(
                 aead_key(self.cipher, &self.root_key, epoch, self.dir)
-                    .ok_or(TrafficError::Cipher)?,
+                    .ok_or((TrafficError::Cipher, false))?,
             )
         };
         let window = match (&fresh, self.epochs.get(&epoch)) {
             (None, Some((_, window))) => window,
             _ => &ReplayWindow::default(),
         };
-        window.check(seq)?;
+        window.check(seq).map_err(|error| (error, false))?;
 
         let key = match &fresh {
             Some(key) => key,
@@ -398,7 +472,7 @@ impl Receiver {
             .map(|plain| plain.len());
         let plain_len = match opened {
             Ok(len) => len,
-            Err(_) => return Err(self.fail(TrafficError::Open)),
+            Err(_) => return Err((TrafficError::Open, true)),
         };
         debug_assert_eq!(plain_len + TAG_LEN, nonce_at);
 
@@ -406,9 +480,10 @@ impl Receiver {
         if let Some(key) = fresh {
             self.epochs.insert(epoch, (key, ReplayWindow::default()));
         }
-        if epoch > self.newest {
+        if epoch > self.newest || !self.anchored {
             self.newest = epoch;
-            let oldest_kept = epoch - 1;
+            self.anchored = true;
+            let oldest_kept = epoch.saturating_sub(1);
             self.epochs.retain(|&kept, _| kept >= oldest_kept);
         }
         self.epochs
@@ -627,25 +702,77 @@ mod tests {
         }
     }
 
+    fn sealed(epoch: u32, now: Instant) -> Vec<u8> {
+        let mut sender = Sender::new(Cipher::Aes128Gcm, root(), 3, 9, epoch, now).unwrap();
+        let mut packet = b"p".to_vec();
+        sender.seal(&mut packet, now).unwrap();
+        packet
+    }
+
     #[test]
-    fn a_receiver_moves_to_a_synced_epoch() {
+    fn an_unanchored_receiver_takes_the_first_packet_at_or_above_its_floor() {
         let now = Instant::now();
-        let mut receiver = Receiver::new(Cipher::Aes128Gcm, root(), 9, 3, 0).unwrap();
-        receiver.advance_to(7).unwrap();
-        assert_eq!(receiver.newest(), 7);
-        receiver.advance_to(2).unwrap();
-        assert_eq!(receiver.newest(), 7, "never backwards");
-        let seal = |epoch: u32| {
-            let mut sender = Sender::new(Cipher::Aes128Gcm, root(), 3, 9, epoch, now).unwrap();
-            let mut packet = b"p".to_vec();
-            sender.seal(&mut packet, now).unwrap();
-            packet
-        };
-        receiver.open(&mut seal(7)).unwrap();
-        receiver.open(&mut seal(6)).unwrap();
-        assert_eq!(receiver.open(&mut seal(0)), Err(TrafficError::StaleEpoch));
+        let mut receiver = Receiver::unanchored(Cipher::Aes128Gcm, root(), 9, 3, 6).unwrap();
+        // Older packets, replayed or not, neither count nor set the epoch.
+        for _ in 0..MAX_FAILURES + 2 {
+            assert_eq!(
+                receiver.open(&mut sealed(2, now)),
+                Err(TrafficError::StaleEpoch)
+            );
+        }
+        assert!(!receiver.ended());
+        // The peer's real epoch may be far above the floor.
+        receiver.open(&mut sealed(20, now)).unwrap();
+        assert_eq!(receiver.newest(), 20);
+        receiver.open(&mut sealed(19, now)).unwrap();
+        assert_eq!(
+            receiver.open(&mut sealed(6, now)),
+            Err(TrafficError::StaleEpoch)
+        );
         assert!(keys_equal(&root(), &root()));
         assert!(!keys_equal(&root(), &[0; 32]));
+    }
+
+    #[test]
+    fn a_relaxed_receiver_follows_the_peer_far_ahead() {
+        let now = Instant::now();
+        let mut receiver = Receiver::unanchored(Cipher::Aes128Gcm, root(), 9, 3, 0).unwrap();
+        // A replayed old packet came first and set the epoch low.
+        receiver.open(&mut sealed(1, now)).unwrap();
+        receiver.relax_ahead(true);
+        receiver.open(&mut sealed(30, now)).unwrap();
+        assert_eq!(receiver.newest(), 30);
+        receiver.relax_ahead(false);
+        assert_eq!(
+            receiver.open(&mut sealed(40, now)),
+            Err(TrafficError::EpochTooFarAhead)
+        );
+    }
+
+    #[test]
+    fn a_restored_receiver_keeps_its_window_and_refuses_older_epochs() {
+        let now = Instant::now();
+        let mut sender = Sender::new(Cipher::Aes128Gcm, root(), 3, 9, 4, now).unwrap();
+        let mut packets = Vec::new();
+        for _ in 0..3 {
+            let mut packet = b"p".to_vec();
+            sender.seal(&mut packet, now).unwrap();
+            packets.push(packet);
+        }
+        let mut first = Receiver::new(Cipher::Aes128Gcm, root(), 9, 3, 4).unwrap();
+        first.open(&mut packets[0].clone()).unwrap();
+        let window = first.newest_window();
+        let mut receiver =
+            Receiver::restored(Cipher::Aes128Gcm, root(), 9, 3, first.newest(), window).unwrap();
+        assert_eq!(
+            receiver.open(&mut packets[0].clone()),
+            Err(TrafficError::Replay)
+        );
+        receiver.open(&mut packets[1].clone()).unwrap();
+        assert_eq!(
+            receiver.open(&mut sealed(3, now)),
+            Err(TrafficError::StaleEpoch)
+        );
     }
 
     #[test]

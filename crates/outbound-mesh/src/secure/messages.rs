@@ -2,6 +2,8 @@
 //! relay handshake (spec §9). They travel inside Noise messages; this module
 //! only encodes and decodes them.
 
+use zeroize::Zeroizing;
+
 use crate::config::Cipher;
 use crate::route::messages::Uuid;
 use crate::wire::pb::{PbError, Reader, Writer};
@@ -199,8 +201,8 @@ pub struct Msg2 {
     pub role_hint: RoleHint,
     pub action: Action,
     pub session_generation: u32,
-    /// Present exactly for Create and Sync.
-    pub root_key: Option<[u8; ROOT_KEY_LEN]>,
+    /// Present exactly for Create and Sync; wiped on drop.
+    pub root_key: Option<Zeroizing<[u8; ROOT_KEY_LEN]>>,
     pub initial_epoch: u32,
     pub conn_id: Uuid,
     pub peer_conn_id_echo: Uuid,
@@ -221,7 +223,7 @@ impl Msg2 {
             .u32(3, self.action.code())
             .u32(4, self.session_generation);
         if let Some(root_key) = &self.root_key {
-            writer.opt_bytes(5, root_key);
+            writer.opt_bytes(5, &root_key[..]);
         }
         writer.u32(6, self.initial_epoch);
         uuid(&mut writer, 7, &self.conn_id);
@@ -252,7 +254,7 @@ impl Msg2 {
                 2 => role_hint = value.u32(field)?,
                 3 => action = value.u32(field)?,
                 4 => session_generation = value.u32(field)?,
-                5 => root_key = Some(fixed(value.bytes(field)?)?),
+                5 => root_key = Some(Zeroizing::new(fixed(value.bytes(field)?)?)),
                 6 => initial_epoch = value.u32(field)?,
                 7 => conn_id = Uuid::decode(value.bytes(field)?)?,
                 8 => peer_conn_id_echo = Uuid::decode(value.bytes(field)?)?,
@@ -390,7 +392,8 @@ impl RelayMsg1 {
 pub struct RelayMsg2 {
     pub action: Action,
     pub session_generation: u32,
-    pub root_key: Option<[u8; ROOT_KEY_LEN]>,
+    /// Present exactly for Create and Sync; wiped on drop.
+    pub root_key: Option<Zeroizing<[u8; ROOT_KEY_LEN]>>,
     pub initial_epoch: u32,
     pub conn_id: Uuid,
     pub peer_conn_id_echo: Uuid,
@@ -407,7 +410,7 @@ impl RelayMsg2 {
             .u32(3, self.action.code())
             .u32(4, self.session_generation);
         if let Some(root_key) = &self.root_key {
-            writer.opt_bytes(5, root_key);
+            writer.opt_bytes(5, &root_key[..]);
         }
         writer.u32(6, self.initial_epoch);
         uuid(&mut writer, 7, &self.conn_id);
@@ -429,7 +432,7 @@ impl RelayMsg2 {
             match field {
                 3 => action = value.u32(field)?,
                 4 => session_generation = value.u32(field)?,
-                5 => root_key = Some(fixed(value.bytes(field)?)?),
+                5 => root_key = Some(Zeroizing::new(fixed(value.bytes(field)?)?)),
                 6 => initial_epoch = value.u32(field)?,
                 7 => conn_id = Uuid::decode(value.bytes(field)?)?,
                 8 => peer_conn_id_echo = Uuid::decode(value.bytes(field)?)?,
@@ -538,7 +541,7 @@ mod tests {
             role_hint: RoleHint::SameNetwork,
             action: Action::Create,
             session_generation: 1,
-            root_key: Some([7; 32]),
+            root_key: Some(Zeroizing::new([7; 32])),
             initial_epoch: 0,
             conn_id: id(2),
             peer_conn_id_echo: id(1),
@@ -612,7 +615,7 @@ mod tests {
         let msg2 = RelayMsg2 {
             action: Action::Sync,
             session_generation: 4,
-            root_key: Some([6; 32]),
+            root_key: Some(Zeroizing::new([6; 32])),
             initial_epoch: 9,
             conn_id: id(6),
             peer_conn_id_echo: id(5),
