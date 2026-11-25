@@ -56,7 +56,7 @@
 | `paths[]`（0.5） | 本网络配置的自定义路径（规范 §17.2），按配置顺序：`{ "id", "target", "via", "state", "unreachable", "reason" }`。`id` 由目标生成：`peer:<虚拟地址>` 或 `subnet:<网段>`，路径列表改变时同一目标的 `id` 不变。`target` 为 `{ "peer": 成员 id }` 或 `{ "subnet": 网段 }`；`via` 为成员 `id` 列表，与配置顺序相同。目标或途经点的虚拟地址当前没有对应成员时，该项给出虚拟地址原文 |
 | `path.state` | `pending`（能力查询尚未全部有结果，最长 5 秒，按默认选路发送，界面不提示）、`active`（严格按途经点）、`first_hop_only`（只保证开头一段，规范 §17.2.3）、`fallback`（已回落默认选路）。客户端遇到不认识的取值时不提示回落 |
 | `path.unreachable` | `fallback` 时为涉及的成员 `id`（需求 R9）；`active` 时目的本身不可达（路径错误码 2）为目的成员 `id`；其余为 `null` |
-| `path.reason` | `fallback` 时为 `unreachable`（途经点不可达或能力查询超时）、`unsupported`（第一个途经点不支持封装且不是直连邻居）、`not_relay`（途经点不中转）、`hop_limit`（转发计数超限），规范 §17.2.7；其余为 `null`。客户端不认识的取值按 `unreachable` 显示 |
+| `path.reason` | `fallback` 时为 `unreachable`（途经点不可达或能力查询超时）、`unsupported`（第一个途经点不支持封装且不是直连邻居，`unreachable` 为该途经点；或安全模式下目的与本机直连且不是我方节点，`unreachable` 为目的成员）、`not_relay`（途经点不中转）、`hop_limit`（转发计数超限），规范 §17.2.7；其余为 `null`。客户端不认识的取值按 `unreachable` 显示 |
 | `members[].pathState` 取值规则（0.5） | 该成员有 `to_peer` 路径时取该路径的 `state`：`active` 记为 `custom`，`pending` 记为 `auto`，`first_hop_only`、`fallback` 原样；`unreachable` 同该路径。只被 `to_subnet` 路径覆盖的成员仍为 `auto`，子网的路径状态看 `paths[]`。`custom` 与 `first_hop_only` 时 `path` 为按本机拓扑展开的预计路径（经各途经点，途经点之间取默认选路），`hops` 为其中的中转次数；`first_hop_only` 只展开到最后一个保证经过的途经点，之后按本机拓扑的默认选路估计 |
 | 宿主组（0.5） | 组内虚拟机（`members[].vms`）没有单独的路径状态，随网关成员行；组地址段在 `subnets[]` 中的 `path` 按到网关的路径给出（需求 R25） |
 | `subnet.state` | `ok`、`unreachable`、`refused`（内网范围外，列出但不装路由，需求 R17） |
