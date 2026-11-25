@@ -97,6 +97,41 @@ pub struct PathError {
     pub failed: u32,
 }
 
+/// What an echoing waypoint did with the probe towards its next waypoint
+/// (offset 3 of an Echo, spec §17.2.6 rule 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EchoStatus {
+    /// Sent on, or this was the last waypoint.
+    Forwarded,
+    /// The next waypoint's capability query is queued or running.
+    Pending,
+    /// The next waypoint is not "supported" in this node's cache. Reserved
+    /// values read as this one.
+    NotEncapsulable,
+    /// The next waypoint is unreachable in this node's topology.
+    Unreachable,
+}
+
+impl EchoStatus {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Forwarded,
+            1 => Self::Pending,
+            3 => Self::Unreachable,
+            _ => Self::NotEncapsulable,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Forwarded => 0,
+            Self::Pending => 1,
+            Self::NotEncapsulable => 2,
+            Self::Unreachable => 3,
+        }
+    }
+}
+
 /// A decoded probe echo (spec §17.2.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Echo {
@@ -105,6 +140,7 @@ pub struct Echo {
     /// The waypoint that answered.
     pub waypoint: u32,
     pub token: u64,
+    pub status: EchoStatus,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -157,7 +193,14 @@ pub fn encode_error(error: &PathError) -> Vec<u8> {
 /// Builds an echo payload (spec §17.2.6).
 pub fn encode_echo(echo: &Echo) -> Vec<u8> {
     let mut out = Vec::with_capacity(ECHO_LEN);
-    prefix(&mut out, KIND_ECHO, 0, 0, echo.origin, echo.destination);
+    prefix(
+        &mut out,
+        KIND_ECHO,
+        0,
+        echo.status.as_u8(),
+        echo.origin,
+        echo.destination,
+    );
     out.extend_from_slice(&echo.waypoint.to_le_bytes());
     out.extend_from_slice(&echo.token.to_le_bytes());
     out
@@ -194,7 +237,7 @@ pub fn decode(payload: &[u8]) -> Option<Payload<'_>> {
             }))
         }
         KIND_ECHO => {
-            if payload.len() != ECHO_LEN || count != 0 || payload[3] != 0 {
+            if payload.len() != ECHO_LEN || count != 0 {
                 return None;
             }
             Some(Payload::Echo(Echo {
@@ -202,6 +245,7 @@ pub fn decode(payload: &[u8]) -> Option<Payload<'_>> {
                 destination,
                 waypoint: u32_at(payload, 12),
                 token: u64_at(payload, 16),
+                status: EchoStatus::from_u8(payload[3]),
             }))
         }
         kind @ (KIND_FORWARD | KIND_PROBE) => {
@@ -300,6 +344,10 @@ pub struct WaypointContext<'a> {
     /// such a node (spec §17.2.5 rule 5, §17.2.6 rule 2). The node starts
     /// a query for unknown members itself.
     pub supported: &'a dyn Fn(u32) -> bool,
+    /// Whether this node's capability query for a node is queued or
+    /// running; a probe held up by it echoes status 1 (spec §17.2.4,
+    /// §17.2.6 rule 2).
+    pub pending: &'a dyn Fn(u32) -> bool,
 }
 
 /// Decides what a waypoint does with `transit` (already decoded). An empty
@@ -338,21 +386,28 @@ pub fn step(transit: &Transit<'_>, cx: &WaypointContext<'_>) -> Step {
             destination: transit.destination,
             waypoint: cx.self_id,
             token,
+            status: EchoStatus::Forwarded,
         }),
         Body::Data(_) => None,
     };
+    let held = |status| echo.map(|echo| Echo { status, ..echo });
     let counter = cx.forward_counter + 1;
     match (transit.remaining.split_first(), transit.body) {
         (Some((&next, rest)), body) => {
             if !(cx.reachable)(next) {
                 let mut step = error(ErrorCode::NextUnreachable, next);
-                step.echo = echo;
+                step.echo = held(EchoStatus::Unreachable);
                 return step;
             }
             if !(cx.supported)(next) {
                 // Never send type 40 to an unconfirmed node; no error.
+                let status = if (cx.pending)(next) {
+                    EchoStatus::Pending
+                } else {
+                    EchoStatus::NotEncapsulable
+                };
                 return Step {
-                    echo,
+                    echo: held(status),
                     ..Step::default()
                 };
             }
@@ -551,6 +606,9 @@ pub enum Reason {
     Unsupported,
     NotRelay,
     HopLimit,
+    /// Probes went unanswered while the waypoint stays reachable in the
+    /// topology (spec §17.2.6 rule 3).
+    NoEcho,
 }
 
 impl Reason {
@@ -560,6 +618,7 @@ impl Reason {
             Self::Unsupported => "unsupported",
             Self::NotRelay => "not_relay",
             Self::HopLimit => "hop_limit",
+            Self::NoEcho => "no_echo",
         }
     }
 }
@@ -787,35 +846,66 @@ pub fn judge_error(error: &PathError, reporter: u32, path: &LivePath<'_>) -> Err
 
 /// Probe bookkeeping for one encapsulated waypoint sequence (spec §17.2.6).
 /// The node sends a probe, feeds back the echoes, and closes the round
-/// after 3 s.
+/// after 3 s. A new sequence warms up first (rule 7): probes every second
+/// until one round has every echo, judged by the number of probes, not by
+/// the clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeState {
     waypoints: Vec<u32>,
     token: Option<u64>,
-    answered: Vec<bool>,
+    /// This round's echo status per waypoint, `None` while unanswered.
+    answered: Vec<Option<EchoStatus>>,
+    /// The latest echo status seen from each waypoint.
+    last: Vec<Option<EchoStatus>>,
     misses: Vec<u8>,
     clean_rounds: u8,
-    failed: Option<usize>,
+    warmup: Option<Warmup>,
+    held: Option<(usize, Reason)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Warmup {
+    sent: u32,
+    deadline: u32,
+}
+
+/// Where a probed sequence stands after a round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Still warming up: the paths stay `pending` on default routing.
+    Warming,
+    /// The paths may be `active` (or `first_hop_only` a).
+    Ready,
+    /// The paths fall back, naming this waypoint index.
+    Held { waypoint: usize, reason: Reason },
 }
 
 /// Probes in a row without an echo before a waypoint counts as lost.
 pub const PROBE_MISSES: u8 = 3;
 /// Rounds in a row with every echo before the path recovers.
 pub const PROBE_RECOVERY: u8 = 2;
+/// Warm-up probes beyond the waypoint count before giving up (6 + k).
+pub const WARMUP_PROBES: u32 = 6;
+/// Extra warm-up probes allowed after a status-1 echo.
+pub const WARMUP_GRACE: u32 = 3;
 /// Echoes per second a source expects from one waypoint at most: half of
 /// the waypoint's limit of 32 (spec §17.2.6 rules 1, 4).
 pub const ECHO_BUDGET: u32 = 16;
 
 impl ProbeState {
+    /// A sequence that has to warm up first.
     pub fn new(waypoints: Vec<u32>) -> Self {
         let n = waypoints.len();
+        let deadline = WARMUP_PROBES + n as u32;
         Self {
             waypoints,
             token: None,
-            answered: vec![false; n],
+            answered: vec![None; n],
+            last: vec![None; n],
             misses: vec![0; n],
             clean_rounds: 0,
-            failed: None,
+            warmup: Some(Warmup { sent: 0, deadline }),
+            held: None,
         }
     }
 
@@ -826,7 +916,7 @@ impl ProbeState {
     /// Starts a round with this token.
     pub fn start(&mut self, token: u64) {
         self.token = Some(token);
-        self.answered.iter_mut().for_each(|a| *a = false);
+        self.answered.iter_mut().for_each(|a| *a = None);
     }
 
     /// Takes an echo that arrived with outer `from_peer_id` = `from`.
@@ -837,33 +927,101 @@ impl ProbeState {
         }
         match self.waypoints.iter().position(|id| *id == from) {
             Some(at) => {
-                self.answered[at] = true;
+                self.answered[at] = Some(echo.status);
+                self.last[at] = Some(echo.status);
                 true
             }
             None => false,
         }
     }
 
-    /// Closes the round (3 s after the probe). Returns the waypoint index
-    /// the path is held on, if any (spec §17.2.6 rule 3).
-    pub fn finish(&mut self) -> Option<usize> {
-        if self.token.take().is_none() {
-            return self.failed;
+    /// The current verdict without closing a round.
+    pub fn verdict(&self) -> Verdict {
+        if self.warmup.is_some() {
+            return Verdict::Warming;
         }
-        for (miss, answered) in self.misses.iter_mut().zip(&self.answered) {
-            *miss = if *answered { 0 } else { miss.saturating_add(1) };
+        match self.held {
+            Some((waypoint, reason)) => Verdict::Held { waypoint, reason },
+            None => Verdict::Ready,
         }
-        if self.answered.iter().all(|a| *a) {
-            self.clean_rounds = self.clean_rounds.saturating_add(1);
+    }
+
+    /// Why waypoint `lost` counts as lost: its predecessor's latest echo
+    /// said the next one is unreachable, or it simply did not answer
+    /// (spec §17.2.6 rule 3).
+    fn held_on(&self, lost: usize) -> (usize, Reason) {
+        let unreachable = lost
+            .checked_sub(1)
+            .is_some_and(|before| self.last[before] == Some(EchoStatus::Unreachable));
+        let reason = if unreachable {
+            Reason::Unreachable
         } else {
-            self.clean_rounds = 0;
+            Reason::NoEcho
+        };
+        (lost, reason)
+    }
+
+    /// Closes the round (3 s after the probe) and returns the verdict
+    /// (spec §17.2.6 rules 3 and 7).
+    pub fn finish(&mut self) -> Verdict {
+        if self.token.take().is_none() {
+            return self.verdict();
+        }
+        // Waypoints after one that echoed status 1 are not missing: that
+        // one is still waiting for its query.
+        let excused_from = self
+            .answered
+            .iter()
+            .position(|a| *a == Some(EchoStatus::Pending))
+            .map_or(self.answered.len(), |at| at + 1);
+        for (at, (miss, answered)) in self.misses.iter_mut().zip(&self.answered).enumerate() {
+            if answered.is_some() {
+                *miss = 0;
+            } else if at < excused_from {
+                *miss = miss.saturating_add(1);
+            }
+        }
+        let clean = self.answered.iter().all(Option::is_some);
+        self.clean_rounds = if clean {
+            self.clean_rounds.saturating_add(1)
+        } else {
+            0
+        };
+        if let Some(warmup) = self.warmup.as_mut() {
+            warmup.sent += 1;
+            if clean {
+                self.warmup = None;
+                self.held = None;
+                return Verdict::Ready;
+            }
+            let base = WARMUP_PROBES + self.waypoints.len() as u32;
+            if excused_from < self.answered.len() {
+                warmup.deadline = warmup
+                    .deadline
+                    .max(warmup.sent + WARMUP_GRACE)
+                    .min(base + WARMUP_GRACE);
+            }
+            if warmup.sent < warmup.deadline {
+                return Verdict::Warming;
+            }
+            // Give up: name the first waypoint without an echo this round
+            // and go on probing under rule 3's recovery.
+            self.warmup = None;
+            let lost = self.answered.iter().position(Option::is_none).unwrap_or(0);
+            self.held = Some(self.held_on(lost));
+            return self.verdict();
         }
         if let Some(lost) = self.misses.iter().position(|m| *m >= PROBE_MISSES) {
-            self.failed = Some(lost);
+            self.held = Some(self.held_on(lost));
         } else if self.clean_rounds >= PROBE_RECOVERY {
-            self.failed = None;
+            self.held = None;
         }
-        self.failed
+        self.verdict()
+    }
+
+    /// Warm up again after a waypoint changed its ID or capability.
+    pub fn rewarm(&mut self) {
+        *self = Self::new(std::mem::take(&mut self.waypoints));
     }
 }
 
@@ -1106,14 +1264,29 @@ mod tests {
             destination: 9,
             waypoint: 3,
             token: 77,
+            status: EchoStatus::Forwarded,
         };
         let bytes = encode_echo(&echo);
         assert_eq!(bytes.len(), ECHO_LEN);
         assert_eq!(&bytes[..4], &[1, 4, 0, 0]);
         assert_eq!(decode(&bytes), Some(Payload::Echo(echo)));
-        let mut bad = bytes.clone();
-        bad[3] = 1;
-        assert_eq!(decode(&bad), None);
+        // Offset 3 carries the status; reserved values read as 2.
+        for (byte, status) in [
+            (1, EchoStatus::Pending),
+            (2, EchoStatus::NotEncapsulable),
+            (3, EchoStatus::Unreachable),
+            (9, EchoStatus::NotEncapsulable),
+        ] {
+            let mut other = bytes.clone();
+            other[3] = byte;
+            let Some(Payload::Echo(read)) = decode(&other) else {
+                panic!("status {byte}");
+            };
+            assert_eq!(read.status, status);
+            if byte <= 3 {
+                assert_eq!(encode_echo(&read), other);
+            }
+        }
         assert_eq!(decode(&bytes[..ECHO_LEN - 1]), None);
     }
 
@@ -1198,6 +1371,7 @@ mod tests {
             reachable,
             outer_from: 1,
             supported: &|_| true,
+            pending: &|_| false,
         }
     }
 
@@ -1207,10 +1381,20 @@ mod tests {
         let packet = inner(1, 9);
         let payload = encode_transit(1, 9, &[4], Body::Data(&packet));
         let only_two = |id: u32| id == 2;
+        let asking = |id: u32| id == 4;
         let mut strict = cx(3, 1, &all);
         strict.supported = &only_two;
         // Next waypoint 4 not confirmed: dropped without an error.
         assert_eq!(step(&transit(&payload), &strict), Step::default());
+        // A probe there echoes why it stopped: 2, or 1 while the query for
+        // 4 is queued or running.
+        let onward = encode_transit(1, 9, &[4], Body::Probe(1));
+        let stopped = step(&transit(&onward), &strict);
+        assert_eq!(stopped.next, None);
+        assert_eq!(stopped.echo.unwrap().status, EchoStatus::NotEncapsulable);
+        strict.pending = &asking;
+        let stopped = step(&transit(&onward), &strict);
+        assert_eq!(stopped.echo.unwrap().status, EchoStatus::Pending);
         // A probe whose outer sender is neither the source nor confirmed.
         let probe = encode_transit(1, 9, &[], Body::Probe(1));
         strict.outer_from = 7;
@@ -1305,18 +1489,26 @@ mod tests {
         let none = |_: u32| false;
         let payload = encode_transit(1, 9, &[4], Body::Probe(5));
         let probe = transit(&payload);
-        let echo = Some(Echo {
+        let echo = Echo {
             origin: 1,
             destination: 9,
             waypoint: 3,
             token: 5,
-        });
+            status: EchoStatus::Forwarded,
+        };
         let step3 = step(&probe, &cx(3, 1, &all));
-        assert_eq!(step3.echo, echo);
+        assert_eq!(step3.echo, Some(echo));
         assert_eq!(transit(&step3.next.unwrap().payload).body, Body::Probe(5));
-        // Next unreachable: still echoes, no error.
+        // Next unreachable: still echoes with status 3, no error.
         let lost = step(&probe, &cx(3, 1, &none));
-        assert_eq!((lost.echo, lost.report, lost.next), (echo, None, None));
+        let unreachable = Echo {
+            status: EchoStatus::Unreachable,
+            ..echo
+        };
+        assert_eq!(
+            (lost.echo, lost.report, lost.next),
+            (Some(unreachable), None, None)
+        );
         // Over the counter or not relaying: nothing at all.
         assert_eq!(step(&probe, &cx(3, 8, &all)), Step::default());
         // Last waypoint: echo only, nothing released.
@@ -1579,35 +1771,165 @@ mod tests {
         assert_eq!(judge_error(&other, 3, &path), ErrorAction::Ignore);
     }
 
-    #[test]
-    fn probes_fail_after_three_misses_and_recover_after_two_clean_rounds() {
-        let mut probe = ProbeState::new(vec![3, 4]);
-        let echo = |waypoint, token| Echo {
+    fn echo_from(waypoint: u32, token: u64, status: EchoStatus) -> Echo {
+        Echo {
             origin: 1,
             destination: 9,
             waypoint,
             token,
-        };
+            status,
+        }
+    }
+
+    /// One round in which `answers` echo with their status.
+    fn round(probe: &mut ProbeState, token: u64, answers: &[(u32, EchoStatus)]) -> Verdict {
+        probe.start(token);
+        for (waypoint, status) in answers {
+            assert!(probe.echo(&echo_from(*waypoint, token, *status), *waypoint));
+        }
+        probe.finish()
+    }
+
+    fn warmed(waypoints: Vec<u32>) -> ProbeState {
+        let mut probe = ProbeState::new(waypoints);
+        let all: Vec<_> = probe
+            .waypoints()
+            .iter()
+            .map(|id| (*id, EchoStatus::Forwarded))
+            .collect();
+        assert_eq!(round(&mut probe, 1000, &all), Verdict::Ready);
+        probe
+    }
+
+    #[test]
+    fn probes_fail_after_three_misses_and_recover_after_two_clean_rounds() {
+        use EchoStatus::Forwarded;
+        let mut probe = warmed(vec![3, 4]);
         for token in 0..3u64 {
             probe.start(token);
-            assert!(probe.echo(&echo(3, token), 3));
+            assert!(probe.echo(&echo_from(3, token, Forwarded), 3));
             // Wrong token, or a waypoint field that is not the sender.
-            assert!(!probe.echo(&echo(4, token + 100), 4));
-            assert!(!probe.echo(&echo(4, token), 3));
-            let held = probe.finish();
-            assert_eq!(held, if token == 2 { Some(1) } else { None });
+            assert!(!probe.echo(&echo_from(4, token + 100, Forwarded), 4));
+            assert!(!probe.echo(&echo_from(4, token, Forwarded), 3));
+            let verdict = probe.finish();
+            let expected = if token == 2 {
+                Verdict::Held {
+                    waypoint: 1,
+                    reason: Reason::NoEcho,
+                }
+            } else {
+                Verdict::Ready
+            };
+            assert_eq!(verdict, expected);
         }
         // One clean round is not enough.
-        probe.start(10);
-        probe.echo(&echo(3, 10), 3);
-        probe.echo(&echo(4, 10), 4);
-        assert_eq!(probe.finish(), Some(1));
-        probe.start(11);
-        probe.echo(&echo(3, 11), 3);
-        probe.echo(&echo(4, 11), 4);
-        assert_eq!(probe.finish(), None);
+        let clean = [(3, Forwarded), (4, Forwarded)];
+        assert!(matches!(
+            round(&mut probe, 10, &clean),
+            Verdict::Held { waypoint: 1, .. }
+        ));
+        assert_eq!(round(&mut probe, 11, &clean), Verdict::Ready);
         // Finishing without a probe out changes nothing.
-        assert_eq!(probe.finish(), None);
+        assert_eq!(probe.finish(), Verdict::Ready);
+        assert_eq!(probe.waypoints(), &[3, 4]);
+    }
+
+    #[test]
+    fn echo_status_names_the_reason_and_excuses_later_waypoints() {
+        use EchoStatus::{Forwarded, NotEncapsulable, Pending, Unreachable};
+        // 3 says 4 is unreachable: 4 is held as unreachable.
+        let mut probe = warmed(vec![3, 4, 5]);
+        for token in 0..3 {
+            round(&mut probe, token, &[(3, Unreachable)]);
+        }
+        assert_eq!(
+            probe.verdict(),
+            Verdict::Held {
+                waypoint: 1,
+                reason: Reason::Unreachable
+            }
+        );
+        // 3 says 4 is not encapsulable: no_echo.
+        let mut probe = warmed(vec![3, 4, 5]);
+        for token in 0..3 {
+            round(&mut probe, token, &[(3, NotEncapsulable)]);
+        }
+        assert_eq!(
+            probe.verdict(),
+            Verdict::Held {
+                waypoint: 1,
+                reason: Reason::NoEcho
+            }
+        );
+        // 4 waits for its query of 5: 5 is not missing meanwhile.
+        let mut probe = warmed(vec![3, 4, 5]);
+        for token in 0..5 {
+            let verdict = round(&mut probe, token, &[(3, Forwarded), (4, Pending)]);
+            assert_eq!(verdict, Verdict::Ready);
+        }
+        // Then 5 stays silent with 4 forwarding: three misses count.
+        for token in 5..8 {
+            round(&mut probe, token, &[(3, Forwarded), (4, Forwarded)]);
+        }
+        assert_eq!(
+            probe.verdict(),
+            Verdict::Held {
+                waypoint: 2,
+                reason: Reason::NoEcho
+            }
+        );
+    }
+
+    #[test]
+    fn warmup_counts_probes_and_waits_for_pending_queries() {
+        use EchoStatus::{Forwarded, Pending};
+        // Ready on the first round with every echo.
+        let mut probe = ProbeState::new(vec![3, 4]);
+        assert_eq!(probe.verdict(), Verdict::Warming);
+        assert_eq!(round(&mut probe, 0, &[(3, Forwarded)]), Verdict::Warming);
+        assert_eq!(
+            round(&mut probe, 1, &[(3, Forwarded), (4, Forwarded)]),
+            Verdict::Ready
+        );
+        // Gives up after 6 + k probes, naming the first silent waypoint.
+        let mut probe = ProbeState::new(vec![3, 4]);
+        for token in 0..7 {
+            assert_eq!(
+                round(&mut probe, token, &[(3, Forwarded)]),
+                Verdict::Warming
+            );
+        }
+        assert_eq!(
+            round(&mut probe, 7, &[(3, Forwarded)]),
+            Verdict::Held {
+                waypoint: 1,
+                reason: Reason::NoEcho
+            }
+        );
+        // Rounds not closed do not count: no clock involved.
+        let mut probe = ProbeState::new(vec![3, 4]);
+        for _ in 0..20 {
+            assert_eq!(probe.finish(), Verdict::Warming);
+        }
+        // A status-1 echo on the last counted probe waits at most 3 more.
+        let mut probe = ProbeState::new(vec![3, 4]);
+        for token in 0..10 {
+            assert_eq!(round(&mut probe, token, &[(3, Pending)]), Verdict::Warming);
+        }
+        assert!(matches!(
+            round(&mut probe, 10, &[(3, Pending)]),
+            Verdict::Held { waypoint: 1, .. }
+        ));
+        // After giving up, rule 3's recovery applies.
+        let clean = [(3, Forwarded), (4, Forwarded)];
+        assert!(matches!(
+            round(&mut probe, 11, &clean),
+            Verdict::Held { .. }
+        ));
+        assert_eq!(round(&mut probe, 12, &clean), Verdict::Ready);
+        // A changed waypoint warms up again.
+        probe.rewarm();
+        assert_eq!(probe.verdict(), Verdict::Warming);
         assert_eq!(probe.waypoints(), &[3, 4]);
     }
 
