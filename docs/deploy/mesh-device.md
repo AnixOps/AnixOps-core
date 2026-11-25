@@ -10,7 +10,7 @@
 |---|---|---|
 | `enroll --control URL --token-file FILE --state-dir DIR [--latency CODE=MS]... [--ca-file FILE]` | 以一次性凭据接入，保存设备令牌与首份配置 | 0 成功；2 用法或状态目录错误；8 凭据被拒（401、409）；9 面板不可达或应答无效 |
 | `device --state-dir DIR` | 常驻服务：运行网络、每分钟读取配置、每分钟上报 | 0 收到停止信号；8 令牌失效（需重新接入）；1 其他错误 |
-| `subnet-request --state-dir DIR [--cidr CIDR]...` | 申请通告局域网网段（至多 16 个内网网段；不带 `--cidr` 为撤回），由管理员在面板批准后经配置下发；LuCI 经 rpcd 调用 | 0 已提交；2 用法或状态目录错误；8 令牌失效；9 面板不可达或应答无效 |
+| `subnet-request --state-dir DIR [--cidr CIDR]...` | 申请通告局域网网段（仅完整节点；至多 16 个内网网段；不带 `--cidr` 为撤回），由管理员在面板批准后经配置下发；面板不提供申请状态查询，LuCI 对比下发的 `subnets.advertise` 自行判断；LuCI 经 rpcd 调用 | 0 已提交（202）；2 用法或状态目录错误（含主机位非零的网段，不做规范化）；8 令牌失效（401）；9 面板不可达或应答无效；10 面板拒绝（400 `invalid_request`，或接入端申请时 409 `mesh_conflict`），标准错误末行 JSON 的 `detail` 带面板返回的 `code` |
 | `device-status --state-dir DIR` | 经本机状态套接字读取快照（JSON），供 LuCI 与排障 | 0；1 服务未运行 |
 
 `capabilities` 的命令列表包含 `enroll`、`device`、`device-status` 时，安装器才走无 Agent 路径。受管组网目前只在 Linux 编译，所以这三个命令首先在 Linux 与 OpenWrt 提供；macOS、Windows 的无 Agent 运行在受管组网移植后再列出。
