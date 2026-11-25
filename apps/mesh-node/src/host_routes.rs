@@ -32,6 +32,10 @@ pub use linux::{host_links, host_routes};
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{host_links, host_routes};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{host_links, host_routes, local_networks};
 
 /// Names our mesh interfaces start with: `anixmesh0` for `run`,
 /// `anixmesh-<n>` for the managed networks.

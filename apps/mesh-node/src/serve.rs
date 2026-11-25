@@ -16,6 +16,7 @@ use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
 use ring::rand::SystemRandom;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, watch};
 
@@ -127,6 +128,7 @@ fn busy(what: &str, error: &io::Error) -> Failure {
             Failure::Busy(format!("{what}: {error}"))
         }
         // The kernel answers EBUSY for an interface another program holds.
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EBUSY) => Failure::Busy(format!("{what}: {error}")),
         _ => Failure::Other(format!("{what}: {error}")),
     }
@@ -170,6 +172,7 @@ pub fn key_path(config: &Path) -> std::path::PathBuf {
 /// missing file gets a new key, written readable by the owner only.
 pub fn static_key(path: &Path) -> Result<KeyPair, Failure> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
     match std::fs::read(path) {
@@ -184,10 +187,14 @@ pub fn static_key(path: &Path) -> Result<KeyPair, Failure> {
     }
     let key = KeyPair::generate(&SystemRandom::new())
         .map_err(|_| Failure::Other("no system randomness".into()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Readable by the owner only. On Windows the file takes the access
+    // list of its directory, which the installer limits to SYSTEM and
+    // Administrators.
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(path)
         .map_err(|error| Failure::Other(format!("{}: {error}", path.display())))?;
     file.write_all(&key.private()[..])
@@ -256,6 +263,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
 }
 
 /// Resolves on SIGTERM or SIGINT.
+#[cfg(unix)]
 fn signals() -> Result<impl std::future::Future<Output = ()>, Failure> {
     let mut terminate =
         signal(SignalKind::terminate()).map_err(|error| Failure::Other(error.to_string()))?;
@@ -265,6 +273,17 @@ fn signals() -> Result<impl std::future::Future<Output = ()>, Failure> {
         tokio::select! {
             _ = terminate.recv() => {}
             _ = interrupt.recv() => {}
+        }
+    })
+}
+
+/// Resolves on Ctrl+C, or when the service manager stops the service.
+#[cfg(windows)]
+fn signals() -> Result<impl std::future::Future<Output = ()>, Failure> {
+    Ok(async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = crate::service_windows::stop_requested() => {}
         }
     })
 }
@@ -418,8 +437,11 @@ mod tests {
     fn a_port_in_use_is_busy() {
         let error = io::Error::from(io::ErrorKind::AddrInUse);
         assert_eq!(busy("listen", &error).exit_code(), 3);
-        let error = io::Error::from_raw_os_error(libc::EBUSY);
-        assert_eq!(busy("interface", &error).exit_code(), 3);
+        #[cfg(unix)]
+        {
+            let error = io::Error::from_raw_os_error(libc::EBUSY);
+            assert_eq!(busy("interface", &error).exit_code(), 3);
+        }
         let error = io::Error::from(io::ErrorKind::PermissionDenied);
         assert_eq!(busy("interface", &error).exit_code(), 1);
     }
@@ -461,12 +483,15 @@ mod tests {
         let first = static_key(&path).expect("new key");
         let second = static_key(&path).expect("same key");
         assert_eq!(first.public(), second.public());
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path)
-            .expect("key file")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("key file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::write(&path, b"short").expect("overwrite");
         assert_eq!(static_key(&path).err().map(|f| f.exit_code()), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
