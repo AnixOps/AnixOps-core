@@ -44,6 +44,7 @@
 
 ### Added
 
+- 组网内网域名解析（需求 R28，规范 §15.9.2；outbound-mesh `dns`，mesh-node `managed`、`serve`）：网络配置接受 `dns` 节（`enabled`、`suffix`、`region`、`names`、`resolver_address`），不合规的名字条目跳过并列入 `refused`；名字规范化内嵌面板同一份 Unicode 15.1.0 表（SHA-256 校验，规范 §22.5 全部向量写成测试）；名单由下发条目与成员自报主机名组成，重名返回全部地址并标出、下发在前；应答 A、AAAA、PTR，短名先本地区后其他地区，单标签只查本地区，TTL 5 秒，每种记录最多 32 个地址（UDP 置 TC），对 `mesh.internal` 与网络内的反向域从不外发。完整节点在虚拟网卡上应答发往 `resolver_address` 53 端口的 UDP 与 TCP 查询，其他名字回 REFUSED；地址等于本机时不拦截并告警 `resolver_address_conflict`。`dns` 变化不重启网络。`GET /v1/status` 的 `features` 增加 `mesh_dns` 与 `mesh_resolver_address`。
 - anixops-mesh 接管 Windows 计划任务与登录自启项（mesh-node `winstart`、`detect`、`takeover`，R12 内核 0.4）：计划任务以 `schtasks.exe /End` 结束、`/Change /DISABLE` 关闭，回滚 `/ENABLE` 后 `/Run`；`Run` 键与启动文件夹的自启项按 Windows 自己的启动项设置（`Explorer\StartupApproved`）关闭，回滚恢复原值，已被他人改动时保留现状；未登录用户的启动文件夹只报告。
 - anixops-mesh 接管支持 Windows（mesh-node `winsvc`、`detect`、`takeover`、`host`、`cmdline`，R12/R32 内核 0.4）：进程从系统进程表读取（命令行、工作目录、完整环境变量与运行账户），检测以该程序运行或在数据文件中点名的服务；接管先 `sc.exe stop` 再禁用，回滚逆序恢复启动方式后启动，服务进程不单独重启；其他账户运行的手动进程在任何改动之前报告并失败。新增 `install-windows.ps1`（服务 `AnixOpsMesh`，数据目录仅 SYSTEM 与 Administrators 可访问）。
 - anixops-mesh 接管支持 macOS（mesh-node `launchd`、`detect`、`takeover`、`host`，R12/R32 内核 0.4）：进程从系统进程表读取（`proc_pidpath`、`KERN_PROCARGS2`、`proc_pidinfo`），检测 `/Library/LaunchDaemons` 与各用户 `~/Library/LaunchAgents` 的 launchd 任务；接管先 `launchctl bootout` 再 `disable`，回滚逆序 `enable` 后 `bootstrap`，任务自己的进程不再单独重启；所有用户共用的代理只报告。新增 `install-macos.sh`（launchd 系统守护进程，状态放在不经符号链接的 `/Library/AnixOps/mesh`）。
