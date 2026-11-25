@@ -9,12 +9,13 @@
 //!
 //! Containers are never touched; they are listed for manual handling.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::detect::{detect, scan_processes, Found, Origin};
+use crate::detect::{classify_units, detect, scan_processes, Found, Origin};
 use crate::host::{Host, Signal, Spawn};
 use crate::profile::Profile;
 
@@ -82,7 +83,19 @@ pub enum Action {
         /// Restarted on rollback; holds what the process was started with.
         argv: Vec<String>,
         env: Vec<(String, String)>,
+        /// `env` is the process's whole environment (older manifests kept
+        /// only the profile's variables and add them to ours).
+        #[serde(default)]
+        full_env: bool,
         cwd: Option<String>,
+        /// The user and group it ran as.
+        #[serde(default)]
+        uid: Option<u32>,
+        #[serde(default)]
+        gid: Option<u32>,
+        /// Its supplementary groups.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<u32>>,
         /// `false` for processes a service manager restarts on rollback.
         restart: bool,
         killed: bool,
@@ -184,7 +197,7 @@ impl std::fmt::Display for TakeoverError {
         match self {
             TakeoverError::Locked(path) => write!(
                 f,
-                "another takeover or rollback is running ({} exists)",
+                "another takeover or rollback is running (it holds {})",
                 path.display()
             ),
             TakeoverError::Io(error) => write!(f, "{error}"),
@@ -213,8 +226,10 @@ impl<'a> Lock<'a> {
         host.create_dir_all(state, 0o700)
             .map_err(|error| TakeoverError::Io(format!("{}: {error}", state.display())))?;
         let path = state.join(LOCK);
-        let pid = host.own_pid().to_string();
-        match host.create_new(&path, pid.as_bytes()) {
+        // An advisory lock on a fixed file: the kernel releases it when the
+        // holder exits, so there is no stale lock to judge or remove, and two
+        // runs can never both hold it.
+        match host.try_lock(&path, &host.own_pid().to_string()) {
             Ok(true) => Ok(Lock { host, path }),
             Ok(false) => Err(TakeoverError::Locked(path)),
             Err(error) => Err(TakeoverError::Io(format!("{}: {error}", path.display()))),
@@ -224,7 +239,7 @@ impl<'a> Lock<'a> {
 
 impl Drop for Lock<'_> {
     fn drop(&mut self) {
-        let _ = self.host.remove_file(&self.path);
+        self.host.unlock(&self.path);
     }
 }
 
@@ -333,11 +348,14 @@ fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
                         runlevel: runlevel.clone(),
                     });
                 }
-                stops.push(Planned::ScriptStop {
-                    name: name.clone(),
-                    script: script.clone(),
-                    openrc: true,
-                });
+                // Stopped (and started again on rollback) only if it runs.
+                if !entry.processes.is_empty() {
+                    stops.push(Planned::ScriptStop {
+                        name: name.clone(),
+                        script: script.clone(),
+                        openrc: true,
+                    });
+                }
             }
             Origin::Sysv { name, script } => {
                 backup(script, &mut backups);
@@ -588,9 +606,15 @@ fn wait_gone(host: &dyn Host, pid: u32, exe: &str, ms: u64) -> bool {
     true
 }
 
-fn end_processes(host: &dyn Host, profile: &Profile) -> Vec<Result<Action, String>> {
+fn end_processes(
+    host: &dyn Host,
+    profile: &Profile,
+    owned_units: &BTreeSet<String>,
+) -> Vec<Result<Action, String>> {
     let mut out = Vec::new();
-    for process in scan_processes(host, profile) {
+    let mut processes = scan_processes(host, profile);
+    classify_units(&mut processes, owned_units);
+    for process in processes {
         if process.contained {
             continue;
         }
@@ -615,8 +639,18 @@ fn end_processes(host: &dyn Host, profile: &Profile) -> Vec<Result<Action, Strin
             pid: process.pid,
             exe: process.exe.clone(),
             argv: process.argv.clone(),
-            env: process.env.clone().into_iter().collect(),
+            full_env: !process.environ.is_empty(),
+            env: if process.environ.is_empty() {
+                process.env.clone().into_iter().collect()
+            } else {
+                process.environ.clone()
+            },
             cwd: process.cwd.clone(),
+            uid: process.uid,
+            gid: process.gid,
+            groups: process.groups.clone(),
+            // Only our own services start it again on rollback; a process
+            // started by hand, rc.local or cron is restarted as it was.
             restart: process.unit.is_none(),
             killed,
         }));
@@ -632,6 +666,13 @@ pub fn takeover(
     dry_run: bool,
 ) -> Result<TakeoverReport, TakeoverError> {
     let found = detect(host, profile);
+    let owned_units: BTreeSet<String> = found
+        .iter()
+        .filter_map(|entry| match &entry.origin {
+            Origin::Systemd { unit, .. } => Some(unit.clone()),
+            _ => None,
+        })
+        .collect();
     let (planned, manual) = plan(host, &found);
     let has_processes = scan_processes(host, profile)
         .iter()
@@ -715,8 +756,20 @@ pub fn takeover(
             break;
         }
     }
+    // Units that are not the program's own but run it (cron, rc-local, a
+    // wrapper the profile does not name). Only their process is ended; if
+    // one restarts it, that shows only after its restart delay.
+    let host_units: BTreeSet<String> = {
+        let mut processes = scan_processes(host, profile);
+        classify_units(&mut processes, &owned_units);
+        processes
+            .into_iter()
+            .filter(|process| !process.contained)
+            .filter_map(|process| process.host_unit)
+            .collect()
+    };
     if failure.is_none() {
-        for result in end_processes(host, profile) {
+        for result in end_processes(host, profile, &owned_units) {
             match result {
                 Ok(action) => {
                     if let Err(error) = record(&mut manifest, action, &mut report) {
@@ -737,13 +790,34 @@ pub fn takeover(
         }
     }
     if failure.is_none() {
+        match restart_wait_ms(host, &host_units) {
+            Ok(wait) if wait > 0 => host.sleep_ms(wait),
+            Ok(_) => {}
+            Err(error) => {
+                report.steps.push(StepReport {
+                    step: "verify".into(),
+                    ok: false,
+                    detail: Some(error.clone()),
+                });
+                failure = Some(error);
+            }
+        }
+    }
+    if failure.is_none() {
         let left: Vec<u32> = scan_processes(host, profile)
             .iter()
             .filter(|process| !process.contained)
             .map(|process| process.pid)
             .collect();
         if !left.is_empty() {
-            let error = format!("processes still running after takeover: {left:?}");
+            let error = if host_units.is_empty() {
+                format!("processes still running after takeover: {left:?}")
+            } else {
+                format!(
+                    "processes still running after takeover: {left:?}; if {} starts the program again, name it in the profile's detect.services",
+                    host_units.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
             report.steps.push(StepReport {
                 step: "verify".into(),
                 ok: false,
@@ -754,15 +828,16 @@ pub fn takeover(
     }
     if failure.is_some() {
         let steps: Vec<Step> = manifest.steps.split_off(first_new);
-        let (results, ok) = undo(host, &steps);
+        let (results, remaining) = undo(host, &steps);
         report.rollback = results;
-        if ok {
+        if remaining.is_empty() {
             report.outcome = Outcome::RolledBack;
             manifest.runs -= 1;
         } else {
             report.outcome = Outcome::RollbackFailed;
-            // Keep what could not be undone for a later `rollback`.
-            manifest.steps.extend(steps);
+            // Keep only what could not be undone for a later `rollback`;
+            // steps already undone are never repeated.
+            manifest.steps.extend(remaining);
         }
         let _ = save_manifest(host, state, &manifest);
     }
@@ -835,24 +910,31 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
                 _ => None,
             });
             if sha256_hex(&current) == *sha256_after {
+                // Nothing changed the file since: put the copy back. Without
+                // a readable copy, fall through and uncomment just our line.
                 if let Some((copy, mode, uid, gid)) = backup {
-                    let bytes = host
-                        .read(Path::new(&copy))
-                        .map_err(|error| format!("{copy}: {error}"))?;
-                    host.write(path, &bytes, mode, Some((uid, gid)))
-                        .map_err(|error| format!("{file}: {error}"))?;
-                    return Ok(format!("restored {file} from {copy}"));
+                    if let Ok(bytes) = host.read(Path::new(&copy)) {
+                        host.write(path, &bytes, mode, Some((uid, gid)))
+                            .map_err(|error| format!("{file}: {error}"))?;
+                        return Ok(format!("restored {file} from {copy}"));
+                    }
                 }
             }
             // The file changed since: put back just our line.
             let text = String::from_utf8_lossy(&current).into_owned();
             let marked = format!("{COMMENT_MARKER}{original}");
             let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-            let index = line
+            let found = line
                 .checked_sub(1)
                 .filter(|index| lines.get(*index) == Some(&marked))
-                .or_else(|| lines.iter().position(|candidate| *candidate == marked))
-                .ok_or_else(|| format!("{file}: the commented line is gone"))?;
+                .or_else(|| lines.iter().position(|candidate| *candidate == marked));
+            let Some(index) = found else {
+                // Already put back by an earlier attempt.
+                if lines.iter().any(|candidate| candidate == original) {
+                    return Ok(format!("{file}: the line is already restored"));
+                }
+                return Err(format!("{file}: the commented line is gone"));
+            };
             lines[index] = original.clone();
             let mut updated = lines.join("\n");
             if text.ends_with('\n') {
@@ -873,7 +955,11 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
         Action::Terminate {
             argv,
             env,
+            full_env,
             cwd,
+            uid,
+            gid,
+            groups,
             restart,
             pid,
             ..
@@ -885,24 +971,144 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
                 .spawn_detached(&Spawn {
                     argv: argv.clone(),
                     env: env.clone(),
+                    clear_env: *full_env,
                     cwd: cwd.clone(),
+                    uid: *uid,
+                    gid: *gid,
+                    groups: groups.clone(),
                 })
                 .map_err(|error| format!("restarting process {pid}: {error}"))?;
-            Ok(format!("restarted process {pid} as {new_pid}"))
+            Ok(match own_scope(host, new_pid) {
+                Ok(Some(scope)) => format!("restarted process {pid} as {new_pid} in {scope}"),
+                Ok(None) => format!("restarted process {pid} as {new_pid}"),
+                // Running, only still in our cgroup: worth knowing, not a failure.
+                Err(error) => format!(
+                    "restarted process {pid} as {new_pid}; it stays in this program's cgroup ({error})"
+                ),
+            })
         }
     }
 }
 
-/// Undoes steps in reverse order; keeps going past failures.
-fn undo(host: &dyn Host, steps: &[Step]) -> (Vec<StepReport>, bool) {
+/// The longest restart delay a host unit may have; a takeover does not wait
+/// longer to see whether the program comes back.
+const MAX_RESTART_WAIT_MS: u64 = 60_000;
+/// Margin after a unit's restart delay before the final check.
+const RESTART_MARGIN_MS: u64 = 2_000;
+
+/// How long to wait before the final check so that a host unit that
+/// restarts the program has done so. A unit whose delay is unknown or too
+/// long fails the takeover rather than report it done on a guess.
+fn restart_wait_ms(host: &dyn Host, units: &BTreeSet<String>) -> Result<u64, String> {
+    let mut wait = 0;
+    for unit in units {
+        let output = host
+            .run(
+                "systemctl",
+                &["show", unit.as_str(), "-p", "Restart", "-p", "RestartUSec"],
+            )
+            .map_err(|error| format!("systemctl show {unit}: {error}"))?;
+        if !output.success() {
+            return Err(format!("systemctl show {unit} failed"));
+        }
+        let value = |key: &str| {
+            output
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                .map(str::trim)
+        };
+        match value("Restart") {
+            Some("no") => continue,
+            Some(_) => {}
+            None => return Err(format!("{unit}: restart setting unknown")),
+        }
+        let delay = value("RestartUSec")
+            .and_then(timespan_ms)
+            .filter(|delay| *delay <= MAX_RESTART_WAIT_MS)
+            .ok_or_else(|| {
+                format!("{unit} restarts what it runs after an unknown or long delay; name it in the profile's detect.services")
+            })?;
+        wait = wait.max(delay + RESTART_MARGIN_MS);
+    }
+    Ok(wait)
+}
+
+/// Parses a systemd time span as `systemctl show` prints it: `100ms`,
+/// `5s`, `1min 30s`, `0`.
+fn timespan_ms(text: &str) -> Option<u64> {
+    let mut total_us: u64 = 0;
+    for part in text.split_whitespace() {
+        let digits = part
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(part.len());
+        let (number, unit) = part.split_at(digits);
+        let number: u64 = number.parse().ok()?;
+        let scale: u64 = match unit {
+            "" | "s" | "sec" => 1_000_000,
+            "us" | "usec" => 1,
+            "ms" | "msec" => 1_000,
+            "min" | "m" => 60_000_000,
+            "h" | "hr" => 3_600_000_000,
+            _ => return None,
+        };
+        total_us = total_us.checked_add(number.checked_mul(scale)?)?;
+    }
+    Some(total_us.div_ceil(1_000))
+}
+
+/// On systemd hosts, moves a restarted process into a transient scope of
+/// its own, so it does not live in the cgroup of whoever ran the rollback
+/// (an SSH session, the Agent's service) and end with it.
+fn own_scope(host: &dyn Host, pid: u32) -> Result<Option<String>, String> {
+    if !host.exists(Path::new("/run/systemd/system")) {
+        return Ok(None);
+    }
+    let scope = format!("anixops-mesh-restored-{pid}.scope");
+    let pid_text = pid.to_string();
+    let output = host
+        .run(
+            "busctl",
+            &[
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "StartTransientUnit",
+                "ssa(sv)a(sa(sv))",
+                &scope,
+                "fail",
+                "2",
+                "PIDs",
+                "au",
+                "1",
+                &pid_text,
+                "CollectMode",
+                "s",
+                "inactive-or-failed",
+                "0",
+            ],
+        )
+        .map_err(|error| format!("busctl: {error}"))?;
+    if output.success() {
+        Ok(Some(scope))
+    } else {
+        Err(format!("busctl exited with {:?}", output.code))
+    }
+}
+
+/// Undoes steps in reverse order; keeps going past failures. Returns the
+/// steps still to undo, in their original order: the ones that failed, and
+/// the backups while any of those remain (a later attempt may need them).
+fn undo(host: &dyn Host, steps: &[Step]) -> (Vec<StepReport>, Vec<Step>) {
     let backups: Vec<&Action> = steps
         .iter()
         .map(|step| &step.action)
         .filter(|action| matches!(action, Action::Backup { .. }))
         .collect();
     let mut results = Vec::new();
-    let mut ok = true;
-    for step in steps.iter().rev() {
+    let mut failed = vec![false; steps.len()];
+    for (index, step) in steps.iter().enumerate().rev() {
         match undo_one(host, &step.action, &backups) {
             Ok(detail) => results.push(StepReport {
                 step: step.action.describe(),
@@ -910,7 +1116,7 @@ fn undo(host: &dyn Host, steps: &[Step]) -> (Vec<StepReport>, bool) {
                 detail: Some(detail),
             }),
             Err(error) => {
-                ok = false;
+                failed[index] = true;
                 results.push(StepReport {
                     step: step.action.describe(),
                     ok: false,
@@ -919,7 +1125,16 @@ fn undo(host: &dyn Host, steps: &[Step]) -> (Vec<StepReport>, bool) {
             }
         }
     }
-    (results, ok)
+    let any_failed = failed.iter().any(|failed| *failed);
+    let remaining = steps
+        .iter()
+        .zip(&failed)
+        .filter(|(step, failed)| {
+            **failed || (any_failed && matches!(step.action, Action::Backup { .. }))
+        })
+        .map(|(step, _)| step.clone())
+        .collect();
+    (results, remaining)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -939,9 +1154,11 @@ pub fn rollback(host: &dyn Host, state: &Path) -> Result<RollbackReport, Takeove
             steps: Vec::new(),
         });
     };
-    let (steps, ok) = undo(host, &manifest.steps);
+    let (steps, remaining) = undo(host, &manifest.steps);
+    let ok = remaining.is_empty();
+    // A later rollback retries only what is left.
+    manifest.steps = remaining;
     if ok {
-        manifest.steps.clear();
         manifest.runs = 0;
     }
     save_manifest(host, state, &manifest).map_err(TakeoverError::Io)?;
@@ -1061,13 +1278,21 @@ mod tests {
                 ..
             }
         )));
-        // The lock is released.
-        assert!(!host.exists(&Path::new(STATE).join(LOCK)));
+        // The lock is released (its file stays).
+        assert!(host.locks.borrow().is_empty());
 
         host.ran.borrow_mut().clear();
         let rollback = rollback(&host, Path::new(STATE)).unwrap();
         assert!(rollback.ok, "{rollback:?}");
-        let ran = host.ran.borrow().clone();
+        let mut ran = host.ran.borrow().clone();
+        // The restarted process gets a scope of its own first.
+        let scope = ran.remove(0);
+        assert!(
+            scope.starts_with("busctl call org.freedesktop.systemd1")
+                && scope.contains("StartTransientUnit")
+                && scope.contains("PIDs au 1 "),
+            "{scope}"
+        );
         assert_eq!(
             ran,
             vec![
@@ -1089,6 +1314,8 @@ mod tests {
             spawned[0].env,
             vec![("DEMO_NET_SECRET".to_string(), "x".to_string())]
         );
+        // The whole environment it had, not ours.
+        assert!(spawned[0].clear_env);
         let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
         assert!(manifest.steps.is_empty());
     }
@@ -1135,11 +1362,217 @@ mod tests {
     #[test]
     fn a_second_run_is_refused_while_locked() {
         let host = machine();
-        host.file(&format!("{STATE}/{LOCK}"), "99");
+        host.held_by_others
+            .borrow_mut()
+            .insert(Path::new(STATE).join(LOCK));
         assert!(matches!(
             takeover(&host, &demo(), Path::new(STATE), false),
             Err(TakeoverError::Locked(_))
         ));
+        assert!(matches!(
+            rollback(&host, Path::new(STATE)),
+            Err(TakeoverError::Locked(_))
+        ));
+    }
+
+    #[test]
+    fn a_lock_file_left_behind_does_not_block() {
+        let host = machine();
+        host.signal(100, Signal::Kill).unwrap();
+        // Left by a run that was killed: the file stays, its lock went with
+        // the process.
+        host.file(&format!("{STATE}/{LOCK}"), "4242");
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        // Released after the run, and the next run takes it again.
+        assert!(host.locks.borrow().is_empty());
+        assert!(rollback(&host, Path::new(STATE)).unwrap().ok);
+        assert!(host.locks.borrow().is_empty());
+    }
+
+    #[test]
+    fn host_services_are_never_turned_off() {
+        let host = machine();
+        // On systemd hosts rc.local runs inside rc-local.service.
+        host.process(
+            200,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab"],
+            &["DEMO_NET_SECRET=x", "PATH=/usr/bin"],
+            "0::/system.slice/rc-local.service\n",
+        );
+        host.file(
+            "/proc/200/status",
+            "Name:\tdemo-meshd\nUid:\t1000\t1000\t1000\t1000\nGid:\t100\t100\t100\t100\nGroups:\t27 100 998 \n",
+        );
+        host.file(
+            "/lib/systemd/system/rc-local.service",
+            "[Service]\nType=forking\nExecStart=/etc/rc.local start\n",
+        );
+        host.answer(
+            "systemctl show rc-local.service -p LoadState -p FragmentPath -p DropInPaths -p UnitFileState -p ActiveState",
+            0,
+            "LoadState=loaded\nFragmentPath=/lib/systemd/system/rc-local.service\nDropInPaths=\nUnitFileState=static\nActiveState=active\n",
+        );
+        host.answer(
+            "systemctl show rc-local.service -p Restart -p RestartUSec",
+            0,
+            "Restart=no\nRestartUSec=100ms\n",
+        );
+        host.signal(100, Signal::Kill).unwrap();
+        host.signals.borrow_mut().clear();
+
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let ran = host.ran.borrow().clone();
+        assert!(
+            !ran.iter()
+                .any(|command| command.contains("rc-local")
+                    && !command.starts_with("systemctl show")),
+            "{ran:?}"
+        );
+        assert_eq!(*host.signals.borrow(), vec![(200, Signal::Terminate)]);
+
+        rollback(&host, Path::new(STATE)).unwrap();
+        // Restarted as it ran: same user, group and environment.
+        let spawned = host.spawned.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].uid, Some(1000));
+        assert_eq!(spawned[0].gid, Some(100));
+        assert_eq!(spawned[0].groups, Some(vec![27, 100, 998]));
+        assert!(spawned[0].clear_env);
+        assert!(spawned[0]
+            .env
+            .contains(&("PATH".to_string(), "/usr/bin".to_string())));
+    }
+
+    #[test]
+    fn parses_restart_delays() {
+        assert_eq!(timespan_ms("100ms"), Some(100));
+        assert_eq!(timespan_ms("5s"), Some(5_000));
+        assert_eq!(timespan_ms("1min 30s"), Some(90_000));
+        assert_eq!(timespan_ms("0"), Some(0));
+        assert_eq!(timespan_ms("1w"), None);
+    }
+
+    #[test]
+    fn a_host_unit_that_restarts_the_program_fails_the_takeover() {
+        let host = machine();
+        host.signal(100, Signal::Kill).unwrap();
+        // A wrapper unit the profile does not name runs the program.
+        host.process(
+            300,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab"],
+            &[],
+            "0::/system.slice/office-vpn.service\n",
+        );
+        host.answer(
+            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            0,
+            "Restart=always\nRestartUSec=5s\n",
+        );
+        // It comes back after the delay.
+        host.respawn_after_sleep.borrow_mut().push((
+            301,
+            "/opt/demo-meshd".into(),
+            "0::/system.slice/office-vpn.service\n".into(),
+        ));
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(host.slept.borrow().iter().any(|ms| *ms >= 7_000));
+        let verify = report
+            .steps
+            .iter()
+            .find(|step| step.step == "verify")
+            .unwrap();
+        assert!(verify
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("office-vpn.service"));
+    }
+
+    #[test]
+    fn a_host_unit_with_a_long_restart_delay_is_not_guessed() {
+        let host = machine();
+        host.signal(100, Signal::Kill).unwrap();
+        host.process(
+            300,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab"],
+            &[],
+            "0::/system.slice/office-vpn.service\n",
+        );
+        host.answer(
+            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            0,
+            "Restart=on-failure\nRestartUSec=5min\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+    }
+
+    #[test]
+    fn a_failed_rollback_retries_only_what_is_left() {
+        let host = machine();
+        host.signal(100, Signal::Kill).unwrap();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+
+        // The service cannot be started the first time.
+        host.answer("systemctl start demo-meshd.service", 1, "");
+        let first = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!first.ok);
+        assert_eq!(host.spawned.borrow().len(), 1);
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().all(|step| matches!(
+            step.action,
+            Action::SystemdStop { .. } | Action::Backup { .. }
+        )));
+
+        host.answer("systemctl start demo-meshd.service", 0, "");
+        host.ran.borrow_mut().clear();
+        let second = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(second.ok, "{second:?}");
+        // The manual process is not started twice and rc.local is fine.
+        assert_eq!(host.spawned.borrow().len(), 1);
+        assert_eq!(
+            *host.ran.borrow(),
+            vec!["systemctl start demo-meshd.service".to_string()]
+        );
+        assert_eq!(
+            host.text("/etc/rc.local").unwrap(),
+            "#!/bin/sh\n/opt/demo-meshd --net-name lab &\nexit 0\n"
+        );
+        assert!(load_manifest(&host, Path::new(STATE))
+            .unwrap()
+            .unwrap()
+            .steps
+            .is_empty());
+    }
+
+    #[test]
+    fn openrc_services_are_stopped_only_when_running() {
+        let host = FakeHost::default();
+        host.file(
+            "/etc/init.d/demo-meshd",
+            "#!/sbin/openrc-run\ncommand=\"/usr/bin/demo-meshd\"\ncommand_args=\"-c /etc/demo.toml\"\n",
+        );
+        host.answer("rc-update show -v", 0, "         demo-meshd | default\n");
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let ran = host.ran.borrow().clone();
+        assert!(ran.contains(&"rc-update del demo-meshd default".to_string()));
+        assert!(
+            !ran.iter().any(|command| command.contains("stop")),
+            "{ran:?}"
+        );
+
+        host.ran.borrow_mut().clear();
+        assert!(rollback(&host, Path::new(STATE)).unwrap().ok);
+        let ran = host.ran.borrow().clone();
+        assert_eq!(ran, vec!["rc-update add demo-meshd default".to_string()]);
     }
 
     #[test]

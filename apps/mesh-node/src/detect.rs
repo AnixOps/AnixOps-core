@@ -75,12 +75,29 @@ pub struct Process {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub cwd: Option<String>,
-    /// systemd unit from the cgroup.
+    /// The program's own systemd service, from the cgroup. A process in the
+    /// cgroup of any other unit (rc-local, cron, a user session, a process
+    /// supervisor) has `None` here and that unit in `host_unit`: such a unit
+    /// is never turned off or stopped.
     #[serde(default)]
     pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_unit: Option<String>,
     /// Inside a container.
     #[serde(default)]
     pub contained: bool,
+    /// Real user and group (from `/proc/PID/status`); a restart on rollback
+    /// runs as them.
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub gid: Option<u32>,
+    /// Supplementary groups (`Groups:` in `/proc/PID/status`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<u32>>,
+    /// The whole environment, for a restart on rollback. Holds secrets.
+    #[serde(skip_serializing, default)]
+    pub environ: Vec<(String, String)>,
 }
 
 /// One installation.
@@ -208,7 +225,7 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
         if !is_program(profile, &exe) {
             continue;
         }
-        let env = host
+        let environ = host
             .read(&entry.join("environ"))
             .map(|bytes| {
                 split_nul(&bytes)
@@ -220,6 +237,27 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let status = host
+            .read_to_string(&entry.join("status"))
+            .unwrap_or_default();
+        // "Uid:\treal\teffective\tsaved\tfs": the real id.
+        let id_of = |key: &str| {
+            status.lines().find_map(|line| {
+                line.strip_prefix(key)?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u32>()
+                    .ok()
+            })
+        };
+        let (uid, gid) = (id_of("Uid:"), id_of("Gid:"));
+        let groups = status.lines().find_map(|line| {
+            line.strip_prefix("Groups:").map(|list| {
+                list.split_whitespace()
+                    .filter_map(|group| group.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+        });
         let cwd = host
             .read_link(&entry.join("cwd"))
             .ok()
@@ -248,10 +286,15 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
             pid,
             exe,
             argv,
-            env: wanted_env(profile, env),
+            env: wanted_env(profile, environ.clone()),
             cwd,
             unit,
+            host_unit: None,
             contained,
+            uid,
+            gid,
+            groups,
+            environ,
         });
     }
     out
@@ -420,6 +463,26 @@ fn systemd_found(
             Err(error) => notes.push(format!("unit file {path} unreadable: {error}")),
         }
     }
+    // Only the program's own service is taken over: one the profile names,
+    // or one whose ExecStart runs the program. A unit that merely holds a
+    // process of it in its cgroup (rc-local, cron, a user session, a process
+    // supervisor) belongs to the host and is left alone.
+    let stem = unit.trim_end_matches(".service");
+    let stem = stem.split('@').next().unwrap_or(stem);
+    let named = profile
+        .detect
+        .services
+        .iter()
+        .any(|service| service == stem);
+    let runs_program = service
+        .exec_start
+        .as_deref()
+        .and_then(|line| split_words(line.trim_start_matches(['-', '@', ':', '+', '!'])).ok())
+        .and_then(|words| words.first().cloned())
+        .is_some_and(|program| is_program(profile, &program));
+    if !(named || runs_program) {
+        return None;
+    }
     let unit_env = read_unit_environment(host, &service, &mut notes);
     let own: Vec<Process> = processes
         .iter()
@@ -463,7 +526,8 @@ fn systemd_found(
             }
             Some(Err(error)) => {
                 notes.push(format!(
-                    "the service command line cannot be read exactly: {error:?}"
+                    "the service command line cannot be read exactly: {}",
+                    error.describe()
                 ));
                 (None, None)
             }
@@ -764,21 +828,38 @@ fn containers(host: &dyn Host, profile: &Profile, processes: &[Process]) -> Vec<
     out
 }
 
+/// Keeps `unit` only for the program's own services; any other unit a
+/// process runs under moves to `host_unit`.
+pub fn classify_units(processes: &mut [Process], owned_units: &BTreeSet<String>) {
+    for process in processes {
+        if process
+            .unit
+            .as_ref()
+            .is_some_and(|unit| !owned_units.contains(unit))
+        {
+            process.host_unit = process.unit.take();
+        }
+    }
+}
+
 /// Every installation on this machine.
 pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
-    let processes = scan_processes(host, profile);
+    let mut processes = scan_processes(host, profile);
     let mut found: Vec<Found> = Vec::new();
 
     let mut systemd_stems: BTreeSet<String> = BTreeSet::new();
+    let mut owned_units: BTreeSet<String> = BTreeSet::new();
     if host.exists(Path::new("/run/systemd/system")) {
         for unit in candidate_units(host, profile, &processes) {
             if let Some(entry) = systemd_found(host, profile, &unit, &processes) {
                 let stem = unit.trim_end_matches(".service");
                 systemd_stems.insert(stem.split('@').next().unwrap_or(stem).to_string());
+                owned_units.insert(unit);
                 found.push(entry);
             }
         }
     }
+    classify_units(&mut processes, &owned_units);
     found.extend(init_scripts(host, profile, &systemd_stems, &processes));
     found.extend(autostart_lines(host, profile, &processes));
     found.extend(containers(host, profile, &processes));
@@ -792,8 +873,10 @@ pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
             continue;
         }
         let mut notes = Vec::new();
-        if let Some(unit) = &process.unit {
-            notes.push(format!("runs in the cgroup of {unit}"));
+        if let Some(unit) = &process.host_unit {
+            notes.push(format!(
+                "runs in the cgroup of {unit}, which is not taken over; if that unit starts the program again, turn it off by hand"
+            ));
         }
         found.push(Found {
             origin: Origin::Process { pid: process.pid },
@@ -960,6 +1043,60 @@ mod tests {
         assert!(summary.contains("--net-name"));
         assert!(!summary.contains("manual"), "{summary}");
         assert!(!summary.contains("10.0.0.3"));
+    }
+
+    #[test]
+    fn host_units_are_not_the_programs_services() {
+        let host = machine();
+        // On systemd hosts a program started from cron runs inside the cron
+        // service's cgroup; that service is the host's, not ours.
+        host.process(
+            200,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab2"],
+            &[],
+            "0::/system.slice/cron.service\n",
+        );
+        host.file(
+            "/lib/systemd/system/cron.service",
+            "[Service]\nExecStart=/usr/sbin/cron -f\n",
+        );
+        host.answer(
+            "systemctl show cron.service -p LoadState -p FragmentPath -p DropInPaths -p UnitFileState -p ActiveState",
+            0,
+            "LoadState=loaded\nFragmentPath=/lib/systemd/system/cron.service\nDropInPaths=\nUnitFileState=enabled\nActiveState=active\n",
+        );
+        let found = detect(&host, &demo());
+        let ids: Vec<String> = found.iter().map(|entry| entry.origin.id()).collect();
+        assert!(!ids.iter().any(|id| id.contains("cron.service")), "{ids:?}");
+        let cron = found
+            .iter()
+            .find(|entry| entry.origin.id() == "autostart:/etc/crontab:2")
+            .unwrap();
+        assert_eq!(cron.processes[0].pid, 200);
+        assert_eq!(cron.processes[0].unit, None);
+        assert_eq!(cron.processes[0].host_unit.as_deref(), Some("cron.service"));
+    }
+
+    #[test]
+    fn unreadable_arguments_are_not_printed() {
+        let host = FakeHost::default();
+        host.file("/run/systemd/system/.keep", "");
+        host.file(
+            "/etc/systemd/system/demo-meshd.service",
+            "[Service]\nExecStart=/usr/bin/demo-meshd --net-secret=pa$$w0rd\n",
+        );
+        host.answer(
+            "systemctl show demo-meshd.service -p LoadState -p FragmentPath -p DropInPaths -p UnitFileState -p ActiveState",
+            0,
+            "LoadState=loaded\nFragmentPath=/etc/systemd/system/demo-meshd.service\nDropInPaths=\nUnitFileState=enabled\nActiveState=inactive\n",
+        );
+        let found = detect(&host, &demo());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].invocation.is_none());
+        let summary = serde_json::to_string(&found[0].summary()).unwrap();
+        assert!(!summary.contains("w0rd"), "{summary}");
+        assert!(summary.contains("argument 1"), "{summary}");
     }
 
     #[test]

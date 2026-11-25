@@ -25,13 +25,35 @@ impl CommandOutput {
 pub struct Spawn {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// `env` is the whole environment: start from an empty one.
+    pub clear_env: bool,
     pub cwd: Option<String>,
+    /// Run as this user and group (Unix; needs root to change).
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Supplementary groups; `None` keeps none when the user changes.
+    pub groups: Option<Vec<u32>>,
+}
+
+/// The largest text file the program reads: configuration files, unit
+/// files, scripts and its own profile and manifest are all far smaller.
+pub const MAX_TEXT_FILE: u64 = 1024 * 1024;
+
+fn too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("file is larger than {} bytes", MAX_TEXT_FILE),
+    )
 }
 
 pub trait Host {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// Reads a text file of at most [`MAX_TEXT_FILE`] bytes.
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         let bytes = self.read(path)?;
+        if bytes.len() as u64 > MAX_TEXT_FILE {
+            return Err(too_large());
+        }
         String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
     /// Entries of a directory, full paths, sorted.
@@ -50,8 +72,13 @@ pub trait Host {
     ) -> io::Result<()>;
     /// Unix mode bits, owner and group of a file.
     fn stat(&self, path: &Path) -> io::Result<FileStat>;
-    /// Creates a file that must not exist yet; `Ok(false)` when it does.
-    fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<bool>;
+    /// Takes an exclusive lock on the file, creating it, and writes
+    /// `holder` into it for people to read. The kernel releases the lock when
+    /// the holder exits, however it exits, so a lock is never stale and the
+    /// file is never removed. `Ok(false)` while another process holds it.
+    fn try_lock(&self, path: &Path, holder: &str) -> io::Result<bool>;
+    /// Releases a lock this process took with [`Host::try_lock`].
+    fn unlock(&self, path: &Path);
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Seconds since the Unix epoch.
     fn now_unix(&self) -> u64;
@@ -82,7 +109,11 @@ pub enum Signal {
 }
 
 /// The real machine.
-pub struct RealHost;
+#[derive(Default)]
+pub struct RealHost {
+    /// Lock files this process holds; closing one releases its lock.
+    locks: std::cell::RefCell<std::collections::BTreeMap<PathBuf, std::fs::File>>,
+}
 
 fn write_then_rename(
     options: &std::fs::OpenOptions,
@@ -110,6 +141,19 @@ fn write_then_rename(
 impl Host for RealHost {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        use std::io::Read;
+        // Never more than the limit in memory, whatever the file's size.
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(MAX_TEXT_FILE + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_TEXT_FILE {
+            return Err(too_large());
+        }
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn list_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -185,23 +229,31 @@ impl Host for RealHost {
         })
     }
 
-    fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<bool> {
+    fn try_lock(&self, path: &Path, holder: &str) -> io::Result<bool> {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
+        // Never truncate on open: the holder's text stays until we hold it.
+        options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        match options.open(path) {
-            Ok(mut file) => {
-                file.write_all(contents)?;
-                Ok(true)
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(error),
+        let mut file = options.open(path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
+        file.set_len(0)?;
+        file.write_all(holder.as_bytes())?;
+        self.locks.borrow_mut().insert(path.to_path_buf(), file);
+        Ok(true)
+    }
+
+    fn unlock(&self, path: &Path) {
+        // Dropping the file closes it, which releases the lock.
+        self.locks.borrow_mut().remove(path);
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -297,6 +349,9 @@ impl Host for RealHost {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        if spawn.clear_env {
+            command.env_clear();
+        }
         for (name, value) in &spawn.env {
             command.env(name, value);
         }
@@ -306,11 +361,35 @@ impl Host for RealHost {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: setsid is async-signal-safe and touches no memory.
+            // Identity is changed here rather than with Command::uid/gid,
+            // which drop every supplementary group when root changes user.
+            let groups: Vec<libc::gid_t> = spawn.groups.clone().unwrap_or_default();
+            let (uid, gid) = (spawn.uid, spawn.gid);
+            let change_groups = uid.is_some() || spawn.groups.is_some();
+            // SAFETY: only async-signal-safe calls (setsid, setgroups,
+            // setgid, setuid) on memory prepared before the fork.
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
                     if libc::setsid() == -1 {
                         return Err(io::Error::last_os_error());
+                    }
+                    // Groups, then the group, then the user: once the user
+                    // changes, neither can.
+                    if change_groups
+                        && libc::geteuid() == 0
+                        && libc::setgroups(groups.len() as _, groups.as_ptr()) == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if let Some(gid) = gid {
+                        if libc::setgid(gid) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    if let Some(uid) = uid {
+                        if libc::setuid(uid) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
                     }
                     Ok(())
                 });
@@ -354,6 +433,15 @@ pub(crate) mod fake {
         pub signals: RefCell<Vec<(u32, Signal)>>,
         pub spawned: RefCell<Vec<Spawn>>,
         pub stats: RefCell<BTreeMap<PathBuf, FileStat>>,
+        /// Locks this process holds.
+        pub locks: RefCell<BTreeSet<PathBuf>>,
+        /// Locks another live process holds.
+        pub held_by_others: RefCell<BTreeSet<PathBuf>>,
+        /// Every wait, in milliseconds.
+        pub slept: RefCell<Vec<u64>>,
+        /// Processes (pid, exe, cgroup) that appear at the next wait of a
+        /// second or more.
+        pub respawn_after_sleep: RefCell<Vec<(u32, String, String)>>,
     }
 
     impl FakeHost {
@@ -498,15 +586,17 @@ pub(crate) mod fake {
             }))
         }
 
-        fn create_new(&self, path: &Path, contents: &[u8]) -> io::Result<bool> {
-            if self.files.borrow().contains_key(path) {
+        fn try_lock(&self, path: &Path, holder: &str) -> io::Result<bool> {
+            if self.held_by_others.borrow().contains(path) || self.locks.borrow().contains(path) {
                 return Ok(false);
             }
-            self.file(
-                &path.display().to_string(),
-                &String::from_utf8_lossy(contents),
-            );
+            self.file(&path.display().to_string(), holder);
+            self.locks.borrow_mut().insert(path.to_path_buf());
             Ok(true)
+        }
+
+        fn unlock(&self, path: &Path) {
+            self.locks.borrow_mut().remove(path);
         }
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -566,7 +656,18 @@ pub(crate) mod fake {
             Ok(4242)
         }
 
-        fn sleep_ms(&self, _ms: u64) {}
+        fn sleep_ms(&self, ms: u64) {
+            self.slept.borrow_mut().push(ms);
+            // Processes a supervisor starts again while we wait out its
+            // restart delay (not during the short polls for an exit).
+            if ms < 1_000 {
+                return;
+            }
+            let respawn: Vec<_> = self.respawn_after_sleep.borrow_mut().drain(..).collect();
+            for (pid, exe, cgroup) in respawn {
+                self.process(pid, &exe, &[exe.as_str()], &[], &cgroup);
+            }
+        }
 
         fn own_pid(&self) -> u32 {
             1

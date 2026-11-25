@@ -749,6 +749,103 @@ jobs:
           echo "provenance_file=github-artifact-attestation" >> "${GITHUB_OUTPUT}"
           echo "linux-package-artifact-attestation-execution-status=attested"
 
+  package-mesh-node:
+    name: Package mesh node (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs:
+      - release-policy
+      - release-ci-gate
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Static anixops-mesh for the one-command installer, the Agent and the
+      # OpenWrt package (docs/deploy/mesh-node.md). Same script as CI.
+      - name: Build static anixops-mesh
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-policy.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_SHA: ${{ github.sha }}
+          RUST_TOOLCHAIN: ${{ env.LINUX_RUST_TOOLCHAIN }}
+          RUST_PROFILE: ${{ env.LINUX_RUST_PROFILE }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile "${RUST_PROFILE}"
+          rustup default "${RUST_TOOLCHAIN}"
+          .github/scripts/build-mesh-node.sh "${TARGET}" "${VERSION}" dist/mesh-node
+          if [ "${TARGET}" = x86_64-unknown-linux-musl ]; then
+            installer="anixops-mesh-${VERSION}-install-linux.sh"
+            install -m 0755 apps/mesh-node/install/install-linux.sh "dist/mesh-node/${installer}"
+            (cd dist/mesh-node && sha256sum "${installer}" > "${installer}.sha256")
+          fi
+
+      - name: Upload mesh node build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mesh-node-${{ matrix.target }}
+          path: dist/mesh-node/
+          retention-days: 14
+          if-no-files-found: error
+
+  attest-mesh-node:
+    name: Attest mesh node
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - release-policy
+      - package-mesh-node
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      attestation_status: ${{ steps.attestation-output.outputs.attestation_status }}
+    steps:
+      - name: Download mesh node builds
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: mesh-node-*
+          merge-multiple: true
+          path: dist/mesh-node
+
+      - name: Validate attestation subjects
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-policy.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist/mesh-node
+          for name in \
+            "anixops-mesh-${VERSION}-x86_64-unknown-linux-musl" \
+            "anixops-mesh-${VERSION}-aarch64-unknown-linux-musl" \
+            "anixops-mesh-${VERSION}-install-linux.sh"; do
+            test -s "${name}"
+            test -s "${name}.sha256"
+            sha256sum -c "${name}.sha256"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "6"
+
+      - name: Generate mesh node attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/mesh-node/*
+
+      - name: Emit attestation status
+        id: attestation-output
+        shell: bash
+        run: echo "attestation_status=attested" >> "${GITHUB_OUTPUT}"
+
   post-release-summary:
     name: Linux release notes and rollback gate
     runs-on: ubuntu-latest
@@ -809,6 +906,7 @@ jobs:
       - linux-artifact-readiness
       - package-linux
       - attest-linux
+      - attest-mesh-node
       - post-release-summary
       - capture-gates
     outputs:
@@ -826,11 +924,13 @@ jobs:
           MANIFEST_NAME: ${{ needs.package-linux.outputs.artifact_manifest_name }}
           MANIFEST_CHECKSUM_VALUE: ${{ needs.package-linux.outputs.artifact_manifest_checksum_value }}
           ATTESTATION_STATUS: ${{ needs.attest-linux.outputs.attestation_status }}
+          MESH_NODE_ATTESTATION_STATUS: ${{ needs.attest-mesh-node.outputs.attestation_status }}
           RELEASE_NOTES_STATUS: ${{ needs.post-release-summary.outputs.release_notes_status }}
           ROLLBACK_STATUS: ${{ needs.post-release-summary.outputs.rollback_status }}
         run: |
           set -euo pipefail
           test "${CI_CONCLUSION}" = "success"
+          test "${MESH_NODE_ATTESTATION_STATUS}" = "attested"
           test "${LICENSE_STATUS}" = "confirmed"
           test -n "${ARTIFACT_NAME}"
           test -n "${CHECKSUM_VALUE}"
@@ -851,6 +951,7 @@ jobs:
       - release-ci-gate
       - package-linux
       - attest-linux
+      - attest-mesh-node
       - post-release-summary
       - publish-eligibility-gate
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
@@ -867,6 +968,13 @@ jobs:
         with:
           name: ${{ needs.package-linux.outputs.bundle_name }}
           path: dist/linux-release
+
+      - name: Download mesh node builds
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: mesh-node-*
+          merge-multiple: true
+          path: dist/mesh-node
 
       - name: Create GitHub Release with Linux CLI assets
         id: publish
@@ -903,6 +1011,14 @@ jobs:
             sha256sum -c "${ARTIFACT_NAME}.sha256"
             sha256sum -c "${MANIFEST_NAME}.sha256"
           )
+          mesh_assets=()
+          for name in \
+            "anixops-mesh-${VERSION}-x86_64-unknown-linux-musl" \
+            "anixops-mesh-${VERSION}-aarch64-unknown-linux-musl" \
+            "anixops-mesh-${VERSION}-install-linux.sh"; do
+            (cd dist/mesh-node && sha256sum -c "${name}.sha256")
+            mesh_assets+=("dist/mesh-node/${name}" "dist/mesh-node/${name}.sha256")
+          done
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             echo "::error::Release ${VERSION} already exists. Asset overwrite is forbidden."
             exit 1
@@ -922,6 +1038,13 @@ jobs:
           - Attestation: ${ATTESTATION_STATUS} via GitHub artifact attestation
           - Install model: manual-extract
           - System mutation policy: extraction performs no system mutation; named systemd service, explicit environment-proxy snapshot, and Ubuntu trust-file changes require separate confirmed CLI commands with snapshot/readback/rollback boundaries
+
+          ## Mesh node
+
+          - anixops-mesh-${VERSION}-x86_64-unknown-linux-musl and -aarch64-unknown-linux-musl: static programs for intranet mesh nodes, each with a .sha256 file
+          - anixops-mesh-${VERSION}-install-linux.sh: one-command installer; the panel generates the command with the download URLs and SHA-256 values
+          - Attestation: GitHub artifact attestation
+          - See docs/deploy/mesh-node.md
 
           ## Clients
 
@@ -952,6 +1075,7 @@ jobs:
             "${archive_checksum_path}" \
             "${manifest_path}" \
             "${manifest_checksum_path}" \
+            "${mesh_assets[@]}" \
             --title "${VERSION}" \
             --notes-file "${body_path}" \
             --verify-tag \
@@ -975,6 +1099,8 @@ jobs:
       - linux-artifact-readiness
       - package-linux
       - attest-linux
+      - package-mesh-node
+      - attest-mesh-node
       - post-release-summary
       - publish-eligibility-gate
       - publish-github-release
@@ -988,6 +1114,8 @@ jobs:
           LINUX_READINESS_RESULT: ${{ needs.linux-artifact-readiness.result }}
           PACKAGE_LINUX_RESULT: ${{ needs.package-linux.result }}
           ATTEST_LINUX_RESULT: ${{ needs.attest-linux.result }}
+          PACKAGE_MESH_NODE_RESULT: ${{ needs.package-mesh-node.result }}
+          ATTEST_MESH_NODE_RESULT: ${{ needs.attest-mesh-node.result }}
           RELEASE_NOTES_RESULT: ${{ needs.post-release-summary.result }}
           ELIGIBILITY_RESULT: ${{ needs.publish-eligibility-gate.result }}
           PUBLISH_RESULT: ${{ needs.publish-github-release.result }}
@@ -1011,6 +1139,8 @@ jobs:
             echo "| Linux readiness | ${LINUX_READINESS_RESULT} |"
             echo "| Package Linux | ${PACKAGE_LINUX_RESULT} |"
             echo "| Attest Linux | ${ATTEST_LINUX_RESULT} |"
+            echo "| Package mesh node | ${PACKAGE_MESH_NODE_RESULT} |"
+            echo "| Attest mesh node | ${ATTEST_MESH_NODE_RESULT} |"
             echo "| Release notes/rollback | ${RELEASE_NOTES_RESULT} |"
             echo "| Publish eligibility | ${ELIGIBILITY_RESULT} |"
             echo "| Publish GitHub Release | ${PUBLISH_RESULT} |"
