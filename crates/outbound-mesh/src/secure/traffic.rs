@@ -520,7 +520,7 @@ mod tests {
     fn epoch_limits() {
         let now = Instant::now();
         let mut receiver = Receiver::new(Cipher::Aes128Gcm, root(), 9, 3, 5).unwrap();
-        let mut seal = |epoch: u32| {
+        let seal = |epoch: u32| {
             let mut sender = Sender::new(Cipher::Aes128Gcm, root(), 3, 9, epoch, now).unwrap();
             let mut packet = b"p".to_vec();
             sender.seal(&mut packet, now).unwrap();
