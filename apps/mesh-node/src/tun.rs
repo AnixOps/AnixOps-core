@@ -86,6 +86,25 @@ struct In6IfReq {
     index: libc::c_int,
 }
 
+/// The kernel's `struct in6_rtmsg` (linux/ipv6_route.h), for SIOCADDRT and
+/// SIOCDELRT on an IPv6 socket. The libc crate keeps its fields private.
+#[repr(C)]
+#[derive(Default)]
+// Only the kernel reads the fields.
+#[allow(dead_code)]
+struct In6Rtmsg {
+    dst: [u8; 16],
+    src: [u8; 16],
+    gateway: [u8; 16],
+    kind: u32,
+    dst_len: u16,
+    src_len: u16,
+    metric: u32,
+    info: libc::c_ulong,
+    flags: u32,
+    ifindex: libc::c_int,
+}
+
 fn ioctl<T>(fd: &OwnedFd, request: libc::c_ulong, argument: &mut T) -> io::Result<()> {
     // SAFETY: every request used here reads or writes one `T` that is
     // laid out as the kernel expects (`IfReq` is at least as large as
@@ -226,13 +245,14 @@ impl Tun {
                 ioctl(&socket(libc::AF_INET)?, request, &mut entry)
             }
             IpAddr::V6(network) => {
-                // SAFETY: an all-zero `in6_rtmsg` is valid.
-                let mut message: libc::in6_rtmsg = unsafe { std::mem::zeroed() };
-                message.rtmsg_dst.s6_addr = network.octets();
-                message.rtmsg_dst_len = u16::from(prefix);
-                message.rtmsg_metric = 1;
-                message.rtmsg_flags = libc::RTF_UP as u32;
-                message.rtmsg_ifindex = self.index;
+                let mut message = In6Rtmsg {
+                    dst: network.octets(),
+                    dst_len: u16::from(prefix),
+                    metric: 1,
+                    flags: libc::RTF_UP as u32,
+                    ifindex: self.index,
+                    ..In6Rtmsg::default()
+                };
                 ioctl(&socket(libc::AF_INET6)?, request, &mut message)
             }
         }
@@ -378,6 +398,14 @@ mod tests {
     #[test]
     fn the_request_holds_a_whole_kernel_request() {
         assert!(std::mem::size_of::<IfReq>() >= std::mem::size_of::<libc::ifreq>());
+        assert_eq!(
+            std::mem::size_of::<In6Rtmsg>(),
+            std::mem::size_of::<libc::in6_rtmsg>()
+        );
+        assert_eq!(
+            std::mem::align_of::<In6Rtmsg>(),
+            std::mem::align_of::<libc::in6_rtmsg>()
+        );
     }
 
     #[test]
