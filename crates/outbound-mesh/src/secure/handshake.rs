@@ -8,7 +8,11 @@
 //! or have a static key this node trusts. The weakest level of the
 //! specification, encrypted but unauthenticated, is never accepted. A
 //! relay peer's static key must be the one its route information
-//! announces; the IK pattern proves possession of it.
+//! announces; the IK pattern proves possession of it. A direct peer's
+//! static key is checked the same way when the caller knows it.
+//!
+//! A peer that uses this node's own ID is refused (spec §5.3): both
+//! directions would derive the same key and nonces.
 
 use std::time::Instant;
 
@@ -66,6 +70,11 @@ pub enum HandshakeError {
     Unauthenticated,
     /// The system random source failed.
     Random,
+    /// The peer uses this node's ID (spec §5.3).
+    SameNodeId,
+    /// The peer's static key is not the one its route information
+    /// announces.
+    UnexpectedStaticKey,
 }
 
 impl From<NoiseError> for HandshakeError {
@@ -94,6 +103,29 @@ pub struct Established {
     pub auth: Auth,
     pub action: Action,
     pub generation: u32,
+    /// A repeated relay msg1 answered as before: nothing was installed and
+    /// no connection was counted.
+    pub repeated: bool,
+}
+
+fn other_node(local: &Local, peer_id: u32) -> Result<(), HandshakeError> {
+    if peer_id == local.id {
+        Err(HandshakeError::SameNodeId)
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks `peer_static` against the key the peer's route information
+/// announces, when the caller knows it.
+fn expected_key(
+    expected_static: Option<[u8; LEN]>,
+    peer_static: &[u8; LEN],
+) -> Result<(), HandshakeError> {
+    match expected_static {
+        Some(expected) if expected != *peer_static => Err(HandshakeError::UnexpectedStaticKey),
+        _ => Ok(()),
+    }
 }
 
 fn random_uuid(rng: &dyn SecureRandom) -> Result<Uuid, HandshakeError> {
@@ -157,6 +189,9 @@ impl Client {
         sessions: &Sessions,
         rng: &dyn SecureRandom,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
+        if let Some(peer) = known_peer {
+            other_node(local, peer)?;
+        }
         let mut noise = HandshakeState::new(
             Pattern::Xx,
             true,
@@ -187,14 +222,18 @@ impl Client {
     }
 
     /// Reads msg2 from `peer_id` (its packet header) and returns msg3.
+    /// `expected_static` is the key `peer_id`'s route information announces,
+    /// if known.
     pub fn finish(
         mut self,
         local: &Local,
         peer_id: u32,
+        expected_static: Option<[u8; LEN]>,
         msg2: &[u8],
         sessions: &mut Sessions,
         now: Instant,
     ) -> Result<(Vec<u8>, Established), HandshakeError> {
+        other_node(local, peer_id)?;
         let msg2 = Msg2::decode(&self.noise.read_message(msg2)?)?;
         if msg2.peer_conn_id_echo != self.conn_id {
             return Err(HandshakeError::ConnIdMismatch);
@@ -206,6 +245,7 @@ impl Client {
             .noise
             .remote_static()
             .ok_or(HandshakeError::Noise(NoiseError::OutOfTurn))?;
+        expected_key(expected_static, &peer_static)?;
         let auth = authenticate(
             local,
             msg2.secret_proof.as_ref(),
@@ -236,7 +276,7 @@ impl Client {
         }
         .encode();
         let message = self.noise.write_message(&payload)?;
-        sessions.install(key.clone(), &agreement, local.id, ciphers, now)?;
+        sessions.install(key.clone(), &agreement, local.id, ciphers, peer_static, now)?;
         Ok((
             message,
             Established {
@@ -245,6 +285,7 @@ impl Client {
                 auth,
                 action: agreement.action,
                 generation: agreement.generation,
+                repeated: false,
             },
         ))
     }
@@ -271,6 +312,7 @@ impl Server {
         sessions: &Sessions,
         rng: &dyn SecureRandom,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
+        other_node(local, peer_id)?;
         let mut noise = HandshakeState::new(
             Pattern::Xx,
             false,
@@ -343,9 +385,12 @@ impl Server {
     }
 
     /// Reads msg3, authenticates the client and installs the session.
+    /// `expected_static` is the key the client's route information
+    /// announces, if known.
     pub fn finish(
         mut self,
         local: &Local,
+        expected_static: Option<[u8; LEN]>,
         msg3: &[u8],
         sessions: &mut Sessions,
         now: Instant,
@@ -362,19 +407,21 @@ impl Server {
             .noise
             .remote_static()
             .ok_or(HandshakeError::Noise(NoiseError::OutOfTurn))?;
+        expected_key(expected_static, &peer_static)?;
         let auth = authenticate(
             local,
             msg3.secret_proof.as_ref(),
             &self.after_msg2,
             &peer_static,
         )?;
-        sessions.install(key.clone(), &agreement, local.id, ciphers, now)?;
+        sessions.install(key.clone(), &agreement, local.id, ciphers, peer_static, now)?;
         Ok(Established {
             key,
             peer_static,
             auth,
             action: agreement.action,
             generation: agreement.generation,
+            repeated: false,
         })
     }
 }
@@ -403,6 +450,7 @@ impl RelayInitiator {
         sessions: &Sessions,
         rng: &dyn SecureRandom,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
+        other_node(local, peer_id)?;
         let mut noise = HandshakeState::new(
             Pattern::Ik,
             true,
@@ -458,20 +506,29 @@ impl RelayInitiator {
             msg2.initial_epoch,
             ciphers,
         )?;
-        sessions.install(key.clone(), &agreement, local.id, ciphers, now)?;
+        sessions.install(
+            key.clone(),
+            &agreement,
+            local.id,
+            ciphers,
+            self.peer_static,
+            now,
+        )?;
         Ok(Established {
             key,
             peer_static: self.peer_static,
             auth: Auth::PeerVerified,
             action: agreement.action,
             generation: agreement.generation,
+            repeated: false,
         })
     }
 }
 
 /// Answers relay msg1 from `peer_id` (its packet header), whose route
 /// information announces `expected_static`. Installs the session and
-/// returns relay msg2.
+/// returns relay msg2. A msg1 answered before (relayed again, or replayed
+/// by a node on the path) gets the same answer and changes nothing.
 pub fn relay_respond(
     local: &Local,
     peer_id: u32,
@@ -481,6 +538,7 @@ pub fn relay_respond(
     rng: &dyn SecureRandom,
     now: Instant,
 ) -> Result<(Vec<u8>, Established), HandshakeError> {
+    other_node(local, peer_id)?;
     let mut noise = HandshakeState::new(
         Pattern::Ik,
         false,
@@ -500,7 +558,12 @@ pub fn relay_respond(
         local: local.cipher,
         peer: msg1.cipher,
     };
-    let agreement = sessions.server_choice(&key, msg1.session_generation, ciphers, rng)?;
+    let repeated = sessions.answered(&key, msg1.conn_id);
+    let is_repeat = repeated.is_some();
+    let agreement = match repeated {
+        Some(agreement) => agreement,
+        None => sessions.server_choice(&key, msg1.session_generation, ciphers, rng)?,
+    };
     let reply = RelayMsg2 {
         action: agreement.action,
         session_generation: agreement.generation,
@@ -514,7 +577,10 @@ pub fn relay_respond(
         cipher: local.cipher,
     };
     let message = noise.write_message(&reply.encode()?)?;
-    sessions.install(key.clone(), &agreement, local.id, ciphers, now)?;
+    if !is_repeat {
+        sessions.install(key.clone(), &agreement, local.id, ciphers, peer_static, now)?;
+        sessions.remember_answer(&key, msg1.conn_id, &agreement);
+    }
     Ok((
         message,
         Established {
@@ -523,6 +589,7 @@ pub fn relay_respond(
             auth: Auth::PeerVerified,
             action: agreement.action,
             generation: agreement.generation,
+            repeated: is_repeat,
         },
     ))
 }
@@ -572,11 +639,18 @@ mod tests {
             let (msg3, at_client) = client.finish(
                 &self.client,
                 self.server.id,
+                Some(self.server.static_key.public()),
                 &msg2,
                 &mut self.at_client,
                 now,
             )?;
-            let at_server = server.finish(&self.server, &msg3, &mut self.at_server, now)?;
+            let at_server = server.finish(
+                &self.server,
+                Some(self.client.static_key.public()),
+                &msg3,
+                &mut self.at_server,
+                now,
+            )?;
             Ok((at_client, at_server))
         }
 
@@ -672,7 +746,7 @@ mod tests {
         let mut sessions = Sessions::new();
         assert_eq!(
             client_side
-                .finish(&client, 2, &msg2, &mut sessions, Instant::now())
+                .finish(&client, 2, None, &msg2, &mut sessions, Instant::now())
                 .err(),
             Some(HandshakeError::ForeignNetwork)
         );
@@ -690,10 +764,184 @@ mod tests {
         msg2[last] ^= 1;
         assert_eq!(
             client_side
-                .finish(&client, 2, &msg2, &mut Sessions::new(), Instant::now())
+                .finish(
+                    &client,
+                    2,
+                    None,
+                    &msg2,
+                    &mut Sessions::new(),
+                    Instant::now()
+                )
                 .err(),
             Some(HandshakeError::Noise(NoiseError::Decrypt))
         );
+    }
+
+    #[test]
+    fn the_own_node_id_is_refused() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let a = local(4, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let b = local(4, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let sessions = Sessions::new();
+        assert_eq!(
+            Client::start(&a, Some(4), &sessions, &rng).err(),
+            Some(HandshakeError::SameNodeId)
+        );
+        let (client, msg1) = Client::start(&a, None, &sessions, &rng).unwrap();
+        assert_eq!(
+            Server::respond(&b, 4, &msg1, &sessions, &rng).err(),
+            Some(HandshakeError::SameNodeId)
+        );
+        let other = local(5, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let (_, msg2) = Server::respond(&other, 4, &msg1, &sessions, &rng).unwrap();
+        let mut at_a = Sessions::new();
+        assert_eq!(
+            client.finish(&a, 4, None, &msg2, &mut at_a, now).err(),
+            Some(HandshakeError::SameNodeId)
+        );
+        assert_eq!(
+            RelayInitiator::start(&a, 4, b.static_key.public(), &sessions, &rng).err(),
+            Some(HandshakeError::SameNodeId)
+        );
+        let (_, relay_msg1) =
+            RelayInitiator::start(&a, 9, b.static_key.public(), &sessions, &rng).unwrap();
+        assert_eq!(
+            relay_respond(
+                &b,
+                4,
+                Some(a.static_key.public()),
+                &relay_msg1,
+                &mut at_a,
+                &rng,
+                now
+            )
+            .err(),
+            Some(HandshakeError::SameNodeId)
+        );
+        assert!(at_a.is_empty());
+    }
+
+    #[test]
+    fn a_direct_peer_must_hold_its_announced_key() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let client = local(1, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let server = local(2, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let announced = KeyPair::generate(&rng).unwrap().public();
+        let (at_client, mut at_server) = (Sessions::new(), Sessions::new());
+
+        let (client_side, msg1) = Client::start(&client, Some(2), &at_client, &rng).unwrap();
+        let (_, msg2) = Server::respond(&server, 1, &msg1, &at_server, &rng).unwrap();
+        assert_eq!(
+            client_side
+                .finish(
+                    &client,
+                    2,
+                    Some(announced),
+                    &msg2,
+                    &mut Sessions::new(),
+                    now
+                )
+                .err(),
+            Some(HandshakeError::UnexpectedStaticKey)
+        );
+
+        let (client_side, msg1) = Client::start(&client, Some(2), &at_client, &rng).unwrap();
+        let (server_side, msg2) = Server::respond(&server, 1, &msg1, &at_server, &rng).unwrap();
+        let (msg3, _) = client_side
+            .finish(&client, 2, None, &msg2, &mut Sessions::new(), now)
+            .unwrap();
+        assert_eq!(
+            server_side
+                .finish(&server, Some(announced), &msg3, &mut at_server, now)
+                .err(),
+            Some(HandshakeError::UnexpectedStaticKey)
+        );
+        assert!(at_server.is_empty());
+    }
+
+    #[test]
+    fn another_key_cannot_take_over_a_session_in_use() {
+        let mut pair = Pair::new(
+            local(1, Some(b"s3cr3t"), Cipher::Aes128Gcm),
+            local(2, Some(b"s3cr3t"), Cipher::Aes128Gcm),
+        );
+        pair.run().unwrap();
+        // Another member of the network claims node 1's ID, with its own
+        // key; the server does not know node 1's key from route
+        // information yet.
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let impostor = local(1, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let (client_side, msg1) = Client::start(&impostor, None, &Sessions::new(), &rng).unwrap();
+        let (server_side, msg2) =
+            Server::respond(&pair.server, 1, &msg1, &pair.at_server, &rng).unwrap();
+        let (msg3, _) = client_side
+            .finish(&impostor, 2, None, &msg2, &mut Sessions::new(), now)
+            .unwrap();
+        assert_eq!(
+            server_side
+                .finish(&pair.server, None, &msg3, &mut pair.at_server, now)
+                .err(),
+            Some(HandshakeError::Session(SessionError::StaticKeyMismatch))
+        );
+        pair.check_traffic();
+    }
+
+    #[test]
+    fn a_replayed_relay_msg1_changes_nothing() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let a = local(1, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let b = local(9, Some(b"s3cr3t"), Cipher::Aes128Gcm);
+        let (mut at_a, mut at_b) = (Sessions::new(), Sessions::new());
+        let b_key = session_key(Namespace::Relay, &b, a.id);
+
+        let (initiator, msg1) =
+            RelayInitiator::start(&a, b.id, b.static_key.public(), &at_a, &rng).unwrap();
+        let respond = |at_b: &mut Sessions| {
+            relay_respond(
+                &b,
+                a.id,
+                Some(a.static_key.public()),
+                &msg1,
+                at_b,
+                &rng,
+                now,
+            )
+            .unwrap()
+        };
+        let (msg2, first) = respond(&mut at_b);
+        assert!(!first.repeated);
+        initiator.finish(&a, &msg2, &mut at_a, now).unwrap();
+        let epoch = at_b.get(&b_key).unwrap().sender.epoch();
+        let connections = at_b.get(&b_key).unwrap().connections();
+
+        // The same msg1 again, many times: same answer, nothing moves.
+        for _ in 0..8 {
+            let (_, again) = respond(&mut at_b);
+            assert!(again.repeated);
+            assert_eq!(again.action, Action::Create);
+        }
+        let session = at_b.get(&b_key).unwrap();
+        assert_eq!(session.sender.epoch(), epoch);
+        assert_eq!(session.connections(), connections);
+
+        // Traffic still flows both ways.
+        let a_key = session_key(Namespace::Relay, &a, b.id);
+        let mut packet = b"back".to_vec();
+        at_b.get_mut(&b_key)
+            .unwrap()
+            .sender
+            .seal(&mut packet, now)
+            .unwrap();
+        at_a.get_mut(&a_key)
+            .unwrap()
+            .receiver
+            .open(&mut packet)
+            .unwrap();
+        assert_eq!(packet, b"back");
     }
 
     #[test]

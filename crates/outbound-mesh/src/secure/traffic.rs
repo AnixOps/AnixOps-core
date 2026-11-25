@@ -7,12 +7,16 @@
 //! The sender moves to the next epoch after 1,000,000 packets or 10 minutes;
 //! the receiver accepts epochs at most 3 ahead of the newest it has seen and
 //! rejects replays with a 256-packet window per epoch.
+//!
+//! Root keys and derived keys are wiped when they are dropped. The AEAD
+//! key schedules inside `ring` cannot be wiped from here.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::hkdf;
+use zeroize::Zeroize;
 
 use super::TRAFFIC_INFO;
 use crate::config::Cipher;
@@ -67,15 +71,24 @@ fn aead_key(
     epoch: u32,
     dir: u8,
 ) -> Option<LessSafeKey> {
-    let key = traffic_key(root_key, epoch, dir);
-    let unbound = match cipher {
+    let algorithm = match cipher {
         Cipher::None | Cipher::Xor => return None,
-        Cipher::Aes128Gcm => UnboundKey::new(&aead::AES_128_GCM, &key[..16]),
-        Cipher::Aes256Gcm => UnboundKey::new(&aead::AES_256_GCM, &key),
-        Cipher::ChaCha20Poly1305 => UnboundKey::new(&aead::CHACHA20_POLY1305, &key),
-    }
-    .expect("traffic keys have the algorithm's length");
-    Some(LessSafeKey::new(unbound))
+        Cipher::Aes128Gcm => &aead::AES_128_GCM,
+        Cipher::Aes256Gcm => &aead::AES_256_GCM,
+        Cipher::ChaCha20Poly1305 => &aead::CHACHA20_POLY1305,
+    };
+    let mut key = traffic_key(root_key, epoch, dir);
+    let unbound = UnboundKey::new(algorithm, &key[..algorithm.key_len()]);
+    key.zeroize();
+    Some(LessSafeKey::new(
+        unbound.expect("traffic keys have the algorithm's length"),
+    ))
+}
+
+/// Compares two keys without stopping at the first difference.
+pub fn keys_equal(a: &[u8; ROOT_KEY_LEN], b: &[u8; ROOT_KEY_LEN]) -> bool {
+    let difference = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(difference) == 0
 }
 
 fn nonce(epoch: u32, seq: u64) -> [u8; NONCE_LEN] {
@@ -95,7 +108,8 @@ pub enum TrafficError {
     Replay,
     /// The packet's epoch is too old to keep a window for.
     StaleEpoch,
-    /// The packet's epoch is more than [`MAX_EPOCHS_AHEAD`] ahead.
+    /// The packet's epoch is more than [`MAX_EPOCHS_AHEAD`] ahead. Counts
+    /// as a failure: a peer stuck there gets a new handshake.
     EpochTooFarAhead,
     /// Every epoch is used up, or [`MAX_FAILURES`] decryptions failed in a
     /// row: the session must be replaced by a new handshake.
@@ -104,7 +118,8 @@ pub enum TrafficError {
     Cipher,
 }
 
-/// The sending half of a session for one neighbour or relay peer.
+/// The sending half of a session for one neighbour or relay peer. Wipes
+/// its root key on drop.
 pub struct Sender {
     cipher: Cipher,
     root_key: [u8; ROOT_KEY_LEN],
@@ -140,6 +155,12 @@ impl Sender {
 
     pub fn epoch(&self) -> u32 {
         self.epoch
+    }
+
+    /// Whether this sender derives from `root_key`, compared in constant
+    /// time.
+    pub fn uses_root_key(&self, root_key: &[u8; ROOT_KEY_LEN]) -> bool {
+        keys_equal(&self.root_key, root_key)
     }
 
     /// Moves to `epoch` with the sequence back at 0, as after a Sync told
@@ -189,6 +210,12 @@ impl Sender {
     }
 }
 
+impl Drop for Sender {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
+    }
+}
+
 /// A 256-packet sliding window over sequence numbers.
 #[derive(Clone, Debug, Default)]
 pub struct ReplayWindow {
@@ -201,6 +228,11 @@ pub struct ReplayWindow {
 impl ReplayWindow {
     /// Whether `seq` would be accepted; does not record it.
     pub fn check(&self, seq: u64) -> Result<(), TrafficError> {
+        // No sender gets near it (it rotates after a million packets), and
+        // recording it would overflow the window.
+        if seq == u64::MAX {
+            return Err(TrafficError::Replay);
+        }
         if seq >= self.next {
             return Ok(());
         }
@@ -249,7 +281,7 @@ impl ReplayWindow {
     }
 }
 
-/// The receiving half of a session.
+/// The receiving half of a session. Wipes its root key on drop.
 pub struct Receiver {
     cipher: Cipher,
     root_key: [u8; ROOT_KEY_LEN],
@@ -288,6 +320,29 @@ impl Receiver {
         self.failures >= MAX_FAILURES
     }
 
+    /// The newest epoch a packet authenticated in, or the initial one.
+    pub fn newest(&self) -> u32 {
+        self.newest
+    }
+
+    /// Expects the peer from `epoch` on, as after a Sync to that epoch
+    /// (spec §8.4); keeps the epoch before it for packets in flight. Never
+    /// moves backwards.
+    pub fn advance_to(&mut self, epoch: u32) -> Result<(), TrafficError> {
+        if epoch <= self.newest {
+            return Ok(());
+        }
+        if !self.epochs.contains_key(&epoch) {
+            let key = aead_key(self.cipher, &self.root_key, epoch, self.dir)
+                .ok_or(TrafficError::Cipher)?;
+            self.epochs.insert(epoch, (key, ReplayWindow::default()));
+        }
+        self.newest = epoch;
+        let oldest_kept = epoch - 1;
+        self.epochs.retain(|&kept, _| kept >= oldest_kept);
+        Ok(())
+    }
+
     fn fail(&mut self, error: TrafficError) -> TrafficError {
         self.failures += 1;
         if self.ended() {
@@ -313,7 +368,7 @@ impl Receiver {
 
         if epoch > self.newest {
             if epoch - self.newest > MAX_EPOCHS_AHEAD {
-                return Err(TrafficError::EpochTooFarAhead);
+                return Err(self.fail(TrafficError::EpochTooFarAhead));
             }
         } else if self.newest - epoch > 1 {
             return Err(TrafficError::StaleEpoch);
@@ -364,6 +419,12 @@ impl Receiver {
         body.truncate(plain_len);
         *payload = body;
         Ok(())
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
     }
 }
 
@@ -536,6 +597,55 @@ mod tests {
         receiver.open(&mut seal(7)).unwrap();
         assert_eq!(receiver.open(&mut seal(6)), Err(TrafficError::StaleEpoch));
         assert_eq!(receiver.open(&mut seal(5)), Err(TrafficError::StaleEpoch));
+    }
+
+    #[test]
+    fn the_last_sequence_number_is_refused() {
+        let mut window = ReplayWindow::default();
+        assert_eq!(window.check(u64::MAX), Err(TrafficError::Replay));
+        window.check(u64::MAX - 1).unwrap();
+        window.record(u64::MAX - 1);
+        assert_eq!(window.check(u64::MAX - 1), Err(TrafficError::Replay));
+        assert_eq!(window.check(u64::MAX), Err(TrafficError::Replay));
+    }
+
+    #[test]
+    fn a_peer_stuck_too_far_ahead_ends_the_session() {
+        let now = Instant::now();
+        let mut receiver = Receiver::new(Cipher::Aes128Gcm, root(), 9, 3, 0).unwrap();
+        let mut sender = Sender::new(Cipher::Aes128Gcm, root(), 3, 9, 0, now).unwrap();
+        sender.advance_to(MAX_EPOCHS_AHEAD + 1, now).unwrap();
+        for attempt in 1..=MAX_FAILURES {
+            let mut packet = b"p".to_vec();
+            sender.seal(&mut packet, now).unwrap();
+            let expected = if attempt == MAX_FAILURES {
+                TrafficError::SessionEnded
+            } else {
+                TrafficError::EpochTooFarAhead
+            };
+            assert_eq!(receiver.open(&mut packet), Err(expected), "{attempt}");
+        }
+    }
+
+    #[test]
+    fn a_receiver_moves_to_a_synced_epoch() {
+        let now = Instant::now();
+        let mut receiver = Receiver::new(Cipher::Aes128Gcm, root(), 9, 3, 0).unwrap();
+        receiver.advance_to(7).unwrap();
+        assert_eq!(receiver.newest(), 7);
+        receiver.advance_to(2).unwrap();
+        assert_eq!(receiver.newest(), 7, "never backwards");
+        let seal = |epoch: u32| {
+            let mut sender = Sender::new(Cipher::Aes128Gcm, root(), 3, 9, epoch, now).unwrap();
+            let mut packet = b"p".to_vec();
+            sender.seal(&mut packet, now).unwrap();
+            packet
+        };
+        receiver.open(&mut seal(7)).unwrap();
+        receiver.open(&mut seal(6)).unwrap();
+        assert_eq!(receiver.open(&mut seal(0)), Err(TrafficError::StaleEpoch));
+        assert!(keys_equal(&root(), &root()));
+        assert!(!keys_equal(&root(), &[0; 32]));
     }
 
     #[test]

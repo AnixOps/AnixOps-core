@@ -8,21 +8,40 @@
 //! creates a new session instead, and installs it only once msg3 checks
 //! out. The specification allows creating every time. Relay handshakes
 //! authenticate the initiator in their first message, so they keep Sync.
+//!
+//! A Sync moves both directions to an epoch above any either side has
+//! been seen to use, so the peer that lost the session never seals under a
+//! nonce it used before. Relay msg1 is relayed in the clear and can be
+//! replayed: a session remembers the msg1 it answered and answers a repeat
+//! the same way without touching the session.
+//!
+//! A session is bound to the static key of the peer that set it up. A
+//! handshake with another key under the same node ID cannot take over a
+//! session in use (spec §8.3 leaves this open; the peer may hold the
+//! network secret and still not be that node).
+//!
+//! Root keys are compared in constant time and wiped on drop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ring::rand::SecureRandom;
 
+use zeroize::Zeroize;
+
 use crate::config::Cipher;
+use crate::route::messages::Uuid;
 
 use super::messages::Action;
-use super::traffic::{Receiver, Sender, TrafficError, ROOT_KEY_LEN};
+use super::noise::LEN;
+use super::traffic::{keys_equal, Receiver, Sender, TrafficError, ROOT_KEY_LEN};
 
 /// A session no connection has used for this long is dropped (spec §8.6).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most sessions held at once, over both namespaces.
 pub const MAX_SESSIONS: usize = 4096;
+/// Relay msg1 remembered per session to answer repeats.
+pub const REMEMBERED_ANSWERS: usize = 16;
 
 /// Direct sessions are with neighbours; relay sessions are end to end
 /// (spec §9). They are kept apart.
@@ -48,14 +67,19 @@ pub struct Ciphers {
     pub peer: Cipher,
 }
 
-/// What a handshake settles on, before it is installed. Has no `Debug`:
-/// it holds the root key.
-#[derive(Clone)]
+/// What a handshake settles on, before it is installed. Has no `Debug` and
+/// no `Clone`: it holds the root key, which is wiped on drop.
 pub struct Agreement {
     pub action: Action,
     pub generation: u32,
     pub root_key: [u8; ROOT_KEY_LEN],
     pub initial_epoch: u32,
+}
+
+impl Drop for Agreement {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +91,9 @@ pub enum SessionError {
     NothingToJoin,
     /// [`MAX_SESSIONS`] are held.
     Full,
+    /// The session of this node ID is in use and was set up by a peer with
+    /// another static key.
+    StaticKeyMismatch,
     Traffic(TrafficError),
 }
 
@@ -76,15 +103,26 @@ impl From<TrafficError> for SessionError {
     }
 }
 
-/// One session. Has no `Debug`: it holds the root key.
+/// A relay msg1 a session answered, by its connection ID.
+#[derive(Clone, Copy)]
+struct Answer {
+    conn_id: Uuid,
+    action: Action,
+    initial_epoch: u32,
+}
+
+/// One session. Has no `Debug`: it holds the root key, which is wiped on
+/// drop.
 pub struct Session {
     generation: u32,
     root_key: [u8; ROOT_KEY_LEN],
     ciphers: Ciphers,
+    peer_static: [u8; LEN],
     pub sender: Sender,
     pub receiver: Receiver,
     connections: usize,
     idle_since: Instant,
+    answers: VecDeque<Answer>,
 }
 
 impl Session {
@@ -94,6 +132,31 @@ impl Session {
 
     pub fn ciphers(&self) -> Ciphers {
         self.ciphers
+    }
+
+    /// The static key of the peer that set the session up.
+    pub fn peer_static(&self) -> [u8; LEN] {
+        self.peer_static
+    }
+
+    pub fn connections(&self) -> usize {
+        self.connections
+    }
+
+    /// The epoch a Sync moves both directions to: above any this node has
+    /// sent in or seen the peer send in. `None` when the epochs are used
+    /// up.
+    fn sync_epoch(&self) -> Option<u32> {
+        self.sender
+            .epoch()
+            .max(self.receiver.newest())
+            .checked_add(1)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
     }
 }
 
@@ -161,12 +224,14 @@ impl Sessions {
                 });
             }
             if key.namespace == Namespace::Relay {
-                return Ok(Agreement {
-                    action: Action::Sync,
-                    generation: session.generation,
-                    root_key: session.root_key,
-                    initial_epoch: session.sender.epoch().saturating_add(1),
-                });
+                if let Some(initial_epoch) = session.sync_epoch() {
+                    return Ok(Agreement {
+                        action: Action::Sync,
+                        generation: session.generation,
+                        root_key: session.root_key,
+                        initial_epoch,
+                    });
+                }
             }
         }
         Ok(Agreement {
@@ -214,31 +279,74 @@ impl Sessions {
         }
     }
 
-    /// Installs a finished handshake and counts one more connection on the
-    /// session. Join keeps the session as it is; Create replaces it; Sync
-    /// keeps the root key and moves to the agreed epoch.
+    /// The answer given before to the relay msg1 with `conn_id`, if the
+    /// session still has it: a repeat gets the same answer and changes
+    /// nothing.
+    pub fn answered(&self, key: &SessionKey, conn_id: Uuid) -> Option<Agreement> {
+        let session = self.map.get(key)?;
+        let answer = session
+            .answers
+            .iter()
+            .find(|answer| answer.conn_id == conn_id)?;
+        Some(Agreement {
+            action: answer.action,
+            generation: session.generation,
+            root_key: session.root_key,
+            initial_epoch: answer.initial_epoch,
+        })
+    }
+
+    /// Remembers the answer to a relay msg1, after [`Sessions::install`].
+    pub fn remember_answer(&mut self, key: &SessionKey, conn_id: Uuid, agreement: &Agreement) {
+        if let Some(session) = self.map.get_mut(key) {
+            if session.answers.len() == REMEMBERED_ANSWERS {
+                session.answers.pop_front();
+            }
+            session.answers.push_back(Answer {
+                conn_id,
+                action: agreement.action,
+                initial_epoch: agreement.initial_epoch,
+            });
+        }
+    }
+
+    /// Installs a finished handshake with the peer holding `peer_static`
+    /// and counts one more connection on the session. Join keeps the
+    /// session as it is; Create replaces it; Sync keeps the root key and
+    /// moves both directions to the agreed epoch. A session in use that
+    /// another static key set up is never touched.
     pub fn install(
         &mut self,
         key: SessionKey,
         agreement: &Agreement,
         local_id: u32,
         ciphers: Ciphers,
+        peer_static: [u8; LEN],
         now: Instant,
     ) -> Result<(), SessionError> {
         if !self.map.contains_key(&key) && self.map.len() >= MAX_SESSIONS {
             return Err(SessionError::Full);
         }
         if let Some(session) = self.map.get_mut(&key) {
-            let same = session.generation == agreement.generation
-                && session.root_key == agreement.root_key
+            let same_peer = session.peer_static == peer_static;
+            if !same_peer && session.connections > 0 {
+                return Err(SessionError::StaticKeyMismatch);
+            }
+            let same = same_peer
+                && session.generation == agreement.generation
+                && keys_equal(&session.root_key, &agreement.root_key)
                 && session.ciphers == ciphers;
             if same {
                 session.sender.advance_to(agreement.initial_epoch, now)?;
+                if agreement.action == Action::Sync {
+                    session.receiver.advance_to(agreement.initial_epoch)?;
+                }
                 session.connections += 1;
                 return Ok(());
             }
         }
-        // The session joined was replaced while the handshake ran.
+        // The session joined was replaced while the handshake ran, or was
+        // another peer's.
         if agreement.action == Action::Join {
             return Err(SessionError::NothingToJoin);
         }
@@ -247,6 +355,7 @@ impl Sessions {
             generation: agreement.generation,
             root_key: agreement.root_key,
             ciphers,
+            peer_static,
             sender: Sender::new(
                 ciphers.local,
                 agreement.root_key,
@@ -264,6 +373,7 @@ impl Sessions {
             )?,
             connections: 1,
             idle_since: now,
+            answers: VecDeque::new(),
         };
         self.map.insert(key, session);
         Ok(())
@@ -309,6 +419,8 @@ mod tests {
 
     const AES: Cipher = Cipher::Aes128Gcm;
     const CHACHA: Cipher = Cipher::ChaCha20Poly1305;
+    const PEER: [u8; LEN] = [7; LEN];
+    const OTHER: [u8; LEN] = [8; LEN];
 
     fn c(local: Cipher, peer: Cipher) -> Ciphers {
         Ciphers { local, peer }
@@ -327,7 +439,7 @@ mod tests {
         assert_eq!(first.action, Action::Create);
         assert_eq!((first.generation, first.initial_epoch), (1, 0));
         sessions
-            .install(direct.clone(), &first, 1, c(AES, CHACHA), now)
+            .install(direct.clone(), &first, 1, c(AES, CHACHA), PEER, now)
             .unwrap();
 
         let join = sessions
@@ -357,7 +469,7 @@ mod tests {
             .server_choice(&relay, None, c(AES, AES), &rng)
             .unwrap();
         sessions
-            .install(relay.clone(), &first, 1, c(AES, AES), now)
+            .install(relay.clone(), &first, 1, c(AES, AES), PEER, now)
             .unwrap();
         let sync = sessions
             .server_choice(&relay, None, c(AES, AES), &rng)
@@ -366,13 +478,185 @@ mod tests {
         assert_eq!(sync.root_key, first.root_key);
         assert_eq!((sync.generation, sync.initial_epoch), (1, 1));
         sessions
-            .install(relay.clone(), &sync, 1, c(AES, AES), now)
+            .install(relay.clone(), &sync, 1, c(AES, AES), PEER, now)
             .unwrap();
         let session = sessions.get(&relay).unwrap();
         assert_eq!(session.sender.epoch(), 1);
         assert_eq!(session.connections, 2);
         // The direct namespace is separate.
         assert!(sessions.get(&key(Namespace::Direct)).is_none());
+    }
+
+    #[test]
+    fn a_relay_sync_skips_every_epoch_either_side_used() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let (mut at_a, mut at_b) = (Sessions::new(), Sessions::new());
+        let a_key = SessionKey {
+            peer_id: 9,
+            ..key(Namespace::Relay)
+        };
+        let b_key = SessionKey {
+            peer_id: 1,
+            ..key(Namespace::Relay)
+        };
+        let created = at_b.server_choice(&b_key, None, c(AES, AES), &rng).unwrap();
+        let agreed = at_a
+            .client_agreement(
+                &a_key,
+                created.action,
+                created.generation,
+                Some(created.root_key),
+                created.initial_epoch,
+                c(AES, AES),
+            )
+            .unwrap();
+        at_b.install(b_key.clone(), &created, 9, c(AES, AES), PEER, now)
+            .unwrap();
+        at_a.install(a_key.clone(), &agreed, 1, c(AES, AES), OTHER, now)
+            .unwrap();
+
+        // The initiator rotated to epoch 2 and sent packets the responder
+        // saw; then it lost the session.
+        let mut sent = Vec::new();
+        let sender = &mut at_a.get_mut(&a_key).unwrap().sender;
+        sender.advance_to(2, now).unwrap();
+        for _ in 0..3 {
+            let mut packet = b"old".to_vec();
+            sender.seal(&mut packet, now).unwrap();
+            sent.push(packet);
+        }
+        for packet in &sent {
+            let mut packet = packet.clone();
+            at_b.get_mut(&b_key)
+                .unwrap()
+                .receiver
+                .open(&mut packet)
+                .unwrap();
+        }
+        at_a.invalidate(&a_key);
+
+        let sync = at_b.server_choice(&b_key, None, c(AES, AES), &rng).unwrap();
+        assert_eq!(sync.action, Action::Sync);
+        assert_eq!(sync.initial_epoch, 3, "above the initiator's epoch 2");
+        let agreed = at_a
+            .client_agreement(
+                &a_key,
+                sync.action,
+                sync.generation,
+                Some(sync.root_key),
+                sync.initial_epoch,
+                c(AES, AES),
+            )
+            .unwrap();
+        at_b.install(b_key.clone(), &sync, 9, c(AES, AES), PEER, now)
+            .unwrap();
+        at_a.install(a_key.clone(), &agreed, 1, c(AES, AES), OTHER, now)
+            .unwrap();
+
+        // No nonce is used twice, and both directions work at once.
+        let mut packet = b"new".to_vec();
+        at_a.get_mut(&a_key)
+            .unwrap()
+            .sender
+            .seal(&mut packet, now)
+            .unwrap();
+        for old in &sent {
+            assert_ne!(old[old.len() - 12..], packet[packet.len() - 12..]);
+        }
+        let at_responder = at_b.get_mut(&b_key).unwrap();
+        at_responder.receiver.open(&mut packet).unwrap();
+        assert_eq!(at_responder.receiver.newest(), 3);
+        let mut back = b"back".to_vec();
+        at_responder.sender.seal(&mut back, now).unwrap();
+        at_a.get_mut(&a_key)
+            .unwrap()
+            .receiver
+            .open(&mut back)
+            .unwrap();
+        assert_eq!(back, b"back");
+    }
+
+    #[test]
+    fn a_session_in_use_keeps_its_static_key() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let direct = key(Namespace::Direct);
+        let first = sessions
+            .server_choice(&direct, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions
+            .install(direct.clone(), &first, 1, c(AES, AES), PEER, now)
+            .unwrap();
+
+        // Another key under the same node ID can neither join nor replace
+        // it while it is in use.
+        let join = sessions
+            .server_choice(&direct, Some(1), c(AES, AES), &rng)
+            .unwrap();
+        assert_eq!(join.action, Action::Join);
+        assert_eq!(
+            sessions.install(direct.clone(), &join, 1, c(AES, AES), OTHER, now),
+            Err(SessionError::StaticKeyMismatch)
+        );
+        let create = sessions
+            .server_choice(&direct, None, c(AES, AES), &rng)
+            .unwrap();
+        assert_eq!(
+            sessions.install(direct.clone(), &create, 1, c(AES, AES), OTHER, now),
+            Err(SessionError::StaticKeyMismatch)
+        );
+        assert_eq!(sessions.get(&direct).unwrap().peer_static(), PEER);
+
+        // Once idle, a new key may set up a new session, but not join.
+        sessions.release(&direct, now);
+        assert_eq!(
+            sessions.install(direct.clone(), &join, 1, c(AES, AES), OTHER, now),
+            Err(SessionError::NothingToJoin)
+        );
+        sessions
+            .install(direct.clone(), &create, 1, c(AES, AES), OTHER, now)
+            .unwrap();
+        assert_eq!(sessions.get(&direct).unwrap().peer_static(), OTHER);
+    }
+
+    #[test]
+    fn a_repeated_relay_msg1_gets_the_same_answer() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let relay = key(Namespace::Relay);
+        let first = sessions
+            .server_choice(&relay, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions
+            .install(relay.clone(), &first, 1, c(AES, AES), PEER, now)
+            .unwrap();
+        let first_id = Uuid([1; 16]);
+        sessions.remember_answer(&relay, first_id, &first);
+        let sync = sessions
+            .server_choice(&relay, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions
+            .install(relay.clone(), &sync, 1, c(AES, AES), PEER, now)
+            .unwrap();
+        sessions.remember_answer(&relay, Uuid([2; 16]), &sync);
+
+        let again = sessions.answered(&relay, first_id).unwrap();
+        assert_eq!(again.action, Action::Create);
+        assert_eq!(again.initial_epoch, 0);
+        assert_eq!(again.root_key, first.root_key);
+        let again = sessions.answered(&relay, Uuid([2; 16])).unwrap();
+        assert_eq!((again.action, again.initial_epoch), (Action::Sync, 1));
+        assert!(sessions.answered(&relay, Uuid([3; 16])).is_none());
+
+        // Only the latest answers are kept.
+        for n in 0..REMEMBERED_ANSWERS as u8 {
+            sessions.remember_answer(&relay, Uuid([10 + n; 16]), &sync);
+        }
+        assert!(sessions.answered(&relay, first_id).is_none());
+        assert!(sessions.answered(&relay, Uuid([10; 16])).is_some());
     }
 
     #[test]
@@ -390,7 +674,7 @@ mod tests {
             .client_agreement(&direct, Action::Create, 3, Some([1; 32]), 0, c(AES, AES))
             .unwrap();
         sessions
-            .install(direct.clone(), &created, 1, c(AES, AES), now)
+            .install(direct.clone(), &created, 1, c(AES, AES), PEER, now)
             .unwrap();
         assert_eq!(sessions.generation(&direct), Some(3));
         let joined = sessions
@@ -432,10 +716,10 @@ mod tests {
             )
             .unwrap();
         server
-            .install(at_server.clone(), &choice, 10, c(CHACHA, AES), now)
+            .install(at_server.clone(), &choice, 10, c(CHACHA, AES), PEER, now)
             .unwrap();
         client
-            .install(at_client.clone(), &agreed, 20, c(AES, CHACHA), now)
+            .install(at_client.clone(), &agreed, 20, c(AES, CHACHA), PEER, now)
             .unwrap();
 
         let mut packet = b"hello".to_vec();
@@ -473,7 +757,7 @@ mod tests {
             initial_epoch: 0,
         };
         sessions
-            .install(direct.clone(), &agreement, 1, c(AES, AES), now)
+            .install(direct.clone(), &agreement, 1, c(AES, AES), PEER, now)
             .unwrap();
         sessions.reclaim(now + IDLE_TIMEOUT * 2);
         assert_eq!(sessions.len(), 1, "in use");
@@ -489,7 +773,7 @@ mod tests {
                 ..direct.clone()
             };
             sessions
-                .install(key, &agreement, 1, c(AES, AES), now)
+                .install(key, &agreement, 1, c(AES, AES), PEER, now)
                 .unwrap();
         }
         let extra = SessionKey {
@@ -497,7 +781,7 @@ mod tests {
             ..direct.clone()
         };
         assert_eq!(
-            sessions.install(extra, &agreement, 1, c(AES, AES), now),
+            sessions.install(extra, &agreement, 1, c(AES, AES), PEER, now),
             Err(SessionError::Full)
         );
         sessions.invalidate(&SessionKey {

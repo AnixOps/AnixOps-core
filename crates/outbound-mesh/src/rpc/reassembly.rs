@@ -5,7 +5,9 @@
 //! reassembler is bounded by [`MAX_PENDING_TOTAL`] calls and
 //! [`MAX_TOTAL_BYTES`]. One peer may hold at most [`MAX_PEER_BYTES`], a
 //! quarter of the total, so no single peer can crowd out the calls of the
-//! others (route synchronisation among them).
+//! others (route synchronisation among them). When a few peers together
+//! fill the total, the one holding the most loses its largest call to make
+//! room for a lighter peer.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -98,6 +100,31 @@ impl Reassembler {
         {
             return Err(Dropped::TooMany);
         }
+        let len = piece.body.len();
+        let existing = self.pending.get(&key).map(|pending| {
+            (
+                pending.total,
+                pending.bytes,
+                pending.pieces.contains_key(&piece.piece_idx),
+            )
+        });
+        let (call_bytes, new_piece) = match existing {
+            Some((total, _, _)) if total != piece.total_pieces => {
+                self.remove(&key);
+                return Err(Dropped::Malformed);
+            }
+            Some((_, bytes, held)) => (bytes, !held),
+            None => (0, true),
+        };
+        if new_piece {
+            let fits = call_bytes + len <= MAX_CALL_BYTES
+                && peer_bytes + len <= MAX_PEER_BYTES
+                && (self.bytes + len <= MAX_TOTAL_BYTES || self.make_room(source, peer_bytes, len));
+            if !fits {
+                self.remove(&key);
+                return Err(Dropped::TooLarge);
+            }
+        }
         let pending = self.pending.entry(key).or_insert_with(|| Pending {
             total: piece.total_pieces,
             is_request: piece.is_request,
@@ -106,22 +133,10 @@ impl Reassembler {
             bytes: 0,
             deadline: now + timeout,
         });
-        if pending.total != piece.total_pieces {
-            self.remove(&key);
-            return Err(Dropped::Malformed);
-        }
         if pending.descriptor.is_none() {
             pending.descriptor = piece.descriptor;
         }
-        if !pending.pieces.contains_key(&piece.piece_idx) {
-            let len = piece.body.len();
-            if pending.bytes + len > MAX_CALL_BYTES
-                || peer_bytes + len > MAX_PEER_BYTES
-                || self.bytes + len > MAX_TOTAL_BYTES
-            {
-                self.remove(&key);
-                return Err(Dropped::TooLarge);
-            }
+        if new_piece {
             pending.bytes += len;
             self.bytes += len;
             pending.pieces.insert(piece.piece_idx, piece.body);
@@ -138,6 +153,38 @@ impl Reassembler {
             descriptor,
             body: pending.pieces.into_values().flatten().collect(),
         }))
+    }
+
+    /// Frees room for `len` more bytes from `source`, which holds
+    /// `source_bytes`, when the node-wide budget is full: the peer holding
+    /// the most loses its largest call, as long as it holds more than
+    /// `source` would. Returns whether the room was made.
+    fn make_room(&mut self, source: u32, source_bytes: usize, len: usize) -> bool {
+        while self.bytes + len > MAX_TOTAL_BYTES {
+            let mut per_peer: BTreeMap<u32, usize> = BTreeMap::new();
+            for (&(peer, _, _), pending) in &self.pending {
+                *per_peer.entry(peer).or_default() += pending.bytes;
+            }
+            let Some((&heaviest, &held)) = per_peer.iter().max_by_key(|(_, held)| **held) else {
+                return false;
+            };
+            if heaviest == source || held <= source_bytes + len {
+                return false;
+            }
+            let largest = self
+                .pending
+                .iter()
+                .filter(|((peer, _, _), _)| *peer == heaviest)
+                .max_by_key(|(_, pending)| pending.bytes)
+                .map(|(key, _)| *key);
+            match largest {
+                Some(key) => {
+                    self.remove(&key);
+                }
+                None => return false,
+            }
+        }
+        true
     }
 
     fn remove(&mut self, key: &(u32, i64, bool)) -> Option<Pending> {
@@ -331,6 +378,45 @@ mod tests {
             .push(5, other[0].clone(), TIMEOUT, now)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn peers_that_fill_the_total_make_room_for_a_lighter_one() {
+        let now = Instant::now();
+        let mut reassembler = Reassembler::new();
+        let body = vec![0u8; MAX_PEER_BYTES - 64];
+        let peers = (MAX_TOTAL_BYTES / MAX_PEER_BYTES) as u32;
+        for peer in 1..=peers {
+            let mut pieces = split(peer, 1, 1, &descriptor(), true, &body);
+            pieces.pop();
+            for piece in pieces {
+                assert_eq!(reassembler.push(peer, piece, TIMEOUT, now), Ok(None));
+            }
+        }
+        let full = reassembler.in_progress();
+        assert_eq!(full, peers as usize);
+
+        // A light peer's route call still gets through, at the cost of one
+        // heavy call.
+        let route = vec![1u8; 20_000];
+        let mut done = None;
+        for piece in split(50, 1, 1, &descriptor(), true, &route) {
+            if let Some(call) = reassembler.push(50, piece, TIMEOUT, now).unwrap() {
+                done = Some(call);
+            }
+        }
+        assert_eq!(done.unwrap().body, route);
+        assert_eq!(reassembler.in_progress(), full - 1);
+        assert!(reassembler.bytes() <= MAX_TOTAL_BYTES);
+
+        // The heaviest peer cannot push others out the same way.
+        let mut pieces = split(1, 1, 2, &descriptor(), true, &route);
+        pieces.pop();
+        let refused = pieces
+            .into_iter()
+            .find_map(|piece| reassembler.push(1, piece, TIMEOUT, now).err());
+        assert_eq!(refused, Some(Dropped::TooLarge));
+        assert!(reassembler.bytes() <= MAX_TOTAL_BYTES);
     }
 
     #[test]

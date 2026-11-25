@@ -11,11 +11,11 @@
 
 ## 快照
 
-`mesh_status` 一次返回完整快照。字段名用 lowerCamelCase。读取方忽略未知字段，枚举遇到未知取值按 `other` 处理；某个内核版本尚未提供的字段直接缺省。
+`mesh_status` 一次返回完整快照。快照按网络给出：`network`、`self`、`members`、`subnets`、`refusedAdvertisements` 都属于请求的那个网络（命令参数 `network`；省略时为第一个已加入的网络，没有已加入的网络时为第一个已保存的网络）。`tunnel` 属于整个引擎：一台设备只有一个隧道，它汇总所有已加入的网络，在每个网络的快照里取值相同。顶层 `networks` 列出所有已保存的网络 `{ "id", "name", "state" }`，供多网络时逐个读取。字段名用 lowerCamelCase。读取方忽略未知字段，枚举遇到未知取值按 `other` 处理；某个内核版本尚未提供的字段直接缺省。
 
 | 对象 | 字段 | 自哪个内核版本 |
 |---|---|---|
-| 顶层 | `statusVersion`（固定 1）、`network`、`self`、`members`、`subnets`、`refusedAdvertisements`、`tunnel` | 0.3 |
+| 顶层 | `statusVersion`（固定 1）、`networks`、`network`、`self`、`members`、`subnets`、`refusedAdvertisements`、`tunnel` | 0.3 |
 | 顶层 | `regions`、`links` | 0.4 |
 | 顶层 | `paths` | 0.5 |
 | `network` | `id`（即配置里的 `network.name`）、`name`、`state`、`security`、`failure`、`joining`、`routingPolicy`、`dnsSuffix`、`dnsEnabled` | 0.3 |
@@ -102,7 +102,7 @@
 
 | 命令 | 参数 | 自哪个内核版本 |
 |---|---|---|
-| `mesh_status` | 无 | 0.3 |
+| `mesh_status` | `network`（可省略，见「快照」） | 0.3 |
 | `mesh_join` / `mesh_leave` | `network` | 0.3 |
 | `mesh_save_network` | `config`：`config_version: 1` 网络配置（见 `mesh-module.md`；密钥由钥匙串注入） | 0.3 |
 | `mesh_remove_network` | `network` | 0.3 |
