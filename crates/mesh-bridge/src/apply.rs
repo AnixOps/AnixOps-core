@@ -322,6 +322,17 @@ impl Bridge {
         } else {
             None
         };
+        // A table this bridge did not install (left by an earlier process
+        // of the same node) is replaced too; its lists are the old ones.
+        if self.rules.is_none() {
+            let table = ruleset::table_name(&self.mesh_interface);
+            self.rules = self
+                .host
+                .nft(&["-j", "list", "table", "inet", &table], None)
+                .ok()
+                .and_then(|json| table_lists(&json).ok());
+            self.installed |= self.rules.is_some();
+        }
         let script = ruleset::render(bridge, &self.mesh_interface, local_addresses);
         if let Err(error) = self.host.nft(&["-f", "-"], Some(&script)) {
             // `new_guard` drops here, so forwarding goes back if this
@@ -703,6 +714,7 @@ mod tests {
             for line in script.lines() {
                 if let Some(name) = line.strip_prefix("delete table inet ") {
                     tables.retain(|(f, n)| !(f == "inet" && n == name));
+                    self.table_scripts.lock().unwrap().remove(name);
                 } else if let Some(rest) = line.strip_prefix("table inet ") {
                     if rest.ends_with(" {") {
                         self.table_scripts
@@ -748,7 +760,7 @@ mod tests {
             self.flows
                 .lock()
                 .unwrap()
-                .retain(|flow| !flows.iter().any(|gone| *gone == flow));
+                .retain(|flow| !flows.contains(&flow));
             Ok(())
         }
     }
@@ -862,6 +874,37 @@ mod tests {
                 pair("100.64.0.5", "100.100.0.1"),
             ]
         );
+    }
+
+    #[test]
+    fn a_table_left_by_an_earlier_process_counts_as_the_old_lists() {
+        let (host, forwarding) = setup("1", "1");
+        let mut earlier = Bridge::new(host.clone(), forwarding.clone(), "anixmesh-0").unwrap();
+        earlier
+            .apply(
+                &checked(&["100.64.0.5"], &["10.150.0.2/32", "10.150.0.3/32"]),
+                &subnet(),
+                &[],
+            )
+            .unwrap();
+        std::mem::forget(earlier);
+        host.flows.lock().unwrap().extend([
+            flow("10.150.0.2", "100.64.0.5"),
+            flow("10.150.0.3", "100.64.0.5"),
+        ]);
+        let mut bridge = Bridge::new(host.clone(), forwarding, "anixmesh-0").unwrap();
+        bridge
+            .apply(
+                &checked(&["100.64.0.5"], &["10.150.0.2/32"]),
+                &subnet(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(flows(&host), [pair("10.150.0.2", "100.64.0.5")]);
+        // The adopted table is this bridge's to remove.
+        bridge.remove().unwrap();
+        assert!(flows(&host).is_empty());
+        assert!(host.tables.lock().unwrap().is_empty());
     }
 
     #[test]

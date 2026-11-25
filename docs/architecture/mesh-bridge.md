@@ -50,6 +50,7 @@
 ## 应用、转发与状态（`apply`、`status`）
 
 - `Bridge::apply` 先检查与本网络的冲突，再按需打开 IPv4 转发，然后加载规则。只有规则全部加载成功后才更新 `status()`（即 `externalBridge`）；失败时保留旧规则与旧状态，并给出告警 `external_bridge_apply_failed`（附 nft 的错误输出）。
+- 一个 `Bridge` 第一次应用时，若本机已有同一组网网卡的表（同一节点上一个进程留下、未经启动清理），读出其中名单作为旧名单，整表替换后按下文删除收窄部分的连接跟踪条目，此后由该 `Bridge` 负责拆除。
 - `Bridge::remove` 删除整张表；之后 `status()` 为 `None`（状态接口中为 `null`），面板以此释放桥接相关资源。`Bridge` 被丢弃时也会尽力删除。
 - IPv4 转发由全进程共用的 `Forwarding` 管理：第一个带 IPv4 `routes` 的桥接安装时，若 `/proc/sys/net/ipv4/ip_forward` 为 0 则置 1；最后一个桥接拆除后，只有当初是本进程打开的才恢复为 0。原本就打开的保持不变。
 - IPv6 转发从不修改：打开 `net.ipv6.conf.all.forwarding` 会让 Linux 在 `accept_ra = 1` 的网卡上忽略路由通告，主机自己的 IPv6 默认路由可能因此失效。桥接带 IPv6 `routes` 而 IPv6 转发未打开时，给出告警 `external_bridge_ipv6_forwarding_off`，IPv6 条目在运维人员打开转发前不生效。
