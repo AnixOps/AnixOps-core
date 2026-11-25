@@ -76,7 +76,9 @@
 //! takes a `shadow_tls` object and is then served behind ShadowTLS v3),
 //! `shadowsocks_plugins` (a `shadowsocks` inbound takes `obfs` for
 //! simple-obfs clients, and `transport` `ws` with or without `tls` for
-//! v2ray-plugin clients).
+//! v2ray-plugin clients), `inbound_expiry` (the inbound key
+//! `expires_at_ms`: the node removes the inbound at that time). `types`
+//! lists `socks` when the kernel has the internal-network SOCKS5 inbound.
 //!
 //! A user may carry `speed_limit` (Mbit/s for each direction, shared by
 //! all of its connections) and `device_limit` (most client IPs online at

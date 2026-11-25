@@ -1658,6 +1658,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbound-socks"
+version = "0.2.0"
+dependencies = [
+ "engine-inbound",
+ "engine-outbound",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "inbound-transport"
 version = "0.2.0"
 dependencies = [
@@ -2185,6 +2196,7 @@ dependencies = [
  "inbound-reverse-proxy",
  "inbound-shadowsocks",
  "inbound-snell",
+ "inbound-socks",
  "inbound-trojan",
  "inbound-tuic",
  "inbound-vless",
