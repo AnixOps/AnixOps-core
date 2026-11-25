@@ -6,8 +6,14 @@
 //! checked with [`RouteTable::lookup`] or [`RouteTable::check_outgoing`]
 //! before it is handed to any session; packets a peer delivers are checked
 //! with [`RouteTable::check_incoming`], which drops spoofed sources and
-//! anything not addressed to this node (the node never forwards IP traffic
-//! between peers or out of the mesh).
+//! anything not addressed to this node's stack (the node is never an exit;
+//! relaying for other peers happens on mesh frames in the session layer).
+//!
+//! A [`PeerId`] here is the peer that owns an address, not the next hop: when
+//! a packet travels through relay peers, the session layer resolves the path
+//! to the owner and reports the originating peer of what it delivers. Path
+//! choice (lowest latency or fewest hops, or a path the user fixed) belongs
+//! to that layer.
 
 use std::collections::BTreeMap;
 use std::fmt;

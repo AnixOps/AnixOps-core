@@ -40,10 +40,10 @@ pub struct MeshConfig {
     /// scope of [`crate::scope`].
     #[serde(default)]
     pub allowed_subnets: Vec<String>,
-    /// Accept peers that only offer the older handshake without forward
-    /// secrecy. Off unless the user enables it for this network.
+    /// Whether sessions without forward secrecy are accepted; see
+    /// [`SecurityMode`]. Absent: `"preferred"`.
     #[serde(default)]
-    pub allow_legacy_handshake: bool,
+    pub forward_secrecy: SecurityMode,
 }
 
 /// One bootstrap peer.
@@ -61,15 +61,20 @@ pub struct PeerEndpoint {
     pub port: u16,
 }
 
-/// Which handshakes a node accepts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which handshakes a node accepts, negotiated per connection.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SecurityMode {
-    /// Only sessions with forward secrecy. The default.
-    ForwardSecrecyOnly,
-    /// Sessions with forward secrecy first; a peer that cannot do that may
-    /// use the older handshake, and that session is reported as having no
-    /// forward secrecy.
-    AllowLegacy,
+    /// `"preferred"`, the default: a session with forward secrecy when the
+    /// peer offers one, otherwise the network's default handshake, which has
+    /// none. Each session reports which one it got, so the interface can mark
+    /// the ones without forward secrecy. Networks whose nodes do not enable
+    /// forward secrecy need this mode to interoperate.
+    #[default]
+    Preferred,
+    /// `"required"`: only sessions with forward secrecy; peers that cannot
+    /// do that are refused.
+    Required,
 }
 
 /// Validated settings. Has no `Debug`: it holds the secret.
@@ -176,11 +181,7 @@ impl MeshConfig {
             address_v6,
             peers,
             allowed_subnets,
-            security: if self.allow_legacy_handshake {
-                SecurityMode::AllowLegacy
-            } else {
-                SecurityMode::ForwardSecrecyOnly
-            },
+            security: self.forward_secrecy,
         })
     }
 }
@@ -234,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_config_validates_with_forward_secrecy_only() {
+    fn minimal_config_validates_with_forward_secrecy_preferred() {
         let settings = validate(base()).unwrap();
         assert_eq!(settings.network_name, "office");
         assert_eq!(settings.address.to_string(), "10.144.144.0/24");
@@ -246,7 +247,7 @@ mod tests {
             settings.virtual_subnets(),
             vec![IpNet::parse("10.144.144.0/24").unwrap()]
         );
-        assert_eq!(settings.security, SecurityMode::ForwardSecrecyOnly);
+        assert_eq!(settings.security, SecurityMode::Preferred);
         assert!(settings.allowed_subnets.is_empty());
         assert_eq!(
             settings.peers,
@@ -258,9 +259,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_handshake_is_opt_in() {
-        let settings = validate(with("allow_legacy_handshake", json!(true))).unwrap();
-        assert_eq!(settings.security, SecurityMode::AllowLegacy);
+    fn forward_secrecy_can_be_required() {
+        let settings = validate(with("forward_secrecy", json!("required"))).unwrap();
+        assert_eq!(settings.security, SecurityMode::Required);
+        let settings = validate(with("forward_secrecy", json!("preferred"))).unwrap();
+        assert_eq!(settings.security, SecurityMode::Preferred);
+        assert!(
+            serde_json::from_value::<MeshConfig>(with("forward_secrecy", json!("off"))).is_err()
+        );
     }
 
     #[test]
