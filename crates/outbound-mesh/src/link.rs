@@ -1280,7 +1280,8 @@ mod tests {
             } else {
                 Transport::Tcp
             };
-            let (ticket, _) = admitted(budget.admit(address, transport, member, now));
+            let (ticket, _) =
+                admitted(budget.admit(SocketAddr::new(address, 40000), transport, member, now));
             if n == 500 {
                 udp_ticket = Some(ticket);
             }
