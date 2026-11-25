@@ -42,6 +42,7 @@ pub mod tun;
 #[cfg(windows)]
 #[path = "tun_windows.rs"]
 pub mod tun;
+pub mod winstart;
 pub mod winsvc;
 
 /// Version of this program.
