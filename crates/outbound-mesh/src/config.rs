@@ -233,22 +233,17 @@ pub enum Cipher {
     None,
     /// AES-128-GCM.
     #[default]
-    #[serde(rename = "aes-gcm", alias = "openssl-aes-gcm")]
+    #[serde(rename = "aes-gcm")]
     Aes128Gcm,
     /// AES-256-GCM.
-    #[serde(rename = "aes-256-gcm", alias = "openssl-aes-256-gcm")]
+    #[serde(rename = "aes-256-gcm")]
     Aes256Gcm,
     /// ChaCha20-Poly1305.
-    #[serde(
-        rename = "chacha20",
-        alias = "chacha20-poly1305",
-        alias = "openssl-chacha20",
-        alias = "openssl-chacha20-poly1305"
-    )]
+    #[serde(rename = "chacha20", alias = "chacha20-poly1305")]
     ChaCha20Poly1305,
     /// The unauthenticated XOR mode (spec §7.1). Recognised only so that
     /// validation can say why it is refused; never used.
-    #[serde(rename = "xor", alias = "openssl-xor")]
+    #[serde(rename = "xor")]
     Xor,
 }
 
@@ -794,15 +789,13 @@ mod tests {
     }
 
     #[test]
-    fn ciphers_and_their_aliases() {
+    fn ciphers_take_only_the_names_of_the_table() {
+        // Spec §7.1: other spellings are mapped by the importer, not here.
         for (name, cipher) in [
             ("aes-gcm", Cipher::Aes128Gcm),
-            ("openssl-aes-gcm", Cipher::Aes128Gcm),
             ("aes-256-gcm", Cipher::Aes256Gcm),
-            ("openssl-aes-256-gcm", Cipher::Aes256Gcm),
             ("chacha20", Cipher::ChaCha20Poly1305),
             ("chacha20-poly1305", Cipher::ChaCha20Poly1305),
-            ("openssl-chacha20", Cipher::ChaCha20Poly1305),
         ] {
             let settings = validate(with("network.cipher", json!(name))).unwrap();
             assert_eq!(settings.cipher, cipher, "{name}");
@@ -816,14 +809,18 @@ mod tests {
         assert!(validate(secure_plain).is_err());
         // XOR has no authentication and is refused with that reason
         // (spec §7.1).
-        for name in ["xor", "openssl-xor"] {
-            assert_eq!(
-                validate(with("network.cipher", json!(name))).err(),
-                Some("mesh cipher xor is insecure (no authentication) and is not supported"),
-                "{name}"
-            );
-        }
-        for name in ["AES-GCM", "", "None", "plain"] {
+        assert_eq!(
+            validate(with("network.cipher", json!("xor"))).err(),
+            Some("mesh cipher xor is insecure (no authentication) and is not supported")
+        );
+        for name in [
+            "AES-GCM",
+            "",
+            "None",
+            "plain",
+            "openssl-aes-gcm",
+            "openssl-xor",
+        ] {
             assert!(
                 parse(with("network.cipher", json!(name))).is_err(),
                 "{name}"

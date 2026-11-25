@@ -3,7 +3,9 @@
 //! dropped after its timeout. Calls are keyed by the peer the session layer
 //! received them from, never by what a piece claims, and the whole
 //! reassembler is bounded by [`MAX_PENDING_TOTAL`] calls and
-//! [`MAX_TOTAL_BYTES`].
+//! [`MAX_TOTAL_BYTES`]. One peer may hold at most [`MAX_PEER_BYTES`], a
+//! quarter of the total, so no single peer can crowd out the calls of the
+//! others (route synchronisation among them).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -18,6 +20,8 @@ pub const MAX_CALL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_PENDING_TOTAL: usize = 256;
 /// Most bytes held across all calls in progress.
 pub const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+/// Most bytes one peer's calls in progress may hold together.
+pub const MAX_PEER_BYTES: usize = MAX_TOTAL_BYTES / 4;
 
 /// A whole call, ready to dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +43,8 @@ pub enum Dropped {
     /// The piece claims to come from another peer than the one it arrived
     /// from.
     WrongSource,
-    /// The call would exceed [`MAX_CALL_BYTES`].
+    /// The call would exceed [`MAX_CALL_BYTES`], the peer
+    /// [`MAX_PEER_BYTES`] or the node [`MAX_TOTAL_BYTES`].
     TooLarge,
     /// No descriptor in the first piece.
     NoDescriptor,
@@ -82,15 +87,16 @@ impl Reassembler {
             return Err(Dropped::Malformed);
         }
         let key = (source, piece.transaction_id, piece.is_request);
-        if !self.pending.contains_key(&key) {
-            let in_progress = self
-                .pending
-                .keys()
-                .filter(|(from, _, _)| *from == source)
-                .count();
-            if in_progress >= MAX_PENDING_PER_PEER || self.pending.len() >= MAX_PENDING_TOTAL {
-                return Err(Dropped::TooMany);
-            }
+        let (in_progress, peer_bytes) = self
+            .pending
+            .range((source, i64::MIN, false)..=(source, i64::MAX, true))
+            .fold((0, 0), |(calls, bytes), (_, pending)| {
+                (calls + 1, bytes + pending.bytes)
+            });
+        if !self.pending.contains_key(&key)
+            && (in_progress >= MAX_PENDING_PER_PEER || self.pending.len() >= MAX_PENDING_TOTAL)
+        {
+            return Err(Dropped::TooMany);
         }
         let pending = self.pending.entry(key).or_insert_with(|| Pending {
             total: piece.total_pieces,
@@ -109,7 +115,10 @@ impl Reassembler {
         }
         if !pending.pieces.contains_key(&piece.piece_idx) {
             let len = piece.body.len();
-            if pending.bytes + len > MAX_CALL_BYTES || self.bytes + len > MAX_TOTAL_BYTES {
+            if pending.bytes + len > MAX_CALL_BYTES
+                || peer_bytes + len > MAX_PEER_BYTES
+                || self.bytes + len > MAX_TOTAL_BYTES
+            {
                 self.remove(&key);
                 return Err(Dropped::TooLarge);
             }
@@ -294,6 +303,34 @@ mod tests {
         assert!(reassembler.bytes() > 0);
         assert_eq!(reassembler.expire(now + TIMEOUT), MAX_PENDING_TOTAL);
         assert_eq!(reassembler.bytes(), 0);
+    }
+
+    #[test]
+    fn one_peer_cannot_take_the_whole_budget() {
+        let now = Instant::now();
+        let mut reassembler = Reassembler::new();
+        let body = vec![0u8; MAX_PEER_BYTES * 3 / 4];
+        // All but the last piece of a large call stay in reassembly.
+        let mut first = split(4, 1, 1, &descriptor(), true, &body);
+        first.pop();
+        for piece in first {
+            assert_eq!(reassembler.push(4, piece, TIMEOUT, now), Ok(None));
+        }
+        let mut refused = None;
+        for piece in split(4, 1, 2, &descriptor(), true, &body) {
+            if let Err(dropped) = reassembler.push(4, piece, TIMEOUT, now) {
+                refused = Some(dropped);
+                break;
+            }
+        }
+        assert_eq!(refused, Some(Dropped::TooLarge));
+        assert!(reassembler.bytes() <= MAX_PEER_BYTES);
+        // Another peer still gets through.
+        let other = split(5, 1, 1, &descriptor(), true, b"route");
+        assert!(reassembler
+            .push(5, other[0].clone(), TIMEOUT, now)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

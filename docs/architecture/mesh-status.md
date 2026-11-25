@@ -7,7 +7,7 @@
 - 组网与代理在同一个引擎实例里运行（需求 R23，手机上共用一个 VPN），命令走现有控制通道：iOS、macOS 为 `networkcore_ios_runtime_control`，Android、Windows、Linux 为 `client-core` / `client-ipc` 的同名命令。
 - 请求是 JSON，命令名放在 `cmd` 字段，用下划线命名，与现有命令一致，例如 `{"cmd":"mesh_status"}`。
 - 引擎编入组网后 `networkcore_ios_feature_set_version` 为 7。未编入 `mesh` feature 时 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令返回 `unsupported`。
-- 不新增任何网络监听端口（需求 R11）。独立节点程序 `anixops-mesh` 在本机 socket 上回答同样的 `mesh_status`（OpenWrt LuCI 插件使用，需求 R35）。
+- 不新增任何网络监听端口（需求 R11）。独立节点程序 `anixops-mesh` 在本机 Unix 域套接字上回答同样的 `mesh_status`（Windows 上为命名管道），文件权限只允许 root 与指定组访问；不监听任何 TCP 或 UDP 端口，回环地址也不行（OpenWrt LuCI 插件使用，需求 R35）。
 
 ## 快照
 
@@ -15,7 +15,7 @@
 
 | 对象 | 字段 | 自哪个内核版本 |
 |---|---|---|
-| 顶层 | `statusVersion`（固定 1）、`network`、`self`、`members`、`subnets`、`refusedAdvertisements` | 0.3 |
+| 顶层 | `statusVersion`（固定 1）、`network`、`self`、`members`、`subnets`、`refusedAdvertisements`、`tunnel` | 0.3 |
 | 顶层 | `regions`、`links` | 0.4 |
 | 顶层 | `paths` | 0.5 |
 | `network` | `id`（即配置里的 `network.name`）、`name`、`state`、`security`、`failure`、`joining`、`routingPolicy`、`dnsSuffix`、`dnsEnabled` | 0.3 |
@@ -25,6 +25,7 @@
 | `members[]` | `region`、`addressManaged`、`vms` | 0.4 |
 | `subnets[]` | `cidr`、`advertisers[{member,inUse}]`、`latencyMs`、`path`、`state`、`overlaps`、`localOverlap`、`route` | 0.3 |
 | `subnets[]` | `region` | 0.4 |
+| `tunnel` | `routes`、`routesVersion`、`dns` | 0.3 |
 
 ### 取值
 
@@ -47,6 +48,9 @@
 | `subnet.route` | `mesh`、`local`（与本机网络重叠时默认 `local`） |
 | `suggestedSubnets` | `[{ "cidr", "interface", "public" }]`：只在桌面与服务器的完整节点给出；`public` 为 `true` 的不可通告 |
 | `ipForwarding` | `on`、`off`、`not_needed`；只在完整节点给出 |
+| `tunnel.routes` | 应进入隧道的网段（CIDR 列表）：所有已加入网络的虚拟网段，加上当前路由到组网的通告子网（与本机网络冲突、内网范围外、或用户设为 `local` 的不在内），再按 `routing.system_routes` 限制。去重，顺序稳定 |
+| `tunnel.routesVersion` | 整数，`routes` 每变一次加一；引擎重启后从 1 起 |
+| `tunnel.dns` | `null`，或 `{ "servers": [地址], "matchDomains": [后缀] }`：内网域名开启时只对这些后缀生效（需求 R28） |
 
 ### 失败与冲突原因
 
@@ -66,6 +70,16 @@
 | `unreachable_peers` | 所有初始对端都连不上 |
 
 新增取值属于兼容变更，读取方遇到未知取值按失败处理。
+
+## 隧道生命周期（需求 R23）
+
+组网的加入开关与代理的连接开关互相独立，任一开启即建立 VPN。
+
+- **只开组网**：客户端照常下发普通 profile，不需要专门的模式标记。profile 里只有组网出站、没有代理出站时，路由规则只把 `tunnel.routes` 指向组网，其余流量不进隧道（手机上 `includedRoutes` 只放 `tunnel.routes`，桌面只装这些路由）。
+- **加入与退出是热操作**：`mesh_save_network`、`mesh_join`、`mesh_leave`、`mesh_remove_network` 都不重启引擎，也不影响代理出站。
+- **代理开关不打断组网**：代理连上或断开时，客户端重新下发 profile（增加或去掉代理出站）。只要网络配置没变，组网实例按 `network.id` 保留，会话与成员连接不断；配置变了才重建该网络。
+- **路由由引擎给出**：客户端不自己算网段，通告子网是动态的。客户端在组网加入期间读取 `mesh_status`（前台每 2 秒、后台每 10 秒，或在现有状态变化通知到来时），`tunnel.routesVersion` 变化时重新应用一次隧道网络设置（手机上的 `includedRoutes`、DNS 匹配域），重新应用之间至少间隔 1 秒。
+- 组网与代理都关闭时，客户端关闭 VPN。
 
 ## 命令
 

@@ -111,10 +111,12 @@ pub struct FeatureFlags {
 
 impl FeatureFlags {
     /// What this node announces (spec §12.3): no KCP or QUIC, no direct
-    /// connections yet, and an access node asks not to be used as a relay.
-    pub fn ours(access_node: bool) -> Self {
+    /// connections yet, and a node that does not relay (every access node,
+    /// and a full node with `relay: false`) asks not to be used as one.
+    /// `relays` is [`crate::config::MeshSettings::relay`].
+    pub fn ours(relays: bool) -> Self {
         Self {
-            avoid_relay_data: access_node,
+            avoid_relay_data: !relays,
             no_relay_kcp: true,
             no_relay_quic: true,
             disable_p2p: true,
@@ -571,7 +573,7 @@ mod tests {
             last_update: (1_700_000_000, 5),
             version: 4,
             version_string: "2.6.4-compat".into(),
-            features: FeatureFlags::ours(true),
+            features: FeatureFlags::ours(false),
             route_id: 0xdead_beef_0000_0001,
             network_length: 24,
             ipv6: Some(("fd00::7".parse().unwrap(), 64)),
@@ -579,6 +581,13 @@ mod tests {
             noise_pubkey: vec![9; 32],
             raw: Vec::new(),
         }
+    }
+
+    #[test]
+    fn nodes_that_do_not_relay_say_so() {
+        // Access nodes and full nodes with `relay: false` alike.
+        assert!(FeatureFlags::ours(false).avoid_relay_data);
+        assert!(!FeatureFlags::ours(true).avoid_relay_data);
     }
 
     #[test]
