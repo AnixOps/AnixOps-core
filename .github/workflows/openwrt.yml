@@ -288,11 +288,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { release: "23.05", arch: x86_64, format: ipk, image: IMAGE_X86_64_2305 }
-          - { release: "24.10", arch: x86_64, format: ipk, image: IMAGE_X86_64_2410 }
-          - { release: "25.12", arch: x86_64, format: apk, image: IMAGE_X86_64_2512 }
-          - { release: "24.10", arch: aarch64_generic, format: ipk, image: IMAGE_AARCH64_2410, emulate: true }
-          - { release: "25.12", arch: aarch64_generic, format: apk, image: IMAGE_AARCH64_2512, emulate: true }
+          - { release: "23.05", arch: x86_64, format: ipk, image: IMAGE_X86_64_2305, platform: linux/amd64 }
+          - { release: "24.10", arch: x86_64, format: ipk, image: IMAGE_X86_64_2410, platform: linux/amd64 }
+          - { release: "25.12", arch: x86_64, format: apk, image: IMAGE_X86_64_2512, platform: linux/amd64 }
+          - { release: "24.10", arch: aarch64_generic, format: ipk, image: IMAGE_AARCH64_2410, platform: linux/arm64, emulate: true }
+          - { release: "25.12", arch: aarch64_generic, format: apk, image: IMAGE_AARCH64_2512, platform: linux/arm64, emulate: true }
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -320,9 +320,12 @@ jobs:
           IMAGE: ${{ env[matrix.image] }}
           FORMAT: ${{ matrix.format }}
           ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          docker run --rm \
+          # Some image digests name a multi-platform index; select the
+          # platform explicitly instead of relying on the host's.
+          docker run --rm --platform "${PLATFORM}" \
             -v "${PWD}/dist/openwrt:/pkgs:ro" \
             -v "${PWD}/apps/mesh-node/openwrt/tests:/tests:ro" \
             "${IMAGE}" /bin/sh /tests/container-test.sh /pkgs "${FORMAT}" "${ARCH}"
