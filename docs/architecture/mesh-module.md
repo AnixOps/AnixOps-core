@@ -84,6 +84,7 @@
 | `network.name` / `secret` | 网络名按原样参与摘要（不去空格）；密钥由钥匙串注入 |
 | `network.kind` | `managed`（默认，区域网络，只能安全模式）或 `legacy`（迁移中的旧网） |
 | `network.secure_mode` | `true` 安全模式，`false` 旧模式；省略时按 `kind`；全网一致（规范 §5.2） |
+| `network.native_keys` | 可省略。我方节点的安全模式静态公钥清单（每项 32 字节，base64），由面板经 Agent 下发，只用于状态接口的 `members[].implementation` 判定（规范 §19.2 第 5 条），不影响认证与互通 |
 | `network.cipher` | 旧模式算法：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；不提供异或。`none` 为不加密，只有显式写出才生效，不能与安全模式同用，界面标出“未加密”（需求 R14）；未选择时本节点丢弃不加密网络的明文流量 |
 | `node.address` | IPv4 虚拟地址与前缀（/8–/30），前缀即虚拟网段 |
 | `node.role` | `full` 或 `access`；缺省按平台：桌面与服务器 `full`，iOS、Android 只能 `access`（R10） |
