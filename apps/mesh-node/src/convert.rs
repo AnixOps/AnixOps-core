@@ -2,8 +2,10 @@
 //! (config v1 of the `"type": "mesh"` outbound, requirement R13).
 //!
 //! Only what interworking needs is taken: network name, secret, handshake
-//! mode and cipher, virtual addresses, listeners, peers, advertised subnets
-//! and the route policy. Everything else is listed in the report.
+//! mode and cipher, virtual addresses, host name, MTU, relaying, listeners,
+//! peers, advertised subnets, the route policy and the system route scope.
+//! The network is always written as `"kind": "legacy"`. Everything else is
+//! listed in the report.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -21,6 +23,9 @@ pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_PORT: u16 = 11010;
 /// MTU our node uses when the configuration names none.
 pub const DEFAULT_MTU: i64 = 1380;
+const MIN_MTU: i64 = 1280;
+const MAX_MTU: i64 = 9000;
+const MAX_HOSTNAME_BYTES: usize = 63;
 const MAX_PEERS: usize = 64;
 const MAX_SUBNETS: usize = 256;
 const MAX_NETWORK_NAME_BYTES: usize = 255;
@@ -186,6 +191,15 @@ fn shorthand_port(profile: &Profile, scheme: &str) -> Option<u16> {
         .iter()
         .find(|transport| transport.name == scheme)?;
     shorthand.default_port.checked_add(transport.offset)
+}
+
+/// One DNS label (RFC 1123), as the node's `hostname` must be.
+fn is_dns_label(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_HOSTNAME_BYTES
+        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !text.starts_with('-')
+        && !text.ends_with('-')
 }
 
 pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions) -> Converted {
@@ -718,13 +732,23 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
         );
         peers.truncate(MAX_PEERS);
     }
-    if peers.is_empty() {
+    if peers.is_empty() && listen_json.is_empty() {
         items.push(
             item(
                 Field::Peers.name(),
                 ItemStatus::Blocked,
                 "no_peer",
-                "没有可用的 TCP 或 UDP 对端；配置至少需要一个对端地址。",
+                "没有可用的 TCP 或 UDP 对端，也没有监听地址，本节点无法与其他节点相连。",
+            )
+            .at(peer_origin),
+        );
+    } else if peers.is_empty() {
+        items.push(
+            item(
+                Field::Peers.name(),
+                ItemStatus::Imported,
+                "listen_only",
+                "没有对端；本节点只等待其他节点连接。",
             )
             .at(peer_origin),
         );
@@ -865,62 +889,125 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
         .at(collected.origin(Field::LatencyFirst))
         .with_value(policy),
     );
-    if collected.bool(Field::RelayDisabled) == Some(true) {
+    let mut relay = None;
+    if let Some(disabled) = collected.bool(Field::RelayDisabled) {
+        relay = Some(!disabled);
         items.push(
             item(
                 Field::RelayDisabled.name(),
-                ItemStatus::NeedsConfirmation,
-                "not_yet_supported",
-                "原节点不替其他节点中转；当前配置格式暂无此项，导入后本节点会参与中转，请确认。",
+                ItemStatus::Imported,
+                "imported",
+                "已导入。",
             )
-            .at(collected.origin(Field::RelayDisabled)),
+            .at(collected.origin(Field::RelayDisabled))
+            .with_value((!disabled).to_string()),
         );
     }
+    let mut system_routes: Option<Vec<String>> = None;
     if let Some(routes) = collected.list(Field::SystemRoutes) {
+        let origin = collected.origin(Field::SystemRoutes);
+        let mut kept: Vec<String> = Vec::new();
+        for route in routes {
+            match Cidr::parse(&route.value) {
+                Some(cidr) if is_intranet(&cidr) => {
+                    let network = cidr.network_text();
+                    if !kept.contains(&network) {
+                        kept.push(network);
+                    }
+                }
+                parsed => items.push(
+                    item(
+                        Field::SystemRoutes.name(),
+                        ItemStatus::NeedsConfirmation,
+                        if parsed.is_some() {
+                            "public_system_route"
+                        } else {
+                            "invalid_system_route"
+                        },
+                        "该网段不是内网网段或无法解析，不写入系统路由范围。",
+                    )
+                    .at(origin)
+                    .with_value(route.value.clone()),
+                ),
+            }
+        }
+        if kept.len() > MAX_SUBNETS {
+            items.push(
+                item(
+                    Field::SystemRoutes.name(),
+                    ItemStatus::NeedsConfirmation,
+                    "too_many_system_routes",
+                    &format!("系统路由范围超过 {MAX_SUBNETS} 项，只导入前 {MAX_SUBNETS} 项。"),
+                )
+                .at(origin),
+            );
+            kept.truncate(MAX_SUBNETS);
+        }
         items.push(
             item(
                 Field::SystemRoutes.name(),
-                ItemStatus::NeedsConfirmation,
-                "not_yet_supported",
-                "原节点只把指定网段写入系统路由；当前配置格式暂无此项，导入后会安装全部已接受的路由，请确认。",
+                ItemStatus::Imported,
+                "imported",
+                "已导入；只有这些网段内的路由写入系统路由表。",
             )
-            .at(collected.origin(Field::SystemRoutes))
-            .with_value(
-                routes
-                    .iter()
-                    .map(|route| route.value.clone())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
+            .at(origin)
+            .with_value(kept.join(", ")),
         );
+        system_routes = Some(kept);
     }
+    let mut mtu_value = None;
     if let Some(mtu) = collected.integer(Field::Mtu) {
-        items.push(
+        let in_range = (MIN_MTU..=MAX_MTU).contains(&mtu);
+        if in_range && mtu != DEFAULT_MTU {
+            mtu_value = Some(mtu);
+        }
+        let entry = if in_range {
             item(
                 Field::Mtu.name(),
-                if mtu == DEFAULT_MTU {
-                    ItemStatus::Dropped
-                } else {
-                    ItemStatus::NeedsConfirmation
-                },
-                "not_yet_supported",
-                "当前配置格式暂无 MTU 项，使用默认值 1380。",
+                ItemStatus::Imported,
+                "imported",
+                "已导入。",
             )
-            .at(collected.origin(Field::Mtu))
-            .with_value(mtu.to_string()),
+        } else {
+            item(
+                Field::Mtu.name(),
+                ItemStatus::NeedsConfirmation,
+                "mtu_out_of_range",
+                &format!("MTU 超出 {MIN_MTU}–{MAX_MTU}，未导入，使用默认值 {DEFAULT_MTU}。"),
+            )
+        };
+        items.push(
+            entry
+                .at(collected.origin(Field::Mtu))
+                .with_value(mtu.to_string()),
         );
     }
+    let mut hostname_value = None;
     if let Some(hostname) = collected.text(Field::Hostname) {
-        items.push(
-            item(
-                Field::Hostname.name(),
-                ItemStatus::Dropped,
-                "not_yet_supported",
-                "当前配置格式暂无主机名项，使用系统主机名。",
-            )
-            .at(collected.origin(Field::Hostname))
-            .with_value(hostname.to_string()),
-        );
+        if is_dns_label(hostname) {
+            hostname_value = Some(hostname.to_string());
+            items.push(
+                item(
+                    Field::Hostname.name(),
+                    ItemStatus::Imported,
+                    "imported",
+                    "已导入。",
+                )
+                .at(collected.origin(Field::Hostname))
+                .with_value(hostname.to_string()),
+            );
+        } else {
+            items.push(
+                item(
+                    Field::Hostname.name(),
+                    ItemStatus::NeedsConfirmation,
+                    "hostname_invalid",
+                    "主机名只能含字母、数字和连字符（最长 63 字节），未导入，使用系统主机名。",
+                )
+                .at(collected.origin(Field::Hostname))
+                .with_value(hostname.to_string()),
+            );
+        }
     }
 
     let blocked = items
@@ -942,11 +1029,21 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
             if let Some(v6) = address_v6 {
                 node["address_v6"] = json!(v6.to_string());
             }
+            if let Some(hostname) = hostname_value {
+                node["hostname"] = json!(hostname);
+            }
+            if let Some(mtu) = mtu_value {
+                node["mtu"] = json!(mtu);
+            }
+            if let Some(relay) = relay {
+                node["relay"] = json!(relay);
+            }
             let mut config = json!({
                 "config_version": CONFIG_VERSION,
                 "network": {
                     "name": name,
                     "secret": secret,
+                    "kind": "legacy",
                     "secure_mode": secure_mode,
                     "cipher": cipher,
                 },
@@ -961,6 +1058,9 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
             });
             if !advertise.is_empty() {
                 config["subnets"] = json!({ "advertise": advertise });
+            }
+            if let Some(routes) = system_routes {
+                config["routing"]["system_routes"] = json!(routes);
             }
             Some(config)
         }
@@ -1051,6 +1151,7 @@ mod tests {
                 "network": {
                     "name": "office",
                     "secret": "s3cret",
+                    "kind": "legacy",
                     "secure_mode": false,
                     "cipher": "aes-256-gcm",
                 },
@@ -1218,7 +1319,15 @@ mod tests {
                 "address_is_broadcast",
             ),
             (
-                vec!["--net-name", "n", "--net-secret", "s", "-i", "10.0.0.2/24"],
+                vec![
+                    "--net-name",
+                    "n",
+                    "--net-secret",
+                    "s",
+                    "-i",
+                    "10.0.0.2/24",
+                    "--no-listen",
+                ],
                 "no_peer",
             ),
             (
@@ -1303,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_is_assumed_and_pending_fields_are_reported() {
+    fn prefix_is_assumed_and_node_options_are_imported() {
         let args = [
             "--net-name",
             "n",
@@ -1317,30 +1426,83 @@ mod tests {
             "1400",
             "--no-relay",
             "--routes",
-            "10.5.0.0/16",
+            "10.5.0.0/16,8.8.8.0/24,10.5.1.0/24",
             "--hostname",
             "box",
             "--private-key",
             "k",
         ];
         let converted = run(&args, &ImportOptions::default());
+        let config = converted.config.clone().expect("config");
+        assert_valid(&config);
+        assert_eq!(config["node"]["address"], json!("10.0.0.2/24"));
+        assert_eq!(config["node"]["mtu"], json!(1400));
+        assert_eq!(config["node"]["relay"], json!(false));
+        assert_eq!(config["node"]["hostname"], json!("box"));
         assert_eq!(
-            converted.config.as_ref().unwrap()["node"]["address"],
-            json!("10.0.0.2/24")
+            config["routing"]["system_routes"],
+            json!(["10.5.0.0/16", "10.5.1.0/24"])
         );
         let confirm = codes(&converted, ItemStatus::NeedsConfirmation);
         for code in [
             "prefix_assumed",
             "static_key_not_imported",
-            "not_yet_supported",
+            "public_system_route",
         ] {
             assert!(confirm.iter().any(|c| c == code), "{code}: {confirm:?}");
         }
-        assert_eq!(
-            confirm.iter().filter(|c| *c == "not_yet_supported").count(),
-            3
+        assert!(!confirm.iter().any(|c| c == "not_yet_supported"));
+    }
+
+    #[test]
+    fn invalid_node_options_are_not_written() {
+        let mut args = BASE.to_vec();
+        args.extend(["--mtu", "1380", "--hostname", "my_box.lan"]);
+        let converted = run(&args, &ImportOptions::default());
+        let config = converted.config.clone().expect("config");
+        assert_valid(&config);
+        assert!(config["node"].get("mtu").is_none());
+        assert!(config["node"].get("hostname").is_none());
+        assert!(config["node"].get("relay").is_none());
+        assert!(config["routing"].get("system_routes").is_none());
+        let confirm = codes(&converted, ItemStatus::NeedsConfirmation);
+        assert!(
+            confirm.contains(&"hostname_invalid".to_string()),
+            "{confirm:?}"
         );
-        assert!(codes(&converted, ItemStatus::Dropped).contains(&"not_yet_supported".to_string()));
+        assert!(
+            !confirm.contains(&"mtu_out_of_range".to_string()),
+            "{confirm:?}"
+        );
+
+        let mut args = BASE.to_vec();
+        args.extend(["--mtu", "70000"]);
+        let converted = run(&args, &ImportOptions::default());
+        assert!(converted.config.as_ref().unwrap()["node"]
+            .get("mtu")
+            .is_none());
+        let confirm = codes(&converted, ItemStatus::NeedsConfirmation);
+        assert!(
+            confirm.contains(&"mtu_out_of_range".to_string()),
+            "{confirm:?}"
+        );
+    }
+
+    #[test]
+    fn a_listening_node_without_peers_is_imported() {
+        let args = [
+            "--net-name",
+            "hub",
+            "--net-secret",
+            "s",
+            "-i",
+            "10.0.0.1/24",
+        ];
+        let converted = run(&args, &ImportOptions::default());
+        let config = converted.config.clone().expect("config");
+        assert_valid(&config);
+        assert_eq!(config["peers"], json!([]));
+        assert!(codes(&converted, ItemStatus::Imported).contains(&"listen_only".to_string()));
     }
 
     #[test]
