@@ -13,14 +13,14 @@ use mesh_node::host::{Host, RealHost};
 use mesh_node::import::import;
 use mesh_node::profile::Profile;
 use mesh_node::source::Invocation;
-use mesh_node::takeover::{rollback, takeover};
+use mesh_node::takeover::{rollback_forgetting, takeover};
 
 const USAGE: &str = "usage:
   anixops-mesh detect   --profile FILE
   anixops-mesh import   --profile FILE [--out-dir DIR] [--report FILE]
                         [--allow-unencrypted] [--address CIDR] [-- ARGS...]
   anixops-mesh takeover --profile FILE --state-dir DIR [--dry-run] [--report FILE]
-  anixops-mesh rollback --state-dir DIR [--report FILE]
+  anixops-mesh rollback --state-dir DIR [--forget-process PID... --confirm] [--report FILE]
   anixops-mesh capabilities
   anixops-mesh version";
 
@@ -35,6 +35,9 @@ struct Options {
     address: Option<String>,
     allow_unencrypted: bool,
     dry_run: bool,
+    /// `rollback`: recorded processes the operator started again by hand.
+    forget: Vec<u32>,
+    confirm: bool,
     /// Arguments after `--`: import this command line instead of detecting.
     manual: Option<Vec<String>>,
 }
@@ -62,6 +65,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         address: None,
         allow_unencrypted: false,
         dry_run: false,
+        forget: Vec::new(),
+        confirm: false,
         manual: None,
     };
     let mut index = 0;
@@ -78,6 +83,15 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--address" => options.address = Some(take(args, &mut index, arg)?),
             "--allow-unencrypted" => options.allow_unencrypted = true,
             "--dry-run" => options.dry_run = true,
+            "--forget-process" => {
+                let value = take(args, &mut index, arg)?;
+                options.forget.push(
+                    value
+                        .parse()
+                        .map_err(|_| format!("{arg} needs a process id, not {value}"))?,
+                );
+            }
+            "--confirm" => options.confirm = true,
             "--" => {
                 options.manual = Some(args[index..].to_vec());
                 break;
@@ -218,8 +232,14 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
             let Some(state) = &options.state_dir else {
                 return Err(fail("usage", "--state-dir is required"));
             };
-            let report =
-                rollback(&host, state).map_err(|error| fail("rollback", &error.to_string()))?;
+            if !options.forget.is_empty() && !options.confirm {
+                return Err(fail(
+                    "usage",
+                    "--forget-process drops a recorded process without starting it; start it again by hand first, then add --confirm",
+                ));
+            }
+            let report = rollback_forgetting(&host, state, &options.forget)
+                .map_err(|error| fail("rollback", &error.to_string()))?;
             emit(&host, &report, options.report.as_deref())?;
             Ok(if report.ok {
                 ExitCode::SUCCESS
