@@ -16,6 +16,7 @@
 //! credentials (UUIDs, passwords, private keys) out of error messages.
 
 pub mod accept;
+pub mod backbone;
 pub mod gauge;
 pub mod happy_eyeballs;
 pub mod mux;
