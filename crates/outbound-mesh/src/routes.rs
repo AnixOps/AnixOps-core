@@ -13,7 +13,8 @@
 //! a packet travels through relay peers, the session layer resolves the path
 //! to the owner and reports the originating peer of what it delivers. Path
 //! choice (lowest latency or fewest hops, or a path the user fixed) belongs
-//! to that layer.
+//! to that layer; a custom path for a subnet first finds the owner here by
+//! longest prefix and then uses that owner's path policy.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -316,6 +317,7 @@ mod tests {
             "address": "10.144.144.5/24",
             "address_v6": "fd00:aa::5/64",
             "peers": [{"server": "peer.example", "port": 40000}],
+            "security": "default",
         });
         for (key, value) in extra.as_object().unwrap() {
             config[key] = value.clone();

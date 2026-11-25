@@ -40,10 +40,10 @@ pub struct MeshConfig {
     /// scope of [`crate::scope`].
     #[serde(default)]
     pub allowed_subnets: Vec<String>,
-    /// Whether sessions without forward secrecy are accepted; see
-    /// [`SecurityMode`]. Absent: `"preferred"`.
-    #[serde(default)]
-    pub forward_secrecy: SecurityMode,
+    /// The network's handshake mode, the same on every node of the
+    /// network; see [`SecurityMode`]. Required, so a config never falls into
+    /// a mode nobody chose.
+    pub security: SecurityMode,
 }
 
 /// One bootstrap peer.
@@ -61,20 +61,24 @@ pub struct PeerEndpoint {
     pub port: u16,
 }
 
-/// Which handshakes a node accepts, negotiated per connection.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+/// The handshake mode of a network. Every node of one network uses the same
+/// mode; there is no per-connection negotiation.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityMode {
-    /// `"preferred"`, the default: a session with forward secrecy when the
-    /// peer offers one, otherwise the network's default handshake, which has
-    /// none. Each session reports which one it got, so the interface can mark
-    /// the ones without forward secrecy. Networks whose nodes do not enable
-    /// forward secrecy need this mode to interoperate.
-    #[default]
-    Preferred,
-    /// `"required"`: only sessions with forward secrecy; peers that cannot
-    /// do that are refused.
-    Required,
+    /// `"default"`: the network's default handshake, which has no forward
+    /// secrecy. Sessions in this mode are reported as such so the interface
+    /// can mark them. Networks whose nodes do not enable forward secrecy
+    /// need this mode to interoperate.
+    Default,
+    /// `"forward_secrecy"`: the handshake with forward secrecy.
+    ForwardSecrecy,
+}
+
+impl SecurityMode {
+    pub fn has_forward_secrecy(self) -> bool {
+        self == SecurityMode::ForwardSecrecy
+    }
 }
 
 /// Validated settings. Has no `Debug`: it holds the secret.
@@ -181,7 +185,7 @@ impl MeshConfig {
             address_v6,
             peers,
             allowed_subnets,
-            security: self.forward_secrecy,
+            security: self.security,
         })
     }
 }
@@ -219,6 +223,7 @@ mod tests {
             "network_secret": "s3cret",
             "address": "10.144.144.5/24",
             "peers": [{"server": "peer.example", "port": 40000}],
+            "security": "default",
         })
     }
 
@@ -235,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_config_validates_with_forward_secrecy_preferred() {
+    fn minimal_config_validates() {
         let settings = validate(base()).unwrap();
         assert_eq!(settings.network_name, "office");
         assert_eq!(settings.address.to_string(), "10.144.144.0/24");
@@ -247,7 +252,8 @@ mod tests {
             settings.virtual_subnets(),
             vec![IpNet::parse("10.144.144.0/24").unwrap()]
         );
-        assert_eq!(settings.security, SecurityMode::Preferred);
+        assert_eq!(settings.security, SecurityMode::Default);
+        assert!(!settings.security.has_forward_secrecy());
         assert!(settings.allowed_subnets.is_empty());
         assert_eq!(
             settings.peers,
@@ -259,14 +265,19 @@ mod tests {
     }
 
     #[test]
-    fn forward_secrecy_can_be_required() {
-        let settings = validate(with("forward_secrecy", json!("required"))).unwrap();
-        assert_eq!(settings.security, SecurityMode::Required);
-        let settings = validate(with("forward_secrecy", json!("preferred"))).unwrap();
-        assert_eq!(settings.security, SecurityMode::Preferred);
-        assert!(
-            serde_json::from_value::<MeshConfig>(with("forward_secrecy", json!("off"))).is_err()
-        );
+    fn security_mode_is_required_and_closed() {
+        let settings = validate(with("security", json!("forward_secrecy"))).unwrap();
+        assert_eq!(settings.security, SecurityMode::ForwardSecrecy);
+        assert!(settings.security.has_forward_secrecy());
+        for value in [json!("off"), json!("preferred"), json!(true), json!(null)] {
+            assert!(
+                serde_json::from_value::<MeshConfig>(with("security", value.clone())).is_err(),
+                "{value}"
+            );
+        }
+        let mut missing = base();
+        missing.as_object_mut().unwrap().remove("security");
+        assert!(serde_json::from_value::<MeshConfig>(missing).is_err());
     }
 
     #[test]
