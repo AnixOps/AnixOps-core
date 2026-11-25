@@ -24,7 +24,7 @@ use crate::legacy::cipher::LegacyCipher;
 use crate::legacy::handshake::{self as legacy, HandshakeMessage, DIGEST_LEN};
 use crate::secure::handshake::{Auth, Client, HandshakeError, Local, Server};
 use crate::secure::noise::LEN;
-use crate::secure::session::{Namespace, SessionKey, Sessions};
+use crate::secure::session::{Namespace, SessionError, SessionKey, Sessions};
 use crate::secure::traffic::TrafficError;
 use crate::wire::header::{flags, packet_type, NodeHeader, HEADER_LEN};
 
@@ -78,6 +78,10 @@ pub enum Step {
     Up(Vec<Vec<u8>>, Up),
     /// Write these packets, then close.
     Close(Vec<Vec<u8>>, CloseReason),
+    /// A handshake with the same peer is setting up a session: feed this
+    /// packet again once that one is up or closed. The connection's
+    /// handshake deadline keeps running.
+    Retry,
 }
 
 /// What the handshake needs from the node. `peer_key` gives the static key
@@ -201,6 +205,7 @@ impl Link {
             }
             Step::Up(_, up) => self.phase = Phase::Up(*up),
             Step::Close(..) => self.phase = Phase::Closed,
+            Step::Retry => self.phase = Phase::ServerWaiting,
         }
         step
     }
@@ -231,6 +236,7 @@ impl Link {
                             self.phase = Phase::ServerSecure(Box::new(server));
                             Step::Send(vec![reply])
                         }
+                        Err(HandshakeError::Session(SessionError::Busy)) => Step::Retry,
                         Err(error) => Step::Close(Vec::new(), secure_close(error)),
                     }
                 }
@@ -622,14 +628,16 @@ mod tests {
             let mut to_client = Vec::new();
             for received in to_server.drain(..) {
                 let step = with(server, |hs| at_server.handshake(hs, &received));
-                let (Step::Send(out) | Step::Up(out, _) | Step::Close(out, _)) = &step;
-                to_client.extend(out.iter().cloned());
+                if let Step::Send(out) | Step::Up(out, _) | Step::Close(out, _) = &step {
+                    to_client.extend(out.iter().cloned());
+                }
                 last.1 = step;
             }
             for received in to_client {
                 let step = with(client, |hs| at_client.handshake(hs, &received));
-                let (Step::Send(out) | Step::Up(out, _) | Step::Close(out, _)) = &step;
-                to_server.extend(out.iter().cloned());
+                if let Step::Send(out) | Step::Up(out, _) | Step::Close(out, _) = &step {
+                    to_server.extend(out.iter().cloned());
+                }
                 last.0 = step;
             }
         }
@@ -748,6 +756,43 @@ mod tests {
         let mut b = Side::new(3, b"s3cr3t", SecurityMode::ForwardSecrecy);
         let (_, at_b) = connect(&mut a, &mut b);
         assert_eq!(at_b, Step::Close(Vec::new(), CloseReason::SameNodeId));
+    }
+
+    #[test]
+    fn a_second_msg1_waits_for_the_first_create() {
+        let mut a = Side::new(1, b"s3cr3t", SecurityMode::ForwardSecrecy);
+        let mut b = Side::new(2, b"s3cr3t", SecurityMode::ForwardSecrecy);
+        let (mut first, msg1) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        let (mut second, other_msg1) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        let mut at_b = Link::server(Instant::now());
+        let mut at_b_too = Link::server(Instant::now());
+
+        let Step::Send(msg2) = with(&mut b, |hs| at_b.handshake(hs, &msg1)) else {
+            panic!("msg2 expected");
+        };
+        assert_eq!(
+            with(&mut b, |hs| at_b_too.handshake(hs, &other_msg1)),
+            Step::Retry
+        );
+        let Step::Up(msg3, _) = with(&mut a, |hs| first.handshake(hs, &msg2[0])) else {
+            panic!("up expected");
+        };
+        assert!(matches!(
+            with(&mut b, |hs| at_b.handshake(hs, &msg3[0])),
+            Step::Up(..)
+        ));
+
+        // Now the second connection goes ahead.
+        let Step::Send(msg2) = with(&mut b, |hs| at_b_too.handshake(hs, &other_msg1)) else {
+            panic!("msg2 expected");
+        };
+        let Step::Up(msg3, _) = with(&mut a, |hs| second.handshake(hs, &msg2[0])) else {
+            panic!("up expected");
+        };
+        assert!(matches!(
+            with(&mut b, |hs| at_b_too.handshake(hs, &msg3[0])),
+            Step::Up(..)
+        ));
     }
 
     #[test]

@@ -886,7 +886,8 @@ mod tests {
         let (at_client, mut at_server) = (Sessions::new(), Sessions::new());
 
         let (client_side, msg1) = Client::start(&client, Some(2), &at_client, &rng).unwrap();
-        let (_, msg2) = Server::respond(&server, 1, &msg1, &mut at_server, &rng, now).unwrap();
+        let (_, msg2) =
+            Server::respond(&server, 1, &msg1, &mut Sessions::new(), &rng, now).unwrap();
         assert_eq!(
             client_side
                 .finish(

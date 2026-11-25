@@ -40,8 +40,8 @@ use super::traffic::{keys_equal, Receiver, Sender, TrafficError, ROOT_KEY_LEN};
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most sessions held at once, over both namespaces.
 pub const MAX_SESSIONS: usize = 4096;
-/// How long a Create in progress is shared with other msg1 from the same
-/// peer: the handshake timeout (spec §5.3).
+/// How long a Create in progress holds back other msg1 from the same peer:
+/// the handshake timeout (spec §5.3).
 pub const CREATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Relay msg1 remembered per session to answer repeats.
 pub const REMEMBERED_ANSWERS: usize = 16;
@@ -94,6 +94,9 @@ pub enum SessionError {
     NothingToJoin,
     /// [`MAX_SESSIONS`] are held.
     Full,
+    /// A Create with this peer is in progress: handle the msg1 again once
+    /// it is installed, has failed or has timed out ([`CREATE_TIMEOUT`]).
+    Busy,
     /// The session of this node ID is in use and was set up by a peer with
     /// another static key.
     StaticKeyMismatch,
@@ -169,27 +172,22 @@ fn random_root_key(rng: &dyn SecureRandom) -> Result<[u8; ROOT_KEY_LEN], Session
     Ok(key)
 }
 
-/// A Create this node chose and has not installed yet. Wiped on drop.
+/// A Create this node chose and has not installed yet.
 struct Creating {
     generation: u32,
-    root_key: [u8; ROOT_KEY_LEN],
-    ciphers: Ciphers,
     until: Instant,
-}
-
-impl Drop for Creating {
-    fn drop(&mut self) {
-        self.root_key.zeroize();
-    }
 }
 
 /// The sessions of this node.
 ///
 /// Generations only go up within the process, per peer, also across a
-/// session dropped and set up again. While a Create for a peer is in
-/// progress, every other msg1 from it gets the same root key and
-/// generation, so connections set up at once (over TCP and UDP, say) end
-/// up in one session.
+/// session dropped and set up again. Creates with one peer are serialised:
+/// while one is in progress, another msg1 that would need a Create gets
+/// [`SessionError::Busy`] and is handled again once the first is installed,
+/// has failed or has timed out. Its root key is never handed out twice:
+/// direct msg2 goes out before the client is authenticated, so a forged
+/// msg1 would otherwise read the key, and a second connection starting at
+/// sequence 0 under it would reuse nonces.
 #[derive(Default)]
 pub struct Sessions {
     map: HashMap<SessionKey, Session>,
@@ -256,15 +254,12 @@ impl Sessions {
                 }
             }
         }
-        if let Some(creating) = self.creating.get(key) {
-            if now < creating.until && creating.ciphers == ciphers {
-                return Ok(Agreement {
-                    action: Action::Create,
-                    generation: creating.generation,
-                    root_key: creating.root_key,
-                    initial_epoch: 0,
-                });
-            }
+        if self
+            .creating
+            .get(key)
+            .is_some_and(|creating| now < creating.until)
+        {
+            return Err(SessionError::Busy);
         }
         let last = self
             .generations
@@ -280,8 +275,6 @@ impl Sessions {
             key.clone(),
             Creating {
                 generation,
-                root_key,
-                ciphers,
                 until: now + CREATE_TIMEOUT,
             },
         );
@@ -523,21 +516,30 @@ mod tests {
         assert_eq!(join.action, Action::Join);
         assert_eq!(join.root_key, first.root_key);
 
-        // Another generation, none, or other ciphers: a new session. While
-        // one Create is in progress, msg1 with the same ciphers share it.
-        let mut created = Vec::new();
-        for (generation, peer_cipher) in [(Some(5), CHACHA), (None, CHACHA), (Some(1), AES)] {
+        // Another generation, none, or other ciphers: a new session, one at
+        // a time; the key of one in progress is never handed out again.
+        let mut generation = 1;
+        for (asked, peer_cipher) in [(Some(5), CHACHA), (None, CHACHA), (Some(1), AES)] {
             let choice = sessions
-                .server_choice(&direct, generation, c(AES, peer_cipher), &rng, now)
+                .server_choice(&direct, asked, c(AES, peer_cipher), &rng, now)
                 .unwrap();
             assert_eq!(choice.action, Action::Create);
             assert_ne!(choice.root_key, first.root_key);
-            created.push((choice.generation, choice.root_key));
+            generation += 1;
+            assert_eq!(choice.generation, generation);
+            assert_eq!(
+                sessions
+                    .server_choice(&direct, None, c(AES, AES), &rng, now)
+                    .err(),
+                Some(SessionError::Busy)
+            );
+            // Join still works while a Create is in progress.
+            let join = sessions
+                .server_choice(&direct, Some(1), c(AES, CHACHA), &rng, now)
+                .unwrap();
+            assert_eq!(join.action, Action::Join);
+            sessions.abandon(&direct, choice.generation);
         }
-        assert_eq!(created[0], created[1]);
-        assert_eq!(created[0].0, 2);
-        assert_eq!(created[2].0, 3, "other ciphers: another Create");
-        assert_ne!(created[2].1, created[0].1);
     }
 
     #[test]
@@ -771,7 +773,13 @@ mod tests {
             .server_choice(&direct, None, c(AES, AES), &rng, now)
             .unwrap();
         assert_eq!(third.generation, 3);
-        // A Create in progress is shared only until it times out.
+        // A Create in progress holds others back only until it times out.
+        assert_eq!(
+            sessions
+                .server_choice(&direct, None, c(AES, AES), &rng, now)
+                .err(),
+            Some(SessionError::Busy)
+        );
         let later = sessions
             .server_choice(&direct, None, c(AES, AES), &rng, now + CREATE_TIMEOUT)
             .unwrap();
