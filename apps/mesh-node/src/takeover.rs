@@ -99,6 +99,10 @@ pub enum Action {
         /// `false` for processes a service manager restarts on rollback.
         restart: bool,
         killed: bool,
+        /// The network namespace it ran in, as `/proc/<pid>/ns/net` names
+        /// it; a rollback looks for a copy already running there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net_ns: Option<String>,
     },
 }
 
@@ -266,7 +270,7 @@ fn save_manifest(host: &dyn Host, state: &Path, manifest: &Manifest) -> Result<(
     let text = serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?;
     // It holds the command lines of ended processes, which may include
     // secrets: owner only.
-    host.write(&state.join(MANIFEST), text.as_bytes(), 0o600, None)
+    host.write_state(&state.join(MANIFEST), text.as_bytes())
         .map_err(|error| error.to_string())
 }
 
@@ -473,7 +477,7 @@ fn execute(
             host.create_dir_all(&dir, 0o700)
                 .map_err(|error| format!("{}: {error}", dir.display()))?;
             let copy = dir.join(format!("{}-{index}-{name}", host.now_unix()));
-            host.write(&copy, &bytes, 0o600, None)
+            host.write_state(&copy, &bytes)
                 .map_err(|error| format!("{}: {error}", copy.display()))?;
             Ok(vec![Action::Backup {
                 path: path.clone(),
@@ -594,44 +598,102 @@ fn alive(host: &dyn Host, pid: u32, exe: &str) -> bool {
     }
 }
 
+/// Whether the program already runs again where a rollback would start it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyCheck {
+    Running(u32),
+    None,
+    /// A process with the same command line whose program, user, cgroup or
+    /// network we could not read (a security module may hide them): it may
+    /// be a copy, so nothing is started on a guess.
+    Unknown(u32),
+}
+
 /// A running process of the same program and command line, run by the
-/// same user, outside containers and in our own mount and network
-/// namespaces: a copy that serves the same network as the one we would
-/// start. Anything we cannot read is not counted as a copy.
-fn running_copy(host: &dyn Host, exe: &str, argv: &[String], uid: Option<u32>) -> Option<u32> {
-    let entries = host.list_dir(Path::new("/proc")).ok()?;
-    let own = PathBuf::from(format!("/proc/{}", host.own_pid()));
-    entries.into_iter().find_map(|entry| {
-        let pid: u32 = entry.file_name()?.to_str()?.parse().ok()?;
-        let actual = host.read_link(&entry.join("exe")).ok()?;
-        if actual.display().to_string().trim_end_matches(" (deleted)") != exe {
-            return None;
+/// same user, outside containers and in the network the ended process was
+/// in (recorded at takeover; older records compare with PID 1's): a copy
+/// that serves the same network as the one we would start.
+///
+/// Mount namespaces are not compared: a unit with PrivateTmp= or
+/// ProtectSystem= starts the program in a mount namespace of its own, and
+/// so may the service that runs the rollback, yet that copy still holds the
+/// same ports, interface and node identity.
+fn running_copy(
+    host: &dyn Host,
+    exe: &str,
+    argv: &[String],
+    uid: Option<u32>,
+    net_ns: Option<&str>,
+) -> CopyCheck {
+    let Ok(entries) = host.list_dir(Path::new("/proc")) else {
+        return CopyCheck::None;
+    };
+    let own = host.own_pid();
+    let network = net_ns.map(str::to_string).or_else(|| {
+        host.read_link(Path::new("/proc/1/ns/net"))
+            .ok()
+            .map(|link| link.display().to_string())
+    });
+    let mut unknown = None;
+    for entry in entries {
+        let Some(pid) = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own {
+            continue;
         }
-        let cmdline = host.read(&entry.join("cmdline")).ok()?;
+        // The command line is readable for every process we could have
+        // ended; one we cannot read is not ours.
+        let Ok(cmdline) = host.read(&entry.join("cmdline")) else {
+            continue;
+        };
         if crate::cmdline::split_nul(&cmdline) != argv {
-            return None;
+            continue;
         }
-        if let Some(uid) = uid {
-            let status = host.read_to_string(&entry.join("status")).ok()?;
-            if real_id(&status, "Uid:")? != uid {
-                return None;
-            }
+        match copy_matches(host, &entry, exe, uid, network.as_deref()) {
+            Some(true) => return CopyCheck::Running(pid),
+            Some(false) => {}
+            None => unknown = unknown.or(Some(pid)),
         }
-        let cgroup = host.read_to_string(&entry.join("cgroup")).ok()?;
-        if in_container(&cgroup) {
-            return None;
+    }
+    unknown.map_or(CopyCheck::None, CopyCheck::Unknown)
+}
+
+/// `Some(true)` for a copy, `Some(false)` for something else, `None` when
+/// what tells them apart cannot be read.
+fn copy_matches(
+    host: &dyn Host,
+    entry: &Path,
+    exe: &str,
+    uid: Option<u32>,
+    network: Option<&str>,
+) -> Option<bool> {
+    let actual = host.read_link(&entry.join("exe")).ok()?;
+    if actual.display().to_string().trim_end_matches(" (deleted)") != exe {
+        return Some(false);
+    }
+    if let Some(uid) = uid {
+        let status = host.read_to_string(&entry.join("status")).ok()?;
+        if real_id(&status, "Uid:")? != uid {
+            return Some(false);
         }
-        for kind in ["ns/mnt", "ns/net"] {
-            // Where our own namespace cannot be read there is nothing to
-            // compare with.
-            if let Ok(ours) = host.read_link(&own.join(kind)) {
-                if host.read_link(&entry.join(kind)).ok()? != ours {
-                    return None;
-                }
-            }
+    }
+    let cgroup = host.read_to_string(&entry.join("cgroup")).ok()?;
+    if in_container(&cgroup) {
+        return Some(false);
+    }
+    // Where no network to compare with is known, there is nothing to compare.
+    if let Some(network) = network {
+        let theirs = host.read_link(&entry.join("ns/net")).ok()?;
+        if theirs.display().to_string() != network {
+            return Some(false);
         }
-        Some(pid)
-    })
+    }
+    Some(true)
 }
 
 fn wait_gone(host: &dyn Host, pid: u32, exe: &str, ms: u64) -> bool {
@@ -658,6 +720,11 @@ fn end_processes(
         if process.contained {
             continue;
         }
+        // Read while it runs: a rollback looks for a copy in this network.
+        let net_ns = host
+            .read_link(&PathBuf::from(format!("/proc/{}/ns/net", process.pid)))
+            .ok()
+            .map(|link| link.display().to_string());
         let killed = match host.signal(process.pid, Signal::Terminate) {
             // Already gone on its own: nothing to record.
             Ok(false) => continue,
@@ -693,6 +760,7 @@ fn end_processes(
             // started by hand, rc.local or cron is restarted as it was.
             restart: process.unit.is_none(),
             killed,
+            net_ns,
         }));
     }
     out
@@ -827,24 +895,26 @@ pub fn takeover(
     }
     let mut waited = false;
     if failure.is_none() {
-        for result in end_processes(host, profile, &owned_units) {
-            match result {
-                Ok(action) => {
-                    if let Err(error) = record(&mut manifest, action, &mut report) {
-                        failure = Some(format!("saving the manifest: {error}"));
-                        break;
-                    }
-                }
-                Err(error) => {
-                    report.steps.push(StepReport {
-                        step: "end process".into(),
-                        ok: false,
-                        detail: Some(error.clone()),
-                    });
-                    failure = Some(error);
-                    break;
-                }
+        // Every process that was ended is recorded before any failure is
+        // handled: one that could not be ended must not hide those ended
+        // after it, or the undo would never start them again.
+        let (ended, failed): (Vec<_>, Vec<_>) = end_processes(host, profile, &owned_units)
+            .into_iter()
+            .partition(Result::is_ok);
+        for action in ended.into_iter().flatten() {
+            // `record` keeps the step in memory even when saving fails, so
+            // the undo below still starts it again.
+            if let Err(error) = record(&mut manifest, action, &mut report) {
+                failure.get_or_insert(format!("saving the manifest: {error}"));
             }
+        }
+        for error in failed.into_iter().filter_map(Result::err) {
+            report.steps.push(StepReport {
+                step: "end process".into(),
+                ok: false,
+                detail: Some(error.clone()),
+            });
+            failure.get_or_insert(error);
         }
     }
     if failure.is_none() && restart_wait > 0 {
@@ -1020,6 +1090,7 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             restart,
             pid,
             exe,
+            net_ns,
             ..
         } => {
             if !*restart {
@@ -1028,10 +1099,19 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             // A unit that restarts what it runs may already have started it
             // again; a second copy would fight it for ports, the virtual
             // interface and the node identity.
-            if let Some(other) = running_copy(host, exe, argv, *uid) {
-                return Ok(format!(
-                    "process {pid} already runs again as {other}; not started twice"
-                ));
+            match running_copy(host, exe, argv, *uid, net_ns.as_deref()) {
+                CopyCheck::Running(other) => {
+                    return Ok(format!(
+                        "process {pid} already runs again as {other}; not started twice"
+                    ));
+                }
+                // Kept for a later `rollback`, once it can be told apart.
+                CopyCheck::Unknown(other) => {
+                    return Err(format!(
+                        "process {pid}: cannot tell whether process {other} is a copy of it; not started"
+                    ));
+                }
+                CopyCheck::None => {}
             }
             let spawn = Spawn {
                 argv: argv.clone(),
@@ -1081,7 +1161,20 @@ fn restart_wait_ms(host: &dyn Host, units: &BTreeSet<String>) -> Result<u64, Str
         let output = host
             .run(
                 "systemctl",
-                &["show", unit.as_str(), "-p", "Restart", "-p", "RestartUSec"],
+                &[
+                    "show",
+                    unit.as_str(),
+                    "-p",
+                    "Restart",
+                    "-p",
+                    "RestartUSec",
+                    "-p",
+                    "RestartUSecNext",
+                    "-p",
+                    "RestartSteps",
+                    "-p",
+                    "RestartMaxDelayUSec",
+                ],
             )
             .map_err(|error| format!("systemctl show {unit}: {error}"))?;
         if !output.success() {
@@ -1099,13 +1192,27 @@ fn restart_wait_ms(host: &dyn Host, units: &BTreeSet<String>) -> Result<u64, Str
             Some(_) => {}
             None => return Err(format!("{unit}: restart setting unknown")),
         }
-        let delay = value("RestartUSec")
-            .and_then(timespan_ms)
-            .filter(|delay| *delay <= MAX_RESTART_WAIT_MS)
-            .ok_or_else(|| {
-                format!("{unit} restarts what it runs after an unknown or long delay; name it in the profile's detect.services")
-            })?;
-        wait = wait.max(delay + RESTART_MARGIN_MS);
+        let unknown = || {
+            format!("{unit} restarts what it runs after an unknown or long delay; name it in the profile's detect.services")
+        };
+        // With RestartSteps= (systemd 254+) each restart waits longer, up to
+        // RestartMaxDelayUSec=; RestartUSecNext= is the next one. Older
+        // systemd prints none of these and restarts after RestartUSec=.
+        let steps = match value("RestartSteps").filter(|steps| !steps.is_empty()) {
+            None => 0,
+            Some(steps) => steps.parse::<u32>().map_err(|_| unknown())?,
+        };
+        let mut spans = vec![value("RestartUSec").ok_or_else(unknown)?];
+        spans.extend(value("RestartUSecNext").filter(|next| !next.is_empty()));
+        if steps > 0 {
+            spans.push(value("RestartMaxDelayUSec").ok_or_else(unknown)?);
+        }
+        for span in spans {
+            let delay = timespan_ms(span)
+                .filter(|delay| *delay <= MAX_RESTART_WAIT_MS)
+                .ok_or_else(unknown)?;
+            wait = wait.max(delay + RESTART_MARGIN_MS);
+        }
     }
     Ok(wait)
 }
@@ -1533,7 +1640,7 @@ mod tests {
             "LoadState=loaded\nFragmentPath=/lib/systemd/system/rc-local.service\nDropInPaths=\nUnitFileState=static\nActiveState=active\n",
         );
         host.answer(
-            "systemctl show rc-local.service -p Restart -p RestartUSec",
+            "systemctl show rc-local.service -p Restart -p RestartUSec -p RestartUSecNext -p RestartSteps -p RestartMaxDelayUSec",
             0,
             "Restart=no\nRestartUSec=100ms\n",
         );
@@ -1592,7 +1699,7 @@ mod tests {
             "0::/system.slice/office-vpn.service\n",
         );
         host.answer(
-            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            "systemctl show office-vpn.service -p Restart -p RestartUSec -p RestartUSecNext -p RestartSteps -p RestartMaxDelayUSec",
             0,
             "Restart=always\nRestartUSec=5s\n",
         );
@@ -1643,7 +1750,7 @@ mod tests {
             "0::/system.slice/office-vpn.service\n",
         );
         host.answer(
-            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            "systemctl show office-vpn.service -p Restart -p RestartUSec -p RestartUSecNext -p RestartSteps -p RestartMaxDelayUSec",
             0,
             "Restart=on-failure\nRestartUSec=5min\n",
         );
@@ -1681,7 +1788,7 @@ mod tests {
             "0::/system.slice/office-vpn.service\n",
         );
         host.answer(
-            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            "systemctl show office-vpn.service -p Restart -p RestartUSec -p RestartUSecNext -p RestartSteps -p RestartMaxDelayUSec",
             0,
             "Restart=always\nRestartUSec=1.5s\n",
         );
@@ -1725,37 +1832,131 @@ mod tests {
             .map(|arg| arg.to_string())
             .collect();
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let copy = |uid, net: Option<&str>| running_copy(&host, "/opt/demo-meshd", &argv, uid, net);
         host.process(500, "/opt/demo-meshd", &args, &[], "0::/user.slice\n");
         host.file("/proc/500/status", "Uid:\t1000\t1000\t1000\t1000\n");
-        assert_eq!(
-            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
-            Some(500)
-        );
-        assert_eq!(running_copy(&host, "/opt/demo-meshd", &argv, Some(0)), None);
+        assert_eq!(copy(Some(1000), None), CopyCheck::Running(500));
+        assert_eq!(copy(Some(0), None), CopyCheck::None);
         host.file("/proc/500/cgroup", "0::/system.slice/docker-abc.scope\n");
-        assert_eq!(
-            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
-            None
-        );
-        // Another network namespace than ours.
+        assert_eq!(copy(Some(1000), None), CopyCheck::None);
         host.file("/proc/500/cgroup", "0::/user.slice\n");
-        host.link("/proc/1/ns/net", "net:[1]");
+        // Another network than the one the ended process was in.
         host.link("/proc/500/ns/net", "net:[2]");
-        assert_eq!(
-            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
-            None
-        );
+        assert_eq!(copy(Some(1000), Some("net:[1]")), CopyCheck::None);
+        assert_eq!(copy(Some(1000), Some("net:[2]")), CopyCheck::Running(500));
+        // Older records compare with PID 1's network.
+        host.link("/proc/1/ns/net", "net:[1]");
+        assert_eq!(copy(Some(1000), None), CopyCheck::None);
         host.link("/proc/500/ns/net", "net:[1]");
-        assert_eq!(
-            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
-            Some(500)
-        );
-        // An executable we cannot read is not a copy.
+        assert_eq!(copy(Some(1000), None), CopyCheck::Running(500));
+        // A unit's private mounts (PrivateTmp=, ProtectSystem=) do not make
+        // it another copy: mount namespaces are not compared.
+        host.link(&format!("/proc/{}/ns/mnt", host.own_pid()), "mnt:[1]");
+        host.link("/proc/500/ns/mnt", "mnt:[9]");
+        assert_eq!(copy(Some(1000), None), CopyCheck::Running(500));
+        // Same command line but nothing else readable: it may be a copy, so
+        // it is neither counted nor ignored.
         host.links.borrow_mut().remove(Path::new("/proc/500/exe"));
-        assert_eq!(
-            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
-            None
+        assert_eq!(copy(Some(1000), None), CopyCheck::Unknown(500));
+        host.link("/proc/500/exe", "/opt/demo-meshd");
+        host.files
+            .borrow_mut()
+            .remove(Path::new("/proc/500/status"));
+        assert_eq!(copy(Some(1000), None), CopyCheck::Unknown(500));
+        assert_eq!(copy(None, None), CopyCheck::Running(500));
+        // Another program with the same command line is not a candidate.
+        host.link("/proc/500/exe", "/usr/bin/other");
+        assert_eq!(copy(Some(1000), None), CopyCheck::None);
+    }
+
+    #[test]
+    fn restart_delays_that_grow_are_waited_out_in_full() {
+        let host = FakeHost::default();
+        let units: BTreeSet<String> = ["office-vpn.service".to_string()].into();
+        let key = "systemctl show office-vpn.service -p Restart -p RestartUSec -p RestartUSecNext -p RestartSteps -p RestartMaxDelayUSec";
+        // Older systemd: only RestartUSec.
+        host.answer(key, 0, "Restart=always\nRestartUSec=1s\n");
+        assert_eq!(restart_wait_ms(&host, &units), Ok(3_000));
+        // The next restart already waits longer.
+        host.answer(
+            key,
+            0,
+            "Restart=always\nRestartUSec=1s\nRestartUSecNext=4s\nRestartSteps=0\nRestartMaxDelayUSec=infinity\n",
         );
+        assert_eq!(restart_wait_ms(&host, &units), Ok(6_000));
+        // Growing delays: the longest one counts.
+        host.answer(
+            key,
+            0,
+            "Restart=always\nRestartUSec=1s\nRestartUSecNext=1s\nRestartSteps=3\nRestartMaxDelayUSec=10s\n",
+        );
+        assert_eq!(restart_wait_ms(&host, &units), Ok(12_000));
+        // Growing without a bound is not guessed.
+        host.answer(
+            key,
+            0,
+            "Restart=always\nRestartUSec=1s\nRestartUSecNext=1s\nRestartSteps=3\nRestartMaxDelayUSec=infinity\n",
+        );
+        assert!(restart_wait_ms(&host, &units).is_err());
+    }
+
+    #[test]
+    fn a_rollback_does_not_guess_about_a_process_it_cannot_read() {
+        let host = machine();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        // Same command line, program unreadable (a security module hides it).
+        host.process(
+            600,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab"],
+            &[],
+            "0::/user.slice\n",
+        );
+        host.links.borrow_mut().remove(Path::new("/proc/600/exe"));
+        host.spawned.borrow_mut().clear();
+        let first = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!first.ok, "{first:?}");
+        assert!(host.spawned.borrow().is_empty());
+        // Once it is gone, a later rollback starts the program.
+        host.signal(600, Signal::Kill).unwrap();
+        let second = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(second.ok, "{second:?}");
+        assert!(host
+            .spawned
+            .borrow()
+            .iter()
+            .any(|spawn| spawn.argv == ["/opt/demo-meshd", "--net-name", "lab"]));
+    }
+
+    #[test]
+    fn a_process_that_will_not_exit_does_not_hide_those_ended_after_it() {
+        let host = machine();
+        // Listed before the others in /proc, and it will not exit.
+        host.process(
+            50,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab2"],
+            &[],
+            "0::/user.slice\n",
+        );
+        host.unkillable.borrow_mut().insert(50);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| !step.ok && step.detail.as_deref() == Some("process 50 did not exit")));
+        // Process 200, ended after the failure, is recorded and started again.
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.ok && step.step.starts_with("end process 200 ")));
+        assert!(host
+            .spawned
+            .borrow()
+            .iter()
+            .any(|spawn| spawn.argv == ["/opt/demo-meshd", "--net-name", "lab"]));
     }
 
     #[test]
