@@ -192,5 +192,5 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 | 版本 | 内容 |
 | --- | --- |
 | 内核 0.3 / 客户端 1.1 | 本文的检测、导入、接管与回滚（Linux）；Linux 安装脚本 |
-| 内核 0.4 / 客户端 1.2 | macOS launchd 的检测、接管与安装；Windows 服务的检测、接管与安装；只读上报在线与延迟 |
+| 内核 0.4 / 客户端 1.2 | macOS launchd 的检测、接管与安装；Windows 服务的检测、接管与安装；无 Agent 设备的接入、配置读取与只读上报（[`mesh-device.md`](mesh-device.md)） |
 | 内核 0.5 / 客户端 1.3 | OpenWrt 软件包（musl 静态、procd、UCI）与网页插件；软件包安装方式的检测与停用 |
