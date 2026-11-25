@@ -134,9 +134,13 @@ impl Inner {
                 .iter()
                 .position(|instance| instance.tag == network.tag)
                 .map(|at| current.remove(at));
-            match previous.map(|instance| keep(instance, &network.settings)) {
-                Some(Ok(instance)) => next.push(Some(instance)),
-                Some(Err(instance)) => {
+            let previous = previous.map(|mut instance| {
+                let kept = keep(&mut instance, &network.settings);
+                (instance, kept)
+            });
+            match previous {
+                Some((instance, true)) => next.push(Some(instance)),
+                Some((instance, false)) => {
                     stopping.push(instance);
                     next.push(None);
                     starts.push((index, network));
@@ -255,8 +259,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Whether `instance` can go on under `settings` without a restart: the
 /// same settings, or, while it runs, the same but for the native key list,
 /// which is handed to the running driver. A network that failed to start
-/// is tried again. `Err` gives the instance back to be stopped.
-fn keep(mut instance: Instance, settings: &MeshSettings) -> Result<Instance, Instance> {
+/// is tried again. `false` means the instance is to be stopped.
+fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
     let same = instance.settings == *settings;
     let update = match &instance.state {
         State::Waiting(_) => same,
@@ -279,10 +283,8 @@ fn keep(mut instance: Instance, settings: &MeshSettings) -> Result<Instance, Ins
     };
     if update {
         instance.settings = settings.clone();
-        Ok(instance)
-    } else {
-        Err(instance)
     }
+    update
 }
 
 fn running_ok(running: &Running) -> bool {
