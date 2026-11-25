@@ -143,6 +143,9 @@ pub trait Host {
     }
 }
 
+/// Environment variables as name and value, in order.
+pub type Environ = Vec<(String, String)>;
+
 /// A process as the system's process table describes it (macOS and
 /// Windows).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -174,7 +177,7 @@ fn split_windows_command_line_of(line: &str) -> Vec<String> {
 /// count (a native-endian 32-bit integer), the program path, padding, then
 /// the arguments and the environment, each ending in NUL. `None` when the
 /// buffer is shorter than its own count says.
-pub fn parse_procargs2(buffer: &[u8]) -> Option<(Vec<String>, Vec<(String, String)>)> {
+pub fn parse_procargs2(buffer: &[u8]) -> Option<(Vec<String>, Environ)> {
     let count = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
     let count = usize::try_from(count).ok()?;
     let mut rest = &buffer[4..];
@@ -847,7 +850,7 @@ impl Host for RealHost {
 /// parameters block, so a restart on rollback is exact.
 #[cfg(windows)]
 mod windows {
-    use super::{split_windows_command_line_of, ProcInfo};
+    use super::{split_windows_command_line_of, Environ, ProcInfo};
     use std::ffi::c_void;
     use std::io;
     use std::mem::{size_of, MaybeUninit};
@@ -1026,8 +1029,10 @@ mod windows {
 
     fn utf16(bytes: &[u8]) -> Option<String> {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_ne_bytes(*pair))
             .collect();
         String::from_utf16(&units).ok()
     }
@@ -1044,7 +1049,7 @@ mod windows {
 
     /// The working directory and environment from the process parameters.
     #[cfg(target_pointer_width = "64")]
-    fn parameters(process: &Handle) -> Option<(Option<String>, Vec<(String, String)>)> {
+    fn parameters(process: &Handle) -> Option<(Option<String>, Environ)> {
         let mut info = MaybeUninit::<BasicInformation>::zeroed();
         let mut len = 0u32;
         // SAFETY: the buffer is a BasicInformation.
@@ -1094,7 +1099,7 @@ mod windows {
     }
 
     #[cfg(not(target_pointer_width = "64"))]
-    fn parameters(_process: &Handle) -> Option<(Option<String>, Vec<(String, String)>)> {
+    fn parameters(_process: &Handle) -> Option<(Option<String>, Environ)> {
         None
     }
 
@@ -1200,7 +1205,7 @@ mod windows {
 /// path, arguments and environment exactly as the kernel holds them.
 #[cfg(target_os = "macos")]
 mod darwin {
-    use super::{parse_procargs2, ProcInfo};
+    use super::{parse_procargs2, Environ, ProcInfo};
     use std::ffi::{CStr, CString};
     use std::io;
     use std::mem::{size_of, MaybeUninit};
@@ -1275,7 +1280,7 @@ mod darwin {
         String::from_utf8(buffer).ok()
     }
 
-    fn arguments(pid: libc::c_int) -> Option<(Vec<String>, Vec<(String, String)>)> {
+    fn arguments(pid: libc::c_int) -> Option<(Vec<String>, Environ)> {
         let mut max: libc::c_int = 0;
         let mut size = size_of::<libc::c_int>();
         let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -1721,6 +1726,9 @@ pub(crate) mod fake {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
 
+    /// A launchd job: job file, process, loaded.
+    pub(crate) type FakeJob = (String, Option<u32>, bool);
+
     #[derive(Default)]
     pub(crate) struct FakeHost {
         pub files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
@@ -1751,7 +1759,7 @@ pub(crate) mod fake {
         /// A process table instead of `/proc` (macOS), when set.
         pub table: RefCell<Option<BTreeMap<u32, ProcInfo>>>,
         /// launchd jobs by "domain/label": job file, process, loaded.
-        pub launchd: RefCell<BTreeMap<String, (String, Option<u32>, bool)>>,
+        pub launchd: RefCell<BTreeMap<String, FakeJob>>,
         /// Processes that exit when a command runs ("program arg arg").
         pub exits_on: RefCell<BTreeMap<String, Vec<u32>>>,
     }
