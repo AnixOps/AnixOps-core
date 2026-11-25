@@ -54,7 +54,7 @@ macOS 没有 `/proc`，进程从系统进程表读取：程序路径用 `proc_pi
 | --- | --- |
 | 服务 | 一次 PowerShell 查询 `Win32_Service`（名称、命令行、启动方式、状态、进程）。命令行运行该程序、或服务名在 `detect.services` 里（以包装程序启动的服务）时视为该程序的服务；服务的进程是服务进程及其子孙进程（包装程序可能经 `cmd` 再启动程序）。查询结果没有延迟启动标志时（较旧的系统），从服务注册表项的 `DelayedAutostart` 读取 |
 | 计划任务 | 一次 PowerShell 查询 `Get-ScheduledTask`（路径、名称、状态、可执行操作）与任务计划程序服务的进程。某个操作的程序名匹配、或任务名在 `detect.services` 里时视为该程序的任务；运行中任务的进程是任务计划程序服务的直接子进程（数据文件点名的包装任务为其子孙进程） |
-| 登录自启项 | 一次 PowerShell 查询：本机 `Run` 键（64 位与 32 位）、已加载配置的每个用户的 `Run` 键、公共启动文件夹与每个用户配置文件的启动文件夹（快捷方式读取目标、参数与工作目录），以及各项在 `Explorer\StartupApproved` 下的当前值。命令行的程序名匹配时视为该程序的自启项 |
+| 登录自启项 | 一次 PowerShell 查询：本机 `Run` 键（64 位与 32 位）、已加载配置的每个用户的 `Run` 键、公共启动文件夹与每个用户配置文件的启动文件夹（快捷方式读取目标、参数与工作目录），以及各项在 `Explorer\StartupApproved` 下的当前值。命令行的程序名匹配时视为该程序的自启项。不检测：未登录用户（配置未加载）的 `Run` 键、`RunOnce`、`Policies\Explorer\Run` 与 Winlogon 的 `Userinit`/`Shell`（后两者不受 `StartupApproved` 控制）；这些位置启动的原程序需人工停用（#330 复审 L2，下一个小版本补报告） |
 | 手动进程 | 进程表中程序名匹配、且不属于以上任何一项的进程 |
 
 未登录用户的 `Run` 键不在已加载的注册表中，不读取；其启动文件夹中的项只报告，列入需人工处理。经 `cmd /c` 等包装的自启项不识别，它启动的进程按手动进程处理。
@@ -81,6 +81,15 @@ macOS 没有 `/proc`，进程从系统进程表读取：程序路径用 `proc_pi
 | `routing.system_routes` | 只保留内网网段（规范化为网络地址）；其他网段需确认 |
 
 原版节点（未换成我方内核的节点）一律留在 `legacy` 网络，经我方桥接节点与区域网络互通；换成我方内核之后，才能加入 `managed` 网络。部署层不提供跳过桥接、把原版节点直接加入 `managed` 网络的做法。
+
+旧网不拆分，超大旧网不建桥（规范 §11.2「接收」与 §15.11.1）。桥接节点的旧网实例要接收原版节点对整个旧网的全量同步，上限为 4096 个节点、8 MiB。规模在桥接节点上实测，不在导入时估算（`import` 只看到本机一个原版节点的配置，看不到整个旧网）：
+
+1. 桥接节点先以普通成员加入旧网：只加入 `legacy` 网络，不通告任何区域网段，也不加入区域网络。
+2. 同步稳定后（加入后至少 5 分钟，且最近 2 分钟成员数没有变化），读取该网络快照的 `members` 数。成员数（含本机）超过 4096，或该网络出现过同步超限告警（`alerts` 中的 `sync_oversize`：收到的同步重组或解压后超过 8 MiB 被丢弃，或连接图截短后仍送达不了、同步会话被关闭，`detail` 分别以 `received:`、`undelivered:` 开头，见规范 §11.2、§12.2），即判定为超大旧网。
+3. 超大旧网：不启用桥接，桥接节点退出该旧网，向面板报告原因 `legacy_network_too_large`，`detail` 写成员数或超限的大小；不改原版节点的配置，也不尝试拆分。处理方式见 `docs/manual-intervention.md`「超大旧网不能直接建桥」：先挑一部分节点接管、迁入区域网络，旧网缩小到上限以内再建桥。
+4. 未超限：再加入区域网络并通告区域网段，开始桥接。桥接期间旧网成员数超过上限或出现同步超限告警时，同样报告 `legacy_network_too_large`，由管理员决定是否停用桥接。
+
+这项检查由建桥的一方执行（Agent 按面板下发的桥接配置执行，或管理员手工操作时按上面的步骤）。`anixops-mesh` 的接管与导入不建桥，不做这项检查。
 
 换成我方内核的节点加入区域网络时，在面板把本机的静态公钥列入该网络的 `native_keys` 之前，该网络处于 `native_keys_pending`（见 `docs/architecture/mesh-status.md`）：不建立链路，但 `anixops-mesh run` 不退出，服务保持运行。部署层、安装脚本与运维不应据此判定安装失败或回滚；以面板列入公钥后网络转为正常为准。
 
@@ -126,7 +135,7 @@ macOS 上的顺序：备份任务文件 → 已加载的任务先 `launchctl boo
 
 Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（最长 30 秒）→ 自动、延迟自动或手动启动的服务再 `sc.exe config <名称> start= disabled` → 结束剩余进程（先 `taskkill` 请求关闭，10 秒后 `TerminateProcess`）。先停止后关闭，是因为 Windows 不启动被禁用的服务：回滚先恢复原启动方式，再 `sc.exe start`。驱动类服务（`boot`、`system`）只报告。服务的进程（含包装程序的子孙进程）由重新启动服务恢复，不单独重启；手动进程按原命令行、工作目录与环境变量重启。Windows 无法在没有密码的情况下以其他账户启动进程，因此由其他账户运行、或读不出运行账户的手动进程不会被结束：这项检查在第一步改动之前完成，发现即失败，由操作员手工停止。记录中保存手动进程的运行账户（SID），执行回滚的账户与之不同时（例如管理员接管、以 SYSTEM 运行的 Agent 回滚）不启动该进程，该步骤保留并报告，由原账户执行回滚，或手工启动后 `--forget-process`。结束了任何进程后同样先等 12 秒再确认。
 
-计划任务：运行中的任务先 `schtasks.exe /End /TN <任务>` 并等待其不再运行（最长 30 秒）→ 未关闭的任务再 `schtasks.exe /Change /TN <任务> /DISABLE`。回滚先 `/ENABLE`，原来在运行的任务再 `/Run`（已在运行时跳过）；任务的进程由任务恢复，不单独重启。登录自启项按 Windows 自己的启动项设置关闭：在 `Explorer\StartupApproved\Run`（32 位 `Run` 键为 `Run32`，启动文件夹为 `StartupFolder`）下写入以 `03` 开头的值（`reg.exe add`），写入前再读一次，与检测时不同即失败；`Run` 值与快捷方式本身不改。回滚时该值仍是我方写入的值才恢复原值（原来没有则删除），已被他人改动时保留现状并注明。已关闭的自启项跳过。自启项启动的进程按手动进程结束与重启（同样只结束本账户的进程）。
+计划任务：运行中的任务先 `schtasks.exe /End /TN <任务>` 并等待其不再运行（最长 30 秒）→ 未关闭的任务再 `schtasks.exe /Change /TN <任务> /DISABLE`。回滚先 `/ENABLE`，原来在运行的任务再 `/Run`（已在运行时跳过）；任务的进程由任务恢复，不单独重启。登录自启项按 Windows 自己的启动项设置关闭：在 `Explorer\StartupApproved\Run`（32 位 `Run` 键为 `Run32`，启动文件夹为 `StartupFolder`）下写入以 `03` 开头的值（`reg.exe add`），写入前再读一次，与检测时不同即失败；`Run` 值与快捷方式本身不改。回滚时该值仍是我方写入的值才恢复原值（原来没有则删除），已被他人改动时保留现状并注明。用户在接管后已注销、其配置不在注册表中时，以 `reg.exe load` 把该用户的 `NTUSER.DAT` 临时加载到 `HKU\anixops-mesh-<SID>`，在其中恢复后立即卸载；加载不了（例如配置文件夹找不到、文件被占用）时该步骤失败并保留在记录中，`rollback` 以退出码 7 结束，下次再试，不会当作「已被他人改动」。已关闭的自启项跳过。接管停用计划任务前以 `schtasks.exe /Query /XML` 导出任务定义存入记录（超过 64 KiB 不存），回滚启用后再导出比较（不计启用标志），不同时在报告中注明，需人工核对（`/Change` 会重新注册任务）。自启项启动的进程按手动进程结束与重启（同样只结束本账户的进程）。
 
 在其他网络命名空间中运行的手动进程（例如用 `ip netns exec` 启动）不会被结束：回滚只能在主机网络中重新启动程序，无法放回原命名空间。程序自身服务中的进程不在此列（例如单元带 `NetworkNamespacePath=`、`PrivateNetwork=`，或 init 脚本以 `ip netns exec` 启动）：它们由服务管理器停止，回滚时由服务管理器在原命名空间重新启动。改动前的检查还包括：Windows 上其他账户运行的手动进程（见上文），以及记录大小，即把所有将被结束的进程（含完整环境变量）写入记录后是否仍在 1 MiB 读取上限内（留 64 KiB 余量），否则回滚无法读回。这些检查在第一步改动之前完成，`--dry-run` 也做：不通过时报告原因并以退出码 1 结束（`outcome` 为 `refused`），不备份、不停用服务、不结束任何进程，也不写记录；需要接管时先手工停止相应进程。安装脚本在安装程序、配置与服务之前先以 `--dry-run` 运行这些检查，不通过即终止并保存 `takeover-check.json`（此前已建立数据目录与状态目录，并写入导入报告）。接管返回 1（拒绝，或失败后已全部撤销）与 7（撤销也未完成）时，安装脚本给出不同的提示：后者需要按报告处理后执行 `rollback`。
 
@@ -159,10 +168,16 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 | --- | --- |
 | `anixops-mesh-<版本>-x86_64-unknown-linux-musl` | 静态程序，无动态依赖 |
 | `anixops-mesh-<版本>-aarch64-unknown-linux-musl` | 同上 |
-| `anixops-mesh-<版本>-install-linux.sh` | 本节的安装脚本 |
+| `anixops-mesh-<版本>-aarch64-apple-darwin` | macOS 程序（Apple 芯片），只链接系统自带的库 |
+| `anixops-mesh-<版本>-x86_64-apple-darwin` | 同上（Intel） |
+| `anixops-mesh-<版本>-x86_64-pc-windows-msvc.exe` | Windows 程序，C 运行库静态链接，不需要 Visual C++ 运行库 |
+| `anixops-mesh-<版本>-aarch64-pc-windows-msvc.exe` | 同上（ARM64） |
+| `anixops-mesh-<版本>-install-linux.sh` | Linux 安装脚本 |
+| `anixops-mesh-<版本>-install-macos.sh` | macOS 安装脚本 |
+| `anixops-mesh-<版本>-install-windows.ps1` | Windows 安装脚本 |
 | `anixops-mesh-<版本>-<目标>.buildinfo.json` | 构建所用的确切工具链（`rustc -V`、`rustc -Vv`、`cargo -V`）与提交，供复现；随程序一起证明 |
 
-构建脚本是 [`.github/scripts/build-mesh-node.sh`](../../.github/scripts/build-mesh-node.sh)，CI 的「Mesh node static build」在每次 Rust 改动时用同一脚本构建两种架构，确认程序静态链接、x86_64 版本可运行。32 位 ARM 与 MIPS 随 OpenWrt 软件包（内核 0.5）提供。
+构建脚本是 [`.github/scripts/build-mesh-node.sh`](../../.github/scripts/build-mesh-node.sh)。CI 在每次 Rust 改动时用同一脚本构建全部目标：「Mesh node static build」构建两种 Linux 架构，确认静态链接、x86_64 版本可运行；「Mesh node desktop build」在 macOS 与 Windows 机器上构建，确认 macOS 程序只链接 `/usr/lib` 与 `/System/Library` 下的库、Windows 程序不导入 `vcruntime`、`msvcp`、`ucrtbase` 与 `api-ms-win-crt-*`，与机器同架构的版本可运行。发布签名（Apple 公证、Windows 代码签名）尚未提供，安装命令以面板给出的 SHA-256 与构建证明为准。32 位 ARM 与 MIPS 随 OpenWrt 软件包（内核 0.5）提供。
 
 ## 接管数据文件格式
 
@@ -199,5 +214,5 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 | 版本 | 内容 |
 | --- | --- |
 | 内核 0.3 / 客户端 1.1 | 本文的检测、导入、接管与回滚（Linux）；Linux 安装脚本 |
-| 内核 0.4 / 客户端 1.2 | macOS launchd 的检测、接管与安装；Windows 服务的检测、接管与安装；只读上报在线与延迟 |
+| 内核 0.4 / 客户端 1.2 | macOS launchd 的检测、接管与安装；Windows 服务的检测、接管与安装；无 Agent 设备的接入、配置读取与只读上报（[`mesh-device.md`](mesh-device.md)） |
 | 内核 0.5 / 客户端 1.3 | OpenWrt 软件包（musl 静态、procd、UCI）与网页插件；软件包安装方式的检测与停用 |

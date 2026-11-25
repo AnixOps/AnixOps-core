@@ -836,6 +836,7 @@ mod tests {
                 edges: vec![(0, 1), (1, 0)],
             }),
             foreign_network_infos: Some(vec![0x0a, 0x00]),
+            ..SyncRouteRequest::default()
         };
         let decoded = SyncRouteRequest::decode(&request.encode()).unwrap();
         assert_eq!(decoded.my_session_id, 99);

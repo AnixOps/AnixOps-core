@@ -1339,9 +1339,11 @@ mod tests {
         assert_eq!(sent.peers.iter().filter(|(_, v)| *v > 0).count(), count + 1);
         assert_eq!(a.refused().cut_graphs, 0);
 
-        // Not again until a row changes.
+        // Not again until a row changes. The response carries the session
+        // the neighbour used above; another one would make it a new
+        // session and send everything again (spec §12.2).
         let response = SyncRouteResponse {
-            session_id: 9,
+            session_id: 1,
             ..SyncRouteResponse::default()
         };
         a.on_response(2, Some(response), &rng, now).unwrap();
