@@ -47,6 +47,7 @@
 ### Added
 
 - 组网内网域名解析（需求 R28，规范 §15.9.2；outbound-mesh `dns`，mesh-node `managed`、`serve`）：网络配置接受 `dns` 节（`enabled`、`suffix`、`region`、`names`、`resolver_address`），不合规的名字条目跳过并列入 `refused`；名字规范化内嵌面板同一份 Unicode 15.1.0 表（SHA-256 校验，规范 §22.5 全部向量写成测试）；名单由下发条目与成员自报主机名组成，重名返回全部地址并标出、下发在前；应答 A、AAAA、PTR，短名先本地区后其他地区，单标签只查本地区，TTL 5 秒，每种记录最多 32 个地址（UDP 置 TC），对 `mesh.internal` 与网络内的反向域从不外发。完整节点在虚拟网卡上应答发往 `resolver_address` 53 端口的 UDP 与 TCP 查询，其他名字回 REFUSED；地址等于本机时不拦截并告警 `resolver_address_conflict`。`dns` 变化不重启网络。`GET /v1/status` 的 `features` 增加 `mesh_dns` 与 `mesh_resolver_address`。
+- anixops-mesh Windows 发布随附 `wintun.dll`（amd64、arm64，Wintun 0.14.1 原样，固定 SHA-256，附许可证；CI 核对 PE 架构），`install-windows.ps1` 新增 `-WintunUrl`/`-WintunSha256` 并装到程序旁边，服务设 `sc.exe failureflag` 使失败重启对服务专用错误生效；macOS 文档注明网卡为 `utunN`（配合 #344）。
 - 文档 `docs/deploy/mesh-device.md`：无 Agent 组网设备（R31、R32、R35）的程序侧约定，即 `enroll`、`device`、`device-status` 子命令、状态目录、配置读取与上报、字段白名单校验、令牌失效与退避、本机状态套接字、OpenWrt 软件包与 LuCI 插件。
 - 部署文档补超大旧网不建桥的检查（#321 复审 J6b，规范 §11.2、§15.11.1）：桥接节点先以普通成员加入旧网、实测成员数与同步超限告警，超过 4096 个节点或 8 MiB 时不建桥并报告 `legacy_network_too_large`。
 - anixops-mesh 接管 Windows 计划任务与登录自启项（mesh-node `winstart`、`detect`、`takeover`，R12 内核 0.4）：计划任务以 `schtasks.exe /End` 结束、`/Change /DISABLE` 关闭，回滚 `/ENABLE` 后 `/Run`；`Run` 键与启动文件夹的自启项按 Windows 自己的启动项设置（`Explorer\StartupApproved`）关闭，回滚恢复原值，已被他人改动时保留现状；未登录用户的启动文件夹只报告。

@@ -29,6 +29,8 @@
 //! - [`dns`]: intranet names (requirement R28): the `dns` section, the name
 //!   list and the answers, including the resolver address on the virtual
 //!   interface.
+//! - [`waypoint`]: custom paths: path matching, the path state and the
+//!   waypoint packet that carries traffic through every waypoint.
 //! - [`status`]: what a node agent reads and writes through the kernel's
 //!   management API (`/v1/mesh`), and the trait that API drives the mesh
 //!   through.
@@ -48,6 +50,7 @@ pub mod rpc;
 pub mod scope;
 pub mod secure;
 pub mod status;
+pub mod waypoint;
 pub mod wire;
 
 pub use config::{
