@@ -13,8 +13,14 @@
 //! the network was explicitly configured without encryption; handshake
 //! packets are accepted only during the handshake; exit-node traffic is
 //! dropped (spec §1.4).
+//!
+//! Handshakes still waiting for the peer are limited by source address,
+//! never by the unauthenticated node ID (spec §8.1): see
+//! [`HandshakeBudget`].
 
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use ring::rand::SecureRandom;
@@ -45,8 +51,18 @@ pub enum CloseReason {
     ModeMismatch,
     /// The peer is in another network.
     ForeignNetwork,
-    /// The peer uses this node's ID (spec §5.3).
+    /// The peer uses this node's ID and is not authenticated: only the
+    /// connection closes (spec §8.1).
     SameNodeId,
+    /// A server proved the network secret under this node's ID: an ID
+    /// conflict (spec §5.3).
+    IdConflict,
+    /// Another connection to the same peer is creating the session: open
+    /// this one again once that is up or closed (spec §8.1).
+    WaitForSession,
+    /// Pushed out by newer handshakes from the same source address, or by
+    /// the limit in all ([`HandshakeBudget`]).
+    Evicted,
     /// A handshake step did not finish in [`HANDSHAKE_TIMEOUT`].
     Timeout,
     /// A packet that has no place in the handshake.
@@ -78,10 +94,6 @@ pub enum Step {
     Up(Vec<Vec<u8>>, Up),
     /// Write these packets, then close.
     Close(Vec<Vec<u8>>, CloseReason),
-    /// A handshake with the same peer is setting up a session: feed this
-    /// packet again once that one is up or closed. The connection's
-    /// handshake deadline keeps running.
-    Retry,
 }
 
 /// What the handshake needs from the node. `peer_key` gives the static key
@@ -151,8 +163,9 @@ impl Link {
                 ))
             }
             SecurityMode::ForwardSecrecy => {
-                let (client, msg1) = Client::start(hs.local, known_peer, hs.sessions, hs.rng)
-                    .map_err(secure_close)?;
+                let (client, msg1) =
+                    Client::start(hs.local, known_peer, hs.sessions, hs.rng, hs.now)
+                        .map_err(secure_close)?;
                 let first = packet(hs.local.id, 0, packet_type::SECURE_MSG1, &msg1);
                 Ok((
                     Self {
@@ -205,7 +218,6 @@ impl Link {
             }
             Step::Up(_, up) => self.phase = Phase::Up(*up),
             Step::Close(..) => self.phase = Phase::Closed,
-            Step::Retry => self.phase = Phase::ServerWaiting,
         }
         step
     }
@@ -226,8 +238,7 @@ impl Link {
                     if header.from == local.id {
                         return Step::Close(Vec::new(), CloseReason::SameNodeId);
                     }
-                    match Server::respond(local, header.from, payload, hs.sessions, hs.rng, hs.now)
-                    {
+                    match Server::respond(local, header.from, payload, hs.sessions, hs.rng) {
                         Ok((server, msg2)) => {
                             let reply = packet(local.id, 0, packet_type::SECURE_MSG2, &msg2);
                             if server.is_foreign() {
@@ -236,7 +247,6 @@ impl Link {
                             self.phase = Phase::ServerSecure(Box::new(server));
                             Step::Send(vec![reply])
                         }
-                        Err(HandshakeError::Session(SessionError::Busy)) => Step::Retry,
                         Err(error) => Step::Close(Vec::new(), secure_close(error)),
                     }
                 }
@@ -308,6 +318,8 @@ impl Link {
 fn secure_close(error: HandshakeError) -> CloseReason {
     match error {
         HandshakeError::SameNodeId => CloseReason::SameNodeId,
+        HandshakeError::IdConflict => CloseReason::IdConflict,
+        HandshakeError::Session(SessionError::Busy) => CloseReason::WaitForSession,
         HandshakeError::ForeignNetwork => CloseReason::ForeignNetwork,
         other => CloseReason::Secure(other),
     }
@@ -433,7 +445,12 @@ fn session_key(network: &str, neighbour: u32, from: u32) -> SessionKey {
 
 /// Checks, decrypts and decompresses a packet addressed to this node that
 /// arrived from `neighbour` (the peer of the connection).
-pub fn open(crypto: &mut Crypto<'_>, neighbour: u32, packet: &[u8]) -> Result<Inbound, Dropped> {
+pub fn open(
+    crypto: &mut Crypto<'_>,
+    neighbour: u32,
+    packet: &[u8],
+    now: Instant,
+) -> Result<Inbound, Dropped> {
     let mut header = NodeHeader::decode(packet).ok_or(Dropped::Truncated)?;
     if header.has(flags::EXIT_NODE) {
         return Err(Dropped::ExitNode);
@@ -469,15 +486,9 @@ pub fn open(crypto: &mut Crypto<'_>, neighbour: u32, packet: &[u8]) -> Result<In
             Crypto::Default(None) => return Err(Dropped::Decrypt),
             Crypto::Secure { sessions, network } => {
                 let key = session_key(network, neighbour, header.from);
-                let session = sessions.get_mut(&key).ok_or(Dropped::NoSession)?;
-                match session.receiver.open(&mut payload) {
-                    Ok(()) => {}
-                    Err(TrafficError::SessionEnded) => {
-                        sessions.invalidate(&key);
-                        return Err(Dropped::SessionEnded);
-                    }
-                    Err(_) => return Err(Dropped::Decrypt),
-                }
+                sessions
+                    .open(&key, &mut payload, now)
+                    .map_err(session_dropped)?;
             }
         }
         header.flags &= !flags::ENCRYPTED;
@@ -494,6 +505,14 @@ pub fn open(crypto: &mut Crypto<'_>, neighbour: u32, packet: &[u8]) -> Result<In
         payload,
         was_encrypted: encrypted,
     })
+}
+
+fn session_dropped(error: SessionError) -> Dropped {
+    match error {
+        SessionError::NoSession => Dropped::NoSession,
+        SessionError::Traffic(TrafficError::SessionEnded) => Dropped::SessionEnded,
+        _ => Dropped::Decrypt,
+    }
 }
 
 /// zstd only; lzo is dropped (spec §7.4). The result must be exactly
@@ -543,15 +562,9 @@ pub fn seal(
             }
             Crypto::Secure { sessions, network } => {
                 let key = session_key(network, next_hop, to);
-                let session = sessions.get_mut(&key).ok_or(Dropped::NoSession)?;
-                match session.sender.seal(&mut body, now) {
-                    Ok(()) => {}
-                    Err(TrafficError::SessionEnded) => {
-                        sessions.invalidate(&key);
-                        return Err(Dropped::SessionEnded);
-                    }
-                    Err(_) => return Err(Dropped::Decrypt),
-                }
+                sessions
+                    .seal(&key, &mut body, now)
+                    .map_err(session_dropped)?;
                 header.flags |= flags::ENCRYPTED;
             }
         }
@@ -560,6 +573,106 @@ pub fn seal(
     out.extend_from_slice(&header.encode());
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+/// Handshakes waiting for the peer from one source address at most.
+pub const HANDSHAKES_PER_SOURCE: usize = 8;
+/// Handshakes waiting for the peer in all.
+pub const MAX_HANDSHAKES: usize = 1024;
+
+/// A handshake admitted by [`HandshakeBudget`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Ticket(u64);
+
+/// Counts the handshakes this node is answering that have not finished,
+/// by source address (an IPv6 address by its /64) and in all, never by the
+/// node ID the peer claims (spec §8.1). Past a limit the oldest of that
+/// source, or the oldest of the source holding the most, is pushed out:
+/// the driver closes its connection with [`CloseReason::Evicted`], which
+/// drops and wipes its handshake state.
+#[derive(Default)]
+pub struct HandshakeBudget {
+    sources: HashMap<IpAddr, VecDeque<Ticket>>,
+    count: usize,
+    next: u64,
+}
+
+/// The address a source is counted under.
+fn source_of(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(_) => address,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::from(octets)
+        }
+    }
+}
+
+impl HandshakeBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Handshakes not finished.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Admits a handshake from `address`; returns its ticket and the
+    /// ticket of a handshake to close to make room, if any.
+    pub fn admit(&mut self, address: IpAddr) -> (Ticket, Option<Ticket>) {
+        let source = source_of(address);
+        let of_source = self.sources.get(&source).map_or(0, VecDeque::len);
+        let evicted = if of_source >= HANDSHAKES_PER_SOURCE {
+            self.pop_oldest(source)
+        } else if self.count >= MAX_HANDSHAKES {
+            let busiest = self
+                .sources
+                .iter()
+                .max_by_key(|(_, tickets)| tickets.len())
+                .map(|(busiest, _)| *busiest);
+            busiest.and_then(|busiest| self.pop_oldest(busiest))
+        } else {
+            None
+        };
+        self.next += 1;
+        let ticket = Ticket(self.next);
+        self.sources.entry(source).or_default().push_back(ticket);
+        self.count += 1;
+        (ticket, evicted)
+    }
+
+    fn pop_oldest(&mut self, source: IpAddr) -> Option<Ticket> {
+        let tickets = self.sources.get_mut(&source)?;
+        let oldest = tickets.pop_front();
+        if tickets.is_empty() {
+            self.sources.remove(&source);
+        }
+        if oldest.is_some() {
+            self.count -= 1;
+        }
+        oldest
+    }
+
+    /// The handshake of `ticket` from `address` finished, failed or timed
+    /// out.
+    pub fn release(&mut self, address: IpAddr, ticket: Ticket) {
+        let source = source_of(address);
+        let Some(tickets) = self.sources.get_mut(&source) else {
+            return;
+        };
+        let before = tickets.len();
+        tickets.retain(|kept| *kept != ticket);
+        self.count -= before - tickets.len();
+        if tickets.is_empty() {
+            self.sources.remove(&source);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -628,16 +741,14 @@ mod tests {
             let mut to_client = Vec::new();
             for received in to_server.drain(..) {
                 let step = with(server, |hs| at_server.handshake(hs, &received));
-                if let Step::Send(out) | Step::Up(out, _) | Step::Close(out, _) = &step {
-                    to_client.extend(out.iter().cloned());
-                }
+                let (Step::Send(out) | Step::Up(out, _) | Step::Close(out, _)) = &step;
+                to_client.extend(out.iter().cloned());
                 last.1 = step;
             }
             for received in to_client {
                 let step = with(client, |hs| at_client.handshake(hs, &received));
-                if let Step::Send(out) | Step::Up(out, _) | Step::Close(out, _) = &step {
-                    to_server.extend(out.iter().cloned());
-                }
+                let (Step::Send(out) | Step::Up(out, _) | Step::Close(out, _)) = &step;
+                to_server.extend(out.iter().cloned());
                 last.0 = step;
             }
         }
@@ -669,25 +780,28 @@ mod tests {
             sessions: &mut b.sessions,
             network: NETWORK,
         };
-        let inbound = open(&mut crypto, 1, &sent).unwrap();
+        let inbound = open(&mut crypto, 1, &sent, now).unwrap();
         assert_eq!(inbound.payload, b"ip packet");
         assert!(inbound.was_encrypted);
         assert!(!inbound.header.has(flags::ENCRYPTED));
 
         // Plain Data is refused; plain Ping is fine.
         let plain = packet(1, 2, packet_type::DATA, b"forged");
-        assert_eq!(open(&mut crypto, 1, &plain), Err(Dropped::Unencrypted));
+        assert_eq!(open(&mut crypto, 1, &plain, now), Err(Dropped::Unencrypted));
         let ping = packet(1, 2, packet_type::PING, &7u32.to_le_bytes());
-        assert!(open(&mut crypto, 1, &ping).is_ok());
+        assert!(open(&mut crypto, 1, &ping, now).is_ok());
         let late = packet(1, 0, packet_type::SECURE_MSG1, b"x");
-        assert_eq!(open(&mut crypto, 1, &late), Err(Dropped::HandshakeAfterUp));
+        assert_eq!(
+            open(&mut crypto, 1, &late, now),
+            Err(Dropped::HandshakeAfterUp)
+        );
         let mut exit = packet(1, 2, packet_type::PING, b"x");
         exit[9] = flags::EXIT_NODE;
-        assert_eq!(open(&mut crypto, 1, &exit), Err(Dropped::ExitNode));
+        assert_eq!(open(&mut crypto, 1, &exit, now), Err(Dropped::ExitNode));
         // A relayed packet from a node without a relay session.
         let mut far = sent.clone();
         far[0..4].copy_from_slice(&9u32.to_le_bytes());
-        assert_eq!(open(&mut crypto, 1, &far), Err(Dropped::NoSession));
+        assert_eq!(open(&mut crypto, 1, &far, now), Err(Dropped::NoSession));
     }
 
     #[test]
@@ -704,14 +818,14 @@ mod tests {
         let mut crypto = Crypto::Default(Some(&cipher));
         let now = Instant::now();
         let sent = seal(&mut crypto, 1, 2, 2, packet_type::RPC_REQ, b"rpc", now).unwrap();
-        assert_eq!(open(&mut crypto, 1, &sent).unwrap().payload, b"rpc");
+        assert_eq!(open(&mut crypto, 1, &sent, now).unwrap().payload, b"rpc");
         let plain = packet(1, 2, packet_type::RPC_REQ, b"rpc");
-        assert_eq!(open(&mut crypto, 1, &plain), Err(Dropped::Unencrypted));
+        assert_eq!(open(&mut crypto, 1, &plain, now), Err(Dropped::Unencrypted));
 
         // Only an explicitly unencrypted network takes plain Data.
         let mut none = Crypto::Default(None);
         let plain = packet(1, 2, packet_type::DATA, b"ip");
-        assert_eq!(open(&mut none, 1, &plain).unwrap().payload, b"ip");
+        assert_eq!(open(&mut none, 1, &plain, now).unwrap().payload, b"ip");
         assert_eq!(
             seal(&mut none, 1, 2, 2, packet_type::DATA, b"ip", now).unwrap(),
             plain
@@ -759,21 +873,18 @@ mod tests {
     }
 
     #[test]
-    fn a_second_msg1_waits_for_the_first_create() {
+    fn a_second_connection_waits_then_joins() {
         let mut a = Side::new(1, b"s3cr3t", SecurityMode::ForwardSecrecy);
         let mut b = Side::new(2, b"s3cr3t", SecurityMode::ForwardSecrecy);
         let (mut first, msg1) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
-        let (mut second, other_msg1) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        assert_eq!(
+            with(&mut a, |hs| Link::client(hs, Some(2))).err(),
+            Some(CloseReason::WaitForSession)
+        );
         let mut at_b = Link::server(Instant::now());
-        let mut at_b_too = Link::server(Instant::now());
-
         let Step::Send(msg2) = with(&mut b, |hs| at_b.handshake(hs, &msg1)) else {
             panic!("msg2 expected");
         };
-        assert_eq!(
-            with(&mut b, |hs| at_b_too.handshake(hs, &other_msg1)),
-            Step::Retry
-        );
         let Step::Up(msg3, _) = with(&mut a, |hs| first.handshake(hs, &msg2[0])) else {
             panic!("up expected");
         };
@@ -781,9 +892,10 @@ mod tests {
             with(&mut b, |hs| at_b.handshake(hs, &msg3[0])),
             Step::Up(..)
         ));
-
-        // Now the second connection goes ahead.
-        let Step::Send(msg2) = with(&mut b, |hs| at_b_too.handshake(hs, &other_msg1)) else {
+        // Now the second connection asks to join the session.
+        let (mut second, msg1) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        let mut at_b_too = Link::server(Instant::now());
+        let Step::Send(msg2) = with(&mut b, |hs| at_b_too.handshake(hs, &msg1)) else {
             panic!("msg2 expected");
         };
         let Step::Up(msg3, _) = with(&mut a, |hs| second.handshake(hs, &msg2[0])) else {
@@ -793,6 +905,60 @@ mod tests {
             with(&mut b, |hs| at_b_too.handshake(hs, &msg3[0])),
             Step::Up(..)
         ));
+        let key = SessionKey {
+            namespace: Namespace::Direct,
+            network: NETWORK.into(),
+            peer_id: 1,
+        };
+        assert_eq!(b.sessions.get(&key).unwrap().connections(), 2);
+    }
+
+    #[test]
+    fn handshakes_are_limited_by_source_address() {
+        let mut budget = HandshakeBudget::new();
+        let forger: IpAddr = "203.0.113.7".parse().unwrap();
+        let first = budget.admit(forger).0;
+        for _ in 1..HANDSHAKES_PER_SOURCE {
+            assert_eq!(budget.admit(forger).1, None);
+        }
+        // The ninth from the same address pushes out its own oldest.
+        assert_eq!(budget.admit(forger).1, Some(first));
+        assert_eq!(budget.len(), HANDSHAKES_PER_SOURCE);
+        // Another source is not held back by it.
+        let peer: IpAddr = "198.51.100.1".parse().unwrap();
+        let (ticket, evicted) = budget.admit(peer);
+        assert_eq!(evicted, None);
+        budget.release(peer, ticket);
+        assert_eq!(budget.len(), HANDSHAKES_PER_SOURCE);
+
+        // IPv6 counts by /64.
+        let mut budget = HandshakeBudget::new();
+        let base: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let first = budget.admit(base).0;
+        for n in 2..=HANDSHAKES_PER_SOURCE as u16 {
+            let address: IpAddr = format!("2001:db8:1:2::{n:x}").parse().unwrap();
+            assert_eq!(budget.admit(address).1, None);
+        }
+        let same_64: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        assert_eq!(budget.admit(same_64).1, Some(first));
+
+        // In all: the source holding the most makes room.
+        let mut budget = HandshakeBudget::new();
+        let heavy: IpAddr = "192.0.2.1".parse().unwrap();
+        let heavy_first = budget.admit(heavy).0;
+        for _ in 1..HANDSHAKES_PER_SOURCE {
+            budget.admit(heavy);
+        }
+        let mut n = 0u32;
+        while budget.len() < MAX_HANDSHAKES {
+            n += 1;
+            let address = IpAddr::from((0x0a00_0000 + n).to_be_bytes());
+            budget.admit(address);
+        }
+        let newcomer: IpAddr = "192.0.2.200".parse().unwrap();
+        assert_eq!(budget.admit(newcomer).1, Some(heavy_first));
+        assert_eq!(budget.len(), MAX_HANDSHAKES);
+        assert!(!budget.is_empty());
     }
 
     #[test]
@@ -806,6 +972,7 @@ mod tests {
 
     #[test]
     fn compressed_payloads_are_checked() {
+        let now = Instant::now();
         let mut crypto = Crypto::Default(None);
         let body = vec![7u8; 900];
         let mut compressed = ruzstd::encoding::compress_to_vec(
@@ -817,15 +984,15 @@ mod tests {
         header.flags = flags::COMPRESSED;
         let mut sent = header.encode().to_vec();
         sent.extend_from_slice(&compressed);
-        assert_eq!(open(&mut crypto, 1, &sent).unwrap().payload, body);
+        assert_eq!(open(&mut crypto, 1, &sent, now).unwrap().payload, body);
 
         // A length that does not match, and lzo.
         header.len = 800;
         let mut wrong = header.encode().to_vec();
         wrong.extend_from_slice(&compressed);
-        assert_eq!(open(&mut crypto, 1, &wrong), Err(Dropped::Malformed));
+        assert_eq!(open(&mut crypto, 1, &wrong, now), Err(Dropped::Malformed));
         let mut lzo = sent.clone();
         *lzo.last_mut().unwrap() = 2;
-        assert_eq!(open(&mut crypto, 1, &lzo), Err(Dropped::Malformed));
+        assert_eq!(open(&mut crypto, 1, &lzo, now), Err(Dropped::Malformed));
     }
 }
