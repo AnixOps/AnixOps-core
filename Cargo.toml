@@ -20,6 +20,7 @@ members = [
     "crates/inbound-reverse-proxy",
     "crates/inbound-shadowsocks",
     "crates/inbound-snell",
+    "crates/inbound-socks",
     "crates/inbound-transport",
     "crates/inbound-trojan",
     "crates/inbound-tuic",

@@ -84,6 +84,15 @@ pub const FORWARD_TYPE: &str = "forward";
 /// upstreams through its base outbound only.
 pub const REVERSE_PROXY_TYPE: &str = "reverse_proxy";
 
+/// The `type` of the internal-network SOCKS5 inbound (`inbound-socks`). It
+/// must listen on an internal address ([`inbound_socks::is_internal`]) and
+/// carry `expires_at_ms` at most [`MAX_SOCKS_LIFETIME`] ahead, so it is
+/// never reachable from the internet and never permanent.
+pub const SOCKS_TYPE: &str = "socks";
+
+/// Longest time ahead a `"type": "socks"` inbound may expire.
+pub const MAX_SOCKS_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// An inbound's base outbound, for TCP connections and UDP sessions.
 #[derive(Clone)]
 pub struct NodeOutbound {
@@ -162,6 +171,8 @@ pub fn default_registry() -> InboundRegistry {
     registry.register(Arc::new(inbound_naive::NaiveInboundFactory));
     #[cfg(feature = "reverse_proxy")]
     registry.register(Arc::new(inbound_reverse_proxy::ReverseProxyInboundFactory));
+    #[cfg(feature = "socks")]
+    registry.register(Arc::new(inbound_socks::SocksInboundFactory));
     registry
 }
 
@@ -224,6 +235,7 @@ pub const FEATURES: &[&str] = &[
     "sing_mux_h2mux",
     "fallbacks",
     "xhttp_h3",
+    "inbound_expiry",
     #[cfg(feature = "shadowsocks")]
     "shadow_tls",
     #[cfg(feature = "shadowsocks")]
@@ -306,6 +318,9 @@ pub struct InboundInfo {
     /// The network-model ingress the inbound belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingress: Option<String>,
+    /// When the inbound ends, in Unix milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
 }
 
 /// Bytes relayed by one inbound, all users and none together.
@@ -352,6 +367,41 @@ struct Running {
     /// Bytes up and down already reported by a resetting
     /// [`Node::inbound_traffic`] call.
     reported: Mutex<(u64, u64)>,
+    /// When the inbound ends: its task stops serving at `deadline`, and
+    /// the next look at the table drops it.
+    expiry: Option<Expiry>,
+}
+
+#[derive(Clone, Copy)]
+struct Expiry {
+    at_ms: u64,
+    deadline: tokio::time::Instant,
+}
+
+impl Expiry {
+    /// `at_ms` as a deadline; refused unless it is in the future.
+    fn new(at_ms: u64) -> Result<Self, NodeError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|now| u64::try_from(now.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        if at_ms <= now_ms {
+            return Err(NodeError::Invalid("expires_at_ms is not in the future"));
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(at_ms - now_ms))
+            .ok_or(NodeError::Invalid("expires_at_ms is too far ahead"))?;
+        Ok(Self { at_ms, deadline })
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    fn passed(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline
+    }
 }
 
 struct RunningRelay {
@@ -496,6 +546,10 @@ impl Node {
                 (outbound, base)
             }
         };
+        let expiry = config.expires_at_ms.map(Expiry::new).transpose()?;
+        if config.kind == SOCKS_TYPE {
+            check_socks(&config, expiry)?;
+        }
         let inbound = self
             .registry
             .build(&config.kind, &config.settings)
@@ -524,6 +578,7 @@ impl Node {
                 tcp_outbound.clone(),
                 udp_outbound.clone(),
                 config.accept_proxy_protocol,
+                expiry,
             ) {
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse && waited < REBIND_WAIT => {
                     tokio::time::sleep(REBIND_STEP).await;
@@ -548,6 +603,7 @@ impl Node {
                 stats,
                 task,
                 reported: Mutex::new((0, 0)),
+                expiry,
             },
         );
         Ok(listen)
@@ -561,6 +617,7 @@ impl Node {
         outbound: Arc<dyn TcpOutbound>,
         udp: Arc<dyn UdpOutbound>,
         accept_proxy_protocol: bool,
+        expiry: Option<Expiry>,
     ) -> io::Result<(SocketAddr, Arc<InboundStats>, JoinHandle<()>)> {
         let stats = Arc::new(InboundStats::default());
         let settings = ServeSettings {
@@ -587,7 +644,7 @@ impl Node {
                     )),
                     _ => None,
                 };
-                let task = tokio::spawn({
+                let task = tokio::spawn(until(expiry, {
                     let (stream, stats) = (stream.clone(), stats.clone());
                     async move {
                         let streams =
@@ -601,7 +658,7 @@ impl Node {
                             }
                         }
                     }
-                });
+                }));
                 (listen, task)
             }
             Inbound::Packet(packet) => {
@@ -611,9 +668,9 @@ impl Node {
                     packet
                         .clone()
                         .serve(socket, outbound, Some(udp), settings, stats.clone());
-                let task = tokio::spawn(async move {
+                let task = tokio::spawn(until(expiry, async move {
                     let _ = served.await;
-                });
+                }));
                 (listen, task)
             }
         };
@@ -712,7 +769,7 @@ impl Node {
                 relay.listen.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
                 relay.port,
             );
-            match self.spawn(&inbound, address, direct.clone(), direct, false) {
+            match self.spawn(&inbound, address, direct.clone(), direct, false, None) {
                 Ok((listen, stats, task)) => {
                     relays.insert(
                         relay.id,
@@ -726,6 +783,7 @@ impl Node {
                                 stats,
                                 task,
                                 reported: Mutex::new((0, 0)),
+                                expiry: None,
                             },
                             config: relay,
                         },
@@ -787,11 +845,7 @@ impl Node {
     /// Stops an inbound and closes its users' connections.
     pub fn remove_inbound(&self, tag: &str) -> Result<(), NodeError> {
         let running = self.lock().remove(tag).ok_or(NodeError::NotFound)?;
-        running.task.abort();
-        let users = running.inbound.users();
-        for name in users.names() {
-            users.remove(&name);
-        }
+        stop(running);
         Ok(())
     }
 
@@ -854,6 +908,7 @@ impl Node {
                     bytes_down: stats.bytes_down.load(Ordering::Relaxed),
                     outbound: running.outbound.clone(),
                     ingress: running.ingress.clone(),
+                    expires_at_ms: running.expiry.map(|expiry| expiry.at_ms),
                 }
             })
             .collect()
@@ -864,11 +919,79 @@ impl Node {
         self.registry.type_names()
     }
 
+    /// The inbound table, without the inbounds whose expiry passed: those
+    /// are stopped and dropped here, so an expired tag is free again.
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Running>> {
-        self.inbounds
+        let mut inbounds = self
+            .inbounds
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expired: Vec<String> = inbounds
+            .iter()
+            .filter(|(_, running)| running.expiry.is_some_and(|expiry| expiry.passed()))
+            .map(|(tag, _)| tag.clone())
+            .collect();
+        for tag in expired {
+            if let Some(running) = inbounds.remove(&tag) {
+                stop(running);
+            }
+        }
+        inbounds
     }
+}
+
+/// Stops an inbound's task and closes its users' connections.
+fn stop(running: Running) {
+    running.task.abort();
+    let users = running.inbound.users();
+    for name in users.names() {
+        users.remove(&name);
+    }
+}
+
+/// Runs `serve` until `expiry` passes; dropping it then closes the
+/// listener and every connection it accepted.
+async fn until(expiry: Option<Expiry>, serve: impl std::future::Future<Output = ()>) {
+    match expiry {
+        Some(expiry) => {
+            tokio::select! {
+                _ = serve => {}
+                _ = tokio::time::sleep(expiry.remaining()) => {}
+            }
+        }
+        None => serve.await,
+    }
+}
+
+/// The rules of `"type": "socks"`: an expiry at most
+/// [`MAX_SOCKS_LIFETIME`] ahead and an internal listen address.
+fn check_socks(config: &InboundConfig, expiry: Option<Expiry>) -> Result<(), NodeError> {
+    let Some(expiry) = expiry else {
+        return Err(NodeError::Invalid("a socks inbound needs expires_at_ms"));
+    };
+    if expiry.remaining() > MAX_SOCKS_LIFETIME {
+        return Err(NodeError::Invalid(
+            "a socks inbound expires at most seven days ahead",
+        ));
+    }
+    if !is_internal(config.listen) {
+        return Err(NodeError::Invalid(
+            "a socks inbound listens on an internal address only",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "socks")]
+fn is_internal(ip: std::net::IpAddr) -> bool {
+    inbound_socks::is_internal(ip)
+}
+
+/// Without the protocol no address is good enough; the registry refuses
+/// the type anyway.
+#[cfg(not(feature = "socks"))]
+fn is_internal(_ip: std::net::IpAddr) -> bool {
+    false
 }
 
 impl Drop for Node {

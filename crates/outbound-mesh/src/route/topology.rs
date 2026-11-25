@@ -122,10 +122,14 @@ impl Topology {
                 }
                 let first_hop = if node == source { next } else { key.2 };
                 let candidate = match metric {
-                    Metric::Hops => (key.0 + 1, key.1 + through, first_hop),
+                    Metric::Hops => (key.0 + 1, key.1.saturating_add(through), first_hop),
                     Metric::Latency => {
                         let edge = latency(node, next).unwrap_or(UNKNOWN_LATENCY_MS);
-                        (key.0 + edge + through, key.1 + 1, first_hop)
+                        (
+                            key.0.saturating_add(edge).saturating_add(through),
+                            key.1 + 1,
+                            first_hop,
+                        )
                     }
                 };
                 let better = best.get(&next).is_none_or(|(known, _)| candidate < *known);

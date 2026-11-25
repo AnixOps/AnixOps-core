@@ -20,6 +20,8 @@ pub enum FrameError {
     TooLong(u32),
     /// A packet this node was about to send is above [`MAX_SEND_FRAME`].
     SendTooLong(usize),
+    /// More than [`MAX_BUFFERED`] bytes without whole frames being read out.
+    Overflow,
 }
 
 impl fmt::Display for FrameError {
@@ -30,6 +32,7 @@ impl fmt::Display for FrameError {
             }
             FrameError::TooLong(n) => write!(f, "mesh TCP frame of {n} bytes is too long"),
             FrameError::SendTooLong(n) => write!(f, "mesh packet of {n} bytes is too long to send"),
+            FrameError::Overflow => f.write_str("mesh TCP receive buffer is full"),
         }
     }
 }
@@ -54,25 +57,42 @@ pub fn encode_frame(packet: &[u8]) -> Result<Vec<u8>, FrameError> {
 #[derive(Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    /// Bytes at the front of `buf` already returned as packets.
+    start: usize,
 }
+
+/// Most bytes a [`FrameDecoder`] holds: one largest frame plus one read.
+pub const MAX_BUFFERED: usize = LEN_PREFIX + MAX_RECV_FRAME + 64 * 1024;
 
 impl FrameDecoder {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push(&mut self, bytes: &[u8]) {
+    /// Adds bytes read from the connection. Refuses to hold more than
+    /// [`MAX_BUFFERED`]: the caller reads packets out between reads, so a
+    /// full buffer means the peer is not sending frames.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), FrameError> {
+        if self.start > 0 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        if self.buf.len() + bytes.len() > MAX_BUFFERED {
+            return Err(FrameError::Overflow);
+        }
         self.buf.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Bytes held that do not yet form a whole frame.
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.start
     }
 
     /// The next whole packet. An error is final: the connection must close.
     pub fn next_packet(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
-        let Some(prefix) = self.buf.get(..LEN_PREFIX) else {
+        let pending = &self.buf[self.start..];
+        let Some(prefix) = pending.get(..LEN_PREFIX) else {
             return Ok(None);
         };
         let len = u32::from_le_bytes(prefix.try_into().unwrap());
@@ -83,11 +103,11 @@ impl FrameDecoder {
             return Err(FrameError::TooLong(len));
         }
         let end = LEN_PREFIX + len as usize;
-        if self.buf.len() < end {
+        if pending.len() < end {
             return Ok(None);
         }
-        let packet = self.buf[LEN_PREFIX..end].to_vec();
-        self.buf.drain(..end);
+        let packet = pending[LEN_PREFIX..end].to_vec();
+        self.start += end;
         Ok(Some(packet))
     }
 }
@@ -111,7 +131,7 @@ mod tests {
             let mut decoder = FrameDecoder::new();
             let mut out = Vec::new();
             for piece in stream.chunks(chunk) {
-                decoder.push(piece);
+                decoder.push(piece).unwrap();
                 while let Some(packet) = decoder.next_packet().unwrap() {
                     out.push(packet);
                 }
@@ -134,23 +154,42 @@ mod tests {
     #[test]
     fn receive_accepts_up_to_4096_and_rejects_bad_lengths() {
         let mut decoder = FrameDecoder::new();
-        decoder.push(&(MAX_RECV_FRAME as u32).to_le_bytes());
-        decoder.push(&packet(MAX_RECV_FRAME));
+        decoder
+            .push(&(MAX_RECV_FRAME as u32).to_le_bytes())
+            .unwrap();
+        decoder.push(&packet(MAX_RECV_FRAME)).unwrap();
         assert_eq!(
             decoder.next_packet().unwrap().unwrap().len(),
             MAX_RECV_FRAME
         );
 
         let mut decoder = FrameDecoder::new();
-        decoder.push(&4097u32.to_le_bytes());
+        decoder.push(&4097u32.to_le_bytes()).unwrap();
         assert_eq!(decoder.next_packet(), Err(FrameError::TooLong(4097)));
 
         let mut decoder = FrameDecoder::new();
-        decoder.push(&15u32.to_le_bytes());
+        decoder.push(&15u32.to_le_bytes()).unwrap();
         assert_eq!(decoder.next_packet(), Err(FrameError::TooShort(15)));
 
         let mut decoder = FrameDecoder::new();
-        decoder.push(&[16, 0, 0]);
+        decoder.push(&[16, 0, 0]).unwrap();
         assert_eq!(decoder.next_packet(), Ok(None));
+    }
+
+    #[test]
+    fn buffer_is_bounded_and_compacted() {
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            decoder.push(&vec![0xff; MAX_BUFFERED + 1]),
+            Err(FrameError::Overflow)
+        );
+        // Whole frames read out make room again.
+        let frame = encode_frame(&packet(MAX_SEND_FRAME)).unwrap();
+        let mut decoder = FrameDecoder::new();
+        for _ in 0..1000 {
+            decoder.push(&frame).unwrap();
+            assert!(decoder.next_packet().unwrap().is_some());
+            assert_eq!(decoder.buffered(), 0);
+        }
     }
 }

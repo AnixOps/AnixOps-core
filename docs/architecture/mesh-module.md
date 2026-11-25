@@ -31,19 +31,20 @@
 
 需求 R2（`/mnt/project-files/mesh/requirements.md`）：现有组网节点未启用前向保密，必须支持网络的默认握手才能互通。加密模式按网络选择，同一网络内所有节点同一模式，不做逐连接协商。
 
-- `secure_mode`（规范 §5.2）：`false`（默认，与现网一致）为网络默认握手，没有前向保密，状态里每个会话报告这一点，界面标注“未启用前向保密”；`true` 为安全模式。不做自动回落。
+- `network.kind`（规范 §15.11，需求 R30）：`managed`（默认）为我方区域网络，一律安全模式，不允许 `secure_mode: false` 或 `cipher: none`；`legacy` 为迁移期间加入的旧网（通常是桥接节点的旧网实例），只有它可以用默认握手或不加密。
+- `secure_mode`（规范 §5.2）：`true` 为安全模式，`false` 为网络默认握手，没有前向保密，状态里每个会话报告这一点，界面标注“未启用前向保密”。省略时受管网络为 `true`、旧网为 `false`。不做自动回落。
 - 模式与同网对端不一致时连接被拒绝，状态里记录“加密模式不一致”。
-- `cipher`（规范 §7.1）：旧模式的流量加密算法，`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；两端必须一致。不安全的异或方式不提供，配置写它会被拒绝。
+- `cipher`（规范 §7.1）：旧模式的流量加密算法，`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；两端必须一致。不安全的异或方式不提供，配置写 `xor` 时校验报“该加密方式不安全”。
 
 ## 配置
 
-配置结构由我方独立设计（需求 R13），带版本号 `config_version`，按网络、本节点、对端、子网、路由分层；嵌套对象拒绝未知字段，导入器写错时直接失败。旧配置的导入器在 Agent 或部署层，单向转换成本结构，不在内核里。
+配置结构由我方独立设计（需求 R13），带版本号 `config_version`，按网络、本节点、对端、子网、路由分层；顶层与嵌套对象都拒绝未知字段（出站的 `type`、`tag` 由注册层先去掉），导入器写错时直接失败。旧配置的导入器在 Agent 或部署层，单向转换成本结构，不在内核里。
 
 ```json
 {
   "type": "mesh",
   "config_version": 1,
-  "network": { "name": "office", "secret": "<钥匙串注入>", "secure_mode": false, "cipher": "aes-gcm" },
+  "network": { "name": "office", "secret": "<钥匙串注入>", "kind": "managed", "secure_mode": true },
   "node": {
     "address": "10.144.144.5/24",
     "address_v6": "fd00:aa::5/64",
@@ -65,15 +66,20 @@
 | 字段 | 含义 |
 |---|---|
 | `network.name` / `secret` | 网络名按原样参与摘要（不去空格）；密钥由钥匙串注入 |
-| `network.secure_mode` | `false`（默认）旧模式，`true` 安全模式；全网一致（规范 §5.2） |
+| `network.kind` | `managed`（默认，区域网络，只能安全模式）或 `legacy`（迁移中的旧网） |
+| `network.secure_mode` | `true` 安全模式，`false` 旧模式；省略时按 `kind`；全网一致（规范 §5.2） |
 | `network.cipher` | 旧模式算法：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；不提供异或。`none` 为不加密，只有显式写出才生效，不能与安全模式同用，界面标出“未加密”（需求 R14）；未选择时本节点丢弃不加密网络的明文流量 |
 | `node.address` | IPv4 虚拟地址与前缀（/8–/30），前缀即虚拟网段 |
 | `node.role` | `full` 或 `access`；缺省按平台：桌面与服务器 `full`，iOS、Android 只能 `access`（R10） |
 | `node.listen` | 监听，只有完整节点可以配置；端口默认 11010 |
-| `peers` | 初始对端（1–64 个），`transport` 为 `tcp`（默认）或 `udp` |
+| `node.hostname` | 其他节点和内网域名（R28）显示的名称，一个 DNS 标签（1–63 位字母、数字、连字符，不以连字符开头或结尾）；缺省取系统主机名 |
+| `node.mtu` | 虚拟网卡 MTU，1280–9000，默认 1380 |
+| `node.relay` | 是否替其他节点中转；完整节点默认 `true`，接入节点固定 `false`（写 `true` 报错）。`false` 时仍可作为目的节点 |
+| `peers` | 初始对端（最多 64 个），`transport` 为 `tcp`（默认）或 `udp`；只有监听的完整节点（中心节点）可以为空 |
 | `subnets.accept` | 进一步限制接受的通告子网，不能扩大内网范围 |
 | `subnets.advertise` | 本机通告的局域网子网，只有完整节点可以配置，必须在内网范围内且不与虚拟网段重叠 |
 | `routing.policy` | `hops`（默认）或 `latency`（规范 §13） |
+| `routing.system_routes` | 只把这些网段内的路由装进操作系统路由表（限内网范围）；缺省为全部已接受的路由。不在其中的路由仍在组网内部可用并显示 |
 | `routing.paths` | 自定义路径：`to_peer`（节点虚拟地址）或 `to_subnet`（网段）二选一，`via` 为途经节点的虚拟地址，最多 6 个；同一目标只能有一条 |
 
 ## 分层与集成点
@@ -96,6 +102,25 @@
 - 管理（需求 R11）：不实现对端程序的本机管理接口（供命令行或网页控制台使用的管理端口）和远程配置服务器接入，不监听、不响应这类请求；本模块的配置、状态和控制只有两条途径：接入 Agent 的节点由 Agent 下发，未接入 Agent 的节点用本地配置手动设置。节点之间的控制消息（路由同步、延迟汇总、打洞协调）属于组网协议本身，按规范实现。
 - 平台（需求 R4）：macOS、iOS、Windows、Linux、Android；首批传输 TCP 和 UDP（R3）。
 - 桌面整机 TUN 模式（把虚拟网段路由进系统）在出站模式稳定后再做。
+
+## 节点程序 `anixops-mesh` 的退出约定
+
+`apps/mesh-node` 的 `run` 子命令（M2）启动节点；部署层（安装器、Agent）按下面的约定判断是否回滚，约定保持稳定：
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 正常退出 |
+| 1 | 其他运行错误 |
+| 2 | 配置无效（`MeshConfig::validate` 拒绝） |
+| 3 | 启动冲突（需求 R12），拒绝启动 |
+
+非 0 退出时 stderr 最后一行固定是一行 JSON：
+
+- 配置无效：`{"error":"config","detail":"…"}`
+- 启动冲突：`{"error":"conflict","conflict":"<code>","detail":"…"}`，`<code>` 为 `port_in_use`、`tun_in_use`、`route_overlap`、`address_in_use`、`identity_online`、`permission_denied` 之一
+- 其他错误：`{"error":"runtime","detail":"…"}`
+
+`detail` 只给人看，不作判断依据。以后新增 `conflict` 取值属于兼容变更，读取方遇到未知取值按冲突处理。
 
 ## 验证
 

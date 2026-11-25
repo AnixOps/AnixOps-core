@@ -36,6 +36,7 @@ impl LegacyCipher {
     pub fn new(cipher: Cipher, secret: &[u8]) -> Option<Self> {
         let unbound = match cipher {
             Cipher::None => return None,
+            Cipher::Xor => unreachable!("validation refuses the xor cipher"),
             Cipher::Aes128Gcm => UnboundKey::new(&aead::AES_128_GCM, &key128(secret)),
             Cipher::Aes256Gcm => UnboundKey::new(&aead::AES_256_GCM, &key256(secret)),
             Cipher::ChaCha20Poly1305 => UnboundKey::new(&aead::CHACHA20_POLY1305, &key256(secret)),
