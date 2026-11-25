@@ -87,7 +87,10 @@ async fn socks_needs_an_internal_listen_address_and_an_expiry() {
     let soon = now_ms() + 60_000;
     let no_expiry = invalid(node.add_inbound(socks("a", "127.0.0.1", None)).await);
     assert!(no_expiry.contains("expires_at_ms"), "{no_expiry}");
-    let past = invalid(node.add_inbound(socks("a", "127.0.0.1", Some(now_ms() - 1))).await);
+    let past = invalid(
+        node.add_inbound(socks("a", "127.0.0.1", Some(now_ms() - 1)))
+            .await,
+    );
     assert!(past.contains("not in the future"), "{past}");
     let far = now_ms() + 8 * 24 * 60 * 60 * 1000;
     let too_far = invalid(node.add_inbound(socks("a", "127.0.0.1", Some(far))).await);

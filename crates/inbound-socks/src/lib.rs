@@ -370,7 +370,10 @@ mod tests {
     fn connect_failures_get_their_reply() {
         let code = |kind| failure_code(&io::Error::from(kind));
         assert_eq!(code(io::ErrorKind::PermissionDenied), REP_NOT_ALLOWED);
-        assert_eq!(code(io::ErrorKind::ConnectionRefused), REP_CONNECTION_REFUSED);
+        assert_eq!(
+            code(io::ErrorKind::ConnectionRefused),
+            REP_CONNECTION_REFUSED
+        );
         assert_eq!(code(io::ErrorKind::TimedOut), REP_HOST_UNREACHABLE);
         assert_eq!(code(io::ErrorKind::Other), REP_GENERAL_FAILURE);
     }
