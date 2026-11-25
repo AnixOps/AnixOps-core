@@ -118,7 +118,7 @@ fn platform_supported() -> bool {
 }
 
 fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
-    let host = RealHost;
+    let host = RealHost::default();
     match command {
         "version" => {
             println!("{}", mesh_node::VERSION);

@@ -92,6 +92,9 @@ pub struct Process {
     pub uid: Option<u32>,
     #[serde(default)]
     pub gid: Option<u32>,
+    /// Supplementary groups (`Groups:` in `/proc/PID/status`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<u32>>,
     /// The whole environment, for a restart on rollback. Holds secrets.
     #[serde(skip_serializing, default)]
     pub environ: Vec<(String, String)>,
@@ -248,6 +251,13 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
             })
         };
         let (uid, gid) = (id_of("Uid:"), id_of("Gid:"));
+        let groups = status.lines().find_map(|line| {
+            line.strip_prefix("Groups:").map(|list| {
+                list.split_whitespace()
+                    .filter_map(|group| group.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+        });
         let cwd = host
             .read_link(&entry.join("cwd"))
             .ok()
@@ -283,6 +293,7 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
             contained,
             uid,
             gid,
+            groups,
             environ,
         });
     }
