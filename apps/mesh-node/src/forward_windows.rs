@@ -3,14 +3,18 @@
 //!
 //! Every change is a guard from `platform_windows::mesh_host`, held by
 //! [`HostChanges`] while the node runs; what a dead process left behind is
-//! put back by `recover_mesh_host` on the next start.
+//! put back by `recover_mesh_host` on the next start. Only one process per
+//! host makes these changes (the client or this node): a second one is
+//! refused with `ResourceBusy` and runs without them.
 //!
 //! - Firewall: inbound TCP/UDP to this program's listen ports, and inbound
 //!   from the mesh adapter to this program, for any full node that listens.
 //! - Forwarding: interface-level forwarding on the mesh adapter and on each
 //!   interface with an address on an advertised subnet, for a full node with
-//!   subnets to advertise. The global `IPEnableRouter` setting is not
-//!   touched.
+//!   subnets to advertise, for IPv6 too when the node has an IPv6 virtual
+//!   address. The global `IPEnableRouter` setting is not touched. Other
+//!   interfaces that already forward are reported, since Windows forwards
+//!   between all of them.
 //! - Translation: one WinNAT object whose internal prefix is the IPv4
 //!   virtual subnet, so hosts on an advertised subnet answer this machine's
 //!   address on that subnet. WinNAT takes one internal prefix per object and
@@ -21,7 +25,6 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
 
 use outbound_mesh::IpNet;
 use platform_windows::mesh_host::{self, FirewallGuard, ForwardingGuard, NatGuard};
@@ -60,26 +63,34 @@ impl HostChanges {
     }
 
     /// Switches forwarding on for `adapter` and the interfaces that carry
-    /// the `advertised` subnets, then translates the IPv4 virtual subnet
-    /// (`virtual_v4`, the node's address and prefix). `interfaces` are the
-    /// machine's (alias, address network) pairs. Returns warnings: subnets
-    /// no interface is on, and a translation WinNAT refused.
+    /// the `advertised` subnets (IPv6 too when `ipv6`), then translates the
+    /// IPv4 virtual subnet (`virtual_v4`, the node's address and prefix).
+    /// `interfaces` are the machine's (alias, address network) pairs.
+    /// Returns warnings: subnets no interface is on, other interfaces that
+    /// forward, and a translation WinNAT refused.
     pub fn forward(
         &mut self,
-        state_dir: &Path,
         network: &str,
         adapter: &str,
         interfaces: &[(String, IpNet)],
         advertised: &[IpNet],
         virtual_v4: Option<(Ipv4Addr, u8)>,
+        ipv6: bool,
     ) -> io::Result<Vec<String>> {
         let lan = crate::host_routes::lan_interfaces(interfaces, advertised, adapter);
         let mut warnings = missing_interfaces(&lan, advertised);
         let mut aliases: Vec<String> = lan.into_iter().map(|(alias, _)| alias).collect();
         aliases.dedup();
-        self.forwarding = Some(mesh_host::enable_mesh_forwarding(
-            state_dir, adapter, &aliases,
-        )?);
+        let forwarding = mesh_host::enable_mesh_forwarding(adapter, &aliases, ipv6)?;
+        match forwarding.other_forwarding_interfaces() {
+            Ok(others) if !others.is_empty() => warnings.push(format!(
+                "other interfaces forward too and can reach the advertised subnets: {}",
+                others.join(", ")
+            )),
+            Ok(_) => {}
+            Err(error) => warnings.push(format!("forwarding interfaces unknown: {error}")),
+        }
+        self.forwarding = Some(forwarding);
         if let Some((address, prefix)) = virtual_v4 {
             match mesh_host::add_mesh_nat(network, address, prefix) {
                 Ok(guard) => self.nat = Some(guard),

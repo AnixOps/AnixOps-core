@@ -374,29 +374,35 @@ impl HostForwarder for crate::forward_windows::HostChanges {
 /// Windows: puts back what an earlier run left, allows inbound traffic to a
 /// listening full node, and for a full node with subnets to advertise
 /// switches forwarding on and translates the virtual subnet
-/// (`forward_windows`). The state of forwarding is kept next to the
-/// configuration, in the directory the installer limits to SYSTEM and
-/// Administrators. A failure is reported and the node runs on.
+/// (`forward_windows`). One process per host makes these changes: when the
+/// client (or another node) holds them, this node says so and runs without
+/// them. Any other failure is reported and the node runs on.
 #[cfg(windows)]
 fn start_forwarding(
     settings: &MeshSettings,
     interface: &str,
     listen_ports: &[u16],
-    config: &Path,
+    _config: &Path,
 ) -> Option<Box<dyn HostForwarder>> {
     use platform_windows::mesh_host;
 
-    let state_dir = config
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let recovered = match mesh_host::recover_mesh_host(state_dir) {
-        Ok(_) => true,
-        Err(error) => {
-            warn("host_recovery", &error.to_string());
-            false
+    if let Err(error) = mesh_host::recover_mesh_host() {
+        let busy = error.kind() == io::ErrorKind::ResourceBusy;
+        let detail = if busy {
+            "another process holds the host changes".to_owned()
+        } else {
+            error.to_string()
+        };
+        warn("host_changes", &detail);
+        if forwards(settings) {
+            // Without recovery, originals recorded now could be values an
+            // earlier run set.
+            forwarding_line("off", Some(&detail));
+        } else {
+            forwarding_line("not_needed", None);
         }
-    };
+        return None;
+    }
     let mut host = crate::forward_windows::HostChanges::default();
     if settings.role == Role::Full && !listen_ports.is_empty() {
         if let Err(error) = host.allow_inbound(&settings.network_name, listen_ports, interface) {
@@ -405,21 +411,15 @@ fn start_forwarding(
     }
     if !forwards(settings) {
         forwarding_line("not_needed", None);
-    } else if !recovered {
-        // Recording originals now could keep a value an earlier run set.
-        forwarding_line(
-            "off",
-            Some("the forwarding values of an earlier run could not be put back"),
-        );
     } else {
         let started = host_interfaces(interface).and_then(|interfaces| {
             host.forward(
-                state_dir,
                 &settings.network_name,
                 interface,
                 &interfaces,
                 &settings.advertise_subnets,
                 crate::forward_windows::ipv4(&settings.address),
+                settings.address_v6.is_some(),
             )
         });
         match started {
