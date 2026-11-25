@@ -1042,7 +1042,7 @@ mod tests {
         ]);
         let converted = run(&args, &ImportOptions::default());
         assert!(codes(&converted, ItemStatus::Blocked).is_empty());
-        let config = converted.config.expect("config");
+        let config = converted.config.clone().expect("config");
         assert_valid(&config);
         assert_eq!(
             config,
