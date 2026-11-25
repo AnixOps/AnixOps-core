@@ -621,6 +621,67 @@ jobs:
             echo "::endgroup::"
           done
 
+  mesh-bridge-netns:
+    name: Mesh external bridge (nftables)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    needs:
+      - changes
+      - policy-fast
+      - detect-projects
+    # Same condition as the other Rust jobs. Loads the external bridge rules
+    # of crates/mesh-bridge (spec §15.12) into the real Linux nftables in
+    # network namespaces and checks what passes, what is translated and
+    # what is dropped.
+    if: >-
+      ${{
+        needs.detect-projects.outputs.rust == 'true' &&
+        (
+          needs.changes.outputs.full_matrix == 'true' ||
+          needs.changes.outputs.rust == 'true' ||
+          needs.changes.outputs.windows == 'true' ||
+          needs.changes.outputs.linux == 'true' ||
+          needs.changes.outputs.apple == 'true' ||
+          needs.changes.outputs.ios == 'true'
+        )
+      }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+
+      - name: Install nftables
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v nft >/dev/null 2>&1 && [[ ! -x /usr/sbin/nft ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends nftables
+          fi
+          shellcheck --shell=bash .github/scripts/mesh-bridge-netns.sh
+
+      - name: Build the bridge driver
+        shell: bash
+        run: cargo build --locked -p mesh-bridge --example bridge-netns
+
+      - name: Bridge in network namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env "BRIDGE_NETNS=${GITHUB_WORKSPACE}/target/debug/examples/bridge-netns" \
+            bash .github/scripts/mesh-bridge-netns.sh
+
   script-runtime-jsc:
     name: JavaScriptCore script conformance
     runs-on: macos-26
@@ -1032,6 +1093,7 @@ jobs:
       - rust-h2-mitm-fuzz
       - protocol-features
       - mesh-node-static
+      - mesh-bridge-netns
       - script-runtime-jsc
       - ios-runtime-static-libs
     steps:
@@ -1067,6 +1129,7 @@ jobs:
           RESULT_REALITY_INTEROP: ${{ needs.reality-interop.result }}
           RESULT_PROTOCOL_FEATURES: ${{ needs.protocol-features.result }}
           RESULT_MESH_NODE_STATIC: ${{ needs.mesh-node-static.result }}
+          RESULT_MESH_BRIDGE_NETNS: ${{ needs.mesh-bridge-netns.result }}
           RESULT_SCRIPT_RUNTIME_JSC: ${{ needs.script-runtime-jsc.result }}
           RESULT_IOS_RUNTIME_LIBS: ${{ needs.ios-runtime-static-libs.result }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1150,6 +1213,7 @@ jobs:
           record_job "REALITY interop (Linux)" "${RESULT_REALITY_INTEROP}" "${reality_interop_required}"
           record_job "Protocol feature matrix" "${RESULT_PROTOCOL_FEATURES}" "${rust_required}"
           record_job "Mesh node static build" "${RESULT_MESH_NODE_STATIC}" "${rust_required}"
+          record_job "Mesh external bridge (nftables)" "${RESULT_MESH_BRIDGE_NETNS}" "${rust_required}"
           record_job "JavaScriptCore script conformance" "${RESULT_SCRIPT_RUNTIME_JSC}" "${rust_required}"
           record_job "iOS runtime static libraries" "${RESULT_IOS_RUNTIME_LIBS}" "${ios_runtime_required}"
 
@@ -1216,6 +1280,7 @@ jobs:
             echo "| HTTP/2 MITM fuzz | ${rust_required} | ${RESULT_RUST_H2_FUZZ} |"
             echo "| Protocol feature matrix | ${rust_required} | ${RESULT_PROTOCOL_FEATURES} |"
             echo "| Mesh node static build | ${rust_required} | ${RESULT_MESH_NODE_STATIC} |"
+            echo "| Mesh external bridge (nftables) | ${rust_required} | ${RESULT_MESH_BRIDGE_NETNS} |"
             echo "| JavaScriptCore script conformance | ${rust_required} | ${RESULT_SCRIPT_RUNTIME_JSC} |"
             echo "| iOS runtime static libraries | ${ios_runtime_required} | ${RESULT_IOS_RUNTIME_LIBS} |"
           } >> "$GITHUB_STEP_SUMMARY"

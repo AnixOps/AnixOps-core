@@ -26,6 +26,7 @@ members = [
     "crates/inbound-tuic",
     "crates/inbound-vless",
     "crates/inbound-vmess",
+    "crates/mesh-bridge",
     "crates/mitm-anixops-sys",
     "crates/mitm-policy",
     "crates/netstack-smoltcp",

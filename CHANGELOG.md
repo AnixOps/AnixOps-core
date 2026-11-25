@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### Added
+
+- 组网外部网络桥接（规范 §15.12，需求 R36，内核 0.4）新增独立 crate `mesh-bridge`：`external_bridge { interface, routes, allow }` 的配置校验（单个地址可在 100.64.0.0/10 与 fd7a:115c:a1e0::/48 内，网段须在白名单内且不与这两个范围重叠，拒绝默认路由、主机位非零、名单与通告重叠，各原因码见 `docs/architecture/mesh-bridge.md`）；每个组网网卡一张 nftables 表、整表原子替换：只放行名单内来源到通告地址并做源地址转换，外部网络进来的新连接与名单外来源丢弃并计数；IPv4 转发按需打开并在最后一个桥接拆除后恢复，IPv6 转发只告警不修改；`externalBridge` 状态摘要（`docs/architecture/mesh-status.md` 共用测试向量）只在规则全部装好后更新。CI 新增作业「Mesh external bridge (nftables)」在网络命名空间中用真实 nftables 验证。接入组网配置与节点程序在后续 PR 中完成。
+
 ### Security
 
 - anixops-mesh 接管按 #321 复审修复（mesh-node `takeover`、`main`、安装脚本）：改动前检查跳过程序自身服务中的进程，带独立网络命名空间的单元由服务管理器停止与恢复（J1）；改动前预估记录大小，结束进程后会超过读取上限时直接拒绝，撤销或回滚后记录保存失败时报告「save record」并以退出码 7 结束（J2）；`--dry-run` 做同样的检查，拒绝时 `outcome` 为新增的 `refused`（退出码 1、不写记录），三个安装脚本在写入任何文件之前先预检（J3）；`forgotten` 只保留最近 64 条（J4）；文档补子命令参数、清空记录的确切含义与 `native_keys_pending` 期间不判失败（J5、J6a）。`detect`、`import`、`takeover`、`rollback` 在 macOS 与 Windows 上开放。
