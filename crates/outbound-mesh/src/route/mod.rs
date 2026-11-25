@@ -1,5 +1,6 @@
 //! Route synchronisation and path choice (spec §12, §13).
 
+pub mod center;
 pub mod messages;
 pub mod topology;
 

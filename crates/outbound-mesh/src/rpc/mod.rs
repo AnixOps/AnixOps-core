@@ -3,5 +3,6 @@
 //! part of the protocol and is not implemented (spec §11.5, requirement R11).
 
 pub mod packet;
+pub mod reassembly;
 
 pub use packet::{Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse};
