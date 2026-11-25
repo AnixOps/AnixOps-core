@@ -201,6 +201,12 @@ pub struct InboundConfig {
     /// TCP connections start with a PROXY protocol header naming the client.
     #[serde(default)]
     pub accept_proxy_protocol: bool,
+    /// When the inbound ends, in Unix milliseconds: the node closes its
+    /// listener and connections at that time and drops it from the list.
+    /// Must be in the future when the inbound is added; required for
+    /// `"type": "socks"` ([`crate::SOCKS_TYPE`]).
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
     #[serde(flatten)]
     pub settings: Settings,
 }

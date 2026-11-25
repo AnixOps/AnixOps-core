@@ -8,7 +8,17 @@ accounting.
 
 - `config`: the `anixcore` config file (`management`, `allow_private_targets`,
   `inbounds`, `egress`). Inbound keys besides `tag`, `type`, `listen`, `listen_port`,
-  `outbound`, `ingress` and `accept_proxy_protocol` go to the protocol factory.
+  `outbound`, `ingress`, `accept_proxy_protocol` and `expires_at_ms` go to the
+  protocol factory.
+- `"expires_at_ms"` (Unix milliseconds, in the future) on any inbound: at that
+  time the node closes its listener and connections and drops it from
+  `GET /v1/inbounds` (which shows the field), and its tag is free again.
+- A `"type": "socks"` inbound (`inbound-socks`) is a SOCKS5 server for devices
+  of an internal network: username and password required, `CONNECT` only,
+  internal clients only. The node refuses it unless it listens on an internal
+  address (loopback, RFC 1918, `100.64.0.0/10`, link-local, IPv6 unique local;
+  never `0.0.0.0` or `::`) and carries `expires_at_ms` at most seven days
+  ahead.
 - `"accept_proxy_protocol": true` on an inbound with a TCP listener, for a
   node behind a relay or load balancer that sends the PROXY protocol: every
   connection must start with a version 1 or 2 header (read before TLS,
@@ -98,9 +108,10 @@ accounting.
   on hosts without IPv6.
 - Protocols are cargo features (`shadowsocks`, `trojan`, `vless`, `vmess`,
   `hysteria2`, `tuic`, `snell`, `iwan`, `forward`, `anytls`, `naive`,
-  `reverse_proxy`), all on by default.
+  `reverse_proxy`, `socks`), all on by default.
 
 `tests/management_api.rs` drives a node through the API with the engine's
 Shadowsocks-2022 client; `tests/egress.rs` routes domains between two nodes
 through a relay; `tests/network.rs` sends ingresses through a source-bound
-egress and a transport outbound.
+egress and a transport outbound; `tests/socks.rs` checks the SOCKS5
+inbound's listen and expiry rules and that an expired inbound is gone.
