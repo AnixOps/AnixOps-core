@@ -152,16 +152,17 @@ struct Outgoing {
     deadline: Instant,
 }
 
-/// The node's identity in its network.
-pub struct Identity {
-    pub peer_id: u32,
-    pub inst_id: Uuid,
-    pub route_id: u64,
-    pub static_key: KeyPair,
+/// The node's identity in its network: node ID, instance ID and route ID,
+/// generated anew by [`Node::new`] at every start (spec §12.3). The static
+/// key is kept per network by the caller and passed in.
+struct Identity {
+    peer_id: u32,
+    inst_id: Uuid,
+    route_id: u64,
 }
 
 impl Identity {
-    pub fn generate(rng: &dyn SecureRandom) -> Result<Self, Unspecified> {
+    fn generate(rng: &dyn SecureRandom) -> Result<Self, Unspecified> {
         let mut bytes = [0u8; 28];
         rng.fill(&mut bytes)?;
         let mut peer_id = [0u8; 4];
@@ -175,7 +176,6 @@ impl Identity {
             peer_id: u32::from_le_bytes(peer_id).max(1),
             inst_id: Uuid(inst_id),
             route_id: u64::from_le_bytes(route_id),
-            static_key: KeyPair::generate(rng).map_err(|_| Unspecified)?,
         })
     }
 }
@@ -204,7 +204,7 @@ pub struct Node {
     relays: BTreeMap<u32, Relay>,
 }
 
-fn own_info(settings: &MeshSettings, identity: &Identity) -> RoutePeerInfo {
+fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) -> RoutePeerInfo {
     let ipv4 = match settings.address.address() {
         IpAddr::V4(v4) => Some(v4),
         IpAddr::V6(_) => None,
@@ -244,7 +244,7 @@ fn own_info(settings: &MeshSettings, identity: &Identity) -> RoutePeerInfo {
         network_length: u32::from(settings.address.prefix()),
         ipv6,
         noise_pubkey: match settings.security {
-            SecurityMode::ForwardSecrecy => identity.static_key.public().to_vec(),
+            SecurityMode::ForwardSecrecy => static_key.public().to_vec(),
             SecurityMode::Default => Vec::new(),
         },
         ..RoutePeerInfo::default()
@@ -259,10 +259,23 @@ fn random_i64(rng: &dyn SecureRandom) -> Result<i64, Unspecified> {
 }
 
 impl Node {
-    /// A node of the network `settings` describes (already validated).
+    /// A node of the network `settings` describes (already validated),
+    /// with the network's static key. Node, instance and route IDs are new
+    /// every time.
     pub fn new(
         settings: MeshSettings,
+        static_key: KeyPair,
+        rng: &dyn SecureRandom,
+        now: Instant,
+    ) -> Result<Self, Unspecified> {
+        let identity = Identity::generate(rng)?;
+        Self::with_identity(settings, identity, static_key, rng, now)
+    }
+
+    fn with_identity(
+        settings: MeshSettings,
         identity: Identity,
+        static_key: KeyPair,
         rng: &dyn SecureRandom,
         now: Instant,
     ) -> Result<Self, Unspecified> {
@@ -273,10 +286,10 @@ impl Node {
             }
             SecurityMode::ForwardSecrecy => None,
         };
-        let info = own_info(&settings, &identity);
+        let info = own_info(&settings, &identity, &static_key);
         let local = Local {
             id: identity.peer_id,
-            static_key: identity.static_key,
+            static_key,
             network_name: settings.network_name.clone(),
             node_name: settings
                 .hostname
@@ -476,6 +489,10 @@ impl Node {
                 self.sessions.release(&self.direct_key(peer), now);
             }
             if !self.conns.values().any(|other| other.peer == Some(peer)) {
+                // A late answer or timeout must not land on the next
+                // connection's synchronisation.
+                self.calls
+                    .retain(|_, call| !(call.peer == peer && call.kind == CallKind::SyncRoute));
                 self.sync.neighbour_down(peer);
                 self.refresh_routes();
             }
@@ -605,7 +622,7 @@ impl Node {
                 Err(_) => self.counters.refused_incoming += 1,
             },
             packet_type::RPC_REQ | packet_type::RPC_RESP => {
-                self.rpc_piece(from, &inbound.payload, rng, now)
+                self.rpc_piece(from, neighbour, &inbound.payload, rng, now)
             }
             packet_type::RELAY_HANDSHAKE => self.relay_msg1(from, &inbound.payload, rng, now),
             packet_type::RELAY_HANDSHAKE_ACK => self.relay_msg2(from, &inbound.payload, now),
@@ -811,7 +828,16 @@ impl Node {
         self.send_rpc(to, transaction, &descriptor, true, &body, now);
     }
 
-    fn rpc_piece(&mut self, from: u32, payload: &[u8], rng: &dyn SecureRandom, now: Instant) {
+    /// One RPC piece from `from` (the packet header) that arrived over a
+    /// connection to `neighbour`.
+    fn rpc_piece(
+        &mut self,
+        from: u32,
+        neighbour: u32,
+        payload: &[u8],
+        rng: &dyn SecureRandom,
+        now: Instant,
+    ) {
         let Ok(piece) = RpcPacket::decode(payload) else {
             self.counters.dropped += 1;
             return;
@@ -826,6 +852,14 @@ impl Node {
             }
         };
         if call.is_request {
+            // Route synchronisation only with the neighbour the connection
+            // authenticated, never with a header `from` (spec §12.2).
+            let route_sync = call.descriptor.service == ROUTE_SERVICE
+                && call.descriptor.method_index == METHOD_SYNC_ROUTE_INFO;
+            if route_sync && from != neighbour {
+                self.counters.dropped += 1;
+                return;
+            }
             let result = self.serve(from, &call.descriptor, &call.body, now);
             let body = RpcResponse {
                 result,
@@ -1314,7 +1348,8 @@ mod tests {
                 .map(|(i, settings)| {
                     let mut identity = Identity::generate(&rng).unwrap();
                     identity.peer_id = 100 + i as u32;
-                    Node::new(settings, identity, &rng, now).unwrap()
+                    let key = KeyPair::generate(&rng).unwrap();
+                    Node::with_identity(settings, identity, key, &rng, now).unwrap()
                 })
                 .collect();
             Self {
@@ -1541,6 +1576,66 @@ mod tests {
         // This machine sits on 192.168.10.0/24 itself.
         net.nodes[0].set_local_networks(&[IpNet::parse("192.168.10.7/24").unwrap()]);
         assert!(routes(&net).is_empty());
+    }
+
+    #[test]
+    fn route_sync_is_only_served_to_the_connection_neighbour() {
+        // Node 0 is not node 2's neighbour: its request arrives over the
+        // connection to node 1 and is dropped without an answer.
+        let mut net = three_in_a_row(false);
+        let dropped = net.nodes[2].counters().dropped;
+        let request = SyncRouteRequest {
+            my_peer_id: 100,
+            ..SyncRouteRequest::default()
+        };
+        net.nodes[0].call(102, CallKind::SyncRoute, request.encode(), net.now);
+        net.settle();
+        assert_eq!(net.nodes[2].counters().dropped, dropped + 1);
+        assert!(net.nodes[0]
+            .calls
+            .values()
+            .any(|call| call.peer == 102 && call.kind == CallKind::SyncRoute));
+    }
+
+    #[test]
+    fn a_lost_neighbour_takes_its_route_sync_calls_with_it() {
+        let mut net = three_in_a_row(false);
+        net.nodes[0].call(
+            101,
+            CallKind::SyncRoute,
+            SyncRouteRequest::default().encode(),
+            net.now,
+        );
+        assert!(net.nodes[0].calls.values().any(|call| call.peer == 101));
+        let conns: Vec<ConnId> = net.nodes[0].conns.keys().copied().collect();
+        for conn in conns {
+            net.nodes[0].disconnected(conn, net.now);
+        }
+        assert!(!net.nodes[0]
+            .calls
+            .values()
+            .any(|call| call.peer == 101 && call.kind == CallKind::SyncRoute));
+    }
+
+    #[test]
+    fn every_start_gets_new_ids_and_keeps_the_static_key() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let key = KeyPair::generate(&rng).unwrap();
+        let private = key.private();
+        let first = Node::new(
+            settings("10.144.0.1/24", true),
+            KeyPair::from_private(*private),
+            &rng,
+            now,
+        )
+        .unwrap();
+        let second = Node::new(settings("10.144.0.1/24", true), key, &rng, now).unwrap();
+        let (a, b) = (first.sync.own(), second.sync.own());
+        assert_ne!(first.id(), second.id());
+        assert_ne!(a.route_id, b.route_id);
+        assert_ne!(a.inst_id, b.inst_id);
+        assert_eq!(a.noise_pubkey, b.noise_pubkey);
     }
 
     #[test]

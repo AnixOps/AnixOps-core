@@ -24,7 +24,8 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use crate::config::{MeshSettings, PeerEndpoint, Role, Transport};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
-use crate::node::{Action, ConnId, Counters, Identity, Node};
+use crate::node::{Action, ConnId, Counters, Node};
+use crate::secure::noise::KeyPair;
 use crate::wire::tcp::{encode_frame, FrameDecoder};
 use crate::wire::udp::{self, Datagram};
 
@@ -39,6 +40,8 @@ pub const SACK_TIMEOUT: Duration = Duration::from_secs(3);
 /// Connection attempts that wait for another connection's session try again
 /// after this long (spec §8.1).
 const WAIT_FOR_SESSION_RETRY: Duration = Duration::from_millis(500);
+/// Tries before such a connection is closed and redialled.
+const WAIT_FOR_SESSION_TRIES: u32 = 20;
 /// UDP sessions one listening socket keeps.
 pub const MAX_UDP_SESSIONS: usize = 4096;
 /// Packets queued for one connection before new ones are dropped.
@@ -113,7 +116,13 @@ enum Event {
         writer: mpsc::Sender<Vec<u8>>,
         closer: Arc<Notify>,
         /// The source of a connection a peer opened.
-        inbound: Option<(IpAddr, link::Transport)>,
+        inbound: Option<(SocketAddr, link::Transport)>,
+    },
+    /// The address the dial task of `peer` (its place in the peer list)
+    /// connects to: a known member address for the handshake budget.
+    Dialing {
+        peer: usize,
+        address: IpAddr,
     },
     Packet {
         conn: ConnId,
@@ -182,7 +191,7 @@ pub struct Channels {
 /// Runs one network until `shutdown` turns true.
 pub async fn run(
     settings: MeshSettings,
-    identity: Identity,
+    static_key: KeyPair,
     listeners: Listeners,
     channels: Channels,
 ) -> io::Result<()> {
@@ -196,7 +205,7 @@ pub async fn run(
     let rng = SystemRandom::new();
     let started = Instant::now();
     let peers = settings.peers.clone();
-    let mut node = Node::new(settings, identity, &rng, started)
+    let mut node = Node::new(settings, static_key, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
     node.set_local_networks(&local_networks.borrow_and_update());
     let (events, mut event_rx) = mpsc::channel(EVENT_QUEUE);
@@ -211,18 +220,27 @@ pub async fn run(
     for socket in listeners.udp {
         tasks.push(tokio::spawn(serve_udp(socket, shared.clone())));
     }
-    for peer in peers {
-        tasks.push(tokio::spawn(dial(peer, shared.clone())));
+    for (index, peer) in peers.into_iter().enumerate() {
+        tasks.push(tokio::spawn(dial(peer, index, shared.clone())));
     }
 
     let mut conns: HashMap<ConnId, Open> = HashMap::new();
     let mut budget = HandshakeBudget::new();
+    // Addresses the dial tasks connect to, by peer.
+    let mut dialed: HashMap<usize, IpAddr> = HashMap::new();
+    // Outgoing connections waiting for a session another connection is
+    // setting up: (connection, when to try again, tries so far).
+    let mut waiting: Vec<(ConnId, Instant, u32)> = Vec::new();
     let mut ticks = interval(Duration::from_secs(1));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         // Relay handshakes due before the next tick (spec §9 retries).
-        let wake_at = node.next_wake();
+        let wake_at = node
+            .next_wake()
+            .into_iter()
+            .chain(waiting.iter().map(|(_, at, _)| *at))
+            .min();
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -240,7 +258,8 @@ pub async fn run(
                         let mut open = Open { writer, closer, ticket: None };
                         match inbound {
                             Some((address, transport)) => {
-                                match budget.admit(address, transport, false, now) {
+                                let member = dialed.values().any(|known| *known == address.ip());
+                                match budget.admit(address, transport, member, now) {
                                     Admission::Dropped => {
                                         open.closer.notify_one();
                                         continue;
@@ -263,11 +282,13 @@ pub async fn run(
                             }
                             None => {
                                 conns.insert(conn, open);
-                                if let Err(reason) = node.connect(conn, None, &rng, now) {
-                                    if reason == CloseReason::WaitForSession {
-                                        sleep(WAIT_FOR_SESSION_RETRY).await;
+                                match node.connect(conn, None, &rng, now) {
+                                    Ok(()) => {}
+                                    // Tried again shortly, without holding up the node.
+                                    Err(CloseReason::WaitForSession) => {
+                                        waiting.push((conn, now + WAIT_FOR_SESSION_RETRY, 1));
                                     }
-                                    close(&mut conns, &mut node, &mut budget, conn, now);
+                                    Err(_) => close(&mut conns, &mut node, &mut budget, conn, now),
                                 }
                             }
                         }
@@ -277,12 +298,16 @@ pub async fn run(
                             node.receive(conn, &packet, &rng, now);
                             if node.is_up(conn) {
                                 if let Some(ticket) = conns.get_mut(&conn).and_then(|open| open.ticket.take()) {
-                                    budget.finished(ticket);
+                                    budget.finished(ticket, now);
                                 }
                             }
                         }
                     }
+                    Event::Dialing { peer, address } => {
+                        dialed.insert(peer, address);
+                    }
                     Event::Closed { conn } => {
+                        waiting.retain(|(waiting_conn, _, _)| *waiting_conn != conn);
                         if let Some(open) = conns.remove(&conn) {
                             if let Some(ticket) = open.ticket {
                                 budget.release(ticket);
@@ -299,7 +324,28 @@ pub async fn run(
                 let _ = node.send_ip(&packet, now);
                 node.wake(&rng, now);
             }
-            _ = until(wake_at) => node.wake(&rng, Instant::now()),
+            _ = until(wake_at) => {
+                let now = Instant::now();
+                node.wake(&rng, now);
+                let due: Vec<(ConnId, u32)> = waiting
+                    .iter()
+                    .filter(|(_, at, _)| *at <= now)
+                    .map(|(conn, _, tries)| (*conn, *tries))
+                    .collect();
+                waiting.retain(|(_, at, _)| *at > now);
+                for (conn, tries) in due {
+                    if !conns.contains_key(&conn) {
+                        continue;
+                    }
+                    match node.connect(conn, None, &rng, now) {
+                        Ok(()) => {}
+                        Err(CloseReason::WaitForSession) if tries < WAIT_FOR_SESSION_TRIES => {
+                            waiting.push((conn, now + WAIT_FOR_SESSION_RETRY, tries + 1));
+                        }
+                        Err(_) => close(&mut conns, &mut node, &mut budget, conn, now),
+                    }
+                }
+            }
             _ = ticks.tick() => {
                 node.tick(&rng, Instant::now(), unix_now());
                 let _ = snapshots.send(snapshot(&node));
@@ -393,7 +439,7 @@ async fn accept_tcp(listener: TcpListener, shared: Shared) {
         };
         let shared = shared.clone();
         tokio::spawn(async move {
-            run_tcp(stream, Some((address.ip(), link::Transport::Tcp)), shared).await;
+            run_tcp(stream, Some((address, link::Transport::Tcp)), shared).await;
         });
     }
 }
@@ -401,7 +447,7 @@ async fn accept_tcp(listener: TcpListener, shared: Shared) {
 /// Runs one TCP connection until it ends; returns how long it was open.
 async fn run_tcp(
     stream: TcpStream,
-    inbound: Option<(IpAddr, link::Transport)>,
+    inbound: Option<(SocketAddr, link::Transport)>,
     shared: Shared,
 ) -> Duration {
     let opened = Instant::now();
@@ -468,13 +514,24 @@ async fn run_tcp(
 }
 
 /// Keeps one configured peer connected (spec §3).
-async fn dial(peer: PeerEndpoint, shared: Shared) {
+async fn dial(peer: PeerEndpoint, index: usize, shared: Shared) {
     let rng = SystemRandom::new();
     let mut delay = REDIAL_MIN;
     loop {
         let lasted = match tokio::net::lookup_host((peer.server.as_str(), peer.port)).await {
             Ok(mut addresses) => match addresses.next() {
                 Some(address) => match peer.transport {
+                    _ if shared
+                        .events
+                        .send(Event::Dialing {
+                            peer: index,
+                            address: address.ip(),
+                        })
+                        .await
+                        .is_err() =>
+                    {
+                        return;
+                    }
                     Transport::Tcp => match TcpStream::connect(address).await {
                         Ok(stream) => run_tcp(stream, None, shared.clone()).await,
                         Err(_) => Duration::ZERO,
@@ -635,7 +692,7 @@ async fn serve_udp(socket: UdpSocket, shared: Shared) {
                         conn,
                         writer: tx,
                         closer: closer.clone(),
-                        inbound: Some((from.ip(), link::Transport::Udp)),
+                        inbound: Some((from, link::Transport::Udp)),
                     })
                     .await
                     .is_err()
@@ -704,10 +761,9 @@ mod tests {
         _shutdown: watch::Sender<bool>,
     }
 
-    async fn start(settings: MeshSettings, listeners: Listeners, peer_id: u32) -> Running {
+    async fn start(settings: MeshSettings, listeners: Listeners) -> Running {
         let rng = SystemRandom::new();
-        let mut identity = Identity::generate(&rng).unwrap();
-        identity.peer_id = peer_id;
+        let static_key = KeyPair::generate(&rng).unwrap();
         let (to_mesh, from_interface) = mpsc::channel(16);
         let (to_interface, from_mesh) = mpsc::channel(16);
         let (snapshot_tx, snapshots) = watch::channel(Snapshot::default());
@@ -715,7 +771,7 @@ mod tests {
         let (_, local_networks) = watch::channel(Vec::new());
         tokio::spawn(run(
             settings,
-            identity,
+            static_key,
             listeners,
             Channels {
                 from_interface,
@@ -763,14 +819,35 @@ mod tests {
         client.listen.clear();
         let client_listeners = Listeners::bind(&client).await.unwrap();
 
-        let mut a = start(server, listeners, 1).await;
-        let b = start(client, client_listeners, 2).await;
+        let mut a = start(server, listeners).await;
+        let b = start(client, client_listeners).await;
+
+        // Node IDs are new every start; the first snapshot names them.
+        let id_of = |running: &Running| {
+            let mut snapshots = running.snapshots.clone();
+            async move {
+                loop {
+                    let id = snapshots.borrow().peer_id;
+                    if id != 0 {
+                        return id;
+                    }
+                    snapshots.changed().await.unwrap();
+                }
+            }
+        };
+        let a_id = timeout(Duration::from_secs(5), id_of(&a)).await.unwrap();
+        let b_id = timeout(Duration::from_secs(5), id_of(&b)).await.unwrap();
 
         // Wait until both know each other's address.
         timeout(Duration::from_secs(20), async {
             let mut snapshots = b.snapshots.clone();
             loop {
-                if snapshots.borrow().routes.iter().any(|route| route.0 == 1) {
+                if snapshots
+                    .borrow()
+                    .routes
+                    .iter()
+                    .any(|route| route.0 == a_id)
+                {
                     break;
                 }
                 snapshots.changed().await.unwrap();
@@ -786,7 +863,7 @@ mod tests {
             .await
             .expect("delivered in time");
         assert_eq!(received, Some(packet));
-        assert_eq!(a.snapshots.borrow().neighbours, vec![2]);
+        assert_eq!(a.snapshots.borrow().neighbours, vec![b_id]);
     }
 
     #[tokio::test]

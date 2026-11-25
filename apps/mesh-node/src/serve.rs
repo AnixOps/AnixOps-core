@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
-use outbound_mesh::node::Identity;
+use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
 use ring::rand::SystemRandom;
 use tokio::signal::unix::{signal, SignalKind};
@@ -138,6 +138,44 @@ fn status_line(snapshot: &Snapshot, interface: &str) -> String {
     .to_string()
 }
 
+/// Where the network's static key is kept: next to its configuration.
+pub fn key_path(config: &Path) -> std::path::PathBuf {
+    let mut name = config.file_name().unwrap_or_default().to_os_string();
+    name.push(".key");
+    config.with_file_name(name)
+}
+
+/// The network's static key, kept across restarts until the network is
+/// removed (spec §8.2); node and route IDs are new at every start. A
+/// missing file gets a new key, written readable by the owner only.
+pub fn static_key(path: &Path) -> Result<KeyPair, Failure> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let private: [u8; LEN] = bytes.as_slice().try_into().map_err(|_| {
+                Failure::Config(format!("{}: not a {LEN}-byte key", path.display()))
+            })?;
+            return Ok(KeyPair::from_private(private));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Failure::Other(format!("{}: {error}", path.display()))),
+    }
+    let key = KeyPair::generate(&SystemRandom::new())
+        .map_err(|_| Failure::Other("no system randomness".into()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| Failure::Other(format!("{}: {error}", path.display())))?;
+    file.write_all(&key.private()[..])
+        .and_then(|()| file.sync_all())
+        .map_err(|error| Failure::Other(format!("{}: {error}", path.display())))?;
+    Ok(key)
+}
+
 /// Runs the node from the configuration at `path`.
 pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
     let text = std::fs::read_to_string(path)
@@ -164,15 +202,14 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             .map_err(|error| busy("listen", &error))?;
         let device = Tun::create(&interface, address, address_v6, settings.mtu)
             .map_err(|error| busy(&format!("interface {interface}"), &error))?;
-        let identity = Identity::generate(&SystemRandom::new())
-            .map_err(|_| Failure::Other("no system randomness".into()))?;
-        serve(settings, identity, listeners, device).await
+        let static_key = static_key(&key_path(path))?;
+        serve(settings, static_key, listeners, device).await
     })
 }
 
 async fn serve(
     settings: MeshSettings,
-    identity: Identity,
+    static_key: KeyPair,
     listeners: Listeners,
     device: Tun,
 ) -> Result<(), Failure> {
@@ -191,7 +228,7 @@ async fn serve(
 
     let mut node = tokio::spawn(driver::run(
         settings,
-        identity,
+        static_key,
         listeners,
         Channels {
             from_interface,
@@ -314,6 +351,28 @@ mod tests {
         assert_eq!(line["neighbours"], serde_json::json!([3, 9]));
         assert_eq!(line["reachable"], 3);
         assert_eq!(line["duplicate_id"], false);
+    }
+
+    #[test]
+    fn the_static_key_is_kept_next_to_the_configuration() {
+        let dir = std::env::temp_dir().join(format!("mesh-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = dir.join("mesh.json");
+        let path = key_path(&config);
+        assert_eq!(path, dir.join("mesh.json.key"));
+        let _ = std::fs::remove_file(&path);
+        let first = static_key(&path).expect("new key");
+        let second = static_key(&path).expect("same key");
+        assert_eq!(first.public(), second.public());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("key file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::write(&path, b"short").expect("overwrite");
+        assert_eq!(static_key(&path).err().map(|f| f.exit_code()), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

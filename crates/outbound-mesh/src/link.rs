@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use ring::rand::SecureRandom;
@@ -603,15 +603,20 @@ pub const RESERVED_FOR_MEMBERS: usize = 256;
 pub const MSG1_PER_SECOND: f64 = 5.0;
 /// msg1 a source may start at once.
 pub const MSG1_BURST: f64 = 20.0;
-/// Sources whose rate and history are remembered.
+/// Sources whose rate and history are remembered, per table.
 const MAX_SOURCES: usize = 4096;
+/// A source's rate, count and verified mark are forgotten after this long
+/// without activity (spec §8.1).
+pub const SOURCE_IDLE: Duration = Duration::from_secs(600);
+/// How often idle sources are looked for.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// A handshake admitted by [`HandshakeBudget`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket(u64);
 
 /// The transport a handshake arrived on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
     Tcp,
     Udp,
@@ -632,8 +637,9 @@ pub enum Admission {
 struct Waiting {
     ticket: Ticket,
     source: IpAddr,
+    address: SocketAddr,
     transport: Transport,
-    member: bool,
+    verified: bool,
 }
 
 struct Bucket {
@@ -641,33 +647,89 @@ struct Bucket {
     at: Instant,
 }
 
+/// A table of at most [`MAX_SOURCES`] entries, the least recently used
+/// going first when full.
+struct Recent<K, V> {
+    entries: HashMap<K, (V, Instant)>,
+}
+
+impl<K: std::hash::Hash + Eq + Copy, V> Default for Recent<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Copy, V> Recent<K, V> {
+    fn get_mut(&mut self, key: &K, now: Instant) -> Option<&mut V> {
+        self.entries.get_mut(key).map(|(value, at)| {
+            *at = now;
+            value
+        })
+    }
+
+    fn fresh(&self, key: &K, now: Instant) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) < SOURCE_IDLE)
+    }
+
+    fn insert(&mut self, key: K, value: V, now: Instant) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_SOURCES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (value, now));
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.entries
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < SOURCE_IDLE);
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Limits the handshakes this node answers (spec §8.1), by source address
 /// (an IPv6 address by its /64) and in all, never by the node ID the peer
 /// claims:
 ///
 /// - each source starts at most [`MSG1_PER_SECOND`] msg1 a second, in
-///   bursts of [`MSG1_BURST`], which also bounds msg2 sent back to forged
-///   sources;
+///   bursts of [`MSG1_BURST`], with one bucket for TCP and one for UDP, so
+///   forged UDP msg1 from a member's address cannot hold back its TCP
+///   handshakes; this also bounds msg2 sent back to forged sources;
 /// - each source has at most [`HANDSHAKES_PER_SOURCE`] waiting, its oldest
 ///   pushed out by a newer one;
 /// - [`MAX_HANDSHAKES`] wait in all, [`RESERVED_FOR_MEMBERS`] of them only
-///   for sources at known member addresses (route information, the peer
-///   list or a recent connection); when full, a handshake over UDP from a
-///   source that never finished one goes first, then one of the source
-///   holding the most, the oldest first.
+///   for verified sources: over TCP an address the caller knows as a
+///   member's (route information, the peer list) or one that finished a
+///   handshake in the last 10 minutes; over UDP only an IP and port that
+///   did; when full, unverified UDP handshakes go first, then those of
+///   the unverified source holding the most, the oldest first, and
+///   verified ones only when nothing else is left;
+/// - rates, counts and verified marks are forgotten after
+///   [`SOURCE_IDLE`] without activity.
 ///
 /// A pushed-out handshake's connection is closed with
 /// [`CloseReason::Evicted`], which drops and wipes its state.
 #[derive(Default)]
 pub struct HandshakeBudget {
     waiting: VecDeque<Waiting>,
-    buckets: HashMap<IpAddr, Bucket>,
-    /// Bucket sources, oldest first; never longer than [`MAX_SOURCES`].
-    bucket_order: VecDeque<IpAddr>,
-    /// When full buckets were last swept out.
+    buckets: Recent<(IpAddr, Transport), Bucket>,
+    /// TCP sources that finished a handshake.
+    tcp_finished: Recent<IpAddr, ()>,
+    /// UDP addresses (IP and port) that finished a handshake.
+    udp_finished: Recent<SocketAddr, ()>,
     swept: Option<Instant>,
-    /// Sources that finished a handshake, by when.
-    finished: HashMap<IpAddr, u64>,
     next: u64,
 }
 
@@ -697,40 +759,33 @@ impl HandshakeBudget {
         self.waiting.is_empty()
     }
 
-    fn take_token(&mut self, source: IpAddr, now: Instant) -> bool {
-        if !self.buckets.contains_key(&source) {
-            if self.buckets.len() >= MAX_SOURCES
-                && self
-                    .swept
-                    .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
-            {
-                // Forget sources whose bucket has filled up again, at most
-                // once a second so forged sources cannot make every msg1
-                // scan the table.
-                self.swept = Some(now);
-                self.buckets.retain(|_, bucket| {
-                    let refill = now.saturating_duration_since(bucket.at).as_secs_f64();
-                    bucket.tokens + refill * MSG1_PER_SECOND < MSG1_BURST
-                });
-                let buckets = &self.buckets;
-                self.bucket_order
-                    .retain(|source| buckets.contains_key(source));
-            }
-            // A hard limit: the oldest source goes.
-            while self.buckets.len() >= MAX_SOURCES {
-                match self.bucket_order.pop_front() {
-                    Some(oldest) => {
-                        self.buckets.remove(&oldest);
-                    }
-                    None => break,
-                }
-            }
-            self.bucket_order.push_back(source);
+    fn sweep(&mut self, now: Instant) {
+        if self
+            .swept
+            .is_some_and(|at| now.saturating_duration_since(at) < SWEEP_EVERY)
+        {
+            return;
         }
-        let bucket = self.buckets.entry(source).or_insert(Bucket {
-            tokens: MSG1_BURST,
-            at: now,
-        });
+        self.swept = Some(now);
+        self.buckets.expire(now);
+        self.tcp_finished.expire(now);
+        self.udp_finished.expire(now);
+    }
+
+    fn take_token(&mut self, key: (IpAddr, Transport), now: Instant) -> bool {
+        if self.buckets.get_mut(&key, now).is_none() {
+            self.buckets.insert(
+                key,
+                Bucket {
+                    tokens: MSG1_BURST,
+                    at: now,
+                },
+                now,
+            );
+        }
+        let Some(bucket) = self.buckets.get_mut(&key, now) else {
+            return false;
+        };
         let refill = now.saturating_duration_since(bucket.at).as_secs_f64();
         bucket.tokens = (bucket.tokens + refill * MSG1_PER_SECOND).min(MSG1_BURST);
         bucket.at = now;
@@ -741,14 +796,12 @@ impl HandshakeBudget {
         true
     }
 
-    /// The handshake to push out among those `eligible` (spec §8.1): over
-    /// UDP from a source that never finished one, then of the source
-    /// holding the most, the oldest first.
+    /// The handshake to push out among those `eligible` (spec §8.1): an
+    /// unverified one over UDP, then of the source holding the most, the
+    /// oldest first.
     fn victim(&self, eligible: impl Fn(&Waiting) -> bool) -> Option<usize> {
         let stranger = self.waiting.iter().position(|waiting| {
-            eligible(waiting)
-                && waiting.transport == Transport::Udp
-                && !self.finished.contains_key(&waiting.source)
+            eligible(waiting) && waiting.transport == Transport::Udp && !waiting.verified
         });
         if stranger.is_some() {
             return stranger;
@@ -763,40 +816,50 @@ impl HandshakeBudget {
             .position(|waiting| eligible(waiting) && held.get(&waiting.source) == Some(&most))
     }
 
-    /// Admits a msg1 from `address`. `member` tells whether the address is
-    /// a known member address.
+    /// Admits a msg1 from `address`. `known_member` tells whether the
+    /// address is a member's as the caller knows it (route information,
+    /// the peer list); it only counts for TCP.
     pub fn admit(
         &mut self,
-        address: IpAddr,
+        address: SocketAddr,
         transport: Transport,
-        member: bool,
+        known_member: bool,
         now: Instant,
     ) -> Admission {
-        let source = source_of(address);
-        if !self.take_token(source, now) {
+        self.sweep(now);
+        let source = source_of(address.ip());
+        if !self.take_token((source, transport), now) {
             return Admission::Dropped;
         }
+        let verified = match transport {
+            Transport::Tcp => known_member || self.tcp_finished.fresh(&source, now),
+            Transport::Udp => self.udp_finished.fresh(&address, now),
+        };
         let of_source = self
             .waiting
             .iter()
             .filter(|waiting| waiting.source == source)
             .count();
-        let strangers = self
+        let unverified = self
             .waiting
             .iter()
-            .filter(|waiting| !waiting.member)
+            .filter(|waiting| !waiting.verified)
             .count();
         let at = if of_source >= HANDSHAKES_PER_SOURCE {
             self.waiting
                 .iter()
                 .position(|waiting| waiting.source == source)
-        } else if !member && strangers >= MAX_HANDSHAKES - RESERVED_FOR_MEMBERS {
-            match self.victim(|waiting| !waiting.member) {
+        } else if !verified && unverified >= MAX_HANDSHAKES - RESERVED_FOR_MEMBERS {
+            match self.victim(|waiting| !waiting.verified) {
                 Some(at) => Some(at),
                 None => return Admission::Dropped,
             }
         } else if self.waiting.len() >= MAX_HANDSHAKES {
-            match self.victim(|_| true) {
+            // Verified handshakes go only when nothing else is left.
+            match self
+                .victim(|waiting| !waiting.verified)
+                .or_else(|| self.victim(|_| true))
+            {
                 Some(at) => Some(at),
                 None => return Admission::Dropped,
             }
@@ -811,8 +874,9 @@ impl HandshakeBudget {
         self.waiting.push_back(Waiting {
             ticket,
             source,
+            address,
             transport,
-            member,
+            verified,
         });
         Admission::Admitted(ticket, evicted)
     }
@@ -822,9 +886,9 @@ impl HandshakeBudget {
         self.waiting.retain(|waiting| waiting.ticket != ticket);
     }
 
-    /// The handshake of `ticket` finished: its source is no longer a
-    /// stranger.
-    pub fn finished(&mut self, ticket: Ticket) {
+    /// The handshake of `ticket` finished: its source (over UDP, its IP
+    /// and port) is verified for the next [`SOURCE_IDLE`].
+    pub fn finished(&mut self, ticket: Ticket, now: Instant) {
         let Some(at) = self
             .waiting
             .iter()
@@ -832,20 +896,13 @@ impl HandshakeBudget {
         else {
             return;
         };
-        let source = self.waiting[at].source;
-        self.waiting.remove(at);
-        self.next += 1;
-        if !self.finished.contains_key(&source) && self.finished.len() >= MAX_SOURCES {
-            let oldest = self
-                .finished
-                .iter()
-                .min_by_key(|(_, when)| **when)
-                .map(|(oldest, _)| *oldest);
-            if let Some(oldest) = oldest {
-                self.finished.remove(&oldest);
-            }
+        let Some(waiting) = self.waiting.remove(at) else {
+            return;
+        };
+        match waiting.transport {
+            Transport::Tcp => self.tcp_finished.insert(waiting.source, (), now),
+            Transport::Udp => self.udp_finished.insert(waiting.address, (), now),
         }
-        self.finished.insert(source, self.next);
     }
 }
 
@@ -1099,40 +1156,45 @@ mod tests {
         let now = Instant::now();
         let mut budget = HandshakeBudget::new();
         let forger: IpAddr = "203.0.113.7".parse().unwrap();
-        let first = admitted(budget.admit(forger, Transport::Tcp, false, now)).0;
+        let first =
+            admitted(budget.admit(SocketAddr::new(forger, 40000), Transport::Tcp, false, now)).0;
         for _ in 1..HANDSHAKES_PER_SOURCE {
             assert_eq!(
-                admitted(budget.admit(forger, Transport::Tcp, false, now)).1,
+                admitted(budget.admit(SocketAddr::new(forger, 40000), Transport::Tcp, false, now))
+                    .1,
                 None
             );
         }
         // The ninth from the same address pushes out its own oldest.
         assert_eq!(
-            admitted(budget.admit(forger, Transport::Tcp, false, now)).1,
+            admitted(budget.admit(SocketAddr::new(forger, 40000), Transport::Tcp, false, now)).1,
             Some(first)
         );
         assert_eq!(budget.len(), HANDSHAKES_PER_SOURCE);
         // Another source is not held back by it.
         let peer: IpAddr = "198.51.100.1".parse().unwrap();
-        let (ticket, evicted) = admitted(budget.admit(peer, Transport::Tcp, true, now));
+        let (ticket, evicted) =
+            admitted(budget.admit(SocketAddr::new(peer, 40000), Transport::Tcp, true, now));
         assert_eq!(evicted, None);
-        budget.finished(ticket);
+        budget.finished(ticket, now);
         assert_eq!(budget.len(), HANDSHAKES_PER_SOURCE);
 
         // IPv6 counts by /64.
         let mut budget = HandshakeBudget::new();
         let base: IpAddr = "2001:db8:1:2::1".parse().unwrap();
-        let first = admitted(budget.admit(base, Transport::Tcp, false, now)).0;
+        let first =
+            admitted(budget.admit(SocketAddr::new(base, 40000), Transport::Tcp, false, now)).0;
         for n in 2..=HANDSHAKES_PER_SOURCE as u16 {
             let address: IpAddr = format!("2001:db8:1:2::{n:x}").parse().unwrap();
             assert_eq!(
-                admitted(budget.admit(address, Transport::Tcp, false, now)).1,
+                admitted(budget.admit(SocketAddr::new(address, 40000), Transport::Tcp, false, now))
+                    .1,
                 None
             );
         }
         let same_64: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
         assert_eq!(
-            admitted(budget.admit(same_64, Transport::Tcp, false, now)).1,
+            admitted(budget.admit(SocketAddr::new(same_64, 40000), Transport::Tcp, false, now)).1,
             Some(first)
         );
         budget.release(first);
@@ -1145,7 +1207,8 @@ mod tests {
         let source: IpAddr = "203.0.113.9".parse().unwrap();
         let mut admitted_now = 0;
         for _ in 0..40 {
-            if let Admission::Admitted(ticket, _) = budget.admit(source, Transport::Udp, false, now)
+            if let Admission::Admitted(ticket, _) =
+                budget.admit(SocketAddr::new(source, 40000), Transport::Udp, false, now)
             {
                 admitted_now += 1;
                 budget.release(ticket);
@@ -1156,7 +1219,7 @@ mod tests {
         let mut admitted_later = 0;
         for _ in 0..40 {
             if let Admission::Admitted(ticket, _) =
-                budget.admit(source, Transport::Udp, false, later)
+                budget.admit(SocketAddr::new(source, 40000), Transport::Udp, false, later)
             {
                 admitted_later += 1;
                 budget.release(ticket);
@@ -1176,17 +1239,27 @@ mod tests {
             IpAddr::from((0x0a00_0000 + n).to_be_bytes())
         };
         for _ in 0..MAX_HANDSHAKES - RESERVED_FOR_MEMBERS {
-            admitted(budget.admit(stranger(), Transport::Tcp, false, now));
+            admitted(budget.admit(
+                SocketAddr::new(stranger(), 40000),
+                Transport::Tcp,
+                false,
+                now,
+            ));
         }
         // One more stranger pushes out the oldest stranger.
-        let (_, evicted) = admitted(budget.admit(stranger(), Transport::Tcp, false, now));
+        let (_, evicted) = admitted(budget.admit(
+            SocketAddr::new(stranger(), 40000),
+            Transport::Tcp,
+            false,
+            now,
+        ));
         assert!(evicted.is_some());
         assert_eq!(budget.len(), MAX_HANDSHAKES - RESERVED_FOR_MEMBERS);
         // Members still get in without pushing anyone out.
         for m in 0..RESERVED_FOR_MEMBERS as u32 {
             let member = IpAddr::from((0xc000_0200 + m).to_be_bytes());
             assert_eq!(
-                admitted(budget.admit(member, Transport::Tcp, true, now)).1,
+                admitted(budget.admit(SocketAddr::new(member, 40000), Transport::Tcp, true, now)).1,
                 None
             );
         }
@@ -1213,10 +1286,110 @@ mod tests {
         }
         let member: IpAddr = "192.0.2.200".parse().unwrap();
         assert_eq!(
-            admitted(budget.admit(member, Transport::Tcp, true, now)).1,
+            admitted(budget.admit(SocketAddr::new(member, 40000), Transport::Tcp, true, now)).1,
             udp_ticket
         );
         assert!(!budget.is_empty());
+    }
+
+    #[test]
+    fn forged_udp_does_not_hold_back_tcp_from_the_same_address() {
+        let now = Instant::now();
+        let mut budget = HandshakeBudget::new();
+        let member = SocketAddr::new("198.51.100.4".parse().unwrap(), 11010);
+        for _ in 0..(MSG1_BURST as usize * 2) {
+            if let Admission::Admitted(ticket, _) = budget.admit(member, Transport::Udp, true, now)
+            {
+                budget.release(ticket);
+            }
+        }
+        assert_eq!(
+            budget.admit(member, Transport::Udp, true, now),
+            Admission::Dropped
+        );
+        assert!(matches!(
+            budget.admit(member, Transport::Tcp, true, now),
+            Admission::Admitted(..)
+        ));
+    }
+
+    #[test]
+    fn udp_is_verified_by_address_and_port_for_ten_minutes() {
+        let now = Instant::now();
+        let mut budget = HandshakeBudget::new();
+        let ip: IpAddr = "198.51.100.5".parse().unwrap();
+        let address = SocketAddr::new(ip, 40001);
+        let (ticket, _) = admitted(budget.admit(address, Transport::Udp, false, now));
+        budget.finished(ticket, now);
+        let verified = |budget: &HandshakeBudget, ticket: Ticket| {
+            budget
+                .waiting
+                .iter()
+                .find(|waiting| waiting.ticket == ticket)
+                .map(|waiting| waiting.verified)
+        };
+        // The same IP and port, with nothing claimed by the caller.
+        let (same, _) = admitted(budget.admit(address, Transport::Udp, false, now));
+        assert_eq!(verified(&budget, same), Some(true));
+        // Another port of the same IP is not; nor is a known member's IP
+        // over UDP.
+        let other_port = SocketAddr::new(ip, 40002);
+        let (other, _) = admitted(budget.admit(other_port, Transport::Udp, true, now));
+        assert_eq!(verified(&budget, other), Some(false));
+        // Ten minutes later the mark is gone.
+        let later = now + SOURCE_IDLE + Duration::from_secs(1);
+        let (late, _) = admitted(budget.admit(address, Transport::Udp, false, later));
+        assert_eq!(verified(&budget, late), Some(false));
+        // TCP: a finished source stays verified for the same time.
+        let tcp = SocketAddr::new(ip, 50000);
+        let (ticket, _) = admitted(budget.admit(tcp, Transport::Tcp, false, now));
+        budget.finished(ticket, now);
+        let (again, _) = admitted(budget.admit(tcp, Transport::Tcp, false, now));
+        assert_eq!(verified(&budget, again), Some(true));
+    }
+
+    #[test]
+    fn verified_handshakes_are_pushed_out_last() {
+        let now = Instant::now();
+        let mut budget = HandshakeBudget::new();
+        let mut n = 0u32;
+        let mut next = || {
+            n += 1;
+            SocketAddr::new(IpAddr::from((0x0a00_0000 + n).to_be_bytes()), 40000)
+        };
+        // Verified first, so that they are the oldest.
+        let mut members = Vec::new();
+        for _ in 0..RESERVED_FOR_MEMBERS {
+            members.push(admitted(budget.admit(next(), Transport::Tcp, true, now)).0);
+        }
+        while budget.len() < MAX_HANDSHAKES {
+            admitted(budget.admit(next(), Transport::Tcp, false, now));
+        }
+        for _ in 0..100 {
+            let (_, evicted) = admitted(budget.admit(next(), Transport::Tcp, true, now));
+            let evicted = evicted.expect("full");
+            assert!(!members.contains(&evicted));
+        }
+        assert_eq!(budget.len(), MAX_HANDSHAKES);
+    }
+
+    #[test]
+    fn idle_sources_are_forgotten() {
+        let now = Instant::now();
+        let mut budget = HandshakeBudget::new();
+        for n in 0..100u32 {
+            let address = SocketAddr::new(IpAddr::from((0x0a00_0000 + n).to_be_bytes()), 1);
+            let _ = budget.admit(address, Transport::Udp, false, now);
+        }
+        assert_eq!(budget.buckets.len(), 100);
+        let later = now + SOURCE_IDLE + SWEEP_EVERY;
+        let _ = budget.admit(
+            SocketAddr::new("192.0.2.1".parse().unwrap(), 1),
+            Transport::Udp,
+            false,
+            later,
+        );
+        assert_eq!(budget.buckets.len(), 1);
     }
 
     #[test]
@@ -1225,9 +1398,8 @@ mod tests {
         let now = Instant::now();
         for n in 0..(MAX_SOURCES as u32 + 1000) {
             let address = IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + n));
-            let _ = budget.admit(address, Transport::Udp, false, now);
+            let _ = budget.admit(SocketAddr::new(address, 40000), Transport::Udp, false, now);
             assert!(budget.buckets.len() <= MAX_SOURCES);
-            assert_eq!(budget.bucket_order.len(), budget.buckets.len());
         }
     }
 
