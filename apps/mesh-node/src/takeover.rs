@@ -148,6 +148,10 @@ pub enum Action {
         /// it; a rollback looks for a copy already running there.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         net_ns: Option<String>,
+        /// The account it ran as (Windows), as a SID; a rollback run by
+        /// another account does not start it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sid: Option<String>,
     },
 }
 
@@ -1103,6 +1107,9 @@ fn foreign_network_message(pid: u32, namespace: &str) -> String {
 
 /// The network namespace a process is in, as `/proc/<pid>/ns/net` names it.
 fn net_namespace(host: &dyn Host, pid: u32) -> Option<String> {
+    if host.os() != crate::host::Os::Linux {
+        return None;
+    }
     host.read_link(&PathBuf::from(format!("/proc/{pid}/ns/net")))
         .ok()
         .map(|link| link.display().to_string())
@@ -1192,6 +1199,7 @@ fn terminate_action(
         restart: process.unit.is_none() && !service_pids.contains(&process.pid),
         killed,
         net_ns,
+        sid: process.sid.clone(),
     }
 }
 
@@ -1694,10 +1702,27 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             pid,
             exe,
             net_ns,
+            sid,
             ..
         } => {
             if !*restart {
                 return Ok(format!("process {pid} is started by its service"));
+            }
+            // Started again only as the account it ran as: the takeover
+            // ended only processes of the account that ran it, and a
+            // rollback run by another (an Agent running as the system)
+            // would otherwise start the program with that account's rights.
+            if let Some(theirs) = sid {
+                let ours = host
+                    .process_info(host.own_pid())
+                    .ok()
+                    .and_then(|info| info.sid);
+                if ours.as_deref() != Some(theirs.as_str()) {
+                    return Err(format!(
+                        "process {pid} ran as {theirs}, and this rollback runs as {}; run the rollback as that account, or start it by hand and then rollback --forget-process {pid} --confirm",
+                        ours.as_deref().unwrap_or("an unknown account")
+                    ));
+                }
             }
             // A unit that restarts what it runs may already have started it
             // again; a second copy would fight it for ports, the virtual
@@ -1737,7 +1762,8 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             // On systemd hosts the new process moves into a scope of its own
             // before it runs anything, so neither it nor a child it forks
             // stays in the cgroup of whoever ran the rollback.
-            let systemd = host.exists(Path::new("/run/systemd/system"));
+            let systemd = host.os() == crate::host::Os::Linux
+                && host.exists(Path::new("/run/systemd/system"));
             let scope = |new_pid: u32| own_scope(host, new_pid);
             let spawned = host
                 .spawn_detached(&spawn, systemd.then_some(&scope as Hold<'_>))
@@ -2726,6 +2752,7 @@ mod tests {
                     restart: true,
                     killed: false,
                     net_ns: None,
+                    sid: None,
                 },
                 at: 0,
                 run: 1,
@@ -2901,6 +2928,7 @@ mod tests {
     /// started by hand.
     fn mac() -> FakeHost {
         let mut host = FakeHost::default();
+        host.os.set(crate::host::Os::Macos);
         host.programs.insert("launchctl".into());
         host.programs.insert("plutil".into());
         host.file(DAEMON, "<plist/>");
@@ -3022,9 +3050,10 @@ mod tests {
             r#"{"Label":"local.demo","ProgramArguments":["/bin/sh","-c","exec /Users/alice/bin/demo-meshd --net-name lab"]}"#,
         );
         host.answer("launchctl print-disabled gui/501", 0, "");
+        // The shell execs the program: launchd's process is the copy.
         host.launchd
             .borrow_mut()
-            .insert("gui/501/local.demo".into(), (agent.into(), None, true));
+            .insert("gui/501/local.demo".into(), (agent.into(), Some(400), true));
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::Done, "{report:?}");
         let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
@@ -3115,6 +3144,7 @@ mod tests {
     /// administrator.
     fn windows(services_json: &str) -> FakeHost {
         let mut host = FakeHost::default();
+        host.os.set(crate::host::Os::Windows);
         host.programs.insert("powershell.exe".into());
         host.answer(
             &format!(
@@ -3362,12 +3392,13 @@ mod tests {
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::Done, "{report:?}");
         let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        let logon = format!("turn off logon entry demo ({USER_APPROVED})");
         assert_eq!(
             steps,
             vec![
                 r"schtasks.exe /End /TN \DemoTask",
                 r"schtasks.exe /Change /TN \DemoTask /DISABLE",
-                &format!("turn off logon entry demo ({USER_APPROVED})"),
+                logon.as_str(),
                 r"end process 700 (C:\Users\admin\demo-meshd.exe) with TERM",
             ]
         );
@@ -3449,5 +3480,145 @@ mod tests {
             .iter()
             .any(|line| line.starts_with("reg.exe delete")
                 || line.ends_with("/d 020000000000000000000000 /f")));
+    }
+
+    #[test]
+    fn windows_never_reads_unix_paths_a_user_may_create() {
+        // On Windows these are C:\proc and C:\etc, which any user may
+        // create: a planted process and autostart line are ignored.
+        let host = windows(DEMO_SERVICE);
+        host.process(
+            900,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "planted"],
+            &[],
+            "0::/user.slice\n",
+        );
+        let crontab = "* * * * * root /opt/demo-meshd --net-name planted\n";
+        host.file("/etc/crontab", crontab);
+        host.file("/run/systemd/system/.keep", "");
+        let found = detect(&host, &demo());
+        assert!(found.iter().all(|entry| !matches!(
+            entry.origin,
+            Origin::Autostart { .. } | Origin::Systemd { .. }
+        )));
+        assert!(found
+            .iter()
+            .all(|entry| entry.processes.iter().all(|process| process.pid != 900)));
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        assert_eq!(host.text("/etc/crontab").as_deref(), Some(crontab));
+        assert!(host.signals.borrow().iter().all(|(pid, _)| *pid != 900));
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest
+            .steps
+            .iter()
+            .all(|step| !matches!(step.action, Action::Terminate { pid: 900, .. })));
+    }
+
+    #[test]
+    fn a_windows_rollback_by_another_account_does_not_start_the_process() {
+        let host = windows(DEMO_SERVICE);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().any(|step| matches!(
+            &step.action,
+            Action::Terminate { pid: 700, sid: Some(sid), .. } if sid == ADMIN
+        )));
+        // The rollback runs as the system (an Agent), not as the
+        // administrator who ran the takeover.
+        let set_own = |sid: &str| {
+            host.table
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .get_mut(&1)
+                .unwrap()
+                .sid = Some(sid.into());
+        };
+        set_own(SYSTEM);
+        let report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!report.ok);
+        assert!(report.steps.iter().any(|step| !step.ok
+            && step
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("ran as S-1-5-21-9-500"))));
+        assert!(host.spawned.borrow().is_empty());
+        // Kept for a rollback by the right account.
+        set_own(ADMIN);
+        let report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(report.ok, "{report:?}");
+        assert_eq!(host.spawned.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_saved_is_reported() {
+        // The takeover: the first step cannot be recorded, so it is undone,
+        // and the record of that cannot be saved either.
+        let host = windows(DEMO_SERVICE);
+        let record = Path::new(STATE).join(MANIFEST);
+        host.fail_writes.borrow_mut().insert(record.clone());
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RollbackFailed, "{report:?}");
+        assert!(report
+            .rollback
+            .iter()
+            .any(|step| step.step == "save record" && !step.ok));
+        assert!(host
+            .ran
+            .borrow()
+            .contains(&"sc.exe start DemoMesh".to_string()));
+
+        // The rollback: what was undone is reported, and so is the record
+        // that could not be saved.
+        let host = windows(DEMO_SERVICE);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        host.fail_writes.borrow_mut().insert(record);
+        let report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!report.ok);
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.step == "sc.exe stop DemoMesh" && step.ok));
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.step == "save record" && !step.ok));
+    }
+
+    #[test]
+    fn a_copy_with_the_job_command_line_is_not_the_jobs() {
+        // Started by hand with the daemon's exact command line, by the same
+        // account (root): the job's own process is only the one launchd
+        // names, so this copy is ended and started again on rollback.
+        let host = mac();
+        host.table_process(
+            500,
+            "/usr/local/bin/demo-meshd",
+            &["/usr/local/bin/demo-meshd", "-c", "/etc/demo/a.toml"],
+            &[],
+            0,
+        );
+        let found = detect(&host, &demo());
+        let job = found
+            .iter()
+            .find(|entry| matches!(entry.origin, Origin::Launchd { .. }))
+            .unwrap();
+        let pids: Vec<u32> = job.processes.iter().map(|process| process.pid).collect();
+        assert_eq!(pids, vec![300]);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().any(|step| matches!(
+            step.action,
+            Action::Terminate {
+                pid: 500,
+                restart: true,
+                ..
+            }
+        )));
     }
 }

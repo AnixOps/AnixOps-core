@@ -12,7 +12,7 @@
 use serde::Deserialize;
 
 use crate::cmdline::split_windows_command_line;
-use crate::detect::{program_named, Found, Origin, Process};
+use crate::detect::{descends_from, program_named, Found, Origin, Process};
 use crate::host::Host;
 use crate::profile::Profile;
 use crate::source::Invocation;
@@ -160,18 +160,14 @@ pub fn tasks(host: &dyn Host, profile: &Profile, processes: &[Process]) -> Vec<F
         let state = task.state.as_deref().unwrap_or("");
         let running = state == "Running";
         // A running task's program is a child of the Task Scheduler; a
-        // wrapper the profile names starts it one level further down.
+        // wrapper the profile names may start it further down.
         let own: Vec<Process> = processes
             .iter()
             .filter(|process| {
                 running
                     && schedule.is_some_and(|schedule| {
                         process.ppid == Some(schedule)
-                            || (named
-                                && process.ppid.is_some_and(|parent| {
-                                    host.process_info(parent).ok().and_then(|info| info.ppid)
-                                        == Some(schedule)
-                                }))
+                            || (named && descends_from(host, process, schedule))
                     })
             })
             .cloned()
