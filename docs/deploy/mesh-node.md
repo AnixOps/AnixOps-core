@@ -8,6 +8,7 @@
 
 | 子命令 | 作用 | 退出码 |
 | --- | --- | --- |
+| `run --config F [--interface N]` | 运行节点（Linux）：读取导入或面板写入的组网配置，绑定监听端口，创建 TUN 网卡（默认 `anixmesh0`），直到 SIGTERM/SIGINT。与第三方节点的互通测试在 CI 中通过前，`run` 不列入 `capabilities`，安装器因此不会接管现有网络 | 0 收到信号正常停止；1 运行错误；2 用法或配置错误；3 端口或网卡被占用 |
 | `capabilities` | 输出版本和本构建支持的子命令（JSON）。安装器只有在列表含 `run` 时才执行接管 | 0 |
 | `detect --profile F` | 列出本机的现有安装（服务、启动脚本、自启行、手动进程、容器）。只输出参数名，不输出任何取值 | 0；2 用法错误 |
 | `import --profile F [--out-dir D] [--report R] [--allow-unencrypted] [--address CIDR] [-- ARGS…]` | 按检测结果（或 `--` 后手动给出的命令行）生成我方配置和导入报告 | 0 全部可用；3 未发现；5 有需确认项；6 有无法自动迁移的实例 |

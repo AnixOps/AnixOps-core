@@ -4,7 +4,8 @@
 //! installers (requirements R12, R13, R15, R31): finding an existing mesh
 //! program on the machine, importing its configuration into ours with a
 //! report, and taking it over with a recorded, reversible procedure. The
-//! node itself (`run`) is added by the mesh module.
+//! node itself (`run`, Linux only) drives the mesh module's socket driver
+//! over a TUN interface ([`serve`], [`tun`]).
 //!
 //! Nothing here names another program. What identifies one, and how its
 //! configuration is written, comes from a profile file maintained in the
@@ -18,8 +19,12 @@ pub mod import;
 pub mod net;
 pub mod profile;
 pub mod report;
+#[cfg(target_os = "linux")]
+pub mod serve;
 pub mod source;
 pub mod takeover;
+#[cfg(target_os = "linux")]
+pub mod tun;
 
 /// Version of this program.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -27,7 +32,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Subcommands this build has. Installers read them with
 /// `anixops-mesh capabilities` and only take a machine over when `run` is
 /// among them, so an existing network is never stopped without a node to
-/// replace it.
+/// replace it. `run` exists on Linux but is not listed until the
+/// interoperability tests against third-party nodes pass in CI, so that no
+/// installer replaces a working network with an incomplete node.
 pub const COMMANDS: &[&str] = &[
     "capabilities",
     "detect",

@@ -1,0 +1,257 @@
+//! `run`: the node itself. Reads the mesh configuration the importer or the
+//! panel wrote, binds the listeners, creates the virtual interface and runs
+//! the mesh module's socket driver until SIGTERM or SIGINT.
+//!
+//! Exit codes: 0 stopped by a signal, 2 configuration, 3 a port or the
+//! interface is taken (another program still runs), 1 anything else.
+
+use std::io;
+use std::path::Path;
+
+use outbound_mesh::driver::{self, Listeners, Snapshot};
+use outbound_mesh::node::Identity;
+use outbound_mesh::{MeshConfig, MeshSettings};
+use ring::rand::SystemRandom;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, watch};
+
+use crate::tun::{self, Tun};
+
+/// Interface name when the configuration names none.
+pub const DEFAULT_INTERFACE: &str = "anixmesh0";
+
+/// Packets queued between the interface and the driver in each direction.
+const QUEUE: usize = 256;
+
+/// Why `run` stopped.
+#[derive(Debug)]
+pub enum Failure {
+    /// Exit code 2.
+    Config(String),
+    /// Exit code 3.
+    Busy(String),
+    /// Exit code 1.
+    Other(String),
+}
+
+impl Failure {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Config(_) => 2,
+            Self::Busy(_) => 3,
+            Self::Other(_) => 1,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "config",
+            Self::Busy(_) => "busy",
+            Self::Other(_) => "run",
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Config(detail) | Self::Busy(detail) | Self::Other(detail) => detail,
+        }
+    }
+}
+
+/// Parses and validates a configuration file's text.
+pub fn settings_from_json(text: &str) -> Result<MeshSettings, Failure> {
+    let config: MeshConfig =
+        serde_json::from_str(text).map_err(|error| Failure::Config(error.to_string()))?;
+    config
+        .validate()
+        .map_err(|error| Failure::Config(error.into()))
+}
+
+fn busy(what: &str, error: &io::Error) -> Failure {
+    match error.kind() {
+        io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => {
+            Failure::Busy(format!("{what}: {error}"))
+        }
+        // The kernel answers EBUSY for an interface another program holds.
+        _ if error.raw_os_error() == Some(libc::EBUSY) => Failure::Busy(format!("{what}: {error}")),
+        _ => Failure::Other(format!("{what}: {error}")),
+    }
+}
+
+/// One status line for the service log; only printed when it changes.
+fn status_line(snapshot: &Snapshot, interface: &str) -> String {
+    serde_json::json!({
+        "interface": interface,
+        "peer_id": snapshot.peer_id,
+        "neighbours": snapshot.neighbours,
+        "reachable": snapshot.routes.len(),
+        "duplicate_id": snapshot.duplicate_id,
+    })
+    .to_string()
+}
+
+/// Runs the node from the configuration at `path`.
+pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| Failure::Config(format!("{}: {error}", path.display())))?;
+    let settings = settings_from_json(&text)?;
+    let (address, address_v6) = tun::addresses(
+        settings.address.address(),
+        settings.address.prefix(),
+        settings
+            .address_v6
+            .map(|address| (address.address(), address.prefix())),
+    )
+    .ok_or_else(|| Failure::Config("virtual address families are wrong".into()))?;
+    let interface = interface.unwrap_or(DEFAULT_INTERFACE).to_owned();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| Failure::Other(format!("runtime: {error}")))?;
+    runtime.block_on(async move {
+        let listeners = Listeners::bind(&settings)
+            .await
+            .map_err(|error| busy("listen", &error))?;
+        let device = Tun::create(&interface, address, address_v6, settings.mtu)
+            .map_err(|error| busy(&format!("interface {interface}"), &error))?;
+        let identity = Identity::generate(&SystemRandom::new())
+            .map_err(|_| Failure::Other("no system randomness".into()))?;
+        serve(settings, identity, listeners, device).await
+    })
+}
+
+async fn serve(
+    settings: MeshSettings,
+    identity: Identity,
+    listeners: Listeners,
+    device: Tun,
+) -> Result<(), Failure> {
+    let mtu = usize::from(settings.mtu);
+    let (to_node, from_interface) = mpsc::channel::<Vec<u8>>(QUEUE);
+    let (to_interface, mut from_node) = mpsc::channel::<Vec<u8>>(QUEUE);
+    let (snapshots, mut status) = watch::channel(Snapshot::default());
+    let (stop, shutdown) = watch::channel(false);
+    let mut terminate =
+        signal(SignalKind::terminate()).map_err(|error| Failure::Other(error.to_string()))?;
+    let mut interrupt =
+        signal(SignalKind::interrupt()).map_err(|error| Failure::Other(error.to_string()))?;
+
+    let mut node = tokio::spawn(driver::run(
+        settings,
+        identity,
+        listeners,
+        from_interface,
+        to_interface,
+        snapshots,
+        shutdown,
+    ));
+    // Room for one packet larger than the MTU, so that an oversized one is
+    // read whole and refused by the node instead of being cut short.
+    let mut buffer = vec![0u8; mtu + 1];
+    let mut last = String::new();
+    loop {
+        tokio::select! {
+            read = device.recv(&mut buffer) => {
+                let length = read.map_err(|error| Failure::Other(format!("interface: {error}")))?;
+                // A full queue drops the packet like a full interface would.
+                let _ = to_node.try_send(buffer[..length].to_vec());
+            }
+            Some(packet) = from_node.recv() => {
+                if let Err(error) = device.send(&packet).await {
+                    // A packet the kernel refuses (for example an address
+                    // that is not configured) does not stop the node.
+                    eprintln!("{}", serde_json::json!({ "warning": "interface", "detail": error.to_string() }));
+                }
+            }
+            changed = status.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let line = status_line(&status.borrow_and_update(), device.name());
+                if line != last {
+                    println!("{line}");
+                    last = line;
+                }
+            }
+            _ = terminate.recv() => break,
+            _ = interrupt.recv() => break,
+            result = &mut node => {
+                return match result {
+                    Ok(Ok(())) => Err(Failure::Other("the node stopped".into())),
+                    Ok(Err(error)) => Err(Failure::Other(error.to_string())),
+                    Err(error) => Err(Failure::Other(error.to_string())),
+                };
+            }
+        }
+    }
+    let _ = stop.send(true);
+    match node.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(Failure::Other(error.to_string())),
+        Err(error) => Err(Failure::Other(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(address: &str) -> String {
+        serde_json::json!({
+            "config_version": 1,
+            "network": { "name": "office", "secret": "s3cret", "kind": "legacy" },
+            "node": { "address": address, "role": "access" },
+            "peers": [{ "server": "peer.example", "port": 40000 }],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_bad_configuration_is_a_configuration_failure() {
+        let failure = settings_from_json("{").err().expect("not json");
+        assert_eq!(failure.exit_code(), 2);
+        assert_eq!(failure.kind(), "config");
+        let failure = settings_from_json("{\"config_version\": 999}")
+            .err()
+            .expect("missing fields");
+        assert_eq!(failure.exit_code(), 2);
+    }
+
+    #[test]
+    fn a_port_in_use_is_busy() {
+        let error = io::Error::from(io::ErrorKind::AddrInUse);
+        assert_eq!(busy("listen", &error).exit_code(), 3);
+        let error = io::Error::from_raw_os_error(libc::EBUSY);
+        assert_eq!(busy("interface", &error).exit_code(), 3);
+        let error = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(busy("interface", &error).exit_code(), 1);
+    }
+
+    #[test]
+    fn the_status_line_names_the_interface_and_neighbours() {
+        let snapshot = Snapshot {
+            peer_id: 7,
+            neighbours: vec![3, 9],
+            routes: vec![(3, 3, 1), (9, 9, 1), (12, 9, 2)],
+            ..Snapshot::default()
+        };
+        let line: serde_json::Value =
+            serde_json::from_str(&status_line(&snapshot, "anixmesh0")).expect("json");
+        assert_eq!(line["interface"], "anixmesh0");
+        assert_eq!(line["neighbours"], serde_json::json!([3, 9]));
+        assert_eq!(line["reachable"], 3);
+        assert_eq!(line["duplicate_id"], false);
+    }
+
+    #[test]
+    fn a_valid_configuration_gives_matching_interface_addresses() {
+        let settings = settings_from_json(&config("10.144.0.5/24")).expect("valid");
+        let (address, v6) =
+            tun::addresses(settings.address.address(), settings.address.prefix(), None)
+                .expect("IPv4 address");
+        assert_eq!(address, (std::net::Ipv4Addr::new(10, 144, 0, 5), 24));
+        assert!(v6.is_none());
+    }
+}

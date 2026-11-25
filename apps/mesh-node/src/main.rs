@@ -21,6 +21,7 @@ const USAGE: &str = "usage:
                         [--allow-unencrypted] [--address CIDR] [-- ARGS...]
   anixops-mesh takeover --profile FILE --state-dir DIR [--dry-run] [--report FILE]
   anixops-mesh rollback --state-dir DIR [--forget-process PID... --confirm] [--report FILE]
+  anixops-mesh run      --config FILE [--interface NAME]
   anixops-mesh capabilities
   anixops-mesh version";
 
@@ -29,6 +30,10 @@ const EXIT_USAGE: u8 = 2;
 
 struct Options {
     profile: Option<PathBuf>,
+    /// `run`: the mesh configuration.
+    config: Option<PathBuf>,
+    /// `run`: the virtual interface name.
+    interface: Option<String>,
     out_dir: Option<PathBuf>,
     report: Option<PathBuf>,
     state_dir: Option<PathBuf>,
@@ -59,6 +64,8 @@ fn take(args: &[String], index: &mut usize, name: &str) -> Result<String, String
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
         profile: None,
+        config: None,
+        interface: None,
         out_dir: None,
         report: None,
         state_dir: None,
@@ -75,6 +82,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         index += 1;
         match arg {
             "--profile" => options.profile = Some(PathBuf::from(take(args, &mut index, arg)?)),
+            "--config" => options.config = Some(PathBuf::from(take(args, &mut index, arg)?)),
+            "--interface" => options.interface = Some(take(args, &mut index, arg)?),
             "--out-dir" => options.out_dir = Some(PathBuf::from(take(args, &mut index, arg)?)),
             "--report" => options.report = Some(PathBuf::from(take(args, &mut index, arg)?)),
             "--state-dir" => {
@@ -131,6 +140,29 @@ fn platform_supported() -> bool {
     cfg!(target_os = "linux")
 }
 
+#[cfg(target_os = "linux")]
+fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
+    let Some(config) = &options.config else {
+        return Err(fail("usage", "--config is required"));
+    };
+    match mesh_node::serve::run(config, options.interface.as_deref()) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(failure) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "error": failure.kind(), "detail": failure.detail() })
+            );
+            Err(ExitCode::from(failure.exit_code()))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
+    let _ = (&options.config, &options.interface);
+    Err(fail("platform", "the node runs on Linux only"))
+}
+
 fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
     let host = RealHost::default();
     match command {
@@ -149,6 +181,7 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        "run" => run_node(options),
         "detect" => {
             if !platform_supported() {
                 return Err(fail("platform", "detection is implemented for Linux only"));

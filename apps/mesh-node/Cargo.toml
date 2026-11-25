@@ -6,21 +6,24 @@ edition.workspace = true
 rust-version = "1.89"
 license.workspace = true
 repository.workspace = true
-description = "Standalone intranet mesh node: deployment subcommands (detect, import, takeover, rollback) shared by the Agent and the installers."
+description = "Standalone intranet mesh node: the node itself (run) and the deployment subcommands (detect, import, takeover, rollback) shared by the Agent and the installers."
 
 [dependencies]
+# The node: configuration, protocol and socket driver.
+outbound-mesh = { path = "../../crates/outbound-mesh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
 
-[dev-dependencies]
-# Contract tests: every configuration the importer writes must pass the mesh
-# module's own validation.
-outbound-mesh = { path = "../../crates/outbound-mesh" }
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `run`: system randomness for the node identity (already used by the mesh
+# module), and the TUN interface, signals and the driver's runtime.
+ring = "0.17"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "signal"] }
 
 [lib]
 path = "src/lib.rs"
