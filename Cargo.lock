@@ -2322,6 +2322,7 @@ dependencies = [
 name = "outbound-mesh"
 version = "0.2.0"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
 ]

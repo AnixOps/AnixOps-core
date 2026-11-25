@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Optional intranet mesh networking: config, intranet-only route policy and packet checks; the wire protocol follows docs/protocols/intranet-mesh.md."
+description = "Optional intranet mesh networking: written only from docs/protocols/intranet-mesh.md, intranet-only by construction."
 
 [dependencies]
+# AEADs, HMAC and HKDF; already used by the rest of the kernel.
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

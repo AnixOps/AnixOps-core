@@ -32,7 +32,7 @@ pub const MAX_ADDRESSES_PER_PEER: usize = 4;
 
 /// A peer as the session layer identifies it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PeerId(pub u64);
+pub struct PeerId(pub u32);
 
 /// Why traffic or a route was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,9 +93,7 @@ pub struct PeerUpdate {
 #[derive(Default)]
 struct PeerRoutes {
     addresses: Vec<IpAddr>,
-    /// Subnets with the order they were first accepted in, which breaks
-    /// ties between peers advertising the same subnet.
-    subnets: Vec<(IpNet, u64)>,
+    subnets: Vec<IpNet>,
 }
 
 pub struct RouteTable {
@@ -103,7 +101,6 @@ pub struct RouteTable {
     virtual_subnets: Vec<IpNet>,
     allowed: Vec<IpNet>,
     peers: BTreeMap<PeerId, PeerRoutes>,
-    next_order: u64,
 }
 
 impl RouteTable {
@@ -113,7 +110,6 @@ impl RouteTable {
             virtual_subnets: settings.virtual_subnets(),
             allowed: settings.allowed_subnets.clone(),
             peers: BTreeMap::new(),
-            next_order: 0,
         }
     }
 
@@ -125,7 +121,7 @@ impl RouteTable {
         addresses: &[IpAddr],
         subnets: &[IpNet],
     ) -> PeerUpdate {
-        let previous = self.peers.remove(&peer).unwrap_or_default();
+        self.peers.remove(&peer);
         let mut update = PeerUpdate::default();
         let mut routes = PeerRoutes::default();
 
@@ -153,18 +149,9 @@ impl RouteTable {
                 self.admit_subnet(&subnet)
             };
             match verdict {
-                Ok(()) if routes.subnets.iter().any(|(held, _)| *held == subnet) => {}
+                Ok(()) if routes.subnets.contains(&subnet) => {}
                 Ok(()) => {
-                    let order = previous
-                        .subnets
-                        .iter()
-                        .find(|(held, _)| *held == subnet)
-                        .map(|(_, order)| *order)
-                        .unwrap_or_else(|| {
-                            self.next_order += 1;
-                            self.next_order
-                        });
-                    routes.subnets.push((subnet, order));
+                    routes.subnets.push(subnet);
                     update.subnets.push(subnet);
                 }
                 Err(denied) => update.refused_subnets.push((subnet, denied)),
@@ -222,10 +209,16 @@ impl RouteTable {
         Ok(())
     }
 
-    /// The peer that carries `destination`: the holder of a virtual address,
-    /// else the longest advertised subnet (the earliest advertised wins a
-    /// tie).
-    pub fn lookup(&self, destination: IpAddr) -> Result<PeerId, Denied> {
+    /// The peer that owns `destination` (spec §15.2): the holder of a virtual
+    /// address, else the longest advertised subnet; among peers advertising
+    /// that subnet, the fewest hops away and then the smallest ID. `hops`
+    /// gives a peer's distance, `None` when it is unreachable (it is then
+    /// skipped).
+    pub fn lookup_by(
+        &self,
+        destination: IpAddr,
+        hops: impl Fn(PeerId) -> Option<u32>,
+    ) -> Result<PeerId, Denied> {
         let destination = unmap(destination);
         if !is_intranet_address(destination) {
             return Err(Denied::NotIntranet);
@@ -250,13 +243,18 @@ impl RouteTable {
         }
         self.peers
             .iter()
-            .flat_map(|(peer, routes)| routes.subnets.iter().map(move |entry| (*peer, entry)))
-            .filter(|(_, (subnet, _))| subnet.contains(destination))
-            .max_by(|(_, (a, a_order)), (_, (b, b_order))| {
-                a.prefix().cmp(&b.prefix()).then(b_order.cmp(a_order))
-            })
-            .map(|(peer, _)| peer)
+            .flat_map(|(peer, routes)| routes.subnets.iter().map(move |subnet| (*peer, subnet)))
+            .filter(|(_, subnet)| subnet.contains(destination))
+            .filter_map(|(peer, subnet)| Some((peer, subnet.prefix(), hops(peer)?)))
+            // Longest prefix, then fewest hops, then smallest ID.
+            .min_by_key(|(peer, prefix, hops)| (std::cmp::Reverse(*prefix), *hops, *peer))
+            .map(|(peer, _, _)| peer)
             .ok_or(Denied::NoRoute)
+    }
+
+    /// [`lookup_by`](Self::lookup_by) with every peer at the same distance.
+    pub fn lookup(&self, destination: IpAddr) -> Result<PeerId, Denied> {
+        self.lookup_by(destination, |_| Some(0))
     }
 
     /// Checks a packet this node is about to send: it must come from one of
@@ -452,17 +450,29 @@ mod tests {
     }
 
     #[test]
-    fn earliest_advertiser_wins_a_tie_and_keeps_its_place() {
+    fn same_subnet_goes_to_the_nearest_then_smallest_id() {
         let mut table = RouteTable::new(&settings(json!({})));
         table.set_peer(B, &[], &[net("192.168.5.0/24")]);
         table.set_peer(A, &[], &[net("192.168.5.0/24")]);
-        assert_eq!(table.lookup(ip("192.168.5.1")), Ok(B));
-        // Re-advertising the same subnet keeps B first.
-        table.set_peer(B, &[], &[net("192.168.5.0/24"), net("192.168.6.0/24")]);
-        assert_eq!(table.lookup(ip("192.168.5.1")), Ok(B));
-        table.remove_peer(B);
+        let c = PeerId(3);
+        table.set_peer(c, &[], &[net("192.168.5.0/24")]);
         assert_eq!(table.lookup(ip("192.168.5.1")), Ok(A));
-        assert_eq!(table.peer_count(), 1);
+        let hops = |peer: PeerId| match peer.0 {
+            1 => Some(3),
+            2 => Some(1),
+            _ => Some(1),
+        };
+        assert_eq!(table.lookup_by(ip("192.168.5.1"), hops), Ok(B));
+        // An unreachable advertiser is skipped.
+        let hops = |peer: PeerId| (peer != B).then_some(1);
+        assert_eq!(table.lookup_by(ip("192.168.5.1"), hops), Ok(A));
+        assert_eq!(
+            table.lookup_by(ip("192.168.5.1"), |_| None),
+            Err(Denied::NoRoute)
+        );
+        table.remove_peer(A);
+        assert_eq!(table.lookup(ip("192.168.5.1")), Ok(B));
+        assert_eq!(table.peer_count(), 2);
     }
 
     #[test]
