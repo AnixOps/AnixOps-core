@@ -88,6 +88,12 @@
 | `routing.policy` | `hops`（默认）或 `latency`（规范 §13） |
 | `routing.system_routes` | 只把这些网段内的路由装进操作系统路由表（限内网范围）；缺省为全部已接受的路由。不在其中的路由仍在组网内部可用并显示 |
 | `routing.paths` | 自定义路径：`to_peer`（节点虚拟地址）或 `to_subnet`（网段）二选一，`via` 为途经节点的虚拟地址，最多 6 个；同一目标只能有一条 |
+| `dns`（内核 0.3，能力 `mesh_dns`） | 内网域名（需求 R28、规范 §15.9）：`enabled`（布尔，默认 `false`）、`suffix`（默认 `mesh.internal`，一个或多个 DNS 标签）、`names`（`[{ "name", "address" }]`，`name` 为去掉后缀的 `名.地区代码`，每个标签按下面的规范化规则已规范化，`address` 必须是本网络虚拟网段或宿主组地址段内的地址）。同名条目全部接受，解析时返回全部地址，状态里标出重名，不拒绝也不自动改名。下发的名字优先于成员自报的主机名；最多 4096 条 |
+| `host_groups`（内核 0.4，能力 `mesh_host_groups`） | 宿主组（需求 R25、R26）：`[{ "cidr", "gateway", "backup_gateway" }]`，`cidr` 在内网范围内且不与虚拟网段重叠，`gateway` 与可省的 `backup_gateway` 为成员实例 ID（快照的 `id`）；网关不在线时改走备用网关，都不在线时该网段不可达 |
+
+`dns` 与 `host_groups` 与 `subnets`、`routing` 同级，属于每个网络的配置。内核未列出对应能力时，Agent 不下发这两节（配置拒绝未知字段）。
+
+**名字规范化**（与面板 `anix-control` 的 `docs/design/mesh-regions/README.md`「内网域名」一致，规范 §15.9.2 第 5 条按此修订）：转小写 → 字母、数字、连字符以外的 ASCII 字符与非字母数字的 Unicode 字符替换为 `-` → 去掉首尾 `-` → 含非 ASCII 字符时整体转为 `xn--` 加 Punycode（RFC 3492，不做 UTS46 映射）→ 截到 63 字节 → 再去掉末尾 `-`；结果为空时不生成记录。测试向量：`中国` → `xn--fiqs8s`，`Bücher` → `xn--bcher-kva`，`香港 01` → `xn---01-by5gj66p`。成员自报的主机名用同一规则。
 
 ## 分层与集成点
 
