@@ -252,9 +252,13 @@ pub fn load_manifest(host: &dyn Host, state: &Path) -> Result<Option<Manifest>, 
     if !host.exists(&path) {
         return Ok(None);
     }
-    let text = host
-        .read_to_string(&path)
+    // Read through the checked state directory: a rollback starts programs
+    // as the users this record names, so it must be the one we wrote.
+    let bytes = host
+        .read_state(&path)
         .map_err(|error| TakeoverError::Manifest(error.to_string()))?;
+    let text =
+        String::from_utf8(bytes).map_err(|error| TakeoverError::Manifest(error.to_string()))?;
     let manifest: Manifest =
         serde_json::from_str(&text).map_err(|error| TakeoverError::Manifest(error.to_string()))?;
     if manifest.manifest_version != MANIFEST_VERSION {
@@ -629,11 +633,9 @@ fn running_copy(
         return CopyCheck::None;
     };
     let own = host.own_pid();
-    let network = net_ns.map(str::to_string).or_else(|| {
-        host.read_link(Path::new("/proc/1/ns/net"))
-            .ok()
-            .map(|link| link.display().to_string())
-    });
+    let network = net_ns
+        .map(str::to_string)
+        .or_else(|| net_namespace(host, 1));
     let mut unknown = None;
     for entry in entries {
         let Some(pid) = entry
@@ -696,6 +698,13 @@ fn copy_matches(
     Some(true)
 }
 
+/// The network namespace a process is in, as `/proc/<pid>/ns/net` names it.
+fn net_namespace(host: &dyn Host, pid: u32) -> Option<String> {
+    host.read_link(&PathBuf::from(format!("/proc/{pid}/ns/net")))
+        .ok()
+        .map(|link| link.display().to_string())
+}
+
 fn wait_gone(host: &dyn Host, pid: u32, exe: &str, ms: u64) -> bool {
     let mut waited = 0;
     while alive(host, pid, exe) {
@@ -716,15 +725,24 @@ fn end_processes(
     let mut out = Vec::new();
     let mut processes = scan_processes(host, profile);
     classify_units(&mut processes, owned_units);
+    let host_network = net_namespace(host, 1);
     for process in processes {
         if process.contained {
             continue;
         }
         // Read while it runs: a rollback looks for a copy in this network.
-        let net_ns = host
-            .read_link(&PathBuf::from(format!("/proc/{}/ns/net", process.pid)))
-            .ok()
-            .map(|link| link.display().to_string());
+        let net_ns = net_namespace(host, process.pid);
+        // Started in another network namespace (say with `ip netns exec`):
+        // a rollback could not start it there again, so it is not ended.
+        if let (Some(theirs), Some(host_network)) = (&net_ns, &host_network) {
+            if theirs != host_network {
+                out.push(Err(format!(
+                    "process {} runs in another network namespace ({theirs}); stop it by hand, and start it there again by hand to undo",
+                    process.pid
+                )));
+                continue;
+            }
+        }
         let killed = match host.signal(process.pid, Signal::Terminate) {
             // Already gone on its own: nothing to record.
             Ok(false) => continue,
@@ -1040,7 +1058,7 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
                 // Nothing changed the file since: put the copy back. Without
                 // a readable copy, fall through and uncomment just our line.
                 if let Some((copy, mode, uid, gid)) = backup {
-                    if let Ok(bytes) = host.read(Path::new(&copy)) {
+                    if let Ok(bytes) = host.read_state(Path::new(&copy)) {
                         host.write(path, &bytes, mode, Some((uid, gid)))
                             .map_err(|error| format!("{file}: {error}"))?;
                         return Ok(format!("restored {file} from {copy}"));
@@ -1099,6 +1117,15 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             // A unit that restarts what it runs may already have started it
             // again; a second copy would fight it for ports, the virtual
             // interface and the node identity.
+            // We start processes in the host's network only; one recorded in
+            // another (never ended by this version) is left to the operator.
+            if let (Some(theirs), Some(host_network)) = (net_ns, net_namespace(host, 1)) {
+                if *theirs != host_network {
+                    return Err(format!(
+                        "process {pid} ran in another network namespace ({theirs}); start it there by hand, then rollback --forget-process {pid} --confirm"
+                    ));
+                }
+            }
             match running_copy(host, exe, argv, *uid, net_ns.as_deref()) {
                 CopyCheck::Running(other) => {
                     return Ok(format!(
@@ -1361,15 +1388,51 @@ pub struct RollbackReport {
 
 /// Undoes every recorded takeover. The caller stops our own node first.
 pub fn rollback(host: &dyn Host, state: &Path) -> Result<RollbackReport, TakeoverError> {
+    rollback_forgetting(host, state, &[])
+}
+
+/// Like [`rollback`], but first drops the recorded processes in `forget`:
+/// the operator has confirmed starting them again by hand (a process this
+/// program cannot tell apart from a copy, or one that ran in another network
+/// namespace), so they are neither started nor kept for later.
+pub fn rollback_forgetting(
+    host: &dyn Host,
+    state: &Path,
+    forget: &[u32],
+) -> Result<RollbackReport, TakeoverError> {
     let _lock = Lock::take(host, state)?;
     let Some(mut manifest) = load_manifest(host, state)? else {
+        if let Some(pid) = forget.first() {
+            return Err(TakeoverError::Manifest(format!(
+                "no recorded process {pid}"
+            )));
+        }
         return Ok(RollbackReport {
             report_version: crate::report::REPORT_VERSION,
             ok: true,
             steps: Vec::new(),
         });
     };
-    let (steps, remaining) = undo(host, &manifest.steps);
+    let mut forgotten = Vec::new();
+    for pid in forget {
+        let before = manifest.steps.len();
+        manifest.steps.retain(|step| {
+            !matches!(&step.action, Action::Terminate { pid: recorded, .. } if recorded == pid)
+        });
+        if manifest.steps.len() == before {
+            return Err(TakeoverError::Manifest(format!(
+                "no recorded process {pid}"
+            )));
+        }
+        forgotten.push(StepReport {
+            step: format!("forget process {pid}"),
+            ok: true,
+            detail: Some("started again by hand, as the operator confirmed".into()),
+        });
+    }
+    let (mut steps, remaining) = undo(host, &manifest.steps);
+    forgotten.append(&mut steps);
+    let steps = forgotten;
     let ok = remaining.is_empty();
     // A later rollback retries only what is left.
     manifest.steps = remaining;
@@ -1930,23 +1993,69 @@ mod tests {
     }
 
     #[test]
+    fn a_process_in_another_network_namespace_is_left_to_the_operator() {
+        let host = machine();
+        host.link("/proc/1/ns/net", "net:[1]");
+        host.link("/proc/100/ns/net", "net:[1]");
+        // Started with `ip netns exec`: a rollback could not put it back.
+        host.link("/proc/200/ns/net", "net:[7]");
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(report.steps.iter().any(|step| !step.ok
+            && step.detail.as_deref().is_some_and(
+                |detail| detail.starts_with("process 200 runs in another network namespace")
+            )));
+        assert!(!host.signals.borrow().iter().any(|(pid, _)| *pid == 200));
+        assert!(host.spawned.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_operator_can_forget_a_process_started_by_hand() {
+        let host = machine();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        // A security module keeps hiding a process with the same command line.
+        host.process(
+            600,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab"],
+            &[],
+            "0::/user.slice\n",
+        );
+        host.links.borrow_mut().remove(Path::new("/proc/600/exe"));
+        assert!(!rollback(&host, Path::new(STATE)).unwrap().ok);
+        // Only a process that was recorded can be forgotten.
+        assert!(rollback_forgetting(&host, Path::new(STATE), &[999]).is_err());
+        let done = rollback_forgetting(&host, Path::new(STATE), &[200]).unwrap();
+        assert!(done.ok, "{done:?}");
+        assert_eq!(done.steps[0].step, "forget process 200");
+        assert!(host.spawned.borrow().is_empty());
+        assert!(load_manifest(&host, Path::new(STATE))
+            .unwrap()
+            .unwrap()
+            .steps
+            .is_empty());
+    }
+
+    #[test]
     fn a_process_that_will_not_exit_does_not_hide_those_ended_after_it() {
         let host = machine();
-        // Listed before the others in /proc, and it will not exit.
+        // Listed before the others in /proc (`/proc/10` sorts before
+        // `/proc/100` and `/proc/200`), and it will not exit.
         host.process(
-            50,
+            10,
             "/opt/demo-meshd",
             &["/opt/demo-meshd", "--net-name", "lab2"],
             &[],
             "0::/user.slice\n",
         );
-        host.unkillable.borrow_mut().insert(50);
+        host.unkillable.borrow_mut().insert(10);
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
         assert!(report
             .steps
             .iter()
-            .any(|step| !step.ok && step.detail.as_deref() == Some("process 50 did not exit")));
+            .any(|step| !step.ok && step.detail.as_deref() == Some("process 10 did not exit")));
         // Process 200, ended after the failure, is recorded and started again.
         assert!(report
             .steps
