@@ -41,7 +41,7 @@
 
 ## 常驻服务
 
-启动时先应用 `config.json`（面板暂时不可达时网络照常运行），再进入循环：
+启动时没有 `token`（从未接入或令牌已失效）即以退出码 8 结束，不建网络、不写任何文件。否则先应用 `config.json`（面板暂时不可达时网络照常运行），再进入循环：
 
 - **读取配置**：每 60 秒（加 0–5 秒随机偏移）`GET {control}/api/v5/mesh/device/config?features=…`。通过校验的配置与当前不同时调用 `apply` 并写入 `config.json`；`networks` 为空表示地区已停用，停止全部网络。校验不通过时保留现有配置，记录 `config_rejected`（只写字段名与规则，不写取值），下次照常读取。
 - **上报**：每 60 秒，以及受管组网状态变化时（至多每 10 秒一次），`POST {control}/api/v5/mesh/device/report`。请求体为 `{"instance_id","networks":[…],"features":[…]}`：`networks` 每项取受管组网状态中的一项，把 `tag` 换回地区代码作为 `id`，并按网络名附上 `static_key`（字段与 Agent 的 `mesh.status` 相同，见 agent-contract §3）。接管记录存在时另带 `takeover: {"found","stopped","error"}`。只认 204，应答体一律忽略。
