@@ -147,7 +147,7 @@ impl Inner {
             match previous.map(|instance| keep(instance, &network.settings)) {
                 Some(Ok(instance)) => next.push(Some(instance)),
                 Some(Err(instance)) => {
-                    stopping.push(instance);
+                    stopping.push(*instance);
                     next.push(None);
                     starts.push((index, network));
                 }
@@ -267,7 +267,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// and the `dns` section, which are handed to the running driver. A
 /// network that failed to start
 /// is tried again. `Err` gives the instance back to be stopped.
-fn keep(mut instance: Instance, settings: &MeshSettings) -> Result<Instance, Instance> {
+fn keep(mut instance: Instance, settings: &MeshSettings) -> Result<Instance, Box<Instance>> {
     let same = instance.settings == *settings;
     let update = match &instance.state {
         State::Waiting(_) => same,
@@ -297,7 +297,7 @@ fn keep(mut instance: Instance, settings: &MeshSettings) -> Result<Instance, Ins
         instance.settings = settings.clone();
         Ok(instance)
     } else {
-        Err(instance)
+        Err(Box::new(instance))
     }
 }
 
