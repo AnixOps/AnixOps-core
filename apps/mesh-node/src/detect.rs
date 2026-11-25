@@ -3,7 +3,8 @@
 //! and crontabs, and processes started by hand; containers are found and
 //! reported but never touched. On macOS: launchd jobs (see
 //! [`crate::launchd`]) and processes started by hand. On Windows: services
-//! (see [`crate::winsvc`]) and processes started by hand.
+//! (see [`crate::winsvc`]), scheduled tasks and logon entries (see
+//! [`crate::winstart`]) and processes started by hand.
 //!
 //! Each finding carries the command line the program runs with, taken from
 //! the running process where there is one (the most exact source) and from
@@ -72,6 +73,28 @@ pub enum Origin {
         start: String,
         running: bool,
     },
+    /// A scheduled task (Windows), by its full name (`\folder\name`).
+    WinTask {
+        name: String,
+        /// Not turned off.
+        enabled: bool,
+        running: bool,
+    },
+    /// A logon entry (Windows): a value of a `Run` key or an item of a
+    /// Startup folder.
+    WinLogon {
+        /// The `Run` key or the Startup folder.
+        place: String,
+        /// The value or file name.
+        name: String,
+        /// The `StartupApproved` key that turns it off; `None` for a user
+        /// whose settings are not loaded, which is left to the operator.
+        approved: Option<String>,
+        /// The value there before, in hexadecimal.
+        previous: Option<String>,
+        /// Already turned off there.
+        disabled: bool,
+    },
 }
 
 impl Origin {
@@ -87,6 +110,8 @@ impl Origin {
                 format!("launchd:{}/{label}", domain.as_deref().unwrap_or("*"))
             }
             Origin::WinService { name, .. } => format!("service:{name}"),
+            Origin::WinTask { name, .. } => format!("task:{name}"),
+            Origin::WinLogon { place, name, .. } => format!("logon:{place}\\{name}"),
         }
     }
 }
@@ -980,6 +1005,8 @@ pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
     }
     if host.has_program("powershell.exe") {
         found.extend(crate::winsvc::services(host, profile, &processes));
+        found.extend(crate::winstart::tasks(host, profile, &processes));
+        found.extend(crate::winstart::logon_entries(host, profile, &processes));
     }
 
     let claimed: BTreeSet<u32> = found
