@@ -167,6 +167,15 @@ impl Writer {
         Self::default()
     }
 
+    /// A writer whose buffer never grows past `capacity` bytes while the
+    /// message fits, so no copy of a secret it holds is left behind in a
+    /// freed buffer.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn finish(self) -> Vec<u8> {
         self.buf
     }

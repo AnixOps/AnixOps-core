@@ -255,6 +255,14 @@ impl Client {
         ))
     }
 
+    /// The connection ends before msg2: another connection to the peer may
+    /// ask for the session at once.
+    pub fn abandon(mut self, sessions: &mut Sessions) {
+        if let Some(key) = self.creating.take() {
+            sessions.client_done(&key);
+        }
+    }
+
     /// Reads msg2 from `peer_id` (its packet header) and returns msg3.
     /// `expected_static` is the key `peer_id`'s route information announces,
     /// if known.

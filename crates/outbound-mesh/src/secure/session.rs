@@ -255,6 +255,9 @@ struct Record {
 struct Remembered {
     last: u32,
     used: u64,
+    /// A session with this generation was installed, so the peer proved
+    /// who it is; records of unproven peers are forgotten first.
+    confirmed: bool,
 }
 
 /// A relay Create waiting for its first packet (spec §9).
@@ -349,6 +352,39 @@ impl Sessions {
         self.pending.get(key).map_or(0, VecDeque::len)
     }
 
+    /// Forgets one generation record when the table is full and `key` has
+    /// none.
+    fn make_room_for(&mut self, key: &SessionKey) {
+        if !self.generations.contains_key(key) && self.generations.len() >= MAX_GENERATIONS {
+            // msg1 is not authenticated, so forged node IDs only push out
+            // records of other unproven peers; a peer with a session or a
+            // pending relay session keeps its record.
+            let (map, pending) = (&self.map, &self.pending);
+            let oldest = self
+                .generations
+                .iter()
+                .filter(|(peer, _)| !map.contains_key(*peer) && !pending.contains_key(*peer))
+                .min_by_key(|(_, remembered)| (remembered.confirmed, remembered.used))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.generations.remove(&oldest);
+            }
+        }
+    }
+
+    /// A session of `generation` was installed with `key`'s peer.
+    fn confirm(&mut self, key: &SessionKey, generation: u32) {
+        self.make_room_for(key);
+        let tick = self.next_tick();
+        let remembered = self.generations.entry(key.clone()).or_insert(Remembered {
+            last: generation,
+            used: tick,
+            confirmed: true,
+        });
+        remembered.last = remembered.last.max(generation);
+        remembered.confirmed = true;
+    }
+
     fn next_tick(&mut self) -> u64 {
         self.tick += 1;
         self.tick
@@ -378,23 +414,17 @@ impl Sessions {
             }
             None => random_generation(rng)?,
         };
-        if !self.generations.contains_key(key) && self.generations.len() >= MAX_GENERATIONS {
-            let map = &self.map;
-            let oldest = self
-                .generations
-                .iter()
-                .filter(|(peer, _)| !map.contains_key(*peer))
-                .min_by_key(|(_, remembered)| remembered.used)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                self.generations.remove(&oldest);
-            }
-        }
+        self.make_room_for(key);
+        let confirmed = self
+            .generations
+            .get(key)
+            .is_some_and(|remembered| remembered.confirmed);
         self.generations.insert(
             key.clone(),
             Remembered {
                 last: next,
                 used: tick,
+                confirmed,
             },
         );
         Ok(next)
@@ -672,6 +702,7 @@ impl Sessions {
                     session.connections += old.connections;
                 }
                 self.retire(&key);
+                self.confirm(&key, agreement.generation);
                 self.map.insert(key, session);
                 Ok(())
             }
@@ -729,6 +760,7 @@ impl Sessions {
                 )?;
                 session.connections += carried;
                 session.relaxed_until = relaxed_until;
+                self.confirm(&key, agreement.generation);
                 self.map.insert(key, session);
                 Ok(())
             }
@@ -914,12 +946,24 @@ impl Sessions {
             }
             return Ok(());
         }
-        if let Some(original) = original {
+        // A pending session takes no room until it is promoted, so it is
+        // promoted only when there is room.
+        let room = self.map.contains_key(key) || self.map.len() < MAX_SESSIONS;
+        if let Some(original) = original.filter(|_| room) {
             let mut promoted = None;
             if let Some(pending) = self.pending.get_mut(key) {
                 for (at, candidate) in pending.iter_mut().enumerate() {
                     let mut attempt = original.clone();
-                    if candidate.session.receiver.open(&mut attempt).is_ok() {
+                    // Failures on a pending session are not counted: any
+                    // node on the relay path can send packets as the peer,
+                    // and counting them would end the session before it is
+                    // promoted.
+                    if candidate
+                        .session
+                        .receiver
+                        .open_uncounted(&mut attempt)
+                        .is_ok()
+                    {
                         promoted = Some((at, attempt));
                         break;
                     }
@@ -932,6 +976,8 @@ impl Sessions {
                 drop(pending);
                 chosen.idle_since = now;
                 self.retire(key);
+                let generation = chosen.generation;
+                self.confirm(key, generation);
                 self.map.insert(key.clone(), chosen);
                 *payload = attempt;
                 return Ok(());
@@ -1804,5 +1850,112 @@ mod tests {
             ..direct
         });
         assert_eq!(sessions.len(), MAX_SESSIONS - 1);
+    }
+
+    fn pending_relay(sessions: &mut Sessions, key: &SessionKey, now: Instant) -> Agreement {
+        let rng = SystemRandom::new();
+        let choice = sessions
+            .server_choice(key, None, c(AES, AES), &rng)
+            .unwrap();
+        let seen = seen_digest(&choice.root_key);
+        sessions.remember_seen(key, seen);
+        sessions
+            .add_pending(
+                key,
+                seen,
+                &choice,
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                b"msg2".to_vec(),
+                now,
+            )
+            .unwrap();
+        choice
+    }
+
+    fn sealed_with(choice: &Agreement, peer_id: u32, now: Instant) -> Vec<u8> {
+        let mut sender = Sender::new(AES, choice.root_key, peer_id, LOCAL_ID, 0, now).unwrap();
+        let mut packet = b"first".to_vec();
+        sender.seal(&mut packet, now).unwrap();
+        packet
+    }
+
+    #[test]
+    fn forged_relay_packets_do_not_end_a_pending_session() {
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let key = key(Namespace::Relay);
+        let choice = pending_relay(&mut sessions, &key, now);
+        for n in 0..MAX_FAILURES * 2 {
+            let mut forged = vec![n as u8; 48];
+            assert!(sessions.open(&key, &mut forged, now).is_err());
+        }
+        assert_eq!(sessions.pending_len(&key), 1);
+        let mut packet = sealed_with(&choice, 7, now);
+        sessions.open(&key, &mut packet, now).unwrap();
+        assert_eq!(packet, b"first");
+        assert_eq!(sessions.generation(&key), Some(choice.generation));
+    }
+
+    #[test]
+    fn a_pending_session_waits_for_room() {
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let relay = key(Namespace::Relay);
+        let choice = pending_relay(&mut sessions, &relay, now);
+        for peer_id in 0..MAX_SESSIONS as u32 {
+            let key = SessionKey {
+                namespace: Namespace::Direct,
+                network: "office".into(),
+                peer_id,
+            };
+            let mut create = agreement(Action::Create, 1, 0, 0);
+            create.root_key[..4].copy_from_slice(&peer_id.to_be_bytes());
+            create.root_key[4] = 0xee;
+            sessions
+                .install(key, &create, LOCAL_ID, c(AES, AES), PEER, Side::Client, now)
+                .unwrap();
+        }
+        let mut packet = sealed_with(&choice, 7, now);
+        assert!(sessions.open(&relay, &mut packet, now).is_err());
+        assert_eq!(sessions.len(), MAX_SESSIONS);
+        assert_eq!(sessions.pending_len(&relay), 1);
+    }
+
+    #[test]
+    fn forged_node_ids_do_not_push_out_a_proven_peers_generation() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let real = key(Namespace::Direct);
+        let first = sessions
+            .server_choice(&real, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions
+            .install(
+                real.clone(),
+                &first,
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                Side::Server,
+                now,
+            )
+            .unwrap();
+        sessions.invalidate(&real);
+        for peer_id in 1000..1000 + MAX_GENERATIONS as u32 {
+            let forged = SessionKey {
+                peer_id,
+                ..real.clone()
+            };
+            sessions
+                .server_choice(&forged, None, c(AES, AES), &rng)
+                .unwrap();
+        }
+        let next = sessions
+            .server_choice(&real, None, c(AES, AES), &rng)
+            .unwrap();
+        assert_eq!(next.generation, first.generation + 1);
     }
 }
