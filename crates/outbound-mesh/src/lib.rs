@@ -26,11 +26,15 @@
 //!   around a [`node::Node`].
 //! - [`node`]: one node of one network without I/O: connections,
 //!   keep-alive, RPC, route synchronisation, forwarding and traffic checks.
+//! - [`dns`]: intranet names (requirement R28): the `dns` section, the name
+//!   list and the answers, including the resolver address on the virtual
+//!   interface.
 //! - [`status`]: what a node agent reads and writes through the kernel's
 //!   management API (`/v1/mesh`), and the trait that API drives the mesh
 //!   through.
 
 pub mod config;
+pub mod dns;
 #[cfg(feature = "runtime")]
 pub mod driver;
 pub mod legacy;

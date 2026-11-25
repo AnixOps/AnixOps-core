@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use outbound_mesh::config::encode_key;
+use outbound_mesh::dns::DnsSettings;
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
@@ -223,6 +224,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
+        let (_keep_dns, dns) = watch::channel(settings.dns.clone());
         serve_with(
             settings,
             static_key,
@@ -230,6 +232,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             device,
             stop,
             native_keys,
+            dns,
             |snapshot, name| {
                 let line = status_line(snapshot, name);
                 if line != last {
@@ -276,7 +279,9 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `native_keys` carries a new native key list into the running driver.
+/// `native_keys` carries a new native key list into the running driver,
+/// `dns` a new `dns` section.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_with(
     settings: MeshSettings,
     static_key: KeyPair,
@@ -284,6 +289,7 @@ pub(crate) async fn serve_with(
     device: Tun,
     until: impl std::future::Future<Output = ()>,
     native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    dns: watch::Receiver<DnsSettings>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
     let mtu = usize::from(settings.mtu);
@@ -306,6 +312,7 @@ pub(crate) async fn serve_with(
             snapshots,
             local_networks,
             native_keys,
+            dns,
             shutdown,
         },
     ));

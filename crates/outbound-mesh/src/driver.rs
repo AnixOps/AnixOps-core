@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 use crate::config::{MeshSettings, PeerEndpoint, Role, SecurityMode, Transport};
+use crate::dns::{DnsSettings, Names};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
 use crate::node::{Action, ConnId, Counters, Node};
@@ -127,6 +128,9 @@ pub struct Snapshot {
     pub overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
+    /// The intranet name list (R28): the names the status shows, and the
+    /// answers for the engine's split DNS ([`Names::answer`]).
+    pub names: Option<Arc<Names>>,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
@@ -226,6 +230,9 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// A new `dns` section, applied without a restart (R28); the value at
+    /// start is ignored, the settings carry it.
+    pub dns: watch::Receiver<DnsSettings>,
     /// Stops the node when it turns true.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -243,9 +250,11 @@ pub async fn run(
         snapshots,
         mut local_networks,
         mut native_keys,
+        mut dns,
         mut shutdown,
     } = channels;
     native_keys.mark_unchanged();
+    dns.mark_unchanged();
     let rng = SystemRandom::new();
     let started = Instant::now();
     let peers = settings.peers.clone();
@@ -309,6 +318,11 @@ pub async fn run(
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
                 node.set_native_keys(keys, Instant::now());
+                publish(&snapshots, snapshot(&node));
+            }
+            Ok(()) = dns.changed() => {
+                let settings = dns.borrow_and_update().clone();
+                node.set_dns(settings);
                 publish(&snapshots, snapshot(&node));
             }
             event = event_rx.recv() => {
@@ -457,6 +471,7 @@ fn snapshot(node: &Node) -> Snapshot {
             .into_iter()
             .map(|(peer, address)| (peer.0, address))
             .collect(),
+        names: Some(Arc::clone(node.names())),
     }
 }
 
@@ -899,6 +914,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_, local_networks) = watch::channel(Vec::new());
         let (_, native_keys) = watch::channel(None);
+        let (_, dns) = watch::channel(DnsSettings::default());
         tokio::spawn(run(
             settings,
             static_key,
@@ -909,6 +925,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                dns,
                 shutdown,
             },
         ));

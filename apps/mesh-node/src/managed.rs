@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use outbound_mesh::config::encode_key;
+use outbound_mesh::dns::DnsSettings;
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
@@ -35,11 +36,19 @@ use tokio::task::JoinHandle;
 use crate::serve::{self, Failure};
 use crate::tun::{self, Tun};
 
-/// Features this implementation adds to `GET /v1/status`. `mesh_native_keys`
+/// Features this implementation adds to `GET /v1/status`. `mesh_dns` and
+/// `mesh_resolver_address`: each network's `dns` section, with the
+/// resolver address answered on the network's interface (spec §15.9.2).
+/// `mesh_native_keys`
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
+pub const FEATURES: &[&str] = &[
+    "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
+    "mesh_native_keys",
+];
 
 /// Interface names: `anixmesh-<n>`, the lowest number free.
 const INTERFACE_PREFIX: &str = "anixmesh-";
@@ -81,6 +90,7 @@ struct Running {
     /// Dropping or sending stops the network.
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    dns: watch::Sender<DnsSettings>,
     snapshot: watch::Receiver<Snapshot>,
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
@@ -253,8 +263,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Whether `instance` can go on under `settings` without a restart: the
-/// same settings, or, while it runs, the same but for the native key list,
-/// which is handed to the running driver. A network that failed to start
+/// same settings, or, while it runs, the same but for the native key list
+/// and the `dns` section, which are handed to the running driver. A
+/// network that failed to start
 /// is tried again. `Err` gives the instance back to be stopped.
 fn keep(mut instance: Instance, settings: &MeshSettings) -> Result<Instance, Instance> {
     let same = instance.settings == *settings;
@@ -265,12 +276,17 @@ fn keep(mut instance: Instance, settings: &MeshSettings) -> Result<Instance, Ins
         State::Running(running) => {
             if same {
                 true
-            } else if same_but_native_keys(&instance.settings, settings)
+            } else if same_but_hot(&instance.settings, settings)
                 && instance
                     .public
                     .is_some_and(|public| !settings.waits_for_native_keys(&public))
             {
-                let _ = running.native_keys.send(settings.native_keys.clone());
+                if instance.settings.native_keys != settings.native_keys {
+                    let _ = running.native_keys.send(settings.native_keys.clone());
+                }
+                if instance.settings.dns != settings.dns {
+                    let _ = running.dns.send(settings.dns.clone());
+                }
                 true
             } else {
                 false
@@ -289,9 +305,12 @@ fn running_ok(running: &Running) -> bool {
     !running.task.is_finished()
 }
 
-fn same_but_native_keys(old: &MeshSettings, new: &MeshSettings) -> bool {
+/// The same settings but for what a running node takes without a restart:
+/// the native key list and the `dns` section.
+fn same_but_hot(old: &MeshSettings, new: &MeshSettings) -> bool {
     let mut old = old.clone();
     old.native_keys.clone_from(&new.native_keys);
+    old.dns.clone_from(&new.dns);
     old == *new
 }
 
@@ -352,6 +371,7 @@ async fn launch(
 
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
+    let (dns, dns_settings) = watch::channel(settings.dns.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
     let exit = Arc::new(Mutex::new(None));
     let exit_of_task = Arc::clone(&exit);
@@ -367,6 +387,7 @@ async fn launch(
             device,
             until,
             keys,
+            dns_settings,
             move |next, _| {
                 snapshots.send_replace(next.clone());
             },
@@ -380,6 +401,7 @@ async fn launch(
         interface,
         stop: Some(stop),
         native_keys,
+        dns,
         snapshot,
         exit,
         task,
@@ -488,6 +510,20 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             detail: String::new(),
         })
         .collect();
+    // The panel's resolver address is this node's own: it is not
+    // intercepted (spec §15.9.2 item 8).
+    if snapshot
+        .names
+        .as_ref()
+        .is_some_and(|names| names.resolver_conflict())
+    {
+        status.alerts.push(Alert {
+            code: AlertCode::ResolverAddressConflict,
+            address: settings.dns.resolver_address,
+            peer: String::new(),
+            detail: String::new(),
+        });
+    }
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -636,14 +672,18 @@ mod tests {
     }
 
     #[test]
-    fn only_a_native_key_change_keeps_a_network_running() {
+    fn only_native_key_and_dns_changes_keep_a_network_running() {
         let base = settings();
         let mut listed = base.clone();
         listed.native_keys = Some(vec![[1; 32], [2; 32]]);
-        assert!(same_but_native_keys(&base, &listed));
-        let mut moved = listed.clone();
+        assert!(same_but_hot(&base, &listed));
+        let mut named = listed.clone();
+        named.dns.enabled = true;
+        named.dns.resolver_address = Some("10.150.255.254".parse().unwrap());
+        assert!(same_but_hot(&base, &named));
+        let mut moved = named.clone();
         moved.mtu -= 10;
-        assert!(!same_but_native_keys(&base, &moved));
+        assert!(!same_but_hot(&base, &moved));
         assert_eq!(waiting_detail(&base), "empty");
         assert_eq!(waiting_detail(&listed), "self_missing");
     }

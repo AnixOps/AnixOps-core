@@ -33,6 +33,7 @@ use std::net::IpAddr;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use crate::dns::{DnsConfig, DnsSettings};
 use crate::net::IpNet;
 use crate::scope::is_intranet_network;
 
@@ -75,6 +76,9 @@ pub struct MeshConfig {
     pub subnets: SubnetsConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// Intranet names (requirement R28, spec §15.9.2); absent: off.
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
 }
 
 /// The virtual network; every node of it must agree on all of these.
@@ -391,6 +395,8 @@ pub struct MeshSettings {
     pub native_keys: Option<Vec<[u8; 32]>>,
     /// Decoded `node.private_key`, wiped when dropped.
     pub private_key: Option<Zeroizing<[u8; 32]>>,
+    /// The `dns` section; names are off without one.
+    pub dns: DnsSettings,
 }
 
 impl MeshSettings {
@@ -604,6 +610,13 @@ impl MeshConfig {
             }
         };
 
+        let mut virtual_subnets = vec![address.trunc()];
+        virtual_subnets.extend(address_v6.map(|address| address.trunc()));
+        let dns = match self.dns {
+            None => DnsSettings::default(),
+            Some(dns) => dns.validate(&virtual_subnets)?,
+        };
+
         let mut settings = MeshSettings {
             network_name: network.name,
             network_secret: network.secret,
@@ -629,6 +642,7 @@ impl MeshConfig {
             paths: Vec::new(),
             native_keys,
             private_key,
+            dns,
         };
         if advertise_subnets_overlap_virtual(&settings) {
             return Err("mesh subnets.advertise overlaps the virtual subnet");

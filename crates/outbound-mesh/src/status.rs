@@ -194,6 +194,10 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
+    /// The network's `dns.resolver_address` is this node's own virtual
+    /// address, so it is not intercepted (spec §15.9.2 item 8); `address`
+    /// gives it.
+    ResolverAddressConflict,
 }
 
 /// Why a `PUT /v1/mesh` was not applied.
@@ -224,7 +228,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// features and `/v1/mesh` answers 404.
 pub trait MeshControl: Send + Sync {
     /// Feature names this implementation adds to `GET /v1/status`:
-    /// at least `mesh`; `mesh_dns` once the network config takes `dns`.
+    /// at least `mesh`; `mesh_dns` when the network config takes `dns`,
+    /// `mesh_resolver_address` when it also takes `dns.resolver_address`.
     fn features(&self) -> &'static [&'static str];
 
     /// The current status.
