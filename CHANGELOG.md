@@ -46,6 +46,7 @@
 
 ### Added
 
+- anixops-mesh Windows 发布随附 `wintun.dll`（amd64、arm64，Wintun 0.14.1 原样，固定 SHA-256，附许可证；CI 核对 PE 架构），`install-windows.ps1` 新增 `-WintunUrl`/`-WintunSha256` 并装到程序旁边，服务设 `sc.exe failureflag` 使失败重启对服务专用错误生效；macOS 文档注明网卡为 `utunN`（配合 #344）。
 - 文档 `docs/deploy/mesh-device.md`：无 Agent 组网设备（R31、R32、R35）的程序侧约定，即 `enroll`、`device`、`device-status` 子命令、状态目录、配置读取与上报、字段白名单校验、令牌失效与退避、本机状态套接字、OpenWrt 软件包与 LuCI 插件。
 - 部署文档补超大旧网不建桥的检查（#321 复审 J6b，规范 §11.2、§15.11.1）：桥接节点先以普通成员加入旧网、实测成员数与同步超限告警，超过 4096 个节点或 8 MiB 时不建桥并报告 `legacy_network_too_large`。
 
