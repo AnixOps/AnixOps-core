@@ -82,6 +82,13 @@ pub trait Host {
         mode: u32,
         owner: Option<(u32, u32)>,
     ) -> io::Result<()>;
+    /// Writes an owner-only file (mode 0600) in one of the program's
+    /// state directories, which must belong to this user and not be
+    /// writable by others; on Unix through the directory's descriptor,
+    /// never following a link.
+    fn write_state(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        self.write(path, contents, 0o600, None)
+    }
     /// Unix mode bits, owner and group of a file.
     fn stat(&self, path: &Path) -> io::Result<FileStat>;
     /// Takes an exclusive lock on the file, creating it, and writes
@@ -153,29 +160,19 @@ fn write_then_rename(
     std::fs::rename(temporary, path)
 }
 
-/// Opens (creating) the lock file inside its directory without following
-/// links, checking the directory itself rather than its name: the state
-/// directory may come from the command line, and a planted link or a
-/// directory others can write could redirect what we write there. The
-/// directory is opened first and checked through its descriptor, and the
-/// file is opened relative to that descriptor, so nothing can be swapped in
-/// between the check and the open.
+/// Opens a directory the program keeps its state in, without following a
+/// link, and checks it through the descriptor: it must belong to this user
+/// and not be writable by others. The state directory may come from the
+/// command line, and a planted link or a directory others can write could
+/// redirect what we write there. Files are then opened relative to the
+/// descriptor, so nothing can be swapped in between the check and the use.
 #[cfg(unix)]
-fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+fn open_checked_dir(dir: &Path) -> io::Result<std::os::fd::OwnedFd> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "lock path has no file name"))?;
-    let invalid = |_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte");
-    let dir_c = CString::new(dir.as_os_str().as_bytes()).map_err(invalid)?;
-    let name_c = CString::new(name.as_bytes()).map_err(invalid)?;
+    let dir_c = CString::new(dir.as_os_str().as_bytes()).map_err(nul_in_path)?;
     // SAFETY: a valid C string; the descriptor is owned right away.
     let dir_fd = unsafe {
         libc::open(
@@ -207,6 +204,36 @@ fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
             ),
         ));
     }
+    Ok(dir_fd)
+}
+
+#[cfg(unix)]
+fn nul_in_path<T>(_: T) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte")
+}
+
+/// The directory and file name of a path inside a state directory.
+#[cfg(unix)]
+fn split_state_path(path: &Path) -> io::Result<(&Path, std::ffi::CString)> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(nul_in_path)?;
+    Ok((dir, name))
+}
+
+/// Opens (creating) the lock file inside its checked directory without
+/// following links; see [`open_checked_dir`].
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let (dir, name_c) = split_state_path(path)?;
+    let dir_fd = open_checked_dir(dir)?;
     // SAFETY: a valid directory descriptor and C string; never truncates,
     // never follows a link planted where the lock file goes.
     let fd = unsafe {
@@ -222,6 +249,63 @@ fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
     }
     // SAFETY: openat just returned it and nothing else owns it.
     Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// Writes an owner-only file in a checked state directory: a temporary file
+/// created next to it through the directory's descriptor, then renamed over
+/// it through the same descriptor, so neither the write nor the rename can
+/// be redirected by swapping the directory or planting a link.
+#[cfg(unix)]
+fn write_state_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let (dir, name_c) = split_state_path(path)?;
+    let dir_fd = open_checked_dir(dir)?;
+    let mut temporary = b".".to_vec();
+    temporary.extend_from_slice(name_c.as_bytes());
+    temporary.extend_from_slice(format!(".tmp-{}", std::process::id()).as_bytes());
+    let temporary = std::ffi::CString::new(temporary).map_err(nul_in_path)?;
+    let remove_temporary = || {
+        // SAFETY: a valid directory descriptor and C string.
+        unsafe { libc::unlinkat(dir_fd.as_raw_fd(), temporary.as_ptr(), 0) };
+    };
+    // SAFETY: a valid directory descriptor and C string; O_EXCL with
+    // O_NOFOLLOW never opens an existing file or a link.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat just returned it and nothing else owns it.
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        remove_temporary();
+        return Err(error);
+    }
+    // SAFETY: valid descriptors and C strings.
+    let renamed = unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            temporary.as_ptr(),
+            dir_fd.as_raw_fd(),
+            name_c.as_ptr(),
+        )
+    };
+    if renamed == -1 {
+        let error = io::Error::last_os_error();
+        remove_temporary();
+        return Err(error);
+    }
+    // The rename itself survives a crash only once the directory is synced.
+    std::fs::File::from(dir_fd).sync_all()
 }
 
 impl Host for RealHost {
@@ -292,6 +376,11 @@ impl Host for RealHost {
             let _ = std::fs::remove_file(&temporary);
         }
         result
+    }
+
+    #[cfg(unix)]
+    fn write_state(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        write_state_file(path, contents)
     }
 
     #[cfg(unix)]
@@ -726,6 +815,47 @@ mod real_tests {
         std::fs::set_permissions(base.join("state"), std::fs::Permissions::from_mode(0o777))
             .unwrap();
         assert!(other.try_lock(&base.join("state/lock"), "2").is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn state_files_are_written_through_the_checked_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("mesh-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("state")).unwrap();
+        std::fs::set_permissions(base.join("state"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let host = RealHost::default();
+        host.write_state(&base.join("state/takeover.json"), b"one")
+            .unwrap();
+        host.write_state(&base.join("state/takeover.json"), b"two")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("state/takeover.json")).unwrap(),
+            "two"
+        );
+        let metadata = std::fs::metadata(base.join("state/takeover.json")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        // No temporary file is left behind.
+        assert_eq!(std::fs::read_dir(base.join("state")).unwrap().count(), 1);
+        // A link where the file goes is replaced, never written through.
+        std::fs::write(base.join("target"), "keep").unwrap();
+        std::os::unix::fs::symlink(base.join("target"), base.join("state/linked")).unwrap();
+        host.write_state(&base.join("state/linked"), b"new")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).unwrap(),
+            "keep"
+        );
+        // A directory reached through a link, or writable by others.
+        std::os::unix::fs::symlink(base.join("state"), base.join("via")).unwrap();
+        assert!(host.write_state(&base.join("via/other"), b"x").is_err());
+        std::fs::set_permissions(base.join("state"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        assert!(host
+            .write_state(&base.join("state/takeover.json"), b"three")
+            .is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 }
