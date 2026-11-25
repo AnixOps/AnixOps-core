@@ -6,6 +6,8 @@
 
 ### Security
 
+- anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。
+
 - anixops-mesh 接管按 #329 复审修复（mesh-node `detect`、`takeover`、`host`、`winsvc`、`launchd`，三个安装脚本）：K1 数据来源按所运行的系统选择，Windows 上不再读取 `/proc`、`/etc`、`/var/spool/cron`、`/run/systemd`（在 Windows 上是任何用户可建的 `C:\proc` 等目录，可伪造进程、自启行与导入配置）；K2 Windows 安装脚本对 `%ProgramData%\AnixOps`、`Mesh`、`state` 逐级拒绝链接与非管理员属主，属主设为 Administrators 并整体替换访问列表，程序在 Windows 上读写状态与锁之前逐级检查目录属主、访问列表与联接；K3 macOS 程序改放 `/Library/AnixOps/mesh/bin`；K4 Windows 记录手动进程的 SID，回滚账户不同时不启动；K5 包装服务与 K6 launchd 任务按进程树认领进程；K7 缺少延迟启动标志时从注册表读取；K8 安装脚本区分退出码 1 与 7、文档修正、补 `save record` 测试与 Windows 状态目录的实机测试。
 - anixops-mesh 接管按 #321 复审修复（mesh-node `takeover`、`main`、安装脚本）：改动前检查跳过程序自身服务中的进程，带独立网络命名空间的单元由服务管理器停止与恢复（J1）；改动前预估记录大小，结束进程后会超过读取上限时直接拒绝，撤销或回滚后记录保存失败时报告「save record」并以退出码 7 结束（J2）；`--dry-run` 做同样的检查，拒绝时 `outcome` 为新增的 `refused`（退出码 1、不写记录），三个安装脚本在写入任何文件之前先预检（J3）；`forgotten` 只保留最近 64 条（J4）；文档补子命令参数、清空记录的确切含义与 `native_keys_pending` 期间不判失败（J5、J6a）。`detect`、`import`、`takeover`、`rollback` 在 macOS 与 Windows 上开放。
 - anixops-mesh 接管按 #318 复审收口（mesh-node `takeover`）：在其他网络命名空间运行的进程改在第一步改动之前检查，发现即失败，不再先停服务、注释自启行后才拒绝（H1）；`rollback --forget-process` 移除的进程保留在记录的 `forgotten` 列表中（H2）；记录超过读取上限 1 MiB 时不写入，避免回滚无法读回（H3）。
@@ -43,6 +45,9 @@
   - 测试：各带 ECH 的指纹多次生成 `enc` 均为曲线上的规范公钥且互不相同；Chromium 系长度与 AEAD；Firefox / ESR 服务器名 1–100 字节、长名字与续连时的长度和 AEAD 分布；JSON 解析、往返与非法取值；曲线判定的已知点与抓包；从抓包推出的规则与内置 profile 一致。
 
 ### Added
+
+- 文档 `docs/deploy/mesh-device.md`：无 Agent 组网设备（R31、R32、R35）的程序侧约定，即 `enroll`、`device`、`device-status` 子命令、状态目录、配置读取与上报、字段白名单校验、令牌失效与退避、本机状态套接字、OpenWrt 软件包与 LuCI 插件。
+- 部署文档补超大旧网不建桥的检查（#321 复审 J6b，规范 §11.2、§15.11.1）：桥接节点先以普通成员加入旧网、实测成员数与同步超限告警，超过 4096 个节点或 8 MiB 时不建桥并报告 `legacy_network_too_large`。
 
 - anixops-mesh 接管 Windows 计划任务与登录自启项（mesh-node `winstart`、`detect`、`takeover`，R12 内核 0.4）：计划任务以 `schtasks.exe /End` 结束、`/Change /DISABLE` 关闭，回滚 `/ENABLE` 后 `/Run`；`Run` 键与启动文件夹的自启项按 Windows 自己的启动项设置（`Explorer\StartupApproved`）关闭，回滚恢复原值，已被他人改动时保留现状；未登录用户的启动文件夹只报告。
 - anixops-mesh 接管支持 Windows（mesh-node `winsvc`、`detect`、`takeover`、`host`、`cmdline`，R12/R32 内核 0.4）：进程从系统进程表读取（命令行、工作目录、完整环境变量与运行账户），检测以该程序运行或在数据文件中点名的服务；接管先 `sc.exe stop` 再禁用，回滚逆序恢复启动方式后启动，服务进程不单独重启；其他账户运行的手动进程在任何改动之前报告并失败。新增 `install-windows.ps1`（服务 `AnixOpsMesh`，数据目录仅 SYSTEM 与 Administrators 可访问）。
