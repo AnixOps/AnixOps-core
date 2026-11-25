@@ -2,6 +2,8 @@
 name = "mesh-node"
 version.workspace = true
 edition.workspace = true
+# File::try_lock (the takeover lock) is stable from 1.89.
+rust-version = "1.89"
 license.workspace = true
 repository.workspace = true
 description = "Standalone intranet mesh node: deployment subcommands (detect, import, takeover, rollback) shared by the Agent and the installers."

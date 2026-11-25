@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::detect::{classify_units, detect, scan_processes, Found, Origin};
-use crate::host::{Host, Signal, Spawn};
+use crate::host::{Hold, Host, Signal, Spawn};
 use crate::profile::Profile;
 
 pub const MANIFEST_VERSION: u32 = 1;
@@ -594,6 +594,19 @@ fn alive(host: &dyn Host, pid: u32, exe: &str) -> bool {
     }
 }
 
+/// A running process of the same program and command line.
+fn running_copy(host: &dyn Host, exe: &str, argv: &[String]) -> Option<u32> {
+    let entries = host.list_dir(Path::new("/proc")).ok()?;
+    entries.into_iter().find_map(|entry| {
+        let pid: u32 = entry.file_name()?.to_str()?.parse().ok()?;
+        if !alive(host, pid, exe) {
+            return None;
+        }
+        let cmdline = host.read(&entry.join("cmdline")).ok()?;
+        (crate::cmdline::split_nul(&cmdline) == argv).then_some(pid)
+    })
+}
+
 fn wait_gone(host: &dyn Host, pid: u32, exe: &str, ms: u64) -> bool {
     let mut waited = 0;
     while alive(host, pid, exe) {
@@ -962,27 +975,43 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             groups,
             restart,
             pid,
+            exe,
             ..
         } => {
             if !*restart {
                 return Ok(format!("process {pid} is started by its service"));
             }
-            let new_pid = host
-                .spawn_detached(&Spawn {
-                    argv: argv.clone(),
-                    env: env.clone(),
-                    clear_env: *full_env,
-                    cwd: cwd.clone(),
-                    uid: *uid,
-                    gid: *gid,
-                    groups: groups.clone(),
-                })
+            // A unit that restarts what it runs may already have started it
+            // again; a second copy would fight it for ports, the virtual
+            // interface and the node identity.
+            if let Some(other) = running_copy(host, exe, argv) {
+                return Ok(format!(
+                    "process {pid} already runs again as {other}; not started twice"
+                ));
+            }
+            let spawn = Spawn {
+                argv: argv.clone(),
+                env: env.clone(),
+                clear_env: *full_env,
+                cwd: cwd.clone(),
+                uid: *uid,
+                gid: *gid,
+                groups: groups.clone(),
+            };
+            // On systemd hosts the new process moves into a scope of its own
+            // before it runs anything, so neither it nor a child it forks
+            // stays in the cgroup of whoever ran the rollback.
+            let systemd = host.exists(Path::new("/run/systemd/system"));
+            let scope = |new_pid: u32| own_scope(host, new_pid);
+            let spawned = host
+                .spawn_detached(&spawn, systemd.then_some(&scope as Hold<'_>))
                 .map_err(|error| format!("restarting process {pid}: {error}"))?;
-            Ok(match own_scope(host, new_pid) {
-                Ok(Some(scope)) => format!("restarted process {pid} as {new_pid} in {scope}"),
-                Ok(None) => format!("restarted process {pid} as {new_pid}"),
+            let new_pid = spawned.pid;
+            Ok(match spawned.held {
+                Some(Ok(scope)) => format!("restarted process {pid} as {new_pid} in {scope}"),
+                None => format!("restarted process {pid} as {new_pid}"),
                 // Running, only still in our cgroup: worth knowing, not a failure.
-                Err(error) => format!(
+                Some(Err(error)) => format!(
                     "restarted process {pid} as {new_pid}; it stays in this program's cgroup ({error})"
                 ),
             })
@@ -991,7 +1020,10 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
 }
 
 /// The longest restart delay a host unit may have; a takeover does not wait
-/// longer to see whether the program comes back.
+/// longer to see whether the program comes back. systemd's default is
+/// 100 ms and wrapper units commonly use 1–30 s; the old network is already
+/// down while we wait, so one minute bounds that outage. A longer delay is
+/// not guessed: the takeover fails and the unit belongs in the profile.
 const MAX_RESTART_WAIT_MS: u64 = 60_000;
 /// Margin after a unit's restart delay before the final check.
 const RESTART_MARGIN_MS: u64 = 2_000;
@@ -1040,10 +1072,22 @@ fn timespan_ms(text: &str) -> Option<u64> {
     let mut total_us: u64 = 0;
     for part in text.split_whitespace() {
         let digits = part
-            .find(|c: char| !c.is_ascii_digit())
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
             .unwrap_or(part.len());
         let (number, unit) = part.split_at(digits);
-        let number: u64 = number.parse().ok()?;
+        // systemd prints fractions such as `1.500000s`.
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        if whole.is_empty() && fraction.is_empty() {
+            return None;
+        }
+        let whole: u64 = if whole.is_empty() {
+            0
+        } else {
+            whole.parse().ok()?
+        };
+        if !fraction.chars().all(|c| c.is_ascii_digit()) || fraction.len() > 9 {
+            return None;
+        }
         let scale: u64 = match unit {
             "" | "s" | "sec" => 1_000_000,
             "us" | "usec" => 1,
@@ -1052,7 +1096,17 @@ fn timespan_ms(text: &str) -> Option<u64> {
             "h" | "hr" => 3_600_000_000,
             _ => return None,
         };
-        total_us = total_us.checked_add(number.checked_mul(scale)?)?;
+        let mut part_us = whole.checked_mul(scale)?;
+        if !fraction.is_empty() {
+            let denominator = 10u64.pow(fraction.len() as u32);
+            let numerator: u64 = fraction.parse().ok()?;
+            // Rounded up: waiting a little longer is the safe side.
+            part_us = part_us.checked_add(
+                (u128::from(numerator) * u128::from(scale)).div_ceil(u128::from(denominator))
+                    as u64,
+            )?;
+        }
+        total_us = total_us.checked_add(part_us)?;
     }
     Some(total_us.div_ceil(1_000))
 }
@@ -1060,10 +1114,7 @@ fn timespan_ms(text: &str) -> Option<u64> {
 /// On systemd hosts, moves a restarted process into a transient scope of
 /// its own, so it does not live in the cgroup of whoever ran the rollback
 /// (an SSH session, the Agent's service) and end with it.
-fn own_scope(host: &dyn Host, pid: u32) -> Result<Option<String>, String> {
-    if !host.exists(Path::new("/run/systemd/system")) {
-        return Ok(None);
-    }
+fn own_scope(host: &dyn Host, pid: u32) -> Result<String, String> {
     let scope = format!("anixops-mesh-restored-{pid}.scope");
     let pid_text = pid.to_string();
     let output = host
@@ -1090,12 +1141,25 @@ fn own_scope(host: &dyn Host, pid: u32) -> Result<Option<String>, String> {
             ],
         )
         .map_err(|error| format!("busctl: {error}"))?;
-    if output.success() {
-        Ok(Some(scope))
-    } else {
-        Err(format!("busctl exited with {:?}", output.code))
+    if !output.success() {
+        return Err(format!("busctl exited with {:?}", output.code));
     }
+    // The call only queues a job: wait until the process is really there.
+    let cgroup = PathBuf::from(format!("/proc/{pid}/cgroup"));
+    for _ in 0..SCOPE_WAIT_POLLS {
+        if host
+            .read_to_string(&cgroup)
+            .is_ok_and(|text| text.contains(&format!("/{scope}")))
+        {
+            return Ok(scope);
+        }
+        host.sleep_ms(POLL_MS);
+    }
+    Err(format!("{scope} did not take the process in time"))
 }
+
+/// How many polls of [`POLL_MS`] to wait for a scope to take a process.
+const SCOPE_WAIT_POLLS: u32 = 30;
 
 /// Undoes steps in reverse order; keeps going past failures. Returns the
 /// steps still to undo, in their original order: the ones that failed, and
@@ -1452,7 +1516,12 @@ mod tests {
         assert_eq!(timespan_ms("5s"), Some(5_000));
         assert_eq!(timespan_ms("1min 30s"), Some(90_000));
         assert_eq!(timespan_ms("0"), Some(0));
+        assert_eq!(timespan_ms("1.500000s"), Some(1_500));
+        assert_eq!(timespan_ms("2min 0.25s"), Some(120_250));
+        assert_eq!(timespan_ms("0.0001ms"), Some(1));
         assert_eq!(timespan_ms("1w"), None);
+        assert_eq!(timespan_ms("."), None);
+        assert_eq!(timespan_ms("1.2.3s"), None);
     }
 
     #[test]
@@ -1460,10 +1529,11 @@ mod tests {
         let host = machine();
         host.signal(100, Signal::Kill).unwrap();
         // A wrapper unit the profile does not name runs the program.
+        let office = ["/opt/demo-meshd", "--net-name", "office"];
         host.process(
             300,
             "/opt/demo-meshd",
-            &["/opt/demo-meshd", "--net-name", "lab"],
+            &office,
             &[],
             "0::/system.slice/office-vpn.service\n",
         );
@@ -1475,7 +1545,7 @@ mod tests {
         // It comes back after the delay.
         host.respawn_after_sleep.borrow_mut().push((
             301,
-            "/opt/demo-meshd".into(),
+            office.iter().map(|arg| arg.to_string()).collect(),
             "0::/system.slice/office-vpn.service\n".into(),
         ));
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
@@ -1491,6 +1561,20 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("office-vpn.service"));
+        // The unit's own copy runs; the rollback does not start a second.
+        assert!(host.alive.borrow().contains(&301));
+        let spawned = host.spawned.borrow();
+        assert!(
+            !spawned.iter().any(|spawn| spawn.argv == office),
+            "{spawned:?}"
+        );
+        // The process outside any unit is restarted as before.
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].argv, ["/opt/demo-meshd", "--net-name", "lab"]);
+        assert!(report.rollback.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("already runs again as 301"))));
     }
 
     #[test]

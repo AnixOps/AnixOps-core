@@ -35,6 +35,18 @@ pub struct Spawn {
     pub groups: Option<Vec<u32>>,
 }
 
+/// Runs in the parent while a new process waits: given its pid, returns
+/// what it did or why it could not.
+pub type Hold<'a> = &'a dyn Fn(u32) -> Result<String, String>;
+
+/// A started process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spawned {
+    pub pid: u32,
+    /// What `hold` returned; `None` when it did not run.
+    pub held: Option<Result<String, String>>,
+}
+
 /// The largest text file the program reads: configuration files, unit
 /// files, scripts and its own profile and manifest are all far smaller.
 pub const MAX_TEXT_FILE: u64 = 1024 * 1024;
@@ -89,8 +101,11 @@ pub trait Host {
     fn has_program(&self, program: &str) -> bool;
     /// Sends a signal; `Ok(false)` when the process is already gone.
     fn signal(&self, pid: u32, signal: Signal) -> io::Result<bool>;
-    /// Starts a detached process in its own session.
-    fn spawn_detached(&self, spawn: &Spawn) -> io::Result<u32>;
+    /// Starts a detached process in its own session. With `hold`, the new
+    /// process waits before running its program until `hold` has run with
+    /// its pid (on Linux; elsewhere `hold` is not called), so `hold` can move
+    /// it, say into a cgroup, before it can start anything of its own.
+    fn spawn_detached(&self, spawn: &Spawn, hold: Option<Hold<'_>>) -> io::Result<Spawned>;
     fn sleep_ms(&self, ms: u64);
     fn own_pid(&self) -> u32;
 }
@@ -236,8 +251,34 @@ impl Host for RealHost {
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            // The state directory may come from the command line: it must
+            // be a real directory of ours that nobody else can write, or a
+            // planted file or link could redirect what we write there.
+            let dir = match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => Path::new("."),
+            };
+            let metadata = std::fs::symlink_metadata(dir)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a directory", dir.display()),
+                ));
+            }
+            // SAFETY: geteuid has no preconditions.
+            let euid = unsafe { libc::geteuid() };
+            if metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} must belong to this user and not be writable by others",
+                        dir.display()
+                    ),
+                ));
+            }
+            // Never follow a link planted where the lock file goes.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut file = options.open(path)?;
         match file.try_lock() {
@@ -338,7 +379,7 @@ impl Host for RealHost {
     // The child runs in its own session and is meant to outlive this short
     // command; init reaps it once this process exits.
     #[allow(clippy::zombie_processes)]
-    fn spawn_detached(&self, spawn: &Spawn) -> io::Result<u32> {
+    fn spawn_detached(&self, spawn: &Spawn, hold: Option<Hold<'_>>) -> io::Result<Spawned> {
         let (program, args) = spawn
             .argv
             .split_first()
@@ -358,6 +399,11 @@ impl Host for RealHost {
         if let Some(cwd) = &spawn.cwd {
             command.current_dir(cwd);
         }
+        #[cfg(target_os = "linux")]
+        let handshake = match hold {
+            Some(_) => Some(Handshake::new()?),
+            None => None,
+        };
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -366,10 +412,17 @@ impl Host for RealHost {
             let groups: Vec<libc::gid_t> = spawn.groups.clone().unwrap_or_default();
             let (uid, gid) = (spawn.uid, spawn.gid);
             let change_groups = uid.is_some() || spawn.groups.is_some();
-            // SAFETY: only async-signal-safe calls (setsid, setgroups,
-            // setgid, setuid) on memory prepared before the fork.
+            #[cfg(target_os = "linux")]
+            let child_fds = handshake.as_ref().map(Handshake::child_fds);
+            // SAFETY: only async-signal-safe calls (close, getpid, write,
+            // read, setsid, setgroups, setgid, setuid) on memory prepared
+            // before the fork.
             unsafe {
                 command.pre_exec(move || {
+                    #[cfg(target_os = "linux")]
+                    if let Some(fds) = child_fds {
+                        wait_for_parent(fds)?;
+                    }
                     if libc::setsid() == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -395,8 +448,17 @@ impl Host for RealHost {
                 });
             }
         }
+        #[cfg(target_os = "linux")]
+        if let (Some(handshake), Some(hold)) = (handshake, hold) {
+            return handshake.spawn(command, hold);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = hold;
         let child = command.spawn()?;
-        Ok(child.id())
+        Ok(Spawned {
+            pid: child.id(),
+            held: None,
+        })
     }
 
     fn sleep_ms(&self, ms: u64) {
@@ -405,6 +467,141 @@ impl Host for RealHost {
 
     fn own_pid(&self) -> u32 {
         std::process::id()
+    }
+}
+
+/// Pipes between the parent and a new process that waits before running
+/// its program (Linux). Command::spawn only returns once the program runs,
+/// so the spawn happens on another thread while this one reads the pid,
+/// runs the hold and lets the process go on.
+#[cfg(target_os = "linux")]
+struct Handshake {
+    pid_read: std::os::fd::OwnedFd,
+    pid_write: std::os::fd::OwnedFd,
+    go_read: std::os::fd::OwnedFd,
+    go_write: std::os::fd::OwnedFd,
+}
+
+/// The descriptors a waiting child uses: (pid_read, pid_write, go_read,
+/// go_write); it closes the two ends that belong to the parent.
+#[cfg(target_os = "linux")]
+type ChildFds = (i32, i32, i32, i32);
+
+/// How long the parent waits for the new process to report its pid.
+#[cfg(target_os = "linux")]
+const HANDSHAKE_TIMEOUT_MS: i32 = 10_000;
+
+#[cfg(target_os = "linux")]
+fn cloexec_pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: fds has room for the two descriptors pipe2 writes.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 just returned these descriptors and nothing else owns
+    // them.
+    Ok(unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    })
+}
+
+/// In the child, between fork and exec: report the pid, then wait for the
+/// parent's go. End of file (the parent gave up) stops the spawn.
+///
+/// # Safety
+/// Called only in a forked child; uses only async-signal-safe calls.
+#[cfg(target_os = "linux")]
+unsafe fn wait_for_parent((pid_read, pid_write, go_read, go_write): ChildFds) -> io::Result<()> {
+    // Without the parent's ends, a parent that gives up shows as end of file.
+    libc::close(pid_read);
+    libc::close(go_write);
+    let pid = (libc::getpid() as u32).to_ne_bytes();
+    if libc::write(pid_write, pid.as_ptr().cast(), pid.len()) != pid.len() as isize {
+        return Err(io::Error::last_os_error());
+    }
+    let mut go = [0u8; 1];
+    loop {
+        match libc::read(go_read, go.as_mut_ptr().cast(), 1) {
+            1 => return Ok(()),
+            0 => return Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            _ if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => continue,
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Handshake {
+    fn new() -> io::Result<Self> {
+        let (pid_read, pid_write) = cloexec_pipe()?;
+        let (go_read, go_write) = cloexec_pipe()?;
+        Ok(Handshake {
+            pid_read,
+            pid_write,
+            go_read,
+            go_write,
+        })
+    }
+
+    fn child_fds(&self) -> ChildFds {
+        use std::os::fd::AsRawFd;
+        (
+            self.pid_read.as_raw_fd(),
+            self.pid_write.as_raw_fd(),
+            self.go_read.as_raw_fd(),
+            self.go_write.as_raw_fd(),
+        )
+    }
+
+    // As in RealHost::spawn_detached: the child outlives this command.
+    #[allow(clippy::zombie_processes)]
+    fn spawn(self, mut command: Command, hold: Hold<'_>) -> io::Result<Spawned> {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let Handshake {
+            pid_read,
+            pid_write,
+            go_read,
+            go_write,
+        } = self;
+        // The child's ends stay open in this process until the spawn is
+        // done; the child closes the parent's ends in its own copy.
+        let worker = std::thread::spawn(move || {
+            let result = command.spawn().map(|child| child.id());
+            drop((pid_write, go_read));
+            result
+        });
+        let mut poll = libc::pollfd {
+            fd: pid_read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        let ready = unsafe { libc::poll(&mut poll, 1, HANDSHAKE_TIMEOUT_MS) };
+        let mut pid_bytes = [0u8; 4];
+        let reported = if ready == 1 {
+            std::fs::File::from(pid_read)
+                .read_exact(&mut pid_bytes)
+                .ok()
+                .map(|()| u32::from_ne_bytes(pid_bytes))
+        } else {
+            None
+        };
+        let held = reported.map(hold);
+        // Go, or (no pid) end of file so a child still waiting gives up.
+        let mut go = std::fs::File::from(go_write);
+        if reported.is_some() {
+            let _ = go.write_all(&[1]);
+        }
+        drop(go);
+        let pid = worker
+            .join()
+            .map_err(|_| io::Error::other("spawn thread panicked"))??;
+        Ok(Spawned { pid, held })
     }
 }
 
@@ -439,9 +636,9 @@ pub(crate) mod fake {
         pub held_by_others: RefCell<BTreeSet<PathBuf>>,
         /// Every wait, in milliseconds.
         pub slept: RefCell<Vec<u64>>,
-        /// Processes (pid, exe, cgroup) that appear at the next wait of a
+        /// Processes (pid, argv, cgroup) that appear at the next wait of a
         /// second or more.
-        pub respawn_after_sleep: RefCell<Vec<(u32, String, String)>>,
+        pub respawn_after_sleep: RefCell<Vec<(u32, Vec<String>, String)>>,
     }
 
     impl FakeHost {
@@ -623,6 +820,15 @@ pub(crate) mod fake {
                 key.push_str(arg);
             }
             self.ran.borrow_mut().push(key.clone());
+            // systemd moving a process into a new scope.
+            if program == "busctl" && args.contains(&"StartTransientUnit") {
+                if let (Some(scope), Some(pid)) = (args.get(6), args.get(12)) {
+                    self.file(
+                        &format!("/proc/{pid}/cgroup"),
+                        &format!("0::/system.slice/{scope}\n"),
+                    );
+                }
+            }
             Ok(self
                 .answers
                 .borrow()
@@ -651,9 +857,12 @@ pub(crate) mod fake {
             Ok(true)
         }
 
-        fn spawn_detached(&self, spawn: &Spawn) -> io::Result<u32> {
+        fn spawn_detached(&self, spawn: &Spawn, hold: Option<Hold<'_>>) -> io::Result<Spawned> {
             self.spawned.borrow_mut().push(spawn.clone());
-            Ok(4242)
+            Ok(Spawned {
+                pid: 4242,
+                held: hold.map(|hold| hold(4242)),
+            })
         }
 
         fn sleep_ms(&self, ms: u64) {
@@ -664,8 +873,9 @@ pub(crate) mod fake {
                 return;
             }
             let respawn: Vec<_> = self.respawn_after_sleep.borrow_mut().drain(..).collect();
-            for (pid, exe, cgroup) in respawn {
-                self.process(pid, &exe, &[exe.as_str()], &[], &cgroup);
+            for (pid, argv, cgroup) in respawn {
+                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+                self.process(pid, argv[0], &argv, &[], &cgroup);
             }
         }
 
