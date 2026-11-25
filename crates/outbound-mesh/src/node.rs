@@ -1450,8 +1450,8 @@ mod tests {
         let ids = [net.nodes[0].id(), net.nodes[2].id()];
         for (i, peer) in [(0, ids[1]), (2, ids[0])] {
             let node = &mut net.nodes[i];
-            let key = SessionKey {
-                namespace: Namespace::Relay,
+            let key = crate::secure::session::SessionKey {
+                namespace: crate::secure::session::Namespace::Relay,
                 network: node.settings.network_name.clone(),
                 peer_id: peer,
             };
