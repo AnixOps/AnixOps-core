@@ -10,7 +10,7 @@
 //! ```json
 //! {
 //!   "config_version": 1,
-//!   "network": { "name": "office", "secret": "…", "secure_mode": false, "cipher": "aes-gcm" },
+//!   "network": { "name": "office", "secret": "…", "kind": "managed", "secure_mode": true },
 //!   "node": {
 //!     "address": "10.144.144.5/24", "role": "full", "hostname": "build-01",
 //!     "mtu": 1380, "relay": true, "listen": [{ "transport": "tcp" }]
@@ -61,7 +61,10 @@ pub const MAX_HOSTNAME_BYTES: usize = 63;
 /// One mesh node as it appears in the config. The secret is injected from
 /// the Keychain like the other protocols' passwords. Has no `Debug`: it
 /// holds the secret.
+/// The outbound's own fields; the registration layer removes the outbound
+/// `type` and `tag` before parsing, so anything else unknown is an error.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshConfig {
     pub config_version: u32,
     pub network: NetworkConfig,
@@ -80,15 +83,34 @@ pub struct NetworkConfig {
     /// Used byte for byte in the network digest (spec §6.3).
     pub name: String,
     pub secret: String,
-    /// `false`, the default: the default handshake, without forward secrecy.
-    /// `true`: the secure mode. All nodes of a network use the same mode and
-    /// there is no fallback (spec §5.2).
+    /// `managed`, the default: one of our region networks, which always use
+    /// the secure mode (spec §5.2, §15.11, requirement R30). `legacy`: an
+    /// existing network joined during migration, typically the old-network
+    /// instance of a bridge node; only this kind may use the default mode or
+    /// no encryption.
     #[serde(default)]
-    pub secure_mode: bool,
+    pub kind: NetworkKind,
+    /// The secure mode (`true`) or the default handshake without forward
+    /// secrecy (`false`). All nodes of a network use the same mode and there
+    /// is no fallback (spec §5.2). Absent: `true` for managed networks,
+    /// `false` for legacy ones.
+    #[serde(default)]
+    pub secure_mode: Option<bool>,
     /// Cipher of the default handshake mode (spec §7.1). `none` turns
     /// encryption off and must be chosen explicitly.
     #[serde(default)]
     pub cipher: Cipher,
+}
+
+/// Who runs a network (spec §15.11).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkKind {
+    /// Ours: secure mode only, never unencrypted.
+    #[default]
+    Managed,
+    /// An existing network kept during migration.
+    Legacy,
 }
 
 /// This node.
@@ -131,19 +153,33 @@ pub enum Role {
     Access,
 }
 
+/// Whether this build runs on a phone, where nodes are access nodes only
+/// (requirement R10).
+pub const IS_PHONE: bool = cfg!(any(target_os = "ios", target_os = "android"));
+
 impl Role {
     /// The role of this platform when the config names none.
     pub fn platform_default() -> Self {
-        if cfg!(any(target_os = "ios", target_os = "android")) {
+        Self::default_for(IS_PHONE)
+    }
+
+    /// Whether this platform may run as a full node.
+    pub fn platform_allows_full() -> bool {
+        Self::allowed(Role::Full, IS_PHONE)
+    }
+
+    /// The role when the config names none, on a phone or elsewhere.
+    pub fn default_for(phone: bool) -> Self {
+        if phone {
             Role::Access
         } else {
             Role::Full
         }
     }
 
-    /// Whether this platform may run as a full node.
-    pub fn platform_allows_full() -> bool {
-        Self::platform_default() == Role::Full
+    /// Whether `role` may run on a phone or elsewhere.
+    pub fn allowed(role: Role, phone: bool) -> bool {
+        role == Role::Access || !phone
     }
 }
 
@@ -185,7 +221,8 @@ pub enum Transport {
 }
 
 /// Cipher of the default handshake mode (spec §7.1). The unauthenticated
-/// XOR mode is not offered: a config naming it fails to parse.
+/// XOR mode is not offered: a config naming it fails validation with a
+/// message saying it is insecure.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 pub enum Cipher {
     /// No encryption at all (spec §7.1, requirement R14). Only when the
@@ -209,6 +246,10 @@ pub enum Cipher {
         alias = "openssl-chacha20-poly1305"
     )]
     ChaCha20Poly1305,
+    /// The unauthenticated XOR mode (spec §7.1). Recognised only so that
+    /// validation can say why it is refused; never used.
+    #[serde(rename = "xor", alias = "openssl-xor")]
+    Xor,
 }
 
 #[derive(Default, Deserialize)]
@@ -315,6 +356,7 @@ impl MeshSettings {
 pub struct MeshSettings {
     pub network_name: String,
     pub network_secret: String,
+    pub kind: NetworkKind,
     pub security: SecurityMode,
     pub cipher: Cipher,
     /// This node's IPv4 address; [`IpNet::trunc`] is the virtual subnet.
@@ -356,7 +398,7 @@ impl MeshSettings {
     fn in_virtual_subnet(&self, address: IpAddr) -> bool {
         self.virtual_subnets()
             .iter()
-            .any(|subnet| subnet.contains(address) && subnet.network() != address)
+            .any(|subnet| subnet.is_host(address))
     }
 }
 
@@ -379,7 +421,16 @@ impl MeshConfig {
         if network.secret.is_empty() {
             return Err("mesh network secret is empty");
         }
-        if network.secure_mode && network.cipher == Cipher::None {
+        if network.cipher == Cipher::Xor {
+            return Err("mesh cipher xor is insecure (no authentication) and is not supported");
+        }
+        let secure_mode = network
+            .secure_mode
+            .unwrap_or(network.kind == NetworkKind::Managed);
+        if network.kind == NetworkKind::Managed && !secure_mode {
+            return Err("mesh managed networks always use secure_mode");
+        }
+        if secure_mode && network.cipher == Cipher::None {
             return Err(
                 "mesh secure_mode always encrypts; cipher none applies to the default mode only",
             );
@@ -406,7 +457,7 @@ impl MeshConfig {
         };
 
         let role = node.role.unwrap_or_else(Role::platform_default);
-        if role == Role::Full && !Role::platform_allows_full() {
+        if !Role::allowed(role, IS_PHONE) {
             return Err("mesh full nodes are not available on this platform");
         }
         if role == Role::Access && !node.listen.is_empty() {
@@ -436,8 +487,10 @@ impl MeshConfig {
             }
         }
 
-        if self.peers.is_empty() {
-            return Err("mesh needs at least one peer");
+        // A full node that listens may wait for others to connect (a hub);
+        // every other node needs somewhere to connect to.
+        if self.peers.is_empty() && (role == Role::Access || node.listen.is_empty()) {
+            return Err("mesh needs at least one peer, or a full node that listens");
         }
         if self.peers.len() > MAX_PEERS {
             return Err("mesh lists too many peers");
@@ -472,7 +525,8 @@ impl MeshConfig {
         let mut settings = MeshSettings {
             network_name: network.name,
             network_secret: network.secret,
-            security: if network.secure_mode {
+            kind: network.kind,
+            security: if secure_mode {
                 SecurityMode::ForwardSecrecy
             } else {
                 SecurityMode::Default
@@ -622,7 +676,7 @@ mod tests {
     fn base() -> Value {
         json!({
             "config_version": 1,
-            "network": {"name": "office", "secret": "s3cret"},
+            "network": {"name": "office", "secret": "s3cret", "kind": "legacy"},
             "node": {"address": "10.144.144.5/24", "role": "access"},
             "peers": [{"server": "peer.example", "port": 40000}],
         })
@@ -702,6 +756,44 @@ mod tests {
     }
 
     #[test]
+    fn managed_networks_always_use_the_secure_mode() {
+        let mut managed = base();
+        managed["network"].as_object_mut().unwrap().remove("kind");
+        let settings = validate(managed.clone()).unwrap();
+        assert_eq!(settings.kind, NetworkKind::Managed);
+        assert_eq!(settings.security, SecurityMode::ForwardSecrecy);
+        managed["network"]["secure_mode"] = json!(false);
+        assert_eq!(
+            validate(managed.clone()).err(),
+            Some("mesh managed networks always use secure_mode")
+        );
+        managed["network"]["secure_mode"] = json!(true);
+        managed["network"]["cipher"] = json!("none");
+        assert!(validate(managed).is_err());
+        // Legacy networks default to the default mode.
+        let settings = validate(base()).unwrap();
+        assert_eq!(settings.kind, NetworkKind::Legacy);
+        assert_eq!(settings.security, SecurityMode::Default);
+        assert!(parse(with("network.kind", json!("other"))).is_err());
+    }
+
+    #[test]
+    fn roles_by_platform() {
+        assert_eq!(Role::default_for(true), Role::Access);
+        assert_eq!(Role::default_for(false), Role::Full);
+        assert!(!Role::allowed(Role::Full, true));
+        assert!(Role::allowed(Role::Access, true));
+        assert!(Role::allowed(Role::Full, false));
+        assert!(Role::allowed(Role::Access, false));
+        assert_eq!(Role::platform_default(), Role::default_for(IS_PHONE));
+    }
+
+    #[test]
+    fn top_level_unknown_fields_are_rejected() {
+        assert!(parse(with("exit", json!(true))).is_err());
+    }
+
+    #[test]
     fn ciphers_and_their_aliases() {
         for (name, cipher) in [
             ("aes-gcm", Cipher::Aes128Gcm),
@@ -722,8 +814,16 @@ mod tests {
         let mut secure_plain = with("network.cipher", json!("none"));
         secure_plain["network"]["secure_mode"] = json!(true);
         assert!(validate(secure_plain).is_err());
-        // XOR has no authentication and is refused (spec §7.1).
-        for name in ["xor", "openssl-xor", "AES-GCM", "", "None", "plain"] {
+        // XOR has no authentication and is refused with that reason
+        // (spec §7.1).
+        for name in ["xor", "openssl-xor"] {
+            assert_eq!(
+                validate(with("network.cipher", json!(name))).err(),
+                Some("mesh cipher xor is insecure (no authentication) and is not supported"),
+                "{name}"
+            );
+        }
+        for name in ["AES-GCM", "", "None", "plain"] {
             assert!(
                 parse(with("network.cipher", json!(name))).is_err(),
                 "{name}"
@@ -889,6 +989,34 @@ mod tests {
                 "{subnet}"
             );
         }
+    }
+
+    #[test]
+    fn a_listening_full_node_may_have_no_peers() {
+        // An access node always needs a peer.
+        assert!(validate(with("peers", json!([]))).is_err());
+        let mut hub = with("peers", json!([]));
+        hub["node"]["role"] = json!("full");
+        // A full node that does not listen cannot be reached either.
+        assert!(validate(hub.clone()).is_err());
+        hub["node"]["listen"] = json!([{"transport": "tcp"}]);
+        if Role::platform_allows_full() {
+            assert!(validate(hub).unwrap().peers.is_empty());
+        }
+    }
+
+    #[test]
+    fn broadcast_addresses_are_not_nodes() {
+        let path = with(
+            "routing",
+            json!({"paths": [{"to_peer": "10.144.144.255", "via": ["10.144.144.3"]}]}),
+        );
+        assert!(validate(path).is_err());
+        let via = with(
+            "routing",
+            json!({"paths": [{"to_peer": "10.144.144.7", "via": ["10.144.144.255"]}]}),
+        );
+        assert!(validate(via).is_err());
     }
 
     #[test]

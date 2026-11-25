@@ -58,6 +58,10 @@ pub enum Denied {
     NotForUs,
     /// A packet whose source is not this node.
     ForeignSource,
+    /// A subnet that overlaps one of this node's own networks: the subnets
+    /// it advertises or the networks of its interfaces (spec §15.4). Routing
+    /// it into the mesh would take traffic away from the local network.
+    LocalNetwork,
     Malformed(Malformed),
 }
 
@@ -74,6 +78,7 @@ impl fmt::Display for Denied {
             Denied::Spoofed => "packet source does not belong to the delivering peer",
             Denied::NotForUs => "packet is not addressed to this mesh node",
             Denied::ForeignSource => "packet source is not this mesh node",
+            Denied::LocalNetwork => "subnet overlaps a network of this node",
             Denied::Malformed(_) => "malformed IP packet",
         })
     }
@@ -100,6 +105,13 @@ pub struct RouteTable {
     local: Vec<IpAddr>,
     virtual_subnets: Vec<IpNet>,
     allowed: Vec<IpNet>,
+    /// Subnets this node advertises; never accepted from a peer.
+    advertised: Vec<IpNet>,
+    /// Networks of this node's interfaces, as the driver reports them.
+    interfaces: Vec<IpNet>,
+    /// Advertised subnets the user chose to reach through the mesh even
+    /// though they overlap an interface network.
+    mesh_overrides: Vec<IpNet>,
     peers: BTreeMap<PeerId, PeerRoutes>,
 }
 
@@ -109,8 +121,48 @@ impl RouteTable {
             local: settings.local_addresses(),
             virtual_subnets: settings.virtual_subnets(),
             allowed: settings.accept_subnets.clone(),
+            advertised: settings.advertise_subnets.clone(),
+            interfaces: Vec::new(),
+            mesh_overrides: Vec::new(),
             peers: BTreeMap::new(),
         }
+    }
+
+    /// Sets the networks of this node's interfaces and the subnets the user
+    /// routes through the mesh anyway (`mesh_set_subnet_route`). Subnets
+    /// already accepted from peers that now overlap are withdrawn; they are
+    /// returned so the status can show them, and come back with the peer's
+    /// next advertisement once the overlap is gone.
+    pub fn set_local_networks(
+        &mut self,
+        interfaces: &[IpNet],
+        mesh_overrides: &[IpNet],
+    ) -> Vec<(PeerId, IpNet)> {
+        self.interfaces = interfaces.iter().map(IpNet::trunc).collect();
+        self.mesh_overrides = mesh_overrides.iter().map(IpNet::trunc).collect();
+        let mut withdrawn = Vec::new();
+        let peers: Vec<PeerId> = self.peers.keys().copied().collect();
+        for peer in peers {
+            let subnets = std::mem::take(&mut self.peers.get_mut(&peer).expect("listed").subnets);
+            let mut kept = Vec::with_capacity(subnets.len());
+            for subnet in subnets {
+                if self.overlaps_local(&subnet) {
+                    withdrawn.push((peer, subnet));
+                } else {
+                    kept.push(subnet);
+                }
+            }
+            self.peers.get_mut(&peer).expect("listed").subnets = kept;
+        }
+        withdrawn
+    }
+
+    fn overlaps_local(&self, subnet: &IpNet) -> bool {
+        if self.advertised.iter().any(|own| own.overlaps(subnet)) {
+            return true;
+        }
+        self.interfaces.iter().any(|own| own.overlaps(subnet))
+            && !self.mesh_overrides.contains(subnet)
     }
 
     /// Replaces everything `peer` advertises. Entries that fail a check are
@@ -183,7 +235,8 @@ impl RouteTable {
             .iter()
             .find(|subnet| subnet.contains(address))
             .ok_or(Denied::VirtualSubnet)?;
-        if address == subnet.network() {
+        // The network and broadcast addresses are nobody's (spec §15.3).
+        if !subnet.is_host(address) {
             return Err(Denied::VirtualSubnet);
         }
         if self
@@ -205,6 +258,9 @@ impl RouteTable {
         }
         if !self.allowed.is_empty() && !self.allowed.iter().any(|allowed| allowed.covers(subnet)) {
             return Err(Denied::NotAllowed);
+        }
+        if self.overlaps_local(subnet) {
+            return Err(Denied::LocalNetwork);
         }
         Ok(())
     }
@@ -267,18 +323,43 @@ impl RouteTable {
         self.lookup(addresses.destination)
     }
 
-    /// Checks a packet `peer` delivered: its source must be one of the
-    /// peer's virtual addresses or inside a subnet the peer advertised, and
-    /// it must be addressed to this node.
+    /// Checks a packet `peer` delivered: it must be addressed to this node,
+    /// and its source must belong to `peer` by the same rule outgoing
+    /// traffic is routed with (a reverse-path check). The source is one of
+    /// the peer's virtual addresses, or lies in the longest advertised subnet
+    /// that contains it and the peer is one of that subnet's advertisers. A
+    /// peer advertising a wider subnet cannot use the source addresses of a
+    /// narrower subnet another peer advertises.
     pub fn check_incoming(&self, peer: PeerId, packet: &[u8]) -> Result<(), Denied> {
         let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
         if !self.local.contains(&addresses.destination) {
             return Err(Denied::NotForUs);
         }
         let routes = self.peers.get(&peer).ok_or(Denied::Spoofed)?;
-        let source = addresses.source;
-        let owned = routes.addresses.contains(&source)
-            || routes.subnets.iter().any(|subnet| subnet.contains(source));
+        let source = unmap(addresses.source);
+        if routes.addresses.contains(&source) {
+            return Ok(());
+        }
+        if self
+            .virtual_subnets
+            .iter()
+            .any(|subnet| subnet.contains(source))
+        {
+            return Err(Denied::Spoofed);
+        }
+        let longest = self
+            .peers
+            .values()
+            .flat_map(|routes| routes.subnets.iter())
+            .filter(|subnet| subnet.contains(source))
+            .map(IpNet::prefix)
+            .max();
+        let owned = longest.is_some_and(|longest| {
+            routes
+                .subnets
+                .iter()
+                .any(|subnet| subnet.prefix() == longest && subnet.contains(source))
+        });
         if owned {
             Ok(())
         } else {
@@ -512,6 +593,46 @@ mod tests {
     }
 
     #[test]
+    fn local_networks_are_never_taken_over() {
+        let mut config = settings(json!({}));
+        config.advertise_subnets = vec![net("192.168.50.0/24")];
+        let mut table = RouteTable::new(&config);
+        let update = table.set_peer(
+            A,
+            &[ip("10.144.144.6")],
+            &[
+                net("192.168.50.128/25"),
+                net("192.168.60.0/24"),
+                net("192.168.70.0/24"),
+            ],
+        );
+        assert_eq!(
+            update.refused_subnets,
+            vec![(net("192.168.50.128/25"), Denied::LocalNetwork)]
+        );
+        // An interface network appears later: the overlapping route goes.
+        let withdrawn = table.set_local_networks(&[net("192.168.60.7/24")], &[]);
+        assert_eq!(withdrawn, vec![(A, net("192.168.60.0/24"))]);
+        assert_eq!(table.lookup(ip("192.168.60.1")), Err(Denied::NoRoute));
+        assert_eq!(table.lookup(ip("192.168.70.1")), Ok(A));
+        // The user routes that subnet through the mesh after all.
+        table.set_local_networks(&[net("192.168.60.0/24")], &[net("192.168.60.0/24")]);
+        table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.60.0/24")]);
+        assert_eq!(table.lookup(ip("192.168.60.1")), Ok(A));
+        // An override never applies to what this node advertises itself.
+        table.set_local_networks(&[], &[net("192.168.50.128/25")]);
+        let update = table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.50.128/25")]);
+        assert_eq!(update.refused_subnets.len(), 1);
+    }
+
+    #[test]
+    fn broadcast_addresses_belong_to_nobody() {
+        let mut table = RouteTable::new(&settings(json!({})));
+        let update = table.set_peer(A, &[ip("10.144.144.255"), ip("10.144.144.0")], &[]);
+        assert_eq!(update.refused_addresses.len(), 2);
+    }
+
+    #[test]
     fn incoming_packets_drop_spoofed_and_transit_traffic() {
         let mut table = RouteTable::new(&settings(json!({})));
         table.set_peer(
@@ -550,6 +671,22 @@ mod tests {
             table.check_incoming(PeerId(9), &to_us([10, 144, 144, 6])),
             Err(Denied::Spoofed)
         );
+        // Reverse path: B advertises a wider subnet that covers A's; B may
+        // not use sources in A's subnet, A may, and B keeps the rest.
+        table.set_peer(B, &[ip("10.144.144.7")], &[net("192.168.0.0/16")]);
+        assert_eq!(
+            table.check_incoming(B, &to_us([192, 168, 10, 9])),
+            Err(Denied::Spoofed)
+        );
+        assert_eq!(table.check_incoming(A, &to_us([192, 168, 10, 9])), Ok(()));
+        assert_eq!(table.check_incoming(B, &to_us([192, 168, 20, 9])), Ok(()));
+        assert_eq!(
+            table.check_incoming(A, &to_us([192, 168, 20, 9])),
+            Err(Denied::Spoofed)
+        );
+        // Two advertisers of the same subnet may both deliver from it.
+        table.set_peer(B, &[ip("10.144.144.7")], &[net("192.168.10.0/24")]);
+        assert_eq!(table.check_incoming(B, &to_us([192, 168, 10, 9])), Ok(()));
         // Transit through this node is never allowed.
         assert_eq!(
             table.check_incoming(A, &ipv4([10, 144, 144, 6], [10, 144, 144, 7], 0)),

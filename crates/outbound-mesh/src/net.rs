@@ -90,6 +90,19 @@ impl IpNet {
         }
     }
 
+    /// Whether `address` is a usable host address in this network: inside
+    /// it and neither the network address nor, for IPv4 networks of /30 and
+    /// wider, the broadcast address.
+    pub fn is_host(&self, address: IpAddr) -> bool {
+        if !self.contains(address) || address == self.network() {
+            return false;
+        }
+        match address {
+            IpAddr::V4(v4) if self.prefix <= 30 => u32::from(v4) | mask32(self.prefix) != u32::MAX,
+            _ => true,
+        }
+    }
+
     /// The same network with the host bits cleared.
     pub fn trunc(&self) -> Self {
         Self {
@@ -186,6 +199,23 @@ mod tests {
         ] {
             assert!(IpNet::parse(text).is_none(), "{text}");
         }
+    }
+
+    #[test]
+    fn host_addresses() {
+        let net = IpNet::parse("10.144.144.0/24").unwrap();
+        for (address, host) in [
+            ("10.144.144.0", false),
+            ("10.144.144.1", true),
+            ("10.144.144.254", true),
+            ("10.144.144.255", false),
+            ("10.144.145.1", false),
+        ] {
+            assert_eq!(net.is_host(address.parse().unwrap()), host, "{address}");
+        }
+        let v6 = IpNet::parse("fd00::/64").unwrap();
+        assert!(!v6.is_host("fd00::".parse().unwrap()));
+        assert!(v6.is_host("fd00::ffff:ffff:ffff:ffff".parse().unwrap()));
     }
 
     #[test]

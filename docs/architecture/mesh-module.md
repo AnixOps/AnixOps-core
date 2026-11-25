@@ -31,19 +31,20 @@
 
 需求 R2（`/mnt/project-files/mesh/requirements.md`）：现有组网节点未启用前向保密，必须支持网络的默认握手才能互通。加密模式按网络选择，同一网络内所有节点同一模式，不做逐连接协商。
 
-- `secure_mode`（规范 §5.2）：`false`（默认，与现网一致）为网络默认握手，没有前向保密，状态里每个会话报告这一点，界面标注“未启用前向保密”；`true` 为安全模式。不做自动回落。
+- `network.kind`（规范 §15.11，需求 R30）：`managed`（默认）为我方区域网络，一律安全模式，不允许 `secure_mode: false` 或 `cipher: none`；`legacy` 为迁移期间加入的旧网（通常是桥接节点的旧网实例），只有它可以用默认握手或不加密。
+- `secure_mode`（规范 §5.2）：`true` 为安全模式，`false` 为网络默认握手，没有前向保密，状态里每个会话报告这一点，界面标注“未启用前向保密”。省略时受管网络为 `true`、旧网为 `false`。不做自动回落。
 - 模式与同网对端不一致时连接被拒绝，状态里记录“加密模式不一致”。
-- `cipher`（规范 §7.1）：旧模式的流量加密算法，`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；两端必须一致。不安全的异或方式不提供，配置写它会被拒绝。
+- `cipher`（规范 §7.1）：旧模式的流量加密算法，`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；两端必须一致。不安全的异或方式不提供，配置写 `xor` 时校验报“该加密方式不安全”。
 
 ## 配置
 
-配置结构由我方独立设计（需求 R13），带版本号 `config_version`，按网络、本节点、对端、子网、路由分层；嵌套对象拒绝未知字段，导入器写错时直接失败。旧配置的导入器在 Agent 或部署层，单向转换成本结构，不在内核里。
+配置结构由我方独立设计（需求 R13），带版本号 `config_version`，按网络、本节点、对端、子网、路由分层；顶层与嵌套对象都拒绝未知字段（出站的 `type`、`tag` 由注册层先去掉），导入器写错时直接失败。旧配置的导入器在 Agent 或部署层，单向转换成本结构，不在内核里。
 
 ```json
 {
   "type": "mesh",
   "config_version": 1,
-  "network": { "name": "office", "secret": "<钥匙串注入>", "secure_mode": false, "cipher": "aes-gcm" },
+  "network": { "name": "office", "secret": "<钥匙串注入>", "kind": "managed", "secure_mode": true },
   "node": {
     "address": "10.144.144.5/24",
     "address_v6": "fd00:aa::5/64",
@@ -65,7 +66,8 @@
 | 字段 | 含义 |
 |---|---|
 | `network.name` / `secret` | 网络名按原样参与摘要（不去空格）；密钥由钥匙串注入 |
-| `network.secure_mode` | `false`（默认）旧模式，`true` 安全模式；全网一致（规范 §5.2） |
+| `network.kind` | `managed`（默认，区域网络，只能安全模式）或 `legacy`（迁移中的旧网） |
+| `network.secure_mode` | `true` 安全模式，`false` 旧模式；省略时按 `kind`；全网一致（规范 §5.2） |
 | `network.cipher` | 旧模式算法：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；不提供异或。`none` 为不加密，只有显式写出才生效，不能与安全模式同用，界面标出“未加密”（需求 R14）；未选择时本节点丢弃不加密网络的明文流量 |
 | `node.address` | IPv4 虚拟地址与前缀（/8–/30），前缀即虚拟网段 |
 | `node.role` | `full` 或 `access`；缺省按平台：桌面与服务器 `full`，iOS、Android 只能 `access`（R10） |
@@ -73,7 +75,7 @@
 | `node.hostname` | 其他节点和内网域名（R28）显示的名称，一个 DNS 标签（1–63 位字母、数字、连字符，不以连字符开头或结尾）；缺省取系统主机名 |
 | `node.mtu` | 虚拟网卡 MTU，1280–9000，默认 1380 |
 | `node.relay` | 是否替其他节点中转；完整节点默认 `true`，接入节点固定 `false`（写 `true` 报错）。`false` 时仍可作为目的节点 |
-| `peers` | 初始对端（1–64 个），`transport` 为 `tcp`（默认）或 `udp` |
+| `peers` | 初始对端（最多 64 个），`transport` 为 `tcp`（默认）或 `udp`；只有监听的完整节点（中心节点）可以为空 |
 | `subnets.accept` | 进一步限制接受的通告子网，不能扩大内网范围 |
 | `subnets.advertise` | 本机通告的局域网子网，只有完整节点可以配置，必须在内网范围内且不与虚拟网段重叠 |
 | `routing.policy` | `hops`（默认）或 `latency`（规范 §13） |
