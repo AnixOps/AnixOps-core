@@ -144,6 +144,22 @@ pub struct Manifest {
     pub steps: Vec<Step>,
     #[serde(default)]
     pub runs: u32,
+    /// Processes the operator started again by hand and told `rollback`
+    /// to forget (`--forget-process`); kept as an audit trail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forgotten: Vec<Forgotten>,
+}
+
+/// A recorded process removed from the manifest by the operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Forgotten {
+    pub pid: u32,
+    pub exe: String,
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    /// When it was forgotten, seconds since the Unix epoch.
+    pub at: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -272,6 +288,13 @@ pub fn load_manifest(host: &dyn Host, state: &Path) -> Result<Option<Manifest>, 
 
 fn save_manifest(host: &dyn Host, state: &Path, manifest: &Manifest) -> Result<(), String> {
     let text = serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?;
+    // Never save what `load_manifest` could not read back.
+    if text.len() as u64 > crate::host::MAX_TEXT_FILE {
+        return Err(format!(
+            "the record would exceed {} bytes",
+            crate::host::MAX_TEXT_FILE
+        ));
+    }
     // It holds the command lines of ended processes, which may include
     // secrets: owner only.
     host.write_state(&state.join(MANIFEST), text.as_bytes())
@@ -698,6 +721,28 @@ fn copy_matches(
     Some(true)
 }
 
+/// One message for each process of the program running in another network
+/// namespace than the host's.
+fn foreign_network_processes(host: &dyn Host, profile: &Profile) -> Vec<String> {
+    let Some(host_network) = net_namespace(host, 1) else {
+        return Vec::new();
+    };
+    scan_processes(host, profile)
+        .into_iter()
+        .filter(|process| !process.contained)
+        .filter_map(|process| {
+            let theirs = net_namespace(host, process.pid)?;
+            (theirs != host_network).then(|| foreign_network_message(process.pid, &theirs))
+        })
+        .collect()
+}
+
+fn foreign_network_message(pid: u32, namespace: &str) -> String {
+    format!(
+        "process {pid} runs in another network namespace ({namespace}); stop it by hand, and start it there again by hand to undo"
+    )
+}
+
 /// The network namespace a process is in, as `/proc/<pid>/ns/net` names it.
 fn net_namespace(host: &dyn Host, pid: u32) -> Option<String> {
     host.read_link(&PathBuf::from(format!("/proc/{pid}/ns/net")))
@@ -736,10 +781,7 @@ fn end_processes(
         // a rollback could not start it there again, so it is not ended.
         if let (Some(theirs), Some(host_network)) = (&net_ns, &host_network) {
             if theirs != host_network {
-                out.push(Err(format!(
-                    "process {} runs in another network namespace ({theirs}); stop it by hand, and start it there again by hand to undo",
-                    process.pid
-                )));
+                out.push(Err(foreign_network_message(process.pid, theirs)));
                 continue;
             }
         }
@@ -839,6 +881,7 @@ pub fn takeover(
         manifest_version: MANIFEST_VERSION,
         steps: Vec::new(),
         runs: 0,
+        forgotten: Vec::new(),
     });
     manifest.runs += 1;
     let run = manifest.runs;
@@ -859,7 +902,21 @@ pub fn takeover(
         save_manifest(host, state, manifest)
     };
 
+    // Checked before anything is changed: a process in another network
+    // namespace is never ended (a rollback could not put it back there), so
+    // finding one later would only interrupt the network for nothing.
+    for error in foreign_network_processes(host, profile) {
+        report.steps.push(StepReport {
+            step: "check networks".into(),
+            ok: false,
+            detail: Some(error.clone()),
+        });
+        failure.get_or_insert(error);
+    }
     for (index, step) in planned.iter().enumerate() {
+        if failure.is_some() {
+            break;
+        }
         match execute(host, state, step, index) {
             Ok(actions) => {
                 for action in actions {
@@ -1416,14 +1473,34 @@ pub fn rollback_forgetting(
     let mut forgotten = Vec::new();
     for pid in forget {
         let before = manifest.steps.len();
-        manifest.steps.retain(|step| {
-            !matches!(&step.action, Action::Terminate { pid: recorded, .. } if recorded == pid)
+        let mut dropped = Vec::new();
+        manifest.steps.retain(|step| match &step.action {
+            Action::Terminate {
+                pid: recorded,
+                exe,
+                argv,
+                uid,
+                ..
+            } if recorded == pid => {
+                dropped.push(Forgotten {
+                    pid: *pid,
+                    exe: exe.clone(),
+                    argv: argv.clone(),
+                    uid: *uid,
+                    at: host.now_unix(),
+                });
+                false
+            }
+            _ => true,
         });
         if manifest.steps.len() == before {
             return Err(TakeoverError::Manifest(format!(
                 "no recorded process {pid}"
             )));
         }
+        // Kept in the record (owner only, like the steps) so what the
+        // operator dropped stays visible after the steps are gone.
+        manifest.forgotten.append(&mut dropped);
         forgotten.push(StepReport {
             step: format!("forget process {pid}"),
             ok: true,
@@ -2005,8 +2082,18 @@ mod tests {
             && step.detail.as_deref().is_some_and(
                 |detail| detail.starts_with("process 200 runs in another network namespace")
             )));
-        assert!(!host.signals.borrow().iter().any(|(pid, _)| *pid == 200));
         assert!(host.spawned.borrow().is_empty());
+        // Found before anything changed: no service stopped or turned off,
+        // no line commented, no process signalled.
+        assert!(
+            host.signals.borrow().is_empty(),
+            "{:?}",
+            host.signals.borrow()
+        );
+        assert!(!host.ran.borrow().iter().any(|command| {
+            command.starts_with("systemctl stop") || command.starts_with("systemctl disable")
+        }));
+        assert!(!host.text("/etc/rc.local").unwrap().contains(COMMENT_MARKER));
     }
 
     #[test]
@@ -2030,11 +2117,37 @@ mod tests {
         assert!(done.ok, "{done:?}");
         assert_eq!(done.steps[0].step, "forget process 200");
         assert!(host.spawned.borrow().is_empty());
-        assert!(load_manifest(&host, Path::new(STATE))
-            .unwrap()
-            .unwrap()
-            .steps
-            .is_empty());
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.is_empty());
+        // What the operator dropped stays on record.
+        assert_eq!(manifest.forgotten.len(), 1);
+        assert_eq!(manifest.forgotten[0].pid, 200);
+        assert_eq!(
+            manifest.forgotten[0].argv,
+            ["/opt/demo-meshd", "--net-name", "lab"]
+        );
+    }
+
+    #[test]
+    fn a_record_too_large_to_read_back_is_never_saved() {
+        let host = FakeHost::default();
+        let huge = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            steps: vec![Step {
+                action: Action::CommentLine {
+                    file: "/etc/rc.local".into(),
+                    line: 1,
+                    original: "x".repeat(crate::host::MAX_TEXT_FILE as usize),
+                    sha256_after: String::new(),
+                },
+                at: 0,
+                run: 1,
+            }],
+            runs: 1,
+            forgotten: Vec::new(),
+        };
+        assert!(save_manifest(&host, Path::new(STATE), &huge).is_err());
+        assert!(!host.exists(&Path::new(STATE).join(MANIFEST)));
     }
 
     #[test]
