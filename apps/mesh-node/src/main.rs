@@ -141,7 +141,7 @@ fn platform_supported() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos", windows))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     let Some(config) = &options.config else {
         return Err(fail("usage", "--config is required"));
@@ -158,10 +158,10 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     let _ = (&options.config, &options.interface);
-    Err(fail("platform", "the node runs on Linux only"))
+    Err(fail("platform", "the node runs on Linux and macOS only"))
 }
 
 fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
