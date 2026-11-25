@@ -2,9 +2,11 @@
 
 pub mod center;
 pub mod messages;
+pub mod sync;
 pub mod topology;
 
 pub use messages::{
     ConnGraph, FeatureFlags, RoutePeerInfo, SyncRouteRequest, SyncRouteResponse, Uuid,
 };
+pub use sync::RouteSync;
 pub use topology::{Metric, Route, Topology};

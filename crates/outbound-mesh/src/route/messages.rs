@@ -254,6 +254,9 @@ impl RoutePeerInfo {
     }
 
     pub fn decode(message: &[u8]) -> Result<Self, PbError> {
+        if message.len() > MAX_INFO_LEN {
+            return Err(PbError::TooMany(0));
+        }
         let mut info = RoutePeerInfo {
             raw: message.to_vec(),
             ..Self::default()
@@ -265,24 +268,61 @@ impl RoutePeerInfo {
                 2 => info.inst_id = Uuid::decode(value.bytes(field)?)?,
                 3 => info.cost = value.u32(field)?,
                 4 => info.ipv4 = Some(decode_ipv4(value.bytes(field)?)?),
-                5 => info.proxy_cidrs.push(value.str(field)?.to_owned()),
-                6 => info.hostname = Some(value.str(field)?.to_owned()),
+                5 => {
+                    let cidr = value.str(field)?;
+                    if info.proxy_cidrs.len() >= MAX_INFO_SUBNETS || cidr.len() > MAX_CIDR_LEN {
+                        return Err(PbError::TooMany(field));
+                    }
+                    info.proxy_cidrs.push(cidr.to_owned());
+                }
+                6 => {
+                    let hostname = value.str(field)?;
+                    if hostname.len() > MAX_HOSTNAME_LEN {
+                        return Err(PbError::BadValue(field));
+                    }
+                    info.hostname = Some(hostname.to_owned());
+                }
                 7 => info.udp_nat = value.i32(field)?,
                 8 => info.last_update = decode_timestamp(value.bytes(field)?)?,
                 9 => info.version = value.u32(field)?,
-                10 => info.version_string = value.str(field)?.to_owned(),
+                10 => {
+                    let version = value.str(field)?;
+                    if version.len() > MAX_VERSION_STRING_LEN {
+                        return Err(PbError::BadValue(field));
+                    }
+                    info.version_string = version.to_owned();
+                }
                 11 => info.features = FeatureFlags::decode(value.bytes(field)?)?,
                 12 => info.route_id = value.u64(field)?,
                 13 => info.network_length = value.u32(field)?,
                 15 => info.ipv6 = Some(decode_ipv6_inet(value.bytes(field)?)?),
                 17 => info.tcp_nat = value.i32(field)?,
-                18 => info.noise_pubkey = value.bytes(field)?.to_vec(),
+                18 => {
+                    let key = value.bytes(field)?;
+                    if !key.is_empty() && key.len() != 32 {
+                        return Err(PbError::BadValue(field));
+                    }
+                    info.noise_pubkey = key.to_vec();
+                }
                 _ => {}
             }
         }
         Ok(info)
     }
 }
+
+/// Largest encoded node information accepted. The spec sets no limit;
+/// ours bounds what one member can make every node store and forward.
+pub const MAX_INFO_LEN: usize = 16 * 1024;
+/// Most advertised subnets in one node's information (the route table takes
+/// at most [`crate::routes::MAX_SUBNETS_PER_PEER`]).
+pub const MAX_INFO_SUBNETS: usize = 256;
+/// Longest advertised subnet text.
+pub const MAX_CIDR_LEN: usize = 64;
+/// Longest host name (a DNS name).
+pub const MAX_HOSTNAME_LEN: usize = 253;
+/// Longest software version string.
+pub const MAX_VERSION_STRING_LEN: usize = 64;
 
 /// Most nodes one connection graph may list. The spec sets no limit; ours
 /// bounds the work a peer can cause (a bitmap of `n²` bits).
@@ -498,8 +538,12 @@ impl SyncRouteRequest {
                 4 => {
                     let mut items = Reader::new(value.bytes(field)?);
                     while let Some((f, v)) = items.next()? {
-                        if f == 1 {
-                            request.peer_infos.push(RoutePeerInfo::decode(v.bytes(f)?)?);
+                        // One oversized or malformed item is skipped; the
+                        // rest of the request still counts.
+                        if f == 1 && request.peer_infos.len() < MAX_GRAPH_NODES {
+                            if let Ok(info) = RoutePeerInfo::decode(v.bytes(f)?) {
+                                request.peer_infos.push(info);
+                            }
                         }
                     }
                 }
@@ -794,5 +838,43 @@ mod tests {
         let uuid = Uuid([0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4]);
         assert_eq!(uuid.encode(), [0x08, 1, 0x10, 2, 0x18, 3, 0x20, 4]);
         assert_eq!(Uuid::decode(&uuid.encode()).unwrap(), uuid);
+    }
+
+    #[test]
+    fn oversized_node_information_is_skipped_alone() {
+        let good = RoutePeerInfo {
+            peer_id: 1,
+            version: 1,
+            ..RoutePeerInfo::default()
+        };
+        let too_many = RoutePeerInfo {
+            peer_id: 2,
+            version: 1,
+            proxy_cidrs: vec!["10.0.0.0/24".into(); MAX_INFO_SUBNETS + 1],
+            ..RoutePeerInfo::default()
+        };
+        let long_name = RoutePeerInfo {
+            peer_id: 3,
+            version: 1,
+            hostname: Some("h".repeat(MAX_HOSTNAME_LEN + 1)),
+            ..RoutePeerInfo::default()
+        };
+        let bad_key = RoutePeerInfo {
+            peer_id: 4,
+            version: 1,
+            noise_pubkey: vec![1; 31],
+            ..RoutePeerInfo::default()
+        };
+        assert!(RoutePeerInfo::decode(&too_many.encode()).is_err());
+        assert!(RoutePeerInfo::decode(&long_name.encode()).is_err());
+        assert!(RoutePeerInfo::decode(&bad_key.encode()).is_err());
+        let request = SyncRouteRequest {
+            my_peer_id: 9,
+            peer_infos: vec![too_many, good, long_name, bad_key],
+            ..SyncRouteRequest::default()
+        };
+        let decoded = SyncRouteRequest::decode(&request.encode()).unwrap();
+        assert_eq!(decoded.peer_infos.len(), 1);
+        assert_eq!(decoded.peer_infos[0].peer_id, 1);
     }
 }

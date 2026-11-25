@@ -211,12 +211,17 @@ pub struct Msg2 {
     pub cipher: Cipher,
 }
 
+/// Room for every field of msg2 and relay msg2 but the network name, with
+/// margin: the root key is written into a buffer that never reallocates,
+/// so no copy of it stays in freed memory.
+const SECRET_MESSAGE_ROOM: usize = 512;
+
 impl Msg2 {
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
         if self.root_key.is_some() != self.action.carries_root_key() {
             return Err(MessageError::RootKeyMismatch);
         }
-        let mut writer = Writer::new();
+        let mut writer = Writer::with_capacity(self.network_name.len() + SECRET_MESSAGE_ROOM);
         writer
             .str(1, &self.network_name)
             .u32(2, self.role_hint.code())
@@ -405,7 +410,7 @@ impl RelayMsg2 {
         if self.root_key.is_some() != self.action.carries_root_key() {
             return Err(MessageError::RootKeyMismatch);
         }
-        let mut writer = Writer::new();
+        let mut writer = Writer::with_capacity(SECRET_MESSAGE_ROOM);
         writer
             .u32(3, self.action.code())
             .u32(4, self.session_generation);
