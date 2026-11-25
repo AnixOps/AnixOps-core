@@ -13,9 +13,10 @@ permissions:
   contents: read
 
 # Superseded pull request runs are cancelled. Runs on main, tags and manual dispatch
-# always finish so every merged commit has a complete result.
+# always finish so every merged commit has a complete result; outside pull requests
+# each commit has its own group, so a merge does not wait for the previous merge's run.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -838,7 +839,7 @@ jobs:
           sudo env "RUNNER_TEMP=${RUNNER_TEMP}" bash .github/scripts/iwan-tun-interop.sh logs
 
   rust-h2-mitm-fuzz:
-    name: HTTP/2 MITM fuzz
+    name: HTTP/2 MITM fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     needs:
@@ -857,6 +858,28 @@ jobs:
           needs.changes.outputs.ios == 'true'
         )
       }}
+    strategy:
+      # Every target runs to the end, so one crash does not hide another.
+      fail-fast: false
+      matrix:
+        include:
+          # HTTP/2 MITM: TLS ClientHello ALPN, frames after a valid preface, requests.
+          - { target: tls_client_hello_alpn, crate: crates/engine-native, max_len: 4096, dict: "" }
+          - { target: h2_mitm_frames, crate: crates/engine-native, max_len: 4096, dict: "" }
+          - { target: h2_mitm_requests, crate: crates/engine-native, max_len: 4096, dict: "" }
+          # Runtime control JSON through the iOS C entry point; the dictionary
+          # holds the command and field names. Inputs above the 4 KiB request
+          # limit are generated on purpose to reach the size check.
+          - { target: runtime_control, crate: crates/engine-embedded, max_len: 8192, dict: fuzz/dict/runtime_control.dict }
+          # Server side of VLESS, Trojan, VMess and Shadowsocks: the first bytes
+          # a client sends, with and without a valid credential in front.
+          - { target: inbound_handshakes, crate: crates/engine-inbound, max_len: 4096, dict: "" }
+          # Text from outside the app: subscriptions and share links, config
+          # documents, rule lines and rule sets, Loon plugins.
+          - { target: subscription_import, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
+          - { target: config_document, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
+          - { target: rule_text, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
+          - { target: loon_plugin, crate: crates/node-import, max_len: 16384, dict: fuzz/dict/import_text.dict }
     env:
       CARGO_INCREMENTAL: "0"
       # Pull requests fuzz each target for 30 s; main, tags and manual runs for 60 s.
@@ -879,79 +902,36 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      - name: Run fuzz targets
+      # One fuzz target per machine (see the matrix); the time per target, input
+      # sizes, dictionaries and limits are the same as when they ran one after another.
+      - name: Run fuzz target
         shell: bash
-        working-directory: crates/engine-native
+        working-directory: ${{ matrix.crate }}
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_MAX_LEN: ${{ matrix.max_len }}
+          FUZZ_DICT: ${{ matrix.dict }}
         run: |
           set -euo pipefail
+          dict=()
+          if [ -n "${FUZZ_DICT}" ]; then
+            dict=("-dict=${FUZZ_DICT}")
+          fi
           # The prebuilt cargo-fuzz binary is musl-linked and would default to
           # the musl target, which ASan cannot instrument.
-          for target in tls_client_hello_alpn h2_mitm_frames h2_mitm_requests; do
-            echo "::group::cargo fuzz run ${target}"
-            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
-              -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-              -max_len=4096 \
-              -rss_limit_mb=2048 \
-              -timeout=20
-            echo "::endgroup::"
-          done
-
-      # Runtime control JSON through the iOS C entry point; the dictionary
-      # holds the command and field names. Inputs above the 4 KiB request
-      # limit are generated on purpose to reach the size check.
-      - name: Run runtime control fuzz target
-        shell: bash
-        working-directory: crates/engine-embedded
-        run: |
-          set -euo pipefail
-          cargo fuzz run --target x86_64-unknown-linux-gnu runtime_control -- \
+          cargo fuzz run --target x86_64-unknown-linux-gnu "${FUZZ_TARGET}" -- \
             -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-            -dict=fuzz/dict/runtime_control.dict \
-            -max_len=8192 \
+            ${dict[@]+"${dict[@]}"} \
+            -max_len="${FUZZ_MAX_LEN}" \
             -rss_limit_mb=2048 \
             -timeout=20
-
-      # Server side of VLESS, Trojan, VMess and Shadowsocks: the first bytes
-      # a client sends, with and without a valid credential in front.
-      - name: Run inbound handshake fuzz target
-        shell: bash
-        working-directory: crates/engine-inbound
-        run: |
-          set -euo pipefail
-          cargo fuzz run --target x86_64-unknown-linux-gnu inbound_handshakes -- \
-            -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-            -max_len=4096 \
-            -rss_limit_mb=2048 \
-            -timeout=20
-
-      # Text from outside the app: subscriptions and share links, config
-      # documents, rule lines and rule sets, Loon plugins.
-      - name: Run import fuzz targets
-        shell: bash
-        working-directory: crates/node-import
-        run: |
-          set -euo pipefail
-          for target in subscription_import config_document rule_text loon_plugin; do
-            echo "::group::cargo fuzz run ${target}"
-            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
-              -max_total_time="${FUZZ_SECONDS_PER_TARGET}" \
-              -dict=fuzz/dict/import_text.dict \
-              -max_len=16384 \
-              -rss_limit_mb=2048 \
-              -timeout=20
-            echo "::endgroup::"
-          done
 
       - name: Upload fuzz crash artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: h2-mitm-fuzz-artifacts-${{ github.sha }}
-          path: |
-            crates/engine-native/fuzz/artifacts
-            crates/engine-embedded/fuzz/artifacts
-            crates/engine-inbound/fuzz/artifacts
-            crates/node-import/fuzz/artifacts
+          name: h2-mitm-fuzz-artifacts-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ matrix.crate }}/fuzz/artifacts
           if-no-files-found: ignore
 
   ios-runtime-static-libs:
