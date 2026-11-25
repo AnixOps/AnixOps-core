@@ -52,12 +52,35 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Fail "run as Administrator"
 }
 
-# Owned by the system and administrators only: the configuration holds the
-# network secret and the state holds what a rollback starts.
+# Owned by the administrators and open to them and the system only: the
+# configuration holds the network secret and the state holds what a
+# rollback starts. Any user may create folders in ProgramData, so one that
+# already exists must not be a link and must belong to the administrators,
+# the system or the installer service; its access list is then replaced,
+# not added to, with inheritance off. The program checks the same before
+# it reads or writes its state.
+$TrustedOwners = @("S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
 function Protect-Directory([string]$Path) {
-    New-Item -ItemType Directory -Force -Path $Path | Out-Null
-    & icacls.exe $Path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "cannot restrict access to $Path" }
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Fail "$Path is a link or junction; remove it and run again" }
+        if (-not $item.PSIsContainer) { Fail "$Path is not a directory" }
+        $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($TrustedOwners -notcontains $owner) { Fail "$Path belongs to $owner, not to the administrators or the system; remove it and run again" }
+    } else {
+        # Fails if someone creates it in between.
+        New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+    $admins = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $system = New-Object Security.Principal.SecurityIdentifier("S-1-5-18")
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($admins)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($system, $admins)) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, "FullControl", "ContainerInherit, ObjectInherit", "None", "Allow")
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
 function Stop-Ours {
@@ -107,6 +130,7 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "the downloaded program does not run here" }
     $canRun = ($capabilities -join "`n") -match '"run"'
 
+    Protect-Directory (Split-Path -Parent $DataDir)
     Protect-Directory $DataDir
     Protect-Directory $State
 
@@ -183,9 +207,13 @@ try {
     if ($ProfileUrl) {
         Say "taking over the existing installation"
         & $Bin takeover --profile $ProfilePath --state-dir (Join-Path $State "takeover") --report (Join-Path $State "takeover-report.json") | Out-Null
-        if ($LASTEXITCODE -ne 0) {
+        $status = $LASTEXITCODE
+        if ($status -ne 0) {
             Stop-Ours
-            Fail "takeover failed and was rolled back; see $State\takeover-report.json"
+            if ($status -eq 7) {
+                Fail "takeover failed and could not be fully undone; see $State\takeover-report.json, then run: & '$Bin' rollback --state-dir '$State\takeover'"
+            }
+            Fail "takeover failed or was refused; nothing it changed is left changed; see $State\takeover-report.json"
         }
     }
 

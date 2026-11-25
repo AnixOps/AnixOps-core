@@ -15,13 +15,15 @@
 # docs/deploy/mesh-node.md.
 #
 # /etc, /var and /tmp are links on macOS, and the program refuses state
-# directories reached through a link, so everything lives under /Library.
+# directories reached through a link, so everything lives under /Library,
+# the program too: /usr/local/bin may belong to a user (a per-user package
+# manager), who could then replace what root runs.
 
 set -eu
 
-PREFIX=/usr/local/bin
-BIN="$PREFIX/anixops-mesh"
 HOME_DIR=/Library/AnixOps/mesh
+PREFIX="$HOME_DIR/bin"
+BIN="$PREFIX/anixops-mesh"
 STATE="$HOME_DIR/state"
 CONFIG="$HOME_DIR/mesh.json"
 PROFILE="$HOME_DIR/takeover-profile.json"
@@ -113,8 +115,12 @@ can_run=0
 grep -q '"run"' "$work/capabilities.json" && can_run=1
 
 # Owned by root and closed to others all the way down: the program checks.
+for dir in /Library/AnixOps "$HOME_DIR" "$PREFIX" "$STATE"; do
+  [ ! -L "$dir" ] || die "$dir is a link; remove it and run again"
+done
 install -d -o root -g wheel -m 0755 /Library/AnixOps
 install -d -o root -g wheel -m 0700 "$HOME_DIR" "$STATE"
+install -d -o root -g wheel -m 0755 "$PREFIX"
 
 imported=""
 if [ -n "$profile_url" ]; then
@@ -167,8 +173,7 @@ if [ "$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-install -d -m 0755 "$PREFIX"
-install -m 0755 "$work/anixops-mesh" "$BIN"
+install -o root -g wheel -m 0755 "$work/anixops-mesh" "$BIN"
 [ -n "$profile_url" ] && install -m 0600 "$work/profile.json" "$PROFILE"
 [ -n "$source_config" ] && install -m 0600 "$source_config" "$CONFIG"
 
@@ -210,8 +215,14 @@ install -o root -g wheel -m 0644 "$work/daemon.plist" "$PLIST"
 
 if [ -n "$profile_url" ]; then
   log "taking over the existing installation"
+  status=0
   "$BIN" takeover --profile "$PROFILE" --state-dir "$STATE/takeover" --report "$STATE/takeover-report.json" >/dev/null \
-    || die "takeover failed and was rolled back; see $STATE/takeover-report.json"
+    || status=$?
+  case "$status" in
+    0) ;;
+    7) die "takeover failed and could not be fully undone; see $STATE/takeover-report.json, then run: $BIN rollback --state-dir $STATE/takeover" ;;
+    *) die "takeover failed or was refused; nothing it changed is left changed; see $STATE/takeover-report.json" ;;
+  esac
 fi
 
 started=0
