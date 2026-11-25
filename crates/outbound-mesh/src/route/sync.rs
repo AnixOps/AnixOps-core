@@ -596,8 +596,8 @@ impl RouteSync {
                 self.rows.get(&id).map(|row| &row.neighbours)
             };
             for &next in neighbours.into_iter().flatten() {
-                if !hops.contains_key(&next) {
-                    hops.insert(next, distance + 1);
+                if let std::collections::btree_map::Entry::Vacant(entry) = hops.entry(next) {
+                    entry.insert(distance + 1);
                     queue.push_back(next);
                 }
             }

@@ -694,6 +694,7 @@ impl<K: std::hash::Hash + Eq + Copy, V> Recent<K, V> {
             .retain(|_, (_, at)| now.saturating_duration_since(*at) < SOURCE_IDLE);
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
