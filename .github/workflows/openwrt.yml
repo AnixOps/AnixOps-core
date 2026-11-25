@@ -37,11 +37,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # OpenWrt release root file systems, pinned by digest.
+  # OpenWrt release root file systems, pinned by digest. The ARM images
+  # declare the OpenWrt architecture ("aarch64_generic") as their platform,
+  # which no Docker platform matches, so they are pinned by the image
+  # manifest itself rather than by a multi-platform index.
   IMAGE_X86_64_2305: openwrt/rootfs@sha256:f53afb386d05651ada9a4a964e0779930f30962a2abc2fadf1b03bfcbcbabb14 # x86-64-23.05.6
   IMAGE_X86_64_2410: openwrt/rootfs@sha256:9972a4b4747cd136abd597475d7b88c51a49fd849d0d53f069a2f4bf446061b9 # x86-64-24.10.8
   IMAGE_X86_64_2512: openwrt/rootfs@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af # x86-64-25.12.6
-  IMAGE_AARCH64_2410: openwrt/rootfs@sha256:dbe092b7f10824b858e0f6a4501f572e15c5c8739b2815010fbc2868870ea60a # armsr-armv8-24.10.8
+  IMAGE_AARCH64_2410: openwrt/rootfs@sha256:f6dd33c1d9b7d6f1e0848f2fbb92b8d03fc9b425dc08c3574a44936b93133704 # armsr-armv8-24.10.8 (manifest in index dbe092b7…)
   IMAGE_AARCH64_2512: openwrt/rootfs@sha256:22f13387da208c0fb4150c41f3ec12e34cc5994a0717a49e50aa9f9ae6cb5e7b # armsr-armv8-25.12.6
   # apk-tools 3 (3.0.9) for `apk mkpkg`; OpenWrt's device apk has no mkpkg.
   APK_MKPKG_IMAGE: alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2 # 3.23.8
@@ -288,11 +291,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { release: "23.05", arch: x86_64, format: ipk, image: IMAGE_X86_64_2305, platform: linux/amd64 }
-          - { release: "24.10", arch: x86_64, format: ipk, image: IMAGE_X86_64_2410, platform: linux/amd64 }
-          - { release: "25.12", arch: x86_64, format: apk, image: IMAGE_X86_64_2512, platform: linux/amd64 }
-          - { release: "24.10", arch: aarch64_generic, format: ipk, image: IMAGE_AARCH64_2410, platform: linux/arm64, emulate: true }
-          - { release: "25.12", arch: aarch64_generic, format: apk, image: IMAGE_AARCH64_2512, platform: linux/arm64, emulate: true }
+          - { release: "23.05", arch: x86_64, format: ipk, image: IMAGE_X86_64_2305 }
+          - { release: "24.10", arch: x86_64, format: ipk, image: IMAGE_X86_64_2410 }
+          - { release: "25.12", arch: x86_64, format: apk, image: IMAGE_X86_64_2512 }
+          - { release: "24.10", arch: aarch64_generic, format: ipk, image: IMAGE_AARCH64_2410, emulate: true }
+          - { release: "25.12", arch: aarch64_generic, format: apk, image: IMAGE_AARCH64_2512, emulate: true }
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -320,12 +323,9 @@ jobs:
           IMAGE: ${{ env[matrix.image] }}
           FORMAT: ${{ matrix.format }}
           ARCH: ${{ matrix.arch }}
-          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          # Some image digests name a multi-platform index; select the
-          # platform explicitly instead of relying on the host's.
-          docker run --rm --platform "${PLATFORM}" \
+          docker run --rm \
             -v "${PWD}/dist/openwrt:/pkgs:ro" \
             -v "${PWD}/apps/mesh-node/openwrt/tests:/tests:ro" \
             "${IMAGE}" /bin/sh /tests/container-test.sh /pkgs "${FORMAT}" "${ARCH}"
