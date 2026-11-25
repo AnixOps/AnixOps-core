@@ -682,6 +682,18 @@ jobs:
           set -euo pipefail
           .github/scripts/build-mesh-node.sh "${TARGET}" ci dist/mesh-node
 
+      # The release ships wintun.dll beside the Windows program: the pinned
+      # package and the architecture of each DLL are checked here first.
+      - name: Fetch Wintun
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $arch = if ($env:TARGET -like "aarch64-*") { "arm64" } else { "amd64" }
+          & .github/scripts/fetch-wintun.ps1 -Destination (Join-Path $env:RUNNER_TEMP "wintun") -Arch $arch
+
   mesh-bridge-netns:
     name: Mesh external bridge (nftables)
     runs-on: ubuntu-latest

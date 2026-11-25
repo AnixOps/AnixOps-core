@@ -54,6 +54,7 @@ impl MeshControl for FakeMesh {
             let status = ManagedStatus {
                 instance_id: INSTANCE_ID.into(),
                 networks: networks.iter().map(network_status).collect(),
+                static_keys: Vec::new(),
             };
             *self.running.lock().unwrap() = status.clone();
             Ok(status)
@@ -78,6 +79,7 @@ fn network_status(network: &ManagedNetwork) -> ManagedNetworkStatus {
         error: String::new(),
         address: Some(network.settings.address),
         forward_secrecy: network.settings.security.has_forward_secrecy(),
+        failure: None,
         peers: vec![ManagedPeer {
             address: "10.150.0.1".parse().unwrap(),
             subnets: vec![IpNet::parse("192.168.10.0/24").unwrap()],

@@ -65,6 +65,9 @@ pub enum CloseReason {
     Evicted,
     /// A handshake step did not finish in [`HANDSHAKE_TIMEOUT`].
     Timeout,
+    /// A managed network: the peer, by node ID, holds a static key off the
+    /// native key list (spec §8.3.1).
+    NotNative(u32),
     /// A packet that has no place in the handshake.
     Unexpected,
     /// The default handshake failed.
@@ -96,14 +99,14 @@ pub enum Step {
     Close(Vec<Vec<u8>>, CloseReason),
 }
 
-/// What the handshake needs from the node. `peer_key` gives the static key
-/// a node ID's route information announces, if known.
+/// What the handshake needs from the node. A direct handshake is not
+/// checked against the static key route information announces (spec §12.3):
+/// the session binding refuses another key for a node ID in use.
 pub struct Handshaking<'a> {
     pub local: &'a Local,
     pub security: SecurityMode,
     pub sessions: &'a mut Sessions,
     pub rng: &'a dyn SecureRandom,
-    pub peer_key: &'a dyn Fn(u32) -> Option<[u8; LEN]>,
     pub now: Instant,
 }
 
@@ -165,7 +168,7 @@ impl Link {
             SecurityMode::ForwardSecrecy => {
                 let (client, msg1) =
                     Client::start(hs.local, known_peer, hs.sessions, hs.rng, hs.now)
-                        .map_err(secure_close)?;
+                        .map_err(|error| secure_close(error, known_peer.unwrap_or_default()))?;
                 let first = packet(hs.local.id, 0, packet_type::SECURE_MSG1, &msg1);
                 Ok((
                     Self {
@@ -258,7 +261,7 @@ impl Link {
                             self.phase = Phase::ServerSecure(Box::new(server));
                             Step::Send(vec![reply])
                         }
-                        Err(error) => Step::Close(Vec::new(), secure_close(error)),
+                        Err(error) => Step::Close(Vec::new(), secure_close(error, header.from)),
                     }
                 }
                 (SecurityMode::Default, packet_type::SECURE_MSG1)
@@ -274,15 +277,7 @@ impl Link {
             },
             Phase::ClientSecure(client) => match kind {
                 packet_type::SECURE_MSG2 => {
-                    let expected = (hs.peer_key)(header.from);
-                    match (*client).finish(
-                        local,
-                        header.from,
-                        expected,
-                        payload,
-                        hs.sessions,
-                        hs.now,
-                    ) {
+                    match (*client).finish(local, header.from, None, payload, hs.sessions, hs.now) {
                         Ok((msg3, established)) => Step::Up(
                             vec![packet(local.id, 0, packet_type::SECURE_MSG3, &msg3)],
                             Up {
@@ -292,7 +287,7 @@ impl Link {
                                 auth: Some(established.auth),
                             },
                         ),
-                        Err(error) => Step::Close(Vec::new(), secure_close(error)),
+                        Err(error) => Step::Close(Vec::new(), secure_close(error, header.from)),
                     }
                 }
                 packet_type::HANDSHAKE => {
@@ -307,8 +302,7 @@ impl Link {
             Phase::ServerSecure(server) => match kind {
                 packet_type::SECURE_MSG3 => {
                     let peer_id = server.peer_id();
-                    let expected = (hs.peer_key)(peer_id);
-                    match (*server).finish(local, expected, payload, hs.sessions, hs.now) {
+                    match (*server).finish(local, None, payload, hs.sessions, hs.now) {
                         Ok(established) => Step::Up(
                             Vec::new(),
                             Up {
@@ -318,7 +312,7 @@ impl Link {
                                 auth: Some(established.auth),
                             },
                         ),
-                        Err(error) => Step::Close(Vec::new(), secure_close(error)),
+                        Err(error) => Step::Close(Vec::new(), secure_close(error, peer_id)),
                     }
                 }
                 _ => Step::Close(Vec::new(), CloseReason::Unexpected),
@@ -332,8 +326,9 @@ impl Link {
     }
 }
 
-fn secure_close(error: HandshakeError) -> CloseReason {
+fn secure_close(error: HandshakeError, peer: u32) -> CloseReason {
     match error {
+        HandshakeError::NotNative => CloseReason::NotNative(peer),
         HandshakeError::SameNodeId => CloseReason::SameNodeId,
         HandshakeError::IdConflict => CloseReason::IdConflict,
         HandshakeError::Session(SessionError::Busy) => CloseReason::WaitForSession,
@@ -927,11 +922,8 @@ mod tests {
             digest: Some(digest(NETWORK.as_bytes(), secret)),
             cipher: Cipher::Aes128Gcm,
             trusted_keys: Vec::new(),
+            native_keys: None,
         }
-    }
-
-    fn no_keys(_: u32) -> Option<[u8; LEN]> {
-        None
     }
 
     struct Side {
@@ -957,7 +949,6 @@ mod tests {
             security: side.security,
             sessions: &mut side.sessions,
             rng: &rng,
-            peer_key: &no_keys,
             now: Instant::now(),
         };
         f(&mut hs)

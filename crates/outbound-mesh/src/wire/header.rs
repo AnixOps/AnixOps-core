@@ -21,6 +21,8 @@ pub mod packet_type {
     pub const SECURE_MSG3: u8 = 15;
     pub const RELAY_HANDSHAKE: u8 = 20;
     pub const RELAY_HANDSHAKE_ACK: u8 = 21;
+    /// Our extension: waypoint encapsulation (spec §17.2.5).
+    pub const WAYPOINT: u8 = 40;
 }
 
 /// Header flags (spec §4.3).
