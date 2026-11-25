@@ -152,10 +152,16 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 | --- | --- |
 | `anixops-mesh-<版本>-x86_64-unknown-linux-musl` | 静态程序，无动态依赖 |
 | `anixops-mesh-<版本>-aarch64-unknown-linux-musl` | 同上 |
-| `anixops-mesh-<版本>-install-linux.sh` | 本节的安装脚本 |
+| `anixops-mesh-<版本>-aarch64-apple-darwin` | macOS 程序（Apple 芯片），只链接系统自带的库 |
+| `anixops-mesh-<版本>-x86_64-apple-darwin` | 同上（Intel） |
+| `anixops-mesh-<版本>-x86_64-pc-windows-msvc.exe` | Windows 程序，C 运行库静态链接，不需要 Visual C++ 运行库 |
+| `anixops-mesh-<版本>-aarch64-pc-windows-msvc.exe` | 同上（ARM64） |
+| `anixops-mesh-<版本>-install-linux.sh` | Linux 安装脚本 |
+| `anixops-mesh-<版本>-install-macos.sh` | macOS 安装脚本 |
+| `anixops-mesh-<版本>-install-windows.ps1` | Windows 安装脚本 |
 | `anixops-mesh-<版本>-<目标>.buildinfo.json` | 构建所用的确切工具链（`rustc -V`、`rustc -Vv`、`cargo -V`）与提交，供复现；随程序一起证明 |
 
-构建脚本是 [`.github/scripts/build-mesh-node.sh`](../../.github/scripts/build-mesh-node.sh)，CI 的「Mesh node static build」在每次 Rust 改动时用同一脚本构建两种架构，确认程序静态链接、x86_64 版本可运行。32 位 ARM 与 MIPS 随 OpenWrt 软件包（内核 0.5）提供。
+构建脚本是 [`.github/scripts/build-mesh-node.sh`](../../.github/scripts/build-mesh-node.sh)。CI 在每次 Rust 改动时用同一脚本构建全部目标：「Mesh node static build」构建两种 Linux 架构，确认静态链接、x86_64 版本可运行；「Mesh node desktop build」在 macOS 与 Windows 机器上构建，确认 macOS 程序只链接 `/usr/lib` 与 `/System/Library` 下的库、Windows 程序不导入 `vcruntime`、`msvcp`、`ucrtbase` 与 `api-ms-win-crt-*`，与机器同架构的版本可运行。发布签名（Apple 公证、Windows 代码签名）尚未提供，安装命令以面板给出的 SHA-256 与构建证明为准。32 位 ARM 与 MIPS 随 OpenWrt 软件包（内核 0.5）提供。
 
 ## 接管数据文件格式
 
