@@ -26,7 +26,7 @@
 | `subnets[]` | `cidr`、`advertisers[{member,inUse}]`、`latencyMs`、`path`、`state`、`overlaps`、`localOverlap`、`route` | 0.3 |
 | `subnets[]` | `region` | 0.4 |
 | `tunnel` | `routes`、`routesVersion`、`dns` | 0.3 |
-| 顶层 | `names` | 0.3 |
+| 顶层 | `names`、`refusedNames` | 0.3 |
 | 顶层 | `regionRequests` | 0.4 |
 
 ### 取值
@@ -53,6 +53,7 @@
 | `tunnel.routes` | 应进入隧道的网段（CIDR 列表）：所有已加入网络的虚拟网段，加上当前路由到组网的通告子网（与本机网络冲突、内网范围外、或用户设为 `local` 的不在内），再按 `routing.system_routes` 限制。去重，顺序稳定 |
 | `tunnel.routesVersion` | 整数，`routes` 每变一次加一；引擎重启后从 1 起 |
 | `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate" }`：本网络的内网域名名单（不含后缀），`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址（需求 R28） |
+| `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" }`：配置里因地址在内网范围外而跳过的名字条目 |
 | `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请 |
 | `tunnel.dns` | `null`，或 `{ "servers": [地址], "matchDomains": [后缀] }`：内网域名开启时只对这些后缀生效（需求 R28） |
 
