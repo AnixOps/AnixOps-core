@@ -26,6 +26,8 @@
 | `subnets[]` | `cidr`、`advertisers[{member,inUse}]`、`latencyMs`、`path`、`state`、`overlaps`、`localOverlap`、`route` | 0.3 |
 | `subnets[]` | `region` | 0.4 |
 | `tunnel` | `routes`、`routesVersion`、`dns` | 0.3 |
+| 顶层 | `names`、`refusedNames` | 0.3 |
+| 顶层 | `regionRequests` | 0.4 |
 
 ### 取值
 
@@ -50,6 +52,9 @@
 | `ipForwarding` | `on`、`off`、`not_needed`；只在完整节点给出 |
 | `tunnel.routes` | 应进入隧道的网段（CIDR 列表）：所有已加入网络的虚拟网段，加上当前路由到组网的通告子网（与本机网络冲突、内网范围外、或用户设为 `local` 的不在内），再按 `routing.system_routes` 限制。去重，顺序稳定 |
 | `tunnel.routesVersion` | 整数，`routes` 每变一次加一；引擎重启后从 1 起 |
+| `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate" }`：本网络的内网域名名单（不含后缀），`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址（需求 R28） |
+| `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" }`：配置里因地址在内网范围外而跳过的名字条目 |
+| `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请 |
 | `tunnel.dns` | `null`，或 `{ "servers": [地址], "matchDomains": [后缀] }`：内网域名开启时只对这些后缀生效（需求 R28） |
 
 ### 失败与冲突原因
@@ -80,6 +85,18 @@
 - **代理开关不打断组网**：代理连上或断开时，客户端重新下发 profile（增加或去掉代理出站）。只要网络配置没变，组网实例按 `network.id` 保留，会话与成员连接不断；配置变了才重建该网络。
 - **路由由引擎给出**：客户端不自己算网段，通告子网是动态的。客户端在组网加入期间读取 `mesh_status`（前台每 2 秒、后台每 10 秒，或在现有状态变化通知到来时），`tunnel.routesVersion` 变化时重新应用一次隧道网络设置（手机上的 `includedRoutes`、DNS 匹配域），重新应用之间至少间隔 1 秒。
 - 组网与代理都关闭时，客户端关闭 VPN。
+
+## 节点程序管理 API
+
+服务器、OpenWrt 等由 Agent 驱动的节点，Agent 经 `anixcore` 现有的本机管理 API 读写组网（字段名与 `anix-agent` 的 `docs/mesh.md`「内核接口」、`anix-control` 的 `agent-contract.md` 一致）：
+
+| 接口 | 内容 | 自哪个内核版本 |
+|---|---|---|
+| `GET /v1/status` 的 `features` | `mesh`；`mesh_dns`（网络配置接受 `dns` 节）；`mesh_host_groups`（接受 `host_groups` 节）；`mesh_region_requests`（提供下面的申请接口） | `mesh`、`mesh_dns` 0.3；其余 0.4 |
+| `PUT /v1/mesh` | 每个网络一份 `config_version: 1` 配置，`dns`、`host_groups` 与 `subnets`、`routing` 同级 | 0.3 |
+| `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：1–64 位字母、数字或连字符，等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
+| `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为网络的 tag；保留到被删除为止 | 0.4 |
+| `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 为 1–64 位字母、数字或连字符，不存在时返回 404 | 0.4 |
 
 ## 命令
 
