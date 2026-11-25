@@ -9,9 +9,17 @@
 //! interface ([`Node::send_ip`]), calls [`Node::tick`] about once a second,
 //! and carries out the [`Action`]s the node queues.
 //!
-//! Not here yet: relay sessions of the secure mode (spec §9), so in that
-//! mode only direct neighbours are reached; broadcast and multicast
-//! (spec §15.3); shared nodes (spec §16).
+//! Broadcast and multicast go to every direct neighbour (spec §15.3).
+//!
+//! In the secure mode a node that is not a neighbour is reached over an
+//! end-to-end relay session (spec §9): packets for it wait (at most
+//! [`RELAY_QUEUE`]) while relay msg1 goes out, retried as new handshakes
+//! after 200, 400 and 800 ms and given up 1.6 s after the last; when both
+//! ends start at once the smaller node ID stays the initiator. The
+//! answering side keeps its packets until the initiator's first packet
+//! makes the pending session current.
+//!
+//! Not here yet: shared nodes (spec §16).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
@@ -31,13 +39,16 @@ use crate::route::messages::{
 };
 use crate::route::sync::{Notice, RouteSync};
 use crate::route::topology::{Metric, Route};
-use crate::routes::{Denied, PeerId, RouteTable};
+use crate::routes::{self, Denied, PeerId, RouteTable};
 use crate::rpc::packet::{
     split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
     ROUTE_SYNC_TIMEOUT_MS,
 };
 use crate::rpc::reassembly::Reassembler;
-use crate::secure::handshake::Local;
+use crate::secure::handshake::{
+    keeps_initiating, relay_respond, Local, RelayAnswer, RelayInitiator,
+};
+use crate::secure::messages::Action as SessionAction;
 use crate::secure::noise::{KeyPair, LEN};
 use crate::secure::session::Sessions;
 use crate::wire::header::relay_in_place;
@@ -45,6 +56,29 @@ use crate::wire::{flags, packet_type, NodeHeader, HEADER_LEN};
 
 /// The driver's name for one connection.
 pub type ConnId = u64;
+
+/// Packets kept for one destination while its relay session is being set
+/// up (spec §9).
+pub const RELAY_QUEUE: usize = 32;
+/// First wait for relay msg2; doubled for each new attempt (spec §9).
+pub const RELAY_RETRY_START: Duration = Duration::from_millis(200);
+/// New attempts after the first relay msg1 (spec §9).
+pub const RELAY_RETRIES: u32 = 3;
+/// How long packets wait for a session this node answered, pending until
+/// the initiator's first packet arrives (spec §9 rule 2), before this node
+/// starts a handshake of its own.
+pub const RELAY_PENDING_WAIT: Duration = Duration::from_secs(10);
+
+/// A relay session being set up with a node that is not a neighbour.
+struct Relay {
+    initiator: Option<RelayInitiator>,
+    /// msg1 sent so far by this node.
+    attempts: u32,
+    /// When to send the next msg1 (or give up); `None` while waiting for
+    /// nothing.
+    due: Option<Instant>,
+    queue: VecDeque<(u8, Vec<u8>)>,
+}
 
 /// Route synchronisation service (spec §11.4).
 pub const ROUTE_SERVICE: &str = "OspfRouteRpc";
@@ -118,16 +152,17 @@ struct Outgoing {
     deadline: Instant,
 }
 
-/// The node's identity in its network.
-pub struct Identity {
-    pub peer_id: u32,
-    pub inst_id: Uuid,
-    pub route_id: u64,
-    pub static_key: KeyPair,
+/// The node's identity in its network: node ID, instance ID and route ID,
+/// generated anew by [`Node::new`] at every start (spec §12.3). The static
+/// key is kept per network by the caller and passed in.
+struct Identity {
+    peer_id: u32,
+    inst_id: Uuid,
+    route_id: u64,
 }
 
 impl Identity {
-    pub fn generate(rng: &dyn SecureRandom) -> Result<Self, Unspecified> {
+    fn generate(rng: &dyn SecureRandom) -> Result<Self, Unspecified> {
         let mut bytes = [0u8; 28];
         rng.fill(&mut bytes)?;
         let mut peer_id = [0u8; 4];
@@ -141,7 +176,6 @@ impl Identity {
             peer_id: u32::from_le_bytes(peer_id).max(1),
             inst_id: Uuid(inst_id),
             route_id: u64::from_le_bytes(route_id),
-            static_key: KeyPair::generate(rng).map_err(|_| Unspecified)?,
         })
     }
 }
@@ -166,9 +200,11 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
+    /// Relay sessions being set up, by destination (secure mode only).
+    relays: BTreeMap<u32, Relay>,
 }
 
-fn own_info(settings: &MeshSettings, identity: &Identity) -> RoutePeerInfo {
+fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) -> RoutePeerInfo {
     let ipv4 = match settings.address.address() {
         IpAddr::V4(v4) => Some(v4),
         IpAddr::V6(_) => None,
@@ -208,7 +244,7 @@ fn own_info(settings: &MeshSettings, identity: &Identity) -> RoutePeerInfo {
         network_length: u32::from(settings.address.prefix()),
         ipv6,
         noise_pubkey: match settings.security {
-            SecurityMode::ForwardSecrecy => identity.static_key.public().to_vec(),
+            SecurityMode::ForwardSecrecy => static_key.public().to_vec(),
             SecurityMode::Default => Vec::new(),
         },
         ..RoutePeerInfo::default()
@@ -223,10 +259,23 @@ fn random_i64(rng: &dyn SecureRandom) -> Result<i64, Unspecified> {
 }
 
 impl Node {
-    /// A node of the network `settings` describes (already validated).
+    /// A node of the network `settings` describes (already validated),
+    /// with the network's static key. Node, instance and route IDs are new
+    /// every time.
     pub fn new(
         settings: MeshSettings,
+        static_key: KeyPair,
+        rng: &dyn SecureRandom,
+        now: Instant,
+    ) -> Result<Self, Unspecified> {
+        let identity = Identity::generate(rng)?;
+        Self::with_identity(settings, identity, static_key, rng, now)
+    }
+
+    fn with_identity(
+        settings: MeshSettings,
         identity: Identity,
+        static_key: KeyPair,
         rng: &dyn SecureRandom,
         now: Instant,
     ) -> Result<Self, Unspecified> {
@@ -237,10 +286,10 @@ impl Node {
             }
             SecurityMode::ForwardSecrecy => None,
         };
-        let info = own_info(&settings, &identity);
+        let info = own_info(&settings, &identity, &static_key);
         let local = Local {
             id: identity.peer_id,
-            static_key: identity.static_key,
+            static_key,
             network_name: settings.network_name.clone(),
             node_name: settings
                 .hostname
@@ -269,6 +318,7 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
+            relays: BTreeMap::new(),
             settings,
         })
     }
@@ -287,6 +337,24 @@ impl Node {
 
     pub fn route_table(&self) -> &RouteTable {
         &self.routes
+    }
+
+    /// The networks of this machine's other interfaces (spec §15.4).
+    pub fn set_local_networks(&mut self, interfaces: &[IpNet]) {
+        self.routes.set_local_networks(interfaces, &[]);
+    }
+
+    /// Subnets to route into the virtual interface: accepted and routed,
+    /// limited to `routing.system_routes` when it is set.
+    pub fn system_routes(&self) -> Vec<IpNet> {
+        let routes = self.routes.system_routes();
+        match &self.settings.system_routes {
+            None => routes,
+            Some(allowed) => routes
+                .into_iter()
+                .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
+                .collect(),
+        }
     }
 
     pub fn route_sync(&self) -> &RouteSync {
@@ -421,6 +489,10 @@ impl Node {
                 self.sessions.release(&self.direct_key(peer), now);
             }
             if !self.conns.values().any(|other| other.peer == Some(peer)) {
+                // A late answer or timeout must not land on the next
+                // connection's synchronisation.
+                self.calls
+                    .retain(|_, call| !(call.peer == peer && call.kind == CallKind::SyncRoute));
                 self.sync.neighbour_down(peer);
                 self.refresh_routes();
             }
@@ -550,10 +622,24 @@ impl Node {
                 Err(_) => self.counters.refused_incoming += 1,
             },
             packet_type::RPC_REQ | packet_type::RPC_RESP => {
-                self.rpc_piece(from, &inbound.payload, rng, now)
+                self.rpc_piece(from, neighbour, &inbound.payload, rng, now)
             }
+            packet_type::RELAY_HANDSHAKE => self.relay_msg1(from, &inbound.payload, rng, now),
+            packet_type::RELAY_HANDSHAKE_ACK => self.relay_msg2(from, &inbound.payload, now),
             _ => self.counters.dropped += 1,
         }
+        // A packet that decrypted under the session this node answered
+        // makes it current (spec §9 rule 2): what waited can go now.
+        if inbound.was_encrypted
+            && from != neighbour
+            && self
+                .relays
+                .get(&from)
+                .is_some_and(|relay| relay.initiator.is_none())
+        {
+            self.flush_relay(from, now);
+        }
+        self.wake(rng, now);
     }
 
     fn pong(&mut self, conn: ConnId, payload: &[u8], now: Instant) {
@@ -627,10 +713,19 @@ impl Node {
             return false;
         };
         let from = self.local.id;
+        let secure = self.settings.security == SecurityMode::ForwardSecrecy;
         let mut crypto = self.crypto();
-        let Ok(mut packet) = link::seal(&mut crypto, from, to, next_hop, kind, payload, now) else {
-            self.counters.unroutable += 1;
-            return false;
+        let mut packet = match link::seal(&mut crypto, from, to, next_hop, kind, payload, now) {
+            Ok(packet) => packet,
+            // No end-to-end session with a node behind a relay yet: keep the
+            // packet and set one up (spec §9).
+            Err(Dropped::NoSession | Dropped::SessionEnded) if secure && next_hop != to => {
+                return self.queue_for_relay(to, kind, payload, now);
+            }
+            Err(_) => {
+                self.counters.unroutable += 1;
+                return false;
+            }
         };
         if latency_first && packet.len() > 9 {
             packet[9] |= flags::LATENCY_FIRST;
@@ -640,15 +735,28 @@ impl Node {
     }
 
     /// An IP packet from the virtual interface.
+    ///
+    /// A broadcast or multicast goes to every direct neighbour, addressed
+    /// to each of them, and is not relayed further (spec §15.3).
     pub fn send_ip(&mut self, packet: &[u8], now: Instant) -> Result<(), Denied> {
-        let peer = match self.routes.check_outgoing(packet) {
-            Ok(peer) => peer,
+        let outgoing = match self.routes.classify_outgoing(packet) {
+            Ok(outgoing) => outgoing,
             Err(denied) => {
                 self.counters.refused_outgoing += 1;
                 return Err(denied);
             }
         };
-        if !self.originate(peer.0, packet_type::DATA, packet, now) {
+        let sent = match outgoing {
+            routes::Outgoing::Peer(peer) => self.originate(peer.0, packet_type::DATA, packet, now),
+            routes::Outgoing::Neighbours => {
+                let mut any = false;
+                for neighbour in self.neighbours() {
+                    any |= self.originate(neighbour, packet_type::DATA, packet, now);
+                }
+                any
+            }
+        };
+        if !sent {
             return Err(Denied::NoRoute);
         }
         Ok(())
@@ -720,7 +828,16 @@ impl Node {
         self.send_rpc(to, transaction, &descriptor, true, &body, now);
     }
 
-    fn rpc_piece(&mut self, from: u32, payload: &[u8], rng: &dyn SecureRandom, now: Instant) {
+    /// One RPC piece from `from` (the packet header) that arrived over a
+    /// connection to `neighbour`.
+    fn rpc_piece(
+        &mut self,
+        from: u32,
+        neighbour: u32,
+        payload: &[u8],
+        rng: &dyn SecureRandom,
+        now: Instant,
+    ) {
         let Ok(piece) = RpcPacket::decode(payload) else {
             self.counters.dropped += 1;
             return;
@@ -735,6 +852,14 @@ impl Node {
             }
         };
         if call.is_request {
+            // Route synchronisation only with the neighbour the connection
+            // authenticated, never with a header `from` (spec §12.2).
+            let route_sync = call.descriptor.service == ROUTE_SERVICE
+                && call.descriptor.method_index == METHOD_SYNC_ROUTE_INFO;
+            if route_sync && from != neighbour {
+                self.counters.dropped += 1;
+                return;
+            }
             let result = self.serve(from, &call.descriptor, &call.body, now);
             let body = RpcResponse {
                 result,
@@ -879,6 +1004,163 @@ impl Node {
         self.centre_round(now);
         self.reassembler.expire(now);
         self.sessions.reclaim(now);
+        self.wake(rng, now);
+    }
+
+    /// The next time [`wake`](Self::wake) has something to do, earlier
+    /// than the next [`tick`](Self::tick): a relay msg1 to send again.
+    pub fn next_wake(&self) -> Option<Instant> {
+        self.relays.values().filter_map(|relay| relay.due).min()
+    }
+
+    /// Sends the relay handshakes that are due: first attempts for packets
+    /// queued since, and retries. The driver calls it after
+    /// [`send_ip`](Self::send_ip) and at [`next_wake`](Self::next_wake).
+    pub fn wake(&mut self, rng: &dyn SecureRandom, now: Instant) {
+        let due: Vec<u32> = self
+            .relays
+            .iter()
+            .filter(|(_, relay)| relay.due.is_some_and(|due| due <= now))
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in due {
+            self.start_relay(peer, rng, now);
+        }
+    }
+
+    fn queue_for_relay(&mut self, to: u32, kind: u8, payload: &[u8], now: Instant) -> bool {
+        let relay = self.relays.entry(to).or_insert_with(|| Relay {
+            initiator: None,
+            attempts: 0,
+            due: Some(now),
+            queue: VecDeque::new(),
+        });
+        if relay.queue.len() >= RELAY_QUEUE {
+            self.counters.unroutable += 1;
+            return false;
+        }
+        relay.queue.push_back((kind, payload.to_vec()));
+        true
+    }
+
+    /// Gives up on `peer`: its queued packets count as unroutable.
+    fn drop_relay(&mut self, peer: u32) {
+        if let Some(relay) = self.relays.remove(&peer) {
+            self.counters.unroutable += relay.queue.len() as u64;
+        }
+    }
+
+    fn start_relay(&mut self, peer: u32, rng: &dyn SecureRandom, now: Instant) {
+        let attempts = match self.relays.get(&peer) {
+            Some(relay) => relay.attempts,
+            None => return,
+        };
+        if attempts > RELAY_RETRIES {
+            self.drop_relay(peer);
+            return;
+        }
+        let Some(peer_static) = self.peer_static(peer) else {
+            self.drop_relay(peer);
+            return;
+        };
+        let Ok((initiator, msg1)) =
+            RelayInitiator::start(&self.local, peer, peer_static, &self.sessions, rng)
+        else {
+            self.drop_relay(peer);
+            return;
+        };
+        if let Some(relay) = self.relays.get_mut(&peer) {
+            // Each attempt is a new handshake (spec §9).
+            relay.initiator = Some(initiator);
+            relay.attempts = attempts + 1;
+            relay.due = Some(now + RELAY_RETRY_START * 2u32.pow(attempts));
+        }
+        self.originate(peer, packet_type::RELAY_HANDSHAKE, &msg1, now);
+    }
+
+    /// The static key `peer` announces in its route information.
+    fn peer_static(&self, peer: u32) -> Option<[u8; LEN]> {
+        self.sync
+            .info(peer)
+            .and_then(|info| <[u8; LEN]>::try_from(&info.noise_pubkey[..]).ok())
+    }
+
+    /// Sends what waited for the relay session with `peer`.
+    fn flush_relay(&mut self, peer: u32, now: Instant) {
+        let Some(relay) = self.relays.remove(&peer) else {
+            return;
+        };
+        for (kind, payload) in relay.queue {
+            self.originate(peer, kind, &payload, now);
+        }
+    }
+
+    /// Relay msg1 for this node (spec §9).
+    fn relay_msg1(&mut self, from: u32, msg1: &[u8], rng: &dyn SecureRandom, now: Instant) {
+        if self.settings.security != SecurityMode::ForwardSecrecy || from == self.local.id {
+            self.counters.dropped += 1;
+            return;
+        }
+        let initiating = self
+            .relays
+            .get(&from)
+            .is_some_and(|relay| relay.initiator.is_some());
+        if initiating && keeps_initiating(self.local.id, from) {
+            // Both started: the smaller ID stays the initiator.
+            return;
+        }
+        let expected = self.peer_static(from);
+        let answer = relay_respond(
+            &self.local,
+            from,
+            expected,
+            msg1,
+            &mut self.sessions,
+            rng,
+            now,
+        );
+        let (msg2, joined) = match answer {
+            Ok(RelayAnswer::Reply(msg2, established)) => {
+                (msg2, established.action != SessionAction::Create)
+            }
+            Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
+            Err(_) => {
+                self.counters.dropped += 1;
+                return;
+            }
+        };
+        if let Some(relay) = self.relays.get_mut(&from) {
+            // The peer is the initiator now; our packets wait for its
+            // session, or for our own attempt if it never comes.
+            relay.initiator = None;
+            relay.attempts = 0;
+            relay.due = Some(now + RELAY_PENDING_WAIT);
+        }
+        self.originate(from, packet_type::RELAY_HANDSHAKE_ACK, &msg2, now);
+        if joined {
+            self.flush_relay(from, now);
+        }
+    }
+
+    /// Relay msg2 for this node (spec §9).
+    fn relay_msg2(&mut self, from: u32, msg2: &[u8], now: Instant) {
+        if from == self.local.id {
+            self.counters.dropped += 1;
+            return;
+        }
+        let Some(initiator) = self
+            .relays
+            .get_mut(&from)
+            .and_then(|relay| relay.initiator.take())
+        else {
+            self.counters.dropped += 1;
+            return;
+        };
+        match initiator.finish(&self.local, msg2, &mut self.sessions, now) {
+            Ok(_) => self.flush_relay(from, now),
+            // The retry is a new handshake.
+            Err(_) => self.counters.dropped += 1,
+        }
     }
 
     fn handshake_timeouts(&mut self, now: Instant) {
@@ -1049,15 +1331,25 @@ mod tests {
 
     impl Net {
         fn new(addresses: &[&str], secure: bool) -> Self {
+            Self::with(
+                addresses
+                    .iter()
+                    .map(|address| settings(address, secure))
+                    .collect(),
+            )
+        }
+
+        fn with(settings: Vec<MeshSettings>) -> Self {
             let rng = SystemRandom::new();
             let now = Instant::now();
-            let nodes = addresses
-                .iter()
+            let nodes = settings
+                .into_iter()
                 .enumerate()
-                .map(|(i, address)| {
+                .map(|(i, settings)| {
                     let mut identity = Identity::generate(&rng).unwrap();
                     identity.peer_id = 100 + i as u32;
-                    Node::new(settings(address, secure), identity, &rng, now).unwrap()
+                    let key = KeyPair::generate(&rng).unwrap();
+                    Node::with_identity(settings, identity, key, &rng, now).unwrap()
                 })
                 .collect();
             Self {
@@ -1149,6 +1441,250 @@ mod tests {
         net.settle();
         assert_eq!(net.delivered, vec![(2, packet)]);
         assert_eq!(net.nodes[1].counters().relayed, relayed + 1);
+    }
+
+    /// Nodes 0 and 2 already share a relay session once node 2 has
+    /// reported to the latency centre, the smallest ID (node 0). Drops it
+    /// on both ends so that a test sees a handshake from the start.
+    fn without_relay_session(net: &mut Net) {
+        let ids = [net.nodes[0].id(), net.nodes[2].id()];
+        for (i, peer) in [(0, ids[1]), (2, ids[0])] {
+            let node = &mut net.nodes[i];
+            let key = crate::secure::session::SessionKey {
+                namespace: crate::secure::session::Namespace::Relay,
+                network: node.settings.network_name.clone(),
+                peer_id: peer,
+            };
+            node.sessions.invalidate(&key);
+        }
+    }
+
+    /// Sends `packet` from node `i` and lets any relay handshake run.
+    fn send(net: &mut Net, i: usize, packet: &[u8]) {
+        let rng = SystemRandom::new();
+        net.nodes[i].send_ip(packet, net.now).unwrap();
+        net.nodes[i].wake(&rng, net.now);
+        net.settle();
+    }
+
+    #[test]
+    fn secure_nodes_behind_a_relay_set_up_a_session_and_exchange_data() {
+        let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[0].paths()[&102].next_hop, 101);
+
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[0].next_wake(), None);
+
+        // The answering node's session became current with that packet.
+        let reply = ipv4_packet([10, 144, 0, 3], [10, 144, 0, 1]);
+        send(&mut net, 2, &reply);
+        assert_eq!(net.delivered[1..], [(0, reply)]);
+        assert_eq!(net.nodes[2].next_wake(), None);
+        // The relay only carried packets.
+        assert!(net.delivered.iter().all(|(i, _)| *i != 1));
+    }
+
+    #[test]
+    fn both_ends_starting_at_once_end_with_one_session() {
+        let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
+        let rng = SystemRandom::new();
+        let there = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        let back = ipv4_packet([10, 144, 0, 3], [10, 144, 0, 1]);
+        net.nodes[0].send_ip(&there, net.now).unwrap();
+        net.nodes[2].send_ip(&back, net.now).unwrap();
+        net.nodes[0].wake(&rng, net.now);
+        net.nodes[2].wake(&rng, net.now);
+        net.settle();
+        net.delivered.sort();
+        assert_eq!(net.delivered, vec![(0, back), (2, there)]);
+        assert_eq!(net.nodes[0].next_wake(), None);
+        assert_eq!(net.nodes[2].next_wake(), None);
+    }
+
+    #[test]
+    fn an_unanswered_relay_handshake_is_retried_then_given_up() {
+        let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
+        let rng = SystemRandom::new();
+        // The relay loses everything towards node 2.
+        net.wires
+            .retain(|&(from, _), &mut (to, _)| !(from == 1 && to == 2));
+        let unroutable = net.nodes[0].counters().unroutable;
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        let mut waits = Vec::new();
+        let mut last = net.now;
+        while let Some(at) = net.nodes[0].next_wake() {
+            waits.push(at - last);
+            last = at;
+            net.now = at;
+            net.nodes[0].wake(&rng, net.now);
+            net.settle();
+            assert!(waits.len() <= 5, "never gives up");
+        }
+        assert_eq!(
+            waits,
+            [200, 400, 800, 1600].map(Duration::from_millis).to_vec()
+        );
+        assert!(net.delivered.is_empty());
+        assert_eq!(net.nodes[0].counters().unroutable, unroutable + 1);
+    }
+
+    #[test]
+    fn at_most_a_queue_of_packets_waits_for_a_relay_session() {
+        let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
+        net.wires
+            .retain(|&(from, _), &mut (to, _)| !(from == 1 && to == 2));
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        for _ in 0..RELAY_QUEUE {
+            net.nodes[0].send_ip(&packet, net.now).unwrap();
+        }
+        assert_eq!(net.nodes[0].send_ip(&packet, net.now), Err(Denied::NoRoute));
+    }
+
+    #[test]
+    fn system_routes_skip_local_networks_and_follow_the_configured_limit() {
+        let advertising = |address: &str, extra: serde_json::Value| {
+            let mut config = serde_json::json!({
+                "config_version": 1,
+                "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+                "node": {"address": address, "role": "full"},
+                "peers": [{"server": "peer.example", "port": 40000}],
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                config[key] = value.clone();
+            }
+            serde_json::from_value::<MeshConfig>(config)
+                .unwrap()
+                .validate()
+                .unwrap()
+        };
+        let mut net = Net::with(vec![
+            advertising(
+                "10.144.0.1/24",
+                serde_json::json!({"routing": {"system_routes": ["192.168.0.0/16"]}}),
+            ),
+            advertising(
+                "10.144.0.2/24",
+                serde_json::json!({"subnets": {"advertise": ["192.168.10.0/24", "172.16.5.0/24"]}}),
+            ),
+        ]);
+        net.link(0, 1);
+        net.settle();
+        for _ in 0..4 {
+            net.tick(Duration::from_secs(1));
+        }
+        let routes = |net: &Net| -> Vec<String> {
+            net.nodes[0]
+                .system_routes()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        // 172.16.5.0/24 is outside routing.system_routes.
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        assert!(net.nodes[0]
+            .route_table()
+            .lookup("172.16.5.9".parse().unwrap())
+            .is_ok());
+        // This machine sits on 192.168.10.0/24 itself.
+        net.nodes[0].set_local_networks(&[IpNet::parse("192.168.10.7/24").unwrap()]);
+        assert!(routes(&net).is_empty());
+    }
+
+    #[test]
+    fn route_sync_is_only_served_to_the_connection_neighbour() {
+        // Node 0 is not node 2's neighbour: its request arrives over the
+        // connection to node 1 and is dropped without an answer.
+        let mut net = three_in_a_row(false);
+        let dropped = net.nodes[2].counters().dropped;
+        let request = SyncRouteRequest {
+            my_peer_id: 100,
+            ..SyncRouteRequest::default()
+        };
+        net.nodes[0].call(102, CallKind::SyncRoute, request.encode(), net.now);
+        net.settle();
+        assert_eq!(net.nodes[2].counters().dropped, dropped + 1);
+        assert!(net.nodes[0]
+            .calls
+            .values()
+            .any(|call| call.peer == 102 && call.kind == CallKind::SyncRoute));
+    }
+
+    #[test]
+    fn a_lost_neighbour_takes_its_route_sync_calls_with_it() {
+        let mut net = three_in_a_row(false);
+        net.nodes[0].call(
+            101,
+            CallKind::SyncRoute,
+            SyncRouteRequest::default().encode(),
+            net.now,
+        );
+        assert!(net.nodes[0].calls.values().any(|call| call.peer == 101));
+        let conns: Vec<ConnId> = net.nodes[0].conns.keys().copied().collect();
+        for conn in conns {
+            net.nodes[0].disconnected(conn, net.now);
+        }
+        assert!(!net.nodes[0]
+            .calls
+            .values()
+            .any(|call| call.peer == 101 && call.kind == CallKind::SyncRoute));
+    }
+
+    #[test]
+    fn every_start_gets_new_ids_and_keeps_the_static_key() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let key = KeyPair::generate(&rng).unwrap();
+        let private = key.private();
+        let first = Node::new(
+            settings("10.144.0.1/24", true),
+            KeyPair::from_private(*private),
+            &rng,
+            now,
+        )
+        .unwrap();
+        let second = Node::new(settings("10.144.0.1/24", true), key, &rng, now).unwrap();
+        let (a, b) = (first.sync.own(), second.sync.own());
+        assert_ne!(first.id(), second.id());
+        assert_ne!(a.route_id, b.route_id);
+        assert_ne!(a.inst_id, b.inst_id);
+        assert_eq!(a.noise_pubkey, b.noise_pubkey);
+    }
+
+    #[test]
+    fn broadcasts_reach_direct_neighbours_only() {
+        // Node 1 sits between nodes 0 and 2: its broadcast reaches both;
+        // node 0's reaches node 1 and is not relayed to node 2.
+        let mut net = three_in_a_row(false);
+        let packet = ipv4_packet([10, 144, 0, 2], [10, 144, 0, 255]);
+        net.nodes[1].send_ip(&packet, net.now).unwrap();
+        net.settle();
+        net.delivered.sort();
+        assert_eq!(net.delivered, vec![(0, packet.clone()), (2, packet)]);
+
+        net.delivered.clear();
+        let relayed = net.nodes[1].counters().relayed;
+        let packet = ipv4_packet([10, 144, 0, 1], [224, 0, 0, 251]);
+        net.nodes[0].send_ip(&packet, net.now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, vec![(1, packet)]);
+        assert_eq!(net.nodes[1].counters().relayed, relayed);
+    }
+
+    #[test]
+    fn a_broadcast_without_neighbours_is_not_sent() {
+        let mut net = Net::new(&["10.144.0.1/24"], false);
+        let packet = ipv4_packet([10, 144, 0, 1], [255, 255, 255, 255]);
+        assert_eq!(net.nodes[0].send_ip(&packet, net.now), Err(Denied::NoRoute));
+        net.settle();
+        assert!(net.delivered.is_empty());
     }
 
     #[test]

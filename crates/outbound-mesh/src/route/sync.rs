@@ -15,7 +15,7 @@
 //! initiator. When two neighbours pick each other at the same time, the one
 //! with the smaller node ID stays the initiator.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ring::error::Unspecified;
@@ -48,6 +48,13 @@ pub const MAX_NODES: usize = MAX_GRAPH_NODES - 1;
 /// A neighbour that has not pushed as the initiator for this long no longer
 /// counts as pushing.
 pub const PUSH_EXPIRY: Duration = Duration::from_secs(30);
+/// A full table makes room only from nodes unreachable at least this long,
+/// so that a new node is not pushed out before its connection row arrives.
+pub const EVICTION_GRACE: Duration = Duration::from_secs(5);
+/// Encoded node information one request carries at most. The rest goes in
+/// the next rounds, so that a request with the connection graph stays
+/// well under the receiver's limit for one call (4 MiB).
+pub const REQUEST_INFO_BYTES: usize = 2 * 1024 * 1024;
 
 /// Something the driver must act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,10 +335,12 @@ impl RouteSync {
 
         let mut pending = Sent::default();
         let mut infos = Vec::new();
+        let mut info_bytes = 0;
         if session.sent.infos.get(&self.own.peer_id) != Some(&self.own.version) {
             let mut own = self.own.clone();
             own.last_update = unix_now;
             pending.infos.insert(own.peer_id, own.version);
+            info_bytes += own.encode().len();
             infos.push(own);
         }
         for (&id, stored) in &self.infos {
@@ -339,6 +348,12 @@ impl RouteSync {
             if id == peer || session.sent.infos.get(&id).is_some_and(|&v| v >= version) {
                 continue;
             }
+            // What does not fit is not marked as sent and goes next time.
+            let size = stored.info.encode().len();
+            if info_bytes + size > REQUEST_INFO_BYTES {
+                break;
+            }
+            info_bytes += size;
             pending.infos.insert(id, version);
             infos.push(stored.info.clone());
         }
@@ -528,20 +543,31 @@ impl RouteSync {
         match self.infos.get(&info.peer_id) {
             Some(stored) if stored.info.version >= info.version => return false,
             None if self.infos.len() >= MAX_NODES => {
-                // Full: only a node already unreachable makes room, the one
-                // unreachable longest.
-                let Some(oldest) = self
+                // Full: a node unreachable for a while makes room, the one
+                // unreachable longest. A direct neighbour's information is
+                // always taken: then the farthest other node goes.
+                let unreachable = self
                     .unreachable_since
                     .iter()
-                    .filter(|(id, _)| self.infos.contains_key(*id))
+                    .filter(|(id, since)| {
+                        self.infos.contains_key(*id)
+                            && now.saturating_duration_since(**since) >= EVICTION_GRACE
+                    })
                     .min_by_key(|(_, since)| **since)
-                    .map(|(id, _)| *id)
-                else {
-                    return false;
+                    .map(|(id, _)| *id);
+                let victim = match unreachable {
+                    Some(id) => id,
+                    None if self.sessions.contains_key(&info.peer_id) => {
+                        match self.farthest_non_neighbour() {
+                            Some(id) => id,
+                            None => return false,
+                        }
+                    }
+                    None => return false,
                 };
-                self.infos.remove(&oldest);
-                self.rows.remove(&oldest);
-                self.unreachable_since.remove(&oldest);
+                self.infos.remove(&victim);
+                self.rows.remove(&victim);
+                self.unreachable_since.remove(&victim);
             }
             _ => {}
         }
@@ -553,6 +579,34 @@ impl RouteSync {
             },
         );
         true
+    }
+
+    /// The stored node farthest from this one by hops (unreachable ones
+    /// farthest of all) that is not a direct neighbour.
+    fn farthest_non_neighbour(&self) -> Option<u32> {
+        let mut hops: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut queue = VecDeque::new();
+        hops.insert(self.own.peer_id, 0);
+        queue.push_back(self.own.peer_id);
+        while let Some(id) = queue.pop_front() {
+            let distance = hops[&id];
+            let neighbours = if id == self.own.peer_id {
+                Some(&self.own_row.neighbours)
+            } else {
+                self.rows.get(&id).map(|row| &row.neighbours)
+            };
+            for &next in neighbours.into_iter().flatten() {
+                if let std::collections::btree_map::Entry::Vacant(entry) = hops.entry(next) {
+                    entry.insert(distance + 1);
+                    queue.push_back(next);
+                }
+            }
+        }
+        self.infos
+            .keys()
+            .filter(|id| !self.sessions.contains_key(*id))
+            .max_by_key(|id| (hops.get(*id).copied().unwrap_or(u32::MAX), **id))
+            .copied()
     }
 
     fn merge_graph(&mut self, graph: &ConnGraph) -> bool {
@@ -1002,6 +1056,67 @@ mod tests {
     }
 
     #[test]
+    fn large_tables_are_sent_in_parts() {
+        let now = Instant::now();
+        let rng = SystemRandom::new();
+        let mut a = node(1, now);
+        a.neighbour_up(2, &rng).unwrap();
+        // Big entries, more than one request may carry.
+        let big = |id: u32| RoutePeerInfo {
+            proxy_cidrs: (0..200)
+                .map(|n| format!("10.{}.{}.0/24", n % 250, id % 250))
+                .collect(),
+            ..info(id, 1)
+        };
+        let size = big(10_000).encode().len();
+        let count = (REQUEST_INFO_BYTES / size) as u32 * 2 + 10;
+        let fill = SyncRouteRequest {
+            my_peer_id: 2,
+            my_session_id: 1,
+            peer_infos: (0..count).map(|n| big(10_000 + n)).collect(),
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(2, fill, now);
+        assert_eq!(a.infos().count() as u32, count);
+
+        let mut b = node(3, now);
+        connect(&mut a, &mut b);
+        let mut nodes = [a, b];
+        let mut rounds = 0;
+        let mut later = now;
+        while nodes[1].infos().count() < count as usize + 1 {
+            later += SYNC_INTERVAL;
+            for i in 0..2 {
+                let other = nodes[1 - i].id();
+                let requests: Vec<SyncRouteRequest> = nodes[i]
+                    .poll(later, (0, 0))
+                    .into_iter()
+                    .filter(|(peer, _)| *peer == other)
+                    .map(|(_, request)| request)
+                    .collect();
+                for request in requests {
+                    let bytes: usize = request
+                        .peer_infos
+                        .iter()
+                        .map(|item| item.encode().len())
+                        .sum();
+                    assert!(bytes <= REQUEST_INFO_BYTES);
+                    assert!(request.encode().len() < 4 * 1024 * 1024);
+                    let (left, right) = nodes.split_at_mut(1);
+                    if i == 0 {
+                        deliver(&mut left[0], &mut right[0], request, later);
+                    } else {
+                        deliver(&mut right[0], &mut left[0], request, later);
+                    }
+                }
+            }
+            rounds += 1;
+            assert!(rounds < 20, "never finished");
+        }
+        assert!(rounds >= 3, "{rounds} rounds");
+    }
+
+    #[test]
     fn a_full_table_makes_room_only_from_unreachable_nodes() {
         let now = Instant::now();
         let rng = SystemRandom::new();
@@ -1026,8 +1141,49 @@ mod tests {
         a.on_request(2, late.clone(), now);
         assert!(a.info(99_999).is_none());
         a.expire(now);
-        a.on_request(2, late, now);
+        // Only after the grace period.
+        a.on_request(2, late.clone(), now);
+        assert!(a.info(99_999).is_none());
+        let later = now + EVICTION_GRACE;
+        a.on_request(2, late, later);
         assert!(a.info(99_999).is_some());
         assert_eq!(a.infos().count(), MAX_NODES);
+    }
+
+    #[test]
+    fn a_direct_neighbours_information_is_taken_when_the_table_is_full() {
+        let now = Instant::now();
+        let rng = SystemRandom::new();
+        let mut a = node(1, now);
+        a.neighbour_up(2, &rng).unwrap();
+        let fill = SyncRouteRequest {
+            my_peer_id: 2,
+            my_session_id: 1,
+            peer_infos: (0..MAX_NODES as u32).map(|n| info(10_000 + n, 1)).collect(),
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(2, fill, now);
+        assert_eq!(a.infos().count(), MAX_NODES);
+        // A new neighbour's own information, with nothing unreachable for
+        // long: the farthest non-neighbour makes room.
+        a.neighbour_up(3, &rng).unwrap();
+        let own = SyncRouteRequest {
+            my_peer_id: 3,
+            my_session_id: 1,
+            peer_infos: vec![info(3, 1)],
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(3, own, now);
+        assert!(a.info(3).is_some());
+        assert_eq!(a.infos().count(), MAX_NODES);
+        // A stranger's is still refused.
+        let stranger = SyncRouteRequest {
+            my_peer_id: 2,
+            my_session_id: 1,
+            peer_infos: vec![info(99_999, 1)],
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(2, stranger, now);
+        assert!(a.info(99_999).is_none());
     }
 }
