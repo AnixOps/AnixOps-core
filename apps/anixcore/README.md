@@ -24,6 +24,15 @@ anixcore version
 }
 ```
 
+The management API is plaintext HTTP with a bearer token that controls the
+whole node, so `management.listen` must be a loopback address (`127.0.0.1`,
+`::1`): `anixcore run` and `anixcore check` refuse any other address,
+`0.0.0.0` and `::` included. Manage a node from another host through SSH or
+a VPN that ends on its loopback. `"insecure_public": true` accepts a
+non-loopback address in plaintext for a deployment that keeps the port on a
+restricted network; `anixcore` then prints a warning at start. An empty
+token is refused.
+
 Users may carry `"speed_limit"` (Mbit/s for each direction, shared by all
 of the user's connections) and `"device_limit"` (most client IPs online at
 once); both default to 0, no limit.

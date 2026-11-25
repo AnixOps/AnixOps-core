@@ -87,7 +87,7 @@ jobs:
             || { echo "::error::GitHub-hosted jobs stop at 6 h; use runner=self-hosted for ${SOAK_HOURS} h"; exit 1; }
 
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -97,7 +97,7 @@ jobs:
           rustup default stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
 
@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tunnel-soak
           path: results
@@ -127,7 +127,7 @@ jobs:
       SOAK_HOURS: ${{ inputs.hours }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -145,7 +145,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tunnel-soak
           path: results
@@ -168,14 +168,14 @@ jobs:
       MAX_HANDLE_SLOPE_PER_H: ${{ github.event_name == 'pull_request' && '200' || '10' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
       # mitm-anixops-sys builds only for the GNU target on Windows, as in ci.yml.
       - name: Setup Windows C toolchain
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2.34.0
         id: msys2
         with:
           msystem: MINGW64
@@ -210,7 +210,7 @@ jobs:
           fi
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -222,7 +222,7 @@ jobs:
           python -m pip install --disable-pip-version-check psutil==7.0.0
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ${{ runner.os == 'Windows' && 'windows-gnu' || '' }}
           save-if: false
@@ -249,7 +249,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: proxy-soak-${{ matrix.os }}
           path: results

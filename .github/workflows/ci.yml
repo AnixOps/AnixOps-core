@@ -42,7 +42,7 @@ jobs:
       validation_matrix: ${{ steps.changes.outputs.validation_matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -79,11 +79,15 @@ jobs:
       - changes
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify structured fast policy
         shell: bash
         run: bash .github/scripts/verify-repository-policy.sh fast
+
+      # Every action is pinned to a full commit SHA with its release tag (audit 2026-11-25 REL-02).
+      - name: Workflow action pinning
+        run: python3 .github/scripts/workflow_policy.py --self-test .
 
       # Neutral terminology (AnixOps-design guidelines/terminology.md); the script and word list are
       # byte-identical copies of the AnixOps-design baseline.
@@ -273,7 +277,7 @@ jobs:
       - changes
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify structured full policy
         shell: bash
@@ -291,7 +295,7 @@ jobs:
       rust: ${{ steps.detect.outputs.rust }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Detect project manifests
         id: detect
@@ -339,7 +343,7 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.validation_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify workspace
         shell: bash
@@ -368,10 +372,10 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.validation_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
           cache: true
@@ -429,13 +433,13 @@ jobs:
       matrix: ${{ fromJSON(needs.changes.outputs.validation_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
       - name: Setup Windows C toolchain
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2.34.0
         id: msys2
         with:
           msystem: MINGW64
@@ -474,13 +478,13 @@ jobs:
       # evicted each other under the repository cache quota and left Windows cold.
       # The Windows entry keeps its own shared key so the GNU target cache stays separate.
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ${{ runner.os == 'Windows' && 'windows-gnu' || '' }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Setup Node script runtime
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
 
@@ -522,7 +526,7 @@ jobs:
       }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # mitm-policy builds the mitm_anixops C core from this submodule.
           submodules: true
@@ -533,7 +537,7 @@ jobs:
           rustup default stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -577,7 +581,7 @@ jobs:
       }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # mitm-policy builds the mitm_anixops C core from this submodule.
           submodules: true
@@ -588,7 +592,7 @@ jobs:
           rustup default stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: script-runtime-jsc
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -632,7 +636,7 @@ jobs:
       }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
         shell: bash
@@ -642,7 +646,7 @@ jobs:
           rustup default stable
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-audit
 
@@ -655,7 +659,7 @@ jobs:
         run: cargo audit
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-deny
 
@@ -683,7 +687,7 @@ jobs:
       }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
         shell: bash
@@ -693,7 +697,7 @@ jobs:
           rustup default stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
@@ -715,7 +719,7 @@ jobs:
 
       # Builds the iwand-server test server (go.mod declares go 1.22).
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.22"
           cache: false
@@ -793,7 +797,7 @@ jobs:
       FUZZ_SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '30' || '60' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -805,7 +809,7 @@ jobs:
           rustup default nightly
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-fuzz
 
@@ -874,7 +878,7 @@ jobs:
 
       - name: Upload fuzz crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: h2-mitm-fuzz-artifacts-${{ github.sha }}
           path: |
@@ -906,7 +910,7 @@ jobs:
       }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # mitm-policy builds the mitm_anixops C core from this submodule.
           submodules: true
@@ -920,7 +924,7 @@ jobs:
           rustup target add aarch64-apple-ios
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ios-runtime
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

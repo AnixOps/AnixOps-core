@@ -36,7 +36,11 @@ jobs:
       release_kind: ${{ steps.policy.outputs.release_kind }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A release runs no action that is not pinned to a full commit SHA (audit 2026-11-25 REL-02).
+      - name: Workflow action pinning
+        run: python3 .github/scripts/workflow_policy.py --self-test .
 
       - name: Verify release source
         id: policy
@@ -142,7 +146,7 @@ jobs:
       ci_checked_at: ${{ steps.validate.outputs.ci_checked_at }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate same-commit CI success
         id: validate
@@ -304,7 +308,7 @@ jobs:
       artifact_files: ${{ steps.license.outputs.artifact_files }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate Linux artifact readiness
         id: license
@@ -391,7 +395,7 @@ jobs:
       output_dir: ${{ steps.package.outputs.output_dir }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -675,7 +679,7 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload Linux release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.package.outputs.bundle_name }}
           path: |
@@ -702,7 +706,7 @@ jobs:
       provenance_file: ${{ steps.attestation-output.outputs.provenance_file }}
     steps:
       - name: Download Linux release bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.package-linux.outputs.bundle_name }}
           path: dist/linux-attestation
@@ -728,7 +732,7 @@ jobs:
           )
 
       - name: Generate Linux artifact attestation
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             dist/linux-attestation/${{ needs.package-linux.outputs.artifact_name }}
@@ -856,10 +860,10 @@ jobs:
       release_url: ${{ steps.publish.outputs.release_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Download Linux release bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.package-linux.outputs.bundle_name }}
           path: dist/linux-release

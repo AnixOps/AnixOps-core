@@ -64,7 +64,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-pub use config::{InboundConfig, ManagementSettings, NodeConfig};
+pub use config::{InboundConfig, ManagementError, ManagementSettings, NodeConfig};
 pub use direct::DirectOutbound;
 pub use egress::{Egress, EgressConfig, RulesConfig};
 pub use network::{NetworkPlan, NetworkStatus};
