@@ -399,6 +399,99 @@ pub fn set_enabled(host: &dyn Host, name: &str, enabled: bool) -> Result<(), Str
     )
 }
 
+/// Largest task definition kept in the takeover record.
+const MAX_DEFINITION: usize = 64 * 1024;
+
+/// A task's definition (`schtasks.exe /Query /XML`), kept to compare after
+/// rollback; `None` when it cannot be read or is too large to keep.
+pub fn definition(host: &dyn Host, name: &str) -> Option<String> {
+    let output = host
+        .run("schtasks.exe", &["/Query", "/XML", "/TN", name])
+        .ok()?;
+    let xml = output.stdout.trim();
+    (output.success() && !xml.is_empty() && xml.len() <= MAX_DEFINITION).then(|| xml.to_string())
+}
+
+/// Whether two definitions are the same apart from whether the task is
+/// turned on and from line endings and indentation.
+pub fn same_definition(before: &str, after: &str) -> bool {
+    let lines = |xml: &str| -> Vec<String> {
+        xml.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("<Enabled>"))
+            .map(str::to_string)
+            .collect()
+    };
+    lines(before) == lines(after)
+}
+
+/// The user a `HKU\<SID>\...` key belongs to, for the SIDs of local and
+/// domain accounts the logon query lists.
+fn user_of(key: &str) -> Option<&str> {
+    let sid = key.strip_prefix("HKU\\")?.split('\\').next()?;
+    let digits = sid.strip_prefix("S-1-5-21-")?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit() || b == b'-')).then_some(sid)
+}
+
+/// The query for a user's profile folder. The SID is only digits and
+/// dashes, checked by the caller.
+pub fn profile_query(sid: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [string](Get-CimInstance -ClassName Win32_UserProfile | Where-Object {{ $_.SID -eq '{sid}' }} | Select-Object -First 1).LocalPath"
+    )
+}
+
+/// Where a user's settings are loaded while that user is logged off.
+pub fn mount_of(sid: &str) -> String {
+    format!("HKU\\anixops-mesh-{sid}")
+}
+
+/// Runs `change` with the key to use. A key of a user whose settings are
+/// not loaded (the user logged off since the takeover) is reached by
+/// loading the user's `NTUSER.DAT` under a name of our own for the call
+/// and unloading it after. When the settings are neither loaded nor
+/// loadable this fails, so the step is kept and reported, never taken as
+/// changed by someone else.
+pub fn with_settings<T>(
+    host: &dyn Host,
+    key: &str,
+    change: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let Some(sid) = user_of(key) else {
+        return change(key);
+    };
+    let root = format!("HKU\\{sid}");
+    if reg(host, &["query", &root]).is_ok() {
+        return change(key);
+    }
+    let profile = powershell(host, &profile_query(sid))
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "the settings of user {sid} are not loaded and the profile folder was not found"
+            )
+        })?;
+    let mount = mount_of(sid);
+    let hive = format!("{profile}\\NTUSER.DAT");
+    reg(host, &["load", &mount, &hive]).map_err(|error| {
+        format!("the settings of user {sid} are not loaded and could not be loaded: {error}")
+    })?;
+    let result = change(&format!("{mount}{}", &key[root.len()..]));
+    let mut unloaded = reg(host, &["unload", &mount]);
+    if unloaded.is_err() {
+        host.sleep_ms(END_POLL_MS);
+        unloaded = reg(host, &["unload", &mount]);
+    }
+    match (result, unloaded) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(format!(
+            "the change was made, but {error}; unload {mount} by hand before the user logs on"
+        )),
+        (Err(error), _) => Err(error),
+    }
+}
+
 /// `reg.exe` arguments naming one value; an empty name is the key's
 /// default value.
 fn value_args<'a>(key: &'a str, name: &'a str) -> Vec<&'a str> {
@@ -410,7 +503,9 @@ fn value_args<'a>(key: &'a str, name: &'a str) -> Vec<&'a str> {
 }
 
 /// The binary value `reg.exe query` prints, in lower-case hexadecimal;
-/// `None` when there is none.
+/// `None` when there is none. A failed query is read as no value, so a
+/// key of a user's settings must be reached through [`with_settings`],
+/// which fails when those settings are not loaded.
 pub fn read_approved(host: &dyn Host, key: &str, name: &str) -> Result<Option<String>, String> {
     let mut args = vec!["query"];
     args.extend(value_args(key, name));
@@ -493,6 +588,97 @@ mod tests {
         assert_eq!(full_name(&task(Some("\\"))), "\\demo");
         assert_eq!(full_name(&task(Some("\\Vendor\\"))), "\\Vendor\\demo");
         assert_eq!(full_name(&task(None)), "\\demo");
+    }
+
+    #[test]
+    fn user_keys_name_their_sid() {
+        assert_eq!(
+            user_of(r"HKU\S-1-5-21-9-500\Software\X"),
+            Some("S-1-5-21-9-500")
+        );
+        assert_eq!(user_of(r"HKLM\SOFTWARE\X"), None);
+        assert_eq!(user_of(r"HKU\S-1-5-18\Software\X"), None);
+        assert_eq!(user_of(r"HKU\S-1-5-21-9' ;x\Software"), None);
+        assert_eq!(user_of(r"HKU\S-1-5-21-\Software"), None);
+    }
+
+    #[test]
+    fn definitions_compare_without_the_enabled_flag() {
+        let before = "<?xml version=\"1.0\"?>\r\n<Task>\r\n  <Settings>\r\n    <Enabled>true</Enabled>\r\n  </Settings>\r\n</Task>";
+        let after = "<?xml version=\"1.0\"?>\n<Task>\n<Settings>\n</Settings>\n</Task>\n";
+        assert!(same_definition(before, after));
+        assert!(!same_definition(
+            before,
+            &after.replace("<Settings>", "<Settings><Hidden>true</Hidden>")
+        ));
+    }
+
+    #[test]
+    fn settings_of_a_logged_off_user_are_loaded_for_the_change() {
+        let host = crate::host::fake::FakeHost::default();
+        let key = r"HKU\S-1-5-21-9-500\Software\Approved";
+        host.answer(r"reg.exe query HKU\S-1-5-21-9-500", 1, "");
+        host.answer(
+            &format!(
+                "powershell.exe -NoProfile -NonInteractive -Command {}",
+                profile_query("S-1-5-21-9-500")
+            ),
+            0,
+            "C:\\Users\\admin\r\n",
+        );
+        let seen = with_settings(&host, key, |at| Ok(at.to_string())).unwrap();
+        assert_eq!(seen, r"HKU\anixops-mesh-S-1-5-21-9-500\Software\Approved");
+        let ran = host.ran.borrow();
+        assert!(ran.contains(
+            &r"reg.exe load HKU\anixops-mesh-S-1-5-21-9-500 C:\Users\admin\NTUSER.DAT".to_string()
+        ));
+        assert_eq!(
+            ran.last().map(String::as_str),
+            Some(r"reg.exe unload HKU\anixops-mesh-S-1-5-21-9-500")
+        );
+    }
+
+    #[test]
+    fn settings_that_cannot_be_loaded_fail_the_change() {
+        let host = crate::host::fake::FakeHost::default();
+        let key = r"HKU\S-1-5-21-9-500\Software\Approved";
+        host.answer(r"reg.exe query HKU\S-1-5-21-9-500", 1, "");
+        host.answer(
+            &format!(
+                "powershell.exe -NoProfile -NonInteractive -Command {}",
+                profile_query("S-1-5-21-9-500")
+            ),
+            0,
+            "C:\\Users\\admin\r\n",
+        );
+        host.answer(
+            r"reg.exe load HKU\anixops-mesh-S-1-5-21-9-500 C:\Users\admin\NTUSER.DAT",
+            1,
+            "",
+        );
+        let mut called = false;
+        let result = with_settings(&host, key, |_| {
+            called = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!called);
+
+        // Loaded settings and machine keys are used as they are.
+        let host = crate::host::fake::FakeHost::default();
+        assert_eq!(
+            with_settings(&host, key, |at| Ok(at.to_string())).unwrap(),
+            key
+        );
+        assert_eq!(
+            with_settings(&host, r"HKLM\SOFTWARE\X", |at| Ok(at.to_string())).unwrap(),
+            r"HKLM\SOFTWARE\X"
+        );
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.starts_with("reg.exe load")));
     }
 
     #[test]

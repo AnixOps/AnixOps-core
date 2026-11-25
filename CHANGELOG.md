@@ -6,6 +6,8 @@
 
 ### Security
 
+- anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。
+
 - anixops-mesh 接管按 #329 复审修复（mesh-node `detect`、`takeover`、`host`、`winsvc`、`launchd`，三个安装脚本）：K1 数据来源按所运行的系统选择，Windows 上不再读取 `/proc`、`/etc`、`/var/spool/cron`、`/run/systemd`（在 Windows 上是任何用户可建的 `C:\proc` 等目录，可伪造进程、自启行与导入配置）；K2 Windows 安装脚本对 `%ProgramData%\AnixOps`、`Mesh`、`state` 逐级拒绝链接与非管理员属主，属主设为 Administrators 并整体替换访问列表，程序在 Windows 上读写状态与锁之前逐级检查目录属主、访问列表与联接；K3 macOS 程序改放 `/Library/AnixOps/mesh/bin`；K4 Windows 记录手动进程的 SID，回滚账户不同时不启动；K5 包装服务与 K6 launchd 任务按进程树认领进程；K7 缺少延迟启动标志时从注册表读取；K8 安装脚本区分退出码 1 与 7、文档修正、补 `save record` 测试与 Windows 状态目录的实机测试。
 - anixops-mesh 接管按 #321 复审修复（mesh-node `takeover`、`main`、安装脚本）：改动前检查跳过程序自身服务中的进程，带独立网络命名空间的单元由服务管理器停止与恢复（J1）；改动前预估记录大小，结束进程后会超过读取上限时直接拒绝，撤销或回滚后记录保存失败时报告「save record」并以退出码 7 结束（J2）；`--dry-run` 做同样的检查，拒绝时 `outcome` 为新增的 `refused`（退出码 1、不写记录），三个安装脚本在写入任何文件之前先预检（J3）；`forgotten` 只保留最近 64 条（J4）；文档补子命令参数、清空记录的确切含义与 `native_keys_pending` 期间不判失败（J5、J6a）。`detect`、`import`、`takeover`、`rollback` 在 macOS 与 Windows 上开放。
 - anixops-mesh 接管按 #318 复审收口（mesh-node `takeover`）：在其他网络命名空间运行的进程改在第一步改动之前检查，发现即失败，不再先停服务、注释自启行后才拒绝（H1）；`rollback --forget-process` 移除的进程保留在记录的 `forgotten` 列表中（H2）；记录超过读取上限 1 MiB 时不写入，避免回滚无法读回（H3）。
