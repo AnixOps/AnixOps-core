@@ -40,6 +40,9 @@ use super::traffic::{keys_equal, Receiver, Sender, TrafficError, ROOT_KEY_LEN};
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most sessions held at once, over both namespaces.
 pub const MAX_SESSIONS: usize = 4096;
+/// How long a Create in progress is shared with other msg1 from the same
+/// peer: the handshake timeout (spec §5.3).
+pub const CREATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Relay msg1 remembered per session to answer repeats.
 pub const REMEMBERED_ANSWERS: usize = 16;
 
@@ -166,14 +169,32 @@ fn random_root_key(rng: &dyn SecureRandom) -> Result<[u8; ROOT_KEY_LEN], Session
     Ok(key)
 }
 
-fn next_generation(existing: Option<&Session>) -> u32 {
-    existing.map_or(1, |session| session.generation.wrapping_add(1).max(1))
+/// A Create this node chose and has not installed yet. Wiped on drop.
+struct Creating {
+    generation: u32,
+    root_key: [u8; ROOT_KEY_LEN],
+    ciphers: Ciphers,
+    until: Instant,
+}
+
+impl Drop for Creating {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
+    }
 }
 
 /// The sessions of this node.
+///
+/// Generations only go up within the process, per peer, also across a
+/// session dropped and set up again. While a Create for a peer is in
+/// progress, every other msg1 from it gets the same root key and
+/// generation, so connections set up at once (over TCP and UDP, say) end
+/// up in one session.
 #[derive(Default)]
 pub struct Sessions {
     map: HashMap<SessionKey, Session>,
+    generations: HashMap<SessionKey, u32>,
+    creating: HashMap<SessionKey, Creating>,
 }
 
 impl Sessions {
@@ -207,11 +228,12 @@ impl Sessions {
     /// for [`Namespace::Direct`]). `ciphers.local` is what this node will
     /// announce in msg2, `ciphers.peer` what msg1 announced.
     pub fn server_choice(
-        &self,
+        &mut self,
         key: &SessionKey,
         client_generation: Option<u32>,
         ciphers: Ciphers,
         rng: &dyn SecureRandom,
+        now: Instant,
     ) -> Result<Agreement, SessionError> {
         let existing = self.map.get(key);
         if let Some(session) = existing {
@@ -234,12 +256,64 @@ impl Sessions {
                 }
             }
         }
+        if let Some(creating) = self.creating.get(key) {
+            if now < creating.until && creating.ciphers == ciphers {
+                return Ok(Agreement {
+                    action: Action::Create,
+                    generation: creating.generation,
+                    root_key: creating.root_key,
+                    initial_epoch: 0,
+                });
+            }
+        }
+        let last = self
+            .generations
+            .get(key)
+            .copied()
+            .max(existing.map(Session::generation))
+            .unwrap_or(0);
+        let generation = last.wrapping_add(1).max(1);
+        let root_key = random_root_key(rng)?;
+        self.forget_old_generations();
+        self.generations.insert(key.clone(), generation);
+        self.creating.insert(
+            key.clone(),
+            Creating {
+                generation,
+                root_key,
+                ciphers,
+                until: now + CREATE_TIMEOUT,
+            },
+        );
         Ok(Agreement {
             action: Action::Create,
-            generation: next_generation(existing),
-            root_key: random_root_key(rng)?,
+            generation,
+            root_key,
             initial_epoch: 0,
         })
+    }
+
+    /// Bounds the generation memory: past the limit, peers without a
+    /// session are forgotten.
+    fn forget_old_generations(&mut self) {
+        if self.generations.len() < MAX_SESSIONS * 4 {
+            return;
+        }
+        let map = &self.map;
+        self.generations.retain(|key, _| map.contains_key(key));
+        self.creating.retain(|key, _| map.contains_key(key));
+    }
+
+    /// Drops the Create in progress with `generation` after its handshake
+    /// failed.
+    pub fn abandon(&mut self, key: &SessionKey, generation: u32) {
+        if self
+            .creating
+            .get(key)
+            .is_some_and(|creating| creating.generation == generation)
+        {
+            self.creating.remove(key);
+        }
     }
 
     /// The client's view of msg2: what to install. `root_key` is msg2's.
@@ -350,6 +424,7 @@ impl Sessions {
         if agreement.action == Action::Join {
             return Err(SessionError::NothingToJoin);
         }
+        self.abandon(&key, agreement.generation);
         let peer_id = key.peer_id;
         let session = Session {
             generation: agreement.generation,
@@ -434,7 +509,7 @@ mod tests {
         let direct = key(Namespace::Direct);
 
         let first = sessions
-            .server_choice(&direct, None, c(AES, CHACHA), &rng)
+            .server_choice(&direct, None, c(AES, CHACHA), &rng, now)
             .unwrap();
         assert_eq!(first.action, Action::Create);
         assert_eq!((first.generation, first.initial_epoch), (1, 0));
@@ -443,20 +518,26 @@ mod tests {
             .unwrap();
 
         let join = sessions
-            .server_choice(&direct, Some(1), c(AES, CHACHA), &rng)
+            .server_choice(&direct, Some(1), c(AES, CHACHA), &rng, now)
             .unwrap();
         assert_eq!(join.action, Action::Join);
         assert_eq!(join.root_key, first.root_key);
 
-        // Another generation, none, or other ciphers: a new session.
+        // Another generation, none, or other ciphers: a new session. While
+        // one Create is in progress, msg1 with the same ciphers share it.
+        let mut created = Vec::new();
         for (generation, peer_cipher) in [(Some(5), CHACHA), (None, CHACHA), (Some(1), AES)] {
             let choice = sessions
-                .server_choice(&direct, generation, c(AES, peer_cipher), &rng)
+                .server_choice(&direct, generation, c(AES, peer_cipher), &rng, now)
                 .unwrap();
             assert_eq!(choice.action, Action::Create);
-            assert_eq!(choice.generation, 2);
             assert_ne!(choice.root_key, first.root_key);
+            created.push((choice.generation, choice.root_key));
         }
+        assert_eq!(created[0], created[1]);
+        assert_eq!(created[0].0, 2);
+        assert_eq!(created[2].0, 3, "other ciphers: another Create");
+        assert_ne!(created[2].1, created[0].1);
     }
 
     #[test]
@@ -466,13 +547,13 @@ mod tests {
         let mut sessions = Sessions::new();
         let relay = key(Namespace::Relay);
         let first = sessions
-            .server_choice(&relay, None, c(AES, AES), &rng)
+            .server_choice(&relay, None, c(AES, AES), &rng, now)
             .unwrap();
         sessions
             .install(relay.clone(), &first, 1, c(AES, AES), PEER, now)
             .unwrap();
         let sync = sessions
-            .server_choice(&relay, None, c(AES, AES), &rng)
+            .server_choice(&relay, None, c(AES, AES), &rng, now)
             .unwrap();
         assert_eq!(sync.action, Action::Sync);
         assert_eq!(sync.root_key, first.root_key);
@@ -500,7 +581,9 @@ mod tests {
             peer_id: 1,
             ..key(Namespace::Relay)
         };
-        let created = at_b.server_choice(&b_key, None, c(AES, AES), &rng).unwrap();
+        let created = at_b
+            .server_choice(&b_key, None, c(AES, AES), &rng, now)
+            .unwrap();
         let agreed = at_a
             .client_agreement(
                 &a_key,
@@ -536,7 +619,9 @@ mod tests {
         }
         at_a.invalidate(&a_key);
 
-        let sync = at_b.server_choice(&b_key, None, c(AES, AES), &rng).unwrap();
+        let sync = at_b
+            .server_choice(&b_key, None, c(AES, AES), &rng, now)
+            .unwrap();
         assert_eq!(sync.action, Action::Sync);
         assert_eq!(sync.initial_epoch, 3, "above the initiator's epoch 2");
         let agreed = at_a
@@ -584,7 +669,7 @@ mod tests {
         let mut sessions = Sessions::new();
         let direct = key(Namespace::Direct);
         let first = sessions
-            .server_choice(&direct, None, c(AES, AES), &rng)
+            .server_choice(&direct, None, c(AES, AES), &rng, now)
             .unwrap();
         sessions
             .install(direct.clone(), &first, 1, c(AES, AES), PEER, now)
@@ -593,7 +678,7 @@ mod tests {
         // Another key under the same node ID can neither join nor replace
         // it while it is in use.
         let join = sessions
-            .server_choice(&direct, Some(1), c(AES, AES), &rng)
+            .server_choice(&direct, Some(1), c(AES, AES), &rng, now)
             .unwrap();
         assert_eq!(join.action, Action::Join);
         assert_eq!(
@@ -601,7 +686,7 @@ mod tests {
             Err(SessionError::StaticKeyMismatch)
         );
         let create = sessions
-            .server_choice(&direct, None, c(AES, AES), &rng)
+            .server_choice(&direct, None, c(AES, AES), &rng, now)
             .unwrap();
         assert_eq!(
             sessions.install(direct.clone(), &create, 1, c(AES, AES), OTHER, now),
@@ -628,7 +713,7 @@ mod tests {
         let mut sessions = Sessions::new();
         let relay = key(Namespace::Relay);
         let first = sessions
-            .server_choice(&relay, None, c(AES, AES), &rng)
+            .server_choice(&relay, None, c(AES, AES), &rng, now)
             .unwrap();
         sessions
             .install(relay.clone(), &first, 1, c(AES, AES), PEER, now)
@@ -636,7 +721,7 @@ mod tests {
         let first_id = Uuid([1; 16]);
         sessions.remember_answer(&relay, first_id, &first);
         let sync = sessions
-            .server_choice(&relay, None, c(AES, AES), &rng)
+            .server_choice(&relay, None, c(AES, AES), &rng, now)
             .unwrap();
         sessions
             .install(relay.clone(), &sync, 1, c(AES, AES), PEER, now)
@@ -657,6 +742,40 @@ mod tests {
         }
         assert!(sessions.answered(&relay, first_id).is_none());
         assert!(sessions.answered(&relay, Uuid([10; 16])).is_some());
+    }
+
+    #[test]
+    fn generations_never_go_back_and_a_failed_create_is_dropped() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let direct = key(Namespace::Direct);
+        let first = sessions
+            .server_choice(&direct, None, c(AES, AES), &rng, now)
+            .unwrap();
+        sessions
+            .install(direct.clone(), &first, 1, c(AES, AES), PEER, now)
+            .unwrap();
+        sessions.invalidate(&direct);
+        let again = sessions
+            .server_choice(&direct, None, c(AES, AES), &rng, now)
+            .unwrap();
+        assert_eq!(
+            again.generation, 2,
+            "not 1 again after the session was dropped"
+        );
+
+        // The handshake failed: the next msg1 gets a new Create.
+        sessions.abandon(&direct, again.generation);
+        let third = sessions
+            .server_choice(&direct, None, c(AES, AES), &rng, now)
+            .unwrap();
+        assert_eq!(third.generation, 3);
+        // A Create in progress is shared only until it times out.
+        let later = sessions
+            .server_choice(&direct, None, c(AES, AES), &rng, now + CREATE_TIMEOUT)
+            .unwrap();
+        assert_eq!(later.generation, 4);
     }
 
     #[test]
@@ -703,7 +822,7 @@ mod tests {
             ..key(Namespace::Direct)
         };
         let choice = server
-            .server_choice(&at_server, None, c(CHACHA, AES), &rng)
+            .server_choice(&at_server, None, c(CHACHA, AES), &rng, now)
             .unwrap();
         let agreed = client
             .client_agreement(

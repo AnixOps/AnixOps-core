@@ -2347,6 +2347,7 @@ name = "outbound-mesh"
 version = "0.2.0"
 dependencies = [
  "ring",
+ "ruzstd",
  "serde",
  "serde_json",
  "x25519-dalek",

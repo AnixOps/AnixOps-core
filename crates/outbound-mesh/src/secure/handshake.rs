@@ -296,6 +296,7 @@ pub struct Server {
     noise: HandshakeState,
     conn_id: Uuid,
     client_conn_id: Uuid,
+    peer_id: u32,
     /// `None` for a client of another network.
     pending: Option<(SessionKey, Agreement, Ciphers)>,
     /// The handshake hash after msg2: the client proves over it.
@@ -304,13 +305,16 @@ pub struct Server {
 
 impl Server {
     /// Reads msg1 from `peer_id` (its packet header) and returns msg2. The
-    /// session is chosen now and installed only by [`Server::finish`].
+    /// session is chosen now and installed only by [`Server::finish`]; a
+    /// Create chosen now is shared with other msg1 from the same peer until
+    /// then (see [`Sessions`]).
     pub fn respond(
         local: &Local,
         peer_id: u32,
         msg1: &[u8],
-        sessions: &Sessions,
+        sessions: &mut Sessions,
         rng: &dyn SecureRandom,
+        now: Instant,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
         other_node(local, peer_id)?;
         let mut noise = HandshakeState::new(
@@ -330,7 +334,8 @@ impl Server {
                 local: local.cipher,
                 peer: msg1.cipher,
             };
-            let agreement = sessions.server_choice(&key, msg1.session_generation, ciphers, rng)?;
+            let agreement =
+                sessions.server_choice(&key, msg1.session_generation, ciphers, rng, now)?;
             let reply = Msg2 {
                 network_name: local.network_name.clone(),
                 role_hint: RoleHint::SameNetwork,
@@ -371,6 +376,7 @@ impl Server {
                 noise,
                 conn_id,
                 client_conn_id: msg1.conn_id,
+                peer_id,
                 pending,
                 after_msg2,
             },
@@ -382,6 +388,11 @@ impl Server {
     /// connection closes after msg2 is sent.
     pub fn is_foreign(&self) -> bool {
         self.pending.is_none()
+    }
+
+    /// The node ID msg1 came from.
+    pub fn peer_id(&self) -> u32 {
+        self.peer_id
     }
 
     /// Reads msg3, authenticates the client and installs the session.
@@ -397,6 +408,36 @@ impl Server {
     ) -> Result<Established, HandshakeError> {
         let (key, agreement, ciphers) =
             self.pending.take().ok_or(HandshakeError::ForeignNetwork)?;
+        let result = self.check_msg3(local, expected_static, msg3);
+        let (peer_static, auth) = match result {
+            Ok(checked) => checked,
+            Err(error) => {
+                sessions.abandon(&key, agreement.generation);
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            sessions.install(key.clone(), &agreement, local.id, ciphers, peer_static, now)
+        {
+            sessions.abandon(&key, agreement.generation);
+            return Err(error.into());
+        }
+        Ok(Established {
+            key,
+            peer_static,
+            auth,
+            action: agreement.action,
+            generation: agreement.generation,
+            repeated: false,
+        })
+    }
+
+    fn check_msg3(
+        &mut self,
+        local: &Local,
+        expected_static: Option<[u8; LEN]>,
+        msg3: &[u8],
+    ) -> Result<([u8; LEN], Auth), HandshakeError> {
         let msg3 = Msg3::decode(&self.noise.read_message(msg3)?)?;
         if msg3.client_conn_id_echo != self.client_conn_id
             || msg3.server_conn_id_echo != self.conn_id
@@ -414,15 +455,7 @@ impl Server {
             &self.after_msg2,
             &peer_static,
         )?;
-        sessions.install(key.clone(), &agreement, local.id, ciphers, peer_static, now)?;
-        Ok(Established {
-            key,
-            peer_static,
-            auth,
-            action: agreement.action,
-            generation: agreement.generation,
-            repeated: false,
-        })
+        Ok((peer_static, auth))
     }
 }
 
@@ -562,7 +595,7 @@ pub fn relay_respond(
     let is_repeat = repeated.is_some();
     let agreement = match repeated {
         Some(agreement) => agreement,
-        None => sessions.server_choice(&key, msg1.session_generation, ciphers, rng)?,
+        None => sessions.server_choice(&key, msg1.session_generation, ciphers, rng, now)?,
     };
     let reply = RelayMsg2 {
         action: agreement.action,
@@ -634,8 +667,14 @@ mod tests {
             let now = Instant::now();
             let (client, msg1) =
                 Client::start(&self.client, Some(self.server.id), &self.at_client, &rng)?;
-            let (server, msg2) =
-                Server::respond(&self.server, self.client.id, &msg1, &self.at_server, &rng)?;
+            let (server, msg2) = Server::respond(
+                &self.server,
+                self.client.id,
+                &msg1,
+                &mut self.at_server,
+                &rng,
+                now,
+            )?;
             let (msg3, at_client) = client.finish(
                 &self.client,
                 self.server.id,
@@ -740,8 +779,15 @@ mod tests {
         let mut server = local(2, Some(b"s3cr3t"), Cipher::Aes128Gcm);
         server.network_name = "lab".into();
         let (client_side, msg1) = Client::start(&client, None, &Sessions::new(), &rng).unwrap();
-        let (server_side, msg2) =
-            Server::respond(&server, 1, &msg1, &Sessions::new(), &rng).unwrap();
+        let (server_side, msg2) = Server::respond(
+            &server,
+            1,
+            &msg1,
+            &mut Sessions::new(),
+            &rng,
+            Instant::now(),
+        )
+        .unwrap();
         assert!(server_side.is_foreign());
         let mut sessions = Sessions::new();
         assert_eq!(
@@ -759,7 +805,15 @@ mod tests {
         let client = local(1, Some(b"s3cr3t"), Cipher::Aes128Gcm);
         let server = local(2, Some(b"s3cr3t"), Cipher::Aes128Gcm);
         let (client_side, msg1) = Client::start(&client, None, &Sessions::new(), &rng).unwrap();
-        let (_, mut msg2) = Server::respond(&server, 1, &msg1, &Sessions::new(), &rng).unwrap();
+        let (_, mut msg2) = Server::respond(
+            &server,
+            1,
+            &msg1,
+            &mut Sessions::new(),
+            &rng,
+            Instant::now(),
+        )
+        .unwrap();
         let last = msg2.len() - 1;
         msg2[last] ^= 1;
         assert_eq!(
@@ -783,18 +837,18 @@ mod tests {
         let now = Instant::now();
         let a = local(4, Some(b"s3cr3t"), Cipher::Aes128Gcm);
         let b = local(4, Some(b"s3cr3t"), Cipher::Aes128Gcm);
-        let sessions = Sessions::new();
+        let mut sessions = Sessions::new();
         assert_eq!(
             Client::start(&a, Some(4), &sessions, &rng).err(),
             Some(HandshakeError::SameNodeId)
         );
         let (client, msg1) = Client::start(&a, None, &sessions, &rng).unwrap();
         assert_eq!(
-            Server::respond(&b, 4, &msg1, &sessions, &rng).err(),
+            Server::respond(&b, 4, &msg1, &mut sessions, &rng, now).err(),
             Some(HandshakeError::SameNodeId)
         );
         let other = local(5, Some(b"s3cr3t"), Cipher::Aes128Gcm);
-        let (_, msg2) = Server::respond(&other, 4, &msg1, &sessions, &rng).unwrap();
+        let (_, msg2) = Server::respond(&other, 4, &msg1, &mut sessions, &rng, now).unwrap();
         let mut at_a = Sessions::new();
         assert_eq!(
             client.finish(&a, 4, None, &msg2, &mut at_a, now).err(),
@@ -832,7 +886,7 @@ mod tests {
         let (at_client, mut at_server) = (Sessions::new(), Sessions::new());
 
         let (client_side, msg1) = Client::start(&client, Some(2), &at_client, &rng).unwrap();
-        let (_, msg2) = Server::respond(&server, 1, &msg1, &at_server, &rng).unwrap();
+        let (_, msg2) = Server::respond(&server, 1, &msg1, &mut at_server, &rng, now).unwrap();
         assert_eq!(
             client_side
                 .finish(
@@ -848,7 +902,8 @@ mod tests {
         );
 
         let (client_side, msg1) = Client::start(&client, Some(2), &at_client, &rng).unwrap();
-        let (server_side, msg2) = Server::respond(&server, 1, &msg1, &at_server, &rng).unwrap();
+        let (server_side, msg2) =
+            Server::respond(&server, 1, &msg1, &mut at_server, &rng, now).unwrap();
         let (msg3, _) = client_side
             .finish(&client, 2, None, &msg2, &mut Sessions::new(), now)
             .unwrap();
@@ -876,7 +931,7 @@ mod tests {
         let impostor = local(1, Some(b"s3cr3t"), Cipher::Aes128Gcm);
         let (client_side, msg1) = Client::start(&impostor, None, &Sessions::new(), &rng).unwrap();
         let (server_side, msg2) =
-            Server::respond(&pair.server, 1, &msg1, &pair.at_server, &rng).unwrap();
+            Server::respond(&pair.server, 1, &msg1, &mut pair.at_server, &rng, now).unwrap();
         let (msg3, _) = client_side
             .finish(&impostor, 2, None, &msg2, &mut Sessions::new(), now)
             .unwrap();
