@@ -458,10 +458,7 @@ impl RouteSync {
         let keep_ours = request.is_initiator && target == Some(peer) && my_id < peer;
         session.they_initiate = request.is_initiator && !keep_ours;
         let mine = session.mine;
-        if session.they_initiate && target == Some(peer) {
-            self.target = None;
-        }
-        self.choose_target();
+        let they_initiate = session.they_initiate;
 
         let mut changed = false;
         for info in request.peer_infos {
@@ -473,6 +470,11 @@ impl RouteSync {
         if changed {
             self.rebuild();
         }
+        // Chosen after the merge, so the NAT types just learned count.
+        if they_initiate && target == Some(peer) {
+            self.target = None;
+        }
+        self.choose_target();
         SyncRouteResponse {
             is_initiator: self.target == Some(peer),
             session_id: mine,
