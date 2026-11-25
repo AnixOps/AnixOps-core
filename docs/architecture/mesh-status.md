@@ -38,8 +38,8 @@
 | `network.state` | `joined`、`joining`、`partial`（部分成员不可达）、`not_joined`、`failed` |
 | `network.security` | `forward_secrecy`（安全模式）、`standard`（默认模式，未启用前向保密）、`none`（显式选择的不加密，需求 R14） |
 | `network.kind` | `managed`、`legacy`（配置里的 `network.kind`，规范 §5.2） |
-| `network.limitations` | 字符串列表，空列表表示没有限制；只在安全模式网络上给出，旧模式网络为空列表（旧模式另由 `security` 标出）。`reference_peers`：`network.kind` 为 `legacy`（旧网本来就由原版节点组成），或至少一个在线成员的 `implementation` 为 `reference`；与这些成员之间的会话保密性以参考实现为上限（规范 §19.2 第 5 条），界面显示「含原版节点，保密性受限」。`unverified_peers`：`managed` 网络中没有 `reference` 成员，但至少一个在线成员为 `unknown`；界面显示较弱的提示「无法确认对端实现」 |
-| `members[].implementation` | `native`（我方节点程序）、`reference`（原版实现）、`unknown`（尚不能判断）。判定用的是**经握手认证**的对端静态公钥：直连邻居取 Noise XX 握手中认证的静态公钥，经中继的成员取已建立的中继会话（Noise IK）中认证的静态公钥；还没有会话的成员只有路由信息字段 18 中的自报公钥，一律为 `unknown`。认证后的公钥与配置 `network.native_keys`（面板经 Agent 下发的我方节点静态公钥清单，见 `mesh-module.md`）比较：在清单中为 `native`；清单存在但不在其中为 `reference`；配置没有该清单（独立节点等）时为 `unknown`。旧模式网络没有静态公钥认证，一律为 `unknown` |
+| `network.limitations` | 字符串列表，空列表表示没有限制；只在安全模式网络上给出，旧模式网络为空列表（旧模式另由 `security` 标出）。`reference_peers`：`network.kind` 为 `legacy` 且为安全模式（旧网本来就由原版节点组成）；与原版节点之间的会话保密性以参考实现为上限（规范 §19.2 第 5 条），界面显示「含原版节点，保密性受限」。`managed` 网络按规范 §8.3.1 只接纳 `native_keys` 中的我方节点，不会出现该值。`unverified_peers`：保留值，当前不再产生（原用于 `managed` 网络中实现无法判定的成员）；客户端仍应能显示它，提示「无法确认对端实现」 |
+| `members[].implementation` | `native`（我方节点程序）、`reference`（原版实现）、`unknown`（尚不能判断）。判定用的是**经握手认证**的对端静态公钥：直连邻居取 Noise XX 握手中认证的静态公钥，经中继的成员取已建立的中继会话（Noise IK）中认证的静态公钥；还没有会话的成员只有路由信息字段 18 中的自报公钥，一律为 `unknown`。认证后的公钥与配置 `network.native_keys`（面板经 Agent 下发的我方节点静态公钥清单，见 `mesh-module.md`）比较：在清单中为 `native`；清单存在但不在其中为 `reference`；配置没有该清单时为 `unknown`。`managed` 网络必须有清单，且不在清单中的对端握手被拒（规范 §8.3.1），所以已有会话的成员一律为 `native`，`reference` 只出现在带清单的 `legacy` 网络中。旧模式网络没有静态公钥认证，一律为 `unknown` |
 | `network.failure` | `null` 或 `{ "code", "detail" }`，`code` 见下表；`detail` 只给人看 |
 | `network.joining` | `null` 或 `{ "stage": "connecting" \| "assigning_address" \| "measuring_regions", "peersConnected" }` |
 | `routingPolicy` | `hops`、`latency` |
@@ -73,6 +73,7 @@
 | `unencrypted_refused` | 对端不加密而本机未显式选择 `none` |
 | `port_in_use` | 监听端口被占用，`detail` 为传输与端口 |
 | `tun_in_use` | 虚拟网卡名称已被占用 |
+| `peer_not_native` | `managed` 网络中，对端经握手认证的静态公钥不在 `network.native_keys` 中，握手被拒（规范 §8.3.1）；`detail` 为对端节点 ID。通常是原版节点或尚未列入清单的新节点 |
 | `route_overlap` | 虚拟网段或要装的路由与本机已有路由冲突，`detail` 为网段 |
 | `address_in_use` | 虚拟地址已被本机其他接口使用 |
 | `identity_online` | 同一节点身份已在别处在线 |
