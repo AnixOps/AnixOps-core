@@ -18,6 +18,8 @@ pub mod convert;
 pub mod detect;
 #[cfg(target_os = "macos")]
 pub mod forward_macos;
+#[cfg(windows)]
+pub mod forward_windows;
 pub mod host;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod host_routes;

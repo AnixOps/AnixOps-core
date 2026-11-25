@@ -1,5 +1,6 @@
 //! Host changes a Windows mesh node needs when it advertises subnets or relays:
-//! interface-level IP forwarding and inbound firewall rules.
+//! interface-level IP forwarding, inbound firewall rules and source address
+//! translation (WinNAT) of the virtual subnet towards the advertised subnets.
 //!
 //! Both are owned by guards. Dropping a guard puts the host back; what a guard
 //! changed is also written to a state directory, so a process that died with a
@@ -14,10 +15,15 @@
 //!   ports, and inbound traffic to this program from the mesh adapter. Traffic
 //!   the host forwards is not subject to host inbound rules, so no broader rule
 //!   is added for it.
+//! - Source address translation is one WinNAT object per network, named from
+//!   the same prefix and label, whose internal prefix is the network's IPv4
+//!   virtual subnet. Hosts on an advertised subnet then answer the machine's
+//!   own LAN address and need no route back into the mesh.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -62,6 +68,9 @@ pub struct RecoveryReport {
     pub forwarding_failed: usize,
     /// Whether leftover rules of [`MESH_FIREWALL_GROUP`] were removed.
     pub firewall_cleared: bool,
+    /// Whether leftover translation objects named from
+    /// [`MESH_FIREWALL_RULE_PREFIX`] were removed.
+    pub nat_cleared: bool,
 }
 
 /// The part of a network name used in rule names: ASCII letters, digits, `-`
@@ -102,6 +111,26 @@ pub fn firewall_rule_names(network: &str) -> [String; 3] {
         format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-listen-tcp"),
         format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-adapter"),
     ]
+}
+
+/// Name of the WinNAT object created for `network`.
+pub fn nat_name(network: &str) -> String {
+    format!("{MESH_FIREWALL_RULE_PREFIX}-{}", network_label(network))
+}
+
+/// The internal prefix of a WinNAT object, `a.b.c.d/n`, for the IPv4 subnet
+/// holding `address`. Errors for a prefix length WinNAT cannot take (only
+/// /1 to /30 leave room for the host and a peer).
+pub fn nat_prefix(address: Ipv4Addr, prefix: u8) -> io::Result<String> {
+    if !(1..=30).contains(&prefix) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the translated subnet must be /1 to /30",
+        ));
+    }
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    let network = Ipv4Addr::from(u32::from(address) & mask);
+    Ok(format!("{network}/{prefix}"))
 }
 
 /// Listen ports as a comma-separated list, sorted and without duplicates or
@@ -218,14 +247,14 @@ impl Holdings {
 
 #[cfg(windows)]
 pub use native::{
-    add_mesh_firewall_rules, enable_mesh_forwarding, recover_mesh_host, FirewallGuard,
-    ForwardingGuard,
+    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, recover_mesh_host,
+    FirewallGuard, ForwardingGuard, NatGuard,
 };
 
 #[cfg(not(windows))]
 pub use unsupported::{
-    add_mesh_firewall_rules, enable_mesh_forwarding, recover_mesh_host, FirewallGuard,
-    ForwardingGuard,
+    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, recover_mesh_host,
+    FirewallGuard, ForwardingGuard, NatGuard,
 };
 
 #[cfg(not(windows))]
@@ -246,6 +275,15 @@ mod unsupported {
     /// Holds the mesh firewall rules of one network; Windows only.
     #[derive(Debug)]
     pub struct FirewallGuard(());
+
+    /// Holds the translation object of one network; Windows only.
+    #[derive(Debug)]
+    pub struct NatGuard(());
+
+    pub fn add_mesh_nat(network: &str, address: Ipv4Addr, prefix: u8) -> io::Result<NatGuard> {
+        let _ = (network, address, prefix);
+        Err(unsupported())
+    }
 
     pub fn enable_mesh_forwarding(
         state_dir: &Path,
@@ -467,6 +505,12 @@ Get-NetFirewallRule -Group $env:ANIX_MESH_GROUP -ErrorAction SilentlyContinue | 
     /// Runs a fixed script; every variable value is passed through the
     /// environment, never spliced into the script text.
     fn run_firewall_script(script: &str, values: &[(&str, String)]) -> io::Result<()> {
+        run_script(script, values, "the firewall rules could not be changed")
+    }
+
+    /// Runs a fixed script with `values` in the environment; `failure` is the
+    /// error text when it does not succeed.
+    fn run_script(script: &str, values: &[(&str, String)], failure: &str) -> io::Result<()> {
         let mut command = native_windows_powershell_command()?;
         command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -477,7 +521,7 @@ Get-NetFirewallRule -Group $env:ANIX_MESH_GROUP -ErrorAction SilentlyContinue | 
             command.env(name, value);
         }
         if !command.status()?.success() {
-            return Err(io::Error::other("the firewall rules could not be changed"));
+            return Err(io::Error::other(failure.to_owned()));
         }
         Ok(())
     }
@@ -521,9 +565,60 @@ Get-NetFirewallRule -Group $env:ANIX_MESH_GROUP -ErrorAction SilentlyContinue | 
         Ok(guard)
     }
 
+    /// Holds the WinNAT object of one network. Dropping it removes it.
+    #[derive(Debug)]
+    pub struct NatGuard {
+        name: String,
+    }
+
+    impl Drop for NatGuard {
+        fn drop(&mut self) {
+            let _ = run_script(
+                NAT_REMOVE_SCRIPT,
+                &[("ANIX_MESH_NAT", self.name.clone())],
+                "the address translation could not be removed",
+            );
+        }
+    }
+
+    const NAT_ADD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Get-NetNat -Name $env:ANIX_MESH_NAT -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false
+New-NetNat -Name $env:ANIX_MESH_NAT -InternalIPInterfaceAddressPrefix $env:ANIX_MESH_PREFIX | Out-Null
+"#;
+
+    const NAT_REMOVE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Get-NetNat -Name $env:ANIX_MESH_NAT -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false
+"#;
+
+    const NAT_CLEAR_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -like ($env:ANIX_MESH_NAT_PREFIX + '-*') } | Remove-NetNat -Confirm:$false
+"#;
+
+    /// Translates the sources of `network`'s IPv4 virtual subnet (the subnet
+    /// holding `address`) to the address of the interface they leave
+    /// through. An object of the same name left from an earlier run is
+    /// replaced. Fails where WinNAT is missing or takes no further object.
+    pub fn add_mesh_nat(network: &str, address: Ipv4Addr, prefix: u8) -> io::Result<NatGuard> {
+        let internal = nat_prefix(address, prefix)?;
+        let guard = NatGuard {
+            name: nat_name(network),
+        };
+        // A failure part-way drops the guard, which removes what was added.
+        run_script(
+            NAT_ADD_SCRIPT,
+            &[
+                ("ANIX_MESH_NAT", guard.name.clone()),
+                ("ANIX_MESH_PREFIX", internal),
+            ],
+            "the address translation could not be added",
+        )?;
+        Ok(guard)
+    }
+
     /// Puts back what a process that died with guards alive left behind:
-    /// restores forwarding values recorded in `state_dir` and removes every
-    /// rule of [`MESH_FIREWALL_GROUP`]. Call once at start, before any guard
+    /// restores forwarding values recorded in `state_dir`, removes every
+    /// rule of [`MESH_FIREWALL_GROUP`] and every WinNAT object whose name
+    /// starts with [`MESH_FIREWALL_RULE_PREFIX`] and `-`. Call once at start, before any guard
     /// is taken.
     pub fn recover_mesh_host(state_dir: &Path) -> io::Result<RecoveryReport> {
         let slot = HOLDINGS.lock().unwrap_or_else(|e| e.into_inner());
@@ -550,6 +645,12 @@ Get-NetFirewallRule -Group $env:ANIX_MESH_GROUP -ErrorAction SilentlyContinue | 
         write_state(state_dir, &left)?;
         drop(slot);
         report.firewall_cleared = run_firewall_script(CLEAR_SCRIPT, &[]).is_ok();
+        report.nat_cleared = run_script(
+            NAT_CLEAR_SCRIPT,
+            &[("ANIX_MESH_NAT_PREFIX", MESH_FIREWALL_RULE_PREFIX.to_owned())],
+            "the address translation could not be removed",
+        )
+        .is_ok();
         Ok(report)
     }
 }
@@ -590,6 +691,23 @@ mod tests {
         assert!(label.len() <= MAX_NETWORK_LABEL);
         assert_ne!(label, network_label(&"n".repeat(201)));
         assert!(!firewall_rule_names(&long)[0].contains(','));
+    }
+
+    #[test]
+    fn translation_objects_are_named_and_cover_the_virtual_subnet() {
+        assert_eq!(nat_name("office-1"), "AnixOpsMesh-office-1");
+        assert!(nat_name("a,b").starts_with("AnixOpsMesh-a_b-"));
+        assert_eq!(
+            nat_prefix(Ipv4Addr::new(10, 144, 3, 7), 24).unwrap(),
+            "10.144.3.0/24"
+        );
+        assert_eq!(
+            nat_prefix(Ipv4Addr::new(100, 100, 255, 1), 10).unwrap(),
+            "100.64.0.0/10"
+        );
+        assert!(nat_prefix(Ipv4Addr::new(10, 0, 0, 1), 0).is_err());
+        assert!(nat_prefix(Ipv4Addr::new(10, 0, 0, 1), 31).is_err());
+        assert!(nat_prefix(Ipv4Addr::new(10, 0, 0, 1), 32).is_err());
     }
 
     #[test]
@@ -686,6 +804,12 @@ mod tests {
         );
         assert_eq!(
             recover_mesh_host(&dir).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            add_mesh_nat("n", Ipv4Addr::new(10, 0, 0, 1), 24)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::Unsupported
         );
     }

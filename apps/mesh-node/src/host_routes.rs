@@ -35,7 +35,7 @@ pub use macos::{host_links, host_routes};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{host_links, host_routes, local_networks};
+pub use windows::{host_links, host_routes, local_interfaces, local_networks};
 
 /// Names our mesh interfaces start with: `anixmesh0` for `run`,
 /// `anixmesh-<n>` for the managed networks.
@@ -97,9 +97,55 @@ pub fn foreign_virtual_routes(
     found
 }
 
+/// The LAN interfaces that carry each advertised subnet: those with an
+/// address whose network overlaps it. `interfaces` lists (name, address
+/// network) pairs; `own` is the mesh interface.
+pub fn lan_interfaces(
+    interfaces: &[(String, IpNet)],
+    advertised: &[IpNet],
+    own: &str,
+) -> Vec<(String, IpNet)> {
+    let mut found = Vec::new();
+    for subnet in advertised {
+        for (name, network) in interfaces {
+            if name != own && network.overlaps(subnet) {
+                found.push((name.clone(), *subnet));
+            }
+        }
+    }
+    found.sort_by_key(|(name, net)| (name.clone(), net.to_string()));
+    found.dedup();
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertised_subnets_find_their_interfaces() {
+        let interfaces = vec![
+            ("en0".to_string(), net("192.168.1.10/24")),
+            ("utun4".to_string(), net("10.144.0.5/24")),
+            ("en1".to_string(), net("172.16.5.2/24")),
+        ];
+        let found = lan_interfaces(
+            &interfaces,
+            &[
+                net("192.168.1.0/24"),
+                net("10.144.0.0/24"),
+                net("172.16.0.0/16"),
+            ],
+            "utun4",
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("en0".to_string(), net("192.168.1.0/24")),
+                ("en1".to_string(), net("172.16.0.0/16")),
+            ]
+        );
+    }
 
     fn net(text: &str) -> IpNet {
         IpNet::parse(text).unwrap()

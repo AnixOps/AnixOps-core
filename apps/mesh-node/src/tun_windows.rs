@@ -22,7 +22,7 @@ use platform_windows::tun::{
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-pub use crate::host_routes::local_networks;
+pub use crate::host_routes::{local_interfaces, local_networks};
 
 /// Packets queued between the reader thread and [`Tun::recv`].
 const QUEUE: usize = 256;

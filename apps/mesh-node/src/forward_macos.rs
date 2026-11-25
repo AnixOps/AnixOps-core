@@ -150,27 +150,6 @@ pub fn nat_rules(lan: &[(String, IpNet)], sources: &[IpNet]) -> String {
     rules
 }
 
-/// The LAN interfaces that carry each advertised subnet: those with an
-/// address whose network overlaps it. `interfaces` lists (name, address
-/// network) pairs; `own` is the mesh interface.
-pub fn lan_interfaces(
-    interfaces: &[(String, IpNet)],
-    advertised: &[IpNet],
-    own: &str,
-) -> Vec<(String, IpNet)> {
-    let mut found = Vec::new();
-    for subnet in advertised {
-        for (name, network) in interfaces {
-            if name != own && network.overlaps(subnet) {
-                found.push((name.clone(), *subnet));
-            }
-        }
-    }
-    found.sort_by_key(|(name, net)| (name.clone(), net.to_string()));
-    found.dedup();
-    found
-}
-
 /// The token in `pfctl -E` output (`Token : 12345`).
 pub fn parse_token(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
@@ -356,7 +335,7 @@ impl HostForwarding {
         sources: &[IpNet],
         ipv6: bool,
     ) -> io::Result<(Self, Vec<String>)> {
-        let lan = lan_interfaces(interfaces, advertised, mesh_interface);
+        let lan = crate::host_routes::lan_interfaces(interfaces, advertised, mesh_interface);
         let mut warnings: Vec<String> = advertised
             .iter()
             .filter(|subnet| !lan.iter().any(|(_, net)| net == *subnet))
@@ -488,31 +467,6 @@ mod tests {
         // An interface name pf would misread is skipped.
         let odd = vec![("en0; pass".to_string(), net("192.168.1.0/24"))];
         assert_eq!(nat_rules(&odd, &sources), "");
-    }
-
-    #[test]
-    fn advertised_subnets_find_their_interfaces() {
-        let interfaces = vec![
-            ("en0".to_string(), net("192.168.1.10/24")),
-            ("utun4".to_string(), net("10.144.0.5/24")),
-            ("en1".to_string(), net("172.16.5.2/24")),
-        ];
-        let found = lan_interfaces(
-            &interfaces,
-            &[
-                net("192.168.1.0/24"),
-                net("10.144.0.0/24"),
-                net("172.16.0.0/16"),
-            ],
-            "utun4",
-        );
-        assert_eq!(
-            found,
-            vec![
-                ("en0".to_string(), net("192.168.1.0/24")),
-                ("en1".to_string(), net("172.16.0.0/16")),
-            ]
-        );
     }
 
     #[test]

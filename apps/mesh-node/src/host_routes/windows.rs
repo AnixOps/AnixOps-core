@@ -165,6 +165,15 @@ pub fn host_links() -> io::Result<HashMap<u32, HostLink>> {
 /// The address networks of every interface but loopback and those `skip`
 /// names (by alias).
 pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8)>> {
+    Ok(local_interfaces(skip)?
+        .into_iter()
+        .map(|(_, address, prefix)| (address, prefix))
+        .collect())
+}
+
+/// Every unicast address with the alias of its interface and its on-link
+/// prefix, leaving out loopback and the interfaces `skip` names.
+pub fn local_interfaces(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(String, IpAddr, u8)>> {
     let interfaces = interfaces()?;
     let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
     // SAFETY: the function fills `table`, freed below.
@@ -185,14 +194,18 @@ pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8
     unsafe { FreeMibTable(table.cast()) };
     Ok(rows
         .iter()
-        .filter(|row| {
-            interfaces.get(&row.InterfaceIndex).is_none_or(|interface| {
-                interface.kind != IF_TYPE_SOFTWARE_LOOPBACK && !skip(&interface.alias)
-            })
-        })
         .filter_map(|row| {
+            let alias = match interfaces.get(&row.InterfaceIndex) {
+                Some(interface) => {
+                    if interface.kind == IF_TYPE_SOFTWARE_LOOPBACK || skip(&interface.alias) {
+                        return None;
+                    }
+                    interface.alias.clone()
+                }
+                None => String::new(),
+            };
             let address = address_of(&row.Address)?;
-            (!address.is_loopback()).then_some((address, row.OnLinkPrefixLength))
+            (!address.is_loopback()).then_some((alias, address, row.OnLinkPrefixLength))
         })
         .collect())
 }
@@ -243,5 +256,7 @@ mod tests {
             .all(|route| route.destination == route.destination.trunc()));
         let networks = local_networks(|_| false).expect("addresses");
         assert!(networks.iter().all(|(address, _)| !address.is_loopback()));
+        let named = local_interfaces(|_| false).expect("addresses");
+        assert_eq!(named.len(), networks.len());
     }
 }
