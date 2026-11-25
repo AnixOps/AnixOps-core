@@ -149,6 +149,9 @@ pub struct Counters {
     /// Route sync sessions closed because a connection graph could not be
     /// delivered in time (spec §12.2).
     pub graph_timeouts: u64,
+    /// Nodes refused or reachable nodes evicted because the node table is
+    /// full (spec §12.3, §12.4).
+    pub refused_at_capacity: u64,
 }
 
 /// The last oversized synchronisation, for the alert of spec §11.2 and
@@ -399,6 +402,7 @@ impl Node {
             cut_graphs: refused.cut_graphs,
             refused_not_native: refused.not_native,
             graph_timeouts: refused.graph_timeouts,
+            refused_at_capacity: refused.at_capacity,
             ..self.counters
         }
     }

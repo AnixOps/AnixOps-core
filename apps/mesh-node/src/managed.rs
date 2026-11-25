@@ -509,6 +509,21 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             ),
         });
     }
+    let counters = &snapshot.counters;
+    if counters.refused_at_capacity > 0 || counters.refused_over_budget > 0 {
+        status.alerts.push(Alert {
+            code: AlertCode::SyncOversize,
+            address: None,
+            peer: String::new(),
+            detail: format!(
+                "capacity: node table full ({} entries) or information budget (16 MiB) reached; \
+                 {} refused or evicted at the table limit, {} refused over the budget",
+                outbound_mesh::route::sync::MAX_NODES,
+                counters.refused_at_capacity,
+                counters.refused_over_budget
+            ),
+        });
+    }
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -726,5 +741,14 @@ mod tests {
         fill_running(&mut status, &base, &undelivered);
         assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
         assert!(status.alerts[0].detail.starts_with("undelivered:"));
+
+        let mut full = Snapshot::default();
+        full.counters.refused_at_capacity = 3;
+        let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut status, &base, &full);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
+        assert!(status.alerts[0].detail.starts_with("capacity:"));
+        assert!(status.alerts[0].detail.contains("3 refused"));
     }
 }

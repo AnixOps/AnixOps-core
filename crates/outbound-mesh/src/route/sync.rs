@@ -104,6 +104,10 @@ pub struct Refused {
     /// Node information whose own static key is off the native key list
     /// (spec §8.3.1 rule 4).
     pub not_native: u64,
+    /// Node information or connection rows of new nodes refused, or reachable
+    /// nodes evicted, because [`MAX_NODES`] entries are stored: the network is
+    /// larger than one node keeps (spec §12.3, §12.4).
+    pub at_capacity: u64,
     /// Sessions closed because a connection graph could not be delivered,
     /// even cut by half, within two [`GRAPH_DEADLINE`]s (spec §12.2).
     pub graph_timeouts: u64,
@@ -711,12 +715,16 @@ impl RouteSync {
                 let victim = match unreachable {
                     Some(id) => id,
                     None if self.sessions.contains_key(&info.peer_id) => {
+                        self.refused.at_capacity += 1;
                         match self.farthest_non_neighbour() {
                             Some(id) => id,
                             None => return false,
                         }
                     }
-                    None => return false,
+                    None => {
+                        self.refused.at_capacity += 1;
+                        return false;
+                    }
                 };
                 self.remove_node(victim);
             }
@@ -796,6 +804,7 @@ impl RouteSync {
                 continue;
             }
             if known.is_none() && self.rows.len() >= MAX_NODES {
+                self.refused.at_capacity += 1;
                 continue;
             }
             let replaced = known.map_or(0, |known| known.neighbours.len());
@@ -1706,6 +1715,7 @@ mod tests {
         };
         a.on_request(2, fill, now);
         assert_eq!(a.infos().count(), MAX_NODES);
+        assert_eq!(a.refused().at_capacity, 0);
         let late = SyncRouteRequest {
             my_peer_id: 2,
             my_session_id: 1,
@@ -1716,6 +1726,8 @@ mod tests {
         // for long yet: once marked, the longest unreachable makes room.
         a.on_request(2, late.clone(), now);
         assert!(a.info(99_999).is_none());
+        // The refusal is counted: the network is larger than the table.
+        assert_eq!(a.refused().at_capacity, 1);
         a.expire(now);
         // Only after the grace period.
         a.on_request(2, late.clone(), now);
