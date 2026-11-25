@@ -64,6 +64,10 @@ ip netns exec bridge sysctl -qw net.ipv4.ip_forward=0
 [[ "$(ip netns exec bridge cat /proc/sys/net/ipv4/ip_forward)" == 0 ]] || fail "forwarding starts off"
 expect_blocked member -I 10.150.0.2 100.100.0.5
 
+# Recheck #357 Y1: the capability probe loads inet NAT and leaves nothing.
+if ip netns exec bridge "${BIN}" probe; then pass "probe succeeds"; else fail "probe succeeds"; fi
+if [[ -z "$(ip netns exec bridge nft list tables)" ]]; then pass "probe leaves no table"; else fail "probe leaves no table"; fi
+
 config='{"interface":"ext0","routes":["100.100.0.5"],"allow":["10.150.0.2/32"]}'
 out="$(ip netns exec bridge "${BIN}" apply "${MESH_IF}" "${config}" 10.150.0.0/16 10.150.0.1)"
 echo "${out}"

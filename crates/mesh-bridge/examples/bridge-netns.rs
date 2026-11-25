@@ -7,6 +7,7 @@
 //! bridge-netns remove MESH_IF
 //! bridge-netns counters MESH_IF
 //! bridge-netns cleanup
+//! bridge-netns probe
 //! ```
 //!
 //! `apply` keeps the rules and forwarding after it exits (the script
@@ -76,6 +77,10 @@ fn main() -> ExitCode {
                 Err(error) => fail(&error.to_string()),
             }
         }
+        ["probe"] => match mesh_bridge::probe(host.as_ref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(&error.to_string()),
+        },
         ["cleanup"] => match mesh_bridge::cleanup_all(host.as_ref()) {
             Ok(removed) => {
                 println!("{removed}");

@@ -15,6 +15,8 @@
 //! - [`conntrack`]: deleting the tracked connections a narrowed or
 //!   removed bridge no longer allows.
 //! - [`status`]: `externalBridge` of the status API and its digests.
+//! - [`lock`]: the host-wide lock that keeps a second node program from
+//!   cleaning up the first one's tables.
 //!
 //! The mesh module itself (`outbound-mesh`) is only read from: wiring the
 //! section into the network config, the route advertisement (field 5) and
@@ -24,13 +26,15 @@
 pub mod apply;
 pub mod config;
 pub mod conntrack;
+pub mod lock;
 pub mod ruleset;
 pub mod status;
 
 pub use apply::{
-    cleanup_all, ApplyError, Bridge, BridgeAlert, Counters, Forwarding, Host, SystemHost,
+    cleanup_all, probe, ApplyError, Bridge, BridgeAlert, Counters, Forwarding, Host, SystemHost,
 };
 pub use config::{BridgeError, ExternalBridge, ExternalBridgeConfig};
+pub use lock::HostLock;
 pub use status::BridgeStatus;
 
 /// The capability name a kernel lists once the node program applies

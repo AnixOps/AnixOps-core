@@ -453,6 +453,16 @@ impl Drop for Bridge {
     }
 }
 
+/// Whether this host can run a bridge (spec §15.12; recheck of #357 Y1):
+/// `nft` is present and the kernel accepts what a bridge loads, `inet` NAT
+/// with `masquerade` included. The probe table is created and deleted in
+/// one transaction, so nothing stays. A node declares
+/// [`crate::FEATURE`] only when this succeeds.
+pub fn probe(host: &dyn Host) -> io::Result<()> {
+    host.nft(&["-f", "-"], Some(&ruleset::render_probe()))
+        .map(|_| ())
+}
+
 /// Removes every bridge table this program may have left on the host
 /// (spec §15.12 item 9): at start-up, before anything is installed again,
 /// to clear what a crashed run left; and at exit, after the bridges are
@@ -874,6 +884,15 @@ mod tests {
                 pair("100.64.0.5", "100.100.0.1"),
             ]
         );
+    }
+
+    #[test]
+    fn the_probe_leaves_no_table_and_reports_a_refusal() {
+        let (host, _) = setup("0", "0");
+        probe(host.as_ref()).unwrap();
+        assert!(host.tables.lock().unwrap().is_empty());
+        *host.fail_nft.lock().unwrap() = true;
+        assert!(probe(host.as_ref()).is_err());
     }
 
     #[test]

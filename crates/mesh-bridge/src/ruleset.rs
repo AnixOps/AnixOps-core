@@ -170,6 +170,34 @@ pub fn render_removal(mesh_interface: &str) -> String {
     format!("table inet {table}\ndelete table inet {table}\n")
 }
 
+/// The table the capability probe uses. It is not a bridge table
+/// ([`is_own_table`] is false): the probe creates and deletes it in one
+/// transaction, so it is never left behind.
+pub const PROBE_TABLE: &str = "anixops_bridge_probe";
+
+/// One transaction that sets up what a bridge needs (an `inet` table, a
+/// filter chain with `ct state`, a NAT chain with `masquerade`, an interval
+/// set) and deletes it again. It loads only where the kernel supports all
+/// of it; older kernels (e.g. before 5.2, no `inet` NAT) refuse it.
+pub fn render_probe() -> String {
+    format!(
+        "table inet {PROBE_TABLE}\n\
+         delete table inet {PROBE_TABLE}\n\
+         table inet {PROBE_TABLE} {{\n\
+         \tset probe_v4 {{\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = {{ 10.0.0.0/8 }}\n\t}}\n\
+         \tchain forward {{\n\
+         \t\ttype filter hook forward priority filter; policy accept;\n\
+         \t\tiifname \"lo\" ip saddr @probe_v4 ct state established,related accept\n\
+         \t}}\n\
+         \tchain postrouting {{\n\
+         \t\ttype nat hook postrouting priority srcnat; policy accept;\n\
+         \t\toifname \"lo\" ip saddr @probe_v4 masquerade\n\
+         \t}}\n\
+         }}\n\
+         delete table inet {PROBE_TABLE}\n"
+    )
+}
+
 /// Whether `name` is one of our tables: the prefix, then the hex of a
 /// non-empty interface name as [`table_name`] writes it. This prefix is the
 /// mark spec §15.12 item 9 cleans up by; nothing else is touched.
@@ -201,6 +229,19 @@ pub fn render_cleanup<'a>(tables: impl IntoIterator<Item = (&'a str, &'a str)>) 
 mod tests {
     use super::*;
     use crate::config::ExternalBridgeConfig;
+
+    #[test]
+    fn the_probe_leaves_nothing_and_is_not_a_bridge_table() {
+        let script = render_probe();
+        assert!(!is_own_table(PROBE_TABLE));
+        assert!(script.contains("masquerade"));
+        assert!(script.contains("ct state established,related"));
+        assert!(script.ends_with(&format!("delete table inet {PROBE_TABLE}\n")));
+        let creates = script
+            .matches(&format!("table inet {PROBE_TABLE} {{"))
+            .count();
+        assert_eq!(creates, 1);
+    }
 
     fn bridge(routes: &[&str], allow: &[&str]) -> ExternalBridge {
         ExternalBridgeConfig {
