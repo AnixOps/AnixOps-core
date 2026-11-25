@@ -301,9 +301,9 @@ fn prefix_of(mask: &[u8]) -> u8 {
     u8::try_from(ones).unwrap_or(u8::MAX)
 }
 
-/// The networks of every interface but loopback and `skip` (the mesh's own
-/// interface), for the overlap rule of spec §15.4.
-pub fn local_networks(skip: &str) -> io::Result<Vec<(IpAddr, u8)>> {
+/// The networks of every interface but loopback and those `skip` names (our
+/// own mesh interfaces), for the overlap rule of spec §15.4.
+pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8)>> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` fills `head` with a list freed below.
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -323,7 +323,7 @@ pub fn local_networks(skip: &str) -> io::Result<Vec<(IpAddr, u8)>> {
         }
         // SAFETY: a non-null name is a C string.
         let name = unsafe { CStr::from_ptr(entry.ifa_name) };
-        if name.to_bytes() == skip.as_bytes() {
+        if skip(&name.to_string_lossy()) {
             continue;
         }
         // SAFETY: the address and mask point to socket addresses of the
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn the_machine_has_some_networks_and_never_loopback() {
-        let networks = local_networks("none-such").expect("getifaddrs");
+        let networks = local_networks(|_| false).expect("getifaddrs");
         assert!(networks.iter().all(|(address, _)| !address.is_loopback()));
     }
 

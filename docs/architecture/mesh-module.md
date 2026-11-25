@@ -124,7 +124,7 @@
 | 路由同步会话（规范 §12.2、§12.3，无 I/O） | `route/sync.rs` | 内核 0.3 |
 | 节点核心（无 I/O）：连接与握手、保活（§10）、RPC（§11）、路由同步与延迟中心（§12、§13.3）、转发（§14）、收发检查（§15） | `node.rs` | 内核 0.3 |
 | 驱动：TCP 分帧、UDP 建连（Syn/Sack）、监听、重拨（1 s 起倍增到 30 s）、握手预算准入、计时器、状态快照 | `driver.rs`（feature `runtime`，默认开启） | 内核 0.3 |
-| 独立节点 `anixops-mesh run --config F [--interface N]`（Linux）：TUN 网卡（ioctl 设地址、掩码、MTU、启用，不依赖 `ip` 程序），默认网卡名 `anixmesh0`；状态变化时向标准输出写一行 JSON；SIGTERM/SIGINT 停止。驱动快照给出要装的系统路由（已接受、可路由、在 `routing.system_routes` 之内），`run` 按差异增删经本网卡的路由（ioctl，网卡删除时内核一并清掉）；每 30 秒读一次本机其他网卡的网段交给驱动，与之重叠的通告网段不路由也不装（规范 §15.4） | `apps/mesh-node/src/serve.rs`、`tun.rs` | 内核 0.3；身份持久化待补；互通测试通过前不列入 `capabilities` |
+| 独立节点 `anixops-mesh run --config F [--interface N]`（Linux）：TUN 网卡（ioctl 设地址、掩码、MTU、启用，不依赖 `ip` 程序），默认网卡名 `anixmesh0`；状态变化时向标准输出写一行 JSON；SIGTERM/SIGINT 停止。驱动快照给出要装的系统路由（已接受、可路由、在 `routing.system_routes` 之内），`run` 按差异增删经本网卡的路由（ioctl，网卡删除时内核一并清掉）；每 30 秒读一次本机其他网卡的网段，以及其他程序的虚拟网卡（点对点或无链路层，如 TUN）在所有路由表（含策略路由表）中承载的路由，交给驱动；与之重叠的通告网段不路由也不装（规范 §15.4）。比 /8（IPv4）、/7（IPv6）更宽的路由不算（默认路由及其拆分），名字以 `anixmesh` 开头的网卡和 `--interface` 指定的网卡都是我方组网网卡，不参与比较（`host_routes.rs`）。状态里暂不区分「与本机局域网重叠」和「与其他组网软件的路由重叠」，两者都列在 `overlaps` | `apps/mesh-node/src/serve.rs`、`tun.rs` | 内核 0.3；身份持久化待补；互通测试通过前不列入 `capabilities` |
 | 每节点私有 TCP/IP 协议栈（smoltcp），TCP/UDP 出站 | 与 iWAN / WireGuard 同构 | M2 |
 | `engine-embedded` feature `mesh`、注册 `"type": "mesh"` | `protocols.rs` | M2 |
 
