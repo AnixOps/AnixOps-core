@@ -29,6 +29,7 @@
 | `subnets[]` | `cidr`、`advertisers[{member,inUse}]`、`latencyMs`、`path`、`state`、`overlaps`、`localOverlap`、`route` | 0.3 |
 | `subnets[]` | `region` | 0.4 |
 | `tunnel` | `routes`、`routesVersion`、`dns` | 0.3 |
+| `externalBridge` | `allowDigest`、`allowCount`、`routesDigest`、`appliedAt` | 0.4（能力 `mesh_external_bridge`） |
 | 顶层 | `names`、`refusedNames` | 0.3 |
 | 顶层 | `regionRequests` | 0.4 |
 
@@ -62,6 +63,7 @@
 | `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate", "answerable" }`：本网络的内网域名名单（不含后缀），一个名字的每种来源各一条。`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址，下发来源在前（需求 R28）；同名中有 `member` 来源时界面提示可能冒名。`answerable` 为 `false` 时地址不在可应答的网段内，不会应答。`source` 以后可能出现 `backbone`、`gateway`，按 `other` 处理 |
 | `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" \| "invalid_name" }`：配置里跳过的名字条目，原因分别为地址在内网范围外、名字不是规范化后的 `名.地区代码` |
 | `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请；每个网络最多一条，新申请替换旧的 |
+| `externalBridge` | `null`（本网络没有 `external_bridge` 配置），或本机已生效的桥接配置摘要（规范 §15.12 第 4 条）：`allowDigest` 为 `allow` 名单的摘要，`routesDigest` 为 `routes` 的摘要，`allowCount` 为名单条目数，`appliedAt` 为生效时间（RFC 3339，UTC）。摘要算法：把各条目规范化为 CIDR 文本（IPv4 点分十进制，IPv6 按 RFC 5952 小写压缩，单个地址也写出前缀长度），去重后按字节序排序，以换行符 `\n` 连接（末尾无换行），取 SHA-256 的小写十六进制。只在新配置的防火墙规则全部装好后才更新；装失败时保持旧值并告警。Agent 原样上报，面板对自己下发的名单按同样算法计算，相等即视为桥接节点已应用 |
 | `tunnel.dns` | `null`，或 `{ "servers": [地址], "matchDomains": [后缀] }`：内网域名开启时只对这些后缀生效（需求 R28） |
 
 ### 失败与冲突原因
