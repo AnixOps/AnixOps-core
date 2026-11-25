@@ -36,12 +36,17 @@
 //! `egress:<id>`, bound to its source address and probed by the kernel, and
 //! an inbound with an `ingress` key takes its ingress's active path, failing
 //! over between egresses in pairing order.
+//!
+//! Mesh networking ([`mesh`], [`Node::with_mesh`]): the node program
+//! installs the mesh, and the agent replaces its networks with
+//! `PUT /v1/mesh`.
 
 pub mod api;
 pub mod config;
 mod direct;
 pub mod domains;
 pub mod egress;
+pub mod mesh;
 pub mod network;
 
 use std::collections::BTreeMap;
@@ -191,6 +196,12 @@ pub enum NodeError {
     Qos(String),
     /// A fingerprint bundle was refused; the previous one stays.
     TlsFingerprints(String),
+    /// A `PUT /v1/mesh` body was refused; nothing of it was applied.
+    Mesh(String),
+    /// The mesh failed to apply a valid `PUT /v1/mesh`.
+    MeshFailed(String),
+    /// This kernel runs no mesh ([`Node::with_mesh`] was not called).
+    MeshUnavailable,
     Io(io::Error),
 }
 
@@ -204,7 +215,12 @@ impl fmt::Display for NodeError {
             | NodeError::Network(reason)
             | NodeError::Rules(reason)
             | NodeError::Qos(reason)
-            | NodeError::TlsFingerprints(reason) => f.write_str(reason),
+            | NodeError::TlsFingerprints(reason)
+            | NodeError::Mesh(reason)
+            | NodeError::MeshFailed(reason) => f.write_str(reason),
+            NodeError::MeshUnavailable => {
+                f.write_str("mesh networking is not available in this kernel")
+            }
             NodeError::Io(error) => write!(f, "{error}"),
         }
     }
@@ -423,6 +439,8 @@ pub struct Node {
     /// Base outbounds the embedding binary registered, by name.
     outbounds: Outbounds,
     default_outbound: Option<String>,
+    /// The mesh the node program installed; `None` without mesh support.
+    mesh: Option<mesh::Mesh>,
 }
 
 impl Node {
@@ -438,6 +456,47 @@ impl Node {
             rules: Mutex::new(RulesConfig::default()),
             outbounds: Outbounds::default(),
             default_outbound: None,
+            mesh: None,
+        }
+    }
+
+    /// Installs the mesh `PUT` / `GET /v1/mesh` drive. With it the node
+    /// lists the control's features (at least `mesh`) in `GET /v1/status`.
+    pub fn with_mesh(mut self, control: Arc<dyn outbound_mesh::status::MeshControl>) -> Self {
+        self.mesh = Some(mesh::Mesh::new(control));
+        self
+    }
+
+    /// [`FEATURES`] and those of the installed mesh, as `GET /v1/status`
+    /// lists them.
+    pub fn features(&self) -> Vec<&'static str> {
+        let mut features = FEATURES.to_vec();
+        if let Some(mesh) = &self.mesh {
+            for feature in mesh.features() {
+                if !features.contains(feature) {
+                    features.push(feature);
+                }
+            }
+        }
+        features
+    }
+
+    /// The managed mesh networks (`GET /v1/mesh`).
+    pub fn mesh_state(&self) -> Result<outbound_mesh::status::ManagedStatus, NodeError> {
+        self.mesh
+            .as_ref()
+            .map(mesh::Mesh::status)
+            .ok_or(NodeError::MeshUnavailable)
+    }
+
+    /// Replaces the managed mesh networks with a `PUT /v1/mesh` body.
+    pub async fn apply_mesh(
+        &self,
+        body: &[u8],
+    ) -> Result<outbound_mesh::status::ManagedStatus, NodeError> {
+        match &self.mesh {
+            Some(mesh) => mesh.apply(body).await,
+            None => Err(NodeError::MeshUnavailable),
         }
     }
 
