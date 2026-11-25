@@ -604,6 +604,12 @@ jobs:
             shellcheck --shell=sh "apps/mesh-node/install/${script}"
           done
           shellcheck --shell=bash .github/scripts/build-mesh-node.sh
+          # The Windows installer must at least parse.
+          pwsh -NoProfile -NonInteractive -Command '
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("apps/mesh-node/install/install-windows.ps1", [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_ }; exit 1 }
+          '
 
       - name: Build static anixops-mesh
         shell: bash

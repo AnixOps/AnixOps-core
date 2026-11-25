@@ -93,6 +93,16 @@ pub enum Action {
         label: String,
         plist: String,
     },
+    /// `sc.exe stop`, waited for (Windows).
+    WinServiceStop {
+        name: String,
+    },
+    /// `sc.exe config start= disabled` (Windows).
+    WinServiceDisable {
+        name: String,
+        /// The start type before: `auto`, `delayed-auto` or `demand`.
+        previous: String,
+    },
     /// A process ended with TERM or KILL.
     Terminate {
         pid: u32,
@@ -142,6 +152,10 @@ impl Action {
             }
             Action::LaunchdBootout { domain, label, .. } => {
                 format!("launchctl bootout {domain}/{label}")
+            }
+            Action::WinServiceStop { name } => format!("sc.exe stop {name}"),
+            Action::WinServiceDisable { name, previous } => {
+                format!("sc.exe config {name} start= disabled (was {previous})")
             }
             Action::Terminate {
                 pid, exe, killed, ..
@@ -361,6 +375,11 @@ enum Planned {
         label: String,
         plist: String,
     },
+    WinServiceStop(String),
+    WinServiceDisable {
+        name: String,
+        previous: String,
+    },
 }
 
 fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
@@ -481,6 +500,28 @@ fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
                     });
                 }
             }
+            Origin::WinService {
+                name,
+                start,
+                running,
+            } => {
+                // Stopped first, then turned off: a rollback turns it on
+                // again before starting it, as Windows starts no service
+                // that is turned off.
+                if *running {
+                    disables.push(Planned::WinServiceStop(name.clone()));
+                }
+                match start.as_str() {
+                    "auto" | "delayed-auto" | "demand" => {
+                        disables.push(Planned::WinServiceDisable {
+                            name: name.clone(),
+                            previous: start.clone(),
+                        })
+                    }
+                    "disabled" => {}
+                    _ => manual.push(format!("service {name} (starts as {start})")),
+                }
+            }
             Origin::Process { .. } => {}
             Origin::Container { id, image } => {
                 manual.push(format!("container {id} {image}").trim_end().to_string());
@@ -510,6 +551,10 @@ fn describe_planned(planned: &Planned) -> String {
         }
         Planned::LaunchdBootout { domain, label, .. } => {
             format!("launchctl bootout {domain}/{label}")
+        }
+        Planned::WinServiceStop(name) => format!("sc.exe stop {name}"),
+        Planned::WinServiceDisable { name, previous } => {
+            format!("sc.exe config {name} start= disabled (now {previous})")
         }
     }
 }
@@ -724,6 +769,17 @@ fn execute(
                 plist: plist.clone(),
             }])
         }
+        Planned::WinServiceStop(name) => {
+            crate::winsvc::stop(host, name)?;
+            Ok(vec![Action::WinServiceStop { name: name.clone() }])
+        }
+        Planned::WinServiceDisable { name, previous } => {
+            crate::winsvc::set_start(host, name, "disabled")?;
+            Ok(vec![Action::WinServiceDisable {
+                name: name.clone(),
+                previous: previous.clone(),
+            }])
+        }
     }
 }
 
@@ -898,6 +954,42 @@ fn foreign_network_processes(host: &dyn Host, profile: &Profile) -> Vec<String> 
         .collect()
 }
 
+/// One message for each process of the program, other than a taken-over
+/// service's, that runs as another account than this program (Windows,
+/// where a process cannot be started again as another account without its
+/// password), or whose account cannot be read.
+fn foreign_account_processes(
+    host: &dyn Host,
+    profile: &Profile,
+    service_pids: &BTreeSet<u32>,
+) -> Vec<String> {
+    if !uses_process_table(host) {
+        return Vec::new();
+    }
+    let Some(own) = host
+        .process_info(host.own_pid())
+        .ok()
+        .and_then(|info| info.sid)
+    else {
+        return Vec::new();
+    };
+    scan_processes(host, profile)
+        .into_iter()
+        .filter(|process| !service_pids.contains(&process.pid))
+        .filter_map(|process| match &process.sid {
+            Some(sid) if *sid == own => None,
+            Some(sid) => Some(format!(
+                "process {} runs as another account ({sid}); stop it by hand, and start it again by hand to undo",
+                process.pid
+            )),
+            None => Some(format!(
+                "cannot tell which account runs process {}; stop it by hand, and start it again by hand to undo",
+                process.pid
+            )),
+        })
+        .collect()
+}
+
 fn foreign_network_message(pid: u32, namespace: &str) -> String {
     format!(
         "process {pid} runs in another network namespace ({namespace}); stop it by hand, and start it there again by hand to undo"
@@ -1003,11 +1095,17 @@ pub fn takeover(
             _ => None,
         })
         .collect();
-    // Processes of launchd jobs taken over: loading the job again on
-    // rollback starts them, so they are never started a second time.
+    // Processes of launchd jobs and Windows services taken over: loading
+    // the job or starting the service again on rollback starts them, so
+    // they are never started a second time.
     let service_pids: BTreeSet<u32> = found
         .iter()
-        .filter(|entry| matches!(entry.origin, Origin::Launchd { .. }))
+        .filter(|entry| {
+            matches!(
+                entry.origin,
+                Origin::Launchd { .. } | Origin::WinService { .. }
+            )
+        })
         .flat_map(|entry| entry.processes.iter().map(|process| process.pid))
         .collect();
     let (planned, manual) = plan(host, &found);
@@ -1074,7 +1172,10 @@ pub fn takeover(
     // Checked before anything is changed: a process in another network
     // namespace is never ended (a rollback could not put it back there), so
     // finding one later would only interrupt the network for nothing.
-    for error in foreign_network_processes(host, profile) {
+    for error in foreign_network_processes(host, profile)
+        .into_iter()
+        .chain(foreign_account_processes(host, profile, &service_pids))
+    {
         report.steps.push(StepReport {
             step: "check networks".into(),
             ok: false,
@@ -1347,6 +1448,14 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             }
             run_ok(host, "launchctl", &["bootstrap", domain, plist])?;
             Ok(format!("launchctl bootstrap {domain} {plist}"))
+        }
+        Action::WinServiceStop { name } => {
+            crate::winsvc::start(host, name)?;
+            Ok(format!("sc.exe start {name}"))
+        }
+        Action::WinServiceDisable { name, previous } => {
+            crate::winsvc::set_start(host, name, previous)?;
+            Ok(format!("sc.exe config {name} start= {previous}"))
         }
         Action::Terminate {
             argv,
@@ -2657,5 +2766,184 @@ mod tests {
             running_copy(&host, "/Users/alice/bin/demo-meshd", &argv, Some(501), None),
             CopyCheck::Unknown(400)
         );
+    }
+
+    const ADMIN: &str = "S-1-5-21-9-500";
+    const SYSTEM: &str = "S-1-5-18";
+
+    /// A Windows machine: a service running the program, a copy the
+    /// administrator started by hand, and this program run by the
+    /// administrator.
+    fn windows(services_json: &str) -> FakeHost {
+        let mut host = FakeHost::default();
+        host.programs.insert("powershell.exe".into());
+        host.answer(
+            &format!(
+                "powershell.exe -NoProfile -NonInteractive -Command {}",
+                crate::winsvc::SERVICES_QUERY
+            ),
+            0,
+            services_json,
+        );
+        host.answer(
+            "sc.exe query DemoMesh",
+            0,
+            "SERVICE_NAME: DemoMesh\r\n        STATE              : 1  STOPPED\r\n",
+        );
+        host.windows_process(
+            1,
+            r"C:\anixops\anixops-mesh.exe",
+            &["anixops-mesh"],
+            ADMIN,
+            9,
+        );
+        host.windows_process(
+            500,
+            r"C:\Program Files\Demo\demo-meshd.exe",
+            &[
+                r"C:\Program Files\Demo\demo-meshd.exe",
+                "-c",
+                r"C:\demo\a.toml",
+            ],
+            SYSTEM,
+            600,
+        );
+        host.windows_process(
+            700,
+            r"C:\Users\admin\demo-meshd.exe",
+            &[r"C:\Users\admin\demo-meshd.exe", "--net-name", "lab"],
+            ADMIN,
+            800,
+        );
+        host.exits_on
+            .borrow_mut()
+            .insert("sc.exe stop DemoMesh".into(), vec![500]);
+        host
+    }
+
+    const DEMO_SERVICE: &str = r#"[{"Name":"DemoMesh","PathName":"\"C:\\Program Files\\Demo\\demo-meshd.exe\" -c C:\\demo\\a.toml","StartMode":"Auto","State":"Running","ProcessId":500,"DelayedAutoStart":true},{"Name":"Spooler","PathName":"C:\\Windows\\System32\\spoolsv.exe","StartMode":"Auto","State":"Running","ProcessId":40,"DelayedAutoStart":false}]"#;
+
+    #[test]
+    fn a_windows_service_is_stopped_then_turned_off_and_restored_in_reverse() {
+        let host = windows(DEMO_SERVICE);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert_eq!(
+            steps,
+            vec![
+                "sc.exe stop DemoMesh",
+                "sc.exe config DemoMesh start= disabled (was delayed-auto)",
+                r"end process 700 (C:\Users\admin\demo-meshd.exe) with TERM",
+            ]
+        );
+        // The service's own process was ended by the service manager.
+        assert_eq!(*host.signals.borrow(), vec![(700, Signal::Terminate)]);
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.contains("Spooler")));
+
+        let rollback = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback.ok, "{rollback:?}");
+        let ran = host.ran.borrow();
+        let config = ran
+            .iter()
+            .position(|line| line == "sc.exe config DemoMesh start= delayed-auto")
+            .expect("start type restored");
+        let start = ran
+            .iter()
+            .position(|line| line == "sc.exe start DemoMesh")
+            .expect("started again");
+        // Windows starts no service that is turned off.
+        assert!(config < start);
+        let spawned = host.spawned.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].argv[0], r"C:\Users\admin\demo-meshd.exe");
+        assert_eq!(spawned[0].cwd.as_deref(), Some(r"C:\"));
+        assert!(spawned[0].clear_env);
+    }
+
+    #[test]
+    fn a_process_of_another_windows_account_is_left_to_the_operator() {
+        let host = windows(DEMO_SERVICE);
+        host.windows_process(
+            701,
+            r"C:\Users\bob\demo-meshd.exe",
+            &[r"C:\Users\bob\demo-meshd.exe"],
+            "S-1-5-21-9-1001",
+            800,
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail
+                    .contains("process 701 runs as another account (S-1-5-21-9-1001)"))));
+        // Nothing was changed.
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.starts_with("sc.exe")));
+        assert!(host.signals.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_wrapper_service_named_in_the_profile_is_taken_over_with_its_child() {
+        let host = windows(
+            r#"[{"Name":"demo-meshd","PathName":"C:\\tools\\wrapper.exe","StartMode":"Manual","State":"Running","ProcessId":900,"DelayedAutoStart":false}]"#,
+        );
+        // Only the wrapper service runs the program here.
+        host.table.borrow_mut().as_mut().unwrap().remove(&500);
+        host.windows_process(
+            900,
+            r"C:\tools\wrapper.exe",
+            &[r"C:\tools\wrapper.exe"],
+            SYSTEM,
+            600,
+        );
+        host.windows_process(
+            901,
+            r"C:\opt\Demo-Meshd.EXE",
+            &[r"C:\opt\Demo-Meshd.EXE", "--net-name", "lab"],
+            SYSTEM,
+            900,
+        );
+        host.answer(
+            "sc.exe query demo-meshd",
+            0,
+            "        STATE              : 1  STOPPED\r\n",
+        );
+        host.exits_on
+            .borrow_mut()
+            .insert("sc.exe stop demo-meshd".into(), vec![900, 901]);
+        let found = detect(&host, &demo());
+        let service = found
+            .iter()
+            .find(|entry| matches!(entry.origin, Origin::WinService { .. }))
+            .unwrap();
+        assert_eq!(service.processes.len(), 1);
+        assert_eq!(service.processes[0].pid, 901);
+        assert_eq!(
+            service.invocation.as_ref().unwrap().args,
+            vec!["--net-name".to_string(), "lab".to_string()]
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert!(steps.contains(&"sc.exe config demo-meshd start= disabled (was demand)"));
+        // The service's child runs as another account but is the
+        // service's: no account check, and not restarted on its own.
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest
+            .steps
+            .iter()
+            .all(|step| !matches!(step.action, Action::Terminate { pid: 901, .. })));
     }
 }

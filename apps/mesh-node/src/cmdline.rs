@@ -296,6 +296,84 @@ pub fn split_nul(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Splits a Windows command line the way the C runtime does (and
+/// `CommandLineToArgvW`, apart from `""` inside quotes): the program name
+/// ends at the closing quote or the first space, with no escapes; in the
+/// arguments, 2n backslashes before a quote give n backslashes and the quote
+/// opens or closes quoting, 2n+1 give n and a literal quote, other
+/// backslashes are literal, and `""` inside quotes is a literal quote.
+pub fn split_windows_command_line(line: &str) -> Vec<String> {
+    let mut chars = line.trim_start_matches([' ', '\t']).chars().peekable();
+    let mut out = Vec::new();
+    if chars.peek().is_none() {
+        return out;
+    }
+    let mut program = String::new();
+    if chars.peek() == Some(&'"') {
+        chars.next();
+        for c in chars.by_ref() {
+            if c == '"' {
+                break;
+            }
+            program.push(c);
+        }
+    } else {
+        while let Some(&c) = chars.peek() {
+            if c == ' ' || c == '\t' {
+                break;
+            }
+            program.push(c);
+            chars.next();
+        }
+    }
+    out.push(program);
+    loop {
+        while chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            return out;
+        }
+        let mut arg = String::new();
+        let mut quoted = false;
+        while let Some(&c) = chars.peek() {
+            match c {
+                '\\' => {
+                    let mut count = 0;
+                    while chars.peek() == Some(&'\\') {
+                        chars.next();
+                        count += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        arg.extend(std::iter::repeat_n('\\', count / 2));
+                        if count % 2 == 1 {
+                            arg.push('"');
+                            chars.next();
+                        }
+                    } else {
+                        arg.extend(std::iter::repeat_n('\\', count));
+                    }
+                }
+                '"' => {
+                    chars.next();
+                    if quoted && chars.peek() == Some(&'"') {
+                        arg.push('"');
+                        chars.next();
+                    } else {
+                        quoted = !quoted;
+                    }
+                }
+                ' ' | '\t' if !quoted => break,
+                _ => {
+                    arg.push(c);
+                    chars.next();
+                }
+            }
+        }
+        out.push(arg);
+    }
+}
+
 /// The command a shell line runs when it starts with `executable` (after
 /// optional wrappers such as `nohup`), cut at the first shell operator.
 /// Returns argv including the program, or `None` when the line does not
@@ -357,6 +435,36 @@ pub fn leading_assignments(line: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_windows_command_lines() {
+        assert_eq!(
+            split_windows_command_line(
+                r#""C:\Program Files\Demo\demo-meshd.exe" -c "C:\a b\x.toml" --name=lab"#
+            ),
+            vec![
+                r"C:\Program Files\Demo\demo-meshd.exe",
+                "-c",
+                r"C:\a b\x.toml",
+                "--name=lab"
+            ]
+        );
+        // The program name has no escapes.
+        assert_eq!(
+            split_windows_command_line(r"C:\demo\x.exe a\\b"),
+            vec![r"C:\demo\x.exe", r"a\\b"]
+        );
+        assert_eq!(
+            split_windows_command_line(r#"x "a\"b" c\\"d e" f\\\"g"#),
+            vec!["x", r#"a"b"#, r"c\d e", r#"f\"g"#]
+        );
+        assert_eq!(
+            split_windows_command_line(r#"x "a""b" "" end"#),
+            vec!["x", r#"a"b"#, "", "end"]
+        );
+        assert_eq!(split_windows_command_line("  "), Vec::<String>::new());
+        assert_eq!(split_windows_command_line("x\t"), vec!["x"]);
+    }
 
     #[test]
     fn splits_quotes_and_escapes() {

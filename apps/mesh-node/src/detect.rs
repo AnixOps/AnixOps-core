@@ -2,7 +2,8 @@
 //! services, OpenRC and other init scripts, autostart lines in `rc.local`
 //! and crontabs, and processes started by hand; containers are found and
 //! reported but never touched. On macOS: launchd jobs (see
-//! [`crate::launchd`]) and processes started by hand.
+//! [`crate::launchd`]) and processes started by hand. On Windows: services
+//! (see [`crate::winsvc`]) and processes started by hand.
 //!
 //! Each finding carries the command line the program runs with, taken from
 //! the running process where there is one (the most exact source) and from
@@ -62,6 +63,15 @@ pub enum Origin {
         disabled_key: bool,
         loaded: bool,
     },
+    /// A Windows service.
+    WinService {
+        name: String,
+        /// How it starts, as `sc.exe config start=` takes it: `auto`,
+        /// `delayed-auto`, `demand`, `disabled` (or a driver's `boot`,
+        /// `system`).
+        start: String,
+        running: bool,
+    },
 }
 
 impl Origin {
@@ -76,6 +86,7 @@ impl Origin {
             Origin::Launchd { label, domain, .. } => {
                 format!("launchd:{}/{label}", domain.as_deref().unwrap_or("*"))
             }
+            Origin::WinService { name, .. } => format!("service:{name}"),
         }
     }
 }
@@ -115,6 +126,12 @@ pub struct Process {
     /// The whole environment, for a restart on rollback. Holds secrets.
     #[serde(skip_serializing, default)]
     pub environ: Vec<(String, String)>,
+    /// The parent process (Windows), which a service wrapper may be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    /// The account it runs as (Windows), as a SID string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 /// Whether a process with this `/proc/PID/cgroup` runs in a container.
@@ -215,13 +232,41 @@ const UNIT_DIRS: [&str; 5] = [
     "/lib/systemd/system",
 ];
 
-fn base_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// The file name of a path; a Windows path (`C:\\…`, `\\\\server\\…`)
+/// is split at backslashes too.
+pub fn base_name(path: &str) -> &str {
+    if windows_path(path) {
+        path.rsplit(['/', '\\']).next().unwrap_or(path)
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    }
+}
+
+fn windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\')
+        || path.starts_with("\\\\")
+}
+
+/// Whether a program file is one of `names`. Windows file names compare
+/// without case, and `name.exe` is `name`.
+pub fn program_named(names: &[String], path: &str) -> bool {
+    let base = base_name(path.trim_end_matches(" (deleted)"));
+    if !windows_path(path) {
+        return names.iter().any(|name| name == base);
+    }
+    let cut = base.len().saturating_sub(4);
+    let stem = match base.get(cut..) {
+        Some(ext) if cut > 0 && ext.eq_ignore_ascii_case(".exe") => &base[..cut],
+        _ => base,
+    };
+    names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(base) || name.eq_ignore_ascii_case(stem))
 }
 
 fn is_program(profile: &Profile, path: &str) -> bool {
-    let base = base_name(path.trim_end_matches(" (deleted)"));
-    profile.detect.executables.iter().any(|name| name == base)
+    program_named(&profile.detect.executables, path)
 }
 
 fn wanted_env(
@@ -319,6 +364,8 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
             gid,
             groups,
             environ,
+            ppid: None,
+            sid: None,
         });
     }
     out
@@ -358,6 +405,8 @@ fn scan_table(host: &dyn Host, profile: &Profile) -> Vec<Process> {
                 gid: info.gid,
                 groups: info.groups,
                 environ: info.environ,
+                ppid: info.ppid,
+                sid: info.sid,
             })
         })
         .collect()
@@ -929,6 +978,9 @@ pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
     if host.has_program("launchctl") {
         found.extend(crate::launchd::jobs(host, profile, &processes));
     }
+    if host.has_program("powershell.exe") {
+        found.extend(crate::winsvc::services(host, profile, &processes));
+    }
 
     let claimed: BTreeSet<u32> = found
         .iter()
@@ -962,6 +1014,23 @@ pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_program_names_ignore_case_and_the_exe_suffix() {
+        let names = vec!["demo-meshd".to_string()];
+        assert!(program_named(
+            &names,
+            r"C:\Program Files\Demo\Demo-Meshd.EXE"
+        ));
+        assert!(program_named(&names, r"\\server\share\demo-meshd"));
+        assert!(!program_named(&names, r"C:\demo-meshd\other.exe"));
+        // Unix names stay exact.
+        assert!(program_named(&names, "/usr/bin/demo-meshd"));
+        assert!(!program_named(&names, "/usr/bin/Demo-Meshd"));
+        assert!(!program_named(&names, "/usr/bin/demo-meshd.exe"));
+        assert_eq!(base_name(r"C:\a\b.exe"), "b.exe");
+        assert_eq!(base_name("/a/b\\c"), "b\\c");
+    }
     use crate::host::fake::FakeHost;
     use crate::profile::tests::demo;
 

@@ -43,6 +43,17 @@ macOS 没有 `/proc`，进程从系统进程表读取：程序路径用 `proc_pi
 
 任务文件用 `plutil -convert json` 读取（XML 与二进制格式都支持），读不出的文件跳过。`Program` 或 `ProgramArguments[0]` 的文件名在 `detect.executables` 里、`sh`/`bash`/`zsh`/`dash -c` 的命令以该程序开头、或 `Label` 在 `detect.services` 里时视为该程序的任务。是否已加载及其进程取自 `launchctl print <域>/<Label>`；是否被关闭取自 `launchctl print-disabled <域>`（`launchctl disable`/`enable` 的覆盖值优先于任务文件的 `Disabled` 键）。命令行优先取自任务的进程，其次取自任务文件。任务的进程是 launchd 给出的 pid，以及任务已加载时命令行与任务完全相同的进程（shell 启动的子进程）。
 
+## 检测（Windows）
+
+进程从系统进程表读取：`CreateToolhelp32Snapshot` 列出进程与父进程，程序路径用 `QueryFullProcessImageNameW`，命令行用 `NtQueryInformationProcess`（按 C 运行库规则拆分），工作目录与完整环境变量从进程参数块读取（64 位），运行账户取自进程令牌（SID）。程序名比较不区分大小写，`name.exe` 与 `name` 相同。
+
+| 来源 | 方法 |
+| --- | --- |
+| 服务 | 一次 PowerShell 查询 `Win32_Service`（名称、命令行、启动方式、状态、进程）。命令行运行该程序、或服务名在 `detect.services` 里（以包装程序启动的服务）时视为该程序的服务；服务的进程是服务进程及其子进程 |
+| 手动进程 | 进程表中程序名匹配、且不属于任何服务的进程 |
+
+计划任务、注册表 `Run` 自启项与启动文件夹在下一步加入；在此之前，它们启动的进程按手动进程处理，接管后如被再次拉起，最后的确认会失败并回滚。
+
 ## 导入（R13、R14、R15）
 
 导入是单向转换，输出 `"type": "mesh"` 出站的 config v1（`config_version: 1`），每个网络实例一个文件，写入 `--out-dir`，权限 0600（含网络密钥）。设置的来源按「配置文件 → 环境变量 → 命令行」合并，后者覆盖前者；数据文件可声明列表项追加（`merge: append`）。一个目录中的多个配置文件各是一个实例，命令行只覆盖网络名相同的那个实例。
@@ -106,6 +117,8 @@ OpenRC 服务只在有运行中的进程时才计划停止。宿主单元的 `Re
 
 macOS 上的顺序：备份任务文件 → 已加载的任务先 `launchctl bootout <域>/<Label>`（停止并卸载，有的系统版本卸载成功也报错，以 `launchctl print` 确认已不再加载为准）→ 开机仍会加载的任务再 `launchctl disable <域>/<Label>`（已被关闭、或覆盖值不存在且任务文件 `Disabled` 为真时跳过）→ 结束剩余进程。先卸载后关闭，是因为回滚逆序执行，而 launchd 不加载被关闭的任务：回滚先 `launchctl enable`，再 `launchctl bootstrap <域> <任务文件>`（已加载时跳过）。原来没有覆盖值的任务回滚后留下 `enable` 覆盖值，开机行为与原来一致（只有任务文件未关闭时才会被关闭）。属于已接管任务的进程由重新加载任务启动，回滚时不再单独启动；其他进程按原命令行、环境变量与身份重启。结束了任何进程后，先等 launchd 的默认限流间隔 10 秒再加 2 秒，确认没有未列入数据文件的任务把程序重新拉起。用户代理的 `bootstrap` 需要该用户已登录图形会话，否则该步骤保留，之后的 `rollback` 重试。
 
+Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（最长 30 秒）→ 自动、延迟自动或手动启动的服务再 `sc.exe config <名称> start= disabled` → 结束剩余进程（先 `taskkill` 请求关闭，10 秒后 `TerminateProcess`）。先停止后关闭，是因为 Windows 不启动被禁用的服务：回滚先恢复原启动方式，再 `sc.exe start`。驱动类服务（`boot`、`system`）只报告。服务的进程（含包装程序的子进程）由重新启动服务恢复，不单独重启；手动进程按原命令行、工作目录与环境变量重启。Windows 无法在没有密码的情况下以其他账户启动进程，因此由其他账户运行、或读不出运行账户的手动进程不会被结束：这项检查在第一步改动之前完成，发现即失败，由操作员手工停止。结束了任何进程后同样先等 12 秒再确认。
+
 在其他网络命名空间中运行的进程（例如用 `ip netns exec` 启动）不会被结束：回滚只能在主机网络中重新启动程序，无法放回原命名空间。这项检查在第一步改动之前完成：发现这种进程时报告该进程并直接失败（退出码 1），不备份、不停用服务、不结束任何进程；需要接管时先手工停止它。
 
 回滚的某一步始终无法自动完成（例如安全模块一直隐藏同名进程，或旧记录中的进程曾在其他网络命名空间运行）时，`rollback` 每次都以退出码 7 结束并保留记录。此时由操作员手工处理：按报告中的命令行、用户和网络命名空间手工启动该进程（或确认已有副本在运行），然后执行 `anixops-mesh rollback --state-dir S --forget-process <原 pid> --confirm`。该命令把这一记录移除而不启动，再照常撤销其余步骤；不带 `--confirm` 时拒绝执行，原 pid 不在记录中时报错且不做任何改动。移除的进程（pid、程序、命令行、用户、时间）保留在 `takeover.json` 的 `forgotten` 列表里；执行时应同时加 `--report` 保存报告，供事后核对。执行回滚前先停止我方节点。全部恢复后清空记录。
@@ -118,10 +131,15 @@ macOS 上的顺序：备份任务文件 → 已加载的任务先 `launchctl boo
 
 [`apps/mesh-node/install/install-macos.sh`](../../apps/mesh-node/install/install-macos.sh) 与 Linux 脚本流程相同（以 root 运行）：下载并以 `shasum -a 256` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，写入 launchd 系统守护进程 `/Library/LaunchDaemons/com.anixops.mesh.plist`（`plutil -lint` 校验；非正常退出时重启），`launchctl enable` 后 `bootstrap` 启动，5 秒后仍未运行则卸载我方守护进程并回滚接管。`--uninstall` 卸载并删除守护进程后回滚接管。macOS 的 `/etc`、`/var`、`/tmp` 是符号链接，状态目录不能经过链接，因此程序、配置和状态放在 `/usr/local/bin/anixops-mesh` 与 `/Library/AnixOps/mesh`（root 所有，0700），日志写入 `/Library/Logs/anixops-mesh.log`。CI 对脚本做 `sh -n` 与 shellcheck 检查。macOS 程序的发布产物随 Windows 一起加入发布流程。
 
+## 安装（Windows）
+
+[`apps/mesh-node/install/install-windows.ps1`](../../apps/mesh-node/install/install-windows.ps1) 以管理员身份运行，流程与 Linux 脚本相同：下载并以 `Get-FileHash` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，注册服务 `AnixOpsMesh`（自动启动，失败后 5 秒重启），启动 5 秒后仍未运行则删除我方服务并回滚接管。`-Uninstall` 停止并删除服务后回滚接管。程序放在 `%ProgramFiles%\AnixOps\Mesh`，配置与状态放在 `%ProgramData%\AnixOps\Mesh`，后者以 `icacls` 去掉继承、只允许 SYSTEM 与 Administrators 访问。CI 用 PowerShell 解析器检查脚本语法。
+
 ### 尚未覆盖的安全项
 
 - 程序与数据文件只校验面板给出的 SHA-256，尚未校验发布签名；面板应以构建证明（`actions/attest`）核对发布产物后再生成安装命令。签名校验与一次性入网凭据流程在内核 0.4 与上报一起设计。
 - `run` 启动前与现有程序的端口、网卡冲突检查属于节点运行侧（退出码 3），见 outbound mesh 的运行文档。
+- Windows 上状态目录的访问控制由安装脚本设置，程序自身尚不像 Unix 那样逐级检查目录的属主与权限；手工运行 `takeover` 时状态目录应放在只有 SYSTEM 与 Administrators 可写的位置。
 
 ### 发布产物
 
