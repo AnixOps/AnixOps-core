@@ -292,6 +292,14 @@ pub struct WaypointContext<'a> {
     pub latency_first: bool,
     /// Whether a node is reachable in this node's topology.
     pub reachable: &'a dyn Fn(u32) -> bool,
+    /// The outer header's `from_peer_id`.
+    pub outer_from: u32,
+    /// Whether this node's capability cache holds "supported" for a node
+    /// (and `native` where the network has `native_keys`): the next
+    /// waypoint must be, and a probe's outer sender must be the source or
+    /// such a node (spec §17.2.5 rule 5, §17.2.6 rule 2). The node starts
+    /// a query for unknown members itself.
+    pub supported: &'a dyn Fn(u32) -> bool,
 }
 
 /// Decides what a waypoint does with `transit` (already decoded). An empty
@@ -313,7 +321,8 @@ pub fn step(transit: &Transit<'_>, cx: &WaypointContext<'_>) -> Step {
     };
     if transit.remaining.contains(&cx.self_id)
         || transit.origin == cx.self_id
-        || transit.destination == cx.self_id && probe
+        || (transit.destination == cx.self_id && probe)
+        || (probe && cx.outer_from != transit.origin && !(cx.supported)(cx.outer_from))
     {
         return Step::default();
     }
@@ -339,6 +348,13 @@ pub fn step(transit: &Transit<'_>, cx: &WaypointContext<'_>) -> Step {
                 let mut step = error(ErrorCode::NextUnreachable, next);
                 step.echo = echo;
                 return step;
+            }
+            if !(cx.supported)(next) {
+                // Never send type 40 to an unconfirmed node; no error.
+                return Step {
+                    echo,
+                    ..Step::default()
+                };
             }
             Step {
                 echo,
@@ -1180,7 +1196,30 @@ mod tests {
             forward_counter: counter,
             latency_first: true,
             reachable,
+            outer_from: 1,
+            supported: &|_| true,
         }
+    }
+
+    #[test]
+    fn waypoint_checks_next_capability_and_probe_sender() {
+        let all = |_: u32| true;
+        let packet = inner(1, 9);
+        let payload = encode_transit(1, 9, &[4], Body::Data(&packet));
+        let only_two = |id: u32| id == 2;
+        let mut strict = cx(3, 1, &all);
+        strict.supported = &only_two;
+        // Next waypoint 4 not confirmed: dropped without an error.
+        assert_eq!(step(&transit(&payload), &strict), Step::default());
+        // A probe whose outer sender is neither the source nor confirmed.
+        let probe = encode_transit(1, 9, &[], Body::Probe(1));
+        strict.outer_from = 7;
+        assert_eq!(step(&transit(&probe), &strict), Step::default());
+        // From a confirmed previous waypoint, or from the source: echoed.
+        strict.outer_from = 2;
+        assert!(step(&transit(&probe), &strict).echo.is_some());
+        strict.outer_from = 1;
+        assert!(step(&transit(&probe), &strict).echo.is_some());
     }
 
     #[test]
