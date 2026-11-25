@@ -168,7 +168,7 @@ impl Link {
             SecurityMode::ForwardSecrecy => {
                 let (client, msg1) =
                     Client::start(hs.local, known_peer, hs.sessions, hs.rng, hs.now)
-                        .map_err(secure_close)?;
+                        .map_err(|error| secure_close(error, known_peer.unwrap_or_default()))?;
                 let first = packet(hs.local.id, 0, packet_type::SECURE_MSG1, &msg1);
                 Ok((
                     Self {

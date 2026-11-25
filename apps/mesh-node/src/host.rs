@@ -51,6 +51,32 @@ pub struct Spawned {
 /// files, scripts and its own profile and manifest are all far smaller.
 pub const MAX_TEXT_FILE: u64 = 1024 * 1024;
 
+/// The system the program runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Os {
+    #[default]
+    Linux,
+    Macos,
+    Windows,
+    /// Another Unix: only what is common to all of them is read.
+    Other,
+}
+
+impl Os {
+    /// The system this program was built for.
+    pub const fn current() -> Os {
+        if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+            Os::Linux
+        } else if cfg!(target_os = "macos") {
+            Os::Macos
+        } else if cfg!(windows) {
+            Os::Windows
+        } else {
+            Os::Other
+        }
+    }
+}
+
 fn too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -125,6 +151,13 @@ pub trait Host {
     fn spawn_detached(&self, spawn: &Spawn, hold: Option<Hold<'_>>) -> io::Result<Spawned>;
     fn sleep_ms(&self, ms: u64);
     fn own_pid(&self) -> u32;
+    /// The system this runs on, which decides where installations are
+    /// looked for: never the presence of a path, since on Windows `/proc`
+    /// or `/etc` is a directory at the root of the drive that any user
+    /// may create.
+    fn os(&self) -> Os {
+        Os::current()
+    }
     /// Every process id, where processes are not files under `/proc`
     /// (macOS, Windows). Elsewhere the program reads `/proc` instead.
     fn list_pids(&self) -> io::Result<Vec<u32>> {
@@ -166,6 +199,15 @@ pub struct ProcInfo {
     /// The account it runs as, as a SID string (Windows), where there are
     /// no user ids.
     pub sid: Option<String>,
+}
+
+/// The directory a state file is in.
+#[cfg(windows)]
+fn state_dir_of(path: &Path) -> io::Result<&Path> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => Ok(dir),
+        _ => Ok(Path::new(".")),
+    }
 }
 
 #[cfg(windows)]
@@ -223,6 +265,92 @@ pub enum Signal {
 pub struct RealHost {
     /// Lock files this process holds; closing one releases its lock.
     locks: std::cell::RefCell<std::collections::BTreeMap<PathBuf, std::fs::File>>,
+}
+
+/// Accounts trusted with the program's state on Windows: the system,
+/// the administrators and the installer service.
+pub const TRUSTED_SIDS: [&str; 3] = [
+    "S-1-5-18",
+    "S-1-5-32-544",
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+];
+
+/// Rights over a directory that let an account change what is in it or
+/// who may: writing, adding, deleting, changing attributes, access or
+/// owner, and the generic rights that include them.
+const DIR_WRITE_RIGHTS: u32 = 0x2 // add a file
+    | 0x4 // add a subdirectory
+    | 0x10 // write extended attributes
+    | 0x40 // delete a child
+    | 0x100 // write attributes
+    | 0x1_0000 // delete
+    | 0x4_0000 // change access
+    | 0x8_0000 // change owner
+    | 0x1000_0000 // generic all
+    | 0x4000_0000; // generic write
+/// Rights over a directory above the state directory that let an account
+/// replace what lies below it. Adding entries is allowed there, as
+/// `C:\` and `C:\ProgramData` let every user create folders: what they
+/// create is theirs, and ours stays ours.
+const ANCESTOR_REPLACE_RIGHTS: u32 = 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000;
+
+/// An entry of a directory's access list, as far as the state checks
+/// need it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessEntry {
+    /// An entry that grants (rather than denies).
+    pub allow: bool,
+    /// Applies only to what is created inside, not to the directory.
+    pub inherit_only: bool,
+    pub mask: u32,
+    /// The account, as a SID string; empty for an entry of a kind not
+    /// read here.
+    pub sid: String,
+    /// A plain grant or denial; other kinds are refused.
+    pub known: bool,
+}
+
+/// Checks one directory on the way to a state directory on Windows: it
+/// must belong to a trusted account, and no other account may change it
+/// (`itself`, the state directory) or replace what lies below it (a
+/// directory above). A missing access list grants everyone everything.
+pub fn judge_state_dir(
+    path: &str,
+    owner: &str,
+    dacl: Option<&[AccessEntry]>,
+    itself: bool,
+) -> io::Result<()> {
+    let refuse = |why: String| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path}: {why}"),
+        ))
+    };
+    if !TRUSTED_SIDS.contains(&owner) {
+        return refuse(format!(
+            "belongs to {owner}, not to the administrators or the system"
+        ));
+    }
+    let Some(entries) = dacl else {
+        return refuse("has no access list, which lets everyone change it".into());
+    };
+    let forbidden = if itself {
+        DIR_WRITE_RIGHTS
+    } else {
+        ANCESTOR_REPLACE_RIGHTS
+    };
+    for entry in entries {
+        if entry.inherit_only || (entry.known && !entry.allow) {
+            continue;
+        }
+        if !entry.known {
+            return refuse("has an access entry of a kind not checked here".into());
+        }
+        if entry.mask & forbidden != 0 && !TRUSTED_SIDS.contains(&entry.sid.as_str()) {
+            return refuse(format!("{} may change it", entry.sid));
+        }
+    }
+    Ok(())
 }
 
 fn write_then_rename(
@@ -568,6 +696,22 @@ impl Host for RealHost {
         read_state_file(path)
     }
 
+    #[cfg(windows)]
+    fn write_state(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        windows::check_state_dir(state_dir_of(path)?)?;
+        self.write(path, contents, 0o600, None)
+    }
+
+    #[cfg(windows)]
+    fn read_state(&self, path: &Path) -> io::Result<Vec<u8>> {
+        windows::check_state_dir(state_dir_of(path)?)?;
+        let bytes = self.read(path)?;
+        if bytes.len() as u64 > MAX_TEXT_FILE {
+            return Err(too_large());
+        }
+        Ok(bytes)
+    }
+
     #[cfg(unix)]
     fn stat(&self, path: &Path) -> io::Result<FileStat> {
         use std::os::unix::fs::MetadataExt;
@@ -593,6 +737,8 @@ impl Host for RealHost {
         use std::io::Write;
         #[cfg(unix)]
         let mut file = open_lock_file(path)?;
+        #[cfg(windows)]
+        windows::check_state_dir(state_dir_of(path)?)?;
         #[cfg(not(unix))]
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -850,10 +996,11 @@ impl Host for RealHost {
 /// parameters block, so a restart on rollback is exact.
 #[cfg(windows)]
 mod windows {
-    use super::{split_windows_command_line_of, Environ, ProcInfo};
+    use super::{judge_state_dir, split_windows_command_line_of, AccessEntry, Environ, ProcInfo};
     use std::ffi::c_void;
     use std::io;
     use std::mem::{size_of, MaybeUninit};
+    use std::path::Path;
     use windows_sys::Wdk::System::Threading::{
         NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation,
     };
@@ -861,8 +1008,13 @@ mod windows {
         CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE,
         UNICODE_STRING,
     };
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetAce, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -1137,6 +1289,14 @@ mod windows {
         }
         // SAFETY: on success the buffer starts with a TOKEN_USER.
         let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+        sid_string(sid)
+    }
+
+    /// A SID as its string form (`S-1-5-18`).
+    fn sid_string(sid: PSID) -> Option<String> {
+        if sid.is_null() {
+            return None;
+        }
         let mut text: *mut u16 = std::ptr::null_mut();
         // SAFETY: `sid` points into `buffer`; `text` is allocated by the
         // system and freed below.
@@ -1185,6 +1345,122 @@ mod windows {
             ppid: Some(ppid),
             sid,
         })
+    }
+
+    /// Frees a security descriptor the system allocated.
+    struct Descriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: allocated by GetNamedSecurityInfoW, freed once.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    /// The owner and access list of a file or directory; `None` for a
+    /// missing access list.
+    fn security(path: &Path) -> io::Result<(String, Option<Vec<AccessEntry>>)> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; the out pointers point into the
+        // descriptor, which the system allocates and `Descriptor` frees.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = Descriptor(descriptor);
+        let owner = sid_string(owner).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{}: cannot read its owner", path.display()),
+            )
+        })?;
+        if dacl.is_null() {
+            return Ok((owner, None));
+        }
+        // SAFETY: a non-null DACL from GetNamedSecurityInfoW.
+        let count = unsafe { (*dacl).AceCount };
+        let mut entries = Vec::with_capacity(usize::from(count));
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `index` is below the entry count.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let bytes = ace as *const u8;
+            // SAFETY: every entry starts with a 4-byte header (type, flags,
+            // size); grants and denials follow it with a 4-byte mask and the
+            // SID.
+            let (kind, flags) = unsafe { (*bytes, *bytes.add(1)) };
+            // ACCESS_ALLOWED_ACE_TYPE and ACCESS_DENIED_ACE_TYPE.
+            let known = kind == 0 || kind == 1;
+            let mask = unsafe { std::ptr::read_unaligned(bytes.add(4) as *const u32) };
+            let sid = if known {
+                // SAFETY: as above.
+                sid_string(unsafe { bytes.add(8) } as PSID).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            entries.push(AccessEntry {
+                allow: kind != 1,
+                // INHERIT_ONLY_ACE.
+                inherit_only: flags & 0x08 != 0,
+                mask,
+                sid,
+                known,
+            });
+        }
+        Ok((owner, Some(entries)))
+    }
+
+    /// Checks a state directory and every directory above it, up to the
+    /// root of the drive: no link or junction anywhere, each one owned by
+    /// the system or the administrators, the directory itself changeable
+    /// by them only, and none above it letting anyone else replace what
+    /// lies below. The counterpart of the Unix check from `/` down; once
+    /// it passes, only those accounts could swap anything in.
+    pub(super) fn check_state_dir(dir: &Path) -> io::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT: a link, junction or mount point.
+        const REPARSE_POINT: u32 = 0x400;
+        let absolute = std::path::absolute(dir)?;
+        for (depth, path) in absolute.ancestors().enumerate() {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_attributes() & REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{}: is a link or junction", path.display()),
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{}: is not a directory", path.display()),
+                ));
+            }
+            let (owner, dacl) = security(path)?;
+            judge_state_dir(
+                &path.display().to_string(),
+                &owner,
+                dacl.as_deref(),
+                depth == 0,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn terminate(pid: u32) -> io::Result<bool> {
@@ -1762,6 +2038,10 @@ pub(crate) mod fake {
         pub launchd: RefCell<BTreeMap<String, FakeJob>>,
         /// Processes that exit when a command runs ("program arg arg").
         pub exits_on: RefCell<BTreeMap<String, Vec<u32>>>,
+        /// The system it plays; Linux unless set.
+        pub os: std::cell::Cell<Os>,
+        /// Files every write to fails.
+        pub fail_writes: RefCell<BTreeSet<PathBuf>>,
     }
 
     impl FakeHost {
@@ -1981,6 +2261,9 @@ pub(crate) mod fake {
             mode: u32,
             owner: Option<(u32, u32)>,
         ) -> io::Result<()> {
+            if self.fail_writes.borrow().contains(path) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
             self.add_parents(path);
             self.files
                 .borrow_mut()
@@ -2113,6 +2396,10 @@ pub(crate) mod fake {
             1
         }
 
+        fn os(&self) -> Os {
+            self.os.get()
+        }
+
         fn list_pids(&self) -> io::Result<Vec<u32>> {
             match self.table.borrow().as_ref() {
                 Some(table) => Ok(table.keys().copied().collect()),
@@ -2212,5 +2499,162 @@ mod windows_tests {
         );
         assert!(!host.signal(pid, Signal::Kill).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn icacls(args: &[&str]) {
+        let status = Command::new("icacls.exe").args(args).status().unwrap();
+        assert!(status.success(), "icacls {args:?}");
+    }
+
+    #[test]
+    fn state_directories_must_be_closed_to_other_accounts() {
+        let host = RealHost::default();
+        // Under the user's profile: owned by and open to this account.
+        let open = std::env::temp_dir().join(format!("mesh-node-state-{}", std::process::id()));
+        std::fs::create_dir_all(&open).unwrap();
+        let error = host
+            .write_state(&open.join("takeover.json"), b"{}")
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&open);
+
+        // Under ProgramData, owned by and open to the administrators and
+        // the system only, as the installer leaves it.
+        let program_data = std::env::var_os("ProgramData").unwrap();
+        let closed = std::path::Path::new(&program_data)
+            .join(format!("mesh-node-state-{}", std::process::id()));
+        std::fs::create_dir_all(&closed).unwrap();
+        let path = closed.display().to_string();
+        icacls(&[&path, "/setowner", "*S-1-5-32-544"]);
+        icacls(&[
+            &path,
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+        ]);
+        let file = closed.join("takeover.json");
+        host.write_state(&file, b"{\"a\":1}").unwrap();
+        assert_eq!(host.read_state(&file).unwrap(), b"{\"a\":1}");
+        assert!(host
+            .try_lock(&closed.join("takeover.lock"), "test")
+            .unwrap());
+        host.unlock(&closed.join("takeover.lock"));
+
+        // Another account allowed to write there: refused.
+        icacls(&[&path, "/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+        let error = host.read_state(&file).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        icacls(&[&path, "/remove:g", "*S-1-5-32-545"]);
+        host.read_state(&file).unwrap();
+
+        // A junction on the way: refused.
+        let junction = std::path::Path::new(&program_data)
+            .join(format!("mesh-node-junction-{}", std::process::id()));
+        let status = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&closed)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let error = host
+            .read_state(&junction.join("takeover.json"))
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        let _ = std::fs::remove_dir(&junction);
+        let _ = std::fs::remove_dir_all(&closed);
+    }
+}
+
+#[cfg(test)]
+mod state_dir_tests {
+    use super::{judge_state_dir, AccessEntry};
+
+    fn grant(sid: &str, mask: u32) -> AccessEntry {
+        AccessEntry {
+            allow: true,
+            inherit_only: false,
+            mask,
+            sid: sid.into(),
+            known: true,
+        }
+    }
+
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINS: &str = "S-1-5-32-544";
+    const USERS: &str = "S-1-5-32-545";
+    const FULL: u32 = 0x1f01ff;
+    const READ: u32 = 0x1200a9;
+
+    #[test]
+    fn the_state_directory_is_for_the_administrators_and_the_system() {
+        let closed = [grant(SYSTEM, FULL), grant(ADMINS, FULL)];
+        assert!(judge_state_dir("d", ADMINS, Some(&closed), true).is_ok());
+        assert!(judge_state_dir("d", SYSTEM, Some(&closed), true).is_ok());
+        // Owned by a user: the owner may change the access list.
+        assert!(judge_state_dir("d", "S-1-5-21-1-2-3-1001", Some(&closed), true).is_err());
+        // No access list: everyone may do everything.
+        assert!(judge_state_dir("d", ADMINS, None, true).is_err());
+        // Reading is fine; adding a file is not.
+        let mut entries = closed.to_vec();
+        entries.push(grant(USERS, READ));
+        assert!(judge_state_dir("d", ADMINS, Some(&entries), true).is_ok());
+        entries.push(grant(USERS, 0x2));
+        assert!(judge_state_dir("d", ADMINS, Some(&entries), true).is_err());
+        // A denial, or a grant only for what is created inside, does not
+        // open the directory itself.
+        let mut entries = closed.to_vec();
+        entries.push(AccessEntry {
+            allow: false,
+            ..grant(USERS, FULL)
+        });
+        entries.push(AccessEntry {
+            inherit_only: true,
+            ..grant("S-1-3-0", FULL)
+        });
+        assert!(judge_state_dir("d", ADMINS, Some(&entries), true).is_ok());
+        // An entry of a kind not read here is not guessed at.
+        entries.push(AccessEntry {
+            known: false,
+            sid: String::new(),
+            ..grant(USERS, 0)
+        });
+        assert!(judge_state_dir("d", ADMINS, Some(&entries), true).is_err());
+    }
+
+    #[test]
+    fn directories_above_may_let_users_add_but_not_replace() {
+        // C:\ProgramData: users may create folders and files there.
+        let program_data = [
+            grant(SYSTEM, FULL),
+            grant(ADMINS, FULL),
+            grant(USERS, READ),
+            grant(USERS, 0x2 | 0x4 | 0x10 | 0x100),
+        ];
+        assert!(judge_state_dir("p", SYSTEM, Some(&program_data), false).is_ok());
+        // But not as the state directory itself.
+        assert!(judge_state_dir("p", SYSTEM, Some(&program_data), true).is_err());
+        // Deleting children would let them replace ours.
+        let mut entries = program_data.to_vec();
+        entries.push(grant(USERS, 0x40));
+        assert!(judge_state_dir("p", SYSTEM, Some(&entries), false).is_err());
+        let mut entries = program_data.to_vec();
+        entries.push(grant("S-1-1-0", 0x4_0000));
+        assert!(judge_state_dir("p", SYSTEM, Some(&entries), false).is_err());
+        // A folder a user created there belongs to that user.
+        assert!(judge_state_dir("p", "S-1-5-21-1-2-3-1001", Some(&program_data), false).is_err());
     }
 }
