@@ -52,6 +52,9 @@ pub struct Local {
     pub cipher: Cipher,
     /// Static keys accepted without a secret proof (spec §8.3 level 2).
     pub trusted_keys: Vec<[u8; LEN]>,
+    /// `Some` in a managed network: only peers holding one of these static
+    /// keys are admitted, whatever else they prove (spec §8.3.1).
+    pub native_keys: Option<Vec<[u8; LEN]>>,
 }
 
 /// How the peer was authenticated (spec §8.3).
@@ -87,9 +90,11 @@ pub enum HandshakeError {
     /// A relay msg1 seen before and no longer pending: dropped without an
     /// answer (spec §9).
     Replayed,
-    /// The peer's static key is not the one its route information
-    /// announces.
+    /// The peer's static key is not the one expected for its node ID.
     UnexpectedStaticKey,
+    /// A managed network: the peer's static key is not on the native key
+    /// list (spec §8.3.1).
+    NotNative,
 }
 
 impl From<NoiseError> for HandshakeError {
@@ -138,6 +143,15 @@ fn expected_key(
 ) -> Result<(), HandshakeError> {
     match expected_static {
         Some(expected) if expected != *peer_static => Err(HandshakeError::UnexpectedStaticKey),
+        _ => Ok(()),
+    }
+}
+
+/// Spec §8.3.1: in a managed network the peer's authenticated static key
+/// must be on the native key list.
+fn admit(local: &Local, peer_static: &[u8; LEN]) -> Result<(), HandshakeError> {
+    match &local.native_keys {
+        Some(keys) if !keys.contains(peer_static) => Err(HandshakeError::NotNative),
         _ => Ok(()),
     }
 }
@@ -359,6 +373,9 @@ impl Client {
             &self.after_msg1,
             &peer_static,
         )?;
+        // Before msg3: a server off the list gets nothing more, and the
+        // root key in msg2 is wiped with it.
+        admit(local, &peer_static)?;
         Ok((msg2, peer_static, auth))
     }
 }
@@ -523,6 +540,9 @@ impl Server {
             &self.after_msg2,
             &peer_static,
         )?;
+        // Nothing is installed for a client off the list; the root key
+        // made for it is wiped with the pending agreement.
+        admit(local, &peer_static)?;
         Ok((peer_static, auth))
     }
 }
@@ -542,8 +562,8 @@ pub struct RelayInitiator {
 }
 
 impl RelayInitiator {
-    /// `peer_static` is the key in the peer's route information. Returns
-    /// relay msg1.
+    /// `peer_static` is the key expected for `peer_id` (spec §12.3).
+    /// Returns relay msg1.
     pub fn start(
         local: &Local,
         peer_id: u32,
@@ -552,6 +572,7 @@ impl RelayInitiator {
         rng: &dyn SecureRandom,
     ) -> Result<(Self, Vec<u8>), HandshakeError> {
         other_node(local, peer_id)?;
+        admit(local, &peer_static)?;
         let mut noise = HandshakeState::new(
             Pattern::Ik,
             true,
@@ -677,6 +698,8 @@ pub fn relay_respond(
     let peer_static = noise
         .remote_static()
         .ok_or(HandshakeError::Noise(NoiseError::OutOfTurn))?;
+    // Neither is remembered as seen nor answered (spec §8.3.1 rule 3).
+    admit(local, &peer_static)?;
     if expected_static != Some(peer_static) {
         return Err(HandshakeError::Unauthenticated);
     }
@@ -739,6 +762,7 @@ mod tests {
             digest: secret.map(|_| [5; 32]),
             cipher,
             trusted_keys: Vec::new(),
+            native_keys: None,
         }
     }
 
