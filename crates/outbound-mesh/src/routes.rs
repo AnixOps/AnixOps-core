@@ -59,8 +59,10 @@ pub enum Denied {
     /// A packet whose source is not this node.
     ForeignSource,
     /// A subnet that overlaps one of this node's own networks: the subnets
-    /// it advertises or the networks of its interfaces (spec §15.4). Routing
-    /// it into the mesh would take traffic away from the local network.
+    /// it advertises or the networks of its interfaces (spec §15.4). Such a
+    /// subnet is kept and shown as a conflict, but neither routed nor
+    /// installed as a system route, which would take traffic away from the
+    /// local network; see [`RouteTable::local_conflicts`].
     LocalNetwork,
     Malformed(Malformed),
 }
@@ -93,6 +95,9 @@ pub struct PeerUpdate {
     pub subnets: Vec<IpNet>,
     pub refused_addresses: Vec<(IpAddr, Denied)>,
     pub refused_subnets: Vec<(IpNet, Denied)>,
+    /// Kept in `subnets` but not routed: they overlap a network of this
+    /// node ([`Denied::LocalNetwork`]).
+    pub local_conflicts: Vec<IpNet>,
 }
 
 #[derive(Default)]
@@ -129,10 +134,9 @@ impl RouteTable {
     }
 
     /// Sets the networks of this node's interfaces and the subnets the user
-    /// routes through the mesh anyway (`mesh_set_subnet_route`). Subnets
-    /// already accepted from peers that now overlap are withdrawn; they are
-    /// returned so the status can show them, and come back with the peer's
-    /// next advertisement once the overlap is gone.
+    /// routes through the mesh anyway (`mesh_set_subnet_route`). Accepted
+    /// subnets that now overlap stop being routed at once and start again
+    /// when the overlap is gone; the conflicts are returned for the status.
     pub fn set_local_networks(
         &mut self,
         interfaces: &[IpNet],
@@ -140,21 +144,36 @@ impl RouteTable {
     ) -> Vec<(PeerId, IpNet)> {
         self.interfaces = interfaces.iter().map(IpNet::trunc).collect();
         self.mesh_overrides = mesh_overrides.iter().map(IpNet::trunc).collect();
-        let mut withdrawn = Vec::new();
-        let peers: Vec<PeerId> = self.peers.keys().copied().collect();
-        for peer in peers {
-            let subnets = std::mem::take(&mut self.peers.get_mut(&peer).expect("listed").subnets);
-            let mut kept = Vec::with_capacity(subnets.len());
-            for subnet in subnets {
-                if self.overlaps_local(&subnet) {
-                    withdrawn.push((peer, subnet));
-                } else {
-                    kept.push(subnet);
-                }
-            }
-            self.peers.get_mut(&peer).expect("listed").subnets = kept;
-        }
-        withdrawn
+        self.local_conflicts()
+    }
+
+    /// Accepted subnets that overlap a network of this node (spec §15.4):
+    /// shown as conflicts, not routed, not installed as system routes.
+    pub fn local_conflicts(&self) -> Vec<(PeerId, IpNet)> {
+        self.peers
+            .iter()
+            .flat_map(|(peer, routes)| routes.subnets.iter().map(move |subnet| (*peer, *subnet)))
+            .filter(|(_, subnet)| !self.routable(subnet))
+            .collect()
+    }
+
+    /// The subnets to install as system routes: every accepted subnet that
+    /// is routed, once each. The driver further limits them to
+    /// `routing.system_routes`.
+    pub fn system_routes(&self) -> Vec<IpNet> {
+        let mut routes: Vec<IpNet> = self
+            .peers
+            .values()
+            .flat_map(|routes| routes.subnets.iter().copied())
+            .filter(|subnet| self.routable(subnet))
+            .collect();
+        routes.sort_by_key(|subnet| subnet.to_string());
+        routes.dedup();
+        routes
+    }
+
+    fn routable(&self, subnet: &IpNet) -> bool {
+        !self.overlaps_local(subnet)
     }
 
     fn overlaps_local(&self, subnet: &IpNet) -> bool {
@@ -203,6 +222,9 @@ impl RouteTable {
             match verdict {
                 Ok(()) if routes.subnets.contains(&subnet) => {}
                 Ok(()) => {
+                    if !self.routable(&subnet) {
+                        update.local_conflicts.push(subnet);
+                    }
                     routes.subnets.push(subnet);
                     update.subnets.push(subnet);
                 }
@@ -259,9 +281,9 @@ impl RouteTable {
         if !self.allowed.is_empty() && !self.allowed.iter().any(|allowed| allowed.covers(subnet)) {
             return Err(Denied::NotAllowed);
         }
-        if self.overlaps_local(subnet) {
-            return Err(Denied::LocalNetwork);
-        }
+        // Overlap with this node's own networks is kept, as a conflict
+        // (spec §15.4); the same subnet as this node advertises is how
+        // several advertisers are detected (spec §15.4, R16).
         Ok(())
     }
 
@@ -300,7 +322,7 @@ impl RouteTable {
         self.peers
             .iter()
             .flat_map(|(peer, routes)| routes.subnets.iter().map(move |subnet| (*peer, subnet)))
-            .filter(|(_, subnet)| subnet.contains(destination))
+            .filter(|(_, subnet)| subnet.contains(destination) && self.routable(subnet))
             .filter_map(|(peer, subnet)| Some((peer, subnet.prefix(), hops(peer)?)))
             // Longest prefix, then fewest hops, then smallest ID.
             .min_by_key(|(peer, prefix, hops)| (std::cmp::Reverse(*prefix), *hops, *peer))
@@ -351,14 +373,13 @@ impl RouteTable {
             .peers
             .values()
             .flat_map(|routes| routes.subnets.iter())
-            .filter(|subnet| subnet.contains(source))
+            .filter(|subnet| subnet.contains(source) && self.routable(subnet))
             .map(IpNet::prefix)
             .max();
         let owned = longest.is_some_and(|longest| {
-            routes
-                .subnets
-                .iter()
-                .any(|subnet| subnet.prefix() == longest && subnet.contains(source))
+            routes.subnets.iter().any(|subnet| {
+                subnet.prefix() == longest && subnet.contains(source) && self.routable(subnet)
+            })
         });
         if owned {
             Ok(())
@@ -606,23 +627,38 @@ mod tests {
                 net("192.168.70.0/24"),
             ],
         );
-        assert_eq!(
-            update.refused_subnets,
-            vec![(net("192.168.50.128/25"), Denied::LocalNetwork)]
-        );
-        // An interface network appears later: the overlapping route goes.
-        let withdrawn = table.set_local_networks(&[net("192.168.60.7/24")], &[]);
-        assert_eq!(withdrawn, vec![(A, net("192.168.60.0/24"))]);
+        // Kept and shown, but not routed (spec §15.4).
+        assert!(update.refused_subnets.is_empty());
+        assert_eq!(update.local_conflicts, vec![net("192.168.50.128/25")]);
+        assert_eq!(table.lookup(ip("192.168.50.200")), Err(Denied::NoRoute));
+        assert_eq!(table.local_conflicts(), vec![(A, net("192.168.50.128/25"))]);
+        // An interface network appears later: the overlapping route stops.
+        let conflicts = table.set_local_networks(&[net("192.168.60.7/24")], &[]);
+        assert_eq!(conflicts.len(), 2);
+        assert!(conflicts.contains(&(A, net("192.168.60.0/24"))));
         assert_eq!(table.lookup(ip("192.168.60.1")), Err(Denied::NoRoute));
         assert_eq!(table.lookup(ip("192.168.70.1")), Ok(A));
-        // The user routes that subnet through the mesh after all.
+        assert_eq!(table.system_routes(), vec![net("192.168.70.0/24")]);
+        let from_lan = ipv4([192, 168, 60, 9], [10, 144, 144, 5], 0);
+        assert_eq!(table.check_incoming(A, &from_lan), Err(Denied::Spoofed));
+        // The user routes that subnet through the mesh after all; no new
+        // advertisement is needed.
         table.set_local_networks(&[net("192.168.60.0/24")], &[net("192.168.60.0/24")]);
-        table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.60.0/24")]);
         assert_eq!(table.lookup(ip("192.168.60.1")), Ok(A));
         // An override never applies to what this node advertises itself.
         table.set_local_networks(&[], &[net("192.168.50.128/25")]);
-        let update = table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.50.128/25")]);
-        assert_eq!(update.refused_subnets.len(), 1);
+        assert_eq!(table.lookup(ip("192.168.50.200")), Err(Denied::NoRoute));
+    }
+
+    #[test]
+    fn the_same_subnet_as_this_node_is_kept_for_detection() {
+        let mut config = settings(json!({}));
+        config.advertise_subnets = vec![net("192.168.50.0/24")];
+        let mut table = RouteTable::new(&config);
+        let update = table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.50.0/24")]);
+        assert_eq!(update.subnets, vec![net("192.168.50.0/24")]);
+        assert_eq!(update.local_conflicts, vec![net("192.168.50.0/24")]);
+        assert!(table.system_routes().is_empty());
     }
 
     #[test]

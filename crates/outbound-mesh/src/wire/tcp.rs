@@ -20,7 +20,8 @@ pub enum FrameError {
     TooLong(u32),
     /// A packet this node was about to send is above [`MAX_SEND_FRAME`].
     SendTooLong(usize),
-    /// More than [`MAX_BUFFERED`] bytes without whole frames being read out.
+    /// More than one largest frame left over after the caller read out
+    /// every whole frame: the caller did not drain, or the stream is junk.
     Overflow,
 }
 
@@ -61,23 +62,25 @@ pub struct FrameDecoder {
     start: usize,
 }
 
-/// Most bytes a [`FrameDecoder`] holds: one largest frame plus one read.
-pub const MAX_BUFFERED: usize = LEN_PREFIX + MAX_RECV_FRAME + 64 * 1024;
+/// Most bytes left over between reads once whole frames are read out: one
+/// largest frame. A [`FrameDecoder`] therefore holds at most this plus one
+/// read, whatever size the caller reads in.
+pub const MAX_LEFTOVER: usize = LEN_PREFIX + MAX_RECV_FRAME;
 
 impl FrameDecoder {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adds bytes read from the connection. Refuses to hold more than
-    /// [`MAX_BUFFERED`]: the caller reads packets out between reads, so a
-    /// full buffer means the peer is not sending frames.
+    /// Adds bytes read from the connection, of any length. The caller
+    /// reads every whole packet out between reads; what is left then is at
+    /// most [`MAX_LEFTOVER`], and more is refused.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), FrameError> {
         if self.start > 0 {
             self.buf.drain(..self.start);
             self.start = 0;
         }
-        if self.buf.len() + bytes.len() > MAX_BUFFERED {
+        if self.buf.len() > MAX_LEFTOVER {
             return Err(FrameError::Overflow);
         }
         self.buf.extend_from_slice(bytes);
@@ -178,11 +181,22 @@ mod tests {
 
     #[test]
     fn buffer_is_bounded_and_compacted() {
+        // One read of any size is taken; left undrained, the next is not.
         let mut decoder = FrameDecoder::new();
-        assert_eq!(
-            decoder.push(&vec![0xff; MAX_BUFFERED + 1]),
-            Err(FrameError::Overflow)
-        );
+        decoder.push(&vec![0xff; 256 * 1024]).unwrap();
+        assert_eq!(decoder.push(&[0]), Err(FrameError::Overflow));
+        // A large read of many whole frames is fine once drained.
+        let frame = encode_frame(&packet(MAX_SEND_FRAME)).unwrap();
+        let stream: Vec<u8> = (0..100).flat_map(|_| frame.clone()).collect();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&stream).unwrap();
+        let mut count = 0;
+        while decoder.next_packet().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 100);
+        decoder.push(&frame[..10]).unwrap();
+        assert_eq!(decoder.buffered(), 10);
         // Whole frames read out make room again.
         let frame = encode_frame(&packet(MAX_SEND_FRAME)).unwrap();
         let mut decoder = FrameDecoder::new();

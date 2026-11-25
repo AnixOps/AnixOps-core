@@ -22,6 +22,9 @@ pub enum CipherError {
     Open,
     /// The system random source failed.
     Random,
+    /// The cipher has no key here: `xor`, which validation refuses, so
+    /// this is reached only by a configuration that skipped validation.
+    Unsupported,
 }
 
 /// The network's static traffic key.
@@ -32,20 +35,20 @@ pub struct LegacyCipher {
 
 impl LegacyCipher {
     /// Derives the key of `cipher` from the network secret (spec §7.1);
-    /// `None` for an unencrypted network.
-    pub fn new(cipher: Cipher, secret: &[u8]) -> Option<Self> {
+    /// `Ok(None)` for an unencrypted network.
+    pub fn new(cipher: Cipher, secret: &[u8]) -> Result<Option<Self>, CipherError> {
         let unbound = match cipher {
-            Cipher::None => return None,
-            Cipher::Xor => unreachable!("validation refuses the xor cipher"),
+            Cipher::None => return Ok(None),
+            Cipher::Xor => return Err(CipherError::Unsupported),
             Cipher::Aes128Gcm => UnboundKey::new(&aead::AES_128_GCM, &key128(secret)),
             Cipher::Aes256Gcm => UnboundKey::new(&aead::AES_256_GCM, &key256(secret)),
             Cipher::ChaCha20Poly1305 => UnboundKey::new(&aead::CHACHA20_POLY1305, &key256(secret)),
         }
         .expect("derived keys have the algorithm's length");
-        Some(Self {
+        Ok(Some(Self {
             key: LessSafeKey::new(unbound),
             rng: SystemRandom::new(),
-        })
+        }))
     }
 
     /// Encrypts `payload` in place and appends the tail, with a fresh random
@@ -103,7 +106,9 @@ mod tests {
     // Spec §22.4: the whole TCP frame of one encrypted Data packet.
     #[test]
     fn tcp_frame_vector() {
-        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"s3cr3t").unwrap();
+        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"s3cr3t")
+            .unwrap()
+            .unwrap();
         let plain = unhex(ICMP);
         let mut payload = plain.clone();
         let nonce: [u8; 12] = (0u8..12).collect::<Vec<_>>().try_into().unwrap();
@@ -140,7 +145,7 @@ mod tests {
             Cipher::Aes256Gcm,
             Cipher::ChaCha20Poly1305,
         ] {
-            let cipher = LegacyCipher::new(kind, b"secret").unwrap();
+            let cipher = LegacyCipher::new(kind, b"secret").unwrap().unwrap();
             let mut a = b"hello mesh".to_vec();
             let mut b = a.clone();
             cipher.seal(&mut a).unwrap();
@@ -154,7 +159,9 @@ mod tests {
 
     #[test]
     fn wrong_key_cipher_or_tampering_fails() {
-        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"secret").unwrap();
+        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"secret")
+            .unwrap()
+            .unwrap();
         let mut sealed = b"payload".to_vec();
         cipher.seal(&mut sealed).unwrap();
 
@@ -162,12 +169,14 @@ mod tests {
         assert_eq!(
             LegacyCipher::new(Cipher::Aes128Gcm, b"other")
                 .unwrap()
+                .unwrap()
                 .open(&mut other),
             Err(CipherError::Open)
         );
         let mut other = sealed.clone();
         assert_eq!(
             LegacyCipher::new(Cipher::Aes256Gcm, b"secret")
+                .unwrap()
                 .unwrap()
                 .open(&mut other),
             Err(CipherError::Open)
@@ -177,7 +186,13 @@ mod tests {
         assert_eq!(cipher.open(&mut tampered), Err(CipherError::Open));
         let mut short = vec![0u8; TAIL_LEN - 1];
         assert_eq!(cipher.open(&mut short), Err(CipherError::Truncated));
-        assert!(LegacyCipher::new(Cipher::None, b"secret").is_none());
+        assert!(LegacyCipher::new(Cipher::None, b"secret")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            LegacyCipher::new(Cipher::Xor, b"secret").err(),
+            Some(CipherError::Unsupported)
+        );
         // An empty payload still carries a tag.
         let mut empty = Vec::new();
         cipher.seal(&mut empty).unwrap();

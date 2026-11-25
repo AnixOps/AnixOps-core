@@ -103,10 +103,9 @@ pub fn cipher_name(cipher: Cipher) -> Option<&'static str> {
     }
 }
 
-/// Parses a cipher name announced by a peer, with the `openssl-` variants
-/// (spec §7.1). Unknown names are refused rather than guessed.
+/// Parses a cipher name announced by a peer: only the names of the table
+/// of spec §7.1. Unknown names are refused rather than guessed.
 pub fn parse_cipher(name: &str) -> Result<Cipher, MessageError> {
-    let name = name.strip_prefix("openssl-").unwrap_or(name);
     match name {
         "aes-gcm" => Ok(Cipher::Aes128Gcm),
         "aes-256-gcm" => Ok(Cipher::Aes256Gcm),
@@ -495,15 +494,17 @@ mod tests {
     }
 
     #[test]
-    fn cipher_names_accept_the_variants() {
-        assert_eq!(parse_cipher("openssl-aes-gcm"), Ok(Cipher::Aes128Gcm));
+    fn cipher_names_are_those_of_the_table() {
+        assert_eq!(parse_cipher("aes-gcm"), Ok(Cipher::Aes128Gcm));
         assert_eq!(parse_cipher("aes-256-gcm"), Ok(Cipher::Aes256Gcm));
+        assert_eq!(parse_cipher("chacha20"), Ok(Cipher::ChaCha20Poly1305));
         assert_eq!(
-            parse_cipher("openssl-chacha20-poly1305"),
+            parse_cipher("chacha20-poly1305"),
             Ok(Cipher::ChaCha20Poly1305)
         );
-        assert_eq!(parse_cipher(""), Err(MessageError::BadCipher));
-        assert_eq!(parse_cipher("none"), Err(MessageError::BadCipher));
+        for name in ["", "none", "xor", "openssl-aes-gcm"] {
+            assert_eq!(parse_cipher(name), Err(MessageError::BadCipher), "{name}");
+        }
     }
 
     #[test]
