@@ -20,6 +20,7 @@
 | 顶层 | `paths` | 0.5 |
 | `network` | `id`（即配置里的 `network.name`）、`name`、`state`、`security`、`failure`、`joining`、`routingPolicy`、`dnsSuffix`、`dnsEnabled` | 0.3 |
 | `self` | `id`、`name`、`role`、`address`、`addressV6`、`domain`、`relay`、`listen`、`advertised`、`suggestedSubnets`、`ipForwarding` | 0.3 |
+| `self` | `staticKey` | 0.3 |
 | `self` | `addressManaged`、`region`、`regionBasis`、`regionState`、`hostMode` | 0.4 |
 | `members[]` | `id`、`name`、`role`、`state`、`address`、`domain`、`connection`、`hops`、`transport`、`latencyMs`、`path`、`pathState`、`unreachable`、`subnets`、`duplicateOf` | 0.3 |
 | `members[]` | `region`、`addressManaged`、`vms` | 0.4 |
@@ -38,6 +39,7 @@
 | `network.state` | `joined`、`joining`、`partial`（部分成员不可达）、`not_joined`、`failed` |
 | `network.security` | `forward_secrecy`（安全模式）、`standard`（默认模式，未启用前向保密）、`none`（显式选择的不加密，需求 R14） |
 | `network.kind` | `managed`、`legacy`（配置里的 `network.kind`，规范 §5.2） |
+| `self.staticKey` | 本机在该网络的安全模式静态公钥：32 字节 X25519 公钥的标准 base64（RFC 4648 §4，带填充，44 个字符）。按网络各一份（规范 §8.1），保存网络配置时即生成，网络未加入时也给出；旧模式网络为 `null`。没有 Agent 的设备入网登记时提交这个值，供面板列入 `network.native_keys`（规范 §8.3.1 第 7 条） |
 | `network.limitations` | 字符串列表，空列表表示没有限制；只在安全模式网络上给出，旧模式网络为空列表（旧模式另由 `security` 标出）。`reference_peers`：`network.kind` 为 `legacy` 且为安全模式（旧网本来就由原版节点组成）；与原版节点之间的会话保密性以参考实现为上限（规范 §19.2 第 5 条），界面显示「含原版节点，保密性受限」。`managed` 网络按规范 §8.3.1 只接纳 `native_keys` 中的我方节点，不会出现该值。`unverified_peers`：保留值，当前不再产生（原用于 `managed` 网络中实现无法判定的成员）；客户端仍应能显示它，提示「无法确认对端实现」 |
 | `members[].implementation` | `native`（我方节点程序）、`reference`（原版实现）、`unknown`（尚不能判断）。判定用的是**经握手认证**的对端静态公钥：直连邻居取 Noise XX 握手中认证的静态公钥，经中继的成员取已建立的中继会话（Noise IK）中认证的静态公钥；还没有会话的成员只有路由信息字段 18 中的自报公钥，一律为 `unknown`。认证后的公钥与配置 `network.native_keys`（面板经 Agent 下发的我方节点静态公钥清单，见 `mesh-module.md`）比较：在清单中为 `native`；清单存在但不在其中为 `reference`；配置没有该清单时为 `unknown`。`managed` 网络必须有清单，且不在清单中的对端握手被拒（规范 §8.3.1），所以已有会话的成员一律为 `native`，`reference` 只出现在带清单的 `legacy` 网络中。旧模式网络没有静态公钥认证，一律为 `unknown` |
 | `network.failure` | `null` 或 `{ "code", "detail" }`，`code` 见下表；`detail` 只给人看 |
@@ -101,6 +103,7 @@
 | `GET /v1/status` 的 `features` | `mesh`；`mesh_dns`（网络配置接受 `dns` 节）；`mesh_host_groups`（接受 `host_groups` 节）；`mesh_region_requests`（提供下面的申请接口） | `mesh`、`mesh_dns` 0.3；其余 0.4 |
 | `PUT /v1/mesh` | 每个网络一份 `config_version: 1` 配置，`dns`、`host_groups` 与 `subnets`、`routing` 同级 | 0.3 |
 | `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`，规范 §1），由内核生成，等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
+| `GET /v1/mesh` 顶层 `static_keys` | `[{ "network", "static_key" }]`：本机各网络的安全模式静态公钥，`network` 为该网络配置的 `network.name`，`static_key` 编码同快照的 `self.staticKey`；旧模式网络不列出。Agent 在每个网络实例的状态上报中原样带上 `static_key`，面板只采信 Agent 通道的值来生成 `native_keys`（规范 §8.3.1 第 7 条） | 0.3 |
 | `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为该网络配置的 `network.name`，即快照的 `network.id`；每个网络最多一条待处理申请，新申请替换旧的，保留到被删除为止 | 0.4 |
 | `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 由内核在记下申请时生成，为 1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`），不存在时返回 404 | 0.4 |
 
