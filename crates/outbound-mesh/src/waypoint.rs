@@ -1,17 +1,21 @@
 //! Custom paths (spec §17.2, requirements R7–R9, R25): which path a packet
-//! takes, how a path's state follows the waypoints' reachability and
-//! capability, and the waypoint packet (type 40) that carries a packet
-//! through every waypoint in order.
+//! takes, how a path's state follows the waypoints' reachability,
+//! capability and probes, and the waypoint packet (type 40) that carries a
+//! packet through every waypoint in order.
 //!
 //! Everything here is free of I/O and of the node's state: the node passes
-//! in what it knows (topology, capability answers, recent path errors) and
-//! sends what comes out.
+//! in what it knows (topology, capability answers, path errors, probe
+//! echoes) and sends what comes out. Timers (hold-downs, the probe wait)
+//! and the decision whether a node may receive type 40 at all (its
+//! capability answer, spec §17.2.5) are the node's.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 use crate::config::{CustomPath, PathTarget};
-use crate::wire::header::{flags, packet_type, NodeHeader, HEADER_LEN, MAX_FORWARD_COUNTER};
+use crate::wire::header::{
+    flags, packet_type, NodeHeader, HEADER_LEN, LATENCY_FIRST_MAX_COUNTER, MAX_FORWARD_COUNTER,
+};
 
 /// Encapsulation version this node speaks (spec §17.2.5).
 pub const VERSION: u8 = 1;
@@ -21,9 +25,19 @@ pub const MAX_REMAINING: usize = 6;
 pub const PREFIX_LEN: usize = 12;
 /// Bytes of a whole path error payload.
 pub const ERROR_LEN: usize = PREFIX_LEN + 4;
+/// Bytes of a whole echo payload.
+pub const ECHO_LEN: usize = PREFIX_LEN + 4 + 8;
+/// Encryption tail (spec §7.3, §8.6).
+const TAIL: usize = 28;
+/// Smallest inner packet: a node header and an encryption tail.
+const MIN_INNER: usize = HEADER_LEN + TAIL;
+/// Most segments a path may span: 7 relays (spec §4.4).
+pub const MAX_SEGMENTS: u32 = MAX_FORWARD_COUNTER as u32 + 1;
 
 const KIND_FORWARD: u8 = 1;
 const KIND_ERROR: u8 = 2;
+const KIND_PROBE: u8 = 3;
+const KIND_ECHO: u8 = 4;
 
 /// Name of the private capability service (spec §11.4, §17.2.4).
 pub const RPC_SERVICE: &str = "MeshPathRpc";
@@ -55,14 +69,23 @@ impl ErrorCode {
     }
 }
 
-/// A decoded Forward payload. `inner` is the source's whole packet to the
-/// destination, header included, still encrypted for the destination.
+/// What a Forward or a Probe carries after the waypoint list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Body<'a> {
+    /// The source's whole packet to the destination, header included,
+    /// still encrypted for the destination.
+    Data(&'a [u8]),
+    /// A probe token (spec §17.2.6).
+    Probe(u64),
+}
+
+/// A decoded Forward or Probe: travels through the remaining waypoints.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Forward<'a> {
+pub struct Transit<'a> {
     pub origin: u32,
     pub destination: u32,
     pub remaining: Vec<u32>,
-    pub inner: &'a [u8],
+    pub body: Body<'a>,
 }
 
 /// A decoded path error (spec §17.2.5 rule 6).
@@ -74,33 +97,69 @@ pub struct PathError {
     pub failed: u32,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Payload<'a> {
-    Forward(Forward<'a>),
-    Error(PathError),
+/// A decoded probe echo (spec §17.2.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Echo {
+    pub origin: u32,
+    pub destination: u32,
+    /// The waypoint that answered.
+    pub waypoint: u32,
+    pub token: u64,
 }
 
-/// Builds a Forward payload (spec §17.2.5).
-pub fn encode_forward(origin: u32, destination: u32, remaining: &[u32], inner: &[u8]) -> Vec<u8> {
-    assert!(remaining.len() <= MAX_REMAINING);
-    let mut out = Vec::with_capacity(PREFIX_LEN + 4 * remaining.len() + inner.len());
-    out.extend_from_slice(&[VERSION, KIND_FORWARD, remaining.len() as u8, 0]);
+#[derive(Debug, PartialEq, Eq)]
+pub enum Payload<'a> {
+    Transit(Transit<'a>),
+    Error(PathError),
+    Echo(Echo),
+}
+
+fn prefix(out: &mut Vec<u8>, kind: u8, count: usize, code: u8, origin: u32, destination: u32) {
+    out.extend_from_slice(&[VERSION, kind, count as u8, code]);
     out.extend_from_slice(&origin.to_le_bytes());
     out.extend_from_slice(&destination.to_le_bytes());
+}
+
+/// Builds a Forward or Probe payload (spec §17.2.5).
+pub fn encode_transit(origin: u32, destination: u32, remaining: &[u32], body: Body<'_>) -> Vec<u8> {
+    assert!(remaining.len() <= MAX_REMAINING);
+    let (kind, tail): (u8, &[u8]) = match body {
+        Body::Data(inner) => (KIND_FORWARD, inner),
+        Body::Probe(_) => (KIND_PROBE, &[]),
+    };
+    let mut out = Vec::with_capacity(PREFIX_LEN + 4 * remaining.len() + tail.len().max(8));
+    prefix(&mut out, kind, remaining.len(), 0, origin, destination);
     for id in remaining {
         out.extend_from_slice(&id.to_le_bytes());
     }
-    out.extend_from_slice(inner);
+    match body {
+        Body::Data(inner) => out.extend_from_slice(inner),
+        Body::Probe(token) => out.extend_from_slice(&token.to_le_bytes()),
+    }
     out
 }
 
 /// Builds a path error payload (spec §17.2.5 rule 6).
-pub fn encode_error(error: &PathError) -> [u8; ERROR_LEN] {
-    let mut out = [0u8; ERROR_LEN];
-    out[..4].copy_from_slice(&[VERSION, KIND_ERROR, 0, error.code as u8]);
-    out[4..8].copy_from_slice(&error.origin.to_le_bytes());
-    out[8..12].copy_from_slice(&error.destination.to_le_bytes());
-    out[12..16].copy_from_slice(&error.failed.to_le_bytes());
+pub fn encode_error(error: &PathError) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ERROR_LEN);
+    prefix(
+        &mut out,
+        KIND_ERROR,
+        0,
+        error.code as u8,
+        error.origin,
+        error.destination,
+    );
+    out.extend_from_slice(&error.failed.to_le_bytes());
+    out
+}
+
+/// Builds an echo payload (spec §17.2.6).
+pub fn encode_echo(echo: &Echo) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ECHO_LEN);
+    prefix(&mut out, KIND_ECHO, 0, 0, echo.origin, echo.destination);
+    out.extend_from_slice(&echo.waypoint.to_le_bytes());
+    out.extend_from_slice(&echo.token.to_le_bytes());
     out
 }
 
@@ -108,9 +167,13 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
 /// Reads a decrypted type-40 payload. Checks everything that does not need
-/// the receiver's identity (spec §17.2.5 rules 2 and 3, rule 7's shape);
-/// `None` means drop and count.
+/// the receiver's identity (spec §17.2.5 rules 2 and 3, the fixed lengths,
+/// rule 7's shape); `None` means drop and count.
 pub fn decode(payload: &[u8]) -> Option<Payload<'_>> {
     if payload.len() < PREFIX_LEN || payload[0] != VERSION {
         return None;
@@ -130,12 +193,23 @@ pub fn decode(payload: &[u8]) -> Option<Payload<'_>> {
                 failed: u32_at(payload, 12),
             }))
         }
-        KIND_FORWARD => {
+        KIND_ECHO => {
+            if payload.len() != ECHO_LEN || count != 0 || payload[3] != 0 {
+                return None;
+            }
+            Some(Payload::Echo(Echo {
+                origin,
+                destination,
+                waypoint: u32_at(payload, 12),
+                token: u64_at(payload, 16),
+            }))
+        }
+        kind @ (KIND_FORWARD | KIND_PROBE) => {
             if payload[3] != 0 || count > MAX_REMAINING {
                 return None;
             }
             let list_end = PREFIX_LEN + 4 * count;
-            if payload.len() < list_end + HEADER_LEN {
+            if payload.len() < list_end {
                 return None;
             }
             let remaining: Vec<u32> = (0..count)
@@ -147,45 +221,64 @@ pub fn decode(payload: &[u8]) -> Option<Payload<'_>> {
                     return None;
                 }
             }
-            let inner = &payload[list_end..];
-            let header = NodeHeader::decode(inner)?;
-            if header.from != origin
-                || header.to != destination
-                || header.packet_type != packet_type::DATA
-                || !header.has(flags::ENCRYPTED)
-            {
-                return None;
-            }
-            Some(Payload::Forward(Forward {
+            let rest = &payload[list_end..];
+            let body = if kind == KIND_PROBE {
+                if rest.len() != 8 {
+                    return None;
+                }
+                Body::Probe(u64_at(rest, 0))
+            } else {
+                if rest.len() < MIN_INNER {
+                    return None;
+                }
+                let header = NodeHeader::decode(rest)?;
+                if header.from != origin
+                    || header.to != destination
+                    || header.packet_type != packet_type::DATA
+                    || !header.has(flags::ENCRYPTED)
+                {
+                    return None;
+                }
+                Body::Data(rest)
+            };
+            Some(Payload::Transit(Transit {
                 origin,
                 destination,
                 remaining,
-                inner,
+                body,
             }))
         }
         _ => None,
     }
 }
 
-/// What a waypoint does with a Forward it received (spec §17.2.5 rules
-/// 1–6).
+/// What a waypoint does with a Forward or Probe it received (spec §17.2.5
+/// rules 1–6, §17.2.6 rule 2).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Step {
+    /// Send this error to the source; the transit is dropped. The node
+    /// sends it only when the source's capability answer allows (rule 6).
+    pub report: Option<PathError>,
+    /// Send this echo to the source (probes only), under the same rule.
+    pub echo: Option<Echo>,
+    /// Wrap again for the next waypoint.
+    pub next: Option<Next>,
+    /// This was the last waypoint of a Forward: relay this packet (the
+    /// inner packet with its counter rewritten) towards its destination as
+    /// in spec §14, or handle it locally when the destination is this
+    /// node.
+    pub release: Option<Vec<u8>>,
+}
+
+/// A type-40 packet from this node to the next waypoint.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Step {
-    /// Drop and count, nothing to report.
-    Drop,
-    /// Drop and send this error to `error.origin`.
-    Report(PathError),
-    /// Wrap again for the next waypoint `to`: send a type-40 packet from
-    /// this node with this payload and forward counter.
-    Next {
-        to: u32,
-        forward_counter: u8,
-        payload: Vec<u8>,
-    },
-    /// This was the last waypoint: relay `packet` (the inner packet with its
-    /// counter rewritten) towards its destination as in spec §14, or handle
-    /// it locally when the destination is this node.
-    Release { packet: Vec<u8> },
+pub struct Next {
+    pub to: u32,
+    pub forward_counter: u8,
+    /// Keep LATENCY_FIRST on the outer header (spec §4.4 applied to the new
+    /// counter).
+    pub latency_first: bool,
+    pub payload: Vec<u8>,
 }
 
 /// What the waypoint knows about itself and the topology.
@@ -195,49 +288,83 @@ pub struct WaypointContext<'a> {
     pub relays: bool,
     /// The outer header's forward counter.
     pub forward_counter: u8,
-    /// Whether a node is reachable in this node's topology (this node
-    /// itself counts as reachable).
+    /// The outer header's LATENCY_FIRST flag.
+    pub latency_first: bool,
+    /// Whether a node is reachable in this node's topology.
     pub reachable: &'a dyn Fn(u32) -> bool,
 }
 
-/// Decides what a waypoint does with `forward` (already decoded).
-pub fn step(forward: &Forward<'_>, cx: &WaypointContext<'_>) -> Step {
-    let report = |code, failed| {
-        Step::Report(PathError {
+/// Decides what a waypoint does with `transit` (already decoded). An empty
+/// step means drop and count.
+pub fn step(transit: &Transit<'_>, cx: &WaypointContext<'_>) -> Step {
+    let probe = matches!(transit.body, Body::Probe(_));
+    let error = |code, failed| {
+        // Probes never cause errors (spec §17.2.5 rule 6).
+        let report = (!probe).then_some(PathError {
             code,
-            origin: forward.origin,
-            destination: forward.destination,
+            origin: transit.origin,
+            destination: transit.destination,
             failed,
-        })
+        });
+        Step {
+            report,
+            ..Step::default()
+        }
     };
-    if forward.remaining.contains(&cx.self_id) || forward.origin == cx.self_id {
-        return Step::Drop;
+    if transit.remaining.contains(&cx.self_id)
+        || transit.origin == cx.self_id
+        || transit.destination == cx.self_id && probe
+    {
+        return Step::default();
     }
     if !cx.relays {
-        return report(ErrorCode::NotRelay, cx.self_id);
+        return error(ErrorCode::NotRelay, cx.self_id);
     }
     if cx.forward_counter > MAX_FORWARD_COUNTER {
-        return report(ErrorCode::HopLimit, cx.self_id);
+        return error(ErrorCode::HopLimit, cx.self_id);
     }
+    let echo = match transit.body {
+        Body::Probe(token) => Some(Echo {
+            origin: transit.origin,
+            destination: transit.destination,
+            waypoint: cx.self_id,
+            token,
+        }),
+        Body::Data(_) => None,
+    };
     let counter = cx.forward_counter + 1;
-    match forward.remaining.split_first() {
-        Some((&next, rest)) => {
+    match (transit.remaining.split_first(), transit.body) {
+        (Some((&next, rest)), body) => {
             if !(cx.reachable)(next) {
-                return report(ErrorCode::NextUnreachable, next);
+                let mut step = error(ErrorCode::NextUnreachable, next);
+                step.echo = echo;
+                return step;
             }
-            Step::Next {
-                to: next,
-                forward_counter: counter,
-                payload: encode_forward(forward.origin, forward.destination, rest, forward.inner),
+            Step {
+                echo,
+                next: Some(Next {
+                    to: next,
+                    forward_counter: counter,
+                    latency_first: cx.latency_first && counter <= LATENCY_FIRST_MAX_COUNTER,
+                    payload: encode_transit(transit.origin, transit.destination, rest, body),
+                }),
+                ..Step::default()
             }
         }
-        None => {
-            if forward.destination != cx.self_id && !(cx.reachable)(forward.destination) {
-                return report(ErrorCode::DestinationUnreachable, forward.destination);
+        (None, Body::Probe(_)) => Step {
+            echo,
+            ..Step::default()
+        },
+        (None, Body::Data(inner)) => {
+            if transit.destination != cx.self_id && !(cx.reachable)(transit.destination) {
+                return error(ErrorCode::DestinationUnreachable, transit.destination);
             }
-            let mut packet = forward.inner.to_vec();
+            let mut packet = inner.to_vec();
             packet[10] = counter;
-            Step::Release { packet }
+            Step {
+                release: Some(packet),
+                ..Step::default()
+            }
         }
     }
 }
@@ -309,9 +436,13 @@ impl Capabilities {
         Some(caps)
     }
 
-    /// Whether the node can be a strict waypoint.
-    pub fn supported(&self) -> bool {
-        self.version >= 1 && self.relay
+    /// What the answer means for paths (spec §17.2.4).
+    pub fn capability(&self) -> Capability {
+        match (self.version >= 1, self.relay) {
+            (true, true) => Capability::Supported,
+            (true, false) => Capability::NotRelay,
+            (false, _) => Capability::Unsupported,
+        }
     }
 }
 
@@ -336,20 +467,27 @@ fn read_varint(bytes: &mut &[u8]) -> Option<u64> {
     None
 }
 
-/// What the source knows about one waypoint's capability (spec §17.2.4).
+/// What this node knows about another node's capability (spec §17.2.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
     /// Not asked yet or the answer is outstanding.
     Pending,
-    /// Answered: supports encapsulation and relays.
+    /// Supports encapsulation and relays.
     Supported,
-    /// Answered with Error 3 or version 0 (reference node or an older one
-    /// of ours).
-    Unsupported,
-    /// Answered `relay = false`.
+    /// Knows type 40 but does not relay.
     NotRelay,
+    /// Error 3 or version 0: a reference node or an older one of ours.
+    Unsupported,
     /// The query timed out or failed otherwise.
     Unknown,
+}
+
+impl Capability {
+    /// Whether the node may be sent errors and echoes (spec §17.2.5 rule
+    /// 6).
+    pub fn understands_type_40(self) -> bool {
+        matches!(self, Self::Supported | Self::NotRelay)
+    }
 }
 
 /// One waypoint as the source sees it.
@@ -357,14 +495,40 @@ pub enum Capability {
 pub struct WaypointView {
     /// Node ID; `None` when no member has the configured address.
     pub id: Option<u32>,
-    /// Reachable in the topology with at least one connection on the way.
+    /// Reachable in the topology with a connection to the next hop, and
+    /// the address is claimed by one node ID only.
     pub reachable: bool,
     /// A direct neighbour of this node.
     pub direct: bool,
+    /// The capability of the current node ID.
     pub capability: Capability,
+    /// `false` when the network has `native_keys` and this node's
+    /// implementation is not `native` (spec §17.2.3).
+    pub native: bool,
+    /// Hops of the default route from the previous point (this node, or
+    /// the previous waypoint) to this waypoint.
+    pub hops_in: u32,
+    /// Hops of the default route from this waypoint to the destination.
+    pub hops_to_destination: u32,
 }
 
-/// Why a path fell back (spec §17.2.7; status `path.reason`).
+impl WaypointView {
+    fn encapsulable(&self) -> bool {
+        self.capability == Capability::Supported && self.native
+    }
+
+    /// Why this waypoint cannot be encapsulated through.
+    fn refusal(&self) -> Reason {
+        match self.capability {
+            Capability::NotRelay => Reason::NotRelay,
+            Capability::Unknown => Reason::Unreachable,
+            _ => Reason::Unsupported,
+        }
+    }
+}
+
+/// Why a path fell back or is only partly kept (spec §17.2.7; status
+/// `path.reason`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     Unreachable,
@@ -382,45 +546,43 @@ impl Reason {
             Self::HopLimit => "hop_limit",
         }
     }
+}
 
-    /// The fallback a path error from a waypoint causes (spec §17.2.5 rule
-    /// 7); `None` for errors that only report (destination unreachable).
-    pub fn of_error(code: ErrorCode) -> Option<Self> {
-        match code {
-            ErrorCode::NextUnreachable => Some(Self::Unreachable),
-            ErrorCode::DestinationUnreachable => None,
-            ErrorCode::NotRelay => Some(Self::NotRelay),
-            ErrorCode::HopLimit => Some(Self::HopLimit),
-        }
-    }
+/// The node a state names (status `path.unreachable`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Culprit {
+    /// Index in the configured `via` (after cutting at the destination).
+    Waypoint(usize),
+    /// The destination itself.
+    Destination,
 }
 
 /// How a path is used right now (spec §17.2.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan {
-    /// Capability answers outstanding: default routing, no notice.
+    /// A capability answer is outstanding: default routing, no notice.
     Pending,
     /// Encapsulate through all these waypoints (`active`).
     Strict(Vec<u32>),
-    /// Encapsulate through this leading run only (`first_hop_only` (a)).
-    Prefix(Vec<u32>),
+    /// Encapsulate through this leading run only (`first_hop_only` (a));
+    /// `culprit` is the first waypoint no longer kept.
+    Prefix {
+        waypoints: Vec<u32>,
+        reason: Reason,
+        culprit: usize,
+    },
     /// Send a plain packet through the connection to this direct neighbour
     /// (`first_hop_only` (b)).
-    FirstHop(u32),
+    FirstHop {
+        neighbour: u32,
+        reason: Reason,
+        culprit: usize,
+    },
     /// The destination is itself the first waypoint: default routing,
-    /// `active` (spec §17.2.2 rule 6).
+    /// `active` (spec §17.2.2 rule 7).
     Direct,
-    /// Default routing, naming the node at fault.
-    Fallback { reason: Reason, node: Culprit },
-}
-
-/// The node a fallback names (status `path.unreachable`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Culprit {
-    /// Index in the configured `via`.
-    Waypoint(usize),
-    /// The destination itself (secure mode, direct and not native).
-    Destination,
+    /// Default routing.
+    Fallback { reason: Reason, culprit: Culprit },
 }
 
 impl Plan {
@@ -429,18 +591,26 @@ impl Plan {
         match self {
             Self::Pending => "pending",
             Self::Strict(_) | Self::Direct => "active",
-            Self::Prefix(_) | Self::FirstHop(_) => "first_hop_only",
+            Self::Prefix { .. } | Self::FirstHop { .. } => "first_hop_only",
             Self::Fallback { .. } => "fallback",
+        }
+    }
+
+    /// The waypoints a packet is encapsulated through, if any.
+    pub fn encapsulated(&self) -> Option<&[u32]> {
+        match self {
+            Self::Strict(waypoints) | Self::Prefix { waypoints, .. } => Some(waypoints),
+            _ => None,
         }
     }
 }
 
-/// A recent path error held against a path for 30 s (spec §17.2.5 rule 7):
-/// the reason and the index in `via` of the node it names.
+/// A fallback held against a path by a timer the node keeps: an accepted
+/// path error (30 s) or failed probes (until they recover).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeldError {
+pub struct Held {
     pub reason: Reason,
-    pub node: Culprit,
+    pub culprit: Culprit,
 }
 
 /// What the source knows about the destination B.
@@ -455,61 +625,81 @@ pub struct DestinationView {
 
 /// Decides the plan for a path whose waypoints (configured order, already
 /// cut before the destination by [`cut_at_destination`]) look like `via`.
-pub fn plan(via: &[WaypointView], destination: DestinationView, held: Option<HeldError>) -> Plan {
+pub fn plan(via: &[WaypointView], destination: DestinationView, held: Option<Held>) -> Plan {
     if via.is_empty() {
         return Plan::Direct;
     }
     if let Some(held) = held {
         return Plan::Fallback {
             reason: held.reason,
-            node: held.node,
+            culprit: held.culprit,
         };
     }
     for (index, waypoint) in via.iter().enumerate() {
         if waypoint.id.is_none() || !waypoint.reachable {
             return Plan::Fallback {
                 reason: Reason::Unreachable,
-                node: Culprit::Waypoint(index),
+                culprit: Culprit::Waypoint(index),
             };
         }
     }
     if destination.direct_unverified {
         return Plan::Fallback {
             reason: Reason::Unsupported,
-            node: Culprit::Destination,
+            culprit: Culprit::Destination,
         };
     }
     if via.iter().any(|w| w.capability == Capability::Pending) {
         return Plan::Pending;
     }
     let ids: Vec<u32> = via.iter().map(|w| w.id.unwrap()).collect();
-    let supported = via
-        .iter()
-        .take_while(|w| w.capability == Capability::Supported)
-        .count();
-    if supported == via.len() {
-        return Plan::Strict(ids);
-    }
-    if supported > 0 {
-        return Plan::Prefix(ids[..supported].to_vec());
+    let kept = via.iter().take_while(|w| w.encapsulable()).count();
+    if kept > 0 {
+        if let Some(culprit) = over_hop_limit(&via[..kept]) {
+            return Plan::Fallback {
+                reason: Reason::HopLimit,
+                culprit: Culprit::Waypoint(culprit),
+            };
+        }
+        if kept == via.len() {
+            return Plan::Strict(ids);
+        }
+        return Plan::Prefix {
+            waypoints: ids[..kept].to_vec(),
+            reason: via[kept].refusal(),
+            culprit: kept,
+        };
     }
     let first = via[0];
     if first.direct {
-        return Plan::FirstHop(ids[0]);
+        return Plan::FirstHop {
+            neighbour: ids[0],
+            reason: first.refusal(),
+            culprit: 0,
+        };
     }
-    let reason = match first.capability {
-        Capability::NotRelay => Reason::NotRelay,
-        Capability::Unknown => Reason::Unreachable,
-        _ => Reason::Unsupported,
-    };
     Plan::Fallback {
-        reason,
-        node: Culprit::Waypoint(0),
+        reason: first.refusal(),
+        culprit: Culprit::Waypoint(0),
     }
 }
 
+/// The waypoint whose segment takes the estimated path over 8 segments
+/// (spec §17.2.3, segment estimate), if any.
+fn over_hop_limit(kept: &[WaypointView]) -> Option<usize> {
+    let mut total = 0u32;
+    for (index, waypoint) in kept.iter().enumerate() {
+        total = total.saturating_add(waypoint.hops_in);
+        if total > MAX_SEGMENTS {
+            return Some(index);
+        }
+    }
+    let last = kept.len() - 1;
+    (total.saturating_add(kept[last].hops_to_destination) > MAX_SEGMENTS).then_some(last)
+}
+
 /// Cuts the waypoint list before the destination when the destination is
-/// one of the waypoints (spec §17.2.2 rule 6).
+/// one of the waypoints (spec §17.2.2 rule 7).
 pub fn cut_at_destination(via: &[u32], destination: u32) -> &[u32] {
     match via.iter().position(|id| *id == destination) {
         Some(at) => &via[..at],
@@ -517,16 +707,176 @@ pub fn cut_at_destination(via: &[u32], destination: u32) -> &[u32] {
     }
 }
 
-/// The path a packet to `destination` uses (spec §17.2.2): the longest
-/// `to_subnet` holding the address, else the `to_peer` path of the owner
-/// (`owner`, the virtual address of the node the packet goes to). Returns
-/// the index in `paths`.
+/// A path the source currently encapsulates, as seen when an error
+/// arrives.
+pub struct LivePath<'a> {
+    pub destination: u32,
+    /// The encapsulated waypoints ([`Plan::encapsulated`]).
+    pub waypoints: &'a [u32],
+    /// Whether this node's topology still reaches the destination.
+    pub destination_reachable: bool,
+}
+
+/// What the source does with a path error (spec §17.2.5 rule 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorAction {
+    /// Inconsistent with the path, or a suspicious hop-limit error: drop
+    /// and count.
+    Ignore,
+    /// Hold the path in fallback for 30 s.
+    Fallback { reason: Reason, failed: u32 },
+    /// Keep the path, report the destination as unreachable.
+    DestinationDown,
+    /// Query the reporter's capability again; do not fall back yet.
+    Requery(u32),
+}
+
+/// Judges a path error from `reporter` (the outer `from_peer_id`) against
+/// one live path.
+pub fn judge_error(error: &PathError, reporter: u32, path: &LivePath<'_>) -> ErrorAction {
+    if error.destination != path.destination {
+        return ErrorAction::Ignore;
+    }
+    let Some(at) = path.waypoints.iter().position(|id| *id == reporter) else {
+        return ErrorAction::Ignore;
+    };
+    let last = at + 1 == path.waypoints.len();
+    match error.code {
+        ErrorCode::NextUnreachable => match path.waypoints.get(at + 1) {
+            Some(&next) if next == error.failed => ErrorAction::Fallback {
+                reason: Reason::Unreachable,
+                failed: next,
+            },
+            _ => ErrorAction::Ignore,
+        },
+        ErrorCode::DestinationUnreachable => {
+            if !last || error.failed != path.destination {
+                ErrorAction::Ignore
+            } else if path.destination_reachable {
+                ErrorAction::Fallback {
+                    reason: Reason::Unreachable,
+                    failed: path.destination,
+                }
+            } else {
+                ErrorAction::DestinationDown
+            }
+        }
+        ErrorCode::NotRelay if error.failed == reporter => ErrorAction::Requery(reporter),
+        // The node already falls back on its own estimate (spec §17.2.3)
+        // when a path exceeds 8 segments, so a hop-limit error on a live
+        // path is suspicious.
+        ErrorCode::NotRelay | ErrorCode::HopLimit => ErrorAction::Ignore,
+    }
+}
+
+/// Probe bookkeeping for one encapsulated waypoint sequence (spec §17.2.6).
+/// The node sends a probe, feeds back the echoes, and closes the round
+/// after 3 s.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeState {
+    waypoints: Vec<u32>,
+    token: Option<u64>,
+    answered: Vec<bool>,
+    misses: Vec<u8>,
+    clean_rounds: u8,
+    failed: Option<usize>,
+}
+
+/// Probes in a row without an echo before a waypoint counts as lost.
+pub const PROBE_MISSES: u8 = 3;
+/// Rounds in a row with every echo before the path recovers.
+pub const PROBE_RECOVERY: u8 = 2;
+/// Echoes per second a source expects from one waypoint at most: half of
+/// the waypoint's limit of 32 (spec §17.2.6 rules 1, 4).
+pub const ECHO_BUDGET: u32 = 16;
+
+impl ProbeState {
+    pub fn new(waypoints: Vec<u32>) -> Self {
+        let n = waypoints.len();
+        Self {
+            waypoints,
+            token: None,
+            answered: vec![false; n],
+            misses: vec![0; n],
+            clean_rounds: 0,
+            failed: None,
+        }
+    }
+
+    pub fn waypoints(&self) -> &[u32] {
+        &self.waypoints
+    }
+
+    /// Starts a round with this token.
+    pub fn start(&mut self, token: u64) {
+        self.token = Some(token);
+        self.answered.iter_mut().for_each(|a| *a = false);
+    }
+
+    /// Takes an echo that arrived with outer `from_peer_id` = `from`.
+    /// Returns whether it was accepted.
+    pub fn echo(&mut self, echo: &Echo, from: u32) -> bool {
+        if self.token != Some(echo.token) || echo.waypoint != from {
+            return false;
+        }
+        match self.waypoints.iter().position(|id| *id == from) {
+            Some(at) => {
+                self.answered[at] = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Closes the round (3 s after the probe). Returns the waypoint index
+    /// the path is held on, if any (spec §17.2.6 rule 3).
+    pub fn finish(&mut self) -> Option<usize> {
+        if self.token.take().is_none() {
+            return self.failed;
+        }
+        for (miss, answered) in self.misses.iter_mut().zip(&self.answered) {
+            *miss = if *answered { 0 } else { miss.saturating_add(1) };
+        }
+        if self.answered.iter().all(|a| *a) {
+            self.clean_rounds = self.clean_rounds.saturating_add(1);
+        } else {
+            self.clean_rounds = 0;
+        }
+        if let Some(lost) = self.misses.iter().position(|m| *m >= PROBE_MISSES) {
+            self.failed = Some(lost);
+        } else if self.clean_rounds >= PROBE_RECOVERY {
+            self.failed = None;
+        }
+        self.failed
+    }
+}
+
+/// Probe interval in seconds for a source whose busiest waypoint lies on
+/// `sequences` probed sequences (spec §17.2.6 rule 1).
+pub fn probe_interval(sequences: u32) -> u32 {
+    10u32.max(sequences.div_ceil(ECHO_BUDGET))
+}
+
+/// The path a packet to `destination` uses (spec §17.2.2): a member's
+/// virtual address uses that member's `to_peer` path; otherwise the
+/// longest `to_subnet` holding the address, else the `to_peer` path of the
+/// advertiser `owner`. `member` tells whether the address is a member's
+/// virtual address. Returns the index in `paths`.
 pub fn match_path(
     paths: &[CustomPath],
     destination: IpAddr,
+    member: bool,
     owner: Option<IpAddr>,
 ) -> Option<usize> {
-    let subnet = paths
+    let peer = |address: IpAddr| {
+        paths
+            .iter()
+            .position(|path| path.target == PathTarget::Peer(address))
+    };
+    if member {
+        return peer(destination);
+    }
+    paths
         .iter()
         .enumerate()
         .filter_map(|(index, path)| match path.target {
@@ -534,13 +884,8 @@ pub fn match_path(
             _ => None,
         })
         .max_by_key(|(prefix, _)| *prefix)
-        .map(|(_, index)| index);
-    subnet.or_else(|| {
-        let owner = owner?;
-        paths
-            .iter()
-            .position(|path| path.target == PathTarget::Peer(owner))
-    })
+        .map(|(_, index)| index)
+        .or_else(|| peer(owner?))
 }
 
 /// The status `id` of a path: derived from its target, so it stays the
@@ -555,8 +900,6 @@ pub fn status_id(target: &PathTarget) -> String {
 /// Largest outer packet (node header + payload): the size of a plain Data
 /// packet at the default MTU, 16 + 1380 + 28 (spec §17.2.5, size, rule 1).
 pub const MAX_OUTER: usize = 1424;
-/// Encryption tail (spec §7.3, §8.6).
-const TAIL: usize = 28;
 
 /// Whether an inner packet (node header + encrypted payload) of
 /// `inner_len` bytes still fits once wrapped with `remaining` waypoints.
@@ -574,6 +917,134 @@ pub fn max_mss(remaining: usize, ipv6: bool) -> u16 {
     (ip - headers) as u16
 }
 
+/// The source and destination addresses of a TCP SYN or SYN-ACK in `ip`
+/// (no IPv6 extension headers, no IPv4 fragments), for matching paths
+/// before [`clamp_mss`].
+pub fn tcp_syn_addresses(ip: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    let (src, dst, _) = tcp_segment(ip)?;
+    Some((src, dst))
+}
+
+/// Lowers the MSS option of a TCP SYN or SYN-ACK in the IP packet `ip` to
+/// `max` and fixes the TCP checksum (spec §17.2.5, size, rule 2). Returns
+/// whether the packet changed. Packets that are not such a segment, carry
+/// no MSS option or a smaller one are left alone.
+pub fn clamp_mss(ip: &mut [u8], max: u16) -> bool {
+    let Some((_, _, tcp_at)) = tcp_segment(ip) else {
+        return false;
+    };
+    let tcp = &ip[tcp_at..];
+    let options_end = usize::from(tcp[12] >> 4) * 4;
+    if options_end < 20 || options_end > tcp.len() {
+        return false;
+    }
+    let mut at = 20;
+    let mut field = None;
+    while at < options_end {
+        match tcp[at] {
+            0 => break,
+            1 => at += 1,
+            kind => {
+                let len = usize::from(*tcp.get(at + 1)?);
+                if len < 2 || at + len > options_end {
+                    return false;
+                }
+                if kind == 2 && len == 4 {
+                    field = Some(tcp_at + at + 2);
+                    break;
+                }
+                at += len;
+            }
+        }
+    }
+    let Some(field) = field else {
+        return false;
+    };
+    let current = u16::from_be_bytes([ip[field], ip[field + 1]]);
+    if current <= max {
+        return false;
+    }
+    ip[field..field + 2].copy_from_slice(&max.to_be_bytes());
+    let checksum = tcp_checksum(ip, tcp_at);
+    ip[tcp_at + 16..tcp_at + 18].copy_from_slice(&checksum.to_be_bytes());
+    true
+}
+
+/// Finds a TCP segment with SYN set: addresses and the offset of the TCP
+/// header.
+fn tcp_segment(ip: &[u8]) -> Option<(IpAddr, IpAddr, usize)> {
+    let (src, dst, tcp_at, end) = match ip.first()? >> 4 {
+        4 => {
+            if ip.len() < 20 {
+                return None;
+            }
+            let ihl = usize::from(ip[0] & 0x0f) * 4;
+            let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+            let fragment = u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff;
+            if ip[9] != 6 || ihl < 20 || fragment != 0 || total > ip.len() || total < ihl {
+                return None;
+            }
+            let src: [u8; 4] = ip[12..16].try_into().ok()?;
+            let dst: [u8; 4] = ip[16..20].try_into().ok()?;
+            (IpAddr::from(src), IpAddr::from(dst), ihl, total)
+        }
+        6 => {
+            if ip.len() < 40 || ip[6] != 6 {
+                return None;
+            }
+            let end = 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+            if end > ip.len() {
+                return None;
+            }
+            let src: [u8; 16] = ip[8..24].try_into().ok()?;
+            let dst: [u8; 16] = ip[24..40].try_into().ok()?;
+            (IpAddr::from(src), IpAddr::from(dst), 40, end)
+        }
+        _ => return None,
+    };
+    if end < tcp_at + 20 || ip[tcp_at + 13] & 0x02 == 0 {
+        return None;
+    }
+    let options_end = usize::from(ip[tcp_at + 12] >> 4) * 4;
+    if tcp_at + options_end > end {
+        return None;
+    }
+    Some((src, dst, tcp_at))
+}
+
+/// The TCP checksum of the segment at `tcp_at` with the checksum field
+/// taken as zero.
+fn tcp_checksum(ip: &[u8], tcp_at: usize) -> u16 {
+    let mut sum = 0u32;
+    let mut add = |bytes: &[u8]| {
+        for pair in bytes.chunks(2) {
+            let word = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
+            sum += u32::from(word);
+        }
+    };
+    let end = if ip[0] >> 4 == 4 {
+        let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+        let len = (total - tcp_at) as u16;
+        add(&ip[12..20]);
+        add(&[0, 6]);
+        add(&len.to_be_bytes());
+        total
+    } else {
+        let end = 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+        let len = (end - tcp_at) as u32;
+        add(&ip[8..40]);
+        add(&len.to_be_bytes());
+        add(&[0, 0, 0, 6]);
+        end
+    };
+    add(&ip[tcp_at..tcp_at + 16]);
+    add(&ip[tcp_at + 18..end]);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,25 +1053,52 @@ mod tests {
     fn inner(from: u32, to: u32) -> Vec<u8> {
         let mut header = NodeHeader::new(from, to, packet_type::DATA, 4);
         header.flags = flags::ENCRYPTED;
-        header.forward_counter = 1;
         let mut packet = header.encode().to_vec();
         packet.extend_from_slice(&[0xaa; 4 + 28]);
         packet
     }
 
+    fn transit(payload: &[u8]) -> Transit<'_> {
+        match decode(payload) {
+            Some(Payload::Transit(transit)) => transit,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn forward_round_trip() {
         let packet = inner(1, 9);
-        let payload = encode_forward(1, 9, &[3, 4], &packet);
+        let payload = encode_transit(1, 9, &[3, 4], Body::Data(&packet));
         assert_eq!(&payload[..4], &[1, 1, 2, 0]);
         assert_eq!(payload.len(), PREFIX_LEN + 8 + packet.len());
-        let Some(Payload::Forward(forward)) = decode(&payload) else {
-            panic!("not a forward");
-        };
-        assert_eq!(forward.origin, 1);
-        assert_eq!(forward.destination, 9);
+        let forward = transit(&payload);
+        assert_eq!((forward.origin, forward.destination), (1, 9));
         assert_eq!(forward.remaining, vec![3, 4]);
-        assert_eq!(forward.inner, &packet[..]);
+        assert_eq!(forward.body, Body::Data(&packet));
+    }
+
+    #[test]
+    fn probe_and_echo_round_trip() {
+        let payload = encode_transit(1, 9, &[3], Body::Probe(0x0102_0304_0506_0708));
+        assert_eq!(&payload[..4], &[1, 3, 1, 0]);
+        assert_eq!(payload.len(), PREFIX_LEN + 4 + 8);
+        assert_eq!(transit(&payload).body, Body::Probe(0x0102_0304_0506_0708));
+        // A probe has exactly 8 bytes after the list.
+        assert_eq!(decode(&payload[..payload.len() - 1]), None);
+        let echo = Echo {
+            origin: 1,
+            destination: 9,
+            waypoint: 3,
+            token: 77,
+        };
+        let bytes = encode_echo(&echo);
+        assert_eq!(bytes.len(), ECHO_LEN);
+        assert_eq!(&bytes[..4], &[1, 4, 0, 0]);
+        assert_eq!(decode(&bytes), Some(Payload::Echo(echo)));
+        let mut bad = bytes.clone();
+        bad[3] = 1;
+        assert_eq!(decode(&bad), None);
+        assert_eq!(decode(&bytes[..ECHO_LEN - 1]), None);
     }
 
     #[test]
@@ -616,7 +1114,7 @@ mod tests {
         assert_eq!(decode(&bytes), Some(Payload::Error(error)));
         // Wrong length, count or code.
         assert_eq!(decode(&bytes[..15]), None);
-        let mut bad = bytes;
+        let mut bad = bytes.clone();
         bad[2] = 1;
         assert_eq!(decode(&bad), None);
         let mut bad = bytes;
@@ -627,36 +1125,47 @@ mod tests {
     #[test]
     fn rejects_bad_forward() {
         let packet = inner(1, 9);
+        let data = Body::Data(&packet);
         // Version, reserved byte, too many waypoints.
-        let mut bad = encode_forward(1, 9, &[3], &packet);
+        let mut bad = encode_transit(1, 9, &[3], data);
         bad[0] = 2;
         assert_eq!(decode(&bad), None);
-        let mut bad = encode_forward(1, 9, &[3], &packet);
+        let mut bad = encode_transit(1, 9, &[3], data);
         bad[3] = 1;
         assert_eq!(decode(&bad), None);
-        let mut bad = encode_forward(1, 9, &[3], &packet);
+        let mut bad = encode_transit(1, 9, &[3], data);
         bad[2] = 7;
         assert_eq!(decode(&bad), None);
         // Repeated waypoint, waypoint equal to origin or destination.
-        assert_eq!(decode(&encode_forward(1, 9, &[3, 3], &packet)), None);
-        assert_eq!(decode(&encode_forward(1, 9, &[1], &packet)), None);
-        assert_eq!(decode(&encode_forward(1, 9, &[9], &packet)), None);
+        assert_eq!(decode(&encode_transit(1, 9, &[3, 3], data)), None);
+        assert_eq!(decode(&encode_transit(1, 9, &[1], data)), None);
+        assert_eq!(decode(&encode_transit(1, 9, &[9], data)), None);
         // Inner header must match the source and destination, be Data and
         // be encrypted.
-        assert_eq!(decode(&encode_forward(2, 9, &[3], &packet)), None);
-        assert_eq!(decode(&encode_forward(1, 8, &[3], &packet)), None);
+        assert_eq!(decode(&encode_transit(2, 9, &[3], data)), None);
+        assert_eq!(decode(&encode_transit(1, 8, &[3], data)), None);
         let mut rpc = packet.clone();
         rpc[8] = packet_type::RPC_REQ;
-        assert_eq!(decode(&encode_forward(1, 9, &[3], &rpc)), None);
+        assert_eq!(decode(&encode_transit(1, 9, &[3], Body::Data(&rpc))), None);
         let mut plain = packet.clone();
         plain[9] = 0;
-        assert_eq!(decode(&encode_forward(1, 9, &[3], &plain)), None);
-        // List longer than the payload.
-        let short = encode_forward(1, 9, &[3], &packet[..10]);
+        assert_eq!(
+            decode(&encode_transit(1, 9, &[3], Body::Data(&plain))),
+            None
+        );
+        // The inner packet holds at least a header and an encryption tail.
+        let short = encode_transit(1, 9, &[3], Body::Data(&packet[..MIN_INNER - 1]));
         assert_eq!(decode(&short), None);
+        assert!(decode(&encode_transit(
+            1,
+            9,
+            &[3],
+            Body::Data(&packet[..MIN_INNER])
+        ))
+        .is_some());
         // Unknown kind.
-        let mut bad = encode_forward(1, 9, &[], &packet);
-        bad[1] = 3;
+        let mut bad = encode_transit(1, 9, &[], data);
+        bad[1] = 5;
         assert_eq!(decode(&bad), None);
     }
 
@@ -669,6 +1178,7 @@ mod tests {
             self_id,
             relays: true,
             forward_counter: counter,
+            latency_first: true,
             reachable,
         }
     }
@@ -676,38 +1186,34 @@ mod tests {
     #[test]
     fn waypoint_wraps_for_the_next_one() {
         let packet = inner(1, 9);
-        let payload = encode_forward(1, 9, &[4, 5], &packet);
-        let Some(Payload::Forward(forward)) = decode(&payload) else {
-            panic!()
-        };
+        let payload = encode_transit(1, 9, &[4, 5], Body::Data(&packet));
         let all = |_: u32| true;
-        let Step::Next {
-            to,
-            forward_counter,
-            payload,
-        } = step(&forward, &cx(3, 2, &all))
-        else {
-            panic!("not next");
-        };
-        assert_eq!((to, forward_counter), (4, 3));
-        let Some(Payload::Forward(next)) = decode(&payload) else {
-            panic!()
-        };
-        assert_eq!(next.remaining, vec![5]);
-        assert_eq!(next.inner, &packet[..]);
+        let step = step(&transit(&payload), &cx(3, 1, &all));
+        let next = step.next.expect("next");
+        assert_eq!(
+            (next.to, next.forward_counter, next.latency_first),
+            (4, 2, true)
+        );
+        let wrapped = transit(&next.payload);
+        assert_eq!(wrapped.remaining, vec![5]);
+        assert_eq!(wrapped.body, Body::Data(&packet));
+        assert_eq!((step.report, step.echo, step.release), (None, None, None));
+        // LATENCY_FIRST clears once the counter passes 2 (spec §4.4).
+        let payload = encode_transit(1, 9, &[4], Body::Data(&packet));
+        let next = super::step(&transit(&payload), &cx(3, 2, &all))
+            .next
+            .unwrap();
+        assert!(!next.latency_first);
     }
 
     #[test]
     fn last_waypoint_releases_inner_with_counter() {
         let packet = inner(1, 9);
-        let payload = encode_forward(1, 9, &[], &packet);
-        let Some(Payload::Forward(forward)) = decode(&payload) else {
-            panic!()
-        };
+        let payload = encode_transit(1, 9, &[], Body::Data(&packet));
         let all = |_: u32| true;
-        let Step::Release { packet: out } = step(&forward, &cx(3, 4, &all)) else {
-            panic!("not release");
-        };
+        let out = step(&transit(&payload), &cx(3, 4, &all))
+            .release
+            .expect("release");
         assert_eq!(out[10], 5);
         assert_eq!(&out[..10], &packet[..10]);
         assert_eq!(&out[11..], &packet[11..]);
@@ -718,12 +1224,10 @@ mod tests {
         let packet = inner(1, 9);
         let none = |_: u32| false;
         let all = |_: u32| true;
-        let payload = encode_forward(1, 9, &[4], &packet);
-        let Some(Payload::Forward(forward)) = decode(&payload) else {
-            panic!()
-        };
+        let payload = encode_transit(1, 9, &[4], Body::Data(&packet));
+        let forward = transit(&payload);
         let error = |code, failed| {
-            Step::Report(PathError {
+            Some(PathError {
                 code,
                 origin: 1,
                 destination: 9,
@@ -731,29 +1235,56 @@ mod tests {
             })
         };
         assert_eq!(
-            step(&forward, &cx(3, 1, &none)),
+            step(&forward, &cx(3, 1, &none)).report,
             error(ErrorCode::NextUnreachable, 4)
         );
         assert_eq!(
-            step(&forward, &cx(3, 8, &all)),
+            step(&forward, &cx(3, 8, &all)).report,
             error(ErrorCode::HopLimit, 3)
         );
         let mut access = cx(3, 1, &all);
         access.relays = false;
-        assert_eq!(step(&forward, &access), error(ErrorCode::NotRelay, 3));
+        assert_eq!(
+            step(&forward, &access).report,
+            error(ErrorCode::NotRelay, 3)
+        );
         // Listed again further on, or the source itself: dropped silently.
-        assert_eq!(step(&forward, &cx(4, 1, &all)), Step::Drop);
-        assert_eq!(step(&forward, &cx(1, 1, &all)), Step::Drop);
+        assert_eq!(step(&forward, &cx(4, 1, &all)), Step::default());
+        assert_eq!(step(&forward, &cx(1, 1, &all)), Step::default());
         // Last waypoint, destination gone.
-        let payload = encode_forward(1, 9, &[], &packet);
-        let Some(Payload::Forward(last)) = decode(&payload) else {
-            panic!()
-        };
+        let payload = encode_transit(1, 9, &[], Body::Data(&packet));
         let only_self = |id: u32| id == 3;
         assert_eq!(
-            step(&last, &cx(3, 1, &only_self)),
+            step(&transit(&payload), &cx(3, 1, &only_self)).report,
             error(ErrorCode::DestinationUnreachable, 9)
         );
+    }
+
+    #[test]
+    fn probes_echo_at_every_waypoint_and_never_report() {
+        let all = |_: u32| true;
+        let none = |_: u32| false;
+        let payload = encode_transit(1, 9, &[4], Body::Probe(5));
+        let probe = transit(&payload);
+        let echo = Some(Echo {
+            origin: 1,
+            destination: 9,
+            waypoint: 3,
+            token: 5,
+        });
+        let step3 = step(&probe, &cx(3, 1, &all));
+        assert_eq!(step3.echo, echo);
+        assert_eq!(transit(&step3.next.unwrap().payload).body, Body::Probe(5));
+        // Next unreachable: still echoes, no error.
+        let lost = step(&probe, &cx(3, 1, &none));
+        assert_eq!((lost.echo, lost.report, lost.next), (echo, None, None));
+        // Over the counter or not relaying: nothing at all.
+        assert_eq!(step(&probe, &cx(3, 8, &all)), Step::default());
+        // Last waypoint: echo only, nothing released.
+        let payload = encode_transit(1, 9, &[], Body::Probe(5));
+        let last = step(&transit(&payload), &cx(4, 2, &all));
+        assert_eq!(last.echo.unwrap().waypoint, 4);
+        assert_eq!((last.next, last.release), (None, None));
     }
 
     #[test]
@@ -761,28 +1292,18 @@ mod tests {
         // Six waypoints, each directly after the other: the counter climbs
         // by one per segment and the packet still arrives within 7 relays.
         let packet = inner(1, 99);
-        let mut payload = encode_forward(1, 99, &[11, 12, 13, 14, 15], &packet);
+        let mut payload = encode_transit(1, 99, &[11, 12, 13, 14, 15], Body::Data(&packet));
         let mut counter = 1u8;
         let all = |_: u32| true;
         for id in 10..=15u32 {
-            let Some(Payload::Forward(forward)) = decode(&payload) else {
-                panic!()
-            };
-            match step(&forward, &cx(id, counter, &all)) {
-                Step::Next {
-                    payload: next,
-                    forward_counter,
-                    ..
-                } => {
-                    payload = next;
-                    counter = forward_counter;
-                }
-                Step::Release { packet } => {
-                    assert_eq!(id, 15);
-                    assert_eq!(packet[10], 7);
-                    return;
-                }
-                other => panic!("{other:?}"),
+            let step = step(&transit(&payload), &cx(id, counter, &all));
+            if let Some(next) = step.next {
+                payload = next.payload;
+                counter = next.forward_counter;
+            } else {
+                assert_eq!(id, 15);
+                assert_eq!(step.release.unwrap()[10], 7);
+                return;
             }
         }
         panic!("never released");
@@ -793,11 +1314,15 @@ mod tests {
         let local = Capabilities::local(true);
         assert_eq!(local.encode(), vec![0x08, 1, 0x10, 6, 0x18, 1]);
         assert_eq!(Capabilities::decode(&local.encode()), Some(local));
-        assert!(local.supported());
-        let access = Capabilities::local(false);
-        assert!(!Capabilities::decode(&access.encode()).unwrap().supported());
-        // Empty message: version 0, not supported.
-        assert!(!Capabilities::decode(&[]).unwrap().supported());
+        assert_eq!(local.capability(), Capability::Supported);
+        let access = Capabilities::decode(&Capabilities::local(false).encode()).unwrap();
+        assert_eq!(access.capability(), Capability::NotRelay);
+        assert!(access.capability().understands_type_40());
+        // Empty message: version 0.
+        let empty = Capabilities::decode(&[]).unwrap();
+        assert_eq!(empty.capability(), Capability::Unsupported);
+        assert!(!Capability::Unsupported.understands_type_40());
+        assert!(!Capability::Unknown.understands_type_40());
         // Unknown fields are skipped.
         let mut extended = local.encode();
         extended.extend_from_slice(&[0x22, 2, 0xff, 0xff, 0x28, 5]);
@@ -811,6 +1336,9 @@ mod tests {
             reachable: true,
             direct: false,
             capability,
+            native: true,
+            hops_in: 1,
+            hops_to_destination: 1,
         }
     }
 
@@ -818,22 +1346,14 @@ mod tests {
         direct_unverified: false,
     };
 
+    fn fallback(reason: Reason, culprit: Culprit) -> Plan {
+        Plan::Fallback { reason, culprit }
+    }
+
     #[test]
     fn plans() {
         use Capability::*;
-        assert_eq!(
-            plan(
-                &[view(3, Supported)],
-                DestinationView {
-                    direct_unverified: true
-                },
-                None
-            ),
-            Plan::Fallback {
-                reason: Reason::Unsupported,
-                node: Culprit::Destination
-            }
-        );
+        use Culprit::Waypoint;
         assert_eq!(plan(&[], OK, None), Plan::Direct);
         assert_eq!(
             plan(&[view(3, Supported), view(4, Supported)], OK, None),
@@ -845,72 +1365,222 @@ mod tests {
         );
         assert_eq!(
             plan(&[view(3, Supported), view(4, Unsupported)], OK, None),
-            Plan::Prefix(vec![3])
+            Plan::Prefix {
+                waypoints: vec![3],
+                reason: Reason::Unsupported,
+                culprit: 1
+            }
         );
-        let mut direct = view(3, Unsupported);
+        // Not native under a key list: not encapsulable.
+        let mut foreign = view(4, Supported);
+        foreign.native = false;
+        assert_eq!(
+            plan(&[view(3, Supported), foreign], OK, None),
+            Plan::Prefix {
+                waypoints: vec![3],
+                reason: Reason::Unsupported,
+                culprit: 1
+            }
+        );
+        let mut direct = view(3, NotRelay);
         direct.direct = true;
         assert_eq!(
             plan(&[direct, view(4, Supported)], OK, None),
-            Plan::FirstHop(3)
+            Plan::FirstHop {
+                neighbour: 3,
+                reason: Reason::NotRelay,
+                culprit: 0
+            }
         );
         assert_eq!(
             plan(&[view(3, Unsupported)], OK, None),
-            Plan::Fallback {
-                reason: Reason::Unsupported,
-                node: Culprit::Waypoint(0)
-            }
+            fallback(Reason::Unsupported, Waypoint(0))
         );
         assert_eq!(
             plan(&[view(3, NotRelay)], OK, None),
-            Plan::Fallback {
-                reason: Reason::NotRelay,
-                node: Culprit::Waypoint(0)
-            }
+            fallback(Reason::NotRelay, Waypoint(0))
         );
         assert_eq!(
             plan(&[view(3, Unknown)], OK, None),
-            Plan::Fallback {
-                reason: Reason::Unreachable,
-                node: Culprit::Waypoint(0)
-            }
+            fallback(Reason::Unreachable, Waypoint(0))
         );
         // Unreachable beats pending; an unknown address is unreachable.
         let mut gone = view(4, Supported);
         gone.reachable = false;
         assert_eq!(
             plan(&[view(3, Pending), gone], OK, None),
-            Plan::Fallback {
-                reason: Reason::Unreachable,
-                node: Culprit::Waypoint(1)
-            }
+            fallback(Reason::Unreachable, Waypoint(1))
         );
-        let missing = WaypointView {
-            id: None,
-            reachable: false,
-            direct: false,
-            capability: Pending,
-        };
+        let mut missing = view(0, Pending);
+        missing.id = None;
         assert_eq!(
             plan(&[missing], OK, None),
-            Plan::Fallback {
-                reason: Reason::Unreachable,
-                node: Culprit::Waypoint(0)
-            }
+            fallback(Reason::Unreachable, Waypoint(0))
         );
-        // A held path error wins over everything else.
-        let held = HeldError {
-            reason: Reason::HopLimit,
-            node: Culprit::Waypoint(1),
+        // Destination direct and unverified.
+        let unverified = DestinationView {
+            direct_unverified: true,
+        };
+        assert_eq!(
+            plan(&[view(3, Supported)], unverified, None),
+            fallback(Reason::Unsupported, Culprit::Destination)
+        );
+        // A held fallback wins over everything else.
+        let held = Held {
+            reason: Reason::Unreachable,
+            culprit: Waypoint(1),
         };
         assert_eq!(
             plan(&[view(3, Supported), view(4, Supported)], OK, Some(held)),
-            Plan::Fallback {
-                reason: Reason::HopLimit,
-                node: Culprit::Waypoint(1)
-            }
+            fallback(Reason::Unreachable, Waypoint(1))
         );
         assert_eq!(Plan::Strict(vec![]).state(), "active");
-        assert_eq!(Plan::FirstHop(3).state(), "first_hop_only");
+        assert_eq!(Plan::Pending.state(), "pending");
+    }
+
+    #[test]
+    fn plans_estimate_segments() {
+        use Capability::Supported;
+        // 3 + 3 + 2 = 8 segments: fine.
+        let mut a = view(3, Supported);
+        a.hops_in = 3;
+        let mut b = view(4, Supported);
+        b.hops_in = 3;
+        b.hops_to_destination = 2;
+        assert_eq!(plan(&[a, b], OK, None), Plan::Strict(vec![3, 4]));
+        // One more on the last leg: over, named at the last waypoint.
+        b.hops_to_destination = 3;
+        assert_eq!(
+            plan(&[a, b], OK, None),
+            fallback(Reason::HopLimit, Culprit::Waypoint(1))
+        );
+        // Over already on the way in to the second waypoint.
+        b.hops_in = 6;
+        assert_eq!(
+            plan(&[a, b], OK, None),
+            fallback(Reason::HopLimit, Culprit::Waypoint(1))
+        );
+        a.hops_in = 9;
+        assert_eq!(
+            plan(&[a, b], OK, None),
+            fallback(Reason::HopLimit, Culprit::Waypoint(0))
+        );
+    }
+
+    #[test]
+    fn errors_must_match_the_path() {
+        let path = LivePath {
+            destination: 9,
+            waypoints: &[3, 4],
+            destination_reachable: true,
+        };
+        let error = |code, failed| PathError {
+            code,
+            origin: 1,
+            destination: 9,
+            failed,
+        };
+        use ErrorCode::*;
+        assert_eq!(
+            judge_error(&error(NextUnreachable, 4), 3, &path),
+            ErrorAction::Fallback {
+                reason: Reason::Unreachable,
+                failed: 4
+            }
+        );
+        // Not the waypoint after the reporter, or a reporter off the path.
+        assert_eq!(
+            judge_error(&error(NextUnreachable, 7), 3, &path),
+            ErrorAction::Ignore
+        );
+        assert_eq!(
+            judge_error(&error(NextUnreachable, 4), 8, &path),
+            ErrorAction::Ignore
+        );
+        assert_eq!(
+            judge_error(&error(NextUnreachable, 5), 4, &path),
+            ErrorAction::Ignore
+        );
+        // Destination errors only from the last waypoint, naming B.
+        assert_eq!(
+            judge_error(&error(DestinationUnreachable, 9), 4, &path),
+            ErrorAction::Fallback {
+                reason: Reason::Unreachable,
+                failed: 9
+            }
+        );
+        assert_eq!(
+            judge_error(&error(DestinationUnreachable, 9), 3, &path),
+            ErrorAction::Ignore
+        );
+        let down = LivePath {
+            destination_reachable: false,
+            ..path
+        };
+        assert_eq!(
+            judge_error(&error(DestinationUnreachable, 9), 4, &down),
+            ErrorAction::DestinationDown
+        );
+        // Not relaying: ask again; hop limit: suspicious.
+        assert_eq!(
+            judge_error(&error(NotRelay, 3), 3, &path),
+            ErrorAction::Requery(3)
+        );
+        assert_eq!(
+            judge_error(&error(NotRelay, 4), 3, &path),
+            ErrorAction::Ignore
+        );
+        assert_eq!(
+            judge_error(&error(HopLimit, 3), 3, &path),
+            ErrorAction::Ignore
+        );
+        // Another destination.
+        let mut other = error(NextUnreachable, 4);
+        other.destination = 8;
+        assert_eq!(judge_error(&other, 3, &path), ErrorAction::Ignore);
+    }
+
+    #[test]
+    fn probes_fail_after_three_misses_and_recover_after_two_clean_rounds() {
+        let mut probe = ProbeState::new(vec![3, 4]);
+        let echo = |waypoint, token| Echo {
+            origin: 1,
+            destination: 9,
+            waypoint,
+            token,
+        };
+        for token in 0..3u64 {
+            probe.start(token);
+            assert!(probe.echo(&echo(3, token), 3));
+            // Wrong token, or a waypoint field that is not the sender.
+            assert!(!probe.echo(&echo(4, token + 100), 4));
+            assert!(!probe.echo(&echo(4, token), 3));
+            let held = probe.finish();
+            assert_eq!(held, if token == 2 { Some(1) } else { None });
+        }
+        // One clean round is not enough.
+        probe.start(10);
+        probe.echo(&echo(3, 10), 3);
+        probe.echo(&echo(4, 10), 4);
+        assert_eq!(probe.finish(), Some(1));
+        probe.start(11);
+        probe.echo(&echo(3, 11), 3);
+        probe.echo(&echo(4, 11), 4);
+        assert_eq!(probe.finish(), None);
+        // Finishing without a probe out changes nothing.
+        assert_eq!(probe.finish(), None);
+        assert_eq!(probe.waypoints(), &[3, 4]);
+    }
+
+    #[test]
+    fn probe_interval_keeps_echoes_under_budget() {
+        assert_eq!(probe_interval(0), 10);
+        assert_eq!(probe_interval(160), 10);
+        assert_eq!(probe_interval(161), 11);
+        assert_eq!(probe_interval(1000), 63);
+        for sequences in [1u32, 50, 161, 999, 5000] {
+            assert!(sequences <= ECHO_BUDGET * probe_interval(sequences));
+        }
     }
 
     #[test]
@@ -921,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_prefers_longest_subnet_then_owner() {
+    fn matching() {
         let addr = |s: &str| s.parse::<IpAddr>().unwrap();
         let paths = vec![
             CustomPath {
@@ -938,12 +1608,23 @@ mod tests {
             },
         ];
         let owner = Some(addr("10.144.0.7"));
-        assert_eq!(match_path(&paths, addr("192.168.20.5"), owner), Some(2));
-        assert_eq!(match_path(&paths, addr("192.168.30.5"), owner), Some(1));
-        assert_eq!(match_path(&paths, addr("172.16.0.1"), owner), Some(0));
-        assert_eq!(match_path(&paths, addr("10.144.0.7"), owner), Some(0));
         assert_eq!(
-            match_path(&paths, addr("172.16.0.1"), Some(addr("10.144.0.8"))),
+            match_path(&paths, addr("192.168.20.5"), false, owner),
+            Some(2)
+        );
+        assert_eq!(
+            match_path(&paths, addr("192.168.30.5"), false, owner),
+            Some(1)
+        );
+        assert_eq!(
+            match_path(&paths, addr("172.16.0.1"), false, owner),
+            Some(0)
+        );
+        // A member's address uses only its own to_peer path.
+        assert_eq!(match_path(&paths, addr("10.144.0.7"), true, None), Some(0));
+        assert_eq!(match_path(&paths, addr("10.144.0.8"), true, None), None);
+        assert_eq!(
+            match_path(&paths, addr("172.16.0.1"), false, Some(addr("10.144.0.8"))),
             None
         );
         assert_eq!(status_id(&paths[0].target), "peer:10.144.0.7");
@@ -963,5 +1644,88 @@ mod tests {
         assert_eq!(max_mss(0, false), 1284);
         assert_eq!(max_mss(5, false), 1264);
         assert_eq!(max_mss(0, true), 1264);
+    }
+
+    /// An IPv4 TCP SYN with options MSS 1460, NOP, NOP, SACK permitted and
+    /// a correct checksum.
+    fn syn_v4() -> Vec<u8> {
+        let mut ip = vec![
+            0x45, 0, 0, 48, 0, 1, 0x40, 0, 64, 6, 0, 0, 10, 144, 0, 2, 10, 144, 0, 7,
+        ];
+        let tcp = [
+            0x30, 0x39, 0x00, 0x50, 0, 0, 0, 1, 0, 0, 0, 0, 0x70, 0x02, 0xff, 0xff, 0, 0, 0, 0, 2,
+            4, 0x05, 0xb4, 1, 1, 4, 2,
+        ];
+        ip.extend_from_slice(&tcp);
+        let checksum = tcp_checksum(&ip, 20);
+        ip[36..38].copy_from_slice(&checksum.to_be_bytes());
+        ip
+    }
+
+    /// Verifies the TCP checksum the way a receiver does.
+    fn checksum_ok(ip: &[u8], tcp_at: usize) -> bool {
+        let stored = u16::from_be_bytes([ip[tcp_at + 16], ip[tcp_at + 17]]);
+        tcp_checksum(ip, tcp_at) == stored
+    }
+
+    #[test]
+    fn clamps_ipv4_syn() {
+        let mut ip = syn_v4();
+        assert!(checksum_ok(&ip, 20));
+        assert_eq!(
+            tcp_syn_addresses(&ip),
+            Some((addr4(10, 144, 0, 2), addr4(10, 144, 0, 7)))
+        );
+        assert!(clamp_mss(&mut ip, 1280));
+        assert_eq!(&ip[42..44], &1280u16.to_be_bytes());
+        assert!(checksum_ok(&ip, 20));
+        // Already small enough.
+        assert!(!clamp_mss(&mut ip, 1300));
+        // Not a SYN.
+        let mut ack = syn_v4();
+        ack[33] = 0x10;
+        assert!(!clamp_mss(&mut ack, 1000));
+        assert_eq!(tcp_syn_addresses(&ack), None);
+        // A fragment.
+        let mut fragment = syn_v4();
+        fragment[6] = 0x20;
+        assert!(!clamp_mss(&mut fragment, 1000));
+    }
+
+    fn addr4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::from([a, b, c, d])
+    }
+
+    #[test]
+    fn clamps_ipv6_syn_ack_with_option_after_nops() {
+        let mut ip = vec![0x60, 0, 0, 0, 0, 28, 6, 64];
+        let mut src = [0u8; 16];
+        src[0] = 0xfd;
+        src[15] = 2;
+        let mut dst = [0u8; 16];
+        dst[0] = 0xfd;
+        dst[15] = 7;
+        ip.extend_from_slice(&src);
+        ip.extend_from_slice(&dst);
+        let tcp = [
+            0x00, 0x50, 0x30, 0x39, 0, 0, 0, 9, 0, 0, 0, 2, 0x70, 0x12, 0xff, 0xff, 0, 0, 0, 0, 1,
+            1, 4, 2, 2, 4, 0x05, 0xa0,
+        ];
+        ip.extend_from_slice(&tcp);
+        let checksum = tcp_checksum(&ip, 40);
+        ip[56..58].copy_from_slice(&checksum.to_be_bytes());
+        assert!(clamp_mss(&mut ip, max_mss(2, true)));
+        assert_eq!(&ip[66..68], &max_mss(2, true).to_be_bytes());
+        assert!(checksum_ok(&ip, 40));
+    }
+
+    #[test]
+    fn checksum_matches_a_known_segment() {
+        // Recomputing over a correct checksum gives the same value, and a
+        // flipped bit is caught.
+        let ip = syn_v4();
+        let mut broken = ip.clone();
+        broken[45] ^= 1;
+        assert!(!checksum_ok(&broken, 20));
     }
 }
