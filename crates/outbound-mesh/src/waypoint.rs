@@ -611,6 +611,9 @@ pub enum Reason {
     /// Probes went unanswered while the waypoint stays reachable in the
     /// topology (spec §17.2.6 rule 3).
     NoEcho,
+    /// The path stayed `pending` for 60 s (spec §17.2.3); the node keeps
+    /// that timer.
+    PendingTimeout,
 }
 
 impl Reason {
@@ -621,6 +624,7 @@ impl Reason {
             Self::NotRelay => "not_relay",
             Self::HopLimit => "hop_limit",
             Self::NoEcho => "no_echo",
+            Self::PendingTimeout => "pending_timeout",
         }
     }
 }
@@ -860,6 +864,8 @@ pub struct ProbeState {
     rounds: Vec<Round>,
     /// The latest echo status seen from each waypoint.
     last: Vec<Option<EchoStatus>>,
+    /// Closed rounds in a row in which each waypoint echoed status 1.
+    waiting_rounds: Vec<u8>,
     misses: Vec<u8>,
     clean_rounds: u8,
     warmup: Option<Warmup>,
@@ -899,6 +905,9 @@ pub const PROBE_RECOVERY: u8 = 2;
 pub const WARMUP_PROBES: u32 = 6;
 /// Extra warm-up probes allowed after a status-1 echo.
 pub const WARMUP_GRACE: u32 = 3;
+/// Rounds in a row a status-1 echo excuses the waypoints after it; beyond
+/// that they count as missing (spec §17.2.6 rule 3).
+pub const WAITING_GRACE: u8 = 3;
 /// Most rounds open at once. Warm-up needs three (one a second, 3 s
 /// each); starting a round beyond this closes the oldest first.
 pub const MAX_OPEN_ROUNDS: usize = 4;
@@ -915,6 +924,7 @@ impl ProbeState {
             waypoints,
             rounds: Vec::new(),
             last: vec![None; n],
+            waiting_rounds: vec![0; n],
             misses: vec![0; n],
             clean_rounds: 0,
             warmup: Some(Warmup {
@@ -979,19 +989,20 @@ impl ProbeState {
         }
     }
 
-    /// Why waypoint `lost` counts as lost: its predecessor's latest echo
-    /// said the next one is unreachable, or it simply did not answer
-    /// (spec §17.2.6 rule 3).
+    /// The waypoint and reason for a fallback on lost waypoint `lost`
+    /// (spec §17.2.6 rule 3): its predecessor's latest echo said the next
+    /// one is unreachable (`unreachable`); or the predecessor kept waiting
+    /// for its query, so the lost one never saw a probe and the waiting
+    /// one is named (`no_echo`); or it simply did not answer (`no_echo`).
     fn held_on(&self, lost: usize) -> (usize, Reason) {
-        let unreachable = lost
+        match lost
             .checked_sub(1)
-            .is_some_and(|before| self.last[before] == Some(EchoStatus::Unreachable));
-        let reason = if unreachable {
-            Reason::Unreachable
-        } else {
-            Reason::NoEcho
-        };
-        (lost, reason)
+            .map(|before| (before, self.last[before]))
+        {
+            Some((_, Some(EchoStatus::Unreachable))) => (lost, Reason::Unreachable),
+            Some((before, Some(EchoStatus::Pending))) => (before, Reason::NoEcho),
+            _ => (lost, Reason::NoEcho),
+        }
     }
 
     /// Closes the round of the probe sent with `token` (3 s after sending
@@ -1003,11 +1014,21 @@ impl ProbeState {
         };
         let answered = self.rounds.remove(at).answered;
         // Waypoints after one that echoed status 1 are not missing: that
-        // one is still waiting for its query.
+        // one is still waiting for its query, for at most 3 rounds in a
+        // row.
         let waiting = answered
             .iter()
             .position(|a| *a == Some(EchoStatus::Pending));
-        let excused_from = waiting.map_or(answered.len(), |at| at + 1);
+        for (rounds, answer) in self.waiting_rounds.iter_mut().zip(&answered) {
+            match answer {
+                Some(EchoStatus::Pending) => *rounds = rounds.saturating_add(1),
+                Some(_) => *rounds = 0,
+                None => {}
+            }
+        }
+        let excused_from = waiting
+            .filter(|at| self.waiting_rounds[*at] <= WAITING_GRACE)
+            .map_or(answered.len(), |at| at + 1);
         for (at, (miss, answer)) in self.misses.iter_mut().zip(&answered).enumerate() {
             if answer.is_some() {
                 *miss = 0;
@@ -1968,12 +1989,12 @@ mod tests {
         );
         // 4 waits for its query of 5: 5 is not missing meanwhile.
         let mut probe = warmed(vec![3, 4, 5]);
-        for token in 0..5 {
+        for token in 0..3 {
             let verdict = round(&mut probe, token, &[(3, Forwarded), (4, Pending)]);
             assert_eq!(verdict, Verdict::Ready);
         }
         // Then 5 stays silent with 4 forwarding: three misses count.
-        for token in 5..8 {
+        for token in 3..6 {
             round(&mut probe, token, &[(3, Forwarded), (4, Forwarded)]);
         }
         assert_eq!(
@@ -1983,6 +2004,36 @@ mod tests {
                 reason: Reason::NoEcho
             }
         );
+    }
+
+    #[test]
+    fn waiting_excuses_for_three_rounds_only() {
+        use EchoStatus::{Forwarded, Pending};
+        let mut probe = warmed(vec![3, 4, 5]);
+        let waiting = [(3, Forwarded), (4, Pending)];
+        for token in 0..WAITING_GRACE as u64 + 2 {
+            assert_eq!(round(&mut probe, token, &waiting), Verdict::Ready);
+        }
+        // The third round beyond the grace: 5 counts as lost, and 4, which
+        // kept waiting, is named.
+        assert_eq!(
+            round(&mut probe, 10, &waiting),
+            Verdict::Held {
+                waypoint: 1,
+                reason: Reason::NoEcho
+            }
+        );
+        // An echo of another status resets the count.
+        let mut probe = warmed(vec![3, 4, 5]);
+        for token in 0..20 {
+            let answers: &[(u32, EchoStatus)] = if token % 3 == 2 {
+                &[(3, Forwarded), (4, Forwarded), (5, Forwarded)]
+            } else {
+                &waiting
+            };
+            assert_eq!(round(&mut probe, token, answers), Verdict::Ready);
+        }
+        assert_eq!(Reason::PendingTimeout.as_str(), "pending_timeout");
     }
 
     #[test]
