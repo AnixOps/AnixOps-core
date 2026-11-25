@@ -78,10 +78,13 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
         management.check().map_err(|error| error.to_string())?;
     }
     runtime.block_on(async move {
-        let node = Arc::new(
-            Node::new(default_registry(), config.allow_private_targets)
-                .with_default_outbound(config.default_outbound),
-        );
+        let node = Node::new(default_registry(), config.allow_private_targets)
+            .with_default_outbound(config.default_outbound);
+        let node = Arc::new(if check_only {
+            node
+        } else {
+            with_mesh(node, config.mesh_state_dir.as_deref())
+        });
         if let Some(bundle) = &config.tls_fingerprints {
             let status = node_runtime::apply_tls_fingerprints(bundle)
                 .map_err(|error| format!("tls_fingerprints: {error}"))?;
@@ -139,6 +142,36 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
         println!("shutting down");
         Ok(())
     })
+}
+
+/// Where the managed mesh keeps its state when the config names no place.
+#[cfg(target_os = "linux")]
+const MESH_STATE_DIR: &str = "/var/lib/anixcore/mesh";
+
+/// Installs the managed mesh networks of `PUT /v1/mesh` (Linux). Without
+/// its state directory the node runs without them: `GET /v1/status` does
+/// not list `mesh` and `/v1/mesh` answers 404.
+#[cfg(target_os = "linux")]
+fn with_mesh(node: Node, dir: Option<&std::path::Path>) -> Node {
+    let dir = dir.unwrap_or(std::path::Path::new(MESH_STATE_DIR));
+    match mesh_node::managed::ManagedMesh::open(dir) {
+        Ok(mesh) => {
+            println!("mesh: instance {}", mesh.instance_id());
+            node.with_mesh(Arc::new(mesh))
+        }
+        Err(error) => {
+            eprintln!(
+                "anixcore: mesh networks unavailable: {}: {error}",
+                dir.display()
+            );
+            node
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_mesh(node: Node, _dir: Option<&std::path::Path>) -> Node {
+    node
 }
 
 async fn shutdown_signal() {

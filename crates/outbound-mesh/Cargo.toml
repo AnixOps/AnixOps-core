@@ -7,6 +7,9 @@ repository.workspace = true
 description = "Optional intranet mesh networking: written only from docs/protocols/intranet-mesh.md, intranet-only by construction."
 
 [dependencies]
+# Static keys in the config and the status (standard Base64); already used
+# by the rest of the kernel.
+base64 = "0.22"
 # AEADs, HMAC and HKDF; already used by the rest of the kernel.
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
