@@ -19,6 +19,7 @@ fi
 state_dir="$1"
 
 child=
+# shellcheck disable=SC2329 # invoked by the trap below
 forward() {
 	if [ -n "${child}" ]; then
 		kill -TERM "${child}" 2>/dev/null

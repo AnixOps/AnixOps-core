@@ -9,7 +9,7 @@ OpenWrt 路由器以无 Agent 设备接入组网：软件包只含独立组网�
 | `anixops-mesh` | 每个 OpenWrt 架构一份，见 [`arches.txt`](../../apps/mesh-node/openwrt/arches.txt) | `/usr/bin/anixops-mesh`（musl 静态构建）、`/etc/init.d/anixops-mesh`、`/usr/libexec/anixops-mesh/service`、`/etc/uci-defaults/90-anixops-mesh`、`/lib/upgrade/keep.d/anixops-mesh` | `kmod-tun` |
 | `luci-app-anixops-mesh` | `all` | 两个页面（状态、设置）、菜单、权限、rpcd 后端、简体中文翻译 | `luci-base`、`rpcd-mod-ucode`、`anixops-mesh` |
 
-每个软件包提供 ipk（opkg，OpenWrt 23.05、24.10）与 apk（OpenWrt 25.12 起）两种格式，由 [`.github/scripts/package-openwrt.sh`](../../.github/scripts/package-openwrt.sh) 生成：ipk 由脚本直接写出（归档内容按名称排序、属主 root、时间取提交时间，可重复构建），apk 由对应 OpenWrt 版本镜像中的 `apk mkpkg` 写出。安装与卸载脚本与 OpenWrt 自身构建系统生成的模板相同，由设备的 `/lib/functions.sh` 处理用户组、开机自启与 `uci-defaults`。
+每个软件包提供 ipk（opkg，OpenWrt 23.05、24.10）与 apk（OpenWrt 25.12 起）两种格式，由 [`.github/scripts/package-openwrt.sh`](../../.github/scripts/package-openwrt.sh) 生成：ipk 由脚本直接写出（归档内容按名称排序、属主 root、时间取提交时间，可重复构建），apk 由 apk-tools 3 的 `apk mkpkg` 写出（与 OpenWrt 构建系统在主机上使用的工具相同；设备上的 apk 不含 mkpkg），架构无关的包按 apk 的约定标记为 `noarch`，并在 25.12 设备上实际安装验证。安装与卸载脚本与 OpenWrt 自身构建系统生成的模板相同，由设备的 `/lib/functions.sh` 处理用户组、开机自启与 `uci-defaults`。
 
 程序是静态构建，同一指令集的所有 OpenWrt 架构共用一份构建，只是包的架构标记不同（OpenWrt 只安装架构在本机列表中的包）。当前提供 `x86_64` 与 `aarch64_*`；32 位 ARM（armv7、armv5/6）与 MIPS（`mips_24kc`、`mipsel_24kc`）随交叉构建加入。
 

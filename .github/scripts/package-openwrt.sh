@@ -9,10 +9,12 @@
 #   SHA256SUMS
 #
 # ipk (opkg, OpenWrt 24.10 and older) is written here; apk (OpenWrt 25.12
-# and newer) is written by `apk mkpkg` inside the OpenWrt image given with
-# APK_IMAGE (a digest-pinned openwrt/rootfs image), so the package format is
-# always the one that release's package manager reads. Without APK_IMAGE
-# only ipk is written.
+# and newer) is written by `apk mkpkg` of apk-tools 3 inside the image given
+# with APK_IMAGE (a digest-pinned Alpine image: OpenWrt's own apk on the
+# device is built without mkpkg, and its build system uses the same
+# apk-tools 3 on the host). The workflow installs the result with the
+# device's apk on every OpenWrt release it tests. Without APK_IMAGE only ipk
+# is written.
 #
 #   package-openwrt.sh VERSION BIN_DIR OUT_DIR
 #
@@ -185,9 +187,15 @@ build_apk() {
     done
   fi
   local output="${name}_${pkg_version}_${arch}.apk"
+  # apk names the architecture-independent kind noarch (OpenWrt's
+  # package-pack.mk does the same); the file keeps the ipk-style name.
+  local apk_arch="${arch}"
+  if [ "${arch}" = all ]; then
+    apk_arch=noarch
+  fi
   docker run --rm --network none \
     -v "${stage}:/stage:ro" -v "${out_dir}:/out" \
-    -e "NAME=${name}" -e "VERSION=${pkg_version}" -e "ARCH=${arch}" \
+    -e "NAME=${name}" -e "VERSION=${pkg_version}" -e "ARCH=${apk_arch}" \
     -e "DESCRIPTION=${description}" -e "DEPENDS=${depends}" -e "LICENSE=${license}" \
     -e "URL=${url}" -e "MAINTAINER=${maintainer}" -e "OUTPUT=${output}" \
     -e "OWNER=$(id -u):$(id -g)" \

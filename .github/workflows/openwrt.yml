@@ -37,13 +37,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # OpenWrt release root file systems, pinned by digest. The 25.12 image
-  # also provides `apk mkpkg` for packaging.
+  # OpenWrt release root file systems, pinned by digest.
   IMAGE_X86_64_2305: openwrt/rootfs@sha256:f53afb386d05651ada9a4a964e0779930f30962a2abc2fadf1b03bfcbcbabb14 # x86-64-23.05.6
   IMAGE_X86_64_2410: openwrt/rootfs@sha256:9972a4b4747cd136abd597475d7b88c51a49fd849d0d53f069a2f4bf446061b9 # x86-64-24.10.8
   IMAGE_X86_64_2512: openwrt/rootfs@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af # x86-64-25.12.6
   IMAGE_AARCH64_2410: openwrt/rootfs@sha256:dbe092b7f10824b858e0f6a4501f572e15c5c8739b2815010fbc2868870ea60a # armsr-armv8-24.10.8
   IMAGE_AARCH64_2512: openwrt/rootfs@sha256:22f13387da208c0fb4150c41f3ec12e34cc5994a0717a49e50aa9f9ae6cb5e7b # armsr-armv8-25.12.6
+  # apk-tools 3 (3.0.9) for `apk mkpkg`; OpenWrt's device apk has no mkpkg.
+  APK_MKPKG_IMAGE: alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2 # 3.23.8
   # luci-base's catalog hash, compared with the Python writer.
   LUCI_COMMIT: 8d1aecd0216a02ad52c830e9a03c21da734bf630
   LUCI_LMO_C_SHA256: 1c42aaa581a2a9f6333bce2acd39d3651765b74f6f2513af0a3e295434b06153
@@ -221,7 +222,7 @@ jobs:
       - name: Package
         shell: bash
         env:
-          APK_IMAGE: ${{ env.IMAGE_X86_64_2512 }}
+          APK_IMAGE: ${{ env.APK_MKPKG_IMAGE }}
         run: |
           set -euo pipefail
           chmod 0755 dist/bin/*
