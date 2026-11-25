@@ -1,0 +1,49 @@
+#!/bin/sh
+# Runs `anixops-mesh device` under procd (docs/deploy/openwrt.md).
+#
+# procd restarts an instance on any exit, but exit code 8 means the panel
+# revoked the device token (the program already removed it): restarting
+# cannot help, so the service is stopped instead and stays stopped until
+# the device is enrolled again. Other exit codes are passed on so that
+# procd's respawn limits apply.
+#
+#   service STATE_DIR
+
+PROGRAM=/usr/bin/anixops-mesh
+INIT=/etc/init.d/anixops-mesh
+
+if [ "$#" -ne 1 ]; then
+	echo "usage: $0 STATE_DIR" >&2
+	exit 2
+fi
+state_dir="$1"
+
+child=
+forward() {
+	if [ -n "${child}" ]; then
+		kill -TERM "${child}" 2>/dev/null
+	fi
+}
+# procd stops the service with SIGTERM to this process: pass it on and wait
+# for the program to stop its networks.
+trap forward TERM INT
+
+"${PROGRAM}" device --state-dir "${state_dir}" &
+child=$!
+while :; do
+	wait "${child}"
+	code=$?
+	# wait returns early (code > 128) when a trapped signal arrives while
+	# the program still runs; wait again for its own exit code.
+	if kill -0 "${child}" 2>/dev/null; then
+		continue
+	fi
+	break
+done
+
+if [ "${code}" -eq 8 ]; then
+	logger -t anixops-mesh -p daemon.warn "device token revoked by the panel; service stopped until the device is enrolled again"
+	"${INIT}" stop
+	exit 0
+fi
+exit "${code}"

@@ -197,6 +197,19 @@ jobs:
           grep -qx 'full_matrix=false' "${linux_output}"
           grep -Fqx 'validation_matrix={"include":[{"os":"ubuntu-latest","timeout":30}]}' "${linux_output}"
 
+          # OpenWrt package files run only on Linux (openwrt.yml tests them).
+          base_sha="${head_sha}"
+          mkdir -p "${fixture}/apps/mesh-node/openwrt/anixops-mesh/files/etc/init.d"
+          echo openwrt > "${fixture}/apps/mesh-node/openwrt/anixops-mesh/files/etc/init.d/anixops-mesh"
+          git -C "${fixture}" add apps/mesh-node/openwrt/anixops-mesh/files/etc/init.d/anixops-mesh
+          git -C "${fixture}" commit --quiet -m openwrt
+          head_sha="$(git -C "${fixture}" rev-parse HEAD)"
+          openwrt_output="${fixture}/openwrt.output"
+          classify_commit "${base_sha}" "${head_sha}" "${openwrt_output}"
+          grep -qx 'linux=true' "${openwrt_output}"
+          grep -qx 'unknown=false' "${openwrt_output}"
+          grep -qx 'full_matrix=false' "${openwrt_output}"
+
           base_sha="${head_sha}"
           mkdir -p "${fixture}/crates/platform-windows/src"
           echo windows-platform > "${fixture}/crates/platform-windows/src/lib.rs"

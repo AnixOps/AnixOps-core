@@ -135,7 +135,7 @@ else
         esac
 
         case "${path}" in
-          apps/linux-cli/*|crates/platform-linux/*|docs/architecture/linux-*|docs/release-strategy.md)
+          apps/linux-cli/*|crates/platform-linux/*|docs/architecture/linux-*|docs/release-strategy.md|apps/mesh-node/openwrt/*)
             mark linux
             recognized=true
             ;;
