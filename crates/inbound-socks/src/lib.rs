@@ -206,13 +206,13 @@ impl SocksInbound {
             return Err(Failed);
         }
         if request[1] != CMD_CONNECT {
-            stream.write_all(&reply(REP_COMMAND_NOT_SUPPORTED)).await?;
+            refuse(stream, REP_COMMAND_NOT_SUPPORTED).await?;
             return Err(Failed);
         }
         let target = match read_addr_port(stream, SOCKS).await {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                stream.write_all(&reply(REP_ADDRESS_NOT_SUPPORTED)).await?;
+                refuse(stream, REP_ADDRESS_NOT_SUPPORTED).await?;
                 return Err(Failed);
             }
             Err(error) => return Err(error.into()),
@@ -277,6 +277,32 @@ fn credentials(user: &User) -> Option<(String, String)> {
     let password = user.password.clone()?;
     Some((login(user).to_owned(), password))
 }
+
+/// Answers a request that is not served with `code` and ends the
+/// connection. The rest of the request is unread: closing a socket with
+/// unread data resets the connection, and on Windows the client then loses
+/// the reply. So the write side is shut first and what the client still
+/// sends is read and dropped, at most `LINGER_BYTES` for `LINGER`.
+async fn refuse(stream: &mut BoxStream, code: u8) -> io::Result<()> {
+    stream.write_all(&reply(code)).await?;
+    stream.shutdown().await?;
+    let mut sink = [0u8; 256];
+    let mut left = LINGER_BYTES;
+    let _ = tokio::time::timeout(LINGER, async {
+        while left > 0 {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+    })
+    .await;
+    Ok(())
+}
+
+/// How long and how much `refuse` reads after its answer.
+const LINGER: std::time::Duration = std::time::Duration::from_secs(1);
+const LINGER_BYTES: usize = 4096;
 
 /// A reply with an all-zero IPv4 bound address; clients of `CONNECT` do
 /// not use it.
