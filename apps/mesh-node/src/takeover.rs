@@ -112,6 +112,10 @@ pub enum Action {
     /// `schtasks.exe /Change /DISABLE` (Windows).
     TaskDisable {
         name: String,
+        /// The task's definition before (`schtasks.exe /Query /XML`),
+        /// compared after rollback; `None` when it could not be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        definition: Option<String>,
     },
     /// A logon entry turned off with its `StartupApproved` value (Windows).
     LogonDisable {
@@ -180,7 +184,9 @@ impl Action {
                 format!("sc.exe config {name} start= disabled (was {previous})")
             }
             Action::TaskEnd { name } => format!("schtasks.exe /End /TN {name}"),
-            Action::TaskDisable { name } => format!("schtasks.exe /Change /TN {name} /DISABLE"),
+            Action::TaskDisable { name, .. } => {
+                format!("schtasks.exe /Change /TN {name} /DISABLE")
+            }
             Action::LogonDisable { key, name, .. } => {
                 format!("turn off logon entry {name} ({key})")
             }
@@ -860,8 +866,14 @@ fn execute(
             Ok(vec![Action::TaskEnd { name: name.clone() }])
         }
         Planned::TaskDisable(name) => {
+            // Kept to compare after rollback: turning a task off and on
+            // registers it again.
+            let definition = crate::winstart::definition(host, name);
             crate::winstart::set_enabled(host, name, false)?;
-            Ok(vec![Action::TaskDisable { name: name.clone() }])
+            Ok(vec![Action::TaskDisable {
+                name: name.clone(),
+                definition,
+            }])
         }
         Planned::LogonDisable {
             key,
@@ -869,13 +881,15 @@ fn execute(
             previous,
         } => {
             // The value read again: recorded is what is replaced.
-            let now = crate::winstart::read_approved(host, key, name)?;
-            if now != *previous {
-                return Err(format!(
-                    "logon entry {name} ({key}) changed since detection"
-                ));
-            }
-            crate::winstart::write_approved(host, key, name, crate::winstart::APPROVED_OFF)?;
+            crate::winstart::with_settings(host, key, |at| {
+                let now = crate::winstart::read_approved(host, at, name)?;
+                if now != *previous {
+                    return Err(format!(
+                        "logon entry {name} ({key}) changed since detection"
+                    ));
+                }
+                crate::winstart::write_approved(host, at, name, crate::winstart::APPROVED_OFF)
+            })?;
             Ok(vec![Action::LogonDisable {
                 key: key.clone(),
                 name: name.clone(),
@@ -1667,28 +1681,46 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             crate::winstart::run(host, name)?;
             Ok(format!("schtasks.exe /Run /TN {name}"))
         }
-        Action::TaskDisable { name } => {
+        Action::TaskDisable { name, definition } => {
             crate::winstart::set_enabled(host, name, true)?;
-            Ok(format!("schtasks.exe /Change /TN {name} /ENABLE"))
+            let done = format!("schtasks.exe /Change /TN {name} /ENABLE");
+            let now = crate::winstart::definition(host, name);
+            Ok(match (definition, now) {
+                (Some(before), Some(now))
+                    if !crate::winstart::same_definition(before, &now) =>
+                {
+                    format!(
+                        "{done}; the task's definition differs from the one saved at takeover, check it by hand"
+                    )
+                }
+                (Some(_), None) => format!(
+                    "{done}; the task's definition could not be read to compare with the one saved at takeover"
+                ),
+                _ => done,
+            })
         }
         Action::LogonDisable {
             key,
             name,
             previous,
         } => {
-            // Changed since by someone else (turned on again, or removed):
-            // their choice stands.
-            let now = crate::winstart::read_approved(host, key, name)?;
-            if now.as_deref() != Some(crate::winstart::APPROVED_OFF) {
-                return Ok(format!(
-                    "logon entry {name} ({key}) changed since; left as it is"
-                ));
-            }
-            match previous {
-                Some(hex) => crate::winstart::write_approved(host, key, name, hex)?,
-                None => crate::winstart::delete_approved(host, key, name)?,
-            }
-            Ok(format!("logon entry {name} ({key}) restored"))
+            // A user who has logged off: their settings are loaded for the
+            // change, or the step fails and is kept. Changed since by
+            // someone else (turned on again, or removed): their choice
+            // stands.
+            crate::winstart::with_settings(host, key, |at| {
+                let now = crate::winstart::read_approved(host, at, name)?;
+                if now.as_deref() != Some(crate::winstart::APPROVED_OFF) {
+                    return Ok(format!(
+                        "logon entry {name} ({key}) changed since; left as it is"
+                    ));
+                }
+                match previous {
+                    Some(hex) => crate::winstart::write_approved(host, at, name, hex)?,
+                    None => crate::winstart::delete_approved(host, at, name)?,
+                }
+                Ok(format!("logon entry {name} ({key}) restored"))
+            })
         }
         Action::Terminate {
             argv,
@@ -3440,6 +3472,121 @@ mod tests {
         let spawned = host.spawned.borrow();
         assert_eq!(spawned.len(), 1);
         assert_eq!(spawned[0].argv[0], r"C:\Users\admin\demo-meshd.exe");
+    }
+
+    #[test]
+    fn a_logon_entry_of_a_user_who_logged_off_is_restored_or_kept() {
+        let mounted =
+            USER_APPROVED.replace(r"HKU\S-1-5-21-9-500", r"HKU\anixops-mesh-S-1-5-21-9-500");
+        let logged_off = |host: &FakeHost| {
+            host.answer(r"reg.exe query HKU\S-1-5-21-9-500", 1, "");
+            host.answer(&format!("reg.exe query {USER_APPROVED} /v demo"), 1, "");
+            host.answer(
+                &format!(
+                    "powershell.exe -NoProfile -NonInteractive -Command {}",
+                    crate::winstart::profile_query("S-1-5-21-9-500")
+                ),
+                0,
+                "C:\\Users\\admin\r\n",
+            );
+            host.answer(
+                &format!("reg.exe query {mounted} /v demo"),
+                0,
+                &format!(
+                    "    demo    REG_BINARY    {}\r\n",
+                    crate::winstart::APPROVED_OFF
+                ),
+            );
+        };
+        let load = r"reg.exe load HKU\anixops-mesh-S-1-5-21-9-500 C:\Users\admin\NTUSER.DAT";
+
+        // The user's settings are loaded under our own name, the value is
+        // put back there, and they are unloaded again.
+        let host = windows_startup();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        logged_off(&host);
+        let rollback_report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback_report.ok, "{rollback_report:?}");
+        assert!(rollback_report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.ends_with("restored"))));
+        {
+            let ran = host.ran.borrow();
+            let position = |wanted: &str| {
+                ran.iter()
+                    .position(|line| line == wanted)
+                    .unwrap_or_else(|| panic!("{wanted} not run"))
+            };
+            let add = position(&format!(
+                "reg.exe add {mounted} /v demo /t REG_BINARY /d 020000000000000000000000 /f"
+            ));
+            assert!(position(load) < add);
+            assert!(add < position(r"reg.exe unload HKU\anixops-mesh-S-1-5-21-9-500"));
+        }
+
+        // Settings that cannot be loaded: the step fails and is kept for
+        // the next rollback, never taken as changed by someone else.
+        let host = windows_startup();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        logged_off(&host);
+        host.answer(load, 1, "");
+        let rollback_report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!rollback_report.ok, "{rollback_report:?}");
+        assert!(!rollback_report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.ends_with("left as it is"))));
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|line| line.starts_with("reg.exe add") && line.contains("/d 0200")));
+        let kept = |report: &RollbackReport| {
+            report.steps.iter().any(|step| {
+                !step.ok
+                    && step
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("could not be loaded"))
+            })
+        };
+        assert!(kept(&rollback_report), "{rollback_report:?}");
+        let again = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(!again.ok && kept(&again), "{again:?}");
+    }
+
+    #[test]
+    fn a_task_whose_definition_changed_is_reported_after_rollback() {
+        let host = windows_startup();
+        host.answer(
+            r"schtasks.exe /Query /XML /TN \DemoTask",
+            0,
+            "<Task>\r\n<Settings><Enabled>true</Enabled></Settings>\r\n</Task>\r\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        host.answer(
+            r"schtasks.exe /Query /XML /TN \DemoTask",
+            0,
+            "<Task>\r\n<Settings><Enabled>true</Enabled><RunOnlyIfLoggedOn>true</RunOnlyIfLoggedOn></Settings>\r\n</Task>\r\n",
+        );
+        host.answer(
+            &format!("reg.exe query {USER_APPROVED} /v demo"),
+            0,
+            &format!(
+                "    demo    REG_BINARY    {}\r\n",
+                crate::winstart::APPROVED_OFF
+            ),
+        );
+        let rollback_report = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback_report.ok, "{rollback_report:?}");
+        assert!(rollback_report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.ends_with("check it by hand"))));
     }
 
     #[test]
