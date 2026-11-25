@@ -147,11 +147,11 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 
 ## 安装（macOS）
 
-[`apps/mesh-node/install/install-macos.sh`](../../apps/mesh-node/install/install-macos.sh) 与 Linux 脚本流程相同（以 root 运行）：下载并以 `shasum -a 256` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，写入 launchd 系统守护进程 `/Library/LaunchDaemons/com.anixops.mesh.plist`（`plutil -lint` 校验；非正常退出时重启），`launchctl enable` 后 `bootstrap` 启动，5 秒后仍未运行则卸载我方守护进程并回滚接管。`--uninstall` 卸载并删除守护进程后回滚接管。macOS 的 `/etc`、`/var`、`/tmp` 是符号链接，状态目录不能经过链接；`/usr/local/bin` 可能属于按用户安装软件包管理器的那个用户，放在那里的程序可被该用户替换后以 root 运行，因此程序、配置和状态都放在 `/Library/AnixOps/mesh`（root 所有，0700；程序在其下 `bin/anixops-mesh`），日志写入 `/Library/Logs/anixops-mesh.log`。CI 对脚本做 `sh -n` 与 shellcheck 检查。macOS 程序的发布产物随 Windows 一起加入发布流程。
+[`apps/mesh-node/install/install-macos.sh`](../../apps/mesh-node/install/install-macos.sh) 与 Linux 脚本流程相同（以 root 运行）：下载并以 `shasum -a 256` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，写入 launchd 系统守护进程 `/Library/LaunchDaemons/com.anixops.mesh.plist`（`plutil -lint` 校验；非正常退出时重启），`launchctl enable` 后 `bootstrap` 启动，5 秒后仍未运行则卸载我方守护进程并回滚接管。`--uninstall` 卸载并删除守护进程后回滚接管。macOS 的 `/etc`、`/var`、`/tmp` 是符号链接，状态目录不能经过链接；`/usr/local/bin` 可能属于按用户安装软件包管理器的那个用户，放在那里的程序可被该用户替换后以 root 运行，因此程序、配置和状态都放在 `/Library/AnixOps/mesh`（root 所有，0700；程序在其下 `bin/anixops-mesh`），日志写入 `/Library/Logs/anixops-mesh.log`。CI 对脚本做 `sh -n` 与 shellcheck 检查。节点的虚拟网卡是系统分配的 `utunN`（不是 `anixmesh0`），`run --interface` 只接受 `utunN` 形式；守护进程配置不指定网卡名。
 
 ## 安装（Windows）
 
-[`apps/mesh-node/install/install-windows.ps1`](../../apps/mesh-node/install/install-windows.ps1) 以管理员身份运行，流程与 Linux 脚本相同：下载并以 `Get-FileHash` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，注册服务 `AnixOpsMesh`（自动启动，失败后 5 秒重启），启动 5 秒后仍未运行则删除我方服务并回滚接管。`-Uninstall` 停止并删除服务后回滚接管。程序放在 `%ProgramFiles%\AnixOps\Mesh`，配置与状态放在 `%ProgramData%\AnixOps\Mesh`。任何用户都能在 `%ProgramData%` 下建目录，因此脚本对 `AnixOps`、`Mesh` 与 `state` 逐级处理：已存在的目录是链接或联接、或属主不是 Administrators、SYSTEM 或 TrustedInstaller 时拒绝安装；然后把属主设为 Administrators，并以新的访问列表整体替换（关闭继承，只有 SYSTEM 与 Administrators 完全控制），不保留原有条目。
+[`apps/mesh-node/install/install-windows.ps1`](../../apps/mesh-node/install/install-windows.ps1) 以管理员身份运行，流程与 Linux 脚本相同：下载并以 `Get-FileHash` 校验程序与数据文件（只走 https），执行导入预检；程序支持 `run` 时才接管，注册服务 `AnixOpsMesh`（自动启动，失败后 5 秒重启；程序以服务专用错误报告非零退出，所以同时设 `sc.exe failureflag AnixOpsMesh 1`，否则重启动作不生效），启动 5 秒后仍未运行则删除我方服务并回滚接管。`-Uninstall` 停止并删除服务后回滚接管。程序放在 `%ProgramFiles%\AnixOps\Mesh`，旁边放 `wintun.dll`（节点只从程序所在目录加载它）：程序支持 `run` 时必须给出 `-WintunUrl` 与 `-WintunSha256`（发布中对应架构的 `wintun.dll`），脚本校验 SHA-256 并核对其 PE 机器类型与本机架构一致；虚拟网卡别名默认 `anixmesh0`。配置与状态放在 `%ProgramData%\AnixOps\Mesh`。任何用户都能在 `%ProgramData%` 下建目录，因此脚本对 `AnixOps`、`Mesh` 与 `state` 逐级处理：已存在的目录是链接或联接、或属主不是 Administrators、SYSTEM 或 TrustedInstaller 时拒绝安装；然后把属主设为 Administrators，并以新的访问列表整体替换（关闭继承，只有 SYSTEM 与 Administrators 完全控制），不保留原有条目。
 
 程序在 Windows 上每次读写状态文件与锁之前检查状态目录及其每一级上级目录（直到盘符根目录）：都不能是链接或联接；属主必须是 SYSTEM、Administrators 或 TrustedInstaller；状态目录本身不允许其他账户有任何写入、删除、改权限或改属主的权限；上级目录允许其他账户新建条目（`C:\` 与 `C:\ProgramData` 默认如此，他人新建的条目属于他人，不影响我方目录），但不允许删除子项、删除自身、改权限或改属主。不满足即拒绝执行。CI 用 PowerShell 解析器检查脚本语法。
 
@@ -172,6 +172,8 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 | `anixops-mesh-<版本>-x86_64-apple-darwin` | 同上（Intel） |
 | `anixops-mesh-<版本>-x86_64-pc-windows-msvc.exe` | Windows 程序，C 运行库静态链接，不需要 Visual C++ 运行库 |
 | `anixops-mesh-<版本>-aarch64-pc-windows-msvc.exe` | 同上（ARM64） |
+| `anixops-mesh-<版本>-x86_64-pc-windows-msvc-wintun.dll`、`-aarch64-pc-windows-msvc-wintun.dll` | Wintun 0.14.1 驱动库原样随附（与客户端同一份，固定包的 SHA-256，CI 先核对架构），装在 Windows 程序旁边 |
+| `anixops-mesh-<版本>-wintun-LICENSE.txt` | Wintun 许可证 |
 | `anixops-mesh-<版本>-install-linux.sh` | Linux 安装脚本 |
 | `anixops-mesh-<版本>-install-macos.sh` | macOS 安装脚本 |
 | `anixops-mesh-<版本>-install-windows.ps1` | Windows 安装脚本 |
