@@ -369,7 +369,9 @@ pub fn step(transit: &Transit<'_>, cx: &WaypointContext<'_>) -> Step {
     };
     if transit.remaining.contains(&cx.self_id)
         || transit.origin == cx.self_id
-        || (transit.destination == cx.self_id && probe)
+        // A packet that reached its destination while waypoints remain
+        // is malformed: never forward it on (a probe ends there as well).
+        || (transit.destination == cx.self_id && (probe || !transit.remaining.is_empty()))
         || (probe && cx.outer_from != transit.origin && !(cx.supported)(cx.outer_from))
     {
         return Step::default();
@@ -845,16 +847,17 @@ pub fn judge_error(error: &PathError, reporter: u32, path: &LivePath<'_>) -> Err
 }
 
 /// Probe bookkeeping for one encapsulated waypoint sequence (spec §17.2.6).
-/// The node sends a probe, feeds back the echoes, and closes the round
-/// after 3 s. A new sequence warms up first (rule 7): probes every second
-/// until one round has every echo, judged by the number of probes, not by
-/// the clock.
+/// The node sends a probe, feeds back the echoes, and closes that probe's
+/// round 3 s after sending it. Rounds overlap: during warm-up (rule 7) a
+/// probe goes out every second while each still waits its full 3 s, so up
+/// to three are open at once, each matched by its token. A new sequence
+/// warms up first: until one round has every echo, judged by the number of
+/// closed rounds, not by the clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeState {
     waypoints: Vec<u32>,
-    token: Option<u64>,
-    /// This round's echo status per waypoint, `None` while unanswered.
-    answered: Vec<Option<EchoStatus>>,
+    /// Open rounds, oldest first.
+    rounds: Vec<Round>,
     /// The latest echo status seen from each waypoint.
     last: Vec<Option<EchoStatus>>,
     misses: Vec<u8>,
@@ -863,9 +866,17 @@ pub struct ProbeState {
     held: Option<(usize, Reason)>,
 }
 
+/// One probe waiting for its echoes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Round {
+    token: u64,
+    /// Echo status per waypoint, `None` while unanswered.
+    answered: Vec<Option<EchoStatus>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Warmup {
-    sent: u32,
+    closed: u32,
     deadline: u32,
 }
 
@@ -888,6 +899,9 @@ pub const PROBE_RECOVERY: u8 = 2;
 pub const WARMUP_PROBES: u32 = 6;
 /// Extra warm-up probes allowed after a status-1 echo.
 pub const WARMUP_GRACE: u32 = 3;
+/// Most rounds open at once. Warm-up needs three (one a second, 3 s
+/// each); starting a round beyond this closes the oldest first.
+pub const MAX_OPEN_ROUNDS: usize = 4;
 /// Echoes per second a source expects from one waypoint at most: half of
 /// the waypoint's limit of 32 (spec §17.2.6 rules 1, 4).
 pub const ECHO_BUDGET: u32 = 16;
@@ -899,12 +913,14 @@ impl ProbeState {
         let deadline = WARMUP_PROBES + n as u32;
         Self {
             waypoints,
-            token: None,
-            answered: vec![None; n],
+            rounds: Vec::new(),
             last: vec![None; n],
             misses: vec![0; n],
             clean_rounds: 0,
-            warmup: Some(Warmup { sent: 0, deadline }),
+            warmup: Some(Warmup {
+                closed: 0,
+                deadline,
+            }),
             held: None,
         }
     }
@@ -913,26 +929,43 @@ impl ProbeState {
         &self.waypoints
     }
 
-    /// Starts a round with this token.
+    /// Rounds still waiting for their 3 s.
+    pub fn open_rounds(&self) -> usize {
+        self.rounds.len()
+    }
+
+    /// Opens a round for a probe sent with this token. A token already
+    /// open is ignored.
     pub fn start(&mut self, token: u64) {
-        self.token = Some(token);
-        self.answered.iter_mut().for_each(|a| *a = None);
+        if self.rounds.iter().any(|round| round.token == token) {
+            return;
+        }
+        if self.rounds.len() >= MAX_OPEN_ROUNDS {
+            let oldest = self.rounds[0].token;
+            self.finish(oldest);
+        }
+        self.rounds.push(Round {
+            token,
+            answered: vec![None; self.waypoints.len()],
+        });
     }
 
     /// Takes an echo that arrived with outer `from_peer_id` = `from`.
-    /// Returns whether it was accepted.
+    /// Returns whether it was accepted: its token must belong to an open
+    /// round and its waypoint must be the sender and on the sequence.
     pub fn echo(&mut self, echo: &Echo, from: u32) -> bool {
-        if self.token != Some(echo.token) || echo.waypoint != from {
+        if echo.waypoint != from {
             return false;
         }
-        match self.waypoints.iter().position(|id| *id == from) {
-            Some(at) => {
-                self.answered[at] = Some(echo.status);
-                self.last[at] = Some(echo.status);
-                true
-            }
-            None => false,
-        }
+        let Some(at) = self.waypoints.iter().position(|id| *id == from) else {
+            return false;
+        };
+        let Some(round) = self.rounds.iter_mut().find(|r| r.token == echo.token) else {
+            return false;
+        };
+        round.answered[at] = Some(echo.status);
+        self.last[at] = Some(echo.status);
+        true
     }
 
     /// The current verdict without closing a round.
@@ -961,54 +994,59 @@ impl ProbeState {
         (lost, reason)
     }
 
-    /// Closes the round (3 s after the probe) and returns the verdict
-    /// (spec §17.2.6 rules 3 and 7).
-    pub fn finish(&mut self) -> Verdict {
-        if self.token.take().is_none() {
+    /// Closes the round of the probe sent with `token` (3 s after sending
+    /// it) and returns the verdict (spec §17.2.6 rules 3 and 7). A token
+    /// that is not open changes nothing.
+    pub fn finish(&mut self, token: u64) -> Verdict {
+        let Some(at) = self.rounds.iter().position(|r| r.token == token) else {
             return self.verdict();
-        }
+        };
+        let answered = self.rounds.remove(at).answered;
         // Waypoints after one that echoed status 1 are not missing: that
         // one is still waiting for its query.
-        let excused_from = self
-            .answered
+        let waiting = answered
             .iter()
-            .position(|a| *a == Some(EchoStatus::Pending))
-            .map_or(self.answered.len(), |at| at + 1);
-        for (at, (miss, answered)) in self.misses.iter_mut().zip(&self.answered).enumerate() {
-            if answered.is_some() {
+            .position(|a| *a == Some(EchoStatus::Pending));
+        let excused_from = waiting.map_or(answered.len(), |at| at + 1);
+        for (at, (miss, answer)) in self.misses.iter_mut().zip(&answered).enumerate() {
+            if answer.is_some() {
                 *miss = 0;
             } else if at < excused_from {
                 *miss = miss.saturating_add(1);
             }
         }
-        let clean = self.answered.iter().all(Option::is_some);
+        let clean = answered.iter().all(Option::is_some);
         self.clean_rounds = if clean {
             self.clean_rounds.saturating_add(1)
         } else {
             0
         };
         if let Some(warmup) = self.warmup.as_mut() {
-            warmup.sent += 1;
+            warmup.closed += 1;
             if clean {
                 self.warmup = None;
                 self.held = None;
                 return Verdict::Ready;
             }
             let base = WARMUP_PROBES + self.waypoints.len() as u32;
-            if excused_from < self.answered.len() {
+            if waiting.is_some() {
                 warmup.deadline = warmup
                     .deadline
-                    .max(warmup.sent + WARMUP_GRACE)
+                    .max(warmup.closed + WARMUP_GRACE)
                     .min(base + WARMUP_GRACE);
             }
-            if warmup.sent < warmup.deadline {
+            if warmup.closed < warmup.deadline {
                 return Verdict::Warming;
             }
-            // Give up: name the first waypoint without an echo this round
-            // and go on probing under rule 3's recovery.
+            // Give up and go on probing under rule 3's recovery. Name the
+            // waypoint still waiting for its query if one is (the ones
+            // after it never saw the probe), else the first one without
+            // an echo.
             self.warmup = None;
-            let lost = self.answered.iter().position(Option::is_none).unwrap_or(0);
-            self.held = Some(self.held_on(lost));
+            self.held = Some(match waiting {
+                Some(waypoint) => (waypoint, Reason::NoEcho),
+                None => self.held_on(answered.iter().position(Option::is_none).unwrap_or(0)),
+            });
             return self.verdict();
         }
         if let Some(lost) = self.misses.iter().position(|m| *m >= PROBE_MISSES) {
@@ -1100,8 +1138,9 @@ pub fn tcp_syn_addresses(ip: &[u8]) -> Option<(IpAddr, IpAddr)> {
 }
 
 /// Lowers the MSS option of a TCP SYN or SYN-ACK in the IP packet `ip` to
-/// `max` and fixes the TCP checksum (spec §17.2.5, size, rule 2). Returns
-/// whether the packet changed. Packets that are not such a segment, carry
+/// `max` and updates the TCP checksum incrementally (RFC 1624, eqn. 3; spec
+/// §17.2.5, size, rule 2), so a segment that arrived with a bad checksum
+/// stays bad instead of being repaired. Returns whether the packet changed. Packets that are not such a segment, carry
 /// no MSS option or a smaller one are left alone.
 pub fn clamp_mss(ip: &mut [u8], max: u16) -> bool {
     let Some((_, _, tcp_at)) = tcp_segment(ip) else {
@@ -1142,9 +1181,20 @@ pub fn clamp_mss(ip: &mut [u8], max: u16) -> bool {
         return false;
     }
     ip[field..field + 2].copy_from_slice(&max.to_be_bytes());
-    let checksum = tcp_checksum(ip, tcp_at);
+    let stored = u16::from_be_bytes([ip[tcp_at + 16], ip[tcp_at + 17]]);
+    let checksum = checksum_update(stored, current, max);
     ip[tcp_at + 16..tcp_at + 18].copy_from_slice(&checksum.to_be_bytes());
     true
+}
+
+/// HC' = ~(~HC + ~m + m') in one's complement arithmetic (RFC 1624, eqn.
+/// 3): the checksum after one 16-bit word changed from `old` to `new`.
+fn checksum_update(checksum: u16, old: u16, new: u16) -> u16 {
+    let mut sum = u32::from(!checksum) + u32::from(!old) + u32::from(new);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// Finds a TCP segment with SYN set: addresses and the offset of the TCP
@@ -1189,43 +1239,44 @@ fn tcp_segment(ip: &[u8]) -> Option<(IpAddr, IpAddr, usize)> {
     Some((src, dst, tcp_at))
 }
 
-/// The TCP checksum of the segment at `tcp_at` with the checksum field
-/// taken as zero.
-fn tcp_checksum(ip: &[u8], tcp_at: usize) -> u16 {
-    let mut sum = 0u32;
-    let mut add = |bytes: &[u8]| {
-        for pair in bytes.chunks(2) {
-            let word = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
-            sum += u32::from(word);
-        }
-    };
-    let end = if ip[0] >> 4 == 4 {
-        let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-        let len = (total - tcp_at) as u16;
-        add(&ip[12..20]);
-        add(&[0, 6]);
-        add(&len.to_be_bytes());
-        total
-    } else {
-        let end = 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]]));
-        let len = (end - tcp_at) as u32;
-        add(&ip[8..40]);
-        add(&len.to_be_bytes());
-        add(&[0, 0, 0, 6]);
-        end
-    };
-    add(&ip[tcp_at..tcp_at + 16]);
-    add(&ip[tcp_at + 18..end]);
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::net::IpNet;
+
+    /// A full recomputation, for building and verifying test segments.
+    /// The TCP checksum of the segment at `tcp_at` with the checksum field
+    /// taken as zero.
+    fn tcp_checksum(ip: &[u8], tcp_at: usize) -> u16 {
+        let mut sum = 0u32;
+        let mut add = |bytes: &[u8]| {
+            for pair in bytes.chunks(2) {
+                let word = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
+                sum += u32::from(word);
+            }
+        };
+        let end = if ip[0] >> 4 == 4 {
+            let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+            let len = (total - tcp_at) as u16;
+            add(&ip[12..20]);
+            add(&[0, 6]);
+            add(&len.to_be_bytes());
+            total
+        } else {
+            let end = 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+            let len = (end - tcp_at) as u32;
+            add(&ip[8..40]);
+            add(&len.to_be_bytes());
+            add(&[0, 0, 0, 6]);
+            end
+        };
+        add(&ip[tcp_at..tcp_at + 16]);
+        add(&ip[tcp_at + 18..end]);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
 
     fn inner(from: u32, to: u32) -> Vec<u8> {
         let mut header = NodeHeader::new(from, to, packet_type::DATA, 4);
@@ -1359,6 +1410,15 @@ mod tests {
         let mut bad = encode_transit(1, 9, &[], data);
         bad[1] = 5;
         assert_eq!(decode(&bad), None);
+        // Shorter than the prefix.
+        assert_eq!(decode(&bad[..PREFIX_LEN - 1]), None);
+        assert_eq!(decode(&[]), None);
+        // A list cut short: count 3, two IDs.
+        let probe = encode_transit(1, 9, &[3, 4, 5], Body::Probe(1));
+        assert_eq!(decode(&probe[..PREFIX_LEN + 8]), None);
+        // Six waypoints is the most and is taken.
+        let six = encode_transit(1, 9, &[2, 3, 4, 5, 6, 7], data);
+        assert_eq!(transit(&six).remaining, vec![2, 3, 4, 5, 6, 7]);
     }
 
     fn cx<'a>(
@@ -1484,6 +1544,12 @@ mod tests {
             step(&transit(&payload), &cx(3, 1, &only_self)).report,
             error(ErrorCode::DestinationUnreachable, 9)
         );
+        // At the destination with waypoints left: dropped, never sent on.
+        let early = encode_transit(1, 3, &[4], Body::Data(&inner(1, 3)));
+        assert_eq!(step(&transit(&early), &cx(3, 1, &all)), Step::default());
+        // At the destination as the last waypoint: handled locally.
+        let here = encode_transit(1, 3, &[], Body::Data(&inner(1, 3)));
+        assert!(step(&transit(&here), &cx(3, 1, &none)).release.is_some());
     }
 
     #[test]
@@ -1514,6 +1580,12 @@ mod tests {
         );
         // Over the counter or not relaying: nothing at all.
         assert_eq!(step(&probe, &cx(3, 8, &all)), Step::default());
+        let mut access = cx(3, 1, &all);
+        access.relays = false;
+        assert_eq!(step(&probe, &access), Step::default());
+        // A probe addressed to this node: dropped.
+        let mine = encode_transit(1, 3, &[], Body::Probe(5));
+        assert_eq!(step(&transit(&mine), &cx(3, 1, &all)), Step::default());
         // Last waypoint: echo only, nothing released.
         let payload = encode_transit(1, 9, &[], Body::Probe(5));
         let last = step(&transit(&payload), &cx(4, 2, &all));
@@ -1562,6 +1634,13 @@ mod tests {
         extended.extend_from_slice(&[0x22, 2, 0xff, 0xff, 0x28, 5]);
         assert_eq!(Capabilities::decode(&extended), Some(local));
         assert_eq!(Capabilities::decode(&[0x08]), None);
+        // A version beyond 32 bits, and group wire types 3 and 4.
+        assert_eq!(
+            Capabilities::decode(&[0x08, 0x80, 0x80, 0x80, 0x80, 0x10]),
+            None
+        );
+        assert_eq!(Capabilities::decode(&[0x23, 0x24]), None);
+        assert_eq!(Capabilities::decode(&[0x24]), None);
     }
 
     fn view(id: u32, capability: Capability) -> WaypointView {
@@ -1614,6 +1693,29 @@ mod tests {
                 waypoints: vec![3],
                 reason: Reason::Unsupported,
                 culprit: 1
+            }
+        );
+        // (a) wins over (b): a direct, encapsulable first waypoint keeps
+        // encapsulating.
+        let mut near = view(3, Supported);
+        near.direct = true;
+        assert_eq!(
+            plan(&[near, view(4, NotRelay)], OK, None),
+            Plan::Prefix {
+                waypoints: vec![3],
+                reason: Reason::NotRelay,
+                culprit: 1
+            }
+        );
+        // (b) with an unknown first waypoint: unreachable.
+        let mut silent = view(3, Unknown);
+        silent.direct = true;
+        assert_eq!(
+            plan(&[silent], OK, None),
+            Plan::FirstHop {
+                neighbour: 3,
+                reason: Reason::Unreachable,
+                culprit: 0
             }
         );
         let mut direct = view(3, NotRelay);
@@ -1790,7 +1892,7 @@ mod tests {
         for (waypoint, status) in answers {
             assert!(probe.echo(&echo_from(*waypoint, token, *status), *waypoint));
         }
-        probe.finish()
+        probe.finish(token)
     }
 
     fn warmed(waypoints: Vec<u32>) -> ProbeState {
@@ -1814,7 +1916,7 @@ mod tests {
             // Wrong token, or a waypoint field that is not the sender.
             assert!(!probe.echo(&echo_from(4, token + 100, Forwarded), 4));
             assert!(!probe.echo(&echo_from(4, token, Forwarded), 3));
-            let verdict = probe.finish();
+            let verdict = probe.finish(token);
             let expected = if token == 2 {
                 Verdict::Held {
                     waypoint: 1,
@@ -1832,8 +1934,8 @@ mod tests {
             Verdict::Held { waypoint: 1, .. }
         ));
         assert_eq!(round(&mut probe, 11, &clean), Verdict::Ready);
-        // Finishing without a probe out changes nothing.
-        assert_eq!(probe.finish(), Verdict::Ready);
+        // Finishing a round that is not open changes nothing.
+        assert_eq!(probe.finish(11), Verdict::Ready);
         assert_eq!(probe.waypoints(), &[3, 4]);
     }
 
@@ -1911,18 +2013,23 @@ mod tests {
         );
         // Rounds not closed do not count: no clock involved.
         let mut probe = ProbeState::new(vec![3, 4]);
-        for _ in 0..20 {
-            assert_eq!(probe.finish(), Verdict::Warming);
+        for token in 0..20 {
+            assert_eq!(probe.finish(token), Verdict::Warming);
         }
         // A status-1 echo on the last counted probe waits at most 3 more.
         let mut probe = ProbeState::new(vec![3, 4]);
         for token in 0..10 {
             assert_eq!(round(&mut probe, token, &[(3, Pending)]), Verdict::Warming);
         }
-        assert!(matches!(
+        // It names the waypoint that was waiting, not the one after it
+        // that never saw a probe.
+        assert_eq!(
             round(&mut probe, 10, &[(3, Pending)]),
-            Verdict::Held { waypoint: 1, .. }
-        ));
+            Verdict::Held {
+                waypoint: 0,
+                reason: Reason::NoEcho
+            }
+        );
         // After giving up, rule 3's recovery applies.
         let clean = [(3, Forwarded), (4, Forwarded)];
         assert!(matches!(
@@ -1934,6 +2041,54 @@ mod tests {
         probe.rewarm();
         assert_eq!(probe.verdict(), Verdict::Warming);
         assert_eq!(probe.waypoints(), &[3, 4]);
+    }
+
+    #[test]
+    fn warmup_overlaps_probes_on_a_slow_path() {
+        use EchoStatus::Forwarded;
+        // One probe a second, each answered 2.5 s later and closed after
+        // 3 s: three rounds are open at once and none falls back.
+        let mut probe = ProbeState::new(vec![3, 4, 5]);
+        let probes = 12u64;
+        let mut ready = false;
+        // Half-second ticks.
+        for tick in 0..2 * probes + 6 {
+            if tick % 2 == 0 && tick / 2 < probes {
+                probe.start(tick / 2);
+            }
+            if tick >= 5 && (tick - 5) % 2 == 0 && (tick - 5) / 2 < probes {
+                let token = (tick - 5) / 2;
+                for waypoint in [3, 4, 5] {
+                    assert!(probe.echo(&echo_from(waypoint, token, Forwarded), waypoint));
+                }
+            }
+            if tick >= 6 && tick % 2 == 0 && (tick - 6) / 2 < probes {
+                let verdict = probe.finish((tick - 6) / 2);
+                assert!(!matches!(verdict, Verdict::Held { .. }), "tick {tick}");
+                ready |= verdict == Verdict::Ready;
+            }
+            assert!(probe.open_rounds() <= 3);
+        }
+        assert!(ready);
+        assert_eq!(probe.verdict(), Verdict::Ready);
+        // An echo for a round already closed is not taken.
+        assert!(!probe.echo(&echo_from(3, 0, Forwarded), 3));
+    }
+
+    #[test]
+    fn open_rounds_are_bounded() {
+        let mut probe = ProbeState::new(vec![3]);
+        for token in 0..=MAX_OPEN_ROUNDS as u64 {
+            probe.start(token);
+        }
+        assert_eq!(probe.open_rounds(), MAX_OPEN_ROUNDS);
+        // The oldest was closed (as a miss) to make room.
+        assert!(!probe.echo(&echo_from(3, 0, EchoStatus::Forwarded), 3));
+        assert!(probe.echo(&echo_from(3, 1, EchoStatus::Forwarded), 3));
+        // Starting an open token again changes nothing.
+        probe.start(1);
+        assert_eq!(probe.open_rounds(), MAX_OPEN_ROUNDS);
+        assert_eq!(probe.finish(1), Verdict::Ready);
     }
 
     #[test]
@@ -2060,8 +2215,9 @@ mod tests {
         IpAddr::from([a, b, c, d])
     }
 
-    #[test]
-    fn clamps_ipv6_syn_ack_with_option_after_nops() {
+    /// An IPv6 TCP SYN-ACK with options NOP, NOP, SACK permitted, MSS 1440
+    /// and a correct checksum.
+    fn syn_ack_v6() -> Vec<u8> {
         let mut ip = vec![0x60, 0, 0, 0, 0, 28, 6, 64];
         let mut src = [0u8; 16];
         src[0] = 0xfd;
@@ -2078,18 +2234,71 @@ mod tests {
         ip.extend_from_slice(&tcp);
         let checksum = tcp_checksum(&ip, 40);
         ip[56..58].copy_from_slice(&checksum.to_be_bytes());
+        ip
+    }
+
+    #[test]
+    fn clamps_ipv6_syn_ack_with_option_after_nops() {
+        let mut ip = syn_ack_v6();
         assert!(clamp_mss(&mut ip, max_mss(2, true)));
         assert_eq!(&ip[66..68], &max_mss(2, true).to_be_bytes());
         assert!(checksum_ok(&ip, 40));
     }
 
     #[test]
-    fn checksum_matches_a_known_segment() {
-        // Recomputing over a correct checksum gives the same value, and a
-        // flipped bit is caught.
-        let ip = syn_v4();
-        let mut broken = ip.clone();
+    fn checksum_matches_known_values() {
+        // Worked out by hand from the one's complement sum of the pseudo
+        // header and segment, independently of this module.
+        let mut ip = syn_v4();
+        assert_eq!(&ip[36..38], &[0x3d, 0x6d]);
+        assert!(clamp_mss(&mut ip, 1280));
+        assert_eq!(&ip[36..38], &[0x3e, 0x21]);
+        let mut ip = syn_ack_v6();
+        assert_eq!(&ip[56..58], &[0x58, 0x85]);
+        assert!(clamp_mss(&mut ip, 1256));
+        assert_eq!(&ip[56..58], &[0x59, 0x3d]);
+        // RFC 1624 section 4 example: the old HC0 = 0xDD2F, m = 0x5555,
+        // m' = 0x3285 gives 0x0000, never 0xFFFF.
+        assert_eq!(checksum_update(0xdd2f, 0x5555, 0x3285), 0x0000);
+        // A flipped bit is caught, and an update keeps it broken.
+        let mut broken = syn_v4();
         broken[45] ^= 1;
         assert!(!checksum_ok(&broken, 20));
+        assert!(clamp_mss(&mut broken, 1280));
+        assert!(!checksum_ok(&broken, 20));
+    }
+
+    #[test]
+    fn mss_leaves_odd_segments_alone() {
+        // IPv4 options (IHL 6) before TCP: still found and fixed.
+        let syn = syn_v4();
+        let mut ip = syn[..20].to_vec();
+        ip[0] = 0x46;
+        ip[3] = 52;
+        ip.extend_from_slice(&[1, 1, 1, 0]);
+        ip.extend_from_slice(&syn[20..]);
+        ip[40..42].copy_from_slice(&[0, 0]);
+        let checksum = tcp_checksum(&ip, 24);
+        ip[40..42].copy_from_slice(&checksum.to_be_bytes());
+        assert!(clamp_mss(&mut ip, 1280));
+        assert_eq!(&ip[46..48], &1280u16.to_be_bytes());
+        assert!(checksum_ok(&ip, 24));
+        // IPv6 with an extension header: skipped.
+        let mut ext = syn_ack_v6();
+        ext[6] = 0;
+        assert!(!clamp_mss(&mut ext, 1000));
+        // No MSS option.
+        let mut none = syn_v4();
+        none[40..44].copy_from_slice(&[1, 1, 1, 1]);
+        assert!(!clamp_mss(&mut none, 1000));
+        // An option running past the header.
+        let mut long = syn_v4();
+        long[41] = 40;
+        assert!(!clamp_mss(&mut long, 1000));
+        // Total length beyond the buffer.
+        let mut short = syn_v4();
+        short[3] = 200;
+        assert!(!clamp_mss(&mut short, 1000));
+        assert_eq!(tcp_syn_addresses(&short), None);
     }
 }
