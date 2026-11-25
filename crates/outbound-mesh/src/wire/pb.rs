@@ -109,6 +109,15 @@ impl<'a> Reader<'a> {
         Err(PbError::VarintTooLong)
     }
 
+    /// The next value of a packed repeated varint field (read the field's
+    /// bytes with [`Reader::new`] first), or `None` at the end.
+    pub fn next_varint(&mut self) -> Result<Option<u64>, PbError> {
+        if self.rest.is_empty() {
+            return Ok(None);
+        }
+        self.varint().map(Some)
+    }
+
     fn take(&mut self, len: usize) -> Result<&'a [u8], PbError> {
         if self.rest.len() < len {
             return Err(PbError::Truncated);
@@ -295,6 +304,16 @@ mod tests {
             Reader::new(&[0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]).next(),
             Err(PbError::VarintTooLong)
         );
+    }
+
+    #[test]
+    fn packed_varints() {
+        let mut reader = Reader::new(&[1, 0x96, 0x01, 3]);
+        assert_eq!(reader.next_varint().unwrap(), Some(1));
+        assert_eq!(reader.next_varint().unwrap(), Some(150));
+        assert_eq!(reader.next_varint().unwrap(), Some(3));
+        assert_eq!(reader.next_varint().unwrap(), None);
+        assert_eq!(Reader::new(&[0x80]).next_varint(), Err(PbError::Truncated));
     }
 
     #[test]

@@ -17,11 +17,13 @@
 //! - [`legacy`]: the default handshake mode: digest, static keys, payload
 //!   encryption and the handshake message.
 //! - [`rpc`]: peer RPC packets, pieces, requests and responses.
+//! - [`route`]: route synchronisation messages, topology and path choice.
 
 pub mod config;
 pub mod legacy;
 pub mod net;
 pub mod packet;
+pub mod route;
 pub mod routes;
 pub mod rpc;
 pub mod scope;
