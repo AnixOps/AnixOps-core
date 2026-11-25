@@ -125,6 +125,70 @@ pub trait Host {
     fn spawn_detached(&self, spawn: &Spawn, hold: Option<Hold<'_>>) -> io::Result<Spawned>;
     fn sleep_ms(&self, ms: u64);
     fn own_pid(&self) -> u32;
+    /// Every process id, where processes are not files under `/proc`
+    /// (macOS). Elsewhere the program reads `/proc` instead.
+    fn list_pids(&self) -> io::Result<Vec<u32>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no process table on this system",
+        ))
+    }
+    /// What a process runs and as whom, where processes are not files
+    /// under `/proc` (macOS). `NotFound` once it is gone.
+    fn process_info(&self, _pid: u32) -> io::Result<ProcInfo> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no process table on this system",
+        ))
+    }
+}
+
+/// A process as the system's process table describes it (macOS).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcInfo {
+    /// The program file; `None` when it cannot be read.
+    pub exe: Option<String>,
+    /// Full argv; empty when it cannot be read.
+    pub argv: Vec<String>,
+    pub environ: Vec<(String, String)>,
+    /// Real user and group; `None` when they cannot be read.
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// The user's groups, as a login gives them.
+    pub groups: Option<Vec<u32>>,
+    pub cwd: Option<String>,
+}
+
+/// Splits the `KERN_PROCARGS2` buffer of a macOS process: the argument
+/// count (a native-endian 32-bit integer), the program path, padding, then
+/// the arguments and the environment, each ending in NUL. `None` when the
+/// buffer is shorter than its own count says.
+pub fn parse_procargs2(buffer: &[u8]) -> Option<(Vec<String>, Vec<(String, String)>)> {
+    let count = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let count = usize::try_from(count).ok()?;
+    let mut rest = &buffer[4..];
+    // The program path, then the NULs that pad it.
+    let end = rest.iter().position(|byte| *byte == 0)?;
+    rest = &rest[end..];
+    let start = rest.iter().position(|byte| *byte != 0)?;
+    rest = &rest[start..];
+    let mut strings = rest.split(|byte| *byte == 0);
+    let mut argv = Vec::with_capacity(count);
+    for _ in 0..count {
+        argv.push(String::from_utf8_lossy(strings.next()?).into_owned());
+    }
+    let mut environ = Vec::new();
+    for string in strings {
+        // The environment ends at the first empty string.
+        if string.is_empty() {
+            break;
+        }
+        let text = String::from_utf8_lossy(string);
+        if let Some((name, value)) = text.split_once('=') {
+            environ.push((name.to_string(), value.to_string()));
+        }
+    }
+    Some((argv, environ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,6 +774,229 @@ impl Host for RealHost {
     fn own_pid(&self) -> u32 {
         std::process::id()
     }
+
+    #[cfg(target_os = "macos")]
+    fn list_pids(&self) -> io::Result<Vec<u32>> {
+        darwin::list_pids()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_info(&self, pid: u32) -> io::Result<ProcInfo> {
+        darwin::process_info(pid)
+    }
+}
+
+/// The macOS process table, read through libproc and sysctl: the program
+/// path, arguments and environment exactly as the kernel holds them.
+#[cfg(target_os = "macos")]
+mod darwin {
+    use super::{parse_procargs2, ProcInfo};
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::mem::{size_of, MaybeUninit};
+
+    fn pid_arg(pid: u32) -> io::Result<libc::c_int> {
+        libc::c_int::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))
+    }
+
+    /// `NotFound` for a process that is gone, the OS error otherwise.
+    fn os_error() -> io::Error {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            io::Error::from(io::ErrorKind::NotFound)
+        } else {
+            error
+        }
+    }
+
+    pub(super) fn list_pids() -> io::Result<Vec<u32>> {
+        // SAFETY: a null buffer asks only for the count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Room for processes started since the count.
+        let mut pids: Vec<libc::c_int> = vec![0; count as usize + 256];
+        let bytes = libc::c_int::try_from(pids.len() * size_of::<libc::c_int>())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many processes"))?;
+        // SAFETY: the buffer holds `bytes` bytes.
+        let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        pids.truncate((got as usize).min(pids.len()));
+        Ok(pids
+            .into_iter()
+            .filter_map(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .collect())
+    }
+
+    fn bsd_info(pid: libc::c_int) -> io::Result<libc::proc_bsdinfo> {
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer is a proc_bsdinfo of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if got != size {
+            return Err(os_error());
+        }
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        Ok(unsafe { info.assume_init() })
+    }
+
+    fn program_path(pid: libc::c_int) -> Option<String> {
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the buffer holds PROC_PIDPATHINFO_MAXSIZE bytes.
+        let len =
+            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if len <= 0 {
+            return None;
+        }
+        buffer.truncate(len as usize);
+        String::from_utf8(buffer).ok()
+    }
+
+    fn arguments(pid: libc::c_int) -> Option<(Vec<String>, Vec<(String, String)>)> {
+        let mut max: libc::c_int = 0;
+        let mut size = size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `max` is a c_int and `size` its size.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut max as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || max <= 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; max as usize];
+        let mut size = buffer.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: the buffer holds `size` bytes; sysctl writes at most that
+        // and sets `size` to what it wrote.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        buffer.truncate(size);
+        parse_procargs2(&buffer)
+    }
+
+    fn working_directory(pid: libc::c_int) -> Option<String> {
+        let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+        let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: the buffer is a proc_vnodepathinfo of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if got != size {
+            return None;
+        }
+        // SAFETY: proc_pidinfo filled all `size` bytes.
+        let info = unsafe { info.assume_init() };
+        let bytes: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .iter()
+            .flatten()
+            .map(|byte| *byte as u8)
+            .take_while(|byte| *byte != 0)
+            .collect();
+        if bytes.is_empty() {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    /// The groups a login as this user gets, which is what launchd and a
+    /// shell started as the user give its processes.
+    fn login_groups(uid: u32, gid: u32) -> Option<Vec<u32>> {
+        let mut record = MaybeUninit::<libc::passwd>::zeroed();
+        let mut text = vec![0 as libc::c_char; 16 * 1024];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every buffer outlives the call and has the size passed.
+        let result = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                text.as_mut_ptr(),
+                text.len(),
+                &mut found,
+            )
+        };
+        if result != 0 || found.is_null() {
+            return None;
+        }
+        // SAFETY: getpwuid_r succeeded, so the record and its name are set.
+        let name: CString = unsafe { CStr::from_ptr((*found).pw_name) }.to_owned();
+        let mut count: libc::c_int = 64;
+        loop {
+            let mut groups: Vec<libc::c_int> = vec![0; count as usize];
+            let mut got = count;
+            // SAFETY: `groups` holds `got` entries.
+            let result = unsafe {
+                libc::getgrouplist(
+                    name.as_ptr(),
+                    gid as libc::c_int,
+                    groups.as_mut_ptr(),
+                    &mut got,
+                )
+            };
+            if result == 0 {
+                groups.truncate((got as usize).min(groups.len()));
+                return Some(groups.into_iter().map(|group| group as u32).collect());
+            }
+            if count >= 4096 {
+                return None;
+            }
+            count *= 4;
+        }
+    }
+
+    pub(super) fn process_info(pid: u32) -> io::Result<ProcInfo> {
+        let pid = pid_arg(pid)?;
+        let info = bsd_info(pid)?;
+        let (argv, environ) = arguments(pid).unwrap_or_default();
+        let (uid, gid) = (info.pbi_ruid, info.pbi_rgid);
+        Ok(ProcInfo {
+            exe: program_path(pid),
+            argv,
+            environ,
+            uid: Some(uid),
+            gid: Some(gid),
+            groups: login_groups(uid, gid),
+            cwd: working_directory(pid),
+        })
+    }
 }
 
 /// Pipes between the parent and a new process that waits before running
@@ -1049,6 +1336,10 @@ pub(crate) mod fake {
         /// Processes (pid, argv, cgroup) that appear at the next wait of a
         /// second or more.
         pub respawn_after_sleep: RefCell<Vec<(u32, Vec<String>, String)>>,
+        /// A process table instead of `/proc` (macOS), when set.
+        pub table: RefCell<Option<BTreeMap<u32, ProcInfo>>>,
+        /// launchd jobs by "domain/label": job file, process, loaded.
+        pub launchd: RefCell<BTreeMap<String, (String, Option<u32>, bool)>>,
     }
 
     impl FakeHost {
@@ -1099,6 +1390,79 @@ pub(crate) mod fake {
             self.alive.borrow_mut().insert(pid);
         }
 
+        /// A running process in the process table (macOS), run by `uid`.
+        pub fn table_process(&self, pid: u32, exe: &str, argv: &[&str], env: &[&str], uid: u32) {
+            let info = ProcInfo {
+                exe: Some(exe.to_string()),
+                argv: argv.iter().map(|arg| arg.to_string()).collect(),
+                environ: env
+                    .iter()
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+                uid: Some(uid),
+                gid: Some(20),
+                groups: Some(vec![20]),
+                cwd: Some("/".into()),
+            };
+            self.table
+                .borrow_mut()
+                .get_or_insert_with(BTreeMap::new)
+                .insert(pid, info);
+            self.alive.borrow_mut().insert(pid);
+        }
+
+        /// launchctl for the jobs in `launchd`; `None` for anything else.
+        fn launchctl(&self, program: &str, args: &[&str]) -> Option<CommandOutput> {
+            if program != "launchctl" {
+                return None;
+            }
+            let done = |code: i32, stdout: String| {
+                Some(CommandOutput {
+                    code: Some(code),
+                    stdout,
+                    stderr: String::new(),
+                })
+            };
+            match args {
+                ["print", target] => {
+                    let jobs = self.launchd.borrow();
+                    let (_, pid, loaded) = jobs.get(*target)?;
+                    if !loaded {
+                        return done(113, String::new());
+                    }
+                    let pid = pid
+                        .map(|pid| format!("\tpid = {pid}\n"))
+                        .unwrap_or_default();
+                    done(0, format!("{target} = {{\n\tstate = running\n{pid}}}\n"))
+                }
+                ["bootout", target] => {
+                    let pid = {
+                        let mut jobs = self.launchd.borrow_mut();
+                        let job = jobs.get_mut(*target)?;
+                        if !job.2 {
+                            return done(113, String::new());
+                        }
+                        job.2 = false;
+                        job.1.take()
+                    };
+                    if let Some(pid) = pid {
+                        self.remove_process(pid);
+                    }
+                    done(0, String::new())
+                }
+                ["bootstrap", domain, plist] => {
+                    let mut jobs = self.launchd.borrow_mut();
+                    let (_, job) = jobs.iter_mut().find(|(target, job)| {
+                        target.starts_with(&format!("{domain}/")) && job.0 == *plist
+                    })?;
+                    job.2 = true;
+                    done(0, String::new())
+                }
+                _ => None,
+            }
+        }
+
         fn add_parents(&self, path: &Path) {
             let mut dirs = self.dirs.borrow_mut();
             let mut current = path.parent();
@@ -1118,6 +1482,9 @@ pub(crate) mod fake {
                 .retain(|path, _| !path.starts_with(&base));
             self.dirs.borrow_mut().remove(&base);
             self.alive.borrow_mut().remove(&pid);
+            if let Some(table) = self.table.borrow_mut().as_mut() {
+                table.remove(&pid);
+            }
         }
     }
 
@@ -1230,6 +1597,9 @@ pub(crate) mod fake {
                 key.push_str(arg);
             }
             self.ran.borrow_mut().push(key.clone());
+            if let Some(output) = self.launchctl(program, args) {
+                return Ok(output);
+            }
             // systemd moving a process into a new scope.
             if program == "busctl" && args.contains(&"StartTransientUnit") {
                 if let (Some(scope), Some(pid)) = (args.get(6), args.get(12)) {
@@ -1295,5 +1665,57 @@ pub(crate) mod fake {
         fn own_pid(&self) -> u32 {
             1
         }
+
+        fn list_pids(&self) -> io::Result<Vec<u32>> {
+            match self.table.borrow().as_ref() {
+                Some(table) => Ok(table.keys().copied().collect()),
+                None => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            }
+        }
+
+        fn process_info(&self, pid: u32) -> io::Result<ProcInfo> {
+            match self.table.borrow().as_ref() {
+                Some(table) => table
+                    .get(&pid)
+                    .cloned()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)),
+                None => Err(io::Error::from(io::ErrorKind::Unsupported)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod procargs_tests {
+    use super::parse_procargs2;
+
+    fn buffer(count: i32, rest: &[u8]) -> Vec<u8> {
+        let mut out = count.to_ne_bytes().to_vec();
+        out.extend_from_slice(rest);
+        out
+    }
+
+    #[test]
+    fn arguments_and_environment_are_split_exactly() {
+        let bytes = buffer(
+            3,
+            b"/usr/local/bin/demo\0\0\0\0demo\0-c\0/etc/a b.toml\0HOME=/var/root\0A=1=2\0\0junk\0",
+        );
+        let (argv, environ) = parse_procargs2(&bytes).unwrap();
+        assert_eq!(argv, ["demo", "-c", "/etc/a b.toml"]);
+        assert_eq!(
+            environ,
+            [
+                ("HOME".to_string(), "/var/root".to_string()),
+                ("A".to_string(), "1=2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_buffer_is_not_guessed() {
+        assert_eq!(parse_procargs2(&buffer(3, b"/bin/x\0\0x\0")), None);
+        assert_eq!(parse_procargs2(b"\x01\x00"), None);
+        assert_eq!(parse_procargs2(&buffer(-1, b"/bin/x\0\0x\0")), None);
     }
 }

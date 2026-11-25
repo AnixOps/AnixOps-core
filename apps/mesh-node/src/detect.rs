@@ -1,7 +1,8 @@
-//! Finding existing installations on Linux (requirement R12): systemd
+//! Finding existing installations (requirement R12). On Linux: systemd
 //! services, OpenRC and other init scripts, autostart lines in `rc.local`
-//! and crontabs, and processes started by hand. Containers are found and
-//! reported but never touched.
+//! and crontabs, and processes started by hand; containers are found and
+//! reported but never touched. On macOS: launchd jobs (see
+//! [`crate::launchd`]) and processes started by hand.
 //!
 //! Each finding carries the command line the program runs with, taken from
 //! the running process where there is one (the most exact source) and from
@@ -48,6 +49,19 @@ pub enum Origin {
     Process { pid: u32 },
     /// Runs in a container; reported only.
     Container { id: String, image: String },
+    /// A launchd job (macOS).
+    Launchd {
+        label: String,
+        plist: String,
+        /// `system`, or `gui/<uid>` for a user's agent; `None` for an agent
+        /// every user loads, which is left to the operator.
+        domain: Option<String>,
+        /// `launchctl disable` (`true`) or `enable` (`false`) set for the
+        /// job; `None` when its file's `Disabled` key decides.
+        override_off: Option<bool>,
+        disabled_key: bool,
+        loaded: bool,
+    },
 }
 
 impl Origin {
@@ -59,6 +73,9 @@ impl Origin {
             Origin::Autostart { file, line } => format!("autostart:{file}:{line}"),
             Origin::Process { pid } => format!("process:{pid}"),
             Origin::Container { id, .. } => format!("container:{id}"),
+            Origin::Launchd { label, domain, .. } => {
+                format!("launchd:{}/{label}", domain.as_deref().unwrap_or("*"))
+            }
         }
     }
 }
@@ -221,7 +238,7 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
     let mut out = Vec::new();
     let own = host.own_pid();
     let Ok(entries) = host.list_dir(Path::new("/proc")) else {
-        return out;
+        return scan_table(host, profile);
     };
     for entry in entries {
         let Some(pid) = entry
@@ -305,6 +322,45 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
         });
     }
     out
+}
+
+/// Whether processes are read from the process table (macOS) rather than
+/// from `/proc`.
+pub fn uses_process_table(host: &dyn Host) -> bool {
+    !host.exists(Path::new("/proc")) && host.list_pids().is_ok()
+}
+
+/// Running processes of the program, from the process table (macOS).
+/// There are no containers or cgroups to read there.
+fn scan_table(host: &dyn Host, profile: &Profile) -> Vec<Process> {
+    let own = host.own_pid();
+    let Ok(pids) = host.list_pids() else {
+        return Vec::new();
+    };
+    pids.into_iter()
+        .filter(|pid| *pid != own)
+        .filter_map(|pid| {
+            let info = host.process_info(pid).ok()?;
+            let exe = info.exe.clone().or_else(|| info.argv.first().cloned())?;
+            if !is_program(profile, &exe) {
+                return None;
+            }
+            Some(Process {
+                pid,
+                exe,
+                env: wanted_env(profile, info.environ.clone()),
+                argv: info.argv,
+                cwd: info.cwd,
+                unit: None,
+                host_unit: None,
+                contained: false,
+                uid: info.uid,
+                gid: info.gid,
+                groups: info.groups,
+                environ: info.environ,
+            })
+        })
+        .collect()
 }
 
 fn show_unit(host: &dyn Host, unit: &str) -> BTreeMap<String, String> {
@@ -870,6 +926,9 @@ pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
     found.extend(init_scripts(host, profile, &systemd_stems, &processes));
     found.extend(autostart_lines(host, profile, &processes));
     found.extend(containers(host, profile, &processes));
+    if host.has_program("launchctl") {
+        found.extend(crate::launchd::jobs(host, profile, &processes));
+    }
 
     let claimed: BTreeSet<u32> = found
         .iter()

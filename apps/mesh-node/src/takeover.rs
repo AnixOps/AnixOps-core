@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::detect::{classify_units, detect, in_container, real_id, scan_processes, Found, Origin};
+use crate::detect::{
+    classify_units, detect, in_container, real_id, scan_processes, uses_process_table, Found,
+    Origin,
+};
 use crate::host::{Hold, Host, Signal, Spawn};
 use crate::profile::Profile;
 
@@ -76,6 +79,20 @@ pub enum Action {
         /// backup only if nothing else changed the file since.
         sha256_after: String,
     },
+    /// `launchctl disable` (macOS).
+    LaunchdDisable {
+        domain: String,
+        label: String,
+        /// `enabled` when `launchctl enable` was set before, `none` when the
+        /// job file decided.
+        previous: String,
+    },
+    /// `launchctl bootout`: the job stopped and unloaded (macOS).
+    LaunchdBootout {
+        domain: String,
+        label: String,
+        plist: String,
+    },
     /// A process ended with TERM or KILL.
     Terminate {
         pid: u32,
@@ -120,6 +137,12 @@ impl Action {
             Action::ScriptDisable { name, tool, .. } => format!("{tool} disable {name}"),
             Action::ScriptStop { script, .. } => format!("{script} stop"),
             Action::CommentLine { file, line, .. } => format!("comment out {file}:{line}"),
+            Action::LaunchdDisable { domain, label, .. } => {
+                format!("launchctl disable {domain}/{label}")
+            }
+            Action::LaunchdBootout { domain, label, .. } => {
+                format!("launchctl bootout {domain}/{label}")
+            }
             Action::Terminate {
                 pid, exe, killed, ..
             } => format!(
@@ -328,6 +351,16 @@ enum Planned {
         file: String,
         line: usize,
     },
+    LaunchdDisable {
+        domain: String,
+        label: String,
+        previous: String,
+    },
+    LaunchdBootout {
+        domain: String,
+        label: String,
+        plist: String,
+    },
 }
 
 fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
@@ -409,6 +442,45 @@ fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
                     line: *line,
                 });
             }
+            Origin::Launchd {
+                label,
+                plist,
+                domain,
+                override_off,
+                disabled_key,
+                loaded,
+            } => {
+                let Some(domain) = domain else {
+                    manual.push(format!("login item {label} ({plist})"));
+                    continue;
+                };
+                backup(plist, &mut backups);
+                // Unloaded first, then turned off: a rollback turns it on
+                // again before loading it, as launchd loads no job that is
+                // turned off.
+                if *loaded {
+                    disables.push(Planned::LaunchdBootout {
+                        domain: domain.clone(),
+                        label: label.clone(),
+                        plist: plist.clone(),
+                    });
+                }
+                let off_at_boot = match override_off {
+                    Some(off) => *off,
+                    None => *disabled_key,
+                };
+                if !off_at_boot {
+                    disables.push(Planned::LaunchdDisable {
+                        domain: domain.clone(),
+                        label: label.clone(),
+                        previous: if override_off.is_some() {
+                            "enabled".into()
+                        } else {
+                            "none".into()
+                        },
+                    });
+                }
+            }
             Origin::Process { .. } => {}
             Origin::Container { id, image } => {
                 manual.push(format!("container {id} {image}").trim_end().to_string());
@@ -433,6 +505,12 @@ fn describe_planned(planned: &Planned) -> String {
         Planned::ScriptDisable { name, .. } => format!("disable init script {name}"),
         Planned::ScriptStop { script, .. } => format!("{script} stop"),
         Planned::CommentLine { file, line } => format!("comment out {file}:{line}"),
+        Planned::LaunchdDisable { domain, label, .. } => {
+            format!("launchctl disable {domain}/{label}")
+        }
+        Planned::LaunchdBootout { domain, label, .. } => {
+            format!("launchctl bootout {domain}/{label}")
+        }
     }
 }
 
@@ -610,10 +688,53 @@ fn execute(
                 sha256_after: sha256_hex(updated.as_bytes()),
             }])
         }
+        Planned::LaunchdDisable {
+            domain,
+            label,
+            previous,
+        } => {
+            run_ok(
+                host,
+                "launchctl",
+                &["disable", &format!("{domain}/{label}")],
+            )?;
+            Ok(vec![Action::LaunchdDisable {
+                domain: domain.clone(),
+                label: label.clone(),
+                previous: previous.clone(),
+            }])
+        }
+        Planned::LaunchdBootout {
+            domain,
+            label,
+            plist,
+        } => {
+            let target = format!("{domain}/{label}");
+            let result = run_ok(host, "launchctl", &["bootout", &target]);
+            // Some versions report an error for a job they did unload: what
+            // counts is that it is no longer loaded.
+            if let Err(error) = result {
+                if crate::launchd::loaded(host, domain, label).0 {
+                    return Err(error);
+                }
+            }
+            Ok(vec![Action::LaunchdBootout {
+                domain: domain.clone(),
+                label: label.clone(),
+                plist: plist.clone(),
+            }])
+        }
     }
 }
 
 fn alive(host: &dyn Host, pid: u32, exe: &str) -> bool {
+    if uses_process_table(host) {
+        return match host.process_info(pid) {
+            // A reused pid running something else counts as gone.
+            Ok(info) => info.exe.as_deref().is_none_or(|path| path == exe),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        };
+    }
     let base = PathBuf::from(format!("/proc/{pid}"));
     if !host.exists(&base) {
         return false;
@@ -652,6 +773,9 @@ fn running_copy(
     uid: Option<u32>,
     net_ns: Option<&str>,
 ) -> CopyCheck {
+    if uses_process_table(host) {
+        return running_copy_in_table(host, exe, argv, uid);
+    }
     let Ok(entries) = host.list_dir(Path::new("/proc")) else {
         return CopyCheck::None;
     };
@@ -683,6 +807,43 @@ fn running_copy(
             Some(true) => return CopyCheck::Running(pid),
             Some(false) => {}
             None => unknown = unknown.or(Some(pid)),
+        }
+    }
+    unknown.map_or(CopyCheck::None, CopyCheck::Unknown)
+}
+
+/// [`running_copy`] where processes are read from the process table
+/// (macOS): there are no containers or network namespaces to compare.
+fn running_copy_in_table(
+    host: &dyn Host,
+    exe: &str,
+    argv: &[String],
+    uid: Option<u32>,
+) -> CopyCheck {
+    let Ok(pids) = host.list_pids() else {
+        return CopyCheck::None;
+    };
+    let own = host.own_pid();
+    let mut unknown = None;
+    for pid in pids.into_iter().filter(|pid| *pid != own) {
+        // As with `/proc`: a process whose arguments we cannot read is not
+        // one we could have ended.
+        let Ok(info) = host.process_info(pid) else {
+            continue;
+        };
+        if info.argv != argv {
+            continue;
+        }
+        let same_program = info.exe.as_deref().map(|path| path == exe);
+        let same_user = match (uid, info.uid) {
+            (Some(uid), Some(theirs)) => Some(uid == theirs),
+            (Some(_), None) => None,
+            (None, _) => Some(true),
+        };
+        match (same_program, same_user) {
+            (Some(true), Some(true)) => return CopyCheck::Running(pid),
+            (Some(false), _) | (_, Some(false)) => {}
+            _ => unknown = unknown.or(Some(pid)),
         }
     }
     unknown.map_or(CopyCheck::None, CopyCheck::Unknown)
@@ -766,6 +927,7 @@ fn end_processes(
     host: &dyn Host,
     profile: &Profile,
     owned_units: &BTreeSet<String>,
+    service_pids: &BTreeSet<u32>,
 ) -> Vec<Result<Action, String>> {
     let mut out = Vec::new();
     let mut processes = scan_processes(host, profile);
@@ -818,7 +980,7 @@ fn end_processes(
             groups: process.groups.clone(),
             // Only our own services start it again on rollback; a process
             // started by hand, rc.local or cron is restarted as it was.
-            restart: process.unit.is_none(),
+            restart: process.unit.is_none() && !service_pids.contains(&process.pid),
             killed,
             net_ns,
         }));
@@ -840,6 +1002,13 @@ pub fn takeover(
             Origin::Systemd { unit, .. } => Some(unit.clone()),
             _ => None,
         })
+        .collect();
+    // Processes of launchd jobs taken over: loading the job again on
+    // rollback starts them, so they are never started a second time.
+    let service_pids: BTreeSet<u32> = found
+        .iter()
+        .filter(|entry| matches!(entry.origin, Origin::Launchd { .. }))
+        .flat_map(|entry| entry.processes.iter().map(|process| process.pid))
         .collect();
     let (planned, manual) = plan(host, &found);
     let has_processes = scan_processes(host, profile)
@@ -973,9 +1142,16 @@ pub fn takeover(
         // Every process that was ended is recorded before any failure is
         // handled: one that could not be ended must not hide those ended
         // after it, or the undo would never start them again.
-        let (ended, failed): (Vec<_>, Vec<_>) = end_processes(host, profile, &owned_units)
-            .into_iter()
-            .partition(Result::is_ok);
+        let (ended, failed): (Vec<_>, Vec<_>) =
+            end_processes(host, profile, &owned_units, &service_pids)
+                .into_iter()
+                .partition(Result::is_ok);
+        // On macOS a launchd job the profile does not name may keep the
+        // program alive; it starts it again only after its throttle
+        // interval, so wait that out before the final check.
+        if !ended.is_empty() && uses_process_table(host) {
+            restart_wait = restart_wait.max(LAUNCHD_RESTART_WAIT_MS);
+        }
         for action in ended.into_iter().flatten() {
             // `record` keeps the step in memory even when saving fails, so
             // the undo below still starts it again.
@@ -1154,6 +1330,24 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             .map_err(|error| format!("{file}: {error}"))?;
             Ok(format!("uncommented {file}:{}", index + 1))
         }
+        Action::LaunchdDisable { domain, label, .. } => {
+            // Turned on whether or not an override was set before: the job
+            // was only turned off here when its file did not turn it off,
+            // so an explicit "on" starts it at boot exactly as before.
+            run_ok(host, "launchctl", &["enable", &format!("{domain}/{label}")])?;
+            Ok(format!("launchctl enable {domain}/{label}"))
+        }
+        Action::LaunchdBootout {
+            domain,
+            label,
+            plist,
+        } => {
+            if crate::launchd::loaded(host, domain, label).0 {
+                return Ok(format!("{domain}/{label} is already loaded"));
+            }
+            run_ok(host, "launchctl", &["bootstrap", domain, plist])?;
+            Ok(format!("launchctl bootstrap {domain} {plist}"))
+        }
         Action::Terminate {
             argv,
             env,
@@ -1235,6 +1429,9 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
 const MAX_RESTART_WAIT_MS: u64 = 60_000;
 /// Margin after a unit's restart delay before the final check.
 const RESTART_MARGIN_MS: u64 = 2_000;
+/// launchd's default throttle interval (10 s) plus the margin: how long
+/// a job that keeps the program alive takes to start it again.
+const LAUNCHD_RESTART_WAIT_MS: u64 = 10_000 + RESTART_MARGIN_MS;
 
 /// How long to wait before the final check so that a host unit that
 /// restarts the program has done so. A unit whose delay is unknown or too
@@ -2248,5 +2445,217 @@ mod tests {
         let host = FakeHost::default();
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::NothingFound);
+    }
+
+    const DAEMON: &str = "/Library/LaunchDaemons/com.example.demo.plist";
+
+    /// A Mac: a system daemon running the program, and a copy a user
+    /// started by hand.
+    fn mac() -> FakeHost {
+        let mut host = FakeHost::default();
+        host.programs.insert("launchctl".into());
+        host.programs.insert("plutil".into());
+        host.file(DAEMON, "<plist/>");
+        host.answer(
+            &format!("plutil -convert json -o - -- {DAEMON}"),
+            0,
+            r#"{"Label":"com.example.demo","ProgramArguments":["/usr/local/bin/demo-meshd","-c","/etc/demo/a.toml"],"KeepAlive":true}"#,
+        );
+        host.answer(
+            "launchctl print-disabled system",
+            0,
+            "disabled services = {\n}\n",
+        );
+        host.launchd.borrow_mut().insert(
+            "system/com.example.demo".into(),
+            (DAEMON.into(), Some(300), true),
+        );
+        host.table_process(
+            300,
+            "/usr/local/bin/demo-meshd",
+            &["/usr/local/bin/demo-meshd", "-c", "/etc/demo/a.toml"],
+            &[],
+            0,
+        );
+        host.table_process(
+            400,
+            "/Users/alice/bin/demo-meshd",
+            &["/Users/alice/bin/demo-meshd", "--net-name", "lab"],
+            &["DEMO_NET_SECRET=x", "HOME=/Users/alice"],
+            501,
+        );
+        host
+    }
+
+    #[test]
+    fn a_launchd_job_is_unloaded_then_turned_off_and_restored_in_reverse() {
+        let host = mac();
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert_eq!(
+            steps[1..],
+            [
+                "launchctl bootout system/com.example.demo",
+                "launchctl disable system/com.example.demo",
+                "end process 400 (/Users/alice/bin/demo-meshd) with TERM",
+            ]
+        );
+        assert!(steps[0].starts_with(&format!("backup {DAEMON} -> ")));
+        // Only the copy started by hand was signalled; launchd ended its own.
+        assert_eq!(*host.signals.borrow(), vec![(400, Signal::Terminate)]);
+        // A job launchd keeps alive comes back only after its throttle
+        // interval: waited out before the final check.
+        assert!(host.slept.borrow().contains(&LAUNCHD_RESTART_WAIT_MS));
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        let restart = manifest.steps.iter().find_map(|step| match &step.action {
+            Action::Terminate { pid, restart, .. } => Some((*pid, *restart)),
+            _ => None,
+        });
+        assert_eq!(restart, Some((400, true)));
+
+        let rollback = rollback(&host, Path::new(STATE)).unwrap();
+        assert!(rollback.ok, "{rollback:?}");
+        let ran = host.ran.borrow();
+        let enable = ran
+            .iter()
+            .position(|line| line == "launchctl enable system/com.example.demo")
+            .expect("turned on again");
+        let bootstrap = ran
+            .iter()
+            .position(|line| *line == format!("launchctl bootstrap system {DAEMON}"))
+            .expect("loaded again");
+        // launchd loads no job that is turned off.
+        assert!(enable < bootstrap);
+        let spawned = host.spawned.borrow();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].argv[0], "/Users/alice/bin/demo-meshd");
+        assert_eq!(spawned[0].uid, Some(501));
+        assert!(spawned[0].clear_env);
+    }
+
+    #[test]
+    fn a_launchd_job_already_off_at_boot_is_only_unloaded() {
+        let host = mac();
+        host.answer(
+            "launchctl print-disabled system",
+            0,
+            "disabled services = {\n\t\"com.example.demo\" => disabled\n}\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), true).unwrap();
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        let backup = format!("backup {DAEMON}");
+        assert_eq!(
+            steps,
+            vec![
+                backup.as_str(),
+                "launchctl bootout system/com.example.demo",
+                "end remaining processes",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_users_agent_is_taken_over_in_that_users_session() {
+        let host = mac();
+        let agent = "/Users/alice/Library/LaunchAgents/local.demo.plist";
+        host.file(agent, "<plist/>");
+        host.stats.borrow_mut().insert(
+            PathBuf::from(agent),
+            crate::host::FileStat {
+                mode: 0o644,
+                uid: 501,
+                gid: 20,
+            },
+        );
+        host.answer(
+            &format!("plutil -convert json -o - -- {agent}"),
+            0,
+            r#"{"Label":"local.demo","ProgramArguments":["/bin/sh","-c","exec /Users/alice/bin/demo-meshd --net-name lab"]}"#,
+        );
+        host.answer("launchctl print-disabled gui/501", 0, "");
+        host.launchd
+            .borrow_mut()
+            .insert("gui/501/local.demo".into(), (agent.into(), None, true));
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let steps: Vec<&str> = report.steps.iter().map(|step| step.step.as_str()).collect();
+        assert!(steps.contains(&"launchctl bootout gui/501/local.demo"));
+        assert!(steps.contains(&"launchctl disable gui/501/local.demo"));
+        // The agent's shell runs the copy: loading the agent again starts
+        // it, so the rollback does not start it a second time.
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().all(|step| !matches!(
+            step.action,
+            Action::Terminate {
+                pid: 400,
+                restart: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn an_agent_every_user_loads_is_left_to_the_operator() {
+        let host = mac();
+        let shared = "/Library/LaunchAgents/com.example.demo-ui.plist";
+        host.file(shared, "<plist/>");
+        host.answer(
+            &format!("plutil -convert json -o - -- {shared}"),
+            0,
+            r#"{"Label":"com.example.demo-ui","Program":"/usr/local/bin/demo-meshd"}"#,
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), true).unwrap();
+        assert_eq!(
+            report.manual,
+            vec![format!("login item com.example.demo-ui ({shared})")]
+        );
+        assert!(report
+            .steps
+            .iter()
+            .all(|step| !step.step.contains("com.example.demo-ui")));
+    }
+
+    #[test]
+    fn a_failed_unload_is_put_back() {
+        let host = mac();
+        // Turning the job off fails after it was unloaded.
+        host.answer("launchctl disable system/com.example.demo", 1, "");
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert!(host
+            .ran
+            .borrow()
+            .contains(&format!("launchctl bootstrap system {DAEMON}")));
+        assert!(host.signals.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_copy_in_the_process_table_is_not_started_twice() {
+        let host = mac();
+        let argv: Vec<String> = ["/Users/alice/bin/demo-meshd", "--net-name", "lab"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            running_copy(&host, "/Users/alice/bin/demo-meshd", &argv, Some(501), None),
+            CopyCheck::Running(400)
+        );
+        // Another user's copy is not ours.
+        assert_eq!(
+            running_copy(&host, "/Users/alice/bin/demo-meshd", &argv, Some(502), None),
+            CopyCheck::None
+        );
+        // A copy whose program cannot be read may be ours.
+        host.table
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .get_mut(&400)
+            .unwrap()
+            .exe = None;
+        assert_eq!(
+            running_copy(&host, "/Users/alice/bin/demo-meshd", &argv, Some(501), None),
+            CopyCheck::Unknown(400)
+        );
     }
 }

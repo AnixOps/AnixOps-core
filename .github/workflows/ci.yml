@@ -598,9 +598,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The installer is POSIX sh (BusyBox and dash included).
-          sh -n apps/mesh-node/install/install-linux.sh
-          shellcheck --shell=sh apps/mesh-node/install/install-linux.sh
+          # The installers are POSIX sh (BusyBox, dash and macOS sh included).
+          for script in install-linux.sh install-macos.sh; do
+            sh -n "apps/mesh-node/install/${script}"
+            shellcheck --shell=sh "apps/mesh-node/install/${script}"
+          done
           shellcheck --shell=bash .github/scripts/build-mesh-node.sh
 
       - name: Build static anixops-mesh

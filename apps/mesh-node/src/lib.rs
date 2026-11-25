@@ -15,6 +15,7 @@ pub mod convert;
 pub mod detect;
 pub mod host;
 pub mod import;
+pub mod launchd;
 pub mod net;
 pub mod profile;
 pub mod report;
