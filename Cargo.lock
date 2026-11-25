@@ -2213,6 +2213,7 @@ dependencies = [
  "inbound-tuic",
  "inbound-vless",
  "inbound-vmess",
+ "outbound-mesh",
  "outbound-shadowsocks",
  "outbound-vless",
  "rcgen",

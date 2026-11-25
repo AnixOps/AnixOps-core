@@ -22,6 +22,9 @@
 //!   traffic keys, rotation and the replay window.
 //! - [`link`]: one direct connection: the handshake of the network's mode,
 //!   then the receive checks and the encryption of packets.
+//! - [`status`]: what a node agent reads and writes through the kernel's
+//!   management API (`/v1/mesh`), and the trait that API drives the mesh
+//!   through.
 
 pub mod config;
 pub mod legacy;
@@ -33,6 +36,7 @@ pub mod routes;
 pub mod rpc;
 pub mod scope;
 pub mod secure;
+pub mod status;
 pub mod wire;
 
 pub use config::{
