@@ -68,7 +68,8 @@
 1. `outbound-mesh` 的网络配置加顶层可选字段 `external_bridge`（类型 `mesh_bridge::ExternalBridgeConfig`）；只有 `role = full` 的 Linux 节点接受，其他情况以 `invalid_argument` 拒绝。
 2. 校验通过后，`routes` 并入本节点路由信息字段 5，与 `subnets.advertise` 合并去重。
 3. 节点程序启动时先取 `HostLock`（失败则告警 `external_bridge_lock_held`，不清理、不声明能力），再调用 `probe`（失败则不声明能力），两者都成功才声明 `mesh_external_bridge` 并调用 `cleanup_all`；锁持有到进程退出，退出时在丢弃全部 `Bridge` 之后再调用一次；`apps/mesh-node` 在网络启动成功之后调用 `Bridge::apply`（参数为本网络的组网网卡名、虚拟子网与本机虚拟地址），配置更新时再次调用，网络停止（正常停止与丢弃两条路径）时调用 `Bridge::remove`。应用失败映射为网络失败码 `start_refused`（详情为告警原因），并上报告警。
-4. Linux 的 `FEATURES` 加 `mesh_external_bridge`；`networks[].externalBridge` 取 `Bridge::status()`。
+4. 取不到 `HostLock` 时，`external_bridge_lock_held` 放进 `GET /v1/mesh` 顶层可选的 `alerts` 数组（节点级告警，内核没有运行任何网络时也要出现），同时放进每个网络的 `alerts`；字段措辞以规格 PR 为准。
+5. Linux 的 `FEATURES` 加 `mesh_external_bridge`；`networks[].externalBridge` 取 `Bridge::status()`。
 
 ## 验证
 
