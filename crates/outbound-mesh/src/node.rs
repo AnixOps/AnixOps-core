@@ -80,6 +80,11 @@ struct Relay {
     queue: VecDeque<(u8, Vec<u8>)>,
 }
 
+/// Most subnets installed as system routes for one network: as many as
+/// [`routes::MAX_SUBNETS_PER_PEER`] for sixteen advertising members; any
+/// further subnets are not installed.
+pub const MAX_SYSTEM_ROUTES: usize = 16 * routes::MAX_SUBNETS_PER_PEER;
+
 /// Route synchronisation service (spec §11.4).
 pub const ROUTE_SERVICE: &str = "OspfRouteRpc";
 /// `SyncRouteInfo` method.
@@ -420,13 +425,15 @@ impl Node {
 
     /// Subnets to route into the virtual interface: accepted and routed,
     /// limited to `routing.system_routes` when it is set.
+    /// At most [`MAX_SYSTEM_ROUTES`], in the table's stable order, so that
+    /// the members cannot fill the system routing table.
     pub fn system_routes(&self) -> Vec<IpNet> {
-        let routes = self.routes.system_routes();
+        let routes = self.routes.system_routes().into_iter();
         match &self.settings.system_routes {
-            None => routes,
+            None => routes.take(MAX_SYSTEM_ROUTES).collect(),
             Some(allowed) => routes
-                .into_iter()
                 .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
+                .take(MAX_SYSTEM_ROUTES)
                 .collect(),
         }
     }
@@ -1015,7 +1022,7 @@ impl Node {
                 now,
             );
         } else {
-            self.answered(from, call.transaction_id, &call.body, rng, now);
+            self.answered(from, neighbour, call.transaction_id, &call.body, rng, now);
         }
     }
 
@@ -1055,9 +1062,13 @@ impl Node {
         }
     }
 
+    /// An answer from `from` that arrived over the connection to
+    /// `neighbour`. Route synchronisation answers count only from the
+    /// neighbour the connection authenticated (spec §12.2), as requests do.
     fn answered(
         &mut self,
         from: u32,
+        neighbour: u32,
         transaction: i64,
         body: &[u8],
         rng: &dyn SecureRandom,
@@ -1067,6 +1078,10 @@ impl Node {
             return;
         };
         if outgoing.peer != from {
+            return;
+        }
+        if outgoing.kind == CallKind::SyncRoute && from != neighbour {
+            self.counters.dropped += 1;
             return;
         }
         let Some(outgoing) = self.calls.remove(&transaction) else {
@@ -1935,6 +1950,38 @@ mod tests {
             .calls
             .values()
             .any(|call| call.peer == 102 && call.kind == CallKind::SyncRoute));
+    }
+
+    #[test]
+    fn route_sync_answers_count_only_from_the_connection_neighbour() {
+        // Node 0 has a route sync call out to node 2, which is not its
+        // neighbour; an answer from node 2 arrives over the connection to
+        // node 1 and is dropped, the call stays open.
+        let mut net = three_in_a_row(false);
+        net.nodes[0].call(
+            102,
+            CallKind::SyncRoute,
+            SyncRouteRequest::default().encode(),
+            net.now,
+        );
+        let transaction = *net.nodes[0]
+            .calls
+            .iter()
+            .find(|(_, call)| call.peer == 102 && call.kind == CallKind::SyncRoute)
+            .unwrap()
+            .0;
+        let descriptor = net.nodes[2].descriptor(ROUTE_SERVICE, METHOD_SYNC_ROUTE_INFO);
+        let body = RpcResponse {
+            result: Ok(SyncRouteResponse::default().encode()),
+            runtime_us: 0,
+        }
+        .encode();
+        let dropped = net.nodes[0].counters().dropped;
+        let now = net.now;
+        net.nodes[2].send_rpc(100, transaction, &descriptor, false, &body, now);
+        net.settle();
+        assert_eq!(net.nodes[0].counters().dropped, dropped + 1);
+        assert!(net.nodes[0].calls.contains_key(&transaction));
     }
 
     #[test]

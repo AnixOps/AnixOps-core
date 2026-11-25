@@ -5,6 +5,7 @@
 //! Exit codes: 0 stopped by a signal, 2 configuration, 3 a port or the
 //! interface is taken (another program still runs), 1 anything else.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
@@ -45,16 +46,19 @@ fn read_local_networks(skip: &str) -> Vec<IpNet> {
     }
 }
 
-/// Routes to add and to remove to go from `installed` to `wanted`.
+/// Routes to add and to remove to go from `installed` to `wanted`, in
+/// their given order; set lookups keep it linear.
 fn route_changes(installed: &[IpNet], wanted: &[IpNet]) -> (Vec<IpNet>, Vec<IpNet>) {
+    let installed_set: HashSet<&IpNet> = installed.iter().collect();
+    let wanted_set: HashSet<&IpNet> = wanted.iter().collect();
     let add = wanted
         .iter()
-        .filter(|net| !installed.contains(net))
+        .filter(|net| !installed_set.contains(net))
         .copied()
         .collect();
     let remove = installed
         .iter()
-        .filter(|net| !wanted.contains(net))
+        .filter(|net| !wanted_set.contains(net))
         .copied()
         .collect();
     (add, remove)
@@ -328,12 +332,14 @@ pub(crate) async fn serve_with(
                 }
                 let snapshot = status.borrow_and_update().clone();
                 let (add, remove) = route_changes(&installed, &snapshot.system_routes);
+                let mut removed = HashSet::new();
                 for net in remove {
                     if let Err(error) = device.remove_route(net.network(), net.prefix()) {
                         warn("route", &format!("{net}: {error}"));
                     }
-                    installed.retain(|other| *other != net);
+                    removed.insert(net);
                 }
+                installed.retain(|net| !removed.contains(net));
                 for net in add {
                     match device.add_route(net.network(), net.prefix()) {
                         Ok(()) => installed.push(net),
