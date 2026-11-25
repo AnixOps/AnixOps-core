@@ -2,7 +2,7 @@
 
 未安装 Agent 的机器（服务器、路由器、OpenWrt）由独立程序 `anixops-mesh` 直接接入面板。面板一侧的接口见 anix-control `docs/design/mesh-regions/agent-contract.md` §4，本页是程序一侧的约定。接管与导入见 [`mesh-node.md`](mesh-node.md)，状态字段见 [`mesh-status.md`](../architecture/mesh-status.md)。
 
-原则：设备只**读取**本机成员信息、只**上报**状态与时延，不接受面板的任何指令（R31）；不新增网络监听端口（R11）。网络运行与 Agent 路径共用同一套代码：面板下发的网络去掉 `id` 再加 `tag = mesh-<id>`，即本机管理 API `PUT /v1/mesh` 的请求体，交给同进程的受管组网（`ManagedMesh::apply`）；上报取同一受管组网的状态（与 `GET /v1/mesh` 应答同构）。准入（`native_keys`）、暂缓与失败码因此与 Agent 节点完全一致。
+原则：设备只**读取**本机成员信息、只**上报**状态与时延，不接受面板的任何指令（R31）；不新增网络监听端口（R11）。网络运行与 Agent 路径共用同一套代码：面板下发的扁平网络按与 Agent 相同的方式转为分层的 `config_version: 1` 配置并加 `tag = mesh-<id>`，即本机管理 API `PUT /v1/mesh` 的请求体（`dns`、`dns.resolver_address` 按本机能力决定是否带上），交给同进程的受管组网（`ManagedMesh::apply`）；上报取同一受管组网的状态（与 `GET /v1/mesh` 应答同构）。准入（`native_keys`）、暂缓与失败码因此与 Agent 节点完全一致。
 
 ## 子命令
 
