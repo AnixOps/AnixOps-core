@@ -72,10 +72,10 @@
 `device` 在 `status.sock`（Unix 域套接字，0660，属组 `anixops-mesh`）上回答一行 JSON 请求 `{"cmd":"mesh_status"}`，应答为受管组网状态加上设备字段：
 
 ```json
-{"ok":true,"device":{"device_id":5,"control":"https://…","last_config":"2026-11-25T21:00:00Z","last_report":"2026-11-25T21:00:03Z","control_state":"ok"},"mesh":{"instance_id":"…","networks":[…]}}
+{"ok":true,"device":{"device_id":5,"control":"https://…","last_config":"2026-11-25T21:00:00Z","last_report":"2026-11-25T21:00:03Z","control_state":"ok","advertise":["192.168.1.0/24"]},"mesh":{"instance_id":"…","networks":[…]}}
 ```
 
-`control_state`：`ok`、`unreachable`（最近一次读取或上报失败）、`rejected`（最近一份配置未通过校验）。只接受这一条命令，其他请求回 `{"ok":false,"error":{"code":"unsupported"}}`；不监听 TCP 或 UDP 端口（R11）。实现放在 `apps/mesh-node/src/local_status.rs`，`run` 路径以同一文件经 `serve_with` 的观察回调提供 `mesh-status.md` 的快照。
+`control_state`：`ok`、`unreachable`（最近一次读取或上报失败）、`rejected`（最近一份配置未通过校验）。`advertise`：`config.json` 各网络 `subnets.advertise` 的并集，即面板已批准并下发的通告网段（按网段排序去重；未接入或没有配置时为空数组），LuCI 据此区分「已批准」与「待管理员批准」。`device-status` 连接套接字时读写超时各 3 秒，服务未运行或无应答时以退出码 1 结束，不会挂住调用方（rpcd 同步调用）。只接受这一条命令，其他请求回 `{"ok":false,"error":{"code":"unsupported"}}`；不监听 TCP 或 UDP 端口（R11）。实现放在 `apps/mesh-node/src/local_status.rs`，`run` 路径以同一文件经 `serve_with` 的观察回调提供 `mesh-status.md` 的快照。
 
 ## OpenWrt（R35，内核 0.5）
 
