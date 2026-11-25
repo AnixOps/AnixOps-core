@@ -34,15 +34,14 @@ pub fn siphash13(data: &[u8]) -> u64 {
         *v2 = v2.rotate_left(32);
     }
 
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let m = u64::from_le_bytes(chunk.try_into().unwrap());
+    let (blocks, tail) = data.as_chunks::<8>();
+    for chunk in blocks {
+        let m = u64::from_le_bytes(*chunk);
         v3 ^= m;
         round(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= m;
     }
     let mut last = [0u8; 8];
-    let tail = chunks.remainder();
     last[..tail.len()].copy_from_slice(tail);
     last[7] = data.len() as u8;
     let b = u64::from_le_bytes(last);

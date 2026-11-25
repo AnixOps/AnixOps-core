@@ -15,8 +15,8 @@ pub struct Uuid(pub [u8; 16]);
 impl Uuid {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        for (i, chunk) in self.0.chunks_exact(4).enumerate() {
-            writer.u32(i as u32 + 1, u32::from_be_bytes(chunk.try_into().unwrap()));
+        for (i, chunk) in self.0.as_chunks::<4>().0.iter().enumerate() {
+            writer.u32(i as u32 + 1, u32::from_be_bytes(*chunk));
         }
         writer.finish()
     }
@@ -53,8 +53,8 @@ fn decode_ipv4(message: &[u8]) -> Result<Ipv4Addr, PbError> {
 
 fn encode_ipv6(address: Ipv6Addr) -> Vec<u8> {
     let mut writer = Writer::new();
-    for (i, chunk) in address.octets().chunks_exact(4).enumerate() {
-        writer.u32(i as u32 + 1, u32::from_be_bytes(chunk.try_into().unwrap()));
+    for (i, chunk) in address.octets().as_chunks::<4>().0.iter().enumerate() {
+        writer.u32(i as u32 + 1, u32::from_be_bytes(*chunk));
     }
     writer.finish()
 }
