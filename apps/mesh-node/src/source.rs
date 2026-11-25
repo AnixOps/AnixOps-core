@@ -874,10 +874,10 @@ a = 1
             unknown,
             vec![
                 "env DEMO_STRANGE".to_string(),
-                "file /etc/demo/a.toml: identity.extra".to_string(),
-                "file /etc/demo/a.toml: options.unknown_flag".to_string(),
-                "file /etc/demo/a.toml: peer[1].weird".to_string(),
-                "file /etc/demo/a.toml: surprise".to_string(),
+                format!("file {expected}: identity.extra"),
+                format!("file {expected}: options.unknown_flag"),
+                format!("file {expected}: peer[1].weird"),
+                format!("file {expected}: surprise"),
             ]
         );
     }
