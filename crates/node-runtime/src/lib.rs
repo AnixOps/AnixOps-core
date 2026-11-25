@@ -1048,36 +1048,56 @@ fn prefer_congestion_control(socket: &socket2::Socket) {
 /// Binds a UDP socket like [`bind_tcp`].
 /// Ephemeral ports tried for a TCP listener that needs UDP on the same
 /// number.
-const SAME_PORT_ATTEMPTS: usize = 8;
+const SAME_PORT_ATTEMPTS: usize = 32;
 
-/// Binds TCP on `address` and, when `udp` is set, UDP on the port TCP got.
-/// With port 0 that number was free for TCP only: UDP may hold it already, or
-/// on Windows it may fall in a range reserved for UDP (os error 10013), so
-/// another ephemeral port is tried.
+/// Binds TCP on `address` and, when `udp` is set, UDP on the same port.
+/// With port 0 the number one protocol got may not be free for the other:
+/// it may be taken, or on Windows fall in a range reserved for that protocol
+/// only (os error 10013). Ephemeral ports there are handed out in order, so a
+/// retry that always starts from TCP walks through the same reserved block;
+/// attempts therefore alternate between letting TCP and letting UDP choose,
+/// and rejected sockets stay bound until the end so no number comes back.
 fn bind_tcp_and_udp(
     address: SocketAddr,
     udp: bool,
 ) -> io::Result<(TcpListener, Option<std::net::UdpSocket>)> {
+    if !udp {
+        return Ok((bind_tcp(address)?, None));
+    }
+    if address.port() != 0 {
+        let listener = bind_tcp(address)?;
+        let socket = bind_udp(listener.local_addr()?)?;
+        return Ok((listener, Some(socket)));
+    }
+    let retryable = |error: &io::Error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+        )
+    };
+    let mut rejected_tcp = Vec::new();
+    let mut rejected_udp = Vec::new();
     let mut attempt = 1;
     loop {
-        let listener = bind_tcp(address)?;
-        if !udp {
-            return Ok((listener, None));
-        }
-        match bind_udp(listener.local_addr()?) {
-            Ok(socket) => return Ok((listener, Some(socket))),
-            Err(error)
-                if address.port() == 0
-                    && attempt < SAME_PORT_ATTEMPTS
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
-                    ) =>
-            {
-                attempt += 1;
+        let last = attempt >= SAME_PORT_ATTEMPTS;
+        if attempt % 2 == 1 {
+            let listener = bind_tcp(address)?;
+            let port = listener.local_addr()?.port();
+            match bind_udp(SocketAddr::new(address.ip(), port)) {
+                Ok(socket) => return Ok((listener, Some(socket))),
+                Err(error) if !last && retryable(&error) => rejected_tcp.push(listener),
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
+        } else {
+            let socket = bind_udp(address)?;
+            let port = socket.local_addr()?.port();
+            match bind_tcp(SocketAddr::new(address.ip(), port)) {
+                Ok(listener) => return Ok((listener, Some(socket))),
+                Err(error) if !last && retryable(&error) => rejected_udp.push(socket),
+                Err(error) => return Err(error),
+            }
         }
+        attempt += 1;
     }
 }
 
@@ -1124,6 +1144,23 @@ fn valid_tag(tag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tcp_and_udp_share_one_ephemeral_port() {
+        let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            let (listener, socket) = bind_tcp_and_udp(address, true).unwrap();
+            let socket = socket.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert_ne!(port, 0);
+            assert_eq!(socket.local_addr().unwrap().port(), port);
+            held.push((listener, socket));
+        }
+        let (listener, socket) = bind_tcp_and_udp(address, false).unwrap();
+        assert!(socket.is_none());
+        assert_ne!(listener.local_addr().unwrap().port(), 0);
+    }
 
     #[test]
     fn validates_tags() {
