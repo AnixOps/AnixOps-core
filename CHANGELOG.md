@@ -44,6 +44,8 @@
 
 ### Added
 
+- anixops-mesh Windows 发布随附 `wintun.dll`（amd64、arm64，Wintun 0.14.1 原样，固定 SHA-256，附许可证；CI 核对 PE 架构），`install-windows.ps1` 新增 `-WintunUrl`/`-WintunSha256` 并装到程序旁边，服务设 `sc.exe failureflag` 使失败重启对服务专用错误生效；macOS 文档注明网卡为 `utunN`（配合 #344）。
+
 - anixops-mesh 接管 Windows 计划任务与登录自启项（mesh-node `winstart`、`detect`、`takeover`，R12 内核 0.4）：计划任务以 `schtasks.exe /End` 结束、`/Change /DISABLE` 关闭，回滚 `/ENABLE` 后 `/Run`；`Run` 键与启动文件夹的自启项按 Windows 自己的启动项设置（`Explorer\StartupApproved`）关闭，回滚恢复原值，已被他人改动时保留现状；未登录用户的启动文件夹只报告。
 - anixops-mesh 接管支持 Windows（mesh-node `winsvc`、`detect`、`takeover`、`host`、`cmdline`，R12/R32 内核 0.4）：进程从系统进程表读取（命令行、工作目录、完整环境变量与运行账户），检测以该程序运行或在数据文件中点名的服务；接管先 `sc.exe stop` 再禁用，回滚逆序恢复启动方式后启动，服务进程不单独重启；其他账户运行的手动进程在任何改动之前报告并失败。新增 `install-windows.ps1`（服务 `AnixOpsMesh`，数据目录仅 SYSTEM 与 Administrators 可访问）。
 - anixops-mesh 接管支持 macOS（mesh-node `launchd`、`detect`、`takeover`、`host`，R12/R32 内核 0.4）：进程从系统进程表读取（`proc_pidpath`、`KERN_PROCARGS2`、`proc_pidinfo`），检测 `/Library/LaunchDaemons` 与各用户 `~/Library/LaunchAgents` 的 launchd 任务；接管先 `launchctl bootout` 再 `disable`，回滚逆序 `enable` 后 `bootstrap`，任务自己的进程不再单独重启；所有用户共用的代理只报告。新增 `install-macos.sh`（launchd 系统守护进程，状态放在不经符号链接的 `/Library/AnixOps/mesh`）。
