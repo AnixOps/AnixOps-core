@@ -37,6 +37,7 @@
 - [Mieru 协议规格（净室实现用）](protocols/mieru.md)：TCP 密钥派生、nonce、分段格式与会话流程，含官方 mita 黑盒实测
 - [Panabit iWAN 协议规格（净室实现用）](protocols/iwan.md)：UDP 三层隧道的握手、签名、XOR 数据面、ECHO、IPFRAG，作为可分流出站的集成约定，以及服务端入站（地址池、节点 DNS 域名映射、面板分流）
 - [XHTTP 传输规格（净室实现用）](protocols/xhttp.md)：Xray XHTTP/SplitHTTP 的会话、`packet-up`/`stream-up`/`stream-one` 三种模式、HTTP 版本选择与 `x_padding` 填充
+- [内网组网协议规格（净室实现用）](protocols/intranet-mesh.md)：点对点虚拟局域网的 TCP/UDP 传输、旧握手与静态密钥、前向保密模式（Noise XX/IK）、对端 RPC、路由同步与选路、中转、子网通告、自定义路径扩展、打洞与测试向量
 
 ## 订阅
 
