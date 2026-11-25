@@ -100,6 +100,7 @@
 | `identity_online` | 同一节点身份已在别处在线 |
 | `permission_denied` | 没有创建虚拟网卡或修改路由的权限 |
 | `unreachable_peers` | 所有初始对端都连不上 |
+| `external_bridge_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级桥接锁 `/run/anixops-mesh-bridge.lock`（同一主机上另有进程在运行桥接），因此不声明 `mesh_external_bridge`、不清理桥接表（规范 §15.12 第 9 条）。出现在每个网络的 `alerts` 中，进程退出前不消除 |
 
 新增取值属于兼容变更，读取方遇到未知取值按失败处理。
 
