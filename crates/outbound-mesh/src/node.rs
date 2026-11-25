@@ -326,6 +326,24 @@ impl Node {
         &self.routes
     }
 
+    /// The networks of this machine's other interfaces (spec §15.4).
+    pub fn set_local_networks(&mut self, interfaces: &[IpNet]) {
+        self.routes.set_local_networks(interfaces, &[]);
+    }
+
+    /// Subnets to route into the virtual interface: accepted and routed,
+    /// limited to `routing.system_routes` when it is set.
+    pub fn system_routes(&self) -> Vec<IpNet> {
+        let routes = self.routes.system_routes();
+        match &self.settings.system_routes {
+            None => routes,
+            Some(allowed) => routes
+                .into_iter()
+                .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
+                .collect(),
+        }
+    }
+
     pub fn route_sync(&self) -> &RouteSync {
         &self.sync
     }
@@ -1279,15 +1297,24 @@ mod tests {
 
     impl Net {
         fn new(addresses: &[&str], secure: bool) -> Self {
+            Self::with(
+                addresses
+                    .iter()
+                    .map(|address| settings(address, secure))
+                    .collect(),
+            )
+        }
+
+        fn with(settings: Vec<MeshSettings>) -> Self {
             let rng = SystemRandom::new();
             let now = Instant::now();
-            let nodes = addresses
-                .iter()
+            let nodes = settings
+                .into_iter()
                 .enumerate()
-                .map(|(i, address)| {
+                .map(|(i, settings)| {
                     let mut identity = Identity::generate(&rng).unwrap();
                     identity.peer_id = 100 + i as u32;
-                    Node::new(settings(address, secure), identity, &rng, now).unwrap()
+                    Node::new(settings, identity, &rng, now).unwrap()
                 })
                 .collect();
             Self {
@@ -1464,6 +1491,56 @@ mod tests {
             net.nodes[0].send_ip(&packet, net.now).unwrap();
         }
         assert_eq!(net.nodes[0].send_ip(&packet, net.now), Err(Denied::NoRoute));
+    }
+
+    #[test]
+    fn system_routes_skip_local_networks_and_follow_the_configured_limit() {
+        let advertising = |address: &str, extra: serde_json::Value| {
+            let mut config = serde_json::json!({
+                "config_version": 1,
+                "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+                "node": {"address": address, "role": "full"},
+                "peers": [{"server": "peer.example", "port": 40000}],
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                config[key] = value.clone();
+            }
+            serde_json::from_value::<MeshConfig>(config)
+                .unwrap()
+                .validate()
+                .unwrap()
+        };
+        let mut net = Net::with(vec![
+            advertising(
+                "10.144.0.1/24",
+                serde_json::json!({"routing": {"system_routes": ["192.168.0.0/16"]}}),
+            ),
+            advertising(
+                "10.144.0.2/24",
+                serde_json::json!({"subnets": {"advertise": ["192.168.10.0/24", "172.16.5.0/24"]}}),
+            ),
+        ]);
+        net.link(0, 1);
+        net.settle();
+        for _ in 0..4 {
+            net.tick(Duration::from_secs(1));
+        }
+        let routes = |net: &Net| -> Vec<String> {
+            net.nodes[0]
+                .system_routes()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        // 172.16.5.0/24 is outside routing.system_routes.
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        assert!(net.nodes[0]
+            .route_table()
+            .lookup("172.16.5.9".parse().unwrap())
+            .is_ok());
+        // This machine sits on 192.168.10.0/24 itself.
+        net.nodes[0].set_local_networks(&[IpNet::parse("192.168.10.7/24").unwrap()]);
+        assert!(routes(&net).is_empty());
     }
 
     #[test]

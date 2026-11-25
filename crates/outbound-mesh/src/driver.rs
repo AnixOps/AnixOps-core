@@ -23,6 +23,7 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
 use crate::config::{MeshSettings, PeerEndpoint, Role, Transport};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
+use crate::net::IpNet;
 use crate::node::{Action, ConnId, Counters, Identity, Node};
 use crate::wire::tcp::{encode_frame, FrameDecoder};
 use crate::wire::udp::{self, Datagram};
@@ -101,6 +102,9 @@ pub struct Snapshot {
     pub counters: Counters,
     /// A neighbour said this node's ID is taken (spec §12.2).
     pub duplicate_id: bool,
+    /// Subnets to route into the interface: accepted, not overlapping this
+    /// machine's networks, within `routing.system_routes`.
+    pub system_routes: Vec<IpNet>,
 }
 
 enum Event {
@@ -160,23 +164,41 @@ fn random_u64(rng: &dyn SecureRandom) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-/// Runs one network until `shutdown` turns true. IP packets for the mesh
-/// arrive on `from_interface`; packets for this node leave on
-/// `to_interface`. `snapshots` gets the state after every timer tick.
+/// How [`run`] talks to the virtual interface and its owner.
+pub struct Channels {
+    /// IP packets for the mesh.
+    pub from_interface: mpsc::Receiver<Vec<u8>>,
+    /// IP packets for this node.
+    pub to_interface: mpsc::Sender<Vec<u8>>,
+    /// The state after every timer tick.
+    pub snapshots: watch::Sender<Snapshot>,
+    /// The networks of this machine's other interfaces: advertised subnets
+    /// that overlap them are neither routed nor installed (spec §15.4).
+    pub local_networks: watch::Receiver<Vec<IpNet>>,
+    /// Stops the node when it turns true.
+    pub shutdown: watch::Receiver<bool>,
+}
+
+/// Runs one network until `shutdown` turns true.
 pub async fn run(
     settings: MeshSettings,
     identity: Identity,
     listeners: Listeners,
-    mut from_interface: mpsc::Receiver<Vec<u8>>,
-    to_interface: mpsc::Sender<Vec<u8>>,
-    snapshots: watch::Sender<Snapshot>,
-    mut shutdown: watch::Receiver<bool>,
+    channels: Channels,
 ) -> io::Result<()> {
+    let Channels {
+        mut from_interface,
+        to_interface,
+        snapshots,
+        mut local_networks,
+        mut shutdown,
+    } = channels;
     let rng = SystemRandom::new();
     let started = Instant::now();
     let peers = settings.peers.clone();
     let mut node = Node::new(settings, identity, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
+    node.set_local_networks(&local_networks.borrow_and_update());
     let (events, mut event_rx) = mpsc::channel(EVENT_QUEUE);
     let shared = Shared {
         events,
@@ -206,6 +228,9 @@ pub async fn run(
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
+            }
+            Ok(()) = local_networks.changed() => {
+                node.set_local_networks(&local_networks.borrow_and_update());
             }
             event = event_rx.recv() => {
                 let Some(event) = event else { break };
@@ -311,6 +336,7 @@ fn snapshot(node: &Node) -> Snapshot {
             .collect(),
         counters: node.counters(),
         duplicate_id: node.duplicate_id(),
+        system_routes: node.system_routes(),
     }
 }
 
@@ -686,14 +712,18 @@ mod tests {
         let (to_interface, from_mesh) = mpsc::channel(16);
         let (snapshot_tx, snapshots) = watch::channel(Snapshot::default());
         let (shutdown_tx, shutdown) = watch::channel(false);
+        let (_, local_networks) = watch::channel(Vec::new());
         tokio::spawn(run(
             settings,
             identity,
             listeners,
-            from_interface,
-            to_interface,
-            snapshot_tx,
-            shutdown,
+            Channels {
+                from_interface,
+                to_interface,
+                snapshots: snapshot_tx,
+                local_networks,
+                shutdown,
+            },
         ));
         Running {
             to_mesh,

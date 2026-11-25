@@ -8,9 +8,11 @@
 use std::io;
 use std::path::Path;
 
-use outbound_mesh::driver::{self, Listeners, Snapshot};
+use std::time::Duration;
+
+use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::node::Identity;
-use outbound_mesh::{MeshConfig, MeshSettings};
+use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
 use ring::rand::SystemRandom;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -22,6 +24,40 @@ pub const DEFAULT_INTERFACE: &str = "anixmesh0";
 
 /// Packets queued between the interface and the driver in each direction.
 const QUEUE: usize = 256;
+
+/// How often the networks of the other interfaces are read again.
+const LOCAL_NETWORKS_EVERY: Duration = Duration::from_secs(30);
+
+fn read_local_networks(skip: &str) -> Vec<IpNet> {
+    match tun::local_networks(skip) {
+        Ok(networks) => networks
+            .into_iter()
+            .filter_map(|(address, prefix)| IpNet::new(address, prefix))
+            .collect(),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "warning": "interfaces", "detail": error.to_string() })
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Routes to add and to remove to go from `installed` to `wanted`.
+fn route_changes(installed: &[IpNet], wanted: &[IpNet]) -> (Vec<IpNet>, Vec<IpNet>) {
+    let add = wanted
+        .iter()
+        .filter(|net| !installed.contains(net))
+        .copied()
+        .collect();
+    let remove = installed
+        .iter()
+        .filter(|net| !wanted.contains(net))
+        .copied()
+        .collect();
+    (add, remove)
+}
 
 /// Why `run` stopped.
 #[derive(Debug)]
@@ -78,6 +114,13 @@ fn busy(what: &str, error: &io::Error) -> Failure {
     }
 }
 
+fn warn(kind: &str, detail: &str) {
+    eprintln!(
+        "{}",
+        serde_json::json!({ "warning": kind, "detail": detail })
+    );
+}
+
 /// One status line for the service log; only printed when it changes.
 fn status_line(snapshot: &Snapshot, interface: &str) -> String {
     serde_json::json!({
@@ -86,6 +129,11 @@ fn status_line(snapshot: &Snapshot, interface: &str) -> String {
         "neighbours": snapshot.neighbours,
         "reachable": snapshot.routes.len(),
         "duplicate_id": snapshot.duplicate_id,
+        "system_routes": snapshot
+            .system_routes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -133,6 +181,9 @@ async fn serve(
     let (to_interface, mut from_node) = mpsc::channel::<Vec<u8>>(QUEUE);
     let (snapshots, mut status) = watch::channel(Snapshot::default());
     let (stop, shutdown) = watch::channel(false);
+    let (networks, local_networks) = watch::channel(read_local_networks(device.name()));
+    let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
+    let mut installed: Vec<IpNet> = Vec::new();
     let mut terminate =
         signal(SignalKind::terminate()).map_err(|error| Failure::Other(error.to_string()))?;
     let mut interrupt =
@@ -142,10 +193,13 @@ async fn serve(
         settings,
         identity,
         listeners,
-        from_interface,
-        to_interface,
-        snapshots,
-        shutdown,
+        Channels {
+            from_interface,
+            to_interface,
+            snapshots,
+            local_networks,
+            shutdown,
+        },
     ));
     // Room for one packet larger than the MTU, so that an oversized one is
     // read whole and refused by the node instead of being cut short.
@@ -162,18 +216,35 @@ async fn serve(
                 if let Err(error) = device.send(&packet).await {
                     // A packet the kernel refuses (for example an address
                     // that is not configured) does not stop the node.
-                    eprintln!("{}", serde_json::json!({ "warning": "interface", "detail": error.to_string() }));
+                    warn("interface", &error.to_string());
                 }
             }
             changed = status.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                let line = status_line(&status.borrow_and_update(), device.name());
+                let snapshot = status.borrow_and_update().clone();
+                let (add, remove) = route_changes(&installed, &snapshot.system_routes);
+                for net in remove {
+                    if let Err(error) = device.remove_route(net.network(), net.prefix()) {
+                        warn("route", &format!("{net}: {error}"));
+                    }
+                    installed.retain(|other| *other != net);
+                }
+                for net in add {
+                    match device.add_route(net.network(), net.prefix()) {
+                        Ok(()) => installed.push(net),
+                        Err(error) => warn("route", &format!("{net}: {error}")),
+                    }
+                }
+                let line = status_line(&snapshot, device.name());
                 if line != last {
                     println!("{line}");
                     last = line;
                 }
+            }
+            _ = rescan.tick() => {
+                let _ = networks.send(read_local_networks(device.name()));
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
@@ -243,6 +314,18 @@ mod tests {
         assert_eq!(line["neighbours"], serde_json::json!([3, 9]));
         assert_eq!(line["reachable"], 3);
         assert_eq!(line["duplicate_id"], false);
+    }
+
+    #[test]
+    fn route_changes_add_the_new_and_remove_the_gone() {
+        let net = |text: &str| IpNet::parse(text).expect("network");
+        let installed = [net("192.168.10.0/24"), net("172.16.0.0/16")];
+        let wanted = [net("192.168.10.0/24"), net("10.20.0.0/16")];
+        let (add, remove) = route_changes(&installed, &wanted);
+        assert_eq!(add, [net("10.20.0.0/16")]);
+        assert_eq!(remove, [net("172.16.0.0/16")]);
+        let (add, remove) = route_changes(&wanted, &wanted);
+        assert!(add.is_empty() && remove.is_empty());
     }
 
     #[test]

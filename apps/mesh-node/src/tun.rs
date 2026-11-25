@@ -7,6 +7,7 @@
 // (OpenWrt); the casts below are only no-ops on one of them.
 #![allow(clippy::unnecessary_cast)]
 
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -126,6 +127,7 @@ fn ipv4_mask(prefix: u8) -> Ipv4Addr {
 pub struct Tun {
     file: AsyncFd<File>,
     name: String,
+    index: libc::c_int,
 }
 
 impl Tun {
@@ -171,14 +173,15 @@ impl Tun {
         request.set_short(flags);
         ioctl(&control, libc::SIOCSIFFLAGS as libc::c_ulong, &mut request)?;
 
+        let mut request = IfReq::new(&name)?;
+        ioctl(&control, libc::SIOCGIFINDEX as libc::c_ulong, &mut request)?;
+        let index = request.int();
         if let Some((address, prefix)) = address_v6 {
-            let mut request = IfReq::new(&name)?;
-            ioctl(&control, libc::SIOCGIFINDEX as libc::c_ulong, &mut request)?;
             let control = socket(libc::AF_INET6)?;
             let mut v6 = In6IfReq {
                 address: address.octets(),
                 prefix: u32::from(prefix),
-                index: request.int(),
+                index,
             };
             ioctl(&control, libc::SIOCSIFADDR as libc::c_ulong, &mut v6)?;
         }
@@ -186,12 +189,53 @@ impl Tun {
         Ok(Self {
             file: AsyncFd::new(File::from(device))?,
             name,
+            index,
         })
     }
 
     /// The name the kernel gave the interface.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Routes `network`/`prefix` into this interface. The kernel removes
+    /// the route with the interface.
+    pub fn add_route(&self, network: IpAddr, prefix: u8) -> io::Result<()> {
+        self.route(libc::SIOCADDRT as libc::c_ulong, network, prefix)
+    }
+
+    /// Removes a route [`add_route`](Self::add_route) added.
+    pub fn remove_route(&self, network: IpAddr, prefix: u8) -> io::Result<()> {
+        self.route(libc::SIOCDELRT as libc::c_ulong, network, prefix)
+    }
+
+    fn route(&self, request: libc::c_ulong, network: IpAddr, prefix: u8) -> io::Result<()> {
+        match network {
+            IpAddr::V4(network) => {
+                let device = CString::new(self.name.as_str())
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                // SAFETY: an all-zero `rtentry` is valid (null pointers,
+                // zero numbers).
+                let mut entry: libc::rtentry = unsafe { std::mem::zeroed() };
+                write_sockaddr_in(&mut entry.rt_dst, network);
+                write_sockaddr_in(&mut entry.rt_genmask, ipv4_mask(prefix));
+                entry.rt_flags = libc::RTF_UP as libc::c_ushort;
+                entry.rt_metric = 1;
+                // The kernel only reads the name.
+                entry.rt_dev = device.as_ptr().cast_mut();
+                ioctl(&socket(libc::AF_INET)?, request, &mut entry)
+            }
+            IpAddr::V6(network) => {
+                // SAFETY: an all-zero `in6_rtmsg` is valid.
+                let mut message: libc::in6_rtmsg = unsafe { std::mem::zeroed() };
+                message.rtmsg_dst.s6_addr = network.octets();
+                message.rtmsg_dst_len = u16::from(prefix);
+                message.rtmsg_metric = 1;
+                message.rtmsg_flags = libc::RTF_UP as u32;
+                message.rtmsg_ifindex = self.index;
+                ioctl(&socket(libc::AF_INET6)?, request, &mut message)
+            }
+        }
     }
 
     /// Reads one IP packet.
@@ -221,6 +265,75 @@ impl Tun {
             }
         }
     }
+}
+
+fn write_sockaddr_in(target: &mut libc::sockaddr, address: Ipv4Addr) {
+    let mut bytes = [0u8; 16];
+    let family = libc::sa_family_t::try_from(libc::AF_INET).unwrap_or(2);
+    bytes[..2].copy_from_slice(&family.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&address.octets());
+    // SAFETY: `sockaddr` is 16 plain bytes; the bytes are a `sockaddr_in`.
+    *target = unsafe { std::mem::transmute::<[u8; 16], libc::sockaddr>(bytes) };
+}
+
+fn prefix_of(mask: &[u8]) -> u8 {
+    let ones: u32 = mask.iter().map(|byte| byte.count_ones()).sum();
+    u8::try_from(ones).unwrap_or(u8::MAX)
+}
+
+/// The networks of every interface but loopback and `skip` (the mesh's own
+/// interface), for the overlap rule of spec §15.4.
+pub fn local_networks(skip: &str) -> io::Result<Vec<(IpAddr, u8)>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with a list freed below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut networks = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` points into the list `getifaddrs` returned.
+        let entry = unsafe { &*cursor };
+        cursor = entry.ifa_next;
+        if entry.ifa_addr.is_null() || entry.ifa_netmask.is_null() || entry.ifa_name.is_null() {
+            continue;
+        }
+        if entry.ifa_flags & (libc::IFF_LOOPBACK as libc::c_uint) != 0 {
+            continue;
+        }
+        // SAFETY: a non-null name is a C string.
+        let name = unsafe { CStr::from_ptr(entry.ifa_name) };
+        if name.to_bytes() == skip.as_bytes() {
+            continue;
+        }
+        // SAFETY: the address and mask point to socket addresses of the
+        // family the address names.
+        let network = unsafe {
+            match libc::c_int::from((*entry.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let address = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
+                    let mask = &*entry.ifa_netmask.cast::<libc::sockaddr_in>();
+                    Some((
+                        IpAddr::V4(Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr))),
+                        prefix_of(&mask.sin_addr.s_addr.to_ne_bytes()),
+                    ))
+                }
+                libc::AF_INET6 => {
+                    let address = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
+                    let mask = &*entry.ifa_netmask.cast::<libc::sockaddr_in6>();
+                    Some((
+                        IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)),
+                        prefix_of(&mask.sin6_addr.s6_addr),
+                    ))
+                }
+                _ => None,
+            }
+        };
+        networks.extend(network);
+    }
+    // SAFETY: `head` came from `getifaddrs` and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(networks)
 }
 
 /// Splits the settings' addresses into the shapes [`Tun::create`] takes.
@@ -274,6 +387,29 @@ mod tests {
         assert_eq!(&request.data[4..8], &[10, 1, 2, 3]);
         let family = libc::sa_family_t::from_ne_bytes([request.data[0], request.data[1]]);
         assert_eq!(libc::c_int::from(family), libc::AF_INET);
+    }
+
+    #[test]
+    fn prefixes_count_mask_bits() {
+        assert_eq!(prefix_of(&[255, 255, 255, 0]), 24);
+        assert_eq!(prefix_of(&[0; 16]), 0);
+        assert_eq!(prefix_of(&[255; 16]), 128);
+    }
+
+    #[test]
+    fn a_route_destination_is_a_socket_address() {
+        // SAFETY: test-only zeroed plain struct.
+        let mut target: libc::sockaddr = unsafe { std::mem::zeroed() };
+        write_sockaddr_in(&mut target, Ipv4Addr::new(192, 168, 10, 0));
+        assert_eq!(libc::c_int::from(target.sa_family), libc::AF_INET);
+        let data: Vec<u8> = target.sa_data.iter().map(|byte| *byte as u8).collect();
+        assert_eq!(&data[2..6], &[192, 168, 10, 0]);
+    }
+
+    #[test]
+    fn the_machine_has_some_networks_and_never_loopback() {
+        let networks = local_networks("none-such").expect("getifaddrs");
+        assert!(networks.iter().all(|(address, _)| !address.is_loopback()));
     }
 
     #[test]
