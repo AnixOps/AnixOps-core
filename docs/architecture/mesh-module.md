@@ -118,10 +118,12 @@
 | 配置与校验 | `config.rs` | M0 完成 |
 | 内网范围、路由表、包检查 | `scope.rs`、`routes.rs`、`packet.rs` | M0 完成 |
 | 握手、帧格式、对端与路由交换（无 I/O 状态机） | 按规范新增 | 待规范 |
-| 驱动：底层连接、计时器、断线重连 | 按规范新增 | 待规范 |
+| 路由同步会话（规范 §12.2、§12.3，无 I/O） | `route/sync.rs` | 内核 0.3 |
+| 驱动：底层连接、计时器、断线重连 | 按规范新增 | 内核 0.3 |
 | 每节点私有 TCP/IP 协议栈（smoltcp），TCP/UDP 出站 | 与 iWAN / WireGuard 同构 | M2 |
 | `engine-embedded` feature `mesh`、注册 `"type": "mesh"` | `protocols.rs` | M2 |
 
+- 路由同步（`RouteSync`）：本节点在不向自己推送的直连邻居中只选一个作为推送目标，优先选公网直连或无端口转换的邻居，选定后不随新邻居改变；向自己推送的邻居同样在下一周期收到本节点的增量（不作为发起方）。双方同时选中对方时，节点 ID 较小的一方继续作为发起方（规范未约定，我方规则）。只接受直连邻居的同步请求，其他一律回「已停止」。连接图在有任一行变化时整张发送；节点信息与连接行各最多 4096 个；收到他人以本节点 ID 但不同 route_id 发布的信息时记为 ID 冲突，不采纳。
 - 分流：引擎自动把每个已加入网络的 `tunnel.routes`（虚拟网段和当前路由到组网的通告子网）指向该网络的组网出站，优先于 profile 里的规则；网段随通告动态变化，客户端不写这类规则。客户端只需把每个网络作为 `"type": "mesh"` 出站放进 profile；嵌入式引擎（`engine-embedded` 的配置信封，`schema_version` 仍为 1）放在 `routing.outbounds`，键是客户端选的标识符（`[A-Za-z0-9._-]`，例如 `mesh-` 加面板的网络 ID），值为 `{"type": "mesh", …}` 加上 `config_version: 1` 网络配置。引擎按配置里的 `network.name`（即快照的 `network.id`）识别实例，不按键名，因为旧网的名字不一定是合法标识符。只开组网时用 `routing`：`outbounds` 只有组网网络，`rules` 为 `["FINAL,DIRECT"]`，`mode` 为 `rule`。嵌入式引擎支持组网的版本以 `networkcore_ios_feature_set_version() >= 7` 判断（内核 0.3 起，随驱动一起提升），桌面和 Android 以控制接口的能力 `mesh` 判断。域名目标先解析，结果仍须通过路由表检查。连接前就拒绝范围外的目的地址，不会发出任何包。
 - 网络密钥：配置里的字段为 `network.secret`。客户端把不含密钥的配置存在应用设置里，密钥存钥匙串（与网络扩展共享）；生成 profile 时由扩展从钥匙串填入，`mesh_save_network` 时由应用填好再发。密钥不出现在状态、日志和导出的诊断信息中。
 - 只开组网的 profile：只有组网出站与 `direct`、`final` 为 `direct` 是合法 profile。客户端的引擎已接管 DNS，内网域名的后缀作为分流域交给组网模块应答（规范 §15.9.2 第 8 条），不另设监听地址：`tunnel.dns.servers` 就是 profile 里隧道已有的 DNS 地址（与代理模式相同）。只开组网时，手机上隧道的 DNS 设置只放这个地址，以 `tunnel.dns.matchDomains` 为匹配域，其余查询不进隧道，仍走系统 DNS；客户端把这个地址也放进 `includedRoutes`。代理同时开启时，代理的 DNS 设置照旧，匹配域的查询仍由组网应答。
