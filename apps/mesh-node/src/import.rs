@@ -291,10 +291,12 @@ mod tests {
         assert_eq!(report.instances.len(), 3);
         let first = &report.instances[0];
         assert_eq!(first.status, InstanceStatus::Ready);
-        assert_eq!(
-            first.output.as_deref(),
-            Some("/etc/anixops-mesh/imported/systemd_demo-meshd.service.json")
-        );
+        // Joined with the platform's separator.
+        let expected = Path::new("/etc/anixops-mesh/imported")
+            .join("systemd_demo-meshd.service.json")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(first.output.as_deref(), Some(expected.as_str()));
         let written = host
             .text("/etc/anixops-mesh/imported/systemd_demo-meshd.service.json")
             .unwrap();

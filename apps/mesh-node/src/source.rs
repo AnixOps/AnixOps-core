@@ -838,7 +838,13 @@ a = 1
         let collected = collect(&host, &profile, &invocation);
         assert_eq!(collected.len(), 1);
         let one = &collected[0];
-        assert_eq!(one.config_file.as_deref(), Some("/etc/demo/a.toml"));
+        // Relative names are joined to the working directory with the
+        // platform's separator.
+        let expected = Path::new("/etc/demo")
+            .join("a.toml")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(one.config_file.as_deref(), Some(expected.as_str()));
         assert_eq!(one.text(Field::NetworkName), Some("office"));
         assert_eq!(one.text(Field::NetworkSecret), Some("from-env"));
         assert_eq!(one.text(Field::Hostname), Some("b"));
