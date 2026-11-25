@@ -42,12 +42,15 @@ const NLA_HDRLEN: usize = 4;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
 const CTA_TUPLE_ORIG: u16 = 1;
+const CTA_STATUS: u16 = 3;
 const CTA_ZONE: u16 = 18;
 const CTA_TUPLE_IP: u16 = 1;
 const CTA_IP_V4_SRC: u16 = 1;
 const CTA_IP_V4_DST: u16 = 2;
 const CTA_IP_V6_SRC: u16 = 3;
 const CTA_IP_V6_DST: u16 = 4;
+/// `IPS_SRC_NAT` in `CTA_STATUS`: the source was translated.
+const IPS_SRC_NAT: u32 = 1 << 4;
 
 pub const AF_INET: u8 = 2;
 pub const AF_INET6: u8 = 10;
@@ -58,6 +61,9 @@ pub struct Flow {
     pub family: u8,
     pub source: IpAddr,
     pub destination: IpAddr,
+    /// The source was translated (`IPS_SRC_NAT`), as the bridge's
+    /// `masquerade` does; entries without it did not go through the bridge.
+    pub source_nat: bool,
     /// The `CTA_TUPLE_ORIG` attribute as received, header included; sent
     /// back unchanged to delete exactly this entry.
     orig: Vec<u8>,
@@ -72,6 +78,7 @@ pub(crate) fn test_flow(source: IpAddr, destination: IpAddr) -> Flow {
         family: if source.is_ipv4() { AF_INET } else { AF_INET6 },
         source,
         destination,
+        source_nat: true,
         orig: Vec::new(),
         zone: None,
     }
@@ -186,10 +193,16 @@ fn parse_flow(body: &[u8]) -> Option<Flow> {
     let source = address(find(ip, src_kind)?.0)?;
     let destination = address(find(ip, dst_kind)?.0)?;
     let zone = find(attrs, CTA_ZONE).map(|(_, whole)| whole.to_vec());
+    let source_nat = find(attrs, CTA_STATUS)
+        .and_then(|(payload, _)| payload.get(..4))
+        .is_some_and(|bytes| {
+            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & IPS_SRC_NAT != 0
+        });
     Some(Flow {
         family,
         source,
         destination,
+        source_nat,
         orig: orig_whole.to_vec(),
         zone,
     })
@@ -240,11 +253,13 @@ pub fn parse_datagram(data: &[u8]) -> io::Result<Received> {
     Ok(received)
 }
 
-/// The entries to delete: original source in one of `sources` and original
-/// destination in one of `destinations`.
+/// The entries to delete: source translated (the bridge's `masquerade`),
+/// original source in one of `sources` and original destination in one of
+/// `destinations`.
 pub fn select<'a>(flows: &'a [Flow], sources: &[IpNet], destinations: &[IpNet]) -> Vec<&'a Flow> {
     flows
         .iter()
+        .filter(|flow| flow.source_nat)
         .filter(|flow| sources.iter().any(|net| net.contains(flow.source)))
         .filter(|flow| {
             destinations
@@ -450,6 +465,15 @@ mod tests {
     }
 
     fn v4_flow_message(src: [u8; 4], dst: [u8; 4], zone: Option<u16>) -> Vec<u8> {
+        v4_flow_message_with_status(src, dst, zone, 8 | IPS_SRC_NAT)
+    }
+
+    fn v4_flow_message_with_status(
+        src: [u8; 4],
+        dst: [u8; 4],
+        zone: Option<u16>,
+        status: u32,
+    ) -> Vec<u8> {
         let ip = nested(
             CTA_TUPLE_IP,
             &[attr(CTA_IP_V4_SRC, &src), attr(CTA_IP_V4_DST, &dst)],
@@ -457,7 +481,7 @@ mod tests {
         let proto = nested(2, &[attr(1, &[1]), attr(4, &7u16.to_be_bytes())]);
         let orig = nested(CTA_TUPLE_ORIG, &[ip.clone(), proto.clone()]);
         let reply = nested(2, &[ip, proto]);
-        let mut attrs = vec![orig, reply, attr(3, &8u32.to_be_bytes())];
+        let mut attrs = vec![orig, reply, attr(CTA_STATUS, &status.to_be_bytes())];
         if let Some(zone) = zone {
             attrs.push(attr(CTA_ZONE, &zone.to_be_bytes()));
         }
@@ -602,5 +626,23 @@ mod tests {
         let pairs = narrowed(&old_allow, &old_routes, None);
         let selected: usize = pairs.iter().map(|(s, d)| select(&flows, s, d).len()).sum();
         assert_eq!(selected, 4);
+    }
+
+    #[test]
+    fn only_translated_flows_are_selected() {
+        let mut datagram = v4_flow_message([10, 150, 0, 2], [100, 100, 0, 5], None);
+        // Same addresses, but the source was never translated: it did not
+        // go out through the bridge.
+        datagram.extend(v4_flow_message_with_status(
+            [10, 150, 0, 2],
+            [100, 100, 0, 5],
+            None,
+            8,
+        ));
+        let flows = parse_datagram(&datagram).unwrap().flows;
+        assert!(flows[0].source_nat);
+        assert!(!flows[1].source_nat);
+        let selected = select(&flows, &[net("10.150.0.2/32")], &[net("100.100.0.5/32")]);
+        assert_eq!(selected, [&flows[0]]);
     }
 }
