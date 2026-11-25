@@ -22,7 +22,8 @@ use ring::error::Unspecified;
 use ring::rand::SecureRandom;
 
 use super::messages::{
-    sync_error, ConnGraph, RoutePeerInfo, SyncRouteRequest, SyncRouteResponse, MAX_GRAPH_NODES,
+    sync_error, ConnGraph, RoutePeerInfo, SyncRouteRequest, SyncRouteResponse, MAX_GRAPH_EDGES,
+    MAX_GRAPH_NODES,
 };
 use super::topology::{Metric, NodeEntry, Topology};
 
@@ -42,8 +43,11 @@ pub const INFO_TTL: Duration = Duration::from_secs(3660);
 /// A node unreachable in the topology for this long is removed
 /// (spec §12.3).
 pub const UNREACHABLE_TTL: Duration = Duration::from_secs(90);
-/// Most nodes kept, the same bound as one connection graph.
-pub const MAX_NODES: usize = MAX_GRAPH_NODES;
+/// Most other nodes kept: with this node, one connection graph's bound.
+pub const MAX_NODES: usize = MAX_GRAPH_NODES - 1;
+/// A neighbour that has not pushed as the initiator for this long no longer
+/// counts as pushing.
+pub const PUSH_EXPIRY: Duration = Duration::from_secs(30);
 
 /// Something the driver must act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +76,8 @@ struct Sent {
 }
 
 struct Session {
+    /// When the neighbour last asked as the initiator.
+    pushed_at: Option<Instant>,
     mine: u64,
     theirs: Option<u64>,
     /// The neighbour pushes to this node as the initiator.
@@ -86,6 +92,7 @@ struct Session {
 impl Session {
     fn new(mine: u64) -> Self {
         Self {
+            pushed_at: None,
             mine,
             theirs: None,
             they_initiate: false,
@@ -148,12 +155,14 @@ impl RouteSync {
         own.version = own.version.max(1);
         own.raw.clear();
         let mut sync = Self {
-            own,
-            own_updated: now,
+            // The connection row starts where the information does, so a
+            // restart with a clock-based first version is not taken as old.
             own_row: Row {
-                version: 1,
+                version: own.version,
                 neighbours: BTreeSet::new(),
             },
+            own,
+            own_updated: now,
             infos: BTreeMap::new(),
             rows: BTreeMap::new(),
             unreachable_since: BTreeMap::new(),
@@ -276,6 +285,22 @@ impl RouteSync {
             self.own.version = self.own.version.wrapping_add(1).max(1);
             self.own_updated = now;
         }
+        // A neighbour that stopped pushing is a candidate target again, so
+        // no link stays synchronised one way only.
+        let mut stale = false;
+        for session in self.sessions.values_mut() {
+            if session.they_initiate
+                && session
+                    .pushed_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= PUSH_EXPIRY)
+            {
+                session.they_initiate = false;
+                stale = true;
+            }
+        }
+        if stale {
+            self.choose_target();
+        }
         let peers: Vec<u32> = self.sessions.keys().copied().collect();
         let mut out = Vec::new();
         for peer in peers {
@@ -343,9 +368,12 @@ impl RouteSync {
                     }
                 }
             }
-            for (id, row) in all_rows() {
+            'edges: for (id, row) in all_rows() {
                 let from = index[&id];
                 for neighbour in &row.neighbours {
+                    if graph.edges.len() >= MAX_GRAPH_EDGES {
+                        break 'edges;
+                    }
                     if let Some(&to) = index.get(neighbour) {
                         graph.edges.push((from, to));
                     }
@@ -457,6 +485,9 @@ impl RouteSync {
         session.theirs = Some(request.my_session_id);
         let keep_ours = request.is_initiator && target == Some(peer) && my_id < peer;
         session.they_initiate = request.is_initiator && !keep_ours;
+        if session.they_initiate {
+            session.pushed_at = Some(now);
+        }
         let mine = session.mine;
         let they_initiate = session.they_initiate;
 
@@ -484,7 +515,9 @@ impl RouteSync {
 
     fn merge_info(&mut self, info: RoutePeerInfo, now: Instant) -> bool {
         if info.peer_id == self.own.peer_id {
-            if info.route_id != self.own.route_id {
+            // An older version is this node's own information from before a
+            // restart, still on its way out of the network.
+            if info.route_id != self.own.route_id && info.version >= self.own.version {
                 self.conflicts.insert(info.peer_id);
             }
             return false;
@@ -494,7 +527,22 @@ impl RouteSync {
         }
         match self.infos.get(&info.peer_id) {
             Some(stored) if stored.info.version >= info.version => return false,
-            None if self.infos.len() >= MAX_NODES => return false,
+            None if self.infos.len() >= MAX_NODES => {
+                // Full: only a node already unreachable makes room, the one
+                // unreachable longest.
+                let Some(oldest) = self
+                    .unreachable_since
+                    .iter()
+                    .filter(|(id, _)| self.infos.contains_key(*id))
+                    .min_by_key(|(_, since)| **since)
+                    .map(|(id, _)| *id)
+                else {
+                    return false;
+                };
+                self.infos.remove(&oldest);
+                self.rows.remove(&oldest);
+                self.unreachable_since.remove(&oldest);
+            }
             _ => {}
         }
         self.infos.insert(
@@ -907,5 +955,79 @@ mod tests {
         };
         a.on_request(3, request, now);
         assert_eq!(a.target(), Some(9));
+    }
+
+    #[test]
+    fn old_own_information_after_a_restart_is_no_conflict() {
+        let now = Instant::now();
+        let rng = SystemRandom::new();
+        let mut a = RouteSync::new(
+            RoutePeerInfo {
+                version: 200,
+                ..info(1, 1)
+            },
+            now,
+        );
+        a.neighbour_up(2, &rng).unwrap();
+        let old = RoutePeerInfo {
+            version: 100,
+            ..info(1, 555)
+        };
+        let request = SyncRouteRequest {
+            my_peer_id: 2,
+            my_session_id: 1,
+            peer_infos: vec![old],
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(2, request, now);
+        assert!(a.conflicts().is_empty());
+    }
+
+    #[test]
+    fn a_neighbour_that_stops_pushing_becomes_a_target_again() {
+        let now = Instant::now();
+        let rng = SystemRandom::new();
+        let mut a = node(5, now);
+        a.neighbour_up(3, &rng).unwrap();
+        let push = SyncRouteRequest {
+            my_peer_id: 3,
+            my_session_id: 1,
+            is_initiator: true,
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(3, push, now);
+        assert_eq!(a.target(), None);
+        a.poll(now + PUSH_EXPIRY, (0, 0));
+        assert_eq!(a.target(), Some(3));
+    }
+
+    #[test]
+    fn a_full_table_makes_room_only_from_unreachable_nodes() {
+        let now = Instant::now();
+        let rng = SystemRandom::new();
+        let mut a = node(1, now);
+        a.neighbour_up(2, &rng).unwrap();
+        let fill = SyncRouteRequest {
+            my_peer_id: 2,
+            my_session_id: 1,
+            peer_infos: (0..MAX_NODES as u32).map(|n| info(10_000 + n, 1)).collect(),
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(2, fill, now);
+        assert_eq!(a.infos().count(), MAX_NODES);
+        let late = SyncRouteRequest {
+            my_peer_id: 2,
+            my_session_id: 1,
+            peer_infos: vec![info(99_999, 1)],
+            ..SyncRouteRequest::default()
+        };
+        // Every stored node is unreachable (no connection rows), but none
+        // for long yet: once marked, the longest unreachable makes room.
+        a.on_request(2, late.clone(), now);
+        assert!(a.info(99_999).is_none());
+        a.expire(now);
+        a.on_request(2, late, now);
+        assert!(a.info(99_999).is_some());
+        assert_eq!(a.infos().count(), MAX_NODES);
     }
 }

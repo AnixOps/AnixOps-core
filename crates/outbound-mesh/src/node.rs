@@ -194,7 +194,14 @@ fn own_info(settings: &MeshSettings, identity: &Identity) -> RoutePeerInfo {
         ipv4,
         proxy_cidrs: advertise,
         hostname: settings.hostname.clone(),
-        version: 1,
+        // Seconds since 1970: a restarted node starts above the versions
+        // its old information still has in the network (spec §12.3).
+        version: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u32::try_from(since.as_secs()).ok())
+            .unwrap_or(1)
+            .max(1),
         version_string: VERSION_STRING.into(),
         features: FeatureFlags::ours(relays),
         route_id: identity.route_id,
