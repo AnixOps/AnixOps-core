@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::detect::{classify_units, detect, scan_processes, Found, Origin};
+use crate::detect::{classify_units, detect, in_container, real_id, scan_processes, Found, Origin};
 use crate::host::{Hold, Host, Signal, Spawn};
 use crate::profile::Profile;
 
@@ -594,16 +594,43 @@ fn alive(host: &dyn Host, pid: u32, exe: &str) -> bool {
     }
 }
 
-/// A running process of the same program and command line.
-fn running_copy(host: &dyn Host, exe: &str, argv: &[String]) -> Option<u32> {
+/// A running process of the same program and command line, run by the
+/// same user, outside containers and in our own mount and network
+/// namespaces: a copy that serves the same network as the one we would
+/// start. Anything we cannot read is not counted as a copy.
+fn running_copy(host: &dyn Host, exe: &str, argv: &[String], uid: Option<u32>) -> Option<u32> {
     let entries = host.list_dir(Path::new("/proc")).ok()?;
+    let own = PathBuf::from(format!("/proc/{}", host.own_pid()));
     entries.into_iter().find_map(|entry| {
         let pid: u32 = entry.file_name()?.to_str()?.parse().ok()?;
-        if !alive(host, pid, exe) {
+        let actual = host.read_link(&entry.join("exe")).ok()?;
+        if actual.display().to_string().trim_end_matches(" (deleted)") != exe {
             return None;
         }
         let cmdline = host.read(&entry.join("cmdline")).ok()?;
-        (crate::cmdline::split_nul(&cmdline) == argv).then_some(pid)
+        if crate::cmdline::split_nul(&cmdline) != argv {
+            return None;
+        }
+        if let Some(uid) = uid {
+            let status = host.read_to_string(&entry.join("status")).ok()?;
+            if real_id(&status, "Uid:")? != uid {
+                return None;
+            }
+        }
+        let cgroup = host.read_to_string(&entry.join("cgroup")).ok()?;
+        if in_container(&cgroup) {
+            return None;
+        }
+        for kind in ["ns/mnt", "ns/net"] {
+            // Where our own namespace cannot be read there is nothing to
+            // compare with.
+            if let Ok(ours) = host.read_link(&own.join(kind)) {
+                if host.read_link(&entry.join(kind)).ok()? != ours {
+                    return None;
+                }
+            }
+        }
+        Some(pid)
     })
 }
 
@@ -781,6 +808,24 @@ pub fn takeover(
             .filter_map(|process| process.host_unit)
             .collect()
     };
+    // Decided before any process is ended: a unit whose restart delay is
+    // unknown or too long fails the takeover while nothing has been
+    // stopped that it could start a second time.
+    let mut restart_wait = 0;
+    if failure.is_none() {
+        match restart_wait_ms(host, &host_units) {
+            Ok(wait) => restart_wait = wait,
+            Err(error) => {
+                report.steps.push(StepReport {
+                    step: "check host units".into(),
+                    ok: false,
+                    detail: Some(error.clone()),
+                });
+                failure = Some(error);
+            }
+        }
+    }
+    let mut waited = false;
     if failure.is_none() {
         for result in end_processes(host, profile, &owned_units) {
             match result {
@@ -802,19 +847,9 @@ pub fn takeover(
             }
         }
     }
-    if failure.is_none() {
-        match restart_wait_ms(host, &host_units) {
-            Ok(wait) if wait > 0 => host.sleep_ms(wait),
-            Ok(_) => {}
-            Err(error) => {
-                report.steps.push(StepReport {
-                    step: "verify".into(),
-                    ok: false,
-                    detail: Some(error.clone()),
-                });
-                failure = Some(error);
-            }
-        }
+    if failure.is_none() && restart_wait > 0 {
+        host.sleep_ms(restart_wait);
+        waited = true;
     }
     if failure.is_none() {
         let left: Vec<u32> = scan_processes(host, profile)
@@ -841,6 +876,15 @@ pub fn takeover(
     }
     if failure.is_some() {
         let steps: Vec<Step> = manifest.steps.split_off(first_new);
+        // A host unit restarts what we ended only after its delay; wait for
+        // it before restarting anything, so the undo sees its copy and does
+        // not start a second one.
+        let ended = steps
+            .iter()
+            .any(|step| matches!(step.action, Action::Terminate { .. }));
+        if ended && restart_wait > 0 && !waited {
+            host.sleep_ms(restart_wait);
+        }
         let (results, remaining) = undo(host, &steps);
         report.rollback = results;
         if remaining.is_empty() {
@@ -984,7 +1028,7 @@ fn undo_one(host: &dyn Host, action: &Action, backups: &[&Action]) -> Result<Str
             // A unit that restarts what it runs may already have started it
             // again; a second copy would fight it for ports, the virtual
             // interface and the node identity.
-            if let Some(other) = running_copy(host, exe, argv) {
+            if let Some(other) = running_copy(host, exe, argv, *uid) {
                 return Ok(format!(
                     "process {pid} already runs again as {other}; not started twice"
                 ));
@@ -1348,6 +1392,16 @@ mod tests {
         host.ran.borrow_mut().clear();
         let rollback = rollback(&host, Path::new(STATE)).unwrap();
         assert!(rollback.ok, "{rollback:?}");
+        // The restarted process is reported in its own scope.
+        assert!(
+            rollback
+                .steps
+                .iter()
+                .any(|step| step.detail.as_deref().is_some_and(
+                    |detail| detail.ends_with("as 4242 in anixops-mesh-restored-4242.scope")
+                )),
+            "{rollback:?}"
+        );
         let mut ran = host.ran.borrow().clone();
         // The restarted process gets a scope of its own first.
         let scope = ran.remove(0);
@@ -1595,6 +1649,113 @@ mod tests {
         );
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
         assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        // Decided before ending anything: no process was stopped, so there
+        // is nothing the unit could start a second time.
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.step == "check host units" && !step.ok));
+        assert!(
+            !host
+                .signals
+                .borrow()
+                .iter()
+                .any(|(pid, _)| *pid == 300 || *pid == 200),
+            "{:?}",
+            host.signals.borrow()
+        );
+        assert!(host.spawned.borrow().is_empty());
+        assert!(host.alive.borrow().contains(&300));
+    }
+
+    #[test]
+    fn a_failure_while_ending_processes_waits_for_host_units() {
+        let host = machine();
+        host.signal(100, Signal::Kill).unwrap();
+        let office = ["/opt/demo-meshd", "--net-name", "office"];
+        host.process(
+            300,
+            "/opt/demo-meshd",
+            &office,
+            &[],
+            "0::/system.slice/office-vpn.service\n",
+        );
+        host.answer(
+            "systemctl show office-vpn.service -p Restart -p RestartUSec",
+            0,
+            "Restart=always\nRestartUSec=1.5s\n",
+        );
+        // Ended after the others, and it will not exit.
+        host.process(
+            400,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "lab2"],
+            &[],
+            "0::/user.slice\n",
+        );
+        host.unkillable.borrow_mut().insert(400);
+        host.respawn_after_sleep.borrow_mut().push((
+            301,
+            office.iter().map(|arg| arg.to_string()).collect(),
+            "0::/system.slice/office-vpn.service\n".into(),
+        ));
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        // Waited out the unit's delay before undoing anything.
+        assert!(
+            host.slept.borrow().contains(&3_500),
+            "{:?}",
+            host.slept.borrow()
+        );
+        let spawned = host.spawned.borrow();
+        assert!(
+            !spawned.iter().any(|spawn| spawn.argv == office),
+            "{spawned:?}"
+        );
+        assert!(spawned
+            .iter()
+            .any(|spawn| spawn.argv == ["/opt/demo-meshd", "--net-name", "lab"]));
+    }
+
+    #[test]
+    fn a_copy_run_by_another_user_or_in_a_container_is_not_ours() {
+        let host = FakeHost::default();
+        let argv: Vec<String> = ["/opt/demo-meshd", "--net-name", "lab"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        host.process(500, "/opt/demo-meshd", &args, &[], "0::/user.slice\n");
+        host.file("/proc/500/status", "Uid:\t1000\t1000\t1000\t1000\n");
+        assert_eq!(
+            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
+            Some(500)
+        );
+        assert_eq!(running_copy(&host, "/opt/demo-meshd", &argv, Some(0)), None);
+        host.file("/proc/500/cgroup", "0::/system.slice/docker-abc.scope\n");
+        assert_eq!(
+            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
+            None
+        );
+        // Another network namespace than ours.
+        host.file("/proc/500/cgroup", "0::/user.slice\n");
+        host.link("/proc/1/ns/net", "net:[1]");
+        host.link("/proc/500/ns/net", "net:[2]");
+        assert_eq!(
+            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
+            None
+        );
+        host.link("/proc/500/ns/net", "net:[1]");
+        assert_eq!(
+            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
+            Some(500)
+        );
+        // An executable we cannot read is not a copy.
+        host.links.borrow_mut().remove(Path::new("/proc/500/exe"));
+        assert_eq!(
+            running_copy(&host, "/opt/demo-meshd", &argv, Some(1000)),
+            None
+        );
     }
 
     #[test]

@@ -153,6 +153,77 @@ fn write_then_rename(
     std::fs::rename(temporary, path)
 }
 
+/// Opens (creating) the lock file inside its directory without following
+/// links, checking the directory itself rather than its name: the state
+/// directory may come from the command line, and a planted link or a
+/// directory others can write could redirect what we write there. The
+/// directory is opened first and checked through its descriptor, and the
+/// file is opened relative to that descriptor, so nothing can be swapped in
+/// between the check and the open.
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "lock path has no file name"))?;
+    let invalid = |_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte");
+    let dir_c = CString::new(dir.as_os_str().as_bytes()).map_err(invalid)?;
+    let name_c = CString::new(name.as_bytes()).map_err(invalid)?;
+    // SAFETY: a valid C string; the descriptor is owned right away.
+    let dir_fd = unsafe {
+        libc::open(
+            dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd == -1 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{}: {error} (must be a directory, not a link)",
+                dir.display()
+            ),
+        ));
+    }
+    // SAFETY: open just returned it and nothing else owns it.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(dir_fd) };
+    let metadata = std::fs::File::from(dir_fd.try_clone()?).metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must belong to this user and not be writable by others",
+                dir.display()
+            ),
+        ));
+    }
+    // SAFETY: a valid directory descriptor and C string; never truncates,
+    // never follows a link planted where the lock file goes.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat just returned it and nothing else owns it.
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
 impl Host for RealHost {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
@@ -246,41 +317,16 @@ impl Host for RealHost {
 
     fn try_lock(&self, path: &Path, holder: &str) -> io::Result<bool> {
         use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        // Never truncate on open: the holder's text stays until we hold it.
-        options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            // The state directory may come from the command line: it must
-            // be a real directory of ours that nobody else can write, or a
-            // planted file or link could redirect what we write there.
-            let dir = match path.parent() {
-                Some(dir) if !dir.as_os_str().is_empty() => dir,
-                _ => Path::new("."),
-            };
-            let metadata = std::fs::symlink_metadata(dir)?;
-            if !metadata.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a directory", dir.display()),
-                ));
-            }
-            // SAFETY: geteuid has no preconditions.
-            let euid = unsafe { libc::geteuid() };
-            if metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} must belong to this user and not be writable by others",
-                        dir.display()
-                    ),
-                ));
-            }
-            // Never follow a link planted where the lock file goes.
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(path)?;
+        let mut file = open_lock_file(path)?;
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // Never truncate on open: the holder's text stays until we hold it.
+            .truncate(false)
+            .open(path)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
@@ -580,8 +626,21 @@ impl Handshake {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: one valid pollfd.
-        let ready = unsafe { libc::poll(&mut poll, 1, HANDSHAKE_TIMEOUT_MS) };
+        // A signal interrupts poll; wait again for whatever time is left.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS as u64);
+        let ready = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            // SAFETY: one valid pollfd.
+            let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis() as i32) };
+            if ready == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                && !left.is_zero()
+            {
+                continue;
+            }
+            break ready;
+        };
         let mut pid_bytes = [0u8; 4];
         let reported = if ready == 1 {
             std::fs::File::from(pid_read)
@@ -602,6 +661,72 @@ impl Handshake {
             .join()
             .map_err(|_| io::Error::other("spawn thread panicked"))??;
         Ok(Spawned { pid, held })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod real_tests {
+    use super::*;
+
+    #[test]
+    fn a_held_process_runs_nothing_until_released() {
+        let host = RealHost::default();
+        let own_exe = std::fs::read_link("/proc/self/exe").unwrap();
+        let seen = std::cell::RefCell::new(None);
+        let hold = |pid: u32| {
+            // Still this test program: the new process has not run its
+            // own program yet.
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| e.to_string())?;
+            *seen.borrow_mut() = Some(exe.clone());
+            Ok(format!("held {pid}"))
+        };
+        let spawned = host
+            .spawn_detached(
+                &Spawn {
+                    argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                    env: Vec::new(),
+                    clear_env: true,
+                    cwd: None,
+                    uid: None,
+                    gid: None,
+                    groups: None,
+                },
+                Some(&hold as Hold<'_>),
+            )
+            .unwrap();
+        assert_eq!(spawned.held, Some(Ok(format!("held {}", spawned.pid))));
+        assert_eq!(seen.borrow().as_deref(), Some(own_exe.as_path()));
+    }
+
+    #[test]
+    fn the_lock_refuses_links_and_open_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mesh-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("state")).unwrap();
+        std::fs::set_permissions(base.join("state"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let host = RealHost::default();
+        assert!(host.try_lock(&base.join("state/lock"), "1").unwrap());
+        // A second holder in the same process is refused by the kernel.
+        let other = RealHost::default();
+        assert!(!other.try_lock(&base.join("state/lock"), "2").unwrap());
+        host.unlock(&base.join("state/lock"));
+        // A link where the lock file goes is never followed.
+        std::fs::write(base.join("target"), "keep").unwrap();
+        std::os::unix::fs::symlink(base.join("target"), base.join("state/linked")).unwrap();
+        assert!(other.try_lock(&base.join("state/linked"), "2").is_err());
+        assert_eq!(
+            std::fs::read_to_string(base.join("target")).unwrap(),
+            "keep"
+        );
+        // A directory reached through a link, or writable by others.
+        std::os::unix::fs::symlink(base.join("state"), base.join("via")).unwrap();
+        assert!(other.try_lock(&base.join("via/lock"), "2").is_err());
+        std::fs::set_permissions(base.join("state"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        assert!(other.try_lock(&base.join("state/lock"), "2").is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
@@ -634,6 +759,8 @@ pub(crate) mod fake {
         pub locks: RefCell<BTreeSet<PathBuf>>,
         /// Locks another live process holds.
         pub held_by_others: RefCell<BTreeSet<PathBuf>>,
+        /// Live processes no signal ends.
+        pub unkillable: RefCell<BTreeSet<u32>>,
         /// Every wait, in milliseconds.
         pub slept: RefCell<Vec<u64>>,
         /// Processes (pid, argv, cgroup) that appear at the next wait of a
@@ -849,6 +976,9 @@ pub(crate) mod fake {
             self.signals.borrow_mut().push((pid, signal));
             if !self.alive.borrow().contains(&pid) {
                 return Ok(false);
+            }
+            if self.unkillable.borrow().contains(&pid) {
+                return Ok(true);
             }
             let stubborn = self.stubborn.borrow().contains(&pid);
             if !stubborn || signal == Signal::Kill {
