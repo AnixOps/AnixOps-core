@@ -76,7 +76,7 @@
 | `port_in_use` | 监听端口被占用，`detail` 为传输与端口 |
 | `tun_in_use` | 虚拟网卡名称已被占用 |
 | `native_keys_pending` | `managed` 网络暂缓：`network.native_keys` 缺省、为空或不含本机在该网络的静态公钥（规范 §8.3.1 第 1 条）。`detail` 为 `empty`（缺省或为空）或 `self_missing`（不含本机公钥）。此时 `network.state` 为 `not_joined`，不建链路、不启动虚拟网卡；`self.staticKey` 与 `static_keys` 照常给出，供 Agent 上报。只影响该网络，不使 `anixops-mesh run` 退出；面板下发含本机公钥的清单后自动启动 |
-| `peer_not_native` | `managed` 网络中，对端经握手认证的静态公钥不在 `network.native_keys` 中，握手被拒（规范 §8.3.1）；`detail` 为对端节点 ID。通常是原版节点或尚未列入清单的新节点 |
+| `peer_not_native` | `managed` 网络中，对端经握手认证的静态公钥不在 `network.native_keys` 中，握手被拒（规范 §8.3.1）。只记录最近一次，`detail` 为对端节点 ID；不改变 `network.state`，不使 `anixops-mesh run` 退出。通常是原版节点或尚未列入清单的新节点，后者在清单下发后自动恢复 |
 | `route_overlap` | 虚拟网段或要装的路由与本机已有路由冲突，`detail` 为网段 |
 | `address_in_use` | 虚拟地址已被本机其他接口使用 |
 | `identity_online` | 同一节点身份已在别处在线 |
