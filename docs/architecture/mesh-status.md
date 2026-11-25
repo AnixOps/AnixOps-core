@@ -53,6 +53,12 @@
 | `latencyMs` | 整数毫秒；未测到为 `null` |
 | `path` | 成员 `id` 列表，从第一跳到目的 |
 | `pathState` | `auto`；0.5 起另有 `custom`、`fallback`（`unreachable` 为连不上的成员 `id`，需求 R9）、`first_hop_only` |
+| `paths[]`（0.5） | 本网络配置的自定义路径（规范 §17.2），按配置顺序：`{ "id", "target", "via", "state", "unreachable", "reason" }`。`id` 由目标生成：`peer:<虚拟地址>` 或 `subnet:<网段>`，路径列表改变时同一目标的 `id` 不变。`target` 为 `{ "peer": 成员 id }` 或 `{ "subnet": 网段 }`；`via` 为成员 `id` 列表，与配置顺序相同。目标或途经点的虚拟地址当前没有对应成员时，该项给出虚拟地址原文 |
+| `path.state` | `pending`（能力查询尚未全部有结果，最长 5 秒，按默认选路发送，界面不提示）、`active`（严格按途经点）、`first_hop_only`（只保证开头一段，规范 §17.2.3）、`fallback`（已回落默认选路）。客户端遇到不认识的取值时不提示回落 |
+| `path.unreachable` | `fallback` 时为涉及的成员 `id`（需求 R9）；`active` 时目的本身不可达（路径错误码 2）为目的成员 `id`；其余为 `null` |
+| `path.reason` | `fallback` 时为 `unreachable`（途经点不可达或能力查询超时）、`unsupported`（第一个途经点不支持封装且不是直连邻居，`unreachable` 为该途经点；或安全模式下目的与本机直连且不是我方节点，`unreachable` 为目的成员）、`not_relay`（途经点不中转）、`hop_limit`（转发计数超限），规范 §17.2.7；其余为 `null`。客户端不认识的取值按 `unreachable` 显示 |
+| `members[].pathState` 取值规则（0.5） | 该成员有 `to_peer` 路径时取该路径的 `state`：`active` 记为 `custom`，`pending` 记为 `auto`，`first_hop_only`、`fallback` 原样；`unreachable` 同该路径。只被 `to_subnet` 路径覆盖的成员仍为 `auto`，子网的路径状态看 `paths[]`。`custom` 与 `first_hop_only` 时 `path` 为按本机拓扑展开的预计路径（经各途经点，途经点之间取默认选路），`hops` 为其中的中转次数；`first_hop_only` 只展开到最后一个保证经过的途经点，之后按本机拓扑的默认选路估计 |
+| 宿主组（0.5） | 组内虚拟机（`members[].vms`）没有单独的路径状态，随网关成员行；组地址段在 `subnets[]` 中的 `path` 按到网关的路径给出（需求 R25） |
 | `subnet.state` | `ok`、`unreachable`、`refused`（内网范围外，列出但不装路由，需求 R17） |
 | `subnet.route` | `mesh`、`local`（与本机网络重叠时默认 `local`） |
 | `suggestedSubnets` | `[{ "cidr", "interface", "public" }]`：只在桌面与服务器的完整节点给出；`public` 为 `true` 的不可通告 |
@@ -101,7 +107,7 @@
 
 | 接口 | 内容 | 自哪个内核版本 |
 |---|---|---|
-| `GET /v1/status` 的 `features` | `mesh`；`mesh_dns`（网络配置接受 `dns` 节）；`mesh_host_groups`（接受 `host_groups` 节）；`mesh_region_requests`（提供下面的申请接口）；`mesh_external_bridge`（接受 `external_bridge` 配置，规范 §15.12，内核 0.4）；`mesh_resolver_address`（`dns` 节接受 `resolver_address`，规范 §15.9.2 第 8 条，内核 0.4；未列出时 Agent 或面板省略该字段）；`mesh_native_keys`（按规范 §8.3.1 处理 `network.kind` 与 `native_keys`：准入、清单未就绪时暂缓并报 `native_keys_pending`、拒绝清单外对端并报 `peer_not_native`，并给出 `static_keys` 与 `self.staticKey`）。Agent 只向列出 `mesh_native_keys` 的内核下发 `kind = managed` 的网络；内核未列出时不下发该网络，向面板上报告警 `native_keys_unsupported`（`legacy` 网络照常下发）；面板下发的 `kind` 不是 `managed` 或 `legacy` 时不下发该网络，上报告警 `invalid_kind`。所有能力都以 `features` 实际列出为准，不按内核版本号推断 | `mesh`、`mesh_dns`、`mesh_native_keys` 0.3；其余 0.4 |
+| `GET /v1/status` 的 `features` | `mesh`；`mesh_dns`（网络配置接受 `dns` 节）；`mesh_host_groups`（接受 `host_groups` 节）；`mesh_region_requests`（提供下面的申请接口）；`mesh_external_bridge`（接受 `external_bridge` 配置，规范 §15.12，内核 0.4）；`mesh_resolver_address`（`dns` 节接受 `resolver_address`，规范 §15.9.2 第 8 条，内核 0.4；未列出时 Agent 或面板省略该字段）；`mesh_native_keys`（按规范 §8.3.1 处理 `network.kind` 与 `native_keys`：准入、清单未就绪时暂缓并报 `native_keys_pending`、拒绝清单外对端并报 `peer_not_native`，并给出 `static_keys` 与 `self.staticKey`）。`mesh_paths`（按规范 §17.2 应用 `routing.paths`：途经点封装、能力查询服务 `MeshPathRpc`、回落与 `paths[]` 状态，接受 `mesh_set_paths`，内核 0.5；未列出的内核虽然接受 `routing.paths` 的语法但不应用，Agent 与面板不向它下发路径，客户端不显示路径编辑）。Agent 只向列出 `mesh_native_keys` 的内核下发 `kind = managed` 的网络；内核未列出时不下发该网络，向面板上报告警 `native_keys_unsupported`（`legacy` 网络照常下发）；面板下发的 `kind` 不是 `managed` 或 `legacy` 时不下发该网络，上报告警 `invalid_kind`。所有能力都以 `features` 实际列出为准，不按内核版本号推断 | `mesh`、`mesh_dns`、`mesh_native_keys` 0.3；`mesh_paths` 0.5；其余 0.4 |
 | `PUT /v1/mesh` | 每个网络一份 `config_version: 1` 配置，`dns`、`host_groups` 与 `subnets`、`routing` 同级 | 0.3 |
 | `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`，规范 §1），由内核生成，等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
 | `GET /v1/mesh` 顶层 `static_keys` | `[{ "network", "static_key" }]`：本机各网络的安全模式静态公钥，`network` 为该网络配置的 `network.name`，`static_key` 编码同快照的 `self.staticKey`；旧模式网络不列出。Agent 在每个网络实例的状态上报中原样带上 `static_key`，面板只采信 Agent 通道的值来生成 `native_keys`（规范 §8.3.1 第 7 条） | 0.3 |
