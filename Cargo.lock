@@ -2350,6 +2350,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "tokio",
  "x25519-dalek",
  "zeroize",
 ]

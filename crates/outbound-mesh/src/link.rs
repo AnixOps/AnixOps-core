@@ -226,7 +226,9 @@ impl Link {
                 self.deadline = hs.now + HANDSHAKE_TIMEOUT;
             }
             Step::Up(_, up) => self.phase = Phase::Up(*up),
-            Step::Close(..) => self.phase = Phase::Closed,
+            // Whatever ended the handshake, a client creating the session
+            // lets the next connection ask at once.
+            Step::Close(..) => self.close(hs.sessions),
         }
         step
     }
@@ -1252,6 +1254,12 @@ mod tests {
         assert!(matches!(
             with(&mut a, |hs| third.handshake(hs, &stray)),
             Step::Close(_, CloseReason::Unexpected)
+        ));
+        let (mut fourth, _) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        // A packet too short for a header ends it as well.
+        assert!(matches!(
+            with(&mut a, |hs| fourth.handshake(hs, &[1, 2, 3])),
+            Step::Close(..)
         ));
         assert!(with(&mut a, |hs| Link::client(hs, Some(2))).is_ok());
     }

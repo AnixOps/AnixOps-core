@@ -236,6 +236,11 @@ impl RouteTable {
         update
     }
 
+    /// Peers with routes in the table.
+    pub fn peers(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.peers.keys().copied()
+    }
+
     /// Forgets a peer and everything it advertised.
     pub fn remove_peer(&mut self, peer: PeerId) {
         self.peers.remove(&peer);

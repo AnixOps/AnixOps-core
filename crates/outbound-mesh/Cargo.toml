@@ -18,9 +18,18 @@ zeroize = "1"
 # zstd payloads from peers (spec §7.4); pure Rust, MIT. Already used by
 # engine-embedded.
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+# The `runtime` driver: sockets and timers. Already used by the rest of the
+# kernel.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "macros"], optional = true }
+
+[features]
+default = ["runtime"]
+# The socket driver (`driver`); without it the crate has no I/O at all.
+runtime = ["dep:tokio"]
 
 [dev-dependencies]
 serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 
 [lib]
 path = "src/lib.rs"

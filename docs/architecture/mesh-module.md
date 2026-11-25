@@ -119,6 +119,7 @@
 | 内网范围、路由表、包检查 | `scope.rs`、`routes.rs`、`packet.rs` | M0 完成 |
 | 握手、帧格式、对端与路由交换（无 I/O 状态机） | 按规范新增 | 待规范 |
 | 路由同步会话（规范 §12.2、§12.3，无 I/O） | `route/sync.rs` | 内核 0.3 |
+| 节点核心（无 I/O）：连接与握手、保活（§10）、RPC（§11）、路由同步与延迟中心（§12、§13.3）、转发（§14）、收发检查（§15） | `node.rs` | 内核 0.3；安全模式中继会话、广播组播待补 |
 | 驱动：底层连接、计时器、断线重连 | 按规范新增 | 内核 0.3 |
 | 每节点私有 TCP/IP 协议栈（smoltcp），TCP/UDP 出站 | 与 iWAN / WireGuard 同构 | M2 |
 | `engine-embedded` feature `mesh`、注册 `"type": "mesh"` | `protocols.rs` | M2 |
