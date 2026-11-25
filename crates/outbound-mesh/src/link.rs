@@ -200,13 +200,22 @@ impl Link {
 
     /// Whether the handshake ran out of time; the connection is then
     /// closed.
-    pub fn timed_out(&mut self, now: Instant) -> bool {
+    pub fn timed_out(&mut self, sessions: &mut Sessions, now: Instant) -> bool {
         let waiting = !matches!(self.phase, Phase::Up(_) | Phase::Closed);
         if waiting && now >= self.deadline {
-            self.phase = Phase::Closed;
+            self.close(sessions);
             return true;
         }
         false
+    }
+
+    /// The driver closes the connection. A client handshake that was
+    /// creating the session lets the next connection to the peer ask for
+    /// it at once.
+    pub fn close(&mut self, sessions: &mut Sessions) {
+        if let Phase::ClientSecure(client) = std::mem::replace(&mut self.phase, Phase::Closed) {
+            (*client).abandon(sessions);
+        }
     }
 
     /// Feeds one packet received during the handshake.
@@ -284,8 +293,14 @@ impl Link {
                         Err(error) => Step::Close(Vec::new(), secure_close(error)),
                     }
                 }
-                packet_type::HANDSHAKE => Step::Close(Vec::new(), CloseReason::ModeMismatch),
-                _ => Step::Close(Vec::new(), CloseReason::Unexpected),
+                packet_type::HANDSHAKE => {
+                    (*client).abandon(hs.sessions);
+                    Step::Close(Vec::new(), CloseReason::ModeMismatch)
+                }
+                _ => {
+                    (*client).abandon(hs.sessions);
+                    Step::Close(Vec::new(), CloseReason::Unexpected)
+                }
             },
             Phase::ServerSecure(server) => match kind {
                 packet_type::SECURE_MSG3 => {
@@ -645,6 +660,10 @@ struct Bucket {
 pub struct HandshakeBudget {
     waiting: VecDeque<Waiting>,
     buckets: HashMap<IpAddr, Bucket>,
+    /// Bucket sources, oldest first; never longer than [`MAX_SOURCES`].
+    bucket_order: VecDeque<IpAddr>,
+    /// When full buckets were last swept out.
+    swept: Option<Instant>,
     /// Sources that finished a handshake, by when.
     finished: HashMap<IpAddr, u64>,
     next: u64,
@@ -677,12 +696,34 @@ impl HandshakeBudget {
     }
 
     fn take_token(&mut self, source: IpAddr, now: Instant) -> bool {
-        if !self.buckets.contains_key(&source) && self.buckets.len() >= MAX_SOURCES {
-            // Forget sources whose bucket has filled up again.
-            self.buckets.retain(|_, bucket| {
-                let refill = now.saturating_duration_since(bucket.at).as_secs_f64();
-                bucket.tokens + refill * MSG1_PER_SECOND < MSG1_BURST
-            });
+        if !self.buckets.contains_key(&source) {
+            if self.buckets.len() >= MAX_SOURCES
+                && self
+                    .swept
+                    .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(1))
+            {
+                // Forget sources whose bucket has filled up again, at most
+                // once a second so forged sources cannot make every msg1
+                // scan the table.
+                self.swept = Some(now);
+                self.buckets.retain(|_, bucket| {
+                    let refill = now.saturating_duration_since(bucket.at).as_secs_f64();
+                    bucket.tokens + refill * MSG1_PER_SECOND < MSG1_BURST
+                });
+                let buckets = &self.buckets;
+                self.bucket_order
+                    .retain(|source| buckets.contains_key(source));
+            }
+            // A hard limit: the oldest source goes.
+            while self.buckets.len() >= MAX_SOURCES {
+                match self.bucket_order.pop_front() {
+                    Some(oldest) => {
+                        self.buckets.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+            self.bucket_order.push_back(source);
         }
         let bucket = self.buckets.entry(source).or_insert(Bucket {
             tokens: MSG1_BURST,
@@ -1177,12 +1218,42 @@ mod tests {
     }
 
     #[test]
+    fn the_rate_table_never_grows_past_its_limit() {
+        let mut budget = HandshakeBudget::new();
+        let now = Instant::now();
+        for n in 0..(MAX_SOURCES as u32 + 1000) {
+            let address = IpAddr::from(std::net::Ipv4Addr::from(0x0A00_0000 + n));
+            let _ = budget.admit(address, Transport::Udp, false, now);
+            assert!(budget.buckets.len() <= MAX_SOURCES);
+            assert_eq!(budget.bucket_order.len(), budget.buckets.len());
+        }
+    }
+
+    #[test]
     fn handshakes_time_out() {
         let start = Instant::now();
+        let mut sessions = Sessions::new();
         let mut link = Link::server(start);
-        assert!(!link.timed_out(start + HANDSHAKE_TIMEOUT / 2));
-        assert!(link.timed_out(start + HANDSHAKE_TIMEOUT));
+        assert!(!link.timed_out(&mut sessions, start + HANDSHAKE_TIMEOUT / 2));
+        assert!(link.timed_out(&mut sessions, start + HANDSHAKE_TIMEOUT));
         assert!(link.is_closed());
+    }
+
+    #[test]
+    fn a_closed_or_failed_client_lets_the_next_connection_ask_at_once() {
+        let mut a = Side::new(1, b"s3cr3t", SecurityMode::ForwardSecrecy);
+        let (mut first, _) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        first.close(&mut a.sessions);
+        let (mut second, _) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        assert!(second.timed_out(&mut a.sessions, Instant::now() + HANDSHAKE_TIMEOUT));
+        let (mut third, _) = with(&mut a, |hs| Link::client(hs, Some(2))).unwrap();
+        // An unexpected packet ends the handshake the same way.
+        let stray = packet(2, 1, packet_type::PING, &[0; 4]);
+        assert!(matches!(
+            with(&mut a, |hs| third.handshake(hs, &stray)),
+            Step::Close(_, CloseReason::Unexpected)
+        ));
+        assert!(with(&mut a, |hs| Link::client(hs, Some(2))).is_ok());
     }
 
     #[test]
