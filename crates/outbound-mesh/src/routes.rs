@@ -43,7 +43,7 @@ pub enum Denied {
     Local,
     /// Intranet, but no peer carries it.
     NoRoute,
-    /// Outside the `allowed_subnets` the user configured.
+    /// Outside the `subnets.accept` the user configured.
     NotAllowed,
     /// A virtual address outside the virtual subnets, or a subnet that
     /// overlaps them.
@@ -67,7 +67,7 @@ impl fmt::Display for Denied {
             Denied::NotIntranet => "destination is outside the mesh's intranet ranges",
             Denied::Local => "destination is this mesh node",
             Denied::NoRoute => "no mesh peer carries this destination",
-            Denied::NotAllowed => "destination is outside the configured allowed_subnets",
+            Denied::NotAllowed => "destination is outside the configured subnets.accept",
             Denied::VirtualSubnet => "address conflicts with the virtual subnet",
             Denied::Conflict => "virtual address is held by another peer",
             Denied::TooMany => "peer advertised too many routes",
@@ -108,7 +108,7 @@ impl RouteTable {
         Self {
             local: settings.local_addresses(),
             virtual_subnets: settings.virtual_subnets(),
-            allowed: settings.allowed_subnets.clone(),
+            allowed: settings.accept_subnets.clone(),
             peers: BTreeMap::new(),
         }
     }
@@ -310,14 +310,13 @@ mod tests {
 
     fn settings(extra: serde_json::Value) -> MeshSettings {
         let mut config = json!({
-            "network_name": "office",
-            "network_secret": "s3cret",
-            "address": "10.144.144.5/24",
-            "address_v6": "fd00:aa::5/64",
-            "peers": [{"server": "peer.example", "port": 40000}],
+            "config_version": 1,
+            "network": {"name": "office", "secret": "s3cret"},
+            "node": {"address": "10.144.144.5/24", "address_v6": "fd00:aa::5/64", "role": "access"},
+            "peers": [{"server": "peer.example"}],
         });
-        for (key, value) in extra.as_object().unwrap() {
-            config[key] = value.clone();
+        if let Some(accept) = extra.get("accept") {
+            config["subnets"] = json!({"accept": accept});
         }
         serde_json::from_value::<MeshConfig>(config)
             .unwrap()
@@ -431,7 +430,7 @@ mod tests {
 
     #[test]
     fn allowed_subnets_narrow_what_is_accepted() {
-        let mut table = RouteTable::new(&settings(json!({"allowed_subnets": ["192.168.10.0/24"]})));
+        let mut table = RouteTable::new(&settings(json!({"accept": ["192.168.10.0/24"]})));
         let update = table.set_peer(
             A,
             &[ip("10.144.144.6")],

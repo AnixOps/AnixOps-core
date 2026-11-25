@@ -37,26 +37,44 @@
 
 ## 配置
 
+配置结构由我方独立设计（需求 R13），带版本号 `config_version`，按网络、本节点、对端、子网、路由分层；嵌套对象拒绝未知字段，导入器写错时直接失败。旧配置的导入器在 Agent 或部署层，单向转换成本结构，不在内核里。
+
 ```json
 {
   "type": "mesh",
-  "network_name": "office",
-  "network_secret": "<钥匙串注入>",
-  "address": "10.144.144.5/24",
-  "address_v6": "fd00:aa::5/64",
+  "config_version": 1,
+  "network": { "name": "office", "secret": "<钥匙串注入>", "secure_mode": false, "cipher": "aes-gcm" },
+  "node": {
+    "address": "10.144.144.5/24",
+    "address_v6": "fd00:aa::5/64",
+    "role": "full",
+    "listen": [{ "transport": "tcp", "port": 11010 }, { "transport": "udp", "port": 11010 }]
+  },
   "peers": [{ "server": "peer.example.com", "port": 11010, "transport": "tcp" }],
-  "allowed_subnets": ["192.168.10.0/24"],
-  "secure_mode": false,
-  "cipher": "aes-gcm",
-  "route_policy": "hops"
+  "subnets": { "accept": ["192.168.0.0/16"], "advertise": ["192.168.10.0/24"] },
+  "routing": {
+    "policy": "hops",
+    "paths": [
+      { "to_peer": "10.144.144.7", "via": ["10.144.144.3"] },
+      { "to_subnet": "192.168.20.0/24", "via": ["10.144.144.3"] }
+    ]
+  }
 }
 ```
 
-- `address`：本节点 IPv4 虚拟地址和前缀，前缀即虚拟网段（/8 到 /30），不能是网络地址或广播地址。
-- `address_v6`：可选，IPv6 虚拟地址（/8 到 /126）。
-- `peers`：初始对端（1 到 64 个），更多对端从它们那里学到。`transport` 为 `tcp`（默认）或 `udp`，端口默认 11010（规范 §2.4）。
-- `route_policy`：本节点自己发出的包的选路，`hops`（默认，最少跳数）或 `latency`（规范 §13.2）。
-- 其余字段见 `crates/outbound-mesh/src/config.rs`。
+| 字段 | 含义 |
+|---|---|
+| `network.name` / `secret` | 网络名按原样参与摘要（不去空格）；密钥由钥匙串注入 |
+| `network.secure_mode` | `false`（默认）旧模式，`true` 安全模式；全网一致（规范 §5.2） |
+| `network.cipher` | 旧模式算法：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；不提供异或 |
+| `node.address` | IPv4 虚拟地址与前缀（/8–/30），前缀即虚拟网段 |
+| `node.role` | `full` 或 `access`；缺省按平台：桌面与服务器 `full`，iOS、Android 只能 `access`（R10） |
+| `node.listen` | 监听，只有完整节点可以配置；端口默认 11010 |
+| `peers` | 初始对端（1–64 个），`transport` 为 `tcp`（默认）或 `udp` |
+| `subnets.accept` | 进一步限制接受的通告子网，不能扩大内网范围 |
+| `subnets.advertise` | 本机通告的局域网子网，只有完整节点可以配置，必须在内网范围内且不与虚拟网段重叠 |
+| `routing.policy` | `hops`（默认）或 `latency`（规范 §13） |
+| `routing.paths` | 自定义路径：`to_peer`（节点虚拟地址）或 `to_subnet`（网段）二选一，`via` 为途经节点的虚拟地址，最多 6 个；同一目标只能有一条 |
 
 ## 分层与集成点
 
