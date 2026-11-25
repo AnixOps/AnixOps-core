@@ -112,6 +112,19 @@ pub struct PeerUpdate {
 struct PeerRoutes {
     addresses: Vec<IpAddr>,
     subnets: Vec<IpNet>,
+    /// Subnets of the peer's last advertisement that were refused.
+    refused_subnets: u64,
+    /// This node's own virtual addresses the peer also claims (R29).
+    claims_local: Vec<IpAddr>,
+}
+
+/// What one peer contributes to the table, for the status.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerView<'a> {
+    /// Its virtual addresses, as accepted.
+    pub addresses: &'a [IpAddr],
+    /// The subnets it advertises, as accepted (routed or not).
+    pub subnets: &'a [IpNet],
 }
 
 pub struct RouteTable {
@@ -216,7 +229,12 @@ impl RouteTable {
                     routes.addresses.push(address);
                     update.addresses.push(address);
                 }
-                Err(denied) => update.refused_addresses.push((address, denied)),
+                Err(denied) => {
+                    if denied == Denied::Local {
+                        routes.claims_local.push(address);
+                    }
+                    update.refused_addresses.push((address, denied));
+                }
             }
         }
 
@@ -236,7 +254,10 @@ impl RouteTable {
                     routes.subnets.push(subnet);
                     update.subnets.push(subnet);
                 }
-                Err(denied) => update.refused_subnets.push((subnet, denied)),
+                Err(denied) => {
+                    routes.refused_subnets += 1;
+                    update.refused_subnets.push((subnet, denied));
+                }
             }
         }
 
@@ -256,6 +277,37 @@ impl RouteTable {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// What `peer` contributes, if it is in the table.
+    pub fn peer(&self, peer: PeerId) -> Option<PeerView<'_>> {
+        self.peers.get(&peer).map(|routes| PeerView {
+            addresses: &routes.addresses,
+            subnets: &routes.subnets,
+        })
+    }
+
+    /// Subnets refused from the peers' current advertisements: outside
+    /// the intranet ranges, the accepted subnets or the virtual subnets,
+    /// or past a peer's share (R16, R17).
+    pub fn refused_subnet_count(&self) -> u64 {
+        self.peers
+            .values()
+            .map(|routes| routes.refused_subnets)
+            .sum()
+    }
+
+    /// Peers that claim one of this node's own virtual addresses (R29).
+    pub fn address_conflicts(&self) -> Vec<(PeerId, IpAddr)> {
+        self.peers
+            .iter()
+            .flat_map(|(peer, routes)| {
+                routes
+                    .claims_local
+                    .iter()
+                    .map(move |address| (*peer, *address))
+            })
+            .collect()
     }
 
     fn admit_address(&self, address: IpAddr) -> Result<(), Denied> {
@@ -504,6 +556,29 @@ mod tests {
         assert_eq!(table.lookup(ip("10.144.144.99")), Err(Denied::NoRoute));
         assert_eq!(table.lookup(ip("172.16.0.1")), Err(Denied::NoRoute));
         assert_eq!(table.lookup(ip("10.144.144.5")), Err(Denied::Local));
+    }
+
+    #[test]
+    fn the_status_view_counts_refusals_and_claims_on_own_addresses() {
+        let mut table = RouteTable::new(&settings(json!({})));
+        table.set_peer(
+            A,
+            &[ip("10.144.144.5"), ip("10.144.144.6")],
+            &[net("192.168.10.0/24"), net("8.8.8.0/24")],
+        );
+        table.set_peer(B, &[ip("10.144.144.7")], &[net("0.0.0.0/0")]);
+        let view = table.peer(A).unwrap();
+        assert_eq!(view.addresses, [ip("10.144.144.6")]);
+        assert_eq!(view.subnets, [net("192.168.10.0/24")]);
+        assert_eq!(table.refused_subnet_count(), 2);
+        assert_eq!(table.address_conflicts(), [(A, ip("10.144.144.5"))]);
+
+        // A new advertisement replaces the old counts.
+        table.set_peer(A, &[ip("10.144.144.6")], &[]);
+        table.remove_peer(B);
+        assert_eq!(table.refused_subnet_count(), 0);
+        assert!(table.address_conflicts().is_empty());
+        assert!(table.peer(B).is_none());
     }
 
     #[test]

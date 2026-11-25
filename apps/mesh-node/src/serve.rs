@@ -5,11 +5,13 @@
 //! Exit codes: 0 stopped by a signal, 2 configuration, 3 a port or the
 //! interface is taken (another program still runs), 1 anything else.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
 use std::time::Duration;
 
+use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
@@ -44,16 +46,19 @@ fn read_local_networks(skip: &str) -> Vec<IpNet> {
     }
 }
 
-/// Routes to add and to remove to go from `installed` to `wanted`.
+/// Routes to add and to remove to go from `installed` to `wanted`, in
+/// their given order; set lookups keep it linear.
 fn route_changes(installed: &[IpNet], wanted: &[IpNet]) -> (Vec<IpNet>, Vec<IpNet>) {
+    let installed_set: HashSet<&IpNet> = installed.iter().collect();
+    let wanted_set: HashSet<&IpNet> = wanted.iter().collect();
     let add = wanted
         .iter()
-        .filter(|net| !installed.contains(net))
+        .filter(|net| !installed_set.contains(net))
         .copied()
         .collect();
     let remove = installed
         .iter()
-        .filter(|net| !wanted.contains(net))
+        .filter(|net| !wanted_set.contains(net))
         .copied()
         .collect();
     (add, remove)
@@ -129,6 +134,8 @@ fn status_line(snapshot: &Snapshot, interface: &str) -> String {
         "neighbours": snapshot.neighbours,
         "reachable": snapshot.routes.len(),
         "duplicate_id": snapshot.duplicate_id,
+        "static_key": snapshot.static_key.as_ref().map(encode_key),
+        "not_native": snapshot.not_native,
         "system_routes": snapshot
             .system_routes
             .iter()
@@ -196,22 +203,88 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         .enable_time()
         .build()
         .map_err(|error| Failure::Other(format!("runtime: {error}")))?;
+    // The key the configuration carries (from the system key store), or
+    // the one kept next to the configuration.
+    let static_key = match &settings.private_key {
+        Some(private) => KeyPair::from_private(**private),
+        None => static_key(&key_path(path))?,
+    };
     runtime.block_on(async move {
+        if settings.waits_for_native_keys(&static_key.public()) {
+            return wait_for_native_keys(&static_key).await;
+        }
         let listeners = Listeners::bind(&settings)
             .await
             .map_err(|error| busy("listen", &error))?;
         let device = Tun::create(&interface, address, address_v6, settings.mtu)
             .map_err(|error| busy(&format!("interface {interface}"), &error))?;
-        let static_key = static_key(&key_path(path))?;
-        serve(settings, static_key, listeners, device).await
+        let stop = signals()?;
+        let mut last = String::new();
+        // Nothing updates the native key list of a standalone node: the
+        // Agent writes a new configuration and starts it again.
+        let (_keep, native_keys) = watch::channel(None);
+        serve_with(
+            settings,
+            static_key,
+            listeners,
+            device,
+            stop,
+            native_keys,
+            |snapshot, name| {
+                let line = status_line(snapshot, name);
+                if line != last {
+                    println!("{line}");
+                    last = line;
+                }
+            },
+        )
+        .await
     })
 }
 
-async fn serve(
+/// Resolves on SIGTERM or SIGINT.
+fn signals() -> Result<impl std::future::Future<Output = ()>, Failure> {
+    let mut terminate =
+        signal(SignalKind::terminate()).map_err(|error| Failure::Other(error.to_string()))?;
+    let mut interrupt =
+        signal(SignalKind::interrupt()).map_err(|error| Failure::Other(error.to_string()))?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+/// A managed network whose native key list lacks this node (spec §8.3.1
+/// rule 1): no listening, interface or routes. The status gives the public
+/// key for the panel's list; the Agent writes the new configuration and
+/// starts the node again.
+async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
+    println!(
+        "{}",
+        serde_json::json!({
+            "state": "not_joined",
+            "reason": "native_keys_pending",
+            "static_key": encode_key(&static_key.public()),
+        })
+    );
+    signals()?.await;
+    Ok(())
+}
+
+/// Runs one network over `device` until `until` resolves: moves packets
+/// between the interface and the driver, keeps the system routes in step
+/// with the driver's snapshot and hands each new snapshot to `observe`.
+/// `native_keys` carries a new native key list into the running driver.
+pub(crate) async fn serve_with(
     settings: MeshSettings,
     static_key: KeyPair,
     listeners: Listeners,
     device: Tun,
+    until: impl std::future::Future<Output = ()>,
+    native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
     let mtu = usize::from(settings.mtu);
     let (to_node, from_interface) = mpsc::channel::<Vec<u8>>(QUEUE);
@@ -221,10 +294,7 @@ async fn serve(
     let (networks, local_networks) = watch::channel(read_local_networks(device.name()));
     let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
     let mut installed: Vec<IpNet> = Vec::new();
-    let mut terminate =
-        signal(SignalKind::terminate()).map_err(|error| Failure::Other(error.to_string()))?;
-    let mut interrupt =
-        signal(SignalKind::interrupt()).map_err(|error| Failure::Other(error.to_string()))?;
+    tokio::pin!(until);
 
     let mut node = tokio::spawn(driver::run(
         settings,
@@ -235,13 +305,13 @@ async fn serve(
             to_interface,
             snapshots,
             local_networks,
+            native_keys,
             shutdown,
         },
     ));
     // Room for one packet larger than the MTU, so that an oversized one is
     // read whole and refused by the node instead of being cut short.
     let mut buffer = vec![0u8; mtu + 1];
-    let mut last = String::new();
     loop {
         tokio::select! {
             read = device.recv(&mut buffer) => {
@@ -262,29 +332,26 @@ async fn serve(
                 }
                 let snapshot = status.borrow_and_update().clone();
                 let (add, remove) = route_changes(&installed, &snapshot.system_routes);
+                let mut removed = HashSet::new();
                 for net in remove {
                     if let Err(error) = device.remove_route(net.network(), net.prefix()) {
                         warn("route", &format!("{net}: {error}"));
                     }
-                    installed.retain(|other| *other != net);
+                    removed.insert(net);
                 }
+                installed.retain(|net| !removed.contains(net));
                 for net in add {
                     match device.add_route(net.network(), net.prefix()) {
                         Ok(()) => installed.push(net),
                         Err(error) => warn("route", &format!("{net}: {error}")),
                     }
                 }
-                let line = status_line(&snapshot, device.name());
-                if line != last {
-                    println!("{line}");
-                    last = line;
-                }
+                observe(&snapshot, device.name());
             }
             _ = rescan.tick() => {
                 let _ = networks.send(read_local_networks(device.name()));
             }
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
+            () = &mut until => break,
             result = &mut node => {
                 return match result {
                     Ok(Ok(())) => Err(Failure::Other("the node stopped".into())),
@@ -351,6 +418,16 @@ mod tests {
         assert_eq!(line["neighbours"], serde_json::json!([3, 9]));
         assert_eq!(line["reachable"], 3);
         assert_eq!(line["duplicate_id"], false);
+        assert_eq!(line["static_key"], serde_json::Value::Null);
+        let secure = Snapshot {
+            static_key: Some([7; 32]),
+            not_native: Some(12),
+            ..Snapshot::default()
+        };
+        let line: serde_json::Value =
+            serde_json::from_str(&status_line(&secure, "anixmesh0")).expect("json");
+        assert_eq!(line["static_key"], encode_key(&[7; 32]));
+        assert_eq!(line["not_native"], 12);
     }
 
     #[test]

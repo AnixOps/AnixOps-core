@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use ring::error::Unspecified;
 use ring::rand::SecureRandom;
 
-use crate::config::{MeshSettings, Role, RoutePolicy, SecurityMode};
+use crate::config::{MeshSettings, NetworkKind, Role, RoutePolicy, SecurityMode};
 use crate::legacy::keys::digest;
 use crate::legacy::LegacyCipher;
 use crate::link::{self, CloseReason, Crypto, Dropped, Handshaking, Link, Step, Up};
@@ -46,11 +46,11 @@ use crate::rpc::packet::{
 };
 use crate::rpc::reassembly::Reassembler;
 use crate::secure::handshake::{
-    keeps_initiating, relay_respond, Local, RelayAnswer, RelayInitiator,
+    keeps_initiating, relay_respond, HandshakeError, Local, RelayAnswer, RelayInitiator,
 };
 use crate::secure::messages::Action as SessionAction;
 use crate::secure::noise::{KeyPair, LEN};
-use crate::secure::session::Sessions;
+use crate::secure::session::{Namespace, SessionKey, Sessions};
 use crate::wire::header::relay_in_place;
 use crate::wire::{flags, packet_type, NodeHeader, HEADER_LEN};
 
@@ -80,6 +80,11 @@ struct Relay {
     queue: VecDeque<(u8, Vec<u8>)>,
 }
 
+/// Most subnets installed as system routes for one network: as many as
+/// [`routes::MAX_SUBNETS_PER_PEER`] for sixteen advertising members; any
+/// further subnets are not installed.
+pub const MAX_SYSTEM_ROUTES: usize = 16 * routes::MAX_SUBNETS_PER_PEER;
+
 /// Route synchronisation service (spec §11.4).
 pub const ROUTE_SERVICE: &str = "OspfRouteRpc";
 /// `SyncRouteInfo` method.
@@ -92,6 +97,10 @@ pub const PING_MAX: Duration = Duration::from_secs(32);
 pub const PING_TIMEOUT: Duration = Duration::from_secs(2);
 /// Missed pings in a row that close a connection (spec §10).
 pub const PING_MISSES: u32 = 5;
+/// A node changes its ID because of a conflict at most this often; past
+/// that it only warns, so that a member forging information cannot make
+/// it change again and again (spec §12.3).
+pub const ID_RENEW_INTERVAL: Duration = Duration::from_secs(600);
 /// Version string announced in route information (spec §12.3).
 pub const VERSION_STRING: &str = "2.6.4-compat";
 
@@ -121,6 +130,20 @@ pub struct Counters {
     pub relayed: u64,
     /// Packets that could not be relayed or sent: no route, hop limit.
     pub unroutable: u64,
+    /// Times this node took new node and route IDs after a conflict.
+    pub id_renewals: u64,
+    /// Node information refused: over a limit or malformed (spec §12.3).
+    pub refused_infos: u64,
+    /// Information of new nodes refused past the storage budget.
+    pub refused_over_budget: u64,
+    /// Connection graphs refused: over the limits or malformed (§12.4).
+    pub refused_graphs: u64,
+    /// Connection rows refused past the stored edge limit (§12.4).
+    pub refused_rows: u64,
+    /// Connection graphs sent cut short to fit one request (§12.4).
+    pub cut_graphs: u64,
+    /// Node information off the native key list (spec §8.3.1 rule 4).
+    pub refused_not_native: u64,
 }
 
 #[derive(Default)]
@@ -200,6 +223,11 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
+    /// The last peer refused for a static key off the native key list
+    /// (spec §8.3.1 rule 5).
+    not_native: Option<u32>,
+    /// When this node last took a new identity after a conflict.
+    renewed_at: Option<Instant>,
     /// Relay sessions being set up, by destination (secure mode only).
     relays: BTreeMap<u32, Relay>,
 }
@@ -230,14 +258,9 @@ fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) 
         ipv4,
         proxy_cidrs: advertise,
         hostname: settings.hostname.clone(),
-        // Seconds since 1970: a restarted node starts above the versions
-        // its old information still has in the network (spec §12.3).
-        version: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|since| u32::try_from(since.as_secs()).ok())
-            .unwrap_or(1)
-            .max(1),
+        // IDs are new at every start, so the version starts at 1
+        // (spec §12.3).
+        version: 1,
         version_string: VERSION_STRING.into(),
         features: FeatureFlags::ours(relays),
         route_id: identity.route_id,
@@ -248,6 +271,15 @@ fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) 
             SecurityMode::Default => Vec::new(),
         },
         ..RoutePeerInfo::default()
+    }
+}
+
+/// The static keys a managed network admits (spec §8.3.1); `None` for a
+/// legacy network, which admits every key.
+fn admitted_keys(settings: &MeshSettings) -> Option<Vec<[u8; LEN]>> {
+    match settings.kind {
+        NetworkKind::Managed => Some(settings.native_keys.clone().unwrap_or_default()),
+        NetworkKind::Legacy => None,
     }
 }
 
@@ -299,13 +331,18 @@ impl Node {
             secret: Some(secret),
             cipher: settings.cipher,
             trusted_keys: Vec::new(),
+            native_keys: admitted_keys(&settings),
         };
         let routes = RouteTable::new(&settings);
         Ok(Self {
             local,
             legacy,
             sessions: Sessions::new(),
-            sync: RouteSync::new(info, now),
+            sync: {
+                let mut sync = RouteSync::new(info, now);
+                sync.set_admitted(admitted_keys(&settings));
+                sync
+            },
             routes,
             conns: BTreeMap::new(),
             reassembler: Reassembler::new(),
@@ -318,6 +355,8 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
+            not_native: None,
+            renewed_at: None,
             relays: BTreeMap::new(),
             settings,
         })
@@ -332,11 +371,51 @@ impl Node {
     }
 
     pub fn counters(&self) -> Counters {
-        self.counters
+        let refused = self.sync.refused();
+        Counters {
+            refused_infos: refused.infos,
+            refused_over_budget: refused.over_budget,
+            refused_graphs: refused.graphs,
+            refused_rows: refused.rows,
+            cut_graphs: refused.cut_graphs,
+            refused_not_native: refused.not_native,
+            ..self.counters
+        }
     }
 
     pub fn route_table(&self) -> &RouteTable {
         &self.routes
+    }
+
+    /// Replaces the native key list of a managed network while it runs
+    /// (spec §8.3.1): the panel lists a new member, or drops one. Route
+    /// information, direct connections and relay sessions of keys no
+    /// longer on the list go; the rest stay up. A list that no longer
+    /// holds this node makes [`Node::waits_for_native_keys`] true, and the
+    /// caller stops the node.
+    pub fn set_native_keys(&mut self, keys: Option<Vec<[u8; LEN]>>, now: Instant) {
+        self.settings.native_keys = keys;
+        let admitted = admitted_keys(&self.settings);
+        self.local.native_keys = admitted.clone();
+        self.sync.set_admitted(admitted);
+        let refused = self.sessions.refused_by(|key| self.settings.admits(key));
+        for key in refused {
+            let conns: Vec<ConnId> = match key.namespace {
+                Namespace::Direct => self
+                    .conns
+                    .iter()
+                    .filter(|(_, state)| state.peer == Some(key.peer_id))
+                    .map(|(&conn, _)| conn)
+                    .collect(),
+                Namespace::Relay => Vec::new(),
+            };
+            for conn in conns {
+                self.close(conn, CloseReason::NotNative(key.peer_id), now);
+            }
+            self.sessions.invalidate(&key);
+            self.relays.remove(&key.peer_id);
+        }
+        self.refresh_routes();
     }
 
     /// The networks of this machine's other interfaces (spec §15.4).
@@ -346,13 +425,15 @@ impl Node {
 
     /// Subnets to route into the virtual interface: accepted and routed,
     /// limited to `routing.system_routes` when it is set.
+    /// At most [`MAX_SYSTEM_ROUTES`], in the table's stable order, so that
+    /// the members cannot fill the system routing table.
     pub fn system_routes(&self) -> Vec<IpNet> {
-        let routes = self.routes.system_routes();
+        let routes = self.routes.system_routes().into_iter();
         match &self.settings.system_routes {
-            None => routes,
+            None => routes.take(MAX_SYSTEM_ROUTES).collect(),
             Some(allowed) => routes
-                .into_iter()
                 .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
+                .take(MAX_SYSTEM_ROUTES)
                 .collect(),
         }
     }
@@ -361,10 +442,75 @@ impl Node {
         &self.sync
     }
 
-    /// A neighbour said this node's ID is taken (spec §12.2): the driver
-    /// should start again with a new identity.
+    /// This node's ID is taken by another node and it could not change
+    /// it yet (at most once in [`ID_RENEW_INTERVAL`], spec §12.3): a
+    /// warning. Cleared when the node takes a new ID.
     pub fn duplicate_id(&self) -> bool {
         self.duplicate_id
+    }
+
+    /// The last peer refused because its static key is off the native key
+    /// list (spec §8.3.1 rule 5), for the status reason `peer_not_native`.
+    pub fn last_not_native(&self) -> Option<u32> {
+        self.not_native
+    }
+
+    /// This node's static public key in the network.
+    pub fn static_public(&self) -> [u8; LEN] {
+        self.local.static_key.public()
+    }
+
+    /// A managed network waits while its native key list lacks this
+    /// node's key (spec §8.3.1 rule 1): the driver opens no links.
+    pub fn waits_for_native_keys(&self) -> bool {
+        self.settings.waits_for_native_keys(&self.static_public())
+    }
+
+    /// Another node holds this node's ID (spec §5.3, §12.2, §12.3): take
+    /// new node, instance and route IDs, unless that happened less than
+    /// [`ID_RENEW_INTERVAL`] ago; then only warn.
+    fn id_conflict(&mut self, rng: &dyn SecureRandom, now: Instant) {
+        let recent = self
+            .renewed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < ID_RENEW_INTERVAL);
+        if recent || self.renew_identity(rng, now).is_err() {
+            self.duplicate_id = true;
+        }
+    }
+
+    /// Starts again under a new identity: every connection closes (the
+    /// driver dials again), and everything learnt under the old ID goes.
+    /// The static key, the settings and this machine's networks stay.
+    fn renew_identity(&mut self, rng: &dyn SecureRandom, now: Instant) -> Result<(), Unspecified> {
+        let identity = Identity::generate(rng)?;
+        let next_transaction = random_i64(rng)?;
+        let conns: Vec<ConnId> = self.conns.keys().copied().collect();
+        for conn in conns {
+            self.close(conn, CloseReason::IdConflict, now);
+        }
+        self.local.id = identity.peer_id;
+        if self.settings.hostname.is_none() {
+            self.local.node_name = format!("node-{}", identity.peer_id);
+        }
+        self.sync = RouteSync::new(
+            own_info(&self.settings, &identity, &self.local.static_key),
+            now,
+        );
+        self.sync.set_admitted(admitted_keys(&self.settings));
+        self.sessions = Sessions::new();
+        self.reassembler = Reassembler::new();
+        self.calls.clear();
+        self.next_transaction = next_transaction;
+        self.centre = CentreServer::new();
+        self.peer_map = GlobalPeerMap::default();
+        self.last_report = None;
+        self.last_fetch = None;
+        self.relays.clear();
+        self.duplicate_id = false;
+        self.renewed_at = Some(now);
+        self.counters.id_renewals += 1;
+        self.refresh_routes();
+        Ok(())
     }
 
     /// Whether the connection finished its handshake.
@@ -423,17 +569,11 @@ impl Node {
         now: Instant,
         f: impl FnOnce(&mut Handshaking<'_>, &mut BTreeMap<ConnId, Conn>) -> T,
     ) -> T {
-        let sync = &self.sync;
-        let peer_key = |peer: u32| -> Option<[u8; LEN]> {
-            sync.info(peer)
-                .and_then(|info| <[u8; LEN]>::try_from(&info.noise_pubkey[..]).ok())
-        };
         let mut hs = Handshaking {
             local: &self.local,
             security: self.settings.security,
             sessions: &mut self.sessions,
             rng,
-            peer_key: &peer_key,
             now,
         };
         f(&mut hs, &mut self.conns)
@@ -548,6 +688,13 @@ impl Node {
                     self.actions.push_back(Action::Send { conn, packet });
                 }
                 self.close(conn, reason, now);
+                if let CloseReason::NotNative(peer) = reason {
+                    self.not_native = Some(peer);
+                }
+                // Only after the server proved the network secret (§5.3).
+                if reason == CloseReason::IdConflict {
+                    self.id_conflict(rng, now);
+                }
             }
         }
     }
@@ -562,7 +709,7 @@ impl Node {
             next_at: Some(now + PING_START),
             ..Ping::default()
         };
-        if self.sync.neighbour_up(up.peer_id, rng).is_err() {
+        if self.sync.neighbour_up(up.peer_id, rng, now).is_err() {
             self.close(conn, CloseReason::Unexpected, now);
             return;
         }
@@ -875,7 +1022,7 @@ impl Node {
                 now,
             );
         } else {
-            self.answered(from, call.transaction_id, &call.body, rng, now);
+            self.answered(from, neighbour, call.transaction_id, &call.body, rng, now);
         }
     }
 
@@ -915,9 +1062,13 @@ impl Node {
         }
     }
 
+    /// An answer from `from` that arrived over the connection to
+    /// `neighbour`. Route synchronisation answers count only from the
+    /// neighbour the connection authenticated (spec §12.2), as requests do.
     fn answered(
         &mut self,
         from: u32,
+        neighbour: u32,
         transaction: i64,
         body: &[u8],
         rng: &dyn SecureRandom,
@@ -927,6 +1078,10 @@ impl Node {
             return;
         };
         if outgoing.peer != from {
+            return;
+        }
+        if outgoing.kind == CallKind::SyncRoute && from != neighbour {
+            self.counters.dropped += 1;
             return;
         }
         let Some(outgoing) = self.calls.remove(&transaction) else {
@@ -939,7 +1094,7 @@ impl Node {
                 if let Ok(Some(Notice::DuplicatePeerId)) =
                     self.sync.on_response(from, response, rng, now)
                 {
-                    self.duplicate_id = true;
+                    self.id_conflict(rng, now);
                 }
             }
             CallKind::ReportPeers => {}
@@ -998,6 +1153,10 @@ impl Node {
 
         for (peer, request) in self.sync.poll(now, unix_now) {
             self.call(peer, CallKind::SyncRoute, request.encode(), now);
+        }
+        // Rule 1 of spec §12.3, or this node's version ran out.
+        if self.sync.take_conflict() {
+            self.id_conflict(rng, now);
         }
         self.sync.expire(now);
         self.refresh_routes();
@@ -1059,7 +1218,11 @@ impl Node {
             self.drop_relay(peer);
             return;
         }
-        let Some(peer_static) = self.peer_static(peer) else {
+        let Some(peer_static) = self.expected_key(peer) else {
+            if self.peer_static(peer).is_some() {
+                // Announced, but off the native key list (spec §8.3.1).
+                self.not_native = Some(peer);
+            }
             self.drop_relay(peer);
             return;
         };
@@ -1083,6 +1246,25 @@ impl Node {
         self.sync
             .info(peer)
             .and_then(|info| <[u8; LEN]>::try_from(&info.noise_pubkey[..]).ok())
+    }
+
+    /// The static key a relay handshake with `peer` must use (spec §12.3):
+    /// the key a handshake bound to the node ID while it has a session,
+    /// otherwise the announced one, which a managed network takes only
+    /// from its native key list.
+    fn expected_key(&self, peer: u32) -> Option<[u8; LEN]> {
+        for namespace in [Namespace::Direct, Namespace::Relay] {
+            let key = SessionKey {
+                namespace,
+                network: self.local.network_name.clone(),
+                peer_id: peer,
+            };
+            if let Some(session) = self.sessions.get(&key) {
+                return Some(session.peer_static());
+            }
+        }
+        self.peer_static(peer)
+            .filter(|announced| self.settings.admits(announced))
     }
 
     /// Sends what waited for the relay session with `peer`.
@@ -1109,7 +1291,7 @@ impl Node {
             // Both started: the smaller ID stays the initiator.
             return;
         }
-        let expected = self.peer_static(from);
+        let expected = self.expected_key(from);
         let answer = relay_respond(
             &self.local,
             from,
@@ -1124,7 +1306,10 @@ impl Node {
                 (msg2, established.action != SessionAction::Create)
             }
             Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
-            Err(_) => {
+            Err(error) => {
+                if error == HandshakeError::NotNative {
+                    self.not_native = Some(from);
+                }
                 self.counters.dropped += 1;
                 return;
             }
@@ -1342,13 +1527,22 @@ mod tests {
         fn with(settings: Vec<MeshSettings>) -> Self {
             let rng = SystemRandom::new();
             let now = Instant::now();
+            let keys: Vec<KeyPair> = settings
+                .iter()
+                .map(|_| KeyPair::generate(&rng).unwrap())
+                .collect();
+            // A managed network lists every node of the test as ours.
+            let native: Vec<[u8; LEN]> = keys.iter().map(KeyPair::public).collect();
             let nodes = settings
                 .into_iter()
+                .zip(keys)
                 .enumerate()
-                .map(|(i, settings)| {
+                .map(|(i, (mut settings, key))| {
+                    if settings.kind == NetworkKind::Managed {
+                        settings.native_keys = Some(native.clone());
+                    }
                     let mut identity = Identity::generate(&rng).unwrap();
                     identity.peer_id = 100 + i as u32;
-                    let key = KeyPair::generate(&rng).unwrap();
                     Node::with_identity(settings, identity, key, &rng, now).unwrap()
                 })
                 .collect();
@@ -1443,6 +1637,147 @@ mod tests {
         assert_eq!(net.nodes[1].counters().relayed, relayed + 1);
     }
 
+    /// Takes node `j`'s static key off node `i`'s native key list.
+    fn unlist(net: &mut Net, i: usize, j: usize) {
+        let removed = net.nodes[j].static_public();
+        let node = &mut net.nodes[i];
+        let keep: Vec<[u8; LEN]> = node
+            .settings
+            .native_keys
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|key| *key != removed)
+            .collect();
+        let now = net.now;
+        node.set_native_keys(Some(keep), now);
+    }
+
+    #[test]
+    fn a_member_dropped_from_the_list_while_running_is_disconnected() {
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.link(0, 1);
+        net.settle();
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        unlist(&mut net, 0, 1);
+        net.settle();
+        assert!(net.nodes[0].neighbours().is_empty());
+        assert!(net.nodes[0].route_sync().info(101).is_none());
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 2]);
+        assert!(net.nodes[0].send_ip(&packet, net.now).is_err());
+    }
+
+    #[test]
+    fn a_managed_network_refuses_peers_off_the_native_key_list() {
+        // As the client: the server is refused after msg2.
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        unlist(&mut net, 0, 1);
+        net.link(0, 1);
+        net.settle();
+        assert!(net.nodes[0].neighbours().is_empty());
+        assert_eq!(net.nodes[0].last_not_native(), Some(101));
+        assert!(!net.nodes[0].waits_for_native_keys());
+
+        // As the server: the client is refused after msg3.
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        unlist(&mut net, 0, 1);
+        net.link(1, 0);
+        net.settle();
+        assert!(net.nodes[0].neighbours().is_empty());
+        assert_eq!(net.nodes[0].last_not_native(), Some(101));
+
+        // Listed, the same nodes connect.
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.link(0, 1);
+        net.settle();
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+    }
+
+    #[test]
+    fn a_node_off_the_list_is_not_routed_to_or_relayed_to() {
+        let mut net = three_in_a_row(true);
+        assert!(net.nodes[0].paths().contains_key(&102));
+        // Node 0 learns that node 2 is not ours: its information goes, and
+        // no relay handshake starts towards it.
+        unlist(&mut net, 0, 2);
+        net.tick(Duration::from_secs(1));
+        assert!(net.nodes[0].route_sync().info(102).is_none());
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        assert!(net.nodes[0].send_ip(&packet, net.now).is_err());
+    }
+
+    #[test]
+    fn a_managed_network_waits_without_its_own_key_on_the_list() {
+        let mut net = Net::new(&["10.144.0.1/24"], true);
+        assert!(!net.nodes[0].waits_for_native_keys());
+        unlist(&mut net, 0, 0);
+        assert!(net.nodes[0].waits_for_native_keys());
+        let legacy = Net::new(&["10.144.0.1/24"], false);
+        assert!(!legacy.nodes[0].waits_for_native_keys());
+    }
+
+    /// Node `i` receives, from its neighbour `from`, information under its
+    /// own ID with another route ID and a newer version (spec §12.3 rule 1).
+    fn forge_own_info(net: &mut Net, i: usize, from: u32) {
+        let forged = RoutePeerInfo {
+            peer_id: net.nodes[i].id(),
+            route_id: 1,
+            version: 50,
+            ..RoutePeerInfo::default()
+        };
+        let request = SyncRouteRequest {
+            my_peer_id: from,
+            my_session_id: 1,
+            peer_infos: vec![forged],
+            ..SyncRouteRequest::default()
+        };
+        let now = net.now;
+        net.nodes[i].sync.on_request(from, request, now);
+    }
+
+    #[test]
+    fn a_taken_id_is_replaced_at_most_once_in_ten_minutes() {
+        let mut net = three_in_a_row(false);
+        let old = net.nodes[0].id();
+        assert_eq!(net.nodes[0].route_sync().own().version, 1);
+        forge_own_info(&mut net, 0, 101);
+        net.tick(Duration::from_secs(1));
+        let new = net.nodes[0].id();
+        assert_ne!(new, old);
+        assert_eq!(net.nodes[0].route_sync().own().peer_id, new);
+        assert_eq!(net.nodes[0].route_sync().own().version, 1);
+        assert_eq!(net.nodes[0].counters().id_renewals, 1);
+        assert!(!net.nodes[0].duplicate_id());
+        assert!(net.nodes[0].neighbours().is_empty());
+
+        // The other side sees the close; the driver dials again.
+        let now = net.now;
+        net.nodes[1].disconnected(11, now);
+        net.link(0, 1);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[2].paths()[&new].next_hop, 101);
+
+        // Again within ten minutes: only a warning.
+        forge_own_info(&mut net, 0, 101);
+        net.tick(Duration::from_secs(1));
+        assert_eq!(net.nodes[0].id(), new);
+        assert!(net.nodes[0].duplicate_id());
+        assert_eq!(net.nodes[0].counters().id_renewals, 1);
+
+        // Later it changes again.
+        net.now += ID_RENEW_INTERVAL;
+        forge_own_info(&mut net, 0, 101);
+        net.tick(Duration::from_secs(1));
+        assert_ne!(net.nodes[0].id(), new);
+        assert!(!net.nodes[0].duplicate_id());
+        assert_eq!(net.nodes[0].counters().id_renewals, 2);
+    }
+
     /// Nodes 0 and 2 already share a relay session once node 2 has
     /// reported to the latency centre, the smallest ID (node 0). Drops it
     /// on both ends so that a test sees a handshake from the start.
@@ -1450,8 +1785,8 @@ mod tests {
         let ids = [net.nodes[0].id(), net.nodes[2].id()];
         for (i, peer) in [(0, ids[1]), (2, ids[0])] {
             let node = &mut net.nodes[i];
-            let key = crate::secure::session::SessionKey {
-                namespace: crate::secure::session::Namespace::Relay,
+            let key = SessionKey {
+                namespace: Namespace::Relay,
                 network: node.settings.network_name.clone(),
                 peer_id: peer,
             };
@@ -1615,6 +1950,38 @@ mod tests {
             .calls
             .values()
             .any(|call| call.peer == 102 && call.kind == CallKind::SyncRoute));
+    }
+
+    #[test]
+    fn route_sync_answers_count_only_from_the_connection_neighbour() {
+        // Node 0 has a route sync call out to node 2, which is not its
+        // neighbour; an answer from node 2 arrives over the connection to
+        // node 1 and is dropped, the call stays open.
+        let mut net = three_in_a_row(false);
+        net.nodes[0].call(
+            102,
+            CallKind::SyncRoute,
+            SyncRouteRequest::default().encode(),
+            net.now,
+        );
+        let transaction = *net.nodes[0]
+            .calls
+            .iter()
+            .find(|(_, call)| call.peer == 102 && call.kind == CallKind::SyncRoute)
+            .unwrap()
+            .0;
+        let descriptor = net.nodes[2].descriptor(ROUTE_SERVICE, METHOD_SYNC_ROUTE_INFO);
+        let body = RpcResponse {
+            result: Ok(SyncRouteResponse::default().encode()),
+            runtime_us: 0,
+        }
+        .encode();
+        let dropped = net.nodes[0].counters().dropped;
+        let now = net.now;
+        net.nodes[2].send_rpc(100, transaction, &descriptor, false, &body, now);
+        net.settle();
+        assert_eq!(net.nodes[0].counters().dropped, dropped + 1);
+        assert!(net.nodes[0].calls.contains_key(&transaction));
     }
 
     #[test]

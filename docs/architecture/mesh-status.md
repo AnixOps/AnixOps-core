@@ -55,9 +55,9 @@
 | `path` | 成员 `id` 列表，从第一跳到目的 |
 | `pathState` | `auto`；0.5 起另有 `custom`、`fallback`（`unreachable` 为连不上的成员 `id`，需求 R9）、`first_hop_only` |
 | `paths[]`（0.5） | 本网络配置的自定义路径（规范 §17.2），按配置顺序：`{ "id", "target", "via", "state", "unreachable", "reason" }`。`id` 由目标生成：`peer:<虚拟地址>` 或 `subnet:<网段>`，路径列表改变时同一目标的 `id` 不变。`target` 为 `{ "peer": 成员 id }` 或 `{ "subnet": 网段 }`；`via` 为成员 `id` 列表，与配置顺序相同。目标或途经点的虚拟地址当前没有对应成员时，该项给出虚拟地址原文 |
-| `path.state` | `pending`（能力查询尚未全部有结果，或途经点序列正在预热；不排队时通常不超过 11 + k 秒（k 为封装途经点数），因探测预算或查询排队顺延的时间另计；按默认选路发送，界面不提示；规范 §17.2.3、§17.2.6 第 7 条）、`active`（严格按途经点）、`first_hop_only`（只保证开头一段，规范 §17.2.3）、`fallback`（已回落默认选路）。客户端遇到不认识的取值时不提示回落 |
+| `path.state` | `pending`（能力查询尚未全部有结果，或途经点序列正在预热；不排队时通常不超过 11 + k 秒（k 为封装途经点数），因探测预算或查询排队顺延的时间另计；按默认选路发送，界面不提示；规范 §17.2.3、§17.2.6 第 7 条；最长 60 秒，超时转为 `fallback`（`pending_timeout`））、`active`（严格按途经点）、`first_hop_only`（只保证开头一段，规范 §17.2.3）、`fallback`（已回落默认选路）。客户端遇到不认识的取值时不提示回落 |
 | `path.unreachable` | `fallback` 与 `first_hop_only` 时为涉及的成员 `id`（需求 R9，规范 §17.2.7）：`fallback` 时为连不上或不支持的节点，`first_hop_only` 时为第一个不再保证经过的途经点；`active` 与 `first_hop_only` 时目的本身不可达（路径错误码 2 且本机同样到不了目的）为目的成员 `id`（`first_hop_only` 时此项优先于第一个不再保证的途经点）；其余为 `null` |
-| `path.reason` | `fallback` 时为 `unreachable`（途经点不可达、能力查询超时、途经点报告下一段或目的不可达）、`no_echo`（路径探测连续缺失回显，而拓扑中仍可达；界面提示"途经节点 C 未响应路径探测"，与连不上区分）、`unsupported`（第一个途经点不支持封装且不是直连邻居，或安全模式下目的与本机直连且不是我方节点，此时 `unreachable` 为目的成员）、`not_relay`（第一个途经点不中转且不是直连邻居）、`hop_limit`（按本机拓扑预估超过 8 段）；`first_hop_only` 时为第一个不再保证经过的途经点的原因（`unsupported`、`not_relay` 或 `unreachable`）；其余为 `null`。规范 §17.2.7。客户端不认识的取值按 `unreachable` 显示 |
+| `path.reason` | `fallback` 时为 `unreachable`（途经点不可达、能力查询超时、途经点报告下一段或目的不可达）、`no_echo`（路径探测连续缺失回显，而拓扑中仍可达；界面提示"途经节点 C 未响应路径探测"，与连不上区分）、`pending_timeout`（能力查询或预热 60 秒仍未完成；界面提示"途经节点 C 未完成路径准备，已改用默认路径"）、`unsupported`（第一个途经点不支持封装且不是直连邻居，或安全模式下目的与本机直连且不是我方节点，此时 `unreachable` 为目的成员）、`not_relay`（第一个途经点不中转且不是直连邻居）、`hop_limit`（按本机拓扑预估超过 8 段）；`first_hop_only` 时为第一个不再保证经过的途经点的原因（`unsupported`、`not_relay` 或 `unreachable`）；其余为 `null`。规范 §17.2.7。客户端不认识的取值按 `unreachable` 显示 |
 | `members[].pathState` 取值规则（0.5） | 该成员有 `to_peer` 路径时取该路径的 `state`：`active` 记为 `custom`，`pending` 记为 `auto`，`first_hop_only`、`fallback` 原样；`unreachable` 同该路径。只被 `to_subnet` 路径覆盖的成员仍为 `auto`，子网的路径状态看 `paths[]`。`custom` 与 `first_hop_only` 时 `path` 为按本机拓扑展开的预计路径（经各途经点，途经点之间取默认选路），`hops` 为其中的中转次数；`first_hop_only` 只展开到最后一个保证经过的途经点，之后按本机拓扑的默认选路估计 |
 | 宿主组（0.5） | 组内虚拟机（`members[].vms`）没有单独的路径状态。组地址段在 `subnets[]` 中的 `path` 按该地址段匹配到的路径给出：有包含它的 `to_subnet` 路径时按最长前缀的那一条，否则按到网关的路径（规范 §17.2.2 第 6 条，需求 R25） |
 | `subnet.state` | `ok`、`unreachable`、`refused`（内网范围外，列出但不装路由，需求 R17） |
@@ -69,7 +69,7 @@
 | `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate", "answerable" }`：本网络的内网域名名单（不含后缀），一个名字的每种来源各一条。`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址，下发来源在前（需求 R28）；同名中有 `member` 来源时界面提示可能冒名。`answerable` 为 `false` 时地址不在可应答的网段内，不会应答。`source` 以后可能出现 `backbone`、`gateway`，按 `other` 处理 |
 | `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" \| "invalid_name" }`：配置里跳过的名字条目，原因分别为地址在内网范围外、名字不是规范化后的 `名.地区代码` |
 | `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请；每个网络最多一条，新申请替换旧的 |
-| `externalBridge` | 三态：**对象**为本机已生效的桥接配置摘要（见下）；**显式 `null`** 表示内核确知本网络当前没有桥接（未配置 `external_bridge`、配置中移除该节、网络停止，或桥接规则已全部撤除），面板以此作为释放桥接相关资源的依据之一；**键缺省**表示状态未知（内核读取防火墙状态失败、配置被拒、网络暂缓等），面板不得据此释放地址占用，也不得视为已应用。Agent 转发规则：内核给出对象或显式 `null` 时原样上报；Agent 已读到内核状态、且内核 `features` 未列出 `mesh_external_bridge` 时，为每个网络（含 `legacy` 与被扣下的网络）上报显式 `null`，只有面板向该网络下发过 `external_bridge` 节时另附告警 `external_bridge_unsupported`（这样的内核不会装桥接规则；Agent 合成的 `null` 以规范 §15.12 第 9 条的规则清理为前提）；网络带告警 `external_bridge_downgrade_residue` 时（见下文 `features` 一行）Agent 省略该键，不合成 `null`，也不附 `external_bridge_unsupported`；内核列出该能力但省略该键，或 Agent 读取内核状态失败时，上报中省略该键。面板把「缺少该键且同一网络带告警 `external_bridge_unsupported`」按显式 `null` 处理，这是「键缺省即未知」的唯一例外（规范 §15.12 第 8 条）。对象即本机已生效的桥接配置摘要（规范 §15.12 第 4 条）：`allowDigest` 为 `allow` 名单的摘要，`routesDigest` 为 `routes` 的摘要，`allowCount` 为名单条目数，`appliedAt` 为生效时间（RFC 3339，UTC）。摘要算法：把各条目规范化为 CIDR 文本（IPv4 点分十进制，IPv6 按 RFC 5952 小写压缩，单个地址也写出前缀长度），去重后按字节序排序，以换行符 `\n` 连接（末尾无换行），取 SHA-256 的小写十六进制。只在新配置的防火墙规则全部装好后才更新；装失败时保持旧值并告警。Agent 原样上报，面板对自己下发的名单按同样算法计算，相等即视为桥接节点已应用；判断「已应用」时，时间以面板收到该上报的观测时间为准（须晚于名单变更时刻），不比较节点时钟给出的 `appliedAt`，`appliedAt` 只供展示 |
+| `externalBridge` | 三态：**对象**为本机已生效的桥接配置摘要（见下）；**显式 `null`** 表示内核确知本网络当前没有桥接（未配置 `external_bridge`、配置中移除该节、网络停止，或桥接规则已全部撤除），面板以此作为释放桥接相关资源的依据之一；**键缺省**表示状态未知（内核读取防火墙状态失败、配置被拒、网络暂缓等），面板不得据此释放地址占用，也不得视为已应用。Agent 转发规则：内核给出对象或显式 `null` 时原样上报；Agent 已读到内核状态、且内核 `features` 未列出 `mesh_external_bridge` 时，为每个网络（含 `legacy` 与被扣下的网络）上报显式 `null`，只有面板向该网络下发过 `external_bridge` 节时另附告警 `external_bridge_unsupported`（这样的内核不会装桥接规则；Agent 合成的 `null` 以规范 §15.12 第 9 条的规则清理为前提）；网络带告警 `external_bridge_downgrade_residue` 或 `external_bridge_lock_held` 时（见下文 `features` 一行）Agent 省略该键，不合成 `null`，也不附 `external_bridge_unsupported`；内核列出该能力但省略该键，或 Agent 读取内核状态失败时，上报中省略该键。面板把「缺少该键且同一网络带告警 `external_bridge_unsupported`」按显式 `null` 处理，这是「键缺省即未知」的唯一例外（规范 §15.12 第 8 条）。对象即本机已生效的桥接配置摘要（规范 §15.12 第 4 条）：`allowDigest` 为 `allow` 名单的摘要，`routesDigest` 为 `routes` 的摘要，`allowCount` 为名单条目数，`appliedAt` 为生效时间（RFC 3339，UTC）。摘要算法：把各条目规范化为 CIDR 文本（IPv4 点分十进制，IPv6 按 RFC 5952 小写压缩，单个地址也写出前缀长度），去重后按字节序排序，以换行符 `\n` 连接（末尾无换行），取 SHA-256 的小写十六进制。只在新配置的防火墙规则全部装好后才更新；装失败时保持旧值并告警。Agent 原样上报，面板对自己下发的名单按同样算法计算，相等即视为桥接节点已应用；判断「已应用」时，时间以面板收到该上报的观测时间为准（须晚于名单变更时刻），不比较节点时钟给出的 `appliedAt`，`appliedAt` 只供展示 |
 | `tunnel.dns` | `null`，或 `{ "servers": [地址], "matchDomains": [后缀] }`：内网域名开启时只对这些后缀生效（需求 R28） |
 
 **`externalBridge` 摘要测试向量**（面板与内核共用；`routesDigest` 用同一算法）。输入是已通过配置校验的条目，主机位非零的网段（如 `192.168.1.5/24`）在校验时已被拒绝，不进入摘要。规范化时没有前缀长度的单个地址补 /32 或 /128，IPv6 改为 RFC 5952 小写压缩形式，去重后按字节序排序，各条以单个换行符（0x0A）连接，末尾不加换行，对 UTF-8 字节取 SHA-256：
@@ -100,6 +100,7 @@
 | `identity_online` | 同一节点身份已在别处在线 |
 | `permission_denied` | 没有创建虚拟网卡或修改路由的权限 |
 | `unreachable_peers` | 所有初始对端都连不上 |
+| `external_bridge_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级桥接锁 `/run/anixops-mesh-bridge.lock`（同一主机上另有持锁、声明该能力的进程），因此不声明 `mesh_external_bridge`、不清理桥接表（规范 §15.12 第 9 条）。出现在每个网络的 `alerts` 中，进程退出前不消除 |
 
 新增取值属于兼容变更，读取方遇到未知取值按失败处理。
 
@@ -123,6 +124,7 @@
 | `PUT /v1/mesh` | 每个网络一份 `config_version: 1` 配置，`dns`、`host_groups` 与 `subnets`、`routing` 同级 | 0.3 |
 | `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`，规范 §1），由内核生成，等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
 | `GET /v1/mesh` 顶层 `static_keys` | `[{ "network", "static_key" }]`：本机各网络的安全模式静态公钥，`network` 为该网络配置的 `network.name`，`static_key` 编码同快照的 `self.staticKey`；旧模式网络不列出。Agent 在每个网络实例的状态上报中原样带上 `static_key`，面板只采信 Agent 通道的值来生成 `native_keys`（规范 §8.3.1 第 7 条） | 0.3 |
+| `GET /v1/mesh` 的 `networks[].failure` | `{ "code", "detail" }` 或 `null`，与该网络快照的 `network.failure` 同值（例如 `native_keys_pending`、`peer_not_native`）；Agent 转为告警上报 | 0.3 |
 | `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为该网络配置的 `network.name`，即快照的 `network.id`；每个网络最多一条待处理申请，新申请替换旧的，保留到被删除为止 | 0.4 |
 | `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 由内核在记下申请时生成，为 1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`），不存在时返回 404 | 0.4 |
 
@@ -131,9 +133,21 @@
 - 请求体 `{"networks": [网络配置]}`：每项是上面的 `config_version: 1` 配置，另带同级的 `tag`，取值 `mesh-<地区代码>`（地区代码与面板一致：2–16 位小写字母、数字或连字符，字母开头，不以连字符结尾）。边界节点同时加入多个网络，所以是数组（需求 R18、R19），最多 64 项。
 - 整体替换：这组网络取代当前运行的全部网络，未变的网络不中断；`{"networks": []}` 停止全部。任一项无效（字段缺失或未知、配置校验不过、`tag` 不合规或重复、`network.name` 重复）时返回 400，整个请求体都不应用，与 `/v1/network`、`/v1/egress` 一致。网络启动不了（R12：端口占用、虚拟网卡或路由冲突、同一节点身份已在线）不算请求无效：应答 200，该网络 `running` 为 `false`，带 `start_refused` 告警。
 - 应答与 `GET` 相同：`{"instance_id", "networks": [...]}`，每项依请求顺序给出 `tag`、`running`、`error`（运行时为空串）、`address`（本机虚拟地址带前缀长度，如 `10.150.0.5/16`，没有时为空串）、`forward_secrecy`、`peers[{ "address", "subnets", "via", "hops", "latency_ms", "forward_secrecy" }]`（`via` 为途经的中继虚拟地址，直连为空；`latency_ms` 未测到为 `null`，需求 R16）、`failure`（同快照的 `network.failure`：`null` 或 `{ "code", "detail" }`，取值与优先级见上；暂缓的网络 `running` 为 `false`、`failure.code` 为 `native_keys_pending`，**不**发 `start_refused` 告警，Agent 只把 `failure` 转为同码告警上报面板）、`rejected_advertisements`（被拒的子网通告数）、`overlaps`（重叠网段，R16、R17）、`alerts[{ "code", "address", "peer", "detail" }]`。内核给出的 `code`：`address_conflict`、`address_unmanaged`（R29）、`start_refused`（`detail` 写原因）；`address`、`peer`（成员实例 ID）不适用时为空串。字段名与面板 `mesh.status` 一致，Agent 把 `tag` 换回地区代码后原样上报。
-- 内核不持久化这些网络：重启后 Agent 重新发送最后一次 `PUT`。
+- 内核不持久化这些网络：重启后 Agent 重新发送最后一次 `PUT`。内核只在状态目录（`anixcore` 配置的 `mesh_state_dir`，缺省 `/var/lib/anixcore/mesh`，权限 0700）保存本设备的 `instance_id` 与各网络的静态密钥（`keys/` 下按 `network.name` 的摘要命名，0600；配置带 `node.private_key` 时用它）。网络移出列表时密钥保留，再次加入仍用同一密钥，面板已列入的 `native_keys` 不失效。状态目录不可用时内核不列 `mesh`。
+- 实现（Linux，`apps/mesh-node` 的 `managed`）：每个运行中的网络各有一组监听、一块虚拟网卡（`anixmesh-<n>`，取最小未用编号）和一个驱动。`PUT` 中与上次相同的网络不中断；只有 `native_keys` 变化的运行中网络把新清单交给驱动，不重启：清单外对端的直连与中继会话断开、路由信息删除，其余照常；新清单不再含本机公钥时该网络停下并转为暂缓。启动失败的网络在下一次 `PUT` 时重试。端口占用、网卡占用、无权限分别给出 `failure.code` `port_in_use`、`tun_in_use`、`permission_denied`，其余为 `start_refused`，都带 `start_refused` 告警。
+- `peers[]` 每项取该成员的第一个虚拟地址；`latency_ms` 只给直连成员（经中继的成员为 `null`）；`alerts` 中的 `address_conflict` 为声称本机虚拟地址的成员（`peer` 暂为空串）。`address_unmanaged` 待地址分配（0.4）实现。
 - `secret` 不出现在任何应答、错误信息和日志中：错误信息只指出第几项、哪条规则或哪个字段名，不回显取值。
 - 内核未编入组网驱动时 `features` 不列 `mesh`，`GET`、`PUT /v1/mesh` 都返回 404。
+
+### Agent 告警码
+
+Agent 自己产生、上报面板的告警（不经内核），与内核给出的 `failure.code`、`alerts[].code` 并列：
+
+| `code` | 含义 |
+|---|---|
+| `native_keys_unsupported` | 内核 `features` 不含 `mesh_native_keys`：`kind = managed` 的网络不下发（包括内核重启后的重发），`legacy` 网络照常 |
+| `invalid_kind` | 面板下发的 `network.kind` 不是 `managed` 或 `legacy`：Agent 扣下该网络，不交给内核 |
+| `peer_not_native` | 由内核 `failure.code = peer_not_native` 转来，另带 `peer`（内核给出的 `detail`，被拒对端的节点 ID） |
 
 ## 命令
 

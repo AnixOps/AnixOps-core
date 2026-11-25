@@ -59,6 +59,47 @@ pub struct ManagedStatus {
     pub instance_id: String,
     /// One entry per network of the last `PUT`, in its order.
     pub networks: Vec<ManagedNetworkStatus>,
+    /// This node's static public key in each network of the secure mode,
+    /// also while the network waits for its native key list; networks of
+    /// the default mode are not listed (spec §8.3.1 rule 7).
+    pub static_keys: Vec<NetworkStaticKey>,
+}
+
+/// One entry of [`ManagedStatus::static_keys`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NetworkStaticKey {
+    /// The network's `network.name`.
+    pub network: String,
+    /// The key, encoded like the snapshot's `self.staticKey`.
+    pub static_key: String,
+}
+
+/// Why a network does not run, or the last thing refused in it: the
+/// snapshot's `network.failure` (`docs/architecture/mesh-status.md`,
+/// "失败与冲突原因").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NetworkFailure {
+    pub code: FailureCode,
+    /// For `native_keys_pending` `empty` or `self_missing`; for
+    /// `peer_not_native` the refused member's node ID; for the start
+    /// failures the reason. Never carries the network secret.
+    pub detail: String,
+}
+
+/// The `network.failure.code` values the management API gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCode {
+    /// A managed network whose native key list is absent, empty or lacks
+    /// this node (spec §8.3.1 rule 1): it waits, not running.
+    NativeKeysPending,
+    /// The last member refused for a key off the native key list.
+    PeerNotNative,
+    PortInUse,
+    TunInUse,
+    PermissionDenied,
+    /// Any other reason the network could not start.
+    StartRefused,
 }
 
 /// One managed network.
@@ -74,6 +115,8 @@ pub struct ManagedNetworkStatus {
     pub address: Option<IpNet>,
     /// Whether the network runs in the secure mode.
     pub forward_secrecy: bool,
+    /// `null`, or why the network waits or what it last refused.
+    pub failure: Option<NetworkFailure>,
     /// Reachable members (requirement R16).
     pub peers: Vec<ManagedPeer>,
     /// Subnet advertisements refused because they lie outside the intranet
@@ -95,6 +138,7 @@ impl ManagedNetworkStatus {
             error: error.into(),
             address: None,
             forward_secrecy: false,
+            failure: None,
             peers: Vec::new(),
             rejected_advertisements: 0,
             overlaps: Vec::new(),
@@ -257,6 +301,10 @@ mod tests {
                 error: String::new(),
                 address: IpNet::parse("10.150.0.5/16"),
                 forward_secrecy: true,
+                failure: Some(NetworkFailure {
+                    code: FailureCode::PeerNotNative,
+                    detail: "123456".into(),
+                }),
                 peers: vec![ManagedPeer {
                     address: "10.150.0.1".parse().unwrap(),
                     subnets: vec![IpNet::parse("192.168.10.0/24").unwrap()],
@@ -282,6 +330,10 @@ mod tests {
                     },
                 ],
             }],
+            static_keys: vec![NetworkStaticKey {
+                network: "office".into(),
+                static_key: "a2V5".into(),
+            }],
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -293,6 +345,7 @@ mod tests {
                     "error": "",
                     "address": "10.150.0.5/16",
                     "forward_secrecy": true,
+                    "failure": {"code": "peer_not_native", "detail": "123456"},
                     "peers": [{
                         "address": "10.150.0.1",
                         "subnets": ["192.168.10.0/24"],
@@ -307,7 +360,8 @@ mod tests {
                         {"code": "address_conflict", "address": "10.150.0.9", "peer": "", "detail": ""},
                         {"code": "start_refused", "address": "", "peer": "", "detail": "tcp port 11010 in use"}
                     ]
-                }]
+                }],
+                "static_keys": [{"network": "office", "static_key": "a2V5"}]
             })
         );
     }
@@ -319,5 +373,10 @@ mod tests {
         assert_eq!(value["address"], json!(""));
         assert_eq!(value["running"], json!(false));
         assert_eq!(value["error"], json!("port in use"));
+        assert_eq!(value["failure"], json!(null));
+        assert_eq!(
+            serde_json::to_value(ManagedStatus::default()).unwrap()["static_keys"],
+            json!([])
+        );
     }
 }
