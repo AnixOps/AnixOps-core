@@ -555,6 +555,64 @@ jobs:
             echo "::endgroup::"
           done
 
+  mesh-node-static:
+    name: Mesh node static build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+    needs:
+      - changes
+      - policy-fast
+      - detect-projects
+    # Same condition as the other Rust jobs. Builds the release form of
+    # anixops-mesh (static musl, x86_64 and aarch64) with the script the
+    # release workflow uses, so a tag never meets an untested build path.
+    if: >-
+      ${{
+        needs.detect-projects.outputs.rust == 'true' &&
+        (
+          needs.changes.outputs.full_matrix == 'true' ||
+          needs.changes.outputs.rust == 'true' ||
+          needs.changes.outputs.windows == 'true' ||
+          needs.changes.outputs.linux == 'true' ||
+          needs.changes.outputs.apple == 'true' ||
+          needs.changes.outputs.ios == 'true'
+        )
+      }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Check installer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The installer is POSIX sh (BusyBox and dash included).
+          sh -n apps/mesh-node/install/install-linux.sh
+          shellcheck --shell=sh apps/mesh-node/install/install-linux.sh
+          shellcheck --shell=bash .github/scripts/build-mesh-node.sh
+
+      - name: Build static anixops-mesh
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            echo "::group::${target}"
+            .github/scripts/build-mesh-node.sh "${target}" ci dist/mesh-node
+            echo "::endgroup::"
+          done
+
   script-runtime-jsc:
     name: JavaScriptCore script conformance
     runs-on: macos-26
@@ -965,6 +1023,7 @@ jobs:
       - reality-interop
       - rust-h2-mitm-fuzz
       - protocol-features
+      - mesh-node-static
       - script-runtime-jsc
       - ios-runtime-static-libs
     steps:
@@ -999,6 +1058,7 @@ jobs:
           RESULT_RUST_H2_FUZZ: ${{ needs.rust-h2-mitm-fuzz.result }}
           RESULT_REALITY_INTEROP: ${{ needs.reality-interop.result }}
           RESULT_PROTOCOL_FEATURES: ${{ needs.protocol-features.result }}
+          RESULT_MESH_NODE_STATIC: ${{ needs.mesh-node-static.result }}
           RESULT_SCRIPT_RUNTIME_JSC: ${{ needs.script-runtime-jsc.result }}
           RESULT_IOS_RUNTIME_LIBS: ${{ needs.ios-runtime-static-libs.result }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1081,6 +1141,7 @@ jobs:
           record_job "HTTP/2 MITM fuzz" "${RESULT_RUST_H2_FUZZ}" "${rust_required}"
           record_job "REALITY interop (Linux)" "${RESULT_REALITY_INTEROP}" "${reality_interop_required}"
           record_job "Protocol feature matrix" "${RESULT_PROTOCOL_FEATURES}" "${rust_required}"
+          record_job "Mesh node static build" "${RESULT_MESH_NODE_STATIC}" "${rust_required}"
           record_job "JavaScriptCore script conformance" "${RESULT_SCRIPT_RUNTIME_JSC}" "${rust_required}"
           record_job "iOS runtime static libraries" "${RESULT_IOS_RUNTIME_LIBS}" "${ios_runtime_required}"
 
@@ -1146,6 +1207,7 @@ jobs:
             echo "| REALITY interop (Linux) | ${reality_interop_required} | ${RESULT_REALITY_INTEROP} |"
             echo "| HTTP/2 MITM fuzz | ${rust_required} | ${RESULT_RUST_H2_FUZZ} |"
             echo "| Protocol feature matrix | ${rust_required} | ${RESULT_PROTOCOL_FEATURES} |"
+            echo "| Mesh node static build | ${rust_required} | ${RESULT_MESH_NODE_STATIC} |"
             echo "| JavaScriptCore script conformance | ${rust_required} | ${RESULT_SCRIPT_RUNTIME_JSC} |"
             echo "| iOS runtime static libraries | ${ios_runtime_required} | ${RESULT_IOS_RUNTIME_LIBS} |"
           } >> "$GITHUB_STEP_SUMMARY"

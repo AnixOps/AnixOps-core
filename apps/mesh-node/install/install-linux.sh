@@ -89,7 +89,9 @@ if [ "$uninstall" -eq 1 ]; then
   exit 0
 fi
 
-[ -n "$binary_url" ] && [ -n "$binary_sha256" ] || die "--binary-url and --binary-sha256 are required"
+if [ -z "$binary_url" ] || [ -z "$binary_sha256" ]; then
+  die "--binary-url and --binary-sha256 are required"
+fi
 if [ -n "$profile_url" ] && [ -z "$profile_sha256" ]; then
   die "--profile-sha256 is required with --profile-url"
 fi
@@ -107,7 +109,13 @@ fetch() {
     curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 -o "$2" "$1"
   elif has wget; then
     case "$1" in https://*) ;; *) die "only https downloads are allowed" ;; esac
-    wget -q -O "$2" "$1"
+    # GNU wget can refuse a redirect to plain http; BusyBox wget has no such
+    # switch, and the checksum check below still rejects whatever it fetched.
+    if wget --help 2>&1 | grep -q -- '--https-only'; then
+      wget -q --https-only -O "$2" "$1"
+    else
+      wget -q -O "$2" "$1"
+    fi
   else
     die "curl or wget is required"
   fi
