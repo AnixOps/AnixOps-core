@@ -85,7 +85,7 @@ jobs:
       BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
         run: |
@@ -93,7 +93,7 @@ jobs:
           rustup default stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
 
@@ -142,7 +142,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rule-bench
           path: results
@@ -162,7 +162,7 @@ jobs:
       SCALE_OUTBOUNDS: ${{ inputs.scale_outbounds || 'redirect ss2022' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -172,7 +172,7 @@ jobs:
           rustup default stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
 
@@ -240,7 +240,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tunnel-scale
           path: results
@@ -258,14 +258,14 @@ jobs:
       WINDOW_KIB: ${{ inputs.window_kib || '64' }}
     steps:
       - name: Checkout head
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: head
           submodules: true
 
       - name: Checkout base
         if: env.BASE_REF != ''
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: base
           ref: ${{ env.BASE_REF }}
@@ -277,7 +277,7 @@ jobs:
           rustup default stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             head -> target
@@ -356,7 +356,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tunnel-perf
           path: |
@@ -379,7 +379,7 @@ jobs:
       WINDOW_KIB: ${{ inputs.window_kib || '64' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
 
@@ -473,7 +473,7 @@ jobs:
 
       - name: Upload profile
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tunnel-profile
           path: profile

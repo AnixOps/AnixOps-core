@@ -72,6 +72,11 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start runtime: {error}"))?;
+    // Before anything binds, and in `check` too: a management listen that
+    // is not loopback is refused unless `insecure_public` accepts it.
+    if let Some(management) = &config.management {
+        management.check().map_err(|error| error.to_string())?;
+    }
     runtime.block_on(async move {
         let node = Arc::new(
             Node::new(default_registry(), config.allow_private_targets)
@@ -121,9 +126,7 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
             return Ok(());
         }
         if let Some(management) = config.management {
-            let listener = tokio::net::TcpListener::bind(management.listen)
-                .await
-                .map_err(|error| format!("management api: {error}"))?;
+            let listener = management.bind("anixcore").await?;
             println!("management api listening on {}", management.listen);
             let node = node.clone();
             tokio::spawn(async move {

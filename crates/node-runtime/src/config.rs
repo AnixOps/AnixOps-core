@@ -13,6 +13,10 @@
 //! }
 //! ```
 //!
+//! `management` is optional. Its `listen` must be a loopback address:
+//! anything else is refused unless `"insecure_public": true` accepts the
+//! plaintext API there ([`ManagementSettings::check`]).
+//!
 //! Every inbound key other than `tag`, `type`, `listen`, `listen_port`,
 //! `outbound`, `ingress` and `accept_proxy_protocol` is passed to the
 //! protocol factory as its settings. `egress` is optional and has the
@@ -90,12 +94,93 @@ pub struct NodeConfig {
 }
 
 /// Has no `Debug`: `token` is a credential.
+///
+/// The management API is plaintext HTTP carrying a reusable bearer token
+/// with full control of the node, so it listens on loopback only:
+/// [`ManagementSettings::check`] refuses any other address (`0.0.0.0` and
+/// `::` included) unless `insecure_public` is set. Remote management goes
+/// through an authenticated, encrypted channel (SSH or a VPN) that ends on
+/// this host's loopback.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementSettings {
     pub listen: SocketAddr,
     /// Bearer token every request must carry.
     pub token: String,
+    /// Accepts a non-loopback `listen` in plaintext. Off by default; a
+    /// deployment that sets it must keep the port on a restricted network.
+    #[serde(default)]
+    pub insecure_public: bool,
+}
+
+/// Why a [`ManagementSettings`] is refused. The messages are static text:
+/// they never quote the token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagementError {
+    /// `listen` is not a loopback address and `insecure_public` is off.
+    PublicWithoutOptIn,
+    /// `token` is empty or whitespace.
+    EmptyToken,
+}
+
+impl ManagementError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PublicWithoutOptIn => {
+                "management api listens on loopback only: bind 127.0.0.1 or ::1 \
+                 and reach it through SSH or a VPN, or set management.insecure_public \
+                 to accept plaintext on this address"
+            }
+            Self::EmptyToken => "management api token must not be empty",
+        }
+    }
+}
+
+impl std::fmt::Display for ManagementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ManagementError {}
+
+/// Whether `address` is a loopback address, an IPv4-mapped IPv6 one
+/// (`::ffff:127.0.0.1`) included.
+pub fn is_loopback(address: IpAddr) -> bool {
+    address.to_canonical().is_loopback()
+}
+
+impl ManagementSettings {
+    /// Checks the settings before anything binds. `Ok(Some(warning))` is a
+    /// non-loopback address accepted through `insecure_public`, which the
+    /// binary prints.
+    pub fn check(&self) -> Result<Option<&'static str>, ManagementError> {
+        if self.token.trim().is_empty() {
+            return Err(ManagementError::EmptyToken);
+        }
+        if is_loopback(self.listen.ip()) {
+            return Ok(None);
+        }
+        if self.insecure_public {
+            Ok(Some(
+                "management api accepts plaintext on a non-loopback address \
+                 (insecure_public): its bearer token can be read by anyone on the path",
+            ))
+        } else {
+            Err(ManagementError::PublicWithoutOptIn)
+        }
+    }
+
+    /// [`Self::check`]s the settings, then binds `listen`. A warning goes to
+    /// stderr prefixed with `program`.
+    pub async fn bind(&self, program: &str) -> Result<tokio::net::TcpListener, String> {
+        if let Some(warning) = self.check().map_err(|error| error.to_string())? {
+            eprintln!("{program}: WARNING: {warning}");
+        }
+        tokio::net::TcpListener::bind(self.listen)
+            .await
+            .map_err(|error| format!("management api: {error}"))
+    }
 }
 
 /// One inbound. Has no `Debug`: settings carry passwords.
@@ -202,6 +287,76 @@ impl InboundConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn management(listen: &str, insecure_public: bool) -> ManagementSettings {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "management": {"listen": listen, "token": "t0ken", "insecure_public": insecure_public}
+        }))
+        .unwrap();
+        config.management.unwrap()
+    }
+
+    #[test]
+    fn management_listens_on_loopback_by_default() {
+        for listen in ["127.0.0.1:10085", "127.8.9.10:1", "[::1]:10085", "[::ffff:127.0.0.1]:10085"] {
+            assert_eq!(management(listen, false).check(), Ok(None), "{listen}");
+        }
+        for listen in [
+            "0.0.0.0:10085",
+            "[::]:10085",
+            "10.0.0.1:10085",
+            "192.168.1.2:10085",
+            "203.0.113.7:10085",
+            "[fd00::1]:10085",
+            "[2001:db8::1]:10085",
+            "[::ffff:10.0.0.1]:10085",
+        ] {
+            assert_eq!(
+                management(listen, false).check(),
+                Err(ManagementError::PublicWithoutOptIn),
+                "{listen}"
+            );
+        }
+    }
+
+    #[test]
+    fn management_non_loopback_needs_the_explicit_switch() {
+        let warning = management("0.0.0.0:10085", true).check().unwrap();
+        assert!(warning.unwrap().contains("plaintext"));
+        // Absent means off.
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "management": {"listen": "0.0.0.0:10085", "token": "t0ken"}
+        }))
+        .unwrap();
+        assert_eq!(
+            config.management.unwrap().check(),
+            Err(ManagementError::PublicWithoutOptIn)
+        );
+    }
+
+    #[test]
+    fn management_refuses_an_empty_token_and_never_quotes_it() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "management": {"listen": "127.0.0.1:10085", "token": "  "}
+        }))
+        .unwrap();
+        assert_eq!(
+            config.management.unwrap().check(),
+            Err(ManagementError::EmptyToken)
+        );
+        let mut settings = management("0.0.0.0:1", false);
+        settings.token = "s3cret-token-value".to_owned();
+        let message = settings.check().unwrap_err().to_string();
+        assert!(!message.contains("s3cret"));
+    }
+
+    #[tokio::test]
+    async fn management_bind_refuses_before_binding() {
+        let error = management("0.0.0.0:0", false).bind("test").await.unwrap_err();
+        assert!(error.contains("loopback only"), "{error}");
+        let listener = management("127.0.0.1:0", false).bind("test").await.unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
+    }
 
     #[test]
     fn splits_inbound_keys_from_protocol_settings() {

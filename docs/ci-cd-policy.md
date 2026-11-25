@@ -182,6 +182,10 @@ CI 的 `concurrency` 只取消同一 pull request 上被新提交取代的旧 ru
 
 `.github/workflows/release.yml` 是发布入口，发布门禁、矩阵和回滚策略以 [Release Strategy](release-strategy.md) 为准。
 
+Action 固定：所有工作流、可复用工作流和复合 Action 引用的第三方 Action 必须固定到完整 40 位提交 SHA，并在同一行用注释写出
+版本标签（`uses: owner/repo@<sha> # v1.2.3`），不允许 docker Action。`.github/scripts/workflow_policy.py` 在 CI
+`policy-fast` 和发布 `release-policy` 中执行该检查，升级由 Dependabot（`.github/dependabot.yml`）以 PR 提出，审阅后合并。
+
 触发与版本：
 
 - 只能通过 tag 或 `workflow_dispatch` 触发；不允许在本机打包 release artifact；产物必须由 GitHub-hosted

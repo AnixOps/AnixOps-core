@@ -88,7 +88,7 @@ else
         esac
 
         case "${path}" in
-          .github/workflows/*|.github/scripts/*)
+          .github/workflows/*|.github/scripts/*|.github/dependabot.yml)
             mark workflow
             mark full_matrix
             recognized=true

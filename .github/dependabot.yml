@@ -1,0 +1,9 @@
+# Proposes updates to the commit-pinned actions (.github/scripts/workflow_policy.py) as reviewed pull requests,
+# keeping the release tag comment next to each SHA.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
