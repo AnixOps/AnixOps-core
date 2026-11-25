@@ -27,6 +27,7 @@ pub mod source;
 pub mod takeover;
 #[cfg(target_os = "linux")]
 pub mod tun;
+pub mod winstart;
 pub mod winsvc;
 
 /// Version of this program.

@@ -3,7 +3,8 @@
 //! and crontabs, and processes started by hand; containers are found and
 //! reported but never touched. On macOS: launchd jobs (see
 //! [`crate::launchd`]) and processes started by hand. On Windows: services
-//! (see [`crate::winsvc`]) and processes started by hand.
+//! (see [`crate::winsvc`]), scheduled tasks and logon entries (see
+//! [`crate::winstart`]) and processes started by hand.
 //!
 //! Each finding carries the command line the program runs with, taken from
 //! the running process where there is one (the most exact source) and from
@@ -18,7 +19,7 @@ use crate::cmdline::{
     command_in_line, exec_argv, leading_assignments, parse_assignments, parse_unit, split_nul,
     split_words, UnitService,
 };
-use crate::host::Host;
+use crate::host::{Host, Os};
 use crate::profile::Profile;
 use crate::source::Invocation;
 
@@ -72,6 +73,28 @@ pub enum Origin {
         start: String,
         running: bool,
     },
+    /// A scheduled task (Windows), by its full name (`\folder\name`).
+    WinTask {
+        name: String,
+        /// Not turned off.
+        enabled: bool,
+        running: bool,
+    },
+    /// A logon entry (Windows): a value of a `Run` key or an item of a
+    /// Startup folder.
+    WinLogon {
+        /// The `Run` key or the Startup folder.
+        place: String,
+        /// The value or file name.
+        name: String,
+        /// The `StartupApproved` key that turns it off; `None` for a user
+        /// whose settings are not loaded, which is left to the operator.
+        approved: Option<String>,
+        /// The value there before, in hexadecimal.
+        previous: Option<String>,
+        /// Already turned off there.
+        disabled: bool,
+    },
 }
 
 impl Origin {
@@ -87,6 +110,8 @@ impl Origin {
                 format!("launchd:{}/{label}", domain.as_deref().unwrap_or("*"))
             }
             Origin::WinService { name, .. } => format!("service:{name}"),
+            Origin::WinTask { name, .. } => format!("task:{name}"),
+            Origin::WinLogon { place, name, .. } => format!("logon:{place}\\{name}"),
         }
     }
 }
@@ -281,9 +306,12 @@ fn wanted_env(
 /// Running processes of the program.
 pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
     let mut out = Vec::new();
+    if uses_process_table(host) {
+        return scan_table(host, profile);
+    }
     let own = host.own_pid();
     let Ok(entries) = host.list_dir(Path::new("/proc")) else {
-        return scan_table(host, profile);
+        return out;
     };
     for entry in entries {
         let Some(pid) = entry
@@ -371,10 +399,11 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
     out
 }
 
-/// Whether processes are read from the process table (macOS) rather than
-/// from `/proc`.
+/// Whether processes are read from the process table (macOS, Windows)
+/// rather than from `/proc` (Linux). Decided by the system, never by
+/// whether `/proc` exists: on Windows any user may create `C:\proc`.
 pub fn uses_process_table(host: &dyn Host) -> bool {
-    !host.exists(Path::new("/proc")) && host.list_pids().is_ok()
+    host.os() != Os::Linux
 }
 
 /// Running processes of the program, from the process table (macOS).
@@ -410,6 +439,28 @@ fn scan_table(host: &dyn Host, profile: &Profile) -> Vec<Process> {
             })
         })
         .collect()
+}
+
+/// How many parents up [`descends_from`] looks.
+const MAX_ANCESTRY: usize = 16;
+
+/// Whether `ancestor` started the process, directly or through its
+/// children (a wrapper that runs `cmd` that runs the program), as the
+/// process table records parents.
+pub fn descends_from(host: &dyn Host, process: &Process, ancestor: u32) -> bool {
+    let mut parent = process.ppid;
+    for _ in 0..MAX_ANCESTRY {
+        match parent {
+            Some(pid) if pid == ancestor => return true,
+            // Pid 0 and the system process (4 on Windows, 1 elsewhere)
+            // end the chain.
+            Some(pid) if pid > 4 && pid != process.pid => {
+                parent = host.process_info(pid).ok().and_then(|info| info.ppid);
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn show_unit(host: &dyn Host, unit: &str) -> BTreeMap<String, String> {
@@ -961,7 +1012,12 @@ pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
 
     let mut systemd_stems: BTreeSet<String> = BTreeSet::new();
     let mut owned_units: BTreeSet<String> = BTreeSet::new();
-    if host.exists(Path::new("/run/systemd/system")) {
+    let os = host.os();
+    // Only the sources of the system it runs on. On Windows the Unix paths
+    // below are directories at the root of the drive that any user may
+    // create, so reading them there would let that user plant processes,
+    // autostart lines and configurations.
+    if os == Os::Linux && host.exists(Path::new("/run/systemd/system")) {
         for unit in candidate_units(host, profile, &processes) {
             if let Some(entry) = systemd_found(host, profile, &unit, &processes) {
                 let stem = unit.trim_end_matches(".service");
@@ -972,14 +1028,18 @@ pub fn detect(host: &dyn Host, profile: &Profile) -> Vec<Found> {
         }
     }
     classify_units(&mut processes, &owned_units);
-    found.extend(init_scripts(host, profile, &systemd_stems, &processes));
-    found.extend(autostart_lines(host, profile, &processes));
-    found.extend(containers(host, profile, &processes));
-    if host.has_program("launchctl") {
+    if os != Os::Windows {
+        found.extend(init_scripts(host, profile, &systemd_stems, &processes));
+        found.extend(autostart_lines(host, profile, &processes));
+        found.extend(containers(host, profile, &processes));
+    }
+    if os == Os::Macos {
         found.extend(crate::launchd::jobs(host, profile, &processes));
     }
-    if host.has_program("powershell.exe") {
+    if os == Os::Windows {
         found.extend(crate::winsvc::services(host, profile, &processes));
+        found.extend(crate::winstart::tasks(host, profile, &processes));
+        found.extend(crate::winstart::logon_entries(host, profile, &processes));
     }
 
     let claimed: BTreeSet<u32> = found
