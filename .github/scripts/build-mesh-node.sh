@@ -20,14 +20,35 @@ out_dir="$3"
 
 case "${target}" in
   x86_64-unknown-linux-musl) ;;
-  # No aarch64 musl C toolchain on the runner: the program is pure Rust and
-  # musl targets ship their own C runtime objects, so the bundled lld links it.
+  # No aarch64 musl C toolchain on the runner: musl targets ship their own C
+  # runtime objects, so the bundled lld links it.
   aarch64-unknown-linux-musl) export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld ;;
   *)
     echo "::error::unsupported mesh node target ${target}"
     exit 1
     ;;
 esac
+
+# The one C dependency is the crypto library's own code, which needs no C
+# library headers: clang compiles it for any target as freestanding code,
+# so neither target needs a musl C toolchain. llvm-ar writes the symbol
+# index lld needs for objects of another architecture.
+command -v clang > /dev/null || {
+  echo "::error::clang is required to build ${target}"
+  exit 1
+}
+llvm_ar="$(command -v llvm-ar || true)"
+if [ -z "${llvm_ar}" ]; then
+  llvm_ar="$(compgen -c llvm-ar- | sort -t- -k3 -n | tail -n 1)"
+fi
+if [ -z "${llvm_ar}" ]; then
+  echo "::error::llvm-ar is required to build ${target}"
+  exit 1
+fi
+target_env="${target//-/_}"
+export "CC_${target_env}=clang"
+export "AR_${target_env}=${llvm_ar}"
+export "CFLAGS_${target_env}=-ffreestanding"
 case "${version}" in
   "" | */* | *" "*)
     echo "::error::invalid version '${version}'"
