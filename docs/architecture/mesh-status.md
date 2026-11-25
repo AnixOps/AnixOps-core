@@ -129,6 +129,13 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `native_keys_unsupported` | 内核 `features` 不含 `mesh_native_keys`：`kind = managed` 的网络不下发（包括内核重启后的重发），`legacy` 网络照常 |
 | `invalid_kind` | 面板下发的 `network.kind` 不是 `managed` 或 `legacy`：Agent 扣下该网络，不交给内核 |
 | `peer_not_native` | 由内核 `failure.code = peer_not_native` 转来，另带 `peer`（内核给出的 `detail`，被拒对端的节点 ID） |
+| `external_bridge_unsupported` | 网络带 `external_bridge`，但内核 `features` 不含 `mesh_external_bridge`：Agent 照常下发该网络，去掉 `external_bridge` 节，并对该网络上报此告警（面板 #647 审计 M-2，anix-agent #203） |
+
+`mesh.status` 中每个网络的 `externalBridge` 有三种情况（anix-agent #202 审计 M1、#203）：
+
+- 摘要对象：内核给出的桥接摘要，原样上报。
+- `null`：内核明确给出 `null`，表示该网络没有运行桥接，原样上报。
+- 不带该键：Agent 不知道内核当前的桥接情况（网络被扣下、下发失败、等待接管、读不到内核、内核应答没有这个键）。缺省**不能**当作「无桥接」。
 
 ## 命令
 
