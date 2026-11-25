@@ -22,11 +22,14 @@
 //!   traffic keys, rotation and the replay window.
 //! - [`link`]: one direct connection: the handshake of the network's mode,
 //!   then the receive checks and the encryption of packets.
+//! - [`node`]: one node of one network without I/O: connections,
+//!   keep-alive, RPC, route synchronisation, forwarding and traffic checks.
 
 pub mod config;
 pub mod legacy;
 pub mod link;
 pub mod net;
+pub mod node;
 pub mod packet;
 pub mod route;
 pub mod routes;
