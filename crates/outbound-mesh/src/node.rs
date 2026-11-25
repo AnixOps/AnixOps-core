@@ -9,9 +9,10 @@
 //! interface ([`Node::send_ip`]), calls [`Node::tick`] about once a second,
 //! and carries out the [`Action`]s the node queues.
 //!
+//! Broadcast and multicast go to every direct neighbour (spec §15.3).
+//!
 //! Not here yet: relay sessions of the secure mode (spec §9), so in that
-//! mode only direct neighbours are reached; broadcast and multicast
-//! (spec §15.3); shared nodes (spec §16).
+//! mode only direct neighbours are reached; shared nodes (spec §16).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
@@ -31,7 +32,7 @@ use crate::route::messages::{
 };
 use crate::route::sync::{Notice, RouteSync};
 use crate::route::topology::{Metric, Route};
-use crate::routes::{Denied, PeerId, RouteTable};
+use crate::routes::{Denied, Outgoing, PeerId, RouteTable};
 use crate::rpc::packet::{
     split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
     ROUTE_SYNC_TIMEOUT_MS,
@@ -640,15 +641,28 @@ impl Node {
     }
 
     /// An IP packet from the virtual interface.
+    ///
+    /// A broadcast or multicast goes to every direct neighbour, addressed
+    /// to each of them, and is not relayed further (spec §15.3).
     pub fn send_ip(&mut self, packet: &[u8], now: Instant) -> Result<(), Denied> {
-        let peer = match self.routes.check_outgoing(packet) {
-            Ok(peer) => peer,
+        let outgoing = match self.routes.classify_outgoing(packet) {
+            Ok(outgoing) => outgoing,
             Err(denied) => {
                 self.counters.refused_outgoing += 1;
                 return Err(denied);
             }
         };
-        if !self.originate(peer.0, packet_type::DATA, packet, now) {
+        let sent = match outgoing {
+            Outgoing::Peer(peer) => self.originate(peer.0, packet_type::DATA, packet, now),
+            Outgoing::Neighbours => {
+                let mut any = false;
+                for neighbour in self.neighbours() {
+                    any |= self.originate(neighbour, packet_type::DATA, packet, now);
+                }
+                any
+            }
+        };
+        if !sent {
             return Err(Denied::NoRoute);
         }
         Ok(())
@@ -1149,6 +1163,35 @@ mod tests {
         net.settle();
         assert_eq!(net.delivered, vec![(2, packet)]);
         assert_eq!(net.nodes[1].counters().relayed, relayed + 1);
+    }
+
+    #[test]
+    fn broadcasts_reach_direct_neighbours_only() {
+        // Node 1 sits between nodes 0 and 2: its broadcast reaches both;
+        // node 0's reaches node 1 and is not relayed to node 2.
+        let mut net = three_in_a_row(false);
+        let packet = ipv4_packet([10, 144, 0, 2], [10, 144, 0, 255]);
+        net.nodes[1].send_ip(&packet, net.now).unwrap();
+        net.settle();
+        net.delivered.sort();
+        assert_eq!(net.delivered, vec![(0, packet.clone()), (2, packet)]);
+
+        net.delivered.clear();
+        let relayed = net.nodes[1].counters().relayed;
+        let packet = ipv4_packet([10, 144, 0, 1], [224, 0, 0, 251]);
+        net.nodes[0].send_ip(&packet, net.now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, vec![(1, packet)]);
+        assert_eq!(net.nodes[1].counters().relayed, relayed);
+    }
+
+    #[test]
+    fn a_broadcast_without_neighbours_is_not_sent() {
+        let mut net = Net::new(&["10.144.0.1/24"], false);
+        let packet = ipv4_packet([10, 144, 0, 1], [255, 255, 255, 255]);
+        assert_eq!(net.nodes[0].send_ip(&packet, net.now), Err(Denied::NoRoute));
+        net.settle();
+        assert!(net.delivered.is_empty());
     }
 
     #[test]
