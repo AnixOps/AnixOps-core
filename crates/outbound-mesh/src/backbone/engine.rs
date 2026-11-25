@@ -646,8 +646,10 @@ impl Backbone {
         match &verdict {
             Verdict::DropAndNotify { peer, region } => {
                 let key = (*peer, region.clone());
-                if !self.relay_notices.contains_key(&key) {
-                    self.relay_notices.insert(key, now);
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    self.relay_notices.entry(key)
+                {
+                    slot.insert(now);
                     let message = Message::RelayUnreachable {
                         region: region.clone(),
                     };
