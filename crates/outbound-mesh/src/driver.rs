@@ -104,7 +104,7 @@ pub struct Snapshot {
     /// Node ID, next hop and hop count of every reachable node.
     pub routes: Vec<(u32, u32, u32)>,
     pub counters: Counters,
-    /// The last RPC call dropped for a body over 8 MiB (spec §11.2).
+    /// The last oversized synchronisation (spec §11.2, §12.2).
     pub sync_oversize: Option<SyncOversize>,
     /// This node's ID is taken and it changed ID less than ten minutes
     /// ago, so it only warns (spec §12.3).

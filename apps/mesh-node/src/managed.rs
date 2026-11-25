@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{Listeners, Snapshot};
+use outbound_mesh::node::SyncOversize;
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedNetwork, ManagedNetworkStatus,
@@ -489,13 +490,22 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
         })
         .collect();
     if let Some(oversize) = snapshot.sync_oversize {
+        let counters = &snapshot.counters;
+        let detail = match oversize {
+            SyncOversize::Received { peer, bytes } => format!(
+                "received: rpc body of at least {bytes} bytes from node {peer} over the 8 MiB limit"
+            ),
+            SyncOversize::Undelivered { peer } => format!(
+                "undelivered: connection graph not taken by node {peer} within 120 s, sync session closed"
+            ),
+        };
         status.alerts.push(Alert {
             code: AlertCode::SyncOversize,
             address: None,
             peer: String::new(),
             detail: format!(
-                "rpc body of at least {} bytes from node {} over the 8 MiB limit ({} dropped)",
-                oversize.bytes, oversize.peer, snapshot.counters.oversize_calls
+                "{detail} ({} received over the limit, {} sessions closed)",
+                counters.oversize_calls, counters.graph_timeouts
             ),
         });
     }
@@ -553,7 +563,6 @@ fn instance_id(path: &Path) -> io::Result<String> {
 mod tests {
     use super::*;
     use outbound_mesh::driver::Member;
-    use outbound_mesh::node::SyncOversize;
     use outbound_mesh::{IpNet, MeshConfig};
     use serde_json::json;
 
@@ -684,7 +693,7 @@ mod tests {
             rejected_advertisements: 2,
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
-            sync_oversize: Some(SyncOversize {
+            sync_oversize: Some(SyncOversize::Received {
                 peer: 9,
                 bytes: 8_400_000,
             }),
@@ -706,6 +715,16 @@ mod tests {
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
         assert_eq!(status.alerts[1].code, AlertCode::SyncOversize);
         assert!(status.alerts[1].detail.contains("8400000"));
+        assert!(status.alerts[1].detail.starts_with("received:"));
         assert!(status.alerts[1].detail.contains("node 9"));
+
+        let undelivered = Snapshot {
+            sync_oversize: Some(SyncOversize::Undelivered { peer: 4 }),
+            ..Snapshot::default()
+        };
+        let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut status, &base, &undelivered);
+        assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
+        assert!(status.alerts[0].detail.starts_with("undelivered:"));
     }
 }

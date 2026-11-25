@@ -146,16 +146,21 @@ pub struct Counters {
     pub refused_not_native: u64,
     /// RPC calls dropped for a body over 8 MiB (spec §11.2).
     pub oversize_calls: u64,
+    /// Route sync sessions closed because a connection graph could not be
+    /// delivered in time (spec §12.2).
+    pub graph_timeouts: u64,
 }
 
-/// The last RPC call dropped for a body over 8 MiB (spec §11.2): the alert
-/// for an oversized synchronisation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SyncOversize {
-    /// Node ID of the sender.
-    pub peer: u32,
-    /// Bytes the call had reached when it was dropped.
-    pub bytes: usize,
+/// The last oversized synchronisation, for the alert of spec §11.2 and
+/// §12.2: an RPC call received over 8 MiB, or a connection graph that a
+/// neighbour did not take in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncOversize {
+    /// A call from `peer` was dropped at `bytes`, over the 8 MiB limit.
+    Received { peer: u32, bytes: usize },
+    /// The session with the neighbour `peer` was closed: the connection
+    /// graph, even cut by half, was not answered within twice 60 seconds.
+    Undelivered { peer: u32 },
 }
 
 #[derive(Default)]
@@ -393,6 +398,7 @@ impl Node {
             refused_rows: refused.rows,
             cut_graphs: refused.cut_graphs,
             refused_not_native: refused.not_native,
+            graph_timeouts: refused.graph_timeouts,
             ..self.counters
         }
     }
@@ -463,8 +469,8 @@ impl Node {
         self.duplicate_id
     }
 
-    /// The last RPC call dropped for a body over 8 MiB; kept while the node
-    /// runs, so an operator sizing a network sees it (spec §11.2).
+    /// The last oversized synchronisation; kept while the node runs, so an
+    /// operator sizing a network sees it (spec §11.2, §12.2).
     pub fn sync_oversize(&self) -> Option<SyncOversize> {
         self.sync_oversize
     }
@@ -1016,7 +1022,7 @@ impl Node {
             Err(RpcDropped::CallTooLarge(bytes)) => {
                 self.counters.dropped += 1;
                 self.counters.oversize_calls += 1;
-                self.sync_oversize = Some(SyncOversize { peer: from, bytes });
+                self.sync_oversize = Some(SyncOversize::Received { peer: from, bytes });
                 return;
             }
             Err(_) => {
@@ -1179,6 +1185,9 @@ impl Node {
 
         for (peer, request) in self.sync.poll(now, unix_now) {
             self.call(peer, CallKind::SyncRoute, request.encode(), now);
+        }
+        if let Some(peer) = self.sync.take_graph_timeout() {
+            self.sync_oversize = Some(SyncOversize::Undelivered { peer });
         }
         // Rule 1 of spec §12.3, or this node's version ran out.
         if self.sync.take_conflict() {

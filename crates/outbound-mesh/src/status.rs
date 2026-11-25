@@ -194,9 +194,10 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
-    /// A route synchronisation call over 8 MiB was dropped (spec §11.2):
-    /// the network is larger than one synchronisation carries. `peer` is
-    /// empty; `detail` gives the size and the sender's node ID.
+    /// The network is larger than route synchronisation carries: a call
+    /// over 8 MiB was dropped (spec §11.2), or a neighbour did not take the
+    /// connection graph in time and the session was closed (§12.2). `peer`
+    /// is empty; `detail` says which, with the node ID.
     SyncOversize,
 }
 
