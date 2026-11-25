@@ -16,5 +16,10 @@ serde_json = "1"
 # used by the rest of the kernel.
 sha2 = "0.10"
 
+# ctnetlink socket for the tracked connections; already used by the rest
+# of the kernel.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [lib]
 path = "src/lib.rs"

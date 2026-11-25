@@ -12,6 +12,8 @@
 //! - [`ruleset`]: the nftables table of one bridge.
 //! - [`apply`]: installing, replacing and removing it, the IPv4 forwarding
 //!   switch, alerts and drop counters.
+//! - [`conntrack`]: deleting the tracked connections a narrowed or
+//!   removed bridge no longer allows.
 //! - [`status`]: `externalBridge` of the status API and its digests.
 //!
 //! The mesh module itself (`outbound-mesh`) is only read from: wiring the
@@ -21,6 +23,7 @@
 
 pub mod apply;
 pub mod config;
+pub mod conntrack;
 pub mod ruleset;
 pub mod status;
 

@@ -24,7 +24,10 @@ use std::time::SystemTime;
 
 use std::io::Write as _;
 
+use outbound_mesh::IpNet;
+
 use crate::config::{valid_interface, BridgeError, ExternalBridge};
+use crate::conntrack::{self, Flow};
 use crate::ruleset::{self, COUNTER_INBOUND_DENIED, COUNTER_SOURCE_DENIED};
 use crate::status::BridgeStatus;
 
@@ -52,6 +55,10 @@ pub trait Host: Send + Sync {
     /// Reads a `/proc/sys` value, trimmed.
     fn read_sysctl(&self, path: &str) -> io::Result<String>;
     fn write_sysctl(&self, path: &str, value: &str) -> io::Result<()>;
+    /// Every tracked connection (both address families).
+    fn conntrack_flows(&self) -> io::Result<Vec<Flow>>;
+    /// Deletes these tracked connections; one already gone is not an error.
+    fn conntrack_delete(&self, flows: &[&Flow]) -> io::Result<()>;
 }
 
 /// The host itself.
@@ -105,6 +112,45 @@ impl Host for SystemHost {
     fn write_sysctl(&self, path: &str, value: &str) -> io::Result<()> {
         std::fs::write(path, value)
     }
+
+    #[cfg(target_os = "linux")]
+    fn conntrack_flows(&self) -> io::Result<Vec<Flow>> {
+        conntrack::sys::flows()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn conntrack_delete(&self, flows: &[&Flow]) -> io::Result<()> {
+        conntrack::sys::delete(flows)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn conntrack_flows(&self) -> io::Result<Vec<Flow>> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn conntrack_delete(&self, _flows: &[&Flow]) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// Deletes the tracked connections from any of `pairs` (sources,
+/// destinations). One dump, then one delete per selected entry.
+fn flush(host: &dyn Host, pairs: &[(Vec<IpNet>, Vec<IpNet>)]) -> io::Result<usize> {
+    if pairs.iter().all(|(s, d)| s.is_empty() || d.is_empty()) {
+        return Ok(0);
+    }
+    let flows = host.conntrack_flows()?;
+    let mut selected: Vec<&Flow> = Vec::new();
+    for (sources, destinations) in pairs {
+        for flow in conntrack::select(&flows, sources, destinations) {
+            if !selected.iter().any(|seen| std::ptr::eq(*seen, flow)) {
+                selected.push(flow);
+            }
+        }
+    }
+    host.conntrack_delete(&selected)?;
+    Ok(selected.len())
 }
 
 /// The process-wide IPv4 forwarding switch, shared by all bridges.
@@ -221,6 +267,12 @@ pub struct Bridge {
     status: Option<BridgeStatus>,
     failure: Option<String>,
     ipv6_off: bool,
+    /// (allow, routes) of the rules now installed.
+    rules: Option<(Vec<IpNet>, Vec<IpNet>)>,
+    /// Tracked connections still to delete: from rules that were narrowed
+    /// or removed while deleting them failed. Retried on every change; the
+    /// status moves only once this is empty.
+    pending: Vec<(Vec<IpNet>, Vec<IpNet>)>,
 }
 
 impl Bridge {
@@ -242,6 +294,8 @@ impl Bridge {
             status: None,
             failure: None,
             ipv6_off: false,
+            rules: None,
+            pending: Vec::new(),
         })
     }
 
@@ -282,12 +336,35 @@ impl Bridge {
             self.guard = None;
         }
         self.ipv6_off = wants_v6 && !self.forwarding.ipv6_on();
+        // Connections set up under the old lists that the new ones no
+        // longer allow would otherwise keep going (recheck #356 X3).
+        if let Some((old_allow, old_routes)) = self.rules.take() {
+            self.pending.extend(conntrack::narrowed(
+                &old_allow,
+                &old_routes,
+                Some((bridge.allow(), bridge.routes())),
+            ));
+        }
+        self.rules = Some((bridge.allow().to_vec(), bridge.routes().to_vec()));
+        self.flush_pending().map_err(|error| self.failed(error))?;
         self.failure = None;
         self.status = Some(BridgeStatus::new(
             bridge.routes(),
             bridge.allow(),
             SystemTime::now(),
         ));
+        Ok(())
+    }
+
+    /// Deletes the pending tracked connections; the status may move only
+    /// when this succeeds.
+    fn flush_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        flush(self.host.as_ref(), &self.pending)
+            .map_err(|error| io::Error::new(error.kind(), format!("conntrack: {error}")))?;
+        self.pending.clear();
         Ok(())
     }
 
@@ -309,6 +386,14 @@ impl Bridge {
             self.installed = false;
         }
         self.guard = None;
+        if let Some((old_allow, old_routes)) = self.rules.take() {
+            self.pending
+                .extend(conntrack::narrowed(&old_allow, &old_routes, None));
+        }
+        // Until the old connections are gone the status keeps the last
+        // applied lists, so the panel does not release anything early.
+        self.flush_pending()
+            .inspect_err(|error| self.failure = Some(error.to_string()))?;
         self.status = None;
         self.failure = None;
         self.ipv6_off = false;
@@ -378,9 +463,126 @@ pub fn cleanup_all(host: &dyn Host) -> io::Result<usize> {
     let Some(script) = ruleset::render_cleanup(refs) else {
         return Ok(0);
     };
+    // The lists of each table, read before it goes, say which tracked
+    // connections were set up through it (recheck #356 X3). A table whose
+    // lists cannot be read still goes; the error is reported afterwards
+    // rather than guessing a wider set of connections to cut.
+    let mut pairs = Vec::new();
+    let mut unread = None;
+    for line in script.lines() {
+        let name = line.trim_start_matches("delete table inet ");
+        match host
+            .nft(&["-j", "list", "table", "inet", name], None)
+            .and_then(|json| table_lists(&json))
+        {
+            Ok(lists) => pairs.push(lists),
+            Err(error) => unread = Some(error),
+        }
+    }
     let count = script.lines().count();
     host.nft(&["-f", "-"], Some(&script))?;
+    flush(host, &pairs)
+        .map_err(|error| io::Error::new(error.kind(), format!("conntrack: {error}")))?;
+    if let Some(error) = unread {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "rules removed, but their lists could not be read to clear tracked connections: {error}"
+            ),
+        ));
+    }
     Ok(count)
+}
+
+/// (allow, routes) of one of our tables in `nft -j list table`.
+pub fn table_lists(json: &str) -> io::Result<(Vec<IpNet>, Vec<IpNet>)> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let items = value
+        .get("nftables")
+        .and_then(|items| items.as_array())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no nftables array"))?;
+    let mut allow = Vec::new();
+    let mut routes = Vec::new();
+    for set in items.iter().filter_map(|item| item.get("set")) {
+        let target = match set.get("name").and_then(|n| n.as_str()) {
+            Some("allow_v4" | "allow_v6") => &mut allow,
+            Some("routes_v4" | "routes_v6") => &mut routes,
+            _ => continue,
+        };
+        let Some(elements) = set.get("elem").and_then(|e| e.as_array()) else {
+            continue;
+        };
+        for element in elements {
+            target.extend(element_nets(element).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected set element {element}"),
+                )
+            })?);
+        }
+    }
+    Ok((allow, routes))
+}
+
+/// One set element as networks: an address, `{"prefix": {addr, len}}`, or
+/// `{"range": [first, last]}` split into prefixes.
+fn element_nets(element: &serde_json::Value) -> Option<Vec<IpNet>> {
+    if let Some(text) = element.as_str() {
+        return Some(vec![IpNet::host(text.parse().ok()?)]);
+    }
+    if let Some(prefix) = element.get("prefix") {
+        let address: IpAddr = prefix.get("addr")?.as_str()?.parse().ok()?;
+        let len = u8::try_from(prefix.get("len")?.as_u64()?).ok()?;
+        return Some(vec![IpNet::new(address, len)?]);
+    }
+    if let Some(range) = element.get("range").and_then(|r| r.as_array()) {
+        let first: IpAddr = range.first()?.as_str()?.parse().ok()?;
+        let last: IpAddr = range.get(1)?.as_str()?.parse().ok()?;
+        return range_nets(first, last);
+    }
+    None
+}
+
+/// The prefixes that exactly cover `first..=last` (same family).
+fn range_nets(first: IpAddr, last: IpAddr) -> Option<Vec<IpNet>> {
+    let (mut start, end, bits, v4) = match (first, last) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => (
+            u128::from(u32::from(a)),
+            u128::from(u32::from(b)),
+            32u32,
+            true,
+        ),
+        (IpAddr::V6(a), IpAddr::V6(b)) => (u128::from(a), u128::from(b), 128u32, false),
+        _ => return None,
+    };
+    if start > end {
+        return None;
+    }
+    let mut nets = Vec::new();
+    loop {
+        // Largest block aligned at `start` that does not pass `end`.
+        let mut size = if start == 0 {
+            bits
+        } else {
+            start.trailing_zeros().min(bits)
+        };
+        while size > 0 && (size >= 128 || start + ((1u128 << size) - 1) > end) {
+            size -= 1;
+        }
+        let address = if v4 {
+            IpAddr::V4(std::net::Ipv4Addr::from(start as u32))
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::from(start))
+        };
+        nets.push(IpNet::new(address, (bits - size) as u8)?);
+        let block_end = start + ((1u128 << size) - 1);
+        if block_end >= end {
+            break;
+        }
+        start = block_end + 1;
+    }
+    Some(nets)
 }
 
 /// (family, name) of each table in `nft -j list tables`.
@@ -440,6 +642,11 @@ mod tests {
         fail_nft: Mutex<bool>,
         /// (family, name) of the tables "on the host".
         tables: Mutex<Vec<(String, String)>>,
+        /// The last script that created each table, to list its sets.
+        table_scripts: Mutex<HashMap<String, String>>,
+        /// Tracked connections "in the kernel".
+        flows: Mutex<Vec<Flow>>,
+        fail_conntrack: Mutex<bool>,
     }
 
     impl FakeHost {
@@ -480,6 +687,13 @@ mod tests {
                     tables.join(",")
                 ));
             }
+            if let ["-j", "list", "table", "inet", name] = args {
+                let scripts = self.table_scripts.lock().unwrap();
+                let script = scripts
+                    .get(*name)
+                    .ok_or_else(|| io::Error::other("no such table"))?;
+                return Ok(fake_table_json(script));
+            }
             if args[0] == "-j" {
                 return Ok(r#"{"nftables":[{"metainfo":{}},{"counter":{"name":"source_denied","packets":3,"bytes":180}},{"counter":{"name":"inbound_denied","packets":7,"bytes":420}}]}"#.into());
             }
@@ -490,6 +704,12 @@ mod tests {
                 if let Some(name) = line.strip_prefix("delete table inet ") {
                     tables.retain(|(f, n)| !(f == "inet" && n == name));
                 } else if let Some(rest) = line.strip_prefix("table inet ") {
+                    if rest.ends_with(" {") {
+                        self.table_scripts
+                            .lock()
+                            .unwrap()
+                            .insert(rest.trim_end_matches(" {").to_owned(), script.to_owned());
+                    }
                     let name = rest.trim_end_matches(" {").to_owned();
                     if !tables.iter().any(|(f, n)| f == "inet" && *n == name) {
                         tables.push(("inet".into(), name));
@@ -518,6 +738,231 @@ mod tests {
                 .insert(path.into(), value.into());
             Ok(())
         }
+        fn conntrack_flows(&self) -> io::Result<Vec<Flow>> {
+            if *self.fail_conntrack.lock().unwrap() {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            Ok(self.flows.lock().unwrap().clone())
+        }
+        fn conntrack_delete(&self, flows: &[&Flow]) -> io::Result<()> {
+            self.flows
+                .lock()
+                .unwrap()
+                .retain(|flow| !flows.iter().any(|gone| *gone == flow));
+            Ok(())
+        }
+    }
+
+    /// `nft -j list table` for a table the fake created: its sets with the
+    /// elements of the script, prefixes as nft prints them.
+    fn fake_table_json(script: &str) -> String {
+        let mut sets = Vec::new();
+        let mut current: Option<&str> = None;
+        for line in script.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_prefix("set ").and_then(|l| l.strip_suffix(" {")) {
+                current = Some(name);
+            } else if let (Some(name), Some(list)) = (
+                current,
+                line.strip_prefix("elements = { ")
+                    .and_then(|l| l.strip_suffix(" }")),
+            ) {
+                let elements: Vec<String> = list
+                    .split(", ")
+                    .map(|element| match element.split_once('/') {
+                        Some((addr, len)) if len != "32" && len != "128" => {
+                            format!(r#"{{"prefix":{{"addr":"{addr}","len":{len}}}}}"#)
+                        }
+                        Some((addr, _)) => format!(r#""{addr}""#),
+                        None => format!(r#""{element}""#),
+                    })
+                    .collect();
+                sets.push(format!(
+                    r#"{{"set":{{"family":"inet","name":"{name}","elem":[{}]}}}}"#,
+                    elements.join(",")
+                ));
+            } else if line == "}" {
+                current = None;
+            }
+        }
+        format!(r#"{{"nftables":[{{"metainfo":{{}}}},{}]}}"#, sets.join(","))
+    }
+
+    fn flow(src: &str, dst: &str) -> Flow {
+        conntrack::test_flow(src.parse().unwrap(), dst.parse().unwrap())
+    }
+
+    fn flows(host: &FakeHost) -> Vec<(String, String)> {
+        host.flows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| (f.source.to_string(), f.destination.to_string()))
+            .collect()
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    #[test]
+    fn narrowing_the_lists_cuts_the_connections_they_no_longer_allow() {
+        let (host, forwarding) = setup("1", "1");
+        let mut bridge = Bridge::new(host.clone(), forwarding, "anixmesh-0").unwrap();
+        bridge
+            .apply(
+                &checked(
+                    &["100.64.0.5", "100.64.0.6"],
+                    &["10.150.0.2/32", "10.150.0.3/32"],
+                ),
+                &subnet(),
+                &[],
+            )
+            .unwrap();
+        host.flows.lock().unwrap().extend([
+            flow("10.150.0.2", "100.64.0.5"),
+            flow("10.150.0.3", "100.64.0.5"),
+            flow("10.150.0.2", "100.64.0.6"),
+            // Not through the bridge.
+            flow("10.150.0.3", "10.150.0.1"),
+            flow("100.64.0.5", "100.100.0.1"),
+        ]);
+        // 10.150.0.3 leaves the list.
+        bridge
+            .apply(
+                &checked(&["100.64.0.5", "100.64.0.6"], &["10.150.0.2/32"]),
+                &subnet(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            flows(&host),
+            [
+                pair("10.150.0.2", "100.64.0.5"),
+                pair("10.150.0.2", "100.64.0.6"),
+                pair("10.150.0.3", "10.150.0.1"),
+                pair("100.64.0.5", "100.100.0.1"),
+            ]
+        );
+        // 100.64.0.6 leaves the routes.
+        bridge
+            .apply(
+                &checked(&["100.64.0.5"], &["10.150.0.2/32"]),
+                &subnet(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(flows(&host).len(), 3);
+        // Removal cuts the rest of the bridged ones.
+        bridge.remove().unwrap();
+        assert_eq!(
+            flows(&host),
+            [
+                pair("10.150.0.3", "10.150.0.1"),
+                pair("100.64.0.5", "100.100.0.1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_status_waits_until_the_old_connections_are_gone() {
+        let (host, forwarding) = setup("1", "1");
+        let mut bridge = Bridge::new(host.clone(), forwarding, "anixmesh-0").unwrap();
+        let wide = checked(&["100.64.0.5"], &["10.150.0.2/32", "10.150.0.3/32"]);
+        bridge.apply(&wide, &subnet(), &[]).unwrap();
+        let before = bridge.status().unwrap().clone();
+        host.flows
+            .lock()
+            .unwrap()
+            .push(flow("10.150.0.3", "100.64.0.5"));
+
+        *host.fail_conntrack.lock().unwrap() = true;
+        let narrow = checked(&["100.64.0.5"], &["10.150.0.2/32"]);
+        assert!(bridge.apply(&narrow, &subnet(), &[]).is_err());
+        assert_eq!(bridge.status(), Some(&before), "not applied yet");
+        assert_eq!(bridge.alerts()[0].code, ALERT_APPLY_FAILED);
+        assert!(bridge.alerts()[0].detail.starts_with("conntrack:"));
+
+        // The next attempt retries what is pending.
+        *host.fail_conntrack.lock().unwrap() = false;
+        bridge.apply(&narrow, &subnet(), &[]).unwrap();
+        assert_eq!(bridge.status().unwrap().allow_count, 1);
+        assert!(flows(&host).is_empty());
+
+        // Removal keeps the status until the connections are gone too.
+        host.flows
+            .lock()
+            .unwrap()
+            .push(flow("10.150.0.2", "100.64.0.5"));
+        *host.fail_conntrack.lock().unwrap() = true;
+        assert!(bridge.remove().is_err());
+        assert!(bridge.status().is_some());
+        *host.fail_conntrack.lock().unwrap() = false;
+        bridge.remove().unwrap();
+        assert!(bridge.status().is_none());
+        assert!(flows(&host).is_empty());
+    }
+
+    #[test]
+    fn startup_cleanup_also_cuts_the_crashed_runs_connections() {
+        let (host, forwarding) = setup("1", "1");
+        let mut crashed = Bridge::new(host.clone(), forwarding, "anixmesh-0").unwrap();
+        crashed
+            .apply(
+                &checked(
+                    &["100.64.0.5", "192.168.50.0/24"],
+                    &["10.127.0.0/24", "10.150.0.2/32"],
+                ),
+                &subnet(),
+                &[],
+            )
+            .unwrap();
+        std::mem::forget(crashed);
+        host.flows.lock().unwrap().extend([
+            flow("10.127.0.9", "192.168.50.7"),
+            flow("10.150.0.2", "100.64.0.5"),
+            flow("10.150.0.4", "100.64.0.5"),
+        ]);
+        assert_eq!(cleanup_all(host.as_ref()).unwrap(), 1);
+        assert_eq!(flows(&host), [pair("10.150.0.4", "100.64.0.5")]);
+    }
+
+    #[test]
+    fn set_elements_are_read_in_every_form_nft_prints() {
+        let json = r#"{"nftables":[{"metainfo":{}},
+            {"set":{"family":"inet","name":"allow_v4","elem":["10.150.0.2",{"prefix":{"addr":"10.127.0.0","len":24}},{"range":["10.0.0.1","10.0.0.6"]}]}},
+            {"set":{"family":"inet","name":"routes_v6","elem":["fd7a:115c:a1e0::9"]}},
+            {"set":{"family":"inet","name":"local_v4","elem":["10.150.0.1"]}},
+            {"set":{"family":"inet","name":"routes_v4"}}]}"#;
+        let (allow, routes) = table_lists(json).unwrap();
+        let allow: Vec<String> = allow.iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            allow,
+            [
+                "10.150.0.2/32",
+                "10.127.0.0/24",
+                "10.0.0.1/32",
+                "10.0.0.2/31",
+                "10.0.0.4/31",
+                "10.0.0.6/32"
+            ]
+        );
+        let routes: Vec<String> = routes.iter().map(|n| n.to_string()).collect();
+        assert_eq!(routes, ["fd7a:115c:a1e0::9/128"]);
+        assert!(
+            table_lists(r#"{"nftables":[{"set":{"name":"allow_v4","elem":[{"weird":1}]}}]}"#)
+                .is_err()
+        );
+        let all: Vec<String> = range_nets(
+            "0.0.0.0".parse().unwrap(),
+            "255.255.255.255".parse().unwrap(),
+        )
+        .unwrap()
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+        assert_eq!(all, ["0.0.0.0/0"]);
+        assert!(range_nets("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap()).is_none());
     }
 
     fn checked(routes: &[&str], allow: &[&str]) -> ExternalBridge {
@@ -738,6 +1183,12 @@ mod tests {
                 Ok("0".into())
             }
             fn write_sysctl(&self, _: &str, _: &str) -> io::Result<()> {
+                Ok(())
+            }
+            fn conntrack_flows(&self) -> io::Result<Vec<Flow>> {
+                Ok(Vec::new())
+            }
+            fn conntrack_delete(&self, _: &[&Flow]) -> io::Result<()> {
                 Ok(())
             }
         }

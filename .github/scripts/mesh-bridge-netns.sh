@@ -34,6 +34,8 @@ expect_reach() { if reaches "$@"; then pass "$1 reaches ${*: -1} (${*:2})"; else
 expect_blocked() { if reaches "$@"; then fail "$1 should not reach (${*:2})"; else pass "$1 blocked (${*:2})"; fi; }
 counters() { ip netns exec bridge "${BIN}" counters "${MESH_IF}"; }
 digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+# Tracked connections in the bridge namespace from $1 to $2.
+tracked() { ip netns exec bridge conntrack -L -s "$1" -d "$2" 2>/dev/null | grep -c . || true; }
 
 for ns in member bridge extnet; do
   ip netns add "${ns}"
@@ -95,10 +97,19 @@ if (( inbound_denied >= 2 )); then pass "inbound_denied counted (${inbound_denie
 # The bridge's own external address is not ours to block.
 expect_reach extnet 100.100.0.1
 
+# Recheck #356 X3: narrowing the list also deletes the tracked connections
+# it no longer allows; the external side's own connections stay.
+n="$(tracked 10.150.0.2 100.100.0.5)"
+if (( n >= 1 )); then pass "allowed source has tracked connections (${n})"; else fail "allowed source has tracked connections"; fi
+
 # A new allow list replaces the old one at once.
 config='{"interface":"ext0","routes":["100.100.0.5"],"allow":["10.150.0.3/32"]}'
 ip netns exec bridge "${BIN}" apply "${MESH_IF}" "${config}" 10.150.0.0/16 10.150.0.1
 ip -n extnet route del 10.150.0.0/16
+n="$(tracked 10.150.0.2 100.100.0.5)"
+if (( n == 0 )); then pass "removed source's tracked connections deleted"; else fail "removed source still has ${n} tracked connections"; fi
+n="$(tracked 100.100.0.5 100.100.0.1)"
+if (( n >= 1 )); then pass "external side's own connections kept (${n})"; else fail "external side's own connections kept"; fi
 expect_blocked member -I 10.150.0.2 100.100.0.5
 expect_reach member -I 10.150.0.3 100.100.0.5
 
@@ -129,7 +140,15 @@ ip netns exec bridge "${BIN}" apply anixmesh-1 "${config}" 10.151.0.0/16 10.151.
 ip netns exec bridge nft add table inet other_program
 ip netns exec bridge nft add table inet anixops_bridge_other
 ip netns exec bridge nft add table ip anixops_bridge_616e69786d6573682d30
+expect_reach member -I 10.150.0.3 100.100.0.5
+expect_reach extnet 100.100.0.1
+n="$(tracked 10.150.0.3 100.100.0.5)"
+if (( n >= 1 )); then pass "crashed run left tracked connections (${n})"; else fail "crashed run left tracked connections"; fi
 removed="$(ip netns exec bridge "${BIN}" cleanup)"
+n="$(tracked 10.150.0.3 100.100.0.5)"
+if (( n == 0 )); then pass "cleanup deleted the bridged connections"; else fail "cleanup left ${n} bridged connections"; fi
+n="$(tracked 100.100.0.5 100.100.0.1)"
+if (( n >= 1 )); then pass "cleanup kept other connections (${n})"; else fail "cleanup kept other connections"; fi
 if [[ "${removed}" == 2 ]]; then pass "cleanup removed our 2 tables"; else fail "cleanup removed ${removed}, want 2"; fi
 left="$(ip netns exec bridge nft list tables)"
 echo "${left}"

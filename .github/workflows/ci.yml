@@ -726,10 +726,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v nft >/dev/null 2>&1 && [[ ! -x /usr/sbin/nft ]]; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends nftables
-          fi
+          # conntrack only lets the script look at the tracked connections;
+          # the bridge itself talks to the kernel directly.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables conntrack
           shellcheck --shell=bash .github/scripts/mesh-bridge-netns.sh
 
       - name: Build the bridge driver
