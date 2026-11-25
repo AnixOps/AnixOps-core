@@ -249,7 +249,12 @@ async fn reports_refused_targets() {
         let (_socket, refused) = refused_addr();
         let mut client = TcpStream::connect(server.addr).await.unwrap();
         assert_eq!(authenticate(&mut client, LOGIN, PASSWORD).await, 0);
-        assert_eq!(request(&mut client, 1, refused).await, 5);
+        // Linux and Windows refuse a bound port that does not listen
+        // (0x05); macOS drops the connection attempt until the outbound's
+        // timeout (0x04). The mapping of each error kind is checked by the
+        // unit test connect_failures_get_their_reply.
+        let reply = request(&mut client, 1, refused).await;
+        assert!(reply == 5 || reply == 4, "reply {reply}");
         assert!(closed(&mut client).await);
         assert_eq!(server.stats.connect_failed.load(Ordering::Relaxed), 1);
     })
