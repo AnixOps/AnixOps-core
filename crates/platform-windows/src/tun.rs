@@ -37,6 +37,11 @@
 //! queries) and on loopback; they go away with the adapter or the process.
 //! [`WindowsTun::outside_dns_blocked`] reports whether they are in place.
 //!
+//! For the mesh alone (`routes`, mesh-status.md 隧道生命周期) the adapter
+//! carries only the routes it is given instead of the capture routes, and
+//! [`WindowsTun::set_routes`] replaces them while it is open as the engine's
+//! routes change; everything else keeps the physical default route.
+//!
 //! Packets read from the adapter go to the callback given to
 //! [`WindowsTun::start_reader`] on a dedicated thread; packets for the
 //! adapter go through a [`WindowsTunWriter`], from any thread.
@@ -78,6 +83,13 @@ pub struct WindowsTunSettings {
     /// Wintun ring capacity in bytes: a power of two between 128 KiB and
     /// 64 MiB.
     pub ring_capacity: u32,
+    /// The routes the adapter carries: `None` captures everything
+    /// ([`capture_routes`]); a list carries only those, as for the mesh
+    /// alone, where an empty list routes nothing yet.
+    pub routes: Option<Vec<CaptureRoute>>,
+    /// Points the adapter's DNS at the tunnel. Off for the mesh alone
+    /// without internal domain names: the device keeps its own DNS.
+    pub announce_dns: bool,
 }
 
 impl Default for WindowsTunSettings {
@@ -91,6 +103,8 @@ impl Default for WindowsTunSettings {
             block_outside_dns: true,
             mtu: 1500,
             ring_capacity: 0x0040_0000,
+            routes: None,
+            announce_dns: true,
         }
     }
 }
@@ -136,6 +150,9 @@ impl WindowsTunSettings {
                 "the Wintun ring capacity must be a power of two from 128 KiB to 64 MiB",
             ));
         }
+        if self.routes.iter().flatten().any(|route| !route.is_valid()) {
+            return Err(invalid("a TUN route prefix is longer than its address"));
+        }
         Ok(())
     }
 }
@@ -163,8 +180,43 @@ pub enum CaptureRoute {
     V6(Ipv6Addr, u8),
 }
 
-/// The capture routes for `settings`.
+impl CaptureRoute {
+    /// A route from `10.144.144.0/24`, `fd00::/64` or a bare address (one
+    /// host); `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (address, length) = match text.trim().split_once('/') {
+            Some((address, length)) => (address, Some(length.parse::<u8>().ok()?)),
+            None => (text.trim(), None),
+        };
+        let route = match address.parse::<std::net::IpAddr>().ok()? {
+            std::net::IpAddr::V4(address) => Self::V4(address, length.unwrap_or(32)),
+            std::net::IpAddr::V6(address) => Self::V6(address, length.unwrap_or(128)),
+        };
+        route.is_valid().then_some(route)
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::V4(_, length) => *length <= 32,
+            Self::V6(_, length) => *length <= 128,
+        }
+    }
+
+    fn is_ipv6(&self) -> bool {
+        matches!(self, Self::V6(..))
+    }
+}
+
+/// The routes the adapter carries for `settings`: its own list (IPv6 routes
+/// only when the adapter has IPv6), else the capture routes.
 pub fn capture_routes(settings: &WindowsTunSettings) -> Vec<CaptureRoute> {
+    if let Some(routes) = &settings.routes {
+        return routes
+            .iter()
+            .filter(|route| settings.ipv6.is_some() || !route.is_ipv6())
+            .copied()
+            .collect();
+    }
     let mut routes = vec![
         CaptureRoute::V4(Ipv4Addr::new(0, 0, 0, 0), 1),
         CaptureRoute::V4(Ipv4Addr::new(128, 0, 0, 0), 1),
@@ -505,6 +557,14 @@ mod unsupported {
             0
         }
 
+        pub fn set_routes(&mut self, _routes: &[CaptureRoute]) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn routes(&self) -> &[CaptureRoute] {
+            &[]
+        }
+
         pub fn outside_dns_blocked(&self) -> bool {
             false
         }
@@ -560,11 +620,11 @@ mod native {
     };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         CancelMibChangeNotify2, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
-        CreateUnicastIpAddressEntry, FreeMibTable, GetBestInterfaceEx, GetIpForwardTable2,
-        GetIpInterfaceEntry, InitializeIpForwardEntry, InitializeIpInterfaceEntry,
-        InitializeUnicastIpAddressEntry, NotifyIpInterfaceChange, NotifyRouteChange2,
-        SetIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
-        MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
+        CreateUnicastIpAddressEntry, DeleteIpForwardEntry2, FreeMibTable, GetBestInterfaceEx,
+        GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry,
+        InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry, NotifyIpInterfaceChange,
+        NotifyRouteChange2, SetIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+        MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows_sys::Win32::Networking::WinSock::{
@@ -731,6 +791,11 @@ mod native {
         dns_guard: Option<DnsGuard>,
         dns_guard_error: Option<String>,
         session: Arc<Session>,
+        luid: NET_LUID_LH,
+        /// Whether the adapter has IPv6: IPv6 routes are left out without.
+        ipv6: bool,
+        /// The routes the adapter carries now ([`Self::set_routes`]).
+        routes: Vec<CaptureRoute>,
         interface_index: u32,
         physical: Arc<PhysicalInterfaceTracker>,
         watch: Option<RouteWatch>,
@@ -793,12 +858,15 @@ mod native {
                 configure_interface(&luid, AF_INET6, settings.mtu)?;
                 add_address(&luid, ipv6_sockaddr(address), prefix)?;
             }
-            set_dns(interface_index, "ipv4", &settings.dns.to_string())?;
-            if let Some(dns6) = ipv6_dns_server(settings) {
-                set_dns(interface_index, "ipv6", &dns6.to_string())?;
+            if settings.announce_dns {
+                set_dns(interface_index, "ipv4", &settings.dns.to_string())?;
+                if let Some(dns6) = ipv6_dns_server(settings) {
+                    set_dns(interface_index, "ipv6", &dns6.to_string())?;
+                }
             }
-            for route in capture_routes(settings) {
-                add_route(&luid, interface_index, route)?;
+            let routes = capture_routes(settings);
+            for route in &routes {
+                add_route(&luid, interface_index, *route)?;
             }
             // Best effort: without the filter engine (the Base Filtering
             // Engine service stopped) the tunnel still works, and the host
@@ -824,12 +892,52 @@ mod native {
                 dns_guard,
                 dns_guard_error,
                 session,
+                luid,
+                ipv6: settings.ipv6.is_some(),
+                routes,
                 interface_index,
                 physical,
                 watch: Some(watch),
                 quit: Arc::new(Event::new()?),
                 reader: None,
             })
+        }
+
+        /// Replaces the routes the adapter carries with `routes` (the mesh's,
+        /// as the engine names them): the ones that went away are deleted
+        /// and the new ones added, so traffic on routes that stay is not
+        /// interrupted. IPv6 routes are left out when the adapter has no
+        /// IPv6. The physical interface does not change.
+        pub fn set_routes(&mut self, routes: &[CaptureRoute]) -> io::Result<()> {
+            if let Some(route) = routes.iter().find(|route| !route.is_valid()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the TUN route {route:?} is not valid"),
+                ));
+            }
+            let next: Vec<CaptureRoute> = routes
+                .iter()
+                .filter(|route| self.ipv6 || !route.is_ipv6())
+                .copied()
+                .collect();
+            for route in self.routes.clone() {
+                if !next.contains(&route) {
+                    delete_route(&self.luid, self.interface_index, route)?;
+                    self.routes.retain(|kept| *kept != route);
+                }
+            }
+            for route in next {
+                if !self.routes.contains(&route) {
+                    add_route(&self.luid, self.interface_index, route)?;
+                    self.routes.push(route);
+                }
+            }
+            Ok(())
+        }
+
+        /// The routes the adapter carries now.
+        pub fn routes(&self) -> &[CaptureRoute] {
+            &self.routes
         }
 
         /// The interfaces the engine's own sockets must use now. It changes
@@ -1277,7 +1385,7 @@ mod native {
         win32(result, "the TUN adapter address could not be set")
     }
 
-    fn add_route(luid: &NET_LUID_LH, index: u32, route: CaptureRoute) -> io::Result<()> {
+    fn route_row(luid: &NET_LUID_LH, index: u32, route: CaptureRoute) -> MIB_IPFORWARD_ROW2 {
         let mut row: MIB_IPFORWARD_ROW2 = unsafe { zeroed() };
         unsafe { InitializeIpForwardEntry(&mut row) };
         row.InterfaceLuid = *luid;
@@ -1295,11 +1403,23 @@ mod native {
             }
         }
         row.Metric = 0;
-        let result = unsafe { CreateIpForwardEntry2(&row) };
+        row
+    }
+
+    fn add_route(luid: &NET_LUID_LH, index: u32, route: CaptureRoute) -> io::Result<()> {
+        let result = unsafe { CreateIpForwardEntry2(&route_row(luid, index, route)) };
         if result == ERROR_OBJECT_ALREADY_EXISTS {
             return Ok(());
         }
         win32(result, "a TUN route could not be added")
+    }
+
+    fn delete_route(luid: &NET_LUID_LH, index: u32, route: CaptureRoute) -> io::Result<()> {
+        let result = unsafe { DeleteIpForwardEntry2(&route_row(luid, index, route)) };
+        if result == ERROR_NOT_FOUND {
+            return Ok(());
+        }
+        win32(result, "a TUN route could not be removed")
     }
 
     /// Points the adapter's DNS of `family` (`ipv4` or `ipv6`) at `dns` with
@@ -1469,6 +1589,45 @@ mod tests {
             ..settings
         };
         assert_eq!(capture_routes(&v4_only).len(), 2);
+    }
+
+    #[test]
+    fn the_mesh_alone_carries_only_its_own_routes() {
+        let routes = vec![
+            CaptureRoute::parse("10.144.144.0/24").unwrap(),
+            CaptureRoute::parse("198.18.0.2").unwrap(),
+            CaptureRoute::parse("fd00:1::/64").unwrap(),
+        ];
+        assert_eq!(
+            routes[1],
+            CaptureRoute::V4(Ipv4Addr::new(198, 18, 0, 2), 32)
+        );
+        let settings = WindowsTunSettings {
+            routes: Some(routes.clone()),
+            announce_dns: false,
+            ..WindowsTunSettings::default()
+        };
+        settings.validate().unwrap();
+        assert_eq!(capture_routes(&settings), routes);
+        let v4_only = WindowsTunSettings {
+            ipv6: None,
+            ..settings.clone()
+        };
+        assert_eq!(capture_routes(&v4_only), routes[..2].to_vec());
+        let nothing_yet = WindowsTunSettings {
+            routes: Some(Vec::new()),
+            ..settings
+        };
+        assert!(capture_routes(&nothing_yet).is_empty());
+
+        for bad in ["10.0.0.0/33", "fd00::/129", "example.com", "10.0.0.0/x", ""] {
+            assert_eq!(CaptureRoute::parse(bad), None, "{bad}");
+        }
+        let invalid = WindowsTunSettings {
+            routes: Some(vec![CaptureRoute::V4(Ipv4Addr::new(10, 0, 0, 0), 40)]),
+            ..WindowsTunSettings::default()
+        };
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

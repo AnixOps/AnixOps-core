@@ -22,14 +22,21 @@
 //!   traffic keys, rotation and the replay window.
 //! - [`link`]: one direct connection: the handshake of the network's mode,
 //!   then the receive checks and the encryption of packets.
+//! - [`driver`] (feature `runtime`): sockets, dialing, listening and timers
+//!   around a [`node::Node`].
+//! - [`node`]: one node of one network without I/O: connections,
+//!   keep-alive, RPC, route synchronisation, forwarding and traffic checks.
 //! - [`status`]: what a node agent reads and writes through the kernel's
 //!   management API (`/v1/mesh`), and the trait that API drives the mesh
 //!   through.
 
 pub mod config;
+#[cfg(feature = "runtime")]
+pub mod driver;
 pub mod legacy;
 pub mod link;
 pub mod net;
+pub mod node;
 pub mod packet;
 pub mod route;
 pub mod routes;
