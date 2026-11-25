@@ -45,6 +45,7 @@
 ### Added
 
 - 文档 `docs/deploy/mesh-device.md`：无 Agent 组网设备（R31、R32、R35）的程序侧约定，即 `enroll`、`device`、`device-status` 子命令、状态目录、配置读取与上报、字段白名单校验、令牌失效与退避、本机状态套接字、OpenWrt 软件包与 LuCI 插件。
+- 部署文档补超大旧网不建桥的检查（#321 复审 J6b，规范 §11.2、§15.11.1）：桥接节点先以普通成员加入旧网、实测成员数与同步超限告警，超过 4096 个节点或 8 MiB 时不建桥并报告 `legacy_network_too_large`。
 
 - anixops-mesh 接管 Windows 计划任务与登录自启项（mesh-node `winstart`、`detect`、`takeover`，R12 内核 0.4）：计划任务以 `schtasks.exe /End` 结束、`/Change /DISABLE` 关闭，回滚 `/ENABLE` 后 `/Run`；`Run` 键与启动文件夹的自启项按 Windows 自己的启动项设置（`Explorer\StartupApproved`）关闭，回滚恢复原值，已被他人改动时保留现状；未登录用户的启动文件夹只报告。
 - anixops-mesh 接管支持 Windows（mesh-node `winsvc`、`detect`、`takeover`、`host`、`cmdline`，R12/R32 内核 0.4）：进程从系统进程表读取（命令行、工作目录、完整环境变量与运行账户），检测以该程序运行或在数据文件中点名的服务；接管先 `sc.exe stop` 再禁用，回滚逆序恢复启动方式后启动，服务进程不单独重启；其他账户运行的手动进程在任何改动之前报告并失败。新增 `install-windows.ps1`（服务 `AnixOpsMesh`，数据目录仅 SYSTEM 与 Administrators 可访问）。
