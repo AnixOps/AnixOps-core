@@ -2319,6 +2319,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "outbound-mesh"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "outbound-mieru"
 version = "0.2.0"
 dependencies = [

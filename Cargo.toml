@@ -32,6 +32,7 @@ members = [
     "crates/outbound-http",
     "crates/outbound-hysteria2",
     "crates/outbound-iwan",
+    "crates/outbound-mesh",
     "crates/outbound-mieru",
     "crates/outbound-shadowsocks",
     "crates/outbound-snell",

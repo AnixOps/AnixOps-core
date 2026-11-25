@@ -466,3 +466,12 @@ linux-artifact-license-notice-release-assets=eligible-after-package-signing-chec
 `package-linux` 和 release assets 仍必须遵守
 `docs/architecture/linux-package-license-notice-transition-validation-contract.md`、同 commit CI、
 checksum/manifest、attestation、release notes、rollback 和 publish eligibility gates。
+
+## 组网模块黑盒互通对端（M3 前完成）
+
+`docs/architecture/mesh-module.md` 的黑盒互通测试需要对方官方发布的二进制作为测试对端。为了不在仓库里出现对方名称，下载信息放在仓库变量里，由维护者在 Settings → Secrets and variables → Actions → Variables 中设置：
+
+- `MESH_PEER_URL`：固定版本的 Linux x86_64 发布包下载地址。
+- `MESH_PEER_SHA256`：该发布包的 SHA-256。
+
+变量缺失时互通任务失败并提示本节，不会跳过。该二进制只在 CI 中作为独立进程运行，不链接、不复制、不随产物分发。

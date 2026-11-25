@@ -921,21 +921,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_removed_easytier_client_transport() {
-        let target_id = validated_profile_binding_target_id("device-1");
-        let error = validate_client_profile(
-            ClientDeliveryProfileWire {
-                id: "client-profile".to_string(),
-                principal_id: "device-1".to_string(),
-                transport: "easytier".to_string(),
-                pops: vec![pop_reference("pop-a")],
-                mitm: None,
-            },
-            &target_id,
-        )
-        .expect_err("EasyTier client transport is no longer supported");
+    fn rejects_client_transports_other_than_ikev2() {
+        // Only IKEv2 is delivered; earlier tunnel engines were removed and a
+        // mesh network is configured as an outbound, not through delivery.
+        for transport in ["mesh", "wireguard", "openvpn"] {
+            let target_id = validated_profile_binding_target_id("device-1");
+            let error = validate_client_profile(
+                ClientDeliveryProfileWire {
+                    id: "client-profile".to_string(),
+                    principal_id: "device-1".to_string(),
+                    transport: transport.to_string(),
+                    pops: vec![pop_reference("pop-a")],
+                    mitm: None,
+                },
+                &target_id,
+            )
+            .expect_err("only the ikev2 client transport is supported");
 
-        assert_eq!(error.code, SDWAN_DELIVERY_PARSE_FAILED_CODE);
+            assert_eq!(error.code, SDWAN_DELIVERY_PARSE_FAILED_CODE, "{transport}");
+        }
     }
 
     #[test]
