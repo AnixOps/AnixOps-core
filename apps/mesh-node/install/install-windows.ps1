@@ -145,6 +145,17 @@ try {
     $sourceConfig = if ($Config) { $Config } else { $imported }
     if (-not $sourceConfig -and -not (Test-Path $ConfigPath)) { Fail "no configuration: pass -Config or a takeover profile" }
 
+    # The takeover's own checks, before anything is installed: a process it
+    # could not put back on rollback refuses the takeover.
+    if ($ProfileUrl -and $canRun) {
+        $check = Join-Path $work "takeover-check.json"
+        & $download takeover --profile $profileDownload --state-dir (Join-Path $State "takeover") --dry-run --report $check | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Copy-Item -Force $check (Join-Path $State "takeover-check.json")
+            Fail "the takeover would be refused; see $State\takeover-check.json"
+        }
+    }
+
     if ($DryRun) {
         Say "dry run: checks passed; nothing was changed"
         if ($ProfileUrl) {

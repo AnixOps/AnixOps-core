@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::detect::{
     classify_units, detect, in_container, real_id, scan_processes, uses_process_table, Found,
-    Origin,
+    Origin, Process,
 };
 use crate::host::{Hold, Host, Signal, Spawn};
 use crate::profile::Profile;
@@ -26,6 +26,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// Prefix of a line this program turned into a comment.
 pub const COMMENT_MARKER: &str = "#[anixops-mesh takeover] ";
 const MANIFEST: &str = "takeover.json";
+/// How many forgotten processes the record keeps.
+const MAX_FORGOTTEN: usize = 64;
 const LOCK: &str = "takeover.lock";
 /// How long a process gets to exit after TERM.
 const TERM_WAIT_MS: u64 = 10_000;
@@ -219,6 +221,9 @@ pub enum Outcome {
     RolledBack,
     /// A step failed and undoing it failed too: manual work needed.
     RollbackFailed,
+    /// Refused before any change (a process that could not be put back,
+    /// or a record that could not be saved); nothing was done.
+    Refused,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,7 +241,7 @@ impl TakeoverReport {
     pub fn exit_code(&self) -> i32 {
         match self.outcome {
             Outcome::NothingFound | Outcome::Planned | Outcome::Done => 0,
-            Outcome::RolledBack => 1,
+            Outcome::RolledBack | Outcome::Refused => 1,
             Outcome::RollbackFailed => 7,
         }
     }
@@ -940,13 +945,20 @@ fn copy_matches(
 
 /// One message for each process of the program running in another network
 /// namespace than the host's.
-fn foreign_network_processes(host: &dyn Host, profile: &Profile) -> Vec<String> {
+fn foreign_network_processes(
+    host: &dyn Host,
+    profile: &Profile,
+    service_pids: &BTreeSet<u32>,
+) -> Vec<String> {
     let Some(host_network) = net_namespace(host, 1) else {
         return Vec::new();
     };
     scan_processes(host, profile)
         .into_iter()
         .filter(|process| !process.contained)
+        // A service's process is stopped by its service manager and started
+        // again by it, in its own namespace.
+        .filter(|process| !service_pids.contains(&process.pid))
         .filter_map(|process| {
             let theirs = net_namespace(host, process.pid)?;
             (theirs != host_network).then(|| foreign_network_message(process.pid, &theirs))
@@ -1056,28 +1068,93 @@ fn end_processes(
                 continue;
             }
         };
-        out.push(Ok(Action::Terminate {
-            pid: process.pid,
-            exe: process.exe.clone(),
-            argv: process.argv.clone(),
-            full_env: !process.environ.is_empty(),
-            env: if process.environ.is_empty() {
-                process.env.clone().into_iter().collect()
-            } else {
-                process.environ.clone()
-            },
-            cwd: process.cwd.clone(),
-            uid: process.uid,
-            gid: process.gid,
-            groups: process.groups.clone(),
-            // Only our own services start it again on rollback; a process
-            // started by hand, rc.local or cron is restarted as it was.
-            restart: process.unit.is_none() && !service_pids.contains(&process.pid),
-            killed,
-            net_ns,
-        }));
+        out.push(Ok(terminate_action(&process, service_pids, killed, net_ns)));
     }
     out
+}
+
+/// The record of ending a process.
+fn terminate_action(
+    process: &Process,
+    service_pids: &BTreeSet<u32>,
+    killed: bool,
+    net_ns: Option<String>,
+) -> Action {
+    Action::Terminate {
+        pid: process.pid,
+        exe: process.exe.clone(),
+        argv: process.argv.clone(),
+        full_env: !process.environ.is_empty(),
+        env: if process.environ.is_empty() {
+            process.env.clone().into_iter().collect()
+        } else {
+            process.environ.clone()
+        },
+        cwd: process.cwd.clone(),
+        uid: process.uid,
+        gid: process.gid,
+        groups: process.groups.clone(),
+        // Only our own services start it again on rollback; a process
+        // started by hand, rc.local or cron is restarted as it was.
+        restart: process.unit.is_none() && !service_pids.contains(&process.pid),
+        killed,
+        net_ns,
+    }
+}
+
+/// Room left in the record for the steps other than ended processes
+/// (backups, services, lines), which are short.
+const RECORD_MARGIN: u64 = 64 * 1024;
+
+/// Reasons to refuse a takeover before anything is changed: processes that
+/// could not be put back where they ran, and a record that would grow too
+/// large to save once the processes are ended (their environments can be
+/// large), which would leave a rollback without them.
+fn refusals(
+    host: &dyn Host,
+    profile: &Profile,
+    service_pids: &BTreeSet<u32>,
+    manifest: Option<&Manifest>,
+) -> Vec<String> {
+    let mut out: Vec<String> = foreign_network_processes(host, profile, service_pids)
+        .into_iter()
+        .chain(foreign_account_processes(host, profile, service_pids))
+        .collect();
+    let mut estimate = manifest.cloned().unwrap_or_else(empty_manifest);
+    for process in scan_processes(host, profile)
+        .iter()
+        .filter(|process| !process.contained)
+    {
+        estimate.steps.push(Step {
+            action: terminate_action(
+                process,
+                service_pids,
+                true,
+                net_namespace(host, process.pid),
+            ),
+            at: host.now_unix(),
+            run: estimate.runs + 1,
+        });
+    }
+    let size = serde_json::to_string_pretty(&estimate)
+        .map(|text| text.len() as u64)
+        .unwrap_or(u64::MAX);
+    if size + RECORD_MARGIN > crate::host::MAX_TEXT_FILE {
+        out.push(format!(
+            "the record of the processes to end would be about {size} bytes, more than the {} a rollback can read; stop them by hand",
+            crate::host::MAX_TEXT_FILE - RECORD_MARGIN
+        ));
+    }
+    out
+}
+
+fn empty_manifest() -> Manifest {
+    Manifest {
+        manifest_version: MANIFEST_VERSION,
+        steps: Vec::new(),
+        runs: 0,
+        forgotten: Vec::new(),
+    }
 }
 
 /// Turns off and stops every installation the profile describes.
@@ -1095,15 +1172,19 @@ pub fn takeover(
             _ => None,
         })
         .collect();
-    // Processes of launchd jobs and Windows services taken over: loading
-    // the job or starting the service again on rollback starts them, so
-    // they are never started a second time.
+    // Processes of the services taken over: their service manager stops
+    // them, and starting the service again on rollback starts them, so they
+    // are never started a second time.
     let service_pids: BTreeSet<u32> = found
         .iter()
         .filter(|entry| {
             matches!(
                 entry.origin,
-                Origin::Launchd { .. } | Origin::WinService { .. }
+                Origin::Systemd { .. }
+                    | Origin::Openrc { .. }
+                    | Origin::Sysv { .. }
+                    | Origin::Launchd { .. }
+                    | Origin::WinService { .. }
             )
         })
         .flat_map(|entry| entry.processes.iter().map(|process| process.pid))
@@ -1124,6 +1205,22 @@ pub fn takeover(
         return Ok(report);
     }
     if dry_run {
+        // The same checks as a real run, so a dry run as a precheck sees a
+        // refusal before anything is installed.
+        let existing = load_manifest(host, state).ok().flatten();
+        let refused = refusals(host, profile, &service_pids, existing.as_ref());
+        if !refused.is_empty() {
+            report.outcome = Outcome::Refused;
+            report.steps = refused
+                .into_iter()
+                .map(|error| StepReport {
+                    step: "check".into(),
+                    ok: false,
+                    detail: Some(error),
+                })
+                .collect();
+            return Ok(report);
+        }
         report.outcome = Outcome::Planned;
         report.steps = planned
             .iter()
@@ -1144,12 +1241,24 @@ pub fn takeover(
     }
 
     let _lock = Lock::take(host, state)?;
-    let mut manifest = load_manifest(host, state)?.unwrap_or(Manifest {
-        manifest_version: MANIFEST_VERSION,
-        steps: Vec::new(),
-        runs: 0,
-        forgotten: Vec::new(),
-    });
+    let mut manifest = load_manifest(host, state)?.unwrap_or_else(empty_manifest);
+    // Checked before anything is changed, and nothing is recorded: a
+    // process in another network namespace or run by another account is
+    // never ended (a rollback could not put it back), so finding one later
+    // would only interrupt the network for nothing.
+    let refused = refusals(host, profile, &service_pids, Some(&manifest));
+    if !refused.is_empty() {
+        report.outcome = Outcome::Refused;
+        report.steps = refused
+            .into_iter()
+            .map(|error| StepReport {
+                step: "check".into(),
+                ok: false,
+                detail: Some(error),
+            })
+            .collect();
+        return Ok(report);
+    }
     manifest.runs += 1;
     let run = manifest.runs;
     let first_new = manifest.steps.len();
@@ -1169,20 +1278,6 @@ pub fn takeover(
         save_manifest(host, state, manifest)
     };
 
-    // Checked before anything is changed: a process in another network
-    // namespace is never ended (a rollback could not put it back there), so
-    // finding one later would only interrupt the network for nothing.
-    for error in foreign_network_processes(host, profile)
-        .into_iter()
-        .chain(foreign_account_processes(host, profile, &service_pids))
-    {
-        report.steps.push(StepReport {
-            step: "check networks".into(),
-            ok: false,
-            detail: Some(error.clone()),
-        });
-        failure.get_or_insert(error);
-    }
     for (index, step) in planned.iter().enumerate() {
         if failure.is_some() {
             break;
@@ -1318,7 +1413,16 @@ pub fn takeover(
             // steps already undone are never repeated.
             manifest.steps.extend(remaining);
         }
-        let _ = save_manifest(host, state, &manifest);
+        // A record that cannot be saved leaves a later rollback without
+        // what is still to undo: say so, and count it as manual work.
+        if let Err(error) = save_manifest(host, state, &manifest) {
+            report.rollback.push(StepReport {
+                step: "save record".into(),
+                ok: false,
+                detail: Some(error),
+            });
+            report.outcome = Outcome::RollbackFailed;
+        }
     }
     Ok(report)
 }
@@ -1807,6 +1911,10 @@ pub fn rollback_forgetting(
         // Kept in the record (owner only, like the steps) so what the
         // operator dropped stays visible after the steps are gone.
         manifest.forgotten.append(&mut dropped);
+        // The most recent ones; older ones are in the reports saved with
+        // `--report`.
+        let excess = manifest.forgotten.len().saturating_sub(MAX_FORGOTTEN);
+        manifest.forgotten.drain(..excess);
         forgotten.push(StepReport {
             step: format!("forget process {pid}"),
             ok: true,
@@ -1815,14 +1923,22 @@ pub fn rollback_forgetting(
     }
     let (mut steps, remaining) = undo(host, &manifest.steps);
     forgotten.append(&mut steps);
-    let steps = forgotten;
-    let ok = remaining.is_empty();
+    let mut steps = forgotten;
+    let mut ok = remaining.is_empty();
     // A later rollback retries only what is left.
     manifest.steps = remaining;
     if ok {
         manifest.runs = 0;
     }
-    save_manifest(host, state, &manifest).map_err(TakeoverError::Io)?;
+    // What was undone is reported even when the record cannot be saved.
+    if let Err(error) = save_manifest(host, state, &manifest) {
+        steps.push(StepReport {
+            step: "save record".into(),
+            ok: false,
+            detail: Some(error),
+        });
+        ok = false;
+    }
     Ok(RollbackReport {
         report_version: crate::report::REPORT_VERSION,
         ok,
@@ -2382,8 +2498,15 @@ mod tests {
         host.link("/proc/100/ns/net", "net:[1]");
         // Started with `ip netns exec`: a rollback could not put it back.
         host.link("/proc/200/ns/net", "net:[7]");
+        // A dry run, which the installers run first, refuses it too.
+        let dry = takeover(&host, &demo(), Path::new(STATE), true).unwrap();
+        assert_eq!(dry.outcome, Outcome::Refused, "{dry:?}");
+        assert_eq!(dry.exit_code(), 1);
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
-        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert_eq!(report.outcome, Outcome::Refused, "{report:?}");
+        assert_eq!(report.exit_code(), 1);
+        // Nothing done, nothing recorded.
+        assert!(!host.exists(&Path::new(STATE).join(MANIFEST)));
         assert!(report.steps.iter().any(|step| !step.ok
             && step.detail.as_deref().is_some_and(
                 |detail| detail.starts_with("process 200 runs in another network namespace")
@@ -2400,6 +2523,97 @@ mod tests {
             command.starts_with("systemctl stop") || command.starts_with("systemctl disable")
         }));
         assert!(!host.text("/etc/rc.local").unwrap().contains(COMMENT_MARKER));
+    }
+
+    #[test]
+    fn a_services_process_in_another_network_namespace_is_taken_over() {
+        let host = machine();
+        host.link("/proc/1/ns/net", "net:[1]");
+        // The program's own unit runs it in a namespace of its own; its
+        // service manager stops it and starts it there again.
+        host.link("/proc/100/ns/net", "net:[7]");
+        host.link("/proc/200/ns/net", "net:[1]");
+        host.exits_on
+            .borrow_mut()
+            .insert("systemctl stop demo-meshd.service".into(), vec![100]);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        assert!(host
+            .ran
+            .borrow()
+            .contains(&"systemctl stop demo-meshd.service".to_string()));
+        assert_eq!(*host.signals.borrow(), vec![(200, Signal::Terminate)]);
+    }
+
+    #[test]
+    fn a_record_that_would_be_too_large_is_refused_before_any_change() {
+        let host = machine();
+        let large = format!(
+            "DEMO_PAD={}",
+            "x".repeat(crate::host::MAX_TEXT_FILE as usize)
+        );
+        host.process(
+            300,
+            "/opt/demo-meshd",
+            &["/opt/demo-meshd", "--net-name", "other"],
+            &[large.as_str()],
+            "0::/user.slice\n",
+        );
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Refused, "{report:?}");
+        assert!(report.steps.iter().any(|step| step
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("the record of the processes to end"))));
+        assert!(host.signals.borrow().is_empty());
+        assert!(!host
+            .ran
+            .borrow()
+            .iter()
+            .any(|command| command.starts_with("systemctl")
+                && !command.starts_with("systemctl show")));
+        assert!(!host.text("/etc/rc.local").unwrap().contains(COMMENT_MARKER));
+    }
+
+    #[test]
+    fn only_the_most_recent_forgotten_processes_are_kept() {
+        let host = FakeHost::default();
+        let old = Forgotten {
+            pid: 1,
+            exe: "/opt/demo-meshd".into(),
+            argv: vec!["/opt/demo-meshd".into()],
+            uid: Some(0),
+            at: 0,
+        };
+        let manifest = Manifest {
+            manifest_version: MANIFEST_VERSION,
+            steps: vec![Step {
+                action: Action::Terminate {
+                    pid: 200,
+                    exe: "/opt/demo-meshd".into(),
+                    argv: vec!["/opt/demo-meshd".into()],
+                    env: Vec::new(),
+                    full_env: true,
+                    cwd: None,
+                    uid: Some(0),
+                    gid: Some(0),
+                    groups: None,
+                    restart: true,
+                    killed: false,
+                    net_ns: None,
+                },
+                at: 0,
+                run: 1,
+            }],
+            runs: 1,
+            forgotten: vec![old; MAX_FORGOTTEN],
+        };
+        save_manifest(&host, Path::new(STATE), &manifest).unwrap();
+        let done = rollback_forgetting(&host, Path::new(STATE), &[200]).unwrap();
+        assert!(done.ok, "{done:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert_eq!(manifest.forgotten.len(), MAX_FORGOTTEN);
+        assert_eq!(manifest.forgotten.last().unwrap().pid, 200);
     }
 
     #[test]
@@ -2876,7 +3090,7 @@ mod tests {
             800,
         );
         let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
-        assert_eq!(report.outcome, Outcome::RolledBack, "{report:?}");
+        assert_eq!(report.outcome, Outcome::Refused, "{report:?}");
         assert!(report
             .steps
             .iter()

@@ -151,6 +151,16 @@ fi
 source_config="${config:-$imported}"
 [ -n "$source_config" ] || [ -f "$CONFIG" ] || die "no configuration: pass --config or a takeover profile"
 
+# The takeover's own checks, before anything is installed: a process it
+# could not put back on rollback refuses the takeover.
+if [ -n "$profile_url" ] && [ "$can_run" -eq 1 ]; then
+  if ! "$work/anixops-mesh" takeover --profile "$work/profile.json" --state-dir "$STATE/takeover" \
+    --dry-run --report "$work/takeover-check.json" >/dev/null; then
+    install -m 0600 "$work/takeover-check.json" "$STATE/takeover-check.json"
+    die "the takeover would be refused; see $STATE/takeover-check.json"
+  fi
+fi
+
 if [ "$dry_run" -eq 1 ]; then
   log "dry run: checks passed; nothing was changed"
   [ -n "$profile_url" ] && "$work/anixops-mesh" takeover --profile "$work/profile.json" --state-dir "$STATE/takeover" --dry-run

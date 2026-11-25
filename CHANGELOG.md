@@ -6,6 +6,7 @@
 
 ### Security
 
+- anixops-mesh 接管按 #321 复审修复（mesh-node `takeover`、`main`、安装脚本）：改动前检查跳过程序自身服务中的进程，带独立网络命名空间的单元由服务管理器停止与恢复（J1）；改动前预估记录大小，结束进程后会超过读取上限时直接拒绝，撤销或回滚后记录保存失败时报告「save record」并以退出码 7 结束（J2）；`--dry-run` 做同样的检查，拒绝时 `outcome` 为新增的 `refused`（退出码 1、不写记录），三个安装脚本在写入任何文件之前先预检（J3）；`forgotten` 只保留最近 64 条（J4）；文档补子命令参数、清空记录的确切含义与 `native_keys_pending` 期间不判失败（J5、J6a）。`detect`、`import`、`takeover`、`rollback` 在 macOS 与 Windows 上开放。
 - anixops-mesh 接管按 #318 复审收口（mesh-node `takeover`）：在其他网络命名空间运行的进程改在第一步改动之前检查，发现即失败，不再先停服务、注释自启行后才拒绝（H1）；`rollback --forget-process` 移除的进程保留在记录的 `forgotten` 列表中（H2）；记录超过读取上限 1 MiB 时不写入，避免回滚无法读回（H3）。
 - anixops-mesh 接管按 #316 复审修复（mesh-node `takeover`、`host`、命令行）：状态目录从 `/` 起逐级以不跟随链接的方式打开并检查，上级目录必须属于 root 或本用户且他人不可写（粘滞目录除外），`takeover.json` 与备份的读取也经该目录句柄，伪造的记录不能让 rollback 以 root 启动程序（G1）；在其他网络命名空间运行的进程不再被结束，接管报告后失败并回滚，回滚也不会把这类记录的进程启动到主机网络（G2）；结束失败顺序测试改用 pid 10，状态文件的临时文件残留时先删除再写（G3）；新增 `rollback --forget-process PID --confirm`，操作员手工启动进程后移除卡住的记录（G4）。
 - anixops-mesh 接管按 #314 复审修复（mesh-node `takeover`、`host`）：撤销与回滚判断副本时不再比较挂载命名空间，宿主单元开了 `PrivateTmp=`、`ProtectSystem=` 等选项或回滚由此类服务执行时不再误判后多启动一份；网络命名空间改为与接管时记录的原进程比较，旧记录与 PID 1 比较（F1）；某个进程结束不了时，其后已结束的进程也全部记录，撤销会把它们重新启动，不再只报告已回滚（F2）；命令行相同但其余信息读不到的进程不再当作“不是副本”，此时不启动、保留步骤待重试（F3）；重启间隔同时读取 `RestartUSecNext`，设了 `RestartSteps=` 时取 `RestartMaxDelayUSec`（F4）；`takeover.json` 与备份经已检查的状态目录句柄写入并改名，不跟随符号链接（F5）。
