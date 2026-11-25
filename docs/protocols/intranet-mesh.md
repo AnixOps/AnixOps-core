@@ -535,7 +535,7 @@ proof(secret, challenge) = HMAC-SHA256(key = secret, C_PROOF_PREFIX ‖ challeng
      - 绑定后的上报不得更改它，值不同时面板忽略并标记该设备；密钥更换（重新加入网络）须重新签发入网凭证并重新登记；
      - 设备经批准迁往其他地区（§15.8）时清空绑定，由迁移后的首次上报重新绑定。
      - 为已有设备重新签发凭证并重新接入时，带公钥则替换，省略则清空绑定、等待首次上报。
-     - **能力上报**：没有 Agent 的设备在每次状态上报（`POST /api/v5/mesh/device/report`）的载荷中带顶层 `features`，取本机内核 `GET /v1/status` 的 `features` 原样列出（`docs/architecture/mesh-status.md`）。面板据此决定向该设备下发哪些字段，作用与 Agent 读取本机能力相同：未确认 `mesh_native_keys` 前，面板不向该设备下发受管网络，也不得以省略 `kind` 的方式把受管网络降级为 `legacy` 下发；未列出 `mesh_resolver_address` 时省略 `dns.resolver_address`；其他能力同理，未列出即不下发对应配置节或字段。面板尚未收到该设备任何上报时按未列出处理。
+     - **能力上报**：没有 Agent 的设备向面板提供本机内核 `GET /v1/status` 的 `features`（原样列出，`docs/architecture/mesh-status.md`），共三处：① 登记请求体的顶层 `features`；② 取配置 `GET /api/v5/mesh/device/config?features=a,b`（能力名逗号分隔）；③ 每次状态上报（`POST /api/v5/mesh/device/report`）载荷的顶层 `features`。登记与取配置都带上，避免首次取配置时因面板还不知道能力而空跑。面板取用时以最新的为准：本次取配置带了 `features` 就用它，否则用最近一次上报的，再否则用登记时的；因为内核升级或回退后，旧名单可能多列已不支持的能力，导致内核以未知字段拒绝整份配置。三处都缺失时按未列出处理：不下发受管网络，设备标 `native_keys_unsupported`。面板据此决定向该设备下发哪些字段，作用与 Agent 读取本机能力相同：未确认 `mesh_native_keys` 前，面板不向该设备下发受管网络，也不得以省略 `kind` 的方式把受管网络降级为 `legacy` 下发；未列出 `mesh_resolver_address` 时省略 `dns.resolver_address`；其他能力同理，未列出即不下发对应配置节或字段。
    面板对两个渠道都遵守：
    - **公钥唯一**：同一公钥不得绑定到两个设备或成员。登记或上报的公钥已属于其他设备或成员时，面板不予绑定或记录，保留原值，并标出「公钥与其他成员重复」；Agent 通道同样执行。否则吊销其中一个会把共用的公钥移出清单、连带另一个被拒，或者被吊销的设备因另一条记录仍留在清单中。
    - **吊销即移出**：吊销或删除设备时，面板把它的公钥移出所在网络的清单并重新下发，内核按第 6 条关闭对应会话。
