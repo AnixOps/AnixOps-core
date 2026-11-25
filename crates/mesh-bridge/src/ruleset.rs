@@ -170,6 +170,33 @@ pub fn render_removal(mesh_interface: &str) -> String {
     format!("table inet {table}\ndelete table inet {table}\n")
 }
 
+/// Whether `name` is one of our tables: the prefix, then the hex of a
+/// non-empty interface name as [`table_name`] writes it. This prefix is the
+/// mark spec §15.12 item 9 cleans up by; nothing else is touched.
+pub fn is_own_table(name: &str) -> bool {
+    let Some(hex) = name.strip_prefix(TABLE_PREFIX) else {
+        return false;
+    };
+    !hex.is_empty()
+        && hex.len().is_multiple_of(2)
+        && hex.len() <= 2 * crate::config::MAX_INTERFACE_BYTES
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The script that removes every table in `tables` (family, name) that is
+/// ours, in one transaction; `None` when none is.
+pub fn render_cleanup<'a>(tables: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
+    let mut out = String::new();
+    for (family, name) in tables {
+        if family == "inet" && is_own_table(name) {
+            let _ = writeln!(out, "delete table inet {name}");
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +311,38 @@ mod tests {
         ));
         assert!(!script.contains("0.0.0.0/0"));
         assert!(!script.contains("::/0"));
+    }
+
+    #[test]
+    fn only_our_tables_are_cleaned_up() {
+        let own = table_name("anixmesh-0");
+        let other = table_name("anixmesh-1");
+        assert!(is_own_table(&own));
+        for foreign in [
+            "anixops_bridge_",
+            "anixops_bridge_6",
+            "anixops_bridge_ZZ",
+            "anixops_bridge_616E",
+            "anixops_bridge_616e_x",
+            "filter",
+            "nat",
+            "anixops_other",
+        ] {
+            assert!(!is_own_table(foreign), "{foreign}");
+        }
+        let script = render_cleanup([
+            ("inet", own.as_str()),
+            ("ip", own.as_str()),
+            ("inet", "filter"),
+            ("inet", other.as_str()),
+            ("ip", "nat"),
+        ])
+        .unwrap();
+        assert_eq!(
+            script,
+            format!("delete table inet {own}\ndelete table inet {other}\n")
+        );
+        assert!(render_cleanup([("inet", "filter"), ("ip", "nat")]).is_none());
     }
 
     #[test]

@@ -53,6 +53,7 @@
 - `Bridge::remove` 删除整张表；之后 `status()` 为 `None`（状态接口中为 `null`），面板以此释放桥接相关资源。`Bridge` 被丢弃时也会尽力删除。
 - IPv4 转发由全进程共用的 `Forwarding` 管理：第一个带 IPv4 `routes` 的桥接安装时，若 `/proc/sys/net/ipv4/ip_forward` 为 0 则置 1；最后一个桥接拆除后，只有当初是本进程打开的才恢复为 0。原本就打开的保持不变。
 - IPv6 转发从不修改：打开 `net.ipv6.conf.all.forwarding` 会让 Linux 在 `accept_ra = 1` 的网卡上忽略路由通告，主机自己的 IPv6 默认路由可能因此失效。桥接带 IPv6 `routes` 而 IPv6 转发未打开时，给出告警 `external_bridge_ipv6_forwarding_off`，IPv6 条目在运维人员打开转发前不生效。
+- **规则清理（规范 §15.12 第 9 条）**：`cleanup_all` 列出本机全部 nftables 表，删除 `inet` 族中名称为 `anixops_bridge_` 加偶数位小写十六进制（至多 30 位）的表，即本模块的标记，全部在一个事务中完成；其他表（包括名称相近但不符合该格式的表、其他族中同名的表）一律不动。没有安装 `nft` 的主机视为没有残留。节点程序在启动时、安装任何桥接之前调用一次，清除上一次运行（含崩溃）残留的规则；退出时先丢弃各 `Bridge`，再调用一次。崩溃后 IPv4 转发保持桥接打开时的状态：清理无法判断主机原先是否打开，所以不改转发，见 `docs/manual-intervention.md`。
 - `Bridge::counters` 读取两个丢弃计数（`source_denied`、`inbound_denied`），供状态与诊断使用。
 - `nft` 只从固定路径查找（`/usr/sbin/nft`、`/sbin/nft`、`/usr/bin/nft`），以空环境运行，不经 `PATH`。
 
@@ -62,10 +63,10 @@
 
 1. `outbound-mesh` 的网络配置加顶层可选字段 `external_bridge`（类型 `mesh_bridge::ExternalBridgeConfig`）；只有 `role = full` 的 Linux 节点接受，其他情况以 `invalid_argument` 拒绝。
 2. 校验通过后，`routes` 并入本节点路由信息字段 5，与 `subnets.advertise` 合并去重。
-3. `apps/mesh-node` 在网络启动成功之后调用 `Bridge::apply`（参数为本网络的组网网卡名、虚拟子网与本机虚拟地址），配置更新时再次调用，网络停止（正常停止与丢弃两条路径）时调用 `Bridge::remove`。应用失败映射为网络失败码 `start_refused`（详情为告警原因），并上报告警。
+3. 节点程序（声明 `mesh_external_bridge` 时）启动时先调用 `cleanup_all`，退出时在丢弃全部 `Bridge` 之后再调用一次；`apps/mesh-node` 在网络启动成功之后调用 `Bridge::apply`（参数为本网络的组网网卡名、虚拟子网与本机虚拟地址），配置更新时再次调用，网络停止（正常停止与丢弃两条路径）时调用 `Bridge::remove`。应用失败映射为网络失败码 `start_refused`（详情为告警原因），并上报告警。
 4. Linux 的 `FEATURES` 加 `mesh_external_bridge`；`networks[].externalBridge` 取 `Bridge::status()`。
 
 ## 验证
 
 - 单元测试：配置校验（各原因码、面板示例、规范化）、摘要（`mesh-status.md` 的共用测试向量）、规则脚本、转发开关的引用计数与恢复、失败时状态不变。
-- CI 作业「Mesh external bridge (nftables)」（`.github/scripts/mesh-bridge-netns.sh`）：在三个网络命名空间（成员、桥接节点、外部网络）中把规则加载进真实的 nftables，检查名单内来源可达外部地址且经过源地址转换（外部网络没有回到我方网段的路由）、名单外来源与非通告地址被丢弃并计数、外部网络即使有路由也不能发起到成员和桥接节点虚拟地址的连接、新名单整体替换、越界配置被拒且不影响已装规则、拆除幂等。
+- CI 作业「Mesh external bridge (nftables)」（`.github/scripts/mesh-bridge-netns.sh`）：在三个网络命名空间（成员、桥接节点、外部网络）中把规则加载进真实的 nftables，检查名单内来源可达外部地址且经过源地址转换（外部网络没有回到我方网段的路由）、名单外来源与非通告地址被丢弃并计数、外部网络即使有路由也不能发起到成员和桥接节点虚拟地址的连接、新名单整体替换、越界配置被拒且不影响已装规则、拆除幂等；模拟崩溃留下两张表后，清理只删除这两张，其他程序的表（含名称相近的表与 `ip` 族的同名表）保留，第二次清理无事可做。单元测试另覆盖启动清理（崩溃残留）与退出清理。

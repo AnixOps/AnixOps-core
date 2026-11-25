@@ -24,7 +24,9 @@ pub mod config;
 pub mod ruleset;
 pub mod status;
 
-pub use apply::{ApplyError, Bridge, BridgeAlert, Counters, Forwarding, Host, SystemHost};
+pub use apply::{
+    cleanup_all, ApplyError, Bridge, BridgeAlert, Counters, Forwarding, Host, SystemHost,
+};
 pub use config::{BridgeError, ExternalBridge, ExternalBridgeConfig};
 pub use status::BridgeStatus;
 

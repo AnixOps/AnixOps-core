@@ -6,6 +6,7 @@
 //! bridge-netns apply  MESH_IF CONFIG_JSON VIRTUAL_SUBNET LOCAL_ADDRESS
 //! bridge-netns remove MESH_IF
 //! bridge-netns counters MESH_IF
+//! bridge-netns cleanup
 //! ```
 //!
 //! `apply` keeps the rules and forwarding after it exits (the script
@@ -75,7 +76,14 @@ fn main() -> ExitCode {
                 Err(error) => fail(&error.to_string()),
             }
         }
-        _ => fail("usage: bridge-netns apply|remove|counters ..."),
+        ["cleanup"] => match mesh_bridge::cleanup_all(host.as_ref()) {
+            Ok(removed) => {
+                println!("{removed}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(&error.to_string()),
+        },
+        _ => fail("usage: bridge-netns apply|remove|counters|cleanup ..."),
     }
 }
 

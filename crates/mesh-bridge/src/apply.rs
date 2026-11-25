@@ -357,6 +357,51 @@ impl Drop for Bridge {
     }
 }
 
+/// Removes every bridge table this program may have left on the host
+/// (spec §15.12 item 9): at start-up, before anything is installed again,
+/// to clear what a crashed run left; and at exit, after the bridges are
+/// dropped. Only tables carrying our mark ([`ruleset::is_own_table`]) are
+/// deleted, all in one transaction. Returns how many were removed; a host
+/// without `nft` has none.
+///
+/// A crash also leaves IPv4 forwarding as the bridge set it; this function
+/// does not change forwarding, because it cannot tell whether the host had
+/// it on before (see `docs/architecture/mesh-bridge.md`).
+pub fn cleanup_all(host: &dyn Host) -> io::Result<usize> {
+    let json = match host.nft(&["-j", "list", "tables"], None) {
+        Ok(json) => json,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let tables = parse_tables(&json)?;
+    let refs = tables.iter().map(|(f, n)| (f.as_str(), n.as_str()));
+    let Some(script) = ruleset::render_cleanup(refs) else {
+        return Ok(0);
+    };
+    let count = script.lines().count();
+    host.nft(&["-f", "-"], Some(&script))?;
+    Ok(count)
+}
+
+/// (family, name) of each table in `nft -j list tables`.
+pub fn parse_tables(json: &str) -> io::Result<Vec<(String, String)>> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let items = value
+        .get("nftables")
+        .and_then(|items| items.as_array())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no nftables array"))?;
+    Ok(items
+        .iter()
+        .filter_map(|item| item.get("table"))
+        .filter_map(|table| {
+            let family = table.get("family")?.as_str()?;
+            let name = table.get("name")?.as_str()?;
+            Some((family.to_owned(), name.to_owned()))
+        })
+        .collect())
+}
+
 /// Reads our two counters from `nft -j list counters`.
 pub fn parse_counters(json: &str) -> io::Result<Counters> {
     let value: serde_json::Value = serde_json::from_str(json)
@@ -393,6 +438,8 @@ mod tests {
         sysctl: Mutex<HashMap<String, String>>,
         scripts: Mutex<Vec<String>>,
         fail_nft: Mutex<bool>,
+        /// (family, name) of the tables "on the host".
+        tables: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeHost {
@@ -418,9 +465,38 @@ mod tests {
             if *self.fail_nft.lock().unwrap() {
                 return Err(io::Error::other("nft exited with 1: Error: syntax error"));
             }
+            if args == ["-j", "list", "tables"] {
+                let tables: Vec<String> = self
+                    .tables
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(family, name)| {
+                        format!(r#"{{"table":{{"family":"{family}","name":"{name}","handle":1}}}}"#)
+                    })
+                    .collect();
+                return Ok(format!(
+                    r#"{{"nftables":[{{"metainfo":{{"json_schema_version":1}}}},{}]}}"#,
+                    tables.join(",")
+                ));
+            }
             if args[0] == "-j" {
                 return Ok(r#"{"nftables":[{"metainfo":{}},{"counter":{"name":"source_denied","packets":3,"bytes":180}},{"counter":{"name":"inbound_denied","packets":7,"bytes":420}}]}"#.into());
             }
+            // Keep the table list in step with the scripts, as nft would.
+            let script = stdin.unwrap_or_default();
+            let mut tables = self.tables.lock().unwrap();
+            for line in script.lines() {
+                if let Some(name) = line.strip_prefix("delete table inet ") {
+                    tables.retain(|(f, n)| !(f == "inet" && n == name));
+                } else if let Some(rest) = line.strip_prefix("table inet ") {
+                    let name = rest.trim_end_matches(" {").to_owned();
+                    if !tables.iter().any(|(f, n)| f == "inet" && *n == name) {
+                        tables.push(("inet".into(), name));
+                    }
+                }
+            }
+            drop(tables);
             self.scripts
                 .lock()
                 .unwrap()
@@ -577,6 +653,108 @@ mod tests {
                 inbound_denied: 7
             }
         );
+    }
+
+    fn tables(host: &FakeHost) -> Vec<(String, String)> {
+        host.tables.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn startup_cleanup_removes_what_a_crashed_run_left() {
+        let (host, forwarding) = setup("1", "1");
+        host.tables.lock().unwrap().extend([
+            ("inet".to_string(), "filter".to_string()),
+            ("ip".to_string(), "nat".to_string()),
+            // Another program's table that only looks similar.
+            ("inet".to_string(), "anixops_bridge_other".to_string()),
+        ]);
+        let config = checked(&["100.64.0.1"], &["10.150.0.2/32"]);
+        // A run that crashed: its rules stay on the host.
+        let mut crashed = Bridge::new(host.clone(), forwarding.clone(), "anixmesh-0").unwrap();
+        crashed.apply(&config, &subnet(), &[]).unwrap();
+        let mut second = Bridge::new(host.clone(), forwarding.clone(), "anixmesh-1").unwrap();
+        second.apply(&config, &subnet(), &[]).unwrap();
+        std::mem::forget(crashed);
+        std::mem::forget(second);
+        assert_eq!(tables(&host).len(), 5);
+
+        // The next start clears them before installing anything.
+        assert_eq!(cleanup_all(host.as_ref()).unwrap(), 2);
+        let left = tables(&host);
+        assert_eq!(
+            left,
+            [
+                ("inet".to_string(), "filter".to_string()),
+                ("ip".to_string(), "nat".to_string()),
+                ("inet".to_string(), "anixops_bridge_other".to_string()),
+            ]
+        );
+        // Both deletions went in one transaction.
+        let scripts = host.scripts.lock().unwrap();
+        assert_eq!(scripts.last().unwrap().lines().count(), 2);
+        drop(scripts);
+        // Nothing left: no script is run.
+        let before = host.scripts.lock().unwrap().len();
+        assert_eq!(cleanup_all(host.as_ref()).unwrap(), 0);
+        assert_eq!(host.scripts.lock().unwrap().len(), before);
+
+        // Reinstalling after the cleanup works as on a clean host.
+        let mut fresh = Bridge::new(host.clone(), forwarding, "anixmesh-0").unwrap();
+        fresh.apply(&config, &subnet(), &[]).unwrap();
+        assert_eq!(tables(&host).len(), 4);
+    }
+
+    #[test]
+    fn exit_cleanup_removes_every_bridge_and_only_ours() {
+        let (host, forwarding) = setup("0", "1");
+        host.tables
+            .lock()
+            .unwrap()
+            .push(("inet".to_string(), "filter".to_string()));
+        let config = checked(&["100.64.0.1"], &["10.150.0.2/32"]);
+        let mut a = Bridge::new(host.clone(), forwarding.clone(), "anixmesh-0").unwrap();
+        let mut b = Bridge::new(host.clone(), forwarding.clone(), "anixmesh-1").unwrap();
+        a.apply(&config, &subnet(), &[]).unwrap();
+        b.apply(&config, &subnet(), &[]).unwrap();
+        // Exit: the bridges are dropped, then everything marked is cleared.
+        drop(a);
+        drop(b);
+        assert_eq!(cleanup_all(host.as_ref()).unwrap(), 0);
+        assert_eq!(tables(&host), [("inet".to_string(), "filter".to_string())]);
+        assert_eq!(host.v4(), "0");
+    }
+
+    #[test]
+    fn a_host_without_nft_has_nothing_to_clean() {
+        struct NoNft;
+        impl Host for NoNft {
+            fn nft(&self, _: &[&str], _: Option<&str>) -> io::Result<String> {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "nft is not installed",
+                ))
+            }
+            fn read_sysctl(&self, _: &str) -> io::Result<String> {
+                Ok("0".into())
+            }
+            fn write_sysctl(&self, _: &str, _: &str) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(cleanup_all(&NoNft).unwrap(), 0);
+    }
+
+    #[test]
+    fn tables_are_read_from_nft_json() {
+        let json = r#"{"nftables":[{"metainfo":{"version":"1.1.1"}},{"table":{"family":"inet","name":"anixops_bridge_6130","handle":3}},{"table":{"family":"ip","name":"nat","handle":4}}]}"#;
+        assert_eq!(
+            parse_tables(json).unwrap(),
+            [
+                ("inet".to_string(), "anixops_bridge_6130".to_string()),
+                ("ip".to_string(), "nat".to_string())
+            ]
+        );
+        assert!(parse_tables("{}").is_err());
     }
 
     #[test]

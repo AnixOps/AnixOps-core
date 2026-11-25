@@ -16,6 +16,7 @@ set -euo pipefail
 
 BIN="${BRIDGE_NETNS:?set BRIDGE_NETNS to the bridge-netns example binary}"
 MESH_IF=anixmesh-0
+table_mesh0=anixops_bridge_616e69786d6573682d30
 failures=0
 
 cleanup() {
@@ -119,6 +120,30 @@ if ip netns exec bridge nft list tables | grep -q anixops_bridge_; then
 else
   pass "table removed"
 fi
+
+# Spec §15.12 item 9: start-up and exit clear every table carrying our mark
+# and nothing else. A run that crashed leaves two bridges' tables; another
+# program has its own tables, one of them with a similar name.
+ip netns exec bridge "${BIN}" apply "${MESH_IF}" "${config}" 10.150.0.0/16 10.150.0.1 >/dev/null
+ip netns exec bridge "${BIN}" apply anixmesh-1 "${config}" 10.151.0.0/16 10.151.0.1 >/dev/null
+ip netns exec bridge nft add table inet other_program
+ip netns exec bridge nft add table inet anixops_bridge_other
+ip netns exec bridge nft add table ip anixops_bridge_616e69786d6573682d30
+removed="$(ip netns exec bridge "${BIN}" cleanup)"
+if [[ "${removed}" == 2 ]]; then pass "cleanup removed our 2 tables"; else fail "cleanup removed ${removed}, want 2"; fi
+left="$(ip netns exec bridge nft list tables)"
+echo "${left}"
+if grep -qx "table inet ${table_mesh0}" <<<"${left}" || grep -q "table inet anixops_bridge_616e69786d6573682d31" <<<"${left}"; then
+  fail "our tables are gone"
+else
+  pass "our tables are gone"
+fi
+for keep in "table inet other_program" "table inet anixops_bridge_other" "table ip anixops_bridge_616e69786d6573682d30"; do
+  if grep -qx "${keep}" <<<"${left}"; then pass "kept: ${keep}"; else fail "kept: ${keep}"; fi
+done
+expect_blocked member -I 10.150.0.3 100.100.0.5
+removed="$(ip netns exec bridge "${BIN}" cleanup)"
+if [[ "${removed}" == 0 ]]; then pass "second cleanup finds nothing"; else fail "second cleanup removed ${removed}"; fi
 
 if (( failures > 0 )); then
   echo "${failures} check(s) failed"
