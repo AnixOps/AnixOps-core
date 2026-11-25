@@ -270,6 +270,16 @@ impl HttpExchange {
         })
     }
 
+    /// [`Self::messages_json`] without what the messages carry: their
+    /// text, data, event names and ids.
+    fn messages_outline_json(&self, since: u64) -> Value {
+        json!({
+            "seen": self.messages.seen,
+            "dropped": self.messages.dropped,
+            "kept": self.messages.outline_since(since),
+        })
+    }
+
     fn json(&self) -> Value {
         let headers = |headers: &[(String, String)]| {
             headers
@@ -1402,6 +1412,7 @@ impl CaptureStore {
         since_rev: Option<u64>,
         limit: Option<usize>,
         filter: &Filter,
+        redact: bool,
     ) -> Value {
         let limit = limit
             .unwrap_or(DEFAULT_REQUEST_ROWS)
@@ -1428,11 +1439,14 @@ impl CaptureStore {
             rows.sort_unstable_by_key(|(_, _, exchange)| exchange.seq);
         }
         let last_seq = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
+        // Redacted rows are filtered in their redacted form, so a filter
+        // cannot test for a value the rows would not show.
         let requests = rows
             .into_iter()
+            .map(|(id, index, exchange)| (id, index, redacted(exchange, redact)))
             .filter(|(_, _, exchange)| filter.matches(exchange))
             .take(limit)
-            .map(|(id, index, exchange)| request_row(id, index, exchange))
+            .map(|(id, index, exchange)| request_row(id, index, &exchange))
             .collect::<Vec<_>>();
         json!({
             "requests": requests,
@@ -1444,8 +1458,10 @@ impl CaptureStore {
 
     /// The `capture_exchange` answer: exchange `index` of connection `id`
     /// with its stream messages from index `since_message` on; `null` when
-    /// it is not kept.
-    pub fn exchange_json(&self, id: u64, index: usize, since_message: u64) -> Value {
+    /// it is not kept. With `redact`, the exchange is masked as an export
+    /// is ([`redact`]) and the stream messages, which that does not check,
+    /// keep only their place, direction, kind and size.
+    pub fn exchange_json(&self, id: u64, index: usize, since_message: u64, redact: bool) -> Value {
         let inner = lock(&self.inner);
         let Some(exchange) = inner
             .connections
@@ -1454,10 +1470,15 @@ impl CaptureStore {
         else {
             return Value::Null;
         };
-        let mut value = exchange.json();
+        let mut value = redacted(exchange, redact).json();
         value["connection_id"] = json!(id);
         value["index"] = json!(index);
-        value["messages"] = exchange.messages_json(since_message);
+        value["messages"] = if redact {
+            exchange.messages_outline_json(since_message)
+        } else {
+            exchange.messages_json(since_message)
+        };
+        value["redacted"] = json!(redact);
         value
     }
 }

@@ -258,7 +258,7 @@ fn requests_list_rows_in_order_and_filter() {
     filed(&store, 1, "POST", "https://a.test/two", 500);
     filed(&store, 2, "GET", "https://b.test/three", 404);
 
-    let all = store.requests_json(0, None, None, &Filter::default());
+    let all = store.requests_json(0, None, None, &Filter::default(), false);
     let rows = all["requests"].as_array().unwrap();
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0]["seq"], 1);
@@ -271,7 +271,7 @@ fn requests_list_rows_in_order_and_filter() {
     assert_eq!(all["last_seq"], 3);
     assert_eq!(all["dropped_before_seq"], 0);
 
-    let since = store.requests_json(1, None, Some(1), &Filter::default());
+    let since = store.requests_json(1, None, Some(1), &Filter::default(), false);
     assert_eq!(since["requests"].as_array().unwrap().len(), 1);
     assert_eq!(since["requests"][0]["seq"], 2);
 
@@ -280,14 +280,111 @@ fn requests_list_rows_in_order_and_filter() {
         None,
         None,
         &Filter::parse("status:>=400 -host:a.test").unwrap(),
+        false,
     );
     assert_eq!(errors["requests"].as_array().unwrap().len(), 1);
     assert_eq!(errors["requests"][0]["url"], "https://b.test/three");
 
     store.clear();
-    let cleared = store.requests_json(0, None, None, &Filter::default());
+    let cleared = store.requests_json(0, None, None, &Filter::default(), false);
     assert!(cleared["requests"].as_array().unwrap().is_empty());
     assert_eq!(cleared["dropped_before_seq"], 3);
+}
+
+#[test]
+fn redacted_rows_mask_urls_and_filter_only_what_they_show() {
+    let store = store(MAX_TOTAL_BYTES_LIMIT);
+    store.begin(1, Network::Tcp, Some("a.test"), "a.test:443", 1);
+    store.mark_decrypted(1);
+    filed(
+        &store,
+        1,
+        "GET",
+        "https://a.test/feed?token=t0p-secret&page=2",
+        200,
+    );
+
+    let raw = store.requests_json(0, None, None, &Filter::default(), false);
+    assert_eq!(
+        raw["requests"][0]["url"],
+        "https://a.test/feed?token=t0p-secret&page=2"
+    );
+
+    let masked = store.requests_json(0, None, None, &Filter::default(), true);
+    let url = masked["requests"][0]["url"].as_str().unwrap();
+    assert!(!url.contains("t0p-secret"), "{url}");
+    assert!(url.contains("page=2"), "{url}");
+    assert_eq!(masked["requests"][0]["host"], "a.test");
+
+    // A filter cannot find a value the redacted rows hide, in the URL or in
+    // a header.
+    for probe in [
+        "t0p-secret",
+        "url:t0p-secret",
+        "header:Authorization=secret-value",
+    ] {
+        let filter = Filter::parse(probe).unwrap();
+        let found = store.requests_json(0, None, None, &filter, true);
+        assert!(found["requests"].as_array().unwrap().is_empty(), "{probe}");
+        let unmasked = store.requests_json(0, None, None, &filter, false);
+        assert_eq!(unmasked["requests"].as_array().unwrap().len(), 1, "{probe}");
+    }
+    // What the rows do show still filters.
+    let shown = store.requests_json(0, None, None, &Filter::parse("page=2").unwrap(), true);
+    assert_eq!(shown["requests"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_redacted_exchange_masks_credentials_and_leaves_out_stream_content() {
+    use stream::{MessageKind, StreamMessage};
+    let store = store(MAX_TOTAL_BYTES_LIMIT);
+    store.begin(7, Network::Tcp, Some("a.test"), "a.test:443", 1);
+    store.mark_decrypted(7);
+    let mut exchange = HttpExchange::new(
+        "GET",
+        "https://a.test/events?access_token=t0p-secret",
+        &[
+            (
+                "Authorization".to_string(),
+                "Bearer secret-value".to_string(),
+            ),
+            ("Accept".to_string(), "text/event-stream".to_string()),
+        ],
+    );
+    exchange.status = Some(200);
+    let index = store.open_exchange(7, exchange).unwrap();
+    store.push_message(
+        7,
+        index,
+        StreamMessage {
+            index: 0,
+            at_ms: 10,
+            direction: Direction::Down,
+            kind: MessageKind::Sse,
+            label: Some("login".into()),
+            id: Some("evt-s3cret".into()),
+            code: None,
+            data: b"session=s3cret".to_vec(),
+            size: 14,
+        },
+    );
+
+    let raw = store.exchange_json(7, index, 0, false);
+    assert_eq!(raw["redacted"], false);
+    assert_eq!(raw["messages"]["kept"][0]["text"], "session=s3cret");
+
+    let masked = store.exchange_json(7, index, 0, true);
+    assert_eq!(masked["redacted"], true);
+    let text = masked.to_string();
+    for secret in ["t0p-secret", "secret-value", "s3cret", "login"] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
+    assert_eq!(masked["request"]["headers"][1][1], "text/event-stream");
+    assert_eq!(masked["messages"]["seen"], 1);
+    let kept = &masked["messages"]["kept"][0];
+    assert_eq!(kept["index"], 0);
+    assert_eq!(kept["size"], 14);
+    assert_eq!(kept["omitted"], true);
 }
 
 #[test]
@@ -301,9 +398,9 @@ fn exchanges_in_progress_are_listed_by_rev_and_keep_their_messages() {
     let index = store.open_exchange(7, exchange.clone()).unwrap();
 
     // Not finished: only `since_rev` lists it.
-    let by_seq = store.requests_json(0, None, None, &Filter::default());
+    let by_seq = store.requests_json(0, None, None, &Filter::default(), false);
     assert!(by_seq["requests"].as_array().unwrap().is_empty());
-    let by_rev = store.requests_json(0, Some(0), None, &Filter::default());
+    let by_rev = store.requests_json(0, Some(0), None, &Filter::default(), false);
     assert_eq!(by_rev["requests"][0]["state"], "in_progress");
     assert_eq!(by_rev["requests"][0]["seq"], 0);
     let last_rev = by_rev["last_rev"].as_u64().unwrap();
@@ -329,17 +426,17 @@ fn exchanges_in_progress_are_listed_by_rev_and_keep_their_messages() {
             },
         );
     }
-    let changed = store.requests_json(0, Some(last_rev), None, &Filter::default());
+    let changed = store.requests_json(0, Some(last_rev), None, &Filter::default(), false);
     let rows = changed["requests"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["status"], 200);
     assert_eq!(rows[0]["message_count"], 3);
     assert_eq!(rows[0]["rules_skipped"], true);
     let last_rev = changed["last_rev"].as_u64().unwrap();
-    let unchanged = store.requests_json(0, Some(last_rev), None, &Filter::default());
+    let unchanged = store.requests_json(0, Some(last_rev), None, &Filter::default(), false);
     assert!(unchanged["requests"].as_array().unwrap().is_empty());
 
-    let detail = store.exchange_json(7, index, 1);
+    let detail = store.exchange_json(7, index, 1, false);
     assert_eq!(detail["messages"]["seen"], 3);
     let kept = detail["messages"]["kept"].as_array().unwrap();
     assert_eq!(kept.len(), 2);
@@ -349,11 +446,14 @@ fn exchanges_in_progress_are_listed_by_rev_and_keep_their_messages() {
 
     // Finishing keeps the messages and files it by `seq`.
     store.finish_exchange(7, index, Some(exchange.clone()));
-    let done = store.requests_json(0, None, None, &Filter::default());
+    let done = store.requests_json(0, None, None, &Filter::default(), false);
     assert_eq!(done["requests"][0]["state"], "done");
     assert_eq!(done["requests"][0]["seq"], 1);
-    assert_eq!(store.exchange_json(7, index, 0)["messages"]["seen"], 3);
-    assert_eq!(store.exchange_json(7, 9, 0), Value::Null);
+    assert_eq!(
+        store.exchange_json(7, index, 0, false)["messages"]["seen"],
+        3
+    );
+    assert_eq!(store.exchange_json(7, 9, 0, false), Value::Null);
 
     // The memory the exchange holds is what the budget counts.
     let expected = {
@@ -580,7 +680,7 @@ fn one_busy_connection_gives_up_its_own_oldest_bodies_only() {
         let inner = lock(&store.inner);
         assert!(inner.connections[&2].memory <= DEFAULT_MAX_TOTAL_BYTES / 2);
     }
-    let rows = store.requests_json(0, None, None, &Filter::default());
+    let rows = store.requests_json(0, None, None, &Filter::default(), false);
     assert_eq!(rows["requests"].as_array().unwrap().len(), 41);
     assert_eq!(rows["dropped_before_seq"], 0);
     assert_accounted(&store);
@@ -627,13 +727,16 @@ fn clearing_keeps_open_connections_recording_under_new_indexes() {
     late.status = Some(200);
     store.finish_exchange(3, old, Some(late));
     store.finish_exchange(3, new, None);
-    let rows = store.requests_json(0, None, None, &Filter::default());
+    let rows = store.requests_json(0, None, None, &Filter::default(), false);
     let rows = rows["requests"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["url"], "https://a.test/new");
     assert_eq!(rows[0]["index"], 1);
-    assert_eq!(store.exchange_json(3, 0, 0), Value::Null);
-    assert_eq!(store.exchange_json(3, 1, 0)["url"], "https://a.test/new");
+    assert_eq!(store.exchange_json(3, 0, 0, false), Value::Null);
+    assert_eq!(
+        store.exchange_json(3, 1, 0, false)["url"],
+        "https://a.test/new"
+    );
     assert_accounted(&store);
 
     // Closed and cleared, it is gone for good.
@@ -658,14 +761,14 @@ fn exchanges_past_the_limit_roll_and_kept_rows_are_never_reported_dropped() {
     assert_eq!(http.len(), MAX_HTTP_EXCHANGES);
     assert_eq!(http[0]["index"], 6);
     assert_eq!(http[0]["url"], "https://a.test/6");
-    assert_eq!(store.exchange_json(2, 5, 0), Value::Null);
+    assert_eq!(store.exchange_json(2, 5, 0, false), Value::Null);
     let newest = MAX_HTTP_EXCHANGES + 5;
     assert_eq!(
-        store.exchange_json(2, newest, 0)["url"],
+        store.exchange_json(2, newest, 0, false)["url"],
         format!("https://a.test/{newest}")
     );
     assert_eq!(store.status().dropped_exchanges, 6);
-    let rows = store.requests_json(0, None, Some(MAX_REQUEST_ROWS), &Filter::default());
+    let rows = store.requests_json(0, None, Some(MAX_REQUEST_ROWS), &Filter::default(), false);
     // The first row (connection 1) is older than the rolled ones but
     // still kept, so a client must not drop it.
     assert_eq!(rows["dropped_before_seq"], 0);
@@ -736,7 +839,7 @@ fn loaded_sessions_take_ids_no_live_connection_has() {
     assert_eq!(loaded["http"][0]["url"], "https://saved.test/1");
     assert_eq!(loaded["http"][1]["url"], "https://saved.test/2");
     assert_eq!(loaded["ended_at_ms"], 5);
-    let rows = store.requests_json(0, None, None, &Filter::default());
+    let rows = store.requests_json(0, None, None, &Filter::default(), false);
     let rows = rows["requests"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows

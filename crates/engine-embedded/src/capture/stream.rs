@@ -140,6 +140,26 @@ impl Messages {
             .collect()
     }
 
+    /// The kept messages from index `since` on, each without its content
+    /// (text, data, event name, id): what a redacted exchange shows.
+    pub fn outline_since(&self, since: u64) -> Vec<Value> {
+        self.kept
+            .iter()
+            .filter(|message| message.index >= since)
+            .map(|message| {
+                json!({
+                    "index": message.index,
+                    "at_ms": message.at_ms,
+                    "dir": message.direction,
+                    "kind": message.kind,
+                    "code": message.code,
+                    "size": message.size,
+                    "omitted": true,
+                })
+            })
+            .collect()
+    }
+
     /// Rebuilds the byte count after loading saved messages.
     pub fn restore(kept: VecDeque<StreamMessage>, seen: u64, dropped: u64) -> Self {
         let data_bytes = kept.iter().map(|message| message.data.len()).sum();

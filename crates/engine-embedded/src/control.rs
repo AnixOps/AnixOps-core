@@ -47,8 +47,8 @@
 //! | `load_capture` | `session` | [`crate::capture::CaptureStatus`]: the session replaces what capture holds, live capture turns off; its connections get new ids from [`crate::capture::LOADED_ID_BASE`] (2^52) up, so no live connection writes into them |
 //! | `delete_capture` | `session` | `{"deleted": bool}` |
 //! | `copy_capture` | `key_base64` (32 bytes), optional `session`, `name` | `{"session", "file_name", "size", "data_base64"}`: a saved session sealed again under that key, or without `session` what capture holds now sealed as this run's session named `name` (no storage needed), for the app's own store (the capture viewer's `import_capture`) |
-//! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter` | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`) |
-//! | `capture_exchange` | `id`, `index`, optional `since_message` | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events, WebSocket messages) from `since_message` on |
+//! | `capture_requests` | optional `since_seq`, `since_rev`, `limit`, `filter`, `redact` (default `false`) | `{"requests": [...], "last_seq", "last_rev", "dropped_before_seq"}` or `{"error": {"code": "invalid_filter", "at"}}`: one row per decrypted HTTP exchange, once finished (by `since_seq`), or at each change, still in progress included (by `since_rev`; rows carry `state`, `rev`, `message_count`, `rules_skipped`). With `redact`, URLs are masked as an export masks them and the filter tests the masked exchange, so it cannot find a value the rows would not show |
+//! | `capture_exchange` | `id`, `index`, optional `since_message`, `redact` (default `false`) | `{"exchange": {...} \| null}`: one decrypted exchange with the kept stream messages (server-sent events, WebSocket messages) from `since_message` on. With `redact`, it is masked as an export is ([`crate::capture::redact`]), carries `"redacted": true`, and the stream messages keep only `index`, `at_ms`, `dir`, `kind`, `code` and `size` (`"omitted": true`) |
 //! | `capture_h2_frames` | `id`, optional `since` | `{"h2_frames": {"seen", "dropped", "frames": [...]} \| null}`: the HTTP/2 frame headers of a decrypted `h2` connection on both links (`link`: `app` \| `origin`, `dir`, `type`, `flags`, `stream`, `length`, `error`, `value`), the last 512 |
 //! | `mitm_hosts` | | `{"enabled", "hosts": [{"host", "decrypted", "failed", "last_failure", "last_failure_at_ms", "last_decrypted_at_ms", "failures"}]}`: what HTTPS decryption did per host since the engine started, the most recently seen first, at most 256; `last_failure` is `client_rejected_certificate` (certificate alert from the app: untrusted root or pinning), `client_closed` (the app hung up during the handshake, often pinning), `client_handshake_failed`, `client_timeout`, `origin_tls` or `origin_unreachable` |
 //! | `clear_mitm_hosts` | | the `mitm_hosts` answer, after forgetting it |
@@ -262,6 +262,8 @@ enum ControlRequest {
         index: usize,
         #[serde(default)]
         since_message: u64,
+        #[serde(default)]
+        redact: bool,
     },
     CaptureH2Frames {
         id: u64,
@@ -318,6 +320,8 @@ enum ControlRequest {
         limit: Option<usize>,
         #[serde(default)]
         filter: String,
+        #[serde(default)]
+        redact: bool,
     },
     MitmHosts,
     ClearMitmHosts,
@@ -797,8 +801,9 @@ fn capture_command(
             id,
             index,
             since_message,
+            redact,
         } => Ok(json!({
-            "exchange": store.exchange_json(id, index, since_message),
+            "exchange": store.exchange_json(id, index, since_message, redact),
         })),
         ControlRequest::CaptureH2Frames { id, since } => Ok(json!({
             "h2_frames": store.h2_frames_json(id, since),
@@ -881,8 +886,9 @@ fn capture_command(
             since_rev,
             limit,
             filter,
+            redact,
         } => match Filter::parse(&filter) {
-            Ok(filter) => Ok(store.requests_json(since_seq, since_rev, limit, &filter)),
+            Ok(filter) => Ok(store.requests_json(since_seq, since_rev, limit, &filter, redact)),
             Err(error) => Ok(json!({
                 "error": { "code": "invalid_filter", "at": error.at },
             })),
