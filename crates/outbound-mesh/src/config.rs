@@ -73,7 +73,8 @@ pub struct NetworkConfig {
     /// there is no fallback (spec §5.2).
     #[serde(default)]
     pub secure_mode: bool,
-    /// Cipher of the default handshake mode (spec §7.1).
+    /// Cipher of the default handshake mode (spec §7.1). `none` turns
+    /// encryption off and must be chosen explicitly.
     #[serde(default)]
     pub cipher: Cipher,
 }
@@ -163,6 +164,12 @@ pub enum Transport {
 /// XOR mode is not offered: a config naming it fails to parse.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 pub enum Cipher {
+    /// No encryption at all (spec §7.1, requirement R14). Only when the
+    /// config says so explicitly; such a network is shown as unencrypted and
+    /// the plaintext checks of spec §7.6 cannot apply. Without it, this node
+    /// drops the plaintext traffic of such a network.
+    #[serde(rename = "none")]
+    None,
     /// AES-128-GCM.
     #[default]
     #[serde(rename = "aes-gcm", alias = "openssl-aes-gcm")]
@@ -266,6 +273,14 @@ impl SecurityMode {
     }
 }
 
+impl MeshSettings {
+    /// Whether traffic is encrypted at all; `false` only with an explicit
+    /// `cipher: none` (requirement R14).
+    pub fn encrypted(&self) -> bool {
+        self.security == SecurityMode::ForwardSecrecy || self.cipher != Cipher::None
+    }
+}
+
 /// Validated settings. Has no `Debug`: it holds the secret.
 #[derive(Clone)]
 pub struct MeshSettings {
@@ -327,6 +342,11 @@ impl MeshConfig {
         }
         if network.secret.is_empty() {
             return Err("mesh network secret is empty");
+        }
+        if network.secure_mode && network.cipher == Cipher::None {
+            return Err(
+                "mesh secure_mode always encrypts; cipher none applies to the default mode only",
+            );
         }
 
         let node = self.node;
@@ -572,6 +592,7 @@ mod tests {
         assert_eq!(settings.security, SecurityMode::Default);
         assert!(!settings.security.has_forward_secrecy());
         assert_eq!(settings.cipher, Cipher::Aes128Gcm);
+        assert!(settings.encrypted());
         assert_eq!(settings.route_policy, RoutePolicy::Hops);
         assert_eq!(settings.role, Role::Access);
         assert!(settings.paths.is_empty());
@@ -622,8 +643,15 @@ mod tests {
             let settings = validate(with("network.cipher", json!(name))).unwrap();
             assert_eq!(settings.cipher, cipher, "{name}");
         }
+        // No encryption only when chosen, and never with the secure mode.
+        let settings = validate(with("network.cipher", json!("none"))).unwrap();
+        assert_eq!(settings.cipher, Cipher::None);
+        assert!(!settings.encrypted());
+        let mut secure_plain = with("network.cipher", json!("none"));
+        secure_plain["network"]["secure_mode"] = json!(true);
+        assert!(validate(secure_plain).is_err());
         // XOR has no authentication and is refused (spec §7.1).
-        for name in ["xor", "openssl-xor", "AES-GCM", ""] {
+        for name in ["xor", "openssl-xor", "AES-GCM", "", "None", "plain"] {
             assert!(
                 parse(with("network.cipher", json!(name))).is_err(),
                 "{name}"

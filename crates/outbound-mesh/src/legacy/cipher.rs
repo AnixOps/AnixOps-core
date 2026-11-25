@@ -31,18 +31,20 @@ pub struct LegacyCipher {
 }
 
 impl LegacyCipher {
-    /// Derives the key of `cipher` from the network secret (spec §7.1).
-    pub fn new(cipher: Cipher, secret: &[u8]) -> Self {
+    /// Derives the key of `cipher` from the network secret (spec §7.1);
+    /// `None` for an unencrypted network.
+    pub fn new(cipher: Cipher, secret: &[u8]) -> Option<Self> {
         let unbound = match cipher {
+            Cipher::None => return None,
             Cipher::Aes128Gcm => UnboundKey::new(&aead::AES_128_GCM, &key128(secret)),
             Cipher::Aes256Gcm => UnboundKey::new(&aead::AES_256_GCM, &key256(secret)),
             Cipher::ChaCha20Poly1305 => UnboundKey::new(&aead::CHACHA20_POLY1305, &key256(secret)),
         }
         .expect("derived keys have the algorithm's length");
-        Self {
+        Some(Self {
             key: LessSafeKey::new(unbound),
             rng: SystemRandom::new(),
-        }
+        })
     }
 
     /// Encrypts `payload` in place and appends the tail, with a fresh random
@@ -100,7 +102,7 @@ mod tests {
     // Spec §22.4: the whole TCP frame of one encrypted Data packet.
     #[test]
     fn tcp_frame_vector() {
-        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"s3cr3t");
+        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"s3cr3t").unwrap();
         let plain = unhex(ICMP);
         let mut payload = plain.clone();
         let nonce: [u8; 12] = (0u8..12).collect::<Vec<_>>().try_into().unwrap();
@@ -137,7 +139,7 @@ mod tests {
             Cipher::Aes256Gcm,
             Cipher::ChaCha20Poly1305,
         ] {
-            let cipher = LegacyCipher::new(kind, b"secret");
+            let cipher = LegacyCipher::new(kind, b"secret").unwrap();
             let mut a = b"hello mesh".to_vec();
             let mut b = a.clone();
             cipher.seal(&mut a).unwrap();
@@ -151,18 +153,22 @@ mod tests {
 
     #[test]
     fn wrong_key_cipher_or_tampering_fails() {
-        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"secret");
+        let cipher = LegacyCipher::new(Cipher::Aes128Gcm, b"secret").unwrap();
         let mut sealed = b"payload".to_vec();
         cipher.seal(&mut sealed).unwrap();
 
         let mut other = sealed.clone();
         assert_eq!(
-            LegacyCipher::new(Cipher::Aes128Gcm, b"other").open(&mut other),
+            LegacyCipher::new(Cipher::Aes128Gcm, b"other")
+                .unwrap()
+                .open(&mut other),
             Err(CipherError::Open)
         );
         let mut other = sealed.clone();
         assert_eq!(
-            LegacyCipher::new(Cipher::Aes256Gcm, b"secret").open(&mut other),
+            LegacyCipher::new(Cipher::Aes256Gcm, b"secret")
+                .unwrap()
+                .open(&mut other),
             Err(CipherError::Open)
         );
         let mut tampered = sealed.clone();
@@ -170,6 +176,7 @@ mod tests {
         assert_eq!(cipher.open(&mut tampered), Err(CipherError::Open));
         let mut short = vec![0u8; TAIL_LEN - 1];
         assert_eq!(cipher.open(&mut short), Err(CipherError::Truncated));
+        assert!(LegacyCipher::new(Cipher::None, b"secret").is_none());
         // An empty payload still carries a tag.
         let mut empty = Vec::new();
         cipher.seal(&mut empty).unwrap();

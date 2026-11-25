@@ -66,7 +66,7 @@
 |---|---|
 | `network.name` / `secret` | 网络名按原样参与摘要（不去空格）；密钥由钥匙串注入 |
 | `network.secure_mode` | `false`（默认）旧模式，`true` 安全模式；全网一致（规范 §5.2） |
-| `network.cipher` | 旧模式算法：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；不提供异或 |
+| `network.cipher` | 旧模式算法：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20`；不提供异或。`none` 为不加密，只有显式写出才生效，不能与安全模式同用，界面标出“未加密”（需求 R14）；未选择时本节点丢弃不加密网络的明文流量 |
 | `node.address` | IPv4 虚拟地址与前缀（/8–/30），前缀即虚拟网段 |
 | `node.role` | `full` 或 `access`；缺省按平台：桌面与服务器 `full`，iOS、Android 只能 `access`（R10） |
 | `node.listen` | 监听，只有完整节点可以配置；端口默认 11010 |

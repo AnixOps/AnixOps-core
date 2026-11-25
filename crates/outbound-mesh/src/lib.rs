@@ -16,12 +16,14 @@
 //! - [`wire`]: framing, the node header and the protobuf subset.
 //! - [`legacy`]: the default handshake mode: digest, static keys, payload
 //!   encryption and the handshake message.
+//! - [`rpc`]: peer RPC packets, pieces, requests and responses.
 
 pub mod config;
 pub mod legacy;
 pub mod net;
 pub mod packet;
 pub mod routes;
+pub mod rpc;
 pub mod scope;
 pub mod wire;
 
