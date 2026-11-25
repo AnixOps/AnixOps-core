@@ -775,8 +775,10 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             installer: install-windows.ps1
+            wintun: amd64
           - os: windows-latest
             target: aarch64-pc-windows-msvc
+            wintun: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -808,6 +810,32 @@ jobs:
               (cd dist/mesh-node && shasum -a 256 "${installer}" > "${installer}.sha256")
             fi
           fi
+
+      # The Windows node loads wintun.dll from its own folder only; it is
+      # shipped beside the program, unmodified, with its license.
+      - name: Add Wintun
+        if: matrix.wintun != ''
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release-policy.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          WINTUN_ARCH: ${{ matrix.wintun }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = Join-Path $env:RUNNER_TEMP "wintun-$env:WINTUN_ARCH"
+          & .github/scripts/fetch-wintun.ps1 -Destination $work -Arch $env:WINTUN_ARCH | Out-Null
+          $dll = "anixops-mesh-$env:VERSION-$env:TARGET-wintun.dll"
+          Copy-Item (Join-Path $work "wintun.dll") (Join-Path "dist/mesh-node" $dll)
+          $names = @($dll)
+          if ($env:WINTUN_ARCH -eq "amd64") {
+            $license = "anixops-mesh-$env:VERSION-wintun-LICENSE.txt"
+            Copy-Item (Join-Path $work "wintun-LICENSE.txt") (Join-Path "dist/mesh-node" $license)
+            $names += $license
+          }
+          foreach ($name in $names) {
+            $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path "dist/mesh-node" $name)).Hash.ToLowerInvariant()
+            [System.IO.File]::WriteAllText((Join-Path "dist/mesh-node" "$name.sha256"), "$hash  $name`n")
+          }
 
       - name: Upload mesh node build
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -855,7 +883,10 @@ jobs:
             "anixops-mesh-${VERSION}-aarch64-pc-windows-msvc.exe" \
             "anixops-mesh-${VERSION}-install-linux.sh" \
             "anixops-mesh-${VERSION}-install-macos.sh" \
-            "anixops-mesh-${VERSION}-install-windows.ps1"; do
+            "anixops-mesh-${VERSION}-install-windows.ps1" \
+            "anixops-mesh-${VERSION}-x86_64-pc-windows-msvc-wintun.dll" \
+            "anixops-mesh-${VERSION}-aarch64-pc-windows-msvc-wintun.dll" \
+            "anixops-mesh-${VERSION}-wintun-LICENSE.txt"; do
             test -s "${name}"
             test -s "${name}.sha256"
             sha256sum -c "${name}.sha256"
@@ -876,7 +907,7 @@ jobs:
                and (.rustc | startswith("rustc ")) and (.cargo | startswith("cargo "))' \
               "${name}.buildinfo.json" >/dev/null
           done
-          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "24"
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "30"
 
       - name: Generate mesh node attestation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -1063,7 +1094,10 @@ jobs:
             "anixops-mesh-${VERSION}-aarch64-pc-windows-msvc.exe" \
             "anixops-mesh-${VERSION}-install-linux.sh" \
             "anixops-mesh-${VERSION}-install-macos.sh" \
-            "anixops-mesh-${VERSION}-install-windows.ps1"; do
+            "anixops-mesh-${VERSION}-install-windows.ps1" \
+            "anixops-mesh-${VERSION}-x86_64-pc-windows-msvc-wintun.dll" \
+            "anixops-mesh-${VERSION}-aarch64-pc-windows-msvc-wintun.dll" \
+            "anixops-mesh-${VERSION}-wintun-LICENSE.txt"; do
             (cd dist/mesh-node && sha256sum -c "${name}.sha256")
             mesh_assets+=("dist/mesh-node/${name}" "dist/mesh-node/${name}.sha256")
           done
@@ -1097,6 +1131,7 @@ jobs:
           - anixops-mesh-${VERSION}-x86_64-unknown-linux-musl and -aarch64-unknown-linux-musl: static programs for intranet mesh nodes, each with a .sha256 file
           - anixops-mesh-${VERSION}-aarch64-apple-darwin and -x86_64-apple-darwin: macOS programs, each with a .sha256 file
           - anixops-mesh-${VERSION}-x86_64-pc-windows-msvc.exe and -aarch64-pc-windows-msvc.exe: Windows programs with the C runtime linked in, each with a .sha256 file
+          - anixops-mesh-${VERSION}-x86_64-pc-windows-msvc-wintun.dll and -aarch64-pc-windows-msvc-wintun.dll: the unmodified Wintun 0.14.1 driver library each Windows program loads from its own folder, with its license anixops-mesh-${VERSION}-wintun-LICENSE.txt
           - anixops-mesh-${VERSION}-install-linux.sh, -install-macos.sh, -install-windows.ps1: one-command installers; the panel generates the command with the download URLs and SHA-256 values
           - Attestation: GitHub artifact attestation
           - See docs/deploy/mesh-node.md

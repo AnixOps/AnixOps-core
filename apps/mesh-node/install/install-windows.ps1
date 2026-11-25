@@ -1,6 +1,7 @@
 # One-command installer of the intranet mesh node for Windows.
 #
 #   install-windows.ps1 -BinaryUrl URL -BinarySha256 HEX
+#                       [-WintunUrl URL -WintunSha256 HEX]
 #                       [-ProfileUrl URL -ProfileSha256 HEX]
 #                       [-Config FILE] [-Address CIDR] [-AllowUnencrypted]
 #                       [-AcceptConfirmations] [-DryRun]
@@ -11,12 +12,16 @@
 # node runs as the Windows service AnixOpsMesh. With a takeover profile the
 # script imports the existing installation and only takes it over when this
 # build can run the node; if our service fails to start, the takeover is
-# rolled back. See docs/deploy/mesh-node.md.
+# rolled back. The node loads wintun.dll from its own folder only: a build
+# that can run the node needs -WintunUrl and -WintunSha256 (the release's
+# wintun.dll for this architecture). See docs/deploy/mesh-node.md.
 
 [CmdletBinding()]
 param(
     [string]$BinaryUrl = "",
     [string]$BinarySha256 = "",
+    [string]$WintunUrl = "",
+    [string]$WintunSha256 = "",
     [string]$ProfileUrl = "",
     [string]$ProfileSha256 = "",
     [string]$Config = "",
@@ -108,6 +113,7 @@ if ($Uninstall) {
 
 if (-not $BinaryUrl -or -not $BinarySha256) { Fail "-BinaryUrl and -BinarySha256 are required" }
 if ($ProfileUrl -and -not $ProfileSha256) { Fail "-ProfileSha256 is required with -ProfileUrl" }
+if ($WintunUrl -and -not $WintunSha256) { Fail "-WintunSha256 is required with -WintunUrl" }
 
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -ne "AMD64" -and $arch -ne "ARM64") { Fail "unsupported architecture $arch" }
@@ -129,6 +135,19 @@ try {
     $capabilities = & $download capabilities
     if ($LASTEXITCODE -ne 0) { Fail "the downloaded program does not run here" }
     $canRun = ($capabilities -join "`n") -match '"run"'
+    $wintunDownload = $null
+    if ($WintunUrl) {
+        Say "downloading wintun.dll"
+        $wintunDownload = Join-Path $work "wintun.dll"
+        Get-Download $WintunUrl $wintunDownload $WintunSha256 "wintun.dll"
+        # The library must be built for this machine.
+        $bytes = [IO.File]::ReadAllBytes($wintunDownload)
+        $machine = [BitConverter]::ToUInt16($bytes, [BitConverter]::ToInt32($bytes, 0x3C) + 4)
+        $wanted = if ($arch -eq "ARM64") { 0xAA64 } else { 0x8664 }
+        if ($machine -ne $wanted) { Fail "wintun.dll is not built for $arch" }
+    } elseif ($canRun) {
+        Fail "-WintunUrl and -WintunSha256 are required: the node needs wintun.dll"
+    }
 
     Protect-Directory (Split-Path -Parent $DataDir)
     Protect-Directory $DataDir
@@ -190,6 +209,7 @@ try {
 
     New-Item -ItemType Directory -Force -Path $ProgramDir | Out-Null
     Copy-Item -Force $download $Bin
+    if ($wintunDownload) { Copy-Item -Force $wintunDownload (Join-Path $ProgramDir "wintun.dll") }
     if ($ProfileUrl) { Copy-Item -Force $profileDownload $ProfilePath }
     if ($sourceConfig) { Copy-Item -Force $sourceConfig $ConfigPath }
 
@@ -203,6 +223,9 @@ try {
     New-Service -Name $ServiceName -DisplayName "AnixOps Mesh" -BinaryPathName $command -StartupType Automatic | Out-Null
     # Restarted after a failure, five seconds apart.
     & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+    # The node reports a failed exit as a service-specific error; without
+    # this flag the restart actions above would not apply to it.
+    & sc.exe failureflag $ServiceName 1 | Out-Null
 
     if ($ProfileUrl) {
         Say "taking over the existing installation"
