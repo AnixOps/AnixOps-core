@@ -1119,7 +1119,10 @@ pub fn clamp_mss(ip: &mut [u8], max: u16) -> bool {
             0 => break,
             1 => at += 1,
             kind => {
-                let len = usize::from(*tcp.get(at + 1)?);
+                let Some(&len) = tcp.get(at + 1) else {
+                    return false;
+                };
+                let len = usize::from(len);
                 if len < 2 || at + len > options_end {
                     return false;
                 }
