@@ -298,7 +298,12 @@ mod tests {
 
     #[test]
     fn management_listens_on_loopback_by_default() {
-        for listen in ["127.0.0.1:10085", "127.8.9.10:1", "[::1]:10085", "[::ffff:127.0.0.1]:10085"] {
+        for listen in [
+            "127.0.0.1:10085",
+            "127.8.9.10:1",
+            "[::1]:10085",
+            "[::ffff:127.0.0.1]:10085",
+        ] {
             assert_eq!(management(listen, false).check(), Ok(None), "{listen}");
         }
         for listen in [
@@ -352,7 +357,10 @@ mod tests {
 
     #[tokio::test]
     async fn management_bind_refuses_before_binding() {
-        let error = management("0.0.0.0:0", false).bind("test").await.unwrap_err();
+        let error = management("0.0.0.0:0", false)
+            .bind("test")
+            .await
+            .unwrap_err();
         assert!(error.contains("loopback only"), "{error}");
         let listener = management("127.0.0.1:0", false).bind("test").await.unwrap();
         assert!(listener.local_addr().unwrap().ip().is_loopback());
