@@ -89,6 +89,18 @@
 
 [`apps/mesh-node/install/install-linux.sh`](../../apps/mesh-node/install/install-linux.sh) 是一条命令安装脚本：下载程序并校验 SHA-256（值由面板生成的安装命令给出），可选下载并校验接管数据文件，执行导入预检；程序支持 `run` 时才接管、注册 systemd 或 OpenRC 服务并启动，启动失败自动停止我方服务并回滚接管。`--uninstall` 停止并删除我方服务后回滚接管。
 
+### 发布产物
+
+每个 `v*` 标签的发布附带以下文件，各有 `.sha256` 和 GitHub 制品证明：
+
+| 文件 | 内容 |
+| --- | --- |
+| `anixops-mesh-<版本>-x86_64-unknown-linux-musl` | 静态程序，无动态依赖 |
+| `anixops-mesh-<版本>-aarch64-unknown-linux-musl` | 同上 |
+| `anixops-mesh-<版本>-install-linux.sh` | 本节的安装脚本 |
+
+构建脚本是 [`.github/scripts/build-mesh-node.sh`](../../.github/scripts/build-mesh-node.sh)，CI 的「Mesh node static build」在每次 Rust 改动时用同一脚本构建两种架构，确认程序静态链接、x86_64 版本可运行。32 位 ARM 与 MIPS 随 OpenWrt 软件包（内核 0.5）提供。
+
 ## 接管数据文件格式
 
 ```json
