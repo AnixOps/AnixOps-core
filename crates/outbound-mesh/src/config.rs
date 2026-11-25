@@ -11,11 +11,15 @@
 //! {
 //!   "config_version": 1,
 //!   "network": { "name": "office", "secret": "…", "secure_mode": false, "cipher": "aes-gcm" },
-//!   "node": { "address": "10.144.144.5/24", "role": "full", "listen": [{ "transport": "tcp" }] },
+//!   "node": {
+//!     "address": "10.144.144.5/24", "role": "full", "hostname": "build-01",
+//!     "mtu": 1380, "relay": true, "listen": [{ "transport": "tcp" }]
+//!   },
 //!   "peers": [{ "server": "peer.example.com", "port": 11010, "transport": "tcp" }],
 //!   "subnets": { "accept": ["192.168.0.0/16"], "advertise": ["192.168.10.0/24"] },
 //!   "routing": {
 //!     "policy": "hops",
+//!     "system_routes": ["192.168.10.0/24"],
 //!     "paths": [{ "to_peer": "10.144.144.7", "via": ["10.144.144.3"] }]
 //!   }
 //! }
@@ -45,6 +49,14 @@ pub const MAX_PATHS: usize = 256;
 pub const MAX_WAYPOINTS: usize = 6;
 /// Default TCP and UDP port (spec §2.4).
 pub const DEFAULT_PORT: u16 = 11010;
+/// Default virtual interface MTU (spec §2.4).
+pub const DEFAULT_MTU: u16 = 1380;
+/// Smallest accepted MTU: the IPv6 minimum.
+pub const MIN_MTU: u16 = 1280;
+/// Largest accepted MTU.
+pub const MAX_MTU: u16 = 9000;
+/// Longest host name: one DNS label.
+pub const MAX_HOSTNAME_BYTES: usize = 63;
 
 /// One mesh node as it appears in the config. The secret is injected from
 /// the Keychain like the other protocols' passwords. Has no `Debug`: it
@@ -95,6 +107,18 @@ pub struct NodeConfig {
     /// Listening sockets; full nodes only.
     #[serde(default)]
     pub listen: Vec<ListenConfig>,
+    /// The name other nodes and the intranet DNS show (requirement R28): one
+    /// DNS label. Absent: the system host name, read when the node starts.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Virtual interface MTU, [`MIN_MTU`] to [`MAX_MTU`]. Absent: [`DEFAULT_MTU`].
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    /// Whether this node relays for other nodes. Absent: `true` on full
+    /// nodes. Access nodes never relay, so `true` is refused there. A node
+    /// that does not relay is still reachable as a destination.
+    #[serde(default)]
+    pub relay: Option<bool>,
 }
 
 /// What a node does for others (spec §1.3, requirement R10).
@@ -204,6 +228,11 @@ pub struct SubnetsConfig {
 pub struct RoutingConfig {
     #[serde(default)]
     pub policy: RoutePolicy,
+    /// Limits which routes go into the operating system's routing table.
+    /// Absent: every accepted route. Present: only routes inside one of
+    /// these networks; the others still work inside the mesh and are shown.
+    #[serde(default)]
+    pub system_routes: Option<Vec<String>>,
     #[serde(default)]
     pub paths: Vec<PathConfig>,
 }
@@ -292,6 +321,11 @@ pub struct MeshSettings {
     pub address: IpNet,
     pub address_v6: Option<IpNet>,
     pub role: Role,
+    /// `None`: the system host name.
+    pub hostname: Option<String>,
+    pub mtu: u16,
+    /// Whether this node relays for others; always `false` on access nodes.
+    pub relay: bool,
     pub listen: Vec<ListenConfig>,
     pub peers: Vec<PeerEndpoint>,
     /// Masked networks; empty means no extra limit.
@@ -299,6 +333,8 @@ pub struct MeshSettings {
     /// Masked networks this node advertises.
     pub advertise_subnets: Vec<IpNet>,
     pub route_policy: RoutePolicy,
+    /// `None`: every accepted route goes into the system routing table.
+    pub system_routes: Option<Vec<IpNet>>,
     pub paths: Vec<CustomPath>,
 }
 
@@ -376,6 +412,20 @@ impl MeshConfig {
         if role == Role::Access && !node.listen.is_empty() {
             return Err("mesh access nodes do not listen");
         }
+        let relay = match (role, node.relay) {
+            (Role::Access, Some(true)) => return Err("mesh access nodes do not relay"),
+            (Role::Access, _) => false,
+            (Role::Full, relay) => relay.unwrap_or(true),
+        };
+        let mtu = node.mtu.unwrap_or(DEFAULT_MTU);
+        if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
+            return Err("mesh node mtu is out of range");
+        }
+        if let Some(hostname) = &node.hostname {
+            if !is_dns_label(hostname) {
+                return Err("mesh node hostname is not a DNS label");
+            }
+        }
         let mut seen = HashSet::new();
         for listen in &node.listen {
             if listen.port == 0 {
@@ -414,6 +464,10 @@ impl MeshConfig {
         if role == Role::Access && !advertise_subnets.is_empty() {
             return Err("mesh access nodes do not advertise subnets");
         }
+        let system_routes = match &self.routing.system_routes {
+            None => None,
+            Some(texts) => Some(intranet_subnets(texts, "mesh routing.system_routes")?),
+        };
 
         let mut settings = MeshSettings {
             network_name: network.name,
@@ -427,11 +481,15 @@ impl MeshConfig {
             address,
             address_v6,
             role,
+            hostname: node.hostname,
+            mtu,
+            relay,
             listen: node.listen,
             peers,
             accept_subnets,
             advertise_subnets,
             route_policy: self.routing.policy,
+            system_routes,
             paths: Vec::new(),
         };
         if advertise_subnets_overlap_virtual(&settings) {
@@ -516,6 +574,16 @@ fn intranet_subnets(texts: &[String], what: &'static str) -> Result<Vec<IpNet>, 
         .collect()
 }
 
+/// One DNS label (RFC 1123): letters, digits and hyphens, not starting or
+/// ending with a hyphen.
+fn is_dns_label(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_HOSTNAME_BYTES
+        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !text.starts_with('-')
+        && !text.ends_with('-')
+}
+
 fn advertise_subnets_overlap_virtual(settings: &MeshSettings) -> bool {
     let virtual_subnets = settings.virtual_subnets();
     settings
@@ -595,6 +663,10 @@ mod tests {
         assert!(settings.encrypted());
         assert_eq!(settings.route_policy, RoutePolicy::Hops);
         assert_eq!(settings.role, Role::Access);
+        assert_eq!(settings.hostname, None);
+        assert_eq!(settings.mtu, DEFAULT_MTU);
+        assert!(!settings.relay);
+        assert_eq!(settings.system_routes, None);
         assert!(settings.paths.is_empty());
         assert_eq!(
             settings.peers,
@@ -740,6 +812,73 @@ mod tests {
     #[test]
     fn phones_cannot_be_full_nodes() {
         assert!(validate(with("node.role", json!("full"))).is_err());
+    }
+
+    #[test]
+    fn hostname_and_mtu() {
+        let mut config = with("node.hostname", json!("build-01"));
+        config["node"]["mtu"] = json!(1420);
+        let settings = validate(config).unwrap();
+        assert_eq!(settings.hostname.as_deref(), Some("build-01"));
+        assert_eq!(settings.mtu, 1420);
+        let long = "a".repeat(64);
+        for bad in ["", "-a", "a-", "a.b", "a b", "例子", long.as_str()] {
+            assert!(
+                validate(with("node.hostname", json!(bad))).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(validate(with("node.hostname", json!("A1-b"))).is_ok());
+        for mtu in [MIN_MTU, MAX_MTU] {
+            assert!(validate(with("node.mtu", json!(mtu))).is_ok(), "{mtu}");
+        }
+        for mtu in [0, 1279, 9001] {
+            assert!(validate(with("node.mtu", json!(mtu))).is_err(), "{mtu}");
+        }
+        assert!(parse(with("node.mtu", json!(70000))).is_err());
+    }
+
+    #[test]
+    fn access_nodes_never_relay() {
+        assert!(!validate(with("node.relay", json!(false))).unwrap().relay);
+        assert_eq!(
+            validate(with("node.relay", json!(true))).err(),
+            Some("mesh access nodes do not relay")
+        );
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[test]
+    fn full_nodes_relay_unless_told_not_to() {
+        assert!(validate(with("node.role", json!("full"))).unwrap().relay);
+        let mut config = with("node.role", json!("full"));
+        config["node"]["relay"] = json!(false);
+        assert!(!validate(config).unwrap().relay);
+    }
+
+    #[test]
+    fn system_routes_are_intranet_networks() {
+        let settings = validate(with(
+            "routing.system_routes",
+            json!(["192.168.10.9/24", "10.20.0.0/16"]),
+        ))
+        .unwrap();
+        assert_eq!(
+            settings.system_routes,
+            Some(vec![
+                IpNet::parse("192.168.10.0/24").unwrap(),
+                IpNet::parse("10.20.0.0/16").unwrap(),
+            ])
+        );
+        // Present but empty: nothing goes into the system routing table.
+        let settings = validate(with("routing.system_routes", json!([]))).unwrap();
+        assert_eq!(settings.system_routes, Some(Vec::new()));
+        for bad in ["0.0.0.0/0", "8.8.8.0/24", "bogus"] {
+            assert!(
+                validate(with("routing.system_routes", json!([bad]))).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
