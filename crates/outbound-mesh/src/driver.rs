@@ -199,6 +199,8 @@ pub async fn run(
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
+        // Relay handshakes due before the next tick (spec §9 retries).
+        let wake_at = node.next_wake();
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -268,8 +270,11 @@ pub async fn run(
             packet = from_interface.recv() => {
                 let Some(packet) = packet else { break };
                 // Refusals are counted by the node.
-                let _ = node.send_ip(&packet, Instant::now());
+                let now = Instant::now();
+                let _ = node.send_ip(&packet, now);
+                node.wake(&rng, now);
             }
+            _ = until(wake_at) => node.wake(&rng, Instant::now()),
             _ = ticks.tick() => {
                 node.tick(&rng, Instant::now(), unix_now());
                 let _ = snapshots.send(snapshot(&node));
@@ -285,6 +290,14 @@ pub async fn run(
         task.abort();
     }
     Ok(())
+}
+
+/// Sleeps until `at`, or forever without one.
+async fn until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn snapshot(node: &Node) -> Snapshot {

@@ -11,8 +11,15 @@
 //!
 //! Broadcast and multicast go to every direct neighbour (spec §15.3).
 //!
-//! Not here yet: relay sessions of the secure mode (spec §9), so in that
-//! mode only direct neighbours are reached; shared nodes (spec §16).
+//! In the secure mode a node that is not a neighbour is reached over an
+//! end-to-end relay session (spec §9): packets for it wait (at most
+//! [`RELAY_QUEUE`]) while relay msg1 goes out, retried as new handshakes
+//! after 200, 400 and 800 ms and given up 1.6 s after the last; when both
+//! ends start at once the smaller node ID stays the initiator. The
+//! answering side keeps its packets until the initiator's first packet
+//! makes the pending session current.
+//!
+//! Not here yet: shared nodes (spec §16).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
@@ -38,7 +45,10 @@ use crate::rpc::packet::{
     ROUTE_SYNC_TIMEOUT_MS,
 };
 use crate::rpc::reassembly::Reassembler;
-use crate::secure::handshake::Local;
+use crate::secure::handshake::{
+    keeps_initiating, relay_respond, Local, RelayAnswer, RelayInitiator,
+};
+use crate::secure::messages::Action as SessionAction;
 use crate::secure::noise::{KeyPair, LEN};
 use crate::secure::session::Sessions;
 use crate::wire::header::relay_in_place;
@@ -46,6 +56,29 @@ use crate::wire::{flags, packet_type, NodeHeader, HEADER_LEN};
 
 /// The driver's name for one connection.
 pub type ConnId = u64;
+
+/// Packets kept for one destination while its relay session is being set
+/// up (spec §9).
+pub const RELAY_QUEUE: usize = 32;
+/// First wait for relay msg2; doubled for each new attempt (spec §9).
+pub const RELAY_RETRY_START: Duration = Duration::from_millis(200);
+/// New attempts after the first relay msg1 (spec §9).
+pub const RELAY_RETRIES: u32 = 3;
+/// How long packets wait for a session this node answered, pending until
+/// the initiator's first packet arrives (spec §9 rule 2), before this node
+/// starts a handshake of its own.
+pub const RELAY_PENDING_WAIT: Duration = Duration::from_secs(10);
+
+/// A relay session being set up with a node that is not a neighbour.
+struct Relay {
+    initiator: Option<RelayInitiator>,
+    /// msg1 sent so far by this node.
+    attempts: u32,
+    /// When to send the next msg1 (or give up); `None` while waiting for
+    /// nothing.
+    due: Option<Instant>,
+    queue: VecDeque<(u8, Vec<u8>)>,
+}
 
 /// Route synchronisation service (spec §11.4).
 pub const ROUTE_SERVICE: &str = "OspfRouteRpc";
@@ -167,6 +200,8 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
+    /// Relay sessions being set up, by destination (secure mode only).
+    relays: BTreeMap<u32, Relay>,
 }
 
 fn own_info(settings: &MeshSettings, identity: &Identity) -> RoutePeerInfo {
@@ -270,6 +305,7 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
+            relays: BTreeMap::new(),
             settings,
         })
     }
@@ -553,8 +589,22 @@ impl Node {
             packet_type::RPC_REQ | packet_type::RPC_RESP => {
                 self.rpc_piece(from, &inbound.payload, rng, now)
             }
+            packet_type::RELAY_HANDSHAKE => self.relay_msg1(from, &inbound.payload, rng, now),
+            packet_type::RELAY_HANDSHAKE_ACK => self.relay_msg2(from, &inbound.payload, now),
             _ => self.counters.dropped += 1,
         }
+        // A packet that decrypted under the session this node answered
+        // makes it current (spec §9 rule 2): what waited can go now.
+        if inbound.was_encrypted
+            && from != neighbour
+            && self
+                .relays
+                .get(&from)
+                .is_some_and(|relay| relay.initiator.is_none())
+        {
+            self.flush_relay(from, now);
+        }
+        self.wake(rng, now);
     }
 
     fn pong(&mut self, conn: ConnId, payload: &[u8], now: Instant) {
@@ -628,10 +678,19 @@ impl Node {
             return false;
         };
         let from = self.local.id;
+        let secure = self.settings.security == SecurityMode::ForwardSecrecy;
         let mut crypto = self.crypto();
-        let Ok(mut packet) = link::seal(&mut crypto, from, to, next_hop, kind, payload, now) else {
-            self.counters.unroutable += 1;
-            return false;
+        let mut packet = match link::seal(&mut crypto, from, to, next_hop, kind, payload, now) {
+            Ok(packet) => packet,
+            // No end-to-end session with a node behind a relay yet: keep the
+            // packet and set one up (spec §9).
+            Err(Dropped::NoSession | Dropped::SessionEnded) if secure && next_hop != to => {
+                return self.queue_for_relay(to, kind, payload, now);
+            }
+            Err(_) => {
+                self.counters.unroutable += 1;
+                return false;
+            }
         };
         if latency_first && packet.len() > 9 {
             packet[9] |= flags::LATENCY_FIRST;
@@ -893,6 +952,163 @@ impl Node {
         self.centre_round(now);
         self.reassembler.expire(now);
         self.sessions.reclaim(now);
+        self.wake(rng, now);
+    }
+
+    /// The next time [`wake`](Self::wake) has something to do, earlier
+    /// than the next [`tick`](Self::tick): a relay msg1 to send again.
+    pub fn next_wake(&self) -> Option<Instant> {
+        self.relays.values().filter_map(|relay| relay.due).min()
+    }
+
+    /// Sends the relay handshakes that are due: first attempts for packets
+    /// queued since, and retries. The driver calls it after
+    /// [`send_ip`](Self::send_ip) and at [`next_wake`](Self::next_wake).
+    pub fn wake(&mut self, rng: &dyn SecureRandom, now: Instant) {
+        let due: Vec<u32> = self
+            .relays
+            .iter()
+            .filter(|(_, relay)| relay.due.is_some_and(|due| due <= now))
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in due {
+            self.start_relay(peer, rng, now);
+        }
+    }
+
+    fn queue_for_relay(&mut self, to: u32, kind: u8, payload: &[u8], now: Instant) -> bool {
+        let relay = self.relays.entry(to).or_insert_with(|| Relay {
+            initiator: None,
+            attempts: 0,
+            due: Some(now),
+            queue: VecDeque::new(),
+        });
+        if relay.queue.len() >= RELAY_QUEUE {
+            self.counters.unroutable += 1;
+            return false;
+        }
+        relay.queue.push_back((kind, payload.to_vec()));
+        true
+    }
+
+    /// Gives up on `peer`: its queued packets count as unroutable.
+    fn drop_relay(&mut self, peer: u32) {
+        if let Some(relay) = self.relays.remove(&peer) {
+            self.counters.unroutable += relay.queue.len() as u64;
+        }
+    }
+
+    fn start_relay(&mut self, peer: u32, rng: &dyn SecureRandom, now: Instant) {
+        let attempts = match self.relays.get(&peer) {
+            Some(relay) => relay.attempts,
+            None => return,
+        };
+        if attempts > RELAY_RETRIES {
+            self.drop_relay(peer);
+            return;
+        }
+        let Some(peer_static) = self.peer_static(peer) else {
+            self.drop_relay(peer);
+            return;
+        };
+        let Ok((initiator, msg1)) =
+            RelayInitiator::start(&self.local, peer, peer_static, &self.sessions, rng)
+        else {
+            self.drop_relay(peer);
+            return;
+        };
+        if let Some(relay) = self.relays.get_mut(&peer) {
+            // Each attempt is a new handshake (spec §9).
+            relay.initiator = Some(initiator);
+            relay.attempts = attempts + 1;
+            relay.due = Some(now + RELAY_RETRY_START * 2u32.pow(attempts));
+        }
+        self.originate(peer, packet_type::RELAY_HANDSHAKE, &msg1, now);
+    }
+
+    /// The static key `peer` announces in its route information.
+    fn peer_static(&self, peer: u32) -> Option<[u8; LEN]> {
+        self.sync
+            .info(peer)
+            .and_then(|info| <[u8; LEN]>::try_from(&info.noise_pubkey[..]).ok())
+    }
+
+    /// Sends what waited for the relay session with `peer`.
+    fn flush_relay(&mut self, peer: u32, now: Instant) {
+        let Some(relay) = self.relays.remove(&peer) else {
+            return;
+        };
+        for (kind, payload) in relay.queue {
+            self.originate(peer, kind, &payload, now);
+        }
+    }
+
+    /// Relay msg1 for this node (spec §9).
+    fn relay_msg1(&mut self, from: u32, msg1: &[u8], rng: &dyn SecureRandom, now: Instant) {
+        if self.settings.security != SecurityMode::ForwardSecrecy || from == self.local.id {
+            self.counters.dropped += 1;
+            return;
+        }
+        let initiating = self
+            .relays
+            .get(&from)
+            .is_some_and(|relay| relay.initiator.is_some());
+        if initiating && keeps_initiating(self.local.id, from) {
+            // Both started: the smaller ID stays the initiator.
+            return;
+        }
+        let expected = self.peer_static(from);
+        let answer = relay_respond(
+            &self.local,
+            from,
+            expected,
+            msg1,
+            &mut self.sessions,
+            rng,
+            now,
+        );
+        let (msg2, joined) = match answer {
+            Ok(RelayAnswer::Reply(msg2, established)) => {
+                (msg2, established.action != SessionAction::Create)
+            }
+            Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
+            Err(_) => {
+                self.counters.dropped += 1;
+                return;
+            }
+        };
+        if let Some(relay) = self.relays.get_mut(&from) {
+            // The peer is the initiator now; our packets wait for its
+            // session, or for our own attempt if it never comes.
+            relay.initiator = None;
+            relay.attempts = 0;
+            relay.due = Some(now + RELAY_PENDING_WAIT);
+        }
+        self.originate(from, packet_type::RELAY_HANDSHAKE_ACK, &msg2, now);
+        if joined {
+            self.flush_relay(from, now);
+        }
+    }
+
+    /// Relay msg2 for this node (spec §9).
+    fn relay_msg2(&mut self, from: u32, msg2: &[u8], now: Instant) {
+        if from == self.local.id {
+            self.counters.dropped += 1;
+            return;
+        }
+        let Some(initiator) = self
+            .relays
+            .get_mut(&from)
+            .and_then(|relay| relay.initiator.take())
+        else {
+            self.counters.dropped += 1;
+            return;
+        };
+        match initiator.finish(&self.local, msg2, &mut self.sessions, now) {
+            Ok(_) => self.flush_relay(from, now),
+            // The retry is a new handshake.
+            Err(_) => self.counters.dropped += 1,
+        }
     }
 
     fn handshake_timeouts(&mut self, now: Instant) {
@@ -1163,6 +1379,91 @@ mod tests {
         net.settle();
         assert_eq!(net.delivered, vec![(2, packet)]);
         assert_eq!(net.nodes[1].counters().relayed, relayed + 1);
+    }
+
+    /// Sends `packet` from node `i` and lets any relay handshake run.
+    fn send(net: &mut Net, i: usize, packet: &[u8]) {
+        let rng = SystemRandom::new();
+        net.nodes[i].send_ip(packet, net.now).unwrap();
+        net.nodes[i].wake(&rng, net.now);
+        net.settle();
+    }
+
+    #[test]
+    fn secure_nodes_behind_a_relay_set_up_a_session_and_exchange_data() {
+        let mut net = three_in_a_row(true);
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[0].paths()[&102].next_hop, 101);
+
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[0].next_wake(), None);
+
+        // The answering node's session became current with that packet.
+        let reply = ipv4_packet([10, 144, 0, 3], [10, 144, 0, 1]);
+        send(&mut net, 2, &reply);
+        assert_eq!(net.delivered[1..], [(0, reply)]);
+        assert_eq!(net.nodes[2].next_wake(), None);
+        // The relay only carried packets.
+        assert!(net.delivered.iter().all(|(i, _)| *i != 1));
+    }
+
+    #[test]
+    fn both_ends_starting_at_once_end_with_one_session() {
+        let mut net = three_in_a_row(true);
+        let rng = SystemRandom::new();
+        let there = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        let back = ipv4_packet([10, 144, 0, 3], [10, 144, 0, 1]);
+        net.nodes[0].send_ip(&there, net.now).unwrap();
+        net.nodes[2].send_ip(&back, net.now).unwrap();
+        net.nodes[0].wake(&rng, net.now);
+        net.nodes[2].wake(&rng, net.now);
+        net.settle();
+        net.delivered.sort();
+        assert_eq!(net.delivered, vec![(0, back), (2, there)]);
+        assert_eq!(net.nodes[0].next_wake(), None);
+        assert_eq!(net.nodes[2].next_wake(), None);
+    }
+
+    #[test]
+    fn an_unanswered_relay_handshake_is_retried_then_given_up() {
+        let mut net = three_in_a_row(true);
+        let rng = SystemRandom::new();
+        // The relay loses everything towards node 2.
+        net.wires
+            .retain(|&(from, _), &mut (to, _)| !(from == 1 && to == 2));
+        let unroutable = net.nodes[0].counters().unroutable;
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        let mut waits = Vec::new();
+        let mut last = net.now;
+        while let Some(at) = net.nodes[0].next_wake() {
+            waits.push(at - last);
+            last = at;
+            net.now = at;
+            net.nodes[0].wake(&rng, net.now);
+            net.settle();
+            assert!(waits.len() <= 5, "never gives up");
+        }
+        assert_eq!(
+            waits,
+            [200, 400, 800, 1600].map(Duration::from_millis).to_vec()
+        );
+        assert!(net.delivered.is_empty());
+        assert_eq!(net.nodes[0].counters().unroutable, unroutable + 1);
+    }
+
+    #[test]
+    fn at_most_a_queue_of_packets_waits_for_a_relay_session() {
+        let mut net = three_in_a_row(true);
+        net.wires
+            .retain(|&(from, _), &mut (to, _)| !(from == 1 && to == 2));
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        for _ in 0..RELAY_QUEUE {
+            net.nodes[0].send_ip(&packet, net.now).unwrap();
+        }
+        assert_eq!(net.nodes[0].send_ip(&packet, net.now), Err(Denied::NoRoute));
     }
 
     #[test]
