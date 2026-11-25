@@ -40,7 +40,7 @@ case "${format}" in
 		luci_pkg="$(ls "${pkg_dir}"/luci-app-anixops-mesh_*_all.ipk)"
 		pm_update() { opkg update; }
 		pm_install() { opkg install "$@"; }
-		pm_reinstall() { opkg install --force-reinstall "$@"; }
+		pm_reinstall() { opkg install --force-reinstall "${main_pkg}"; }
 		pm_remove() { opkg remove "$@"; }
 		pm_installed() { opkg status "$1" | grep -q '^Status: .* installed'; }
 		;;
@@ -50,7 +50,7 @@ case "${format}" in
 		pm_update() { apk update; }
 		# Local packages are not signed by the OpenWrt build key.
 		pm_install() { apk add --allow-untrusted "$@"; }
-		pm_reinstall() { apk fix --reinstall "$@"; }
+		pm_reinstall() { apk fix --reinstall anixops-mesh; }
 		pm_remove() { apk del "$@"; }
 		pm_installed() { apk info -e "$1" > /dev/null; }
 		;;
@@ -358,7 +358,7 @@ end
 step "Reinstall keeps the configuration"
 uci set anixops-mesh.main.control=https://kept.example.com
 uci commit anixops-mesh
-pm_reinstall anixops-mesh || fail "reinstall failed"
+pm_reinstall || fail "reinstall failed"
 [ "$(uci -q get anixops-mesh.main.control)" = https://kept.example.com ] || fail "configuration replaced on reinstall"
 end
 
