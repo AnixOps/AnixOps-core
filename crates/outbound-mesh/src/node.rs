@@ -1443,6 +1443,22 @@ mod tests {
         assert_eq!(net.nodes[1].counters().relayed, relayed + 1);
     }
 
+    /// Nodes 0 and 2 already share a relay session once node 2 has
+    /// reported to the latency centre, the smallest ID (node 0). Drops it
+    /// on both ends so that a test sees a handshake from the start.
+    fn without_relay_session(net: &mut Net) {
+        let ids = [net.nodes[0].id(), net.nodes[2].id()];
+        for (i, peer) in [(0, ids[1]), (2, ids[0])] {
+            let node = &mut net.nodes[i];
+            let key = SessionKey {
+                namespace: Namespace::Relay,
+                network: node.settings.network_name.clone(),
+                peer_id: peer,
+            };
+            node.sessions.invalidate(&key);
+        }
+    }
+
     /// Sends `packet` from node `i` and lets any relay handshake run.
     fn send(net: &mut Net, i: usize, packet: &[u8]) {
         let rng = SystemRandom::new();
@@ -1454,6 +1470,7 @@ mod tests {
     #[test]
     fn secure_nodes_behind_a_relay_set_up_a_session_and_exchange_data() {
         let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
         assert_eq!(net.nodes[0].neighbours(), vec![101]);
         assert_eq!(net.nodes[0].paths()[&102].next_hop, 101);
 
@@ -1474,6 +1491,7 @@ mod tests {
     #[test]
     fn both_ends_starting_at_once_end_with_one_session() {
         let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
         let rng = SystemRandom::new();
         let there = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
         let back = ipv4_packet([10, 144, 0, 3], [10, 144, 0, 1]);
@@ -1491,6 +1509,7 @@ mod tests {
     #[test]
     fn an_unanswered_relay_handshake_is_retried_then_given_up() {
         let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
         let rng = SystemRandom::new();
         // The relay loses everything towards node 2.
         net.wires
@@ -1519,6 +1538,7 @@ mod tests {
     #[test]
     fn at_most_a_queue_of_packets_waits_for_a_relay_session() {
         let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
         net.wires
             .retain(|&(from, _), &mut (to, _)| !(from == 1 && to == 2));
         let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
