@@ -12,7 +12,7 @@ use std::net::IpAddr;
 
 use serde_json::{json, Value};
 
-use crate::net::{is_intranet, Cidr, Endpoint};
+use crate::net::{is_intranet, redact_address, Cidr, Endpoint};
 use crate::profile::{Field, Profile, Severity};
 use crate::report::{item, Item, ItemStatus, NetworkSummary};
 use crate::source::{Collected, Problem};
@@ -20,7 +20,6 @@ use crate::source::{Collected, Problem};
 /// `config_version` of the configuration written.
 pub const CONFIG_VERSION: u32 = 1;
 /// Port used when nothing else names one.
-pub const DEFAULT_PORT: u16 = 11010;
 /// MTU our node uses when the configuration names none.
 pub const DEFAULT_MTU: i64 = 1380;
 const MIN_MTU: i64 = 1280;
@@ -446,6 +445,27 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
                         .at(address_origin)
                         .with_value(cidr.to_string()),
                     );
+                    if given.is_some() && !auto {
+                        let recorded = collected.text(Field::Ipv4).map(|text| {
+                            Cidr::parse(text)
+                                .map(|recorded| recorded.address)
+                                .or_else(|| text.trim().parse::<IpAddr>().ok())
+                        });
+                        if let Some(recorded) = recorded {
+                            if recorded != Some(cidr.address) {
+                                items.push(
+                                    item(
+                                        Field::Ipv4.name(),
+                                        ItemStatus::NeedsConfirmation,
+                                        "address_overridden",
+                                        "命令行地址与原配置的固定地址不同，按命令行导入，请确认。",
+                                    )
+                                    .at(collected.origin(Field::Ipv4))
+                                    .with_value(cidr.to_string()),
+                                );
+                            }
+                        }
+                    }
                     address = Some(cidr);
                 }
                 Err(code) => items.push(
@@ -593,7 +613,7 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
                     "监听地址无法解析，未导入。",
                 )
                 .at(Some(listener_origin))
-                .with_value(value.clone()),
+                .with_value(redact_address(value)),
             ),
         }
     }
@@ -670,7 +690,7 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
                     &format!("对端附加设置 {key} 未导入，请确认。"),
                 )
                 .at(peer_origin)
-                .with_value(entry.value.clone()),
+                .with_value(redact_address(&entry.value)),
             );
         }
         let Some(endpoint) = Endpoint::parse(&entry.value) else {
@@ -679,24 +699,50 @@ pub fn convert(profile: &Profile, collected: &Collected, options: &ImportOptions
                     Field::Peers.name(),
                     ItemStatus::NeedsConfirmation,
                     "invalid_peer",
-                    "对端地址无法解析，未导入。",
+                    "对端地址无法解析（含用户名密码的地址不受支持），未导入。",
                 )
                 .at(peer_origin)
-                .with_value(entry.value.clone()),
+                .with_value(redact_address(&entry.value)),
             );
             continue;
         };
+        if endpoint.extra {
+            items.push(
+                item(
+                    Field::Peers.name(),
+                    ItemStatus::NeedsConfirmation,
+                    "peer_options_dropped",
+                    "对端地址中主机与端口之后的部分（路径或参数）未导入，请确认。",
+                )
+                .at(peer_origin)
+                .with_value(redact_address(&entry.value)),
+            );
+        }
         match transport_name(&endpoint.scheme) {
             Some(transport) => {
                 let port = endpoint
                     .port
-                    .or_else(|| profile.default_peer_ports.get(&endpoint.scheme).copied())
-                    .unwrap_or(DEFAULT_PORT);
+                    .or_else(|| profile.default_peer_ports.get(&endpoint.scheme).copied());
+                let Some(port) = port else {
+                    items.push(
+                        item(
+                            Field::Peers.name(),
+                            ItemStatus::NeedsConfirmation,
+                            "peer_port_unknown",
+                            "对端地址没有端口，数据文件也未给出该传输的默认端口，未导入。",
+                        )
+                        .at(peer_origin)
+                        .with_value(redact_address(&entry.value)),
+                    );
+                    continue;
+                };
                 if seen_peers.insert((endpoint.host.clone(), port, transport)) {
                     peers.push((endpoint.host.clone(), port, transport));
                 }
             }
-            None => other_transport_hosts.push((endpoint.host.clone(), entry.value.clone())),
+            None => {
+                other_transport_hosts.push((endpoint.host.clone(), redact_address(&entry.value)))
+            }
         }
     }
     for (host, value) in other_transport_hosts {
@@ -1409,6 +1455,77 @@ mod tests {
             converted.config.unwrap()["node"]["address"],
             json!("10.126.0.9/24")
         );
+    }
+
+    #[test]
+    fn exit_node_and_management_port_are_reported() {
+        let args = [
+            "--net-name",
+            "n",
+            "--net-secret",
+            "s",
+            "-i",
+            "10.126.0.5/24",
+            "-p",
+            "tcp://a:1",
+            "--exit-nodes",
+            "10.126.0.9",
+            "--manage-port",
+            "15888",
+        ];
+        let converted = run(&args, &ImportOptions::default());
+        assert!(converted.config.is_some());
+        let status_of = |code: &str| {
+            converted
+                .items
+                .iter()
+                .find(|item| item.code == code)
+                .map(|item| item.status)
+        };
+        // Exit use is outside the intranet scope: someone must confirm it.
+        assert_eq!(status_of("exit_node"), Some(ItemStatus::NeedsConfirmation));
+        // The management interface is replaced by the Agent: a note only.
+        assert_eq!(status_of("management_port"), Some(ItemStatus::Dropped));
+        // Neither value reaches the configuration.
+        let text = converted.config.unwrap().to_string();
+        assert!(!text.contains("15888") && !text.contains("10.126.0.9"));
+    }
+
+    #[test]
+    fn a_given_address_that_differs_needs_confirmation() {
+        let args = [
+            "--net-name",
+            "n",
+            "--net-secret",
+            "s",
+            "-i",
+            "10.126.0.5/24",
+            "-p",
+            "tcp://a:1",
+        ];
+        let differs = run(
+            &args,
+            &ImportOptions {
+                address: Some("10.126.0.9/24".into()),
+                ..ImportOptions::default()
+            },
+        );
+        assert_eq!(
+            differs.config.clone().unwrap()["node"]["address"],
+            json!("10.126.0.9/24")
+        );
+        assert_eq!(
+            codes(&differs, ItemStatus::NeedsConfirmation),
+            vec!["address_overridden"]
+        );
+        let same = run(
+            &args,
+            &ImportOptions {
+                address: Some("10.126.0.5/24".into()),
+                ..ImportOptions::default()
+            },
+        );
+        assert!(codes(&same, ItemStatus::NeedsConfirmation).is_empty());
     }
 
     #[test]

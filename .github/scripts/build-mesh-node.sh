@@ -53,7 +53,7 @@ name="anixops-mesh-${version}-${target}"
 mkdir -p "${out_dir}"
 install -m 0755 "${binary}" "${out_dir}/${name}"
 (
-  cd "${out_dir}"
+  cd "${out_dir}" || exit 1
   sha256sum "${name}" > "${name}.sha256"
   sha256sum -c "${name}.sha256"
 )

@@ -594,6 +594,15 @@ jobs:
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
+      - name: Check installer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The installer is POSIX sh (BusyBox and dash included).
+          sh -n apps/mesh-node/install/install-linux.sh
+          shellcheck --shell=sh apps/mesh-node/install/install-linux.sh
+          shellcheck --shell=bash .github/scripts/build-mesh-node.sh
+
       - name: Build static anixops-mesh
         shell: bash
         run: |

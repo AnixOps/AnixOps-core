@@ -6,6 +6,8 @@
 
 ### Security
 
+- anixops-mesh 接管与导入按 2026-11-25 内部审计（#297）修复（mesh-node `detect`、`takeover`、`cmdline`、`source`、`convert`、`net`、`host`）：手动进程所在的宿主 systemd 单元（如 `cron.service`）不再被停用或停止，只结束该进程（H1）；无法展开的启动参数只报告位置，不输出取值（M1）；回滚失败后记录只保留没撤销成功的步骤，`rollback` 只重试这些步骤（M2）；持有进程已不存在或不是本程序的陈旧锁自动清除（M3）；手动进程以原环境变量、用户和组重启（M4）；备份不可读时只还原被注释的行，已手工还原的行视为已恢复（L1）；没写端口的对端需确认，不再假定默认端口（L2）；报告中的地址去掉凭据、路径与参数（L3）；单个文件 1 MiB、配置目录 64 个文件上限（L4）；`--address` 与原固定地址不同时需确认（L8）；OpenRC 服务只在运行时才计划停止（L5）；安装脚本 GNU wget 只走 https（L9），CI 新增 `sh -n` 与 shellcheck（L7）。
+
 - `anixcore` 管理接口默认只许回环地址（node-runtime `ManagementSettings::check` / `bind`，第三方审计 2026-11-25 CORE-01）：管理接口是明文 HTTP，Bearer 令牌可以改入站、用户、出站与规则，此前配置层允许绑定任意地址，绑到其他设备可达的网络且未另加加密时，能观察链路的一方可取得可复用的管理令牌。现在 `management.listen` 不是回环地址（含 `0.0.0.0`、`::` 和 IPv4 映射的非回环地址）时 `anixcore run` 与 `anixcore check` 拒绝启动，错误信息不含令牌；确需跨主机管理时经 SSH 或 VPN 落到本机回环，或显式设置 `"insecure_public": true`（启动时打印警告）。空令牌也在启动前拒绝。行为变化：已有把管理接口绑在非回环地址上的部署升级后需要改成回环或加 `insecure_public`。测试：`config::tests::management_*`。
 - 全部工作流的第三方 Action 固定到完整提交 SHA 并注明版本标签（第三方审计 2026-11-25 REL-02）：此前发布、证明等持有写权限或证明签发权限的作业使用 `actions/checkout@v4`、`actions/download-artifact@v4`、`actions/attest@v4` 等可变标签，标签被改指会改变发布时执行的代码。现在新增 `.github/scripts/workflow_policy.py`（带自测），在 CI `policy-fast` 与发布 `release-policy` 中检查所有工作流和复合 Action：未固定完整 SHA、缺版本注释或使用 docker Action 一律失败；`.github/dependabot.yml` 每周以 PR 形式提出 Action 更新。固定的版本与之前各标签当时解析到的版本相同，不升级大版本。
 
