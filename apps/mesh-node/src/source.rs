@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use crate::host::Host;
 use crate::profile::{DropReason, Field, FlagAction, Kind, Merge, Profile, Source};
 
+/// The most configuration files one configuration directory may hold; a
+/// directory with more is reported as unreadable rather than read.
+pub const MAX_DIR_FILES: usize = 64;
+
 /// How a program was started.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Invocation {
@@ -626,8 +630,8 @@ pub fn collect(host: &dyn Host, profile: &Profile, invocation: &Invocation) -> V
     for dir in &dirs {
         let dir = resolve(dir, invocation.cwd.as_deref());
         match host.list_dir(&dir) {
-            Ok(entries) => paths.extend(
-                entries
+            Ok(entries) => {
+                let found: Vec<String> = entries
                     .into_iter()
                     .filter(|entry| host.is_file(entry))
                     .filter(|entry| {
@@ -635,8 +639,19 @@ pub fn collect(host: &dyn Host, profile: &Profile, invocation: &Invocation) -> V
                             .file_name()
                             .is_some_and(|name| name.to_string_lossy().starts_with('.'))
                     })
-                    .map(|entry| entry.display().to_string()),
-            ),
+                    .map(|entry| entry.display().to_string())
+                    .collect();
+                if found.len() > MAX_DIR_FILES {
+                    let mut unreadable = Collected::default();
+                    unreadable.problems.push(Problem::Unreadable {
+                        path: dir.display().to_string(),
+                        why: format!("more than {MAX_DIR_FILES} files"),
+                    });
+                    instances.push(unreadable);
+                } else {
+                    paths.extend(found);
+                }
+            }
             Err(error) => {
                 let mut unreadable = Collected::default();
                 unreadable.problems.push(Problem::Unreadable {
@@ -879,6 +894,46 @@ a = 1
                 format!("file {expected}: peer[1].weird"),
                 format!("file {expected}: surprise"),
             ]
+        );
+    }
+
+    #[test]
+    fn oversized_files_and_directories_are_not_read() {
+        let host = FakeHost::default();
+        let big = "#".repeat(crate::host::MAX_TEXT_FILE as usize + 1);
+        host.file("/etc/demo/big.toml", &big);
+        for index in 0..=MAX_DIR_FILES {
+            host.file(
+                &format!("/etc/demo/many/{index}.toml"),
+                "ipv4 = \"10.1.0.1/24\"\n",
+            );
+        }
+        let profile = demo();
+        let unreadable = |collected: &[Collected]| -> Vec<String> {
+            collected
+                .iter()
+                .flat_map(|instance| &instance.problems)
+                .filter_map(|problem| match problem {
+                    Problem::Unreadable { why, .. } => Some(why.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let file = collect(
+            &host,
+            &profile,
+            &args(&["--config-file", "/etc/demo/big.toml"]),
+        );
+        assert_eq!(file.len(), 1);
+        let why = unreadable(&file);
+        assert_eq!(why.len(), 1);
+        assert!(why[0].contains("larger than"), "{why:?}");
+
+        let dir = collect(&host, &profile, &args(&["--config-dir", "/etc/demo/many"]));
+        assert_eq!(dir.len(), 1);
+        assert_eq!(
+            unreadable(&dir),
+            vec![format!("more than {MAX_DIR_FILES} files")]
         );
     }
 

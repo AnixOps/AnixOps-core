@@ -102,6 +102,33 @@ pub struct Endpoint {
     /// Host name or address, without IPv6 brackets.
     pub host: String,
     pub port: Option<u16>,
+    /// Something followed host and port (a path, query or fragment); it is
+    /// not imported.
+    pub extra: bool,
+}
+
+/// An address as a report may show it: no credentials and nothing after
+/// host and port, either of which may hold a secret.
+pub fn redact_address(text: &str) -> String {
+    let text = text.trim();
+    let Some((scheme, rest)) = text.split_once("://") else {
+        return if text.contains('@') {
+            "(hidden: contains credentials)".into()
+        } else {
+            text.to_string()
+        };
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let hidden = if authority.contains('@') { "***@" } else { "" };
+    let tail = if rest.len() > authority.len() {
+        "/…"
+    } else {
+        ""
+    };
+    format!("{scheme}://{hidden}{host}{tail}")
 }
 
 impl Endpoint {
@@ -116,6 +143,8 @@ impl Endpoint {
             return None;
         }
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let tail = &rest[authority.len()..];
+        let extra = !(tail.is_empty() || tail == "/");
         // Credentials in the address are not supported.
         if authority.contains('@') {
             return None;
@@ -144,6 +173,7 @@ impl Endpoint {
             scheme: scheme.to_ascii_lowercase(),
             host,
             port,
+            extra,
         })
     }
 
@@ -212,11 +242,12 @@ mod tests {
     #[test]
     fn parses_endpoints() {
         assert_eq!(
-            Endpoint::parse("tcp://1.2.3.4:11010").unwrap(),
+            Endpoint::parse("tcp://1.2.3.4:20010").unwrap(),
             Endpoint {
                 scheme: "tcp".into(),
                 host: "1.2.3.4".into(),
-                port: Some(11010)
+                port: Some(20010),
+                extra: false,
             }
         );
         assert_eq!(
@@ -224,7 +255,8 @@ mod tests {
             Endpoint {
                 scheme: "udp".into(),
                 host: "fd00::1".into(),
-                port: Some(9)
+                port: Some(9),
+                extra: true,
             }
         );
         assert_eq!(Endpoint::parse("ws://peer.example").unwrap().port, None);
@@ -235,5 +267,16 @@ mod tests {
         assert!(Endpoint::parse("tcp://:5").is_none());
         assert!(Endpoint::parse("tcp://0.0.0.0:1").unwrap().is_wildcard());
         assert!(Endpoint::parse("tcp://[::]:1").unwrap().is_wildcard());
+        assert!(!Endpoint::parse("tcp://h:1/").unwrap().extra);
+        assert!(Endpoint::parse("tcp://h:1?token=x").unwrap().extra);
+    }
+
+    #[test]
+    fn redacts_addresses() {
+        assert_eq!(redact_address("tcp://u:p@h:5"), "tcp://***@h:5");
+        assert_eq!(redact_address("ws://h:80/path?key=s"), "ws://h:80/…");
+        assert_eq!(redact_address("tcp://h:5"), "tcp://h:5");
+        assert_eq!(redact_address("u:p@h"), "(hidden: contains credentials)");
+        assert_eq!(redact_address("garbage"), "garbage");
     }
 }

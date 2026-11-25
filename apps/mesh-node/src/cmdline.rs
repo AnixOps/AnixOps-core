@@ -173,6 +173,25 @@ pub enum ExecError {
     Empty,
     /// A `$NAME` the unit's environment does not define.
     UnknownVariable(String),
+    /// The argument at this position (0 = the program) uses `$` in a way
+    /// that cannot be expanded. Only the position is kept: the argument
+    /// itself may hold a secret.
+    Unexpandable(usize),
+}
+
+impl ExecError {
+    /// For reports and notes: never contains an argument's value.
+    pub fn describe(&self) -> String {
+        match self {
+            ExecError::Split(SplitError::UnclosedQuote) => "a quote is not closed".into(),
+            ExecError::Split(SplitError::TrailingBackslash) => "it ends with a backslash".into(),
+            ExecError::Empty => "it is empty".into(),
+            ExecError::UnknownVariable(name) => format!("the variable ${name} is not defined"),
+            ExecError::Unexpandable(position) => {
+                format!("argument {position} uses $ in a way that cannot be expanded")
+            }
+        }
+    }
 }
 
 /// Turns an `ExecStart=` value into argv: strips the systemd prefixes,
@@ -205,6 +224,7 @@ pub fn exec_argv(
     let words = split_words(&expanded).map_err(ExecError::Split)?;
     let mut argv = Vec::with_capacity(words.len());
     for word in words {
+        let position = argv.len();
         if let Some(name) = word
             .strip_prefix("${")
             .and_then(|rest| rest.strip_suffix('}'))
@@ -220,7 +240,7 @@ pub fn exec_argv(
                 .ok_or_else(|| ExecError::UnknownVariable(name.to_string()))?;
             argv.extend(value.split_whitespace().map(str::to_string));
         } else if word.contains('$') {
-            return Err(ExecError::UnknownVariable(word));
+            return Err(ExecError::Unexpandable(position));
         } else {
             argv.push(word);
         }
@@ -399,10 +419,10 @@ mod tests {
             exec_argv("/usr/bin/p $NOPE", None, &env).unwrap_err(),
             ExecError::UnknownVariable("NOPE".into())
         );
-        assert!(matches!(
-            exec_argv("/usr/bin/p pre$ONE", None, &env),
-            Err(ExecError::UnknownVariable(_))
-        ));
+        let error = exec_argv("/usr/bin/p --secret=pa$$w0rd", None, &env).unwrap_err();
+        assert_eq!(error, ExecError::Unexpandable(1));
+        assert!(!error.describe().contains("w0rd"));
+        assert!(!format!("{error:?}").contains("w0rd"));
         assert_eq!(exec_argv("", None, &env).unwrap_err(), ExecError::Empty);
     }
 

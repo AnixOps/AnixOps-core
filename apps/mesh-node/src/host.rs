@@ -25,13 +25,33 @@ impl CommandOutput {
 pub struct Spawn {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// `env` is the whole environment: start from an empty one.
+    pub clear_env: bool,
     pub cwd: Option<String>,
+    /// Run as this user and group (Unix; needs root to change).
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+/// The largest text file the program reads: configuration files, unit
+/// files, scripts and its own profile and manifest are all far smaller.
+pub const MAX_TEXT_FILE: u64 = 1024 * 1024;
+
+fn too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("file is larger than {} bytes", MAX_TEXT_FILE),
+    )
 }
 
 pub trait Host {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// Reads a text file of at most [`MAX_TEXT_FILE`] bytes.
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         let bytes = self.read(path)?;
+        if bytes.len() as u64 > MAX_TEXT_FILE {
+            return Err(too_large());
+        }
         String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
     /// Entries of a directory, full paths, sorted.
@@ -110,6 +130,19 @@ fn write_then_rename(
 impl Host for RealHost {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
+    }
+
+    fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        use std::io::Read;
+        // Never more than the limit in memory, whatever the file's size.
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(MAX_TEXT_FILE + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_TEXT_FILE {
+            return Err(too_large());
+        }
+        String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     fn list_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -297,6 +330,9 @@ impl Host for RealHost {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        if spawn.clear_env {
+            command.env_clear();
+        }
         for (name, value) in &spawn.env {
             command.env(name, value);
         }
@@ -306,6 +342,13 @@ impl Host for RealHost {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // The group first: once the user changes, the group cannot.
+            if let Some(gid) = spawn.gid {
+                command.gid(gid);
+            }
+            if let Some(uid) = spawn.uid {
+                command.uid(uid);
+            }
             // SAFETY: setsid is async-signal-safe and touches no memory.
             unsafe {
                 command.pre_exec(|| {
