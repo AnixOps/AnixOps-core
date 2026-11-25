@@ -528,11 +528,7 @@ fn init_scripts(
         let Ok(text) = host.read_to_string(&entry) else {
             continue;
         };
-        let named = profile
-            .detect
-            .services
-            .iter()
-            .any(|service| *service == name);
+        let named = profile.detect.services.contains(&name);
         let mentions = profile.detect.executables.iter().any(|program| {
             text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'))
                 .any(|word| word == program)
