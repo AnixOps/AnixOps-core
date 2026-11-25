@@ -100,6 +100,31 @@ pub struct Process {
     pub environ: Vec<(String, String)>,
 }
 
+/// Whether a process with this `/proc/PID/cgroup` runs in a container.
+pub fn in_container(cgroup: &str) -> bool {
+    [
+        "docker",
+        "containerd",
+        "kubepods",
+        "libpod",
+        "/lxc",
+        "machine.slice",
+    ]
+    .iter()
+    .any(|marker| cgroup.contains(marker))
+}
+
+/// The real id from a `Uid:` or `Gid:` line of `/proc/PID/status`.
+pub fn real_id(status: &str, key: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        line.strip_prefix(key)?
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()
+    })
+}
+
 /// One installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
@@ -241,16 +266,7 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
             .read_to_string(&entry.join("status"))
             .unwrap_or_default();
         // "Uid:\treal\teffective\tsaved\tfs": the real id.
-        let id_of = |key: &str| {
-            status.lines().find_map(|line| {
-                line.strip_prefix(key)?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<u32>()
-                    .ok()
-            })
-        };
-        let (uid, gid) = (id_of("Uid:"), id_of("Gid:"));
+        let (uid, gid) = (real_id(&status, "Uid:"), real_id(&status, "Gid:"));
         let groups = status.lines().find_map(|line| {
             line.strip_prefix("Groups:").map(|list| {
                 list.split_whitespace()
@@ -265,16 +281,7 @@ pub fn scan_processes(host: &dyn Host, profile: &Profile) -> Vec<Process> {
         let cgroup = host
             .read_to_string(&entry.join("cgroup"))
             .unwrap_or_default();
-        let contained = [
-            "docker",
-            "containerd",
-            "kubepods",
-            "libpod",
-            "/lxc",
-            "machine.slice",
-        ]
-        .iter()
-        .any(|marker| cgroup.contains(marker));
+        let contained = in_container(&cgroup);
         let unit = cgroup.lines().find_map(|line| {
             let path = line.rsplit(':').next()?;
             path.split('/')

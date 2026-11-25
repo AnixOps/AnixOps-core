@@ -823,6 +823,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.release-policy.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           cd dist/mesh-node
@@ -835,8 +836,16 @@ jobs:
             sha256sum -c "${name}.sha256"
           done
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            info="anixops-mesh-${VERSION}-${target}.buildinfo.json"
-            jq -e '.rustc | startswith("rustc ")' "${info}" >/dev/null
+            name="anixops-mesh-${VERSION}-${target}"
+            jq -e \
+              --arg file "${name}" \
+              --arg target "${target}" \
+              --arg version "${VERSION}" \
+              --arg commit "${RELEASE_SHA}" \
+              '.schema_version == 1 and .file == $file and .target == $target
+               and .version == $version and .commit_sha == $commit
+               and (.rustc | startswith("rustc ")) and (.cargo | startswith("cargo "))' \
+              "${name}.buildinfo.json" >/dev/null
           done
           test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "8"
 
