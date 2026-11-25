@@ -52,9 +52,9 @@
 | `ipForwarding` | `on`、`off`、`not_needed`；只在完整节点给出 |
 | `tunnel.routes` | 应进入隧道的网段（CIDR 列表）：所有已加入网络的虚拟网段，加上当前路由到组网的通告子网（与本机网络冲突、内网范围外、或用户设为 `local` 的不在内），再按 `routing.system_routes` 限制。去重，顺序稳定 |
 | `tunnel.routesVersion` | 整数，`routes` 每变一次加一；引擎重启后从 1 起 |
-| `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate" }`：本网络的内网域名名单（不含后缀），`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址（需求 R28） |
-| `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" }`：配置里因地址在内网范围外而跳过的名字条目 |
-| `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请 |
+| `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate", "answerable" }`：本网络的内网域名名单（不含后缀），一个名字的每种来源各一条。`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址，下发来源在前（需求 R28）；同名中有 `member` 来源时界面提示可能冒名。`answerable` 为 `false` 时地址不在可应答的网段内，不会应答。`source` 以后可能出现 `backbone`、`gateway`，按 `other` 处理 |
+| `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" \| "invalid_name" }`：配置里跳过的名字条目，原因分别为地址在内网范围外、名字不是规范化后的 `名.地区代码` |
+| `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请；每个网络最多一条，新申请替换旧的 |
 | `tunnel.dns` | `null`，或 `{ "servers": [地址], "matchDomains": [后缀] }`：内网域名开启时只对这些后缀生效（需求 R28） |
 
 ### 失败与冲突原因
@@ -94,9 +94,9 @@
 |---|---|---|
 | `GET /v1/status` 的 `features` | `mesh`；`mesh_dns`（网络配置接受 `dns` 节）；`mesh_host_groups`（接受 `host_groups` 节）；`mesh_region_requests`（提供下面的申请接口） | `mesh`、`mesh_dns` 0.3；其余 0.4 |
 | `PUT /v1/mesh` | 每个网络一份 `config_version: 1` 配置，`dns`、`host_groups` 与 `subnets`、`routing` 同级 | 0.3 |
-| `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：1–64 位字母、数字或连字符，等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
-| `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为网络的 tag；保留到被删除为止 | 0.4 |
-| `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 为 1–64 位字母、数字或连字符，不存在时返回 404 | 0.4 |
+| `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：`[A-Za-z0-9][A-Za-z0-9-]{0,63}`（由内核生成，不以连字符开头），等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
+| `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为该网络配置的 `network.name`，即快照的 `network.id`；每个网络最多一条待处理申请，新申请替换旧的，保留到被删除为止 | 0.4 |
+| `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 由内核在记下申请时生成，格式为 `[A-Za-z0-9][A-Za-z0-9-]{0,63}`，不存在时返回 404 | 0.4 |
 
 ## 命令
 
@@ -106,11 +106,11 @@
 | `mesh_join` / `mesh_leave` | `network` | 0.3 |
 | `mesh_save_network` | `config`：`config_version: 1` 网络配置（见 `mesh-module.md`；密钥由钥匙串注入） | 0.3 |
 | `mesh_remove_network` | `network` | 0.3 |
-| `mesh_set_dns` | `enabled`、`suffix` | 0.3 |
+| `mesh_set_dns` | `enabled`、可省的 `suffix`；本机覆盖，优先于网络配置的 `dns`，`suffix` 须位于 `internal` 或 `home.arpa` 之下（见 `mesh-module.md`） | 0.3 |
 | `mesh_set_subnet_route` | `network`、`cidr`、`route`（`local` \| `mesh`）；作为本机覆盖保存，不改网络配置 | 0.3 |
 | `mesh_set_relay` / `mesh_set_host_mode` | `network`、`enabled`；仅完整节点 | 0.4 |
 | `mesh_advertise` / `mesh_withdraw` | `network`、`cidr`；仅完整节点，须在内网范围内 | 0.4 |
-| `mesh_request_region` | `network`、`region`；由网络管理者批准 | 0.4 |
+| `mesh_request_region` | `network`、`region`、可省的 `reason`（去掉首尾空白后截到 500 个字符）；由网络管理者批准。内核生成申请 `id`，每个网络只保留最新一条 | 0.4 |
 | `mesh_set_policy` | `network`、`policy` | 0.5 |
 | `mesh_set_paths` | `network`、`paths`（与 `routing.paths` 同结构） | 0.5 |
 | `mesh_join_credential` | `credential`：一次性入网凭据 | 0.5 |
