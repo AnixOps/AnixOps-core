@@ -7,12 +7,16 @@
 //! traffic keys from a root key sent inside the handshake (spec §8.5), so
 //! [`HandshakeState::split`] is not part of the protocol and exists for the
 //! framework's test vectors.
+//!
+//! Keys, chaining keys, DH results and the handshake hash are wiped when
+//! they are dropped or replaced.
 
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::digest;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Length of a hash, a chaining key, a key and a public key.
 pub const LEN: usize = 32;
@@ -82,33 +86,35 @@ pub struct KeyPair {
 }
 
 impl KeyPair {
-    pub fn from_private(private: [u8; LEN]) -> Self {
+    pub fn from_private(mut private: [u8; LEN]) -> Self {
         let secret = StaticSecret::from(private);
+        private.zeroize();
         let public = PublicKey::from(&secret).to_bytes();
         Self { secret, public }
     }
 
     pub fn generate(rng: &dyn SecureRandom) -> Result<Self, NoiseError> {
-        let mut private = [0u8; LEN];
-        rng.fill(&mut private).map_err(|_| NoiseError::Random)?;
-        Ok(Self::from_private(private))
+        let mut private = Zeroizing::new([0u8; LEN]);
+        rng.fill(&mut private[..]).map_err(|_| NoiseError::Random)?;
+        Ok(Self::from_private(*private))
     }
 
     pub fn public(&self) -> [u8; LEN] {
         self.public
     }
 
-    /// The private key, for storing a node's long-term key.
-    pub fn private(&self) -> [u8; LEN] {
-        self.secret.to_bytes()
+    /// The private key, for storing a node's long-term key; wiped when
+    /// dropped.
+    pub fn private(&self) -> Zeroizing<[u8; LEN]> {
+        Zeroizing::new(self.secret.to_bytes())
     }
 
-    fn dh(&self, public: &[u8; LEN]) -> Result<[u8; LEN], NoiseError> {
+    fn dh(&self, public: &[u8; LEN]) -> Result<Zeroizing<[u8; LEN]>, NoiseError> {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*public));
         if !shared.was_contributory() {
             return Err(NoiseError::WeakKey);
         }
-        Ok(shared.to_bytes())
+        Ok(Zeroizing::new(shared.to_bytes()))
     }
 }
 
@@ -123,17 +129,26 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; LEN] {
 
 /// The framework's HKDF with two outputs (§4.3).
 fn hkdf2(chaining_key: &[u8; LEN], input: &[u8]) -> ([u8; LEN], [u8; LEN]) {
-    let temp = hmac(chaining_key, &[input]);
-    let first = hmac(&temp, &[&[1]]);
-    let second = hmac(&temp, &[&first, &[2]]);
+    let temp = Zeroizing::new(hmac(chaining_key, &[input]));
+    let first = hmac(&temp[..], &[&[1]]);
+    let second = hmac(&temp[..], &[&first, &[2]]);
     (first, second)
 }
 
-/// One direction's cipher during the handshake (framework §5.1).
+/// One direction's cipher during the handshake (framework §5.1). The key
+/// is wiped on drop.
 #[derive(Default)]
 pub struct CipherState {
     key: Option<[u8; LEN]>,
     n: u64,
+}
+
+impl Drop for CipherState {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.as_mut() {
+            key.zeroize();
+        }
+    }
 }
 
 impl CipherState {
@@ -154,12 +169,12 @@ impl CipherState {
     }
 
     pub fn encrypt(&mut self, ad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        let Some(key) = self.key else {
+        let Some(key) = self.key.as_ref() else {
             return Ok(plaintext.to_vec());
         };
         let nonce = self.nonce()?;
         let mut buffer = plaintext.to_vec();
-        Self::sealing_key(&key)
+        Self::sealing_key(key)
             .seal_in_place_append_tag(nonce, Aad::from(ad), &mut buffer)
             .map_err(|_| NoiseError::TooLong)?;
         self.n += 1;
@@ -167,12 +182,12 @@ impl CipherState {
     }
 
     pub fn decrypt(&mut self, ad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        let Some(key) = self.key else {
+        let Some(key) = self.key.as_ref() else {
             return Ok(ciphertext.to_vec());
         };
         let nonce = self.nonce()?;
         let mut buffer = ciphertext.to_vec();
-        let plain_len = Self::sealing_key(&key)
+        let plain_len = Self::sealing_key(key)
             .open_in_place(nonce, Aad::from(ad), &mut buffer)
             .map_err(|_| NoiseError::Decrypt)?
             .len();
@@ -182,11 +197,18 @@ impl CipherState {
     }
 }
 
-/// Framework §5.2.
+/// Framework §5.2. The chaining key and hash are wiped on drop.
 struct SymmetricState {
     cipher: CipherState,
     chaining_key: [u8; LEN],
     h: [u8; LEN],
+}
+
+impl Drop for SymmetricState {
+    fn drop(&mut self) {
+        self.chaining_key.zeroize();
+        self.h.zeroize();
+    }
 }
 
 impl SymmetricState {
@@ -212,12 +234,15 @@ impl SymmetricState {
     }
 
     fn mix_key(&mut self, input: &[u8]) {
-        let (chaining_key, key) = hkdf2(&self.chaining_key, input);
+        let (mut chaining_key, mut key) = hkdf2(&self.chaining_key, input);
         self.chaining_key = chaining_key;
+        // The old cipher is wiped as it is dropped.
         self.cipher = CipherState {
             key: Some(key),
             n: 0,
         };
+        chaining_key.zeroize();
+        key.zeroize();
     }
 
     fn encrypt_and_hash(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
@@ -355,11 +380,12 @@ impl HandshakeState {
             (Token::Ss, _) => self.s.dh(self.remote_static_key()?)?,
             (Token::E | Token::S, _) => unreachable!("not a DH token"),
         };
-        self.symmetric.mix_key(&shared);
+        self.symmetric.mix_key(&shared[..]);
         Ok(())
     }
 
-    /// Writes the next message carrying `payload`.
+    /// Writes the next message carrying `payload`. After an error the state
+    /// is not usable any more and the handshake must be dropped.
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, NoiseError> {
         if !self.my_turn() {
             return Err(NoiseError::OutOfTurn);
@@ -439,8 +465,8 @@ impl HandshakeState {
         if !self.is_finished() {
             return Err(NoiseError::OutOfTurn);
         }
-        let (first, second) = hkdf2(&self.symmetric.chaining_key, &[]);
-        Ok((
+        let (mut first, mut second) = hkdf2(&self.symmetric.chaining_key, &[]);
+        let states = (
             CipherState {
                 key: Some(first),
                 n: 0,
@@ -449,7 +475,10 @@ impl HandshakeState {
                 key: Some(second),
                 n: 0,
             },
-        ))
+        );
+        first.zeroize();
+        second.zeroize();
+        Ok(states)
     }
 }
 
@@ -475,7 +504,7 @@ mod tests {
         unhex(text).try_into().unwrap()
     }
 
-    // Public test vectors of the Noise framework (the cacophony suite).
+    // Public test vectors of the Noise framework.
     const PROLOGUE: &str = "4a6f686e2047616c74";
     const INIT_STATIC: &str = "e61ef9919cde45dd5f82166404bd08e38bceb5dfdfded0a34c8df7ed542214d1";
     const INIT_EPHEMERAL: &str = "893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a";

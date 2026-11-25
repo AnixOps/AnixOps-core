@@ -20,9 +20,12 @@
 //! - [`route`]: route synchronisation messages, topology and path choice.
 //! - [`secure`]: the secure mode: Noise handshakes, the secret proof,
 //!   traffic keys, rotation and the replay window.
+//! - [`link`]: one direct connection: the handshake of the network's mode,
+//!   then the receive checks and the encryption of packets.
 
 pub mod config;
 pub mod legacy;
+pub mod link;
 pub mod net;
 pub mod packet;
 pub mod route;
