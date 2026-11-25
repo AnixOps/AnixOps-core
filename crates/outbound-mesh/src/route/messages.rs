@@ -595,7 +595,8 @@ mod tests {
         let decoded = ConnGraph::decode_bitmap(&graph.encode_bitmap()).unwrap();
         assert_eq!(decoded, graph);
         // Bits 1, 3, 5, 7 of a 3×3 matrix: one byte 0b1010_1010, then 0.
-        let mut reader = Reader::new(&graph.encode_bitmap());
+        let encoded = graph.encode_bitmap();
+        let mut reader = Reader::new(&encoded);
         let mut bitmap = Vec::new();
         while let Some((field, value)) = reader.next().unwrap() {
             if field == 2 {

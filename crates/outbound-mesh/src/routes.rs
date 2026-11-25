@@ -278,10 +278,7 @@ impl RouteTable {
         let routes = self.peers.get(&peer).ok_or(Denied::Spoofed)?;
         let source = addresses.source;
         let owned = routes.addresses.contains(&source)
-            || routes
-                .subnets
-                .iter()
-                .any(|(subnet, _)| subnet.contains(source));
+            || routes.subnets.iter().any(|subnet| subnet.contains(source));
         if owned {
             Ok(())
         } else {

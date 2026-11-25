@@ -73,19 +73,15 @@ impl Reassembler {
             if in_progress >= MAX_PENDING_PER_PEER {
                 return Err(Dropped::TooMany);
             }
-            self.pending.insert(
-                key,
-                Pending {
-                    total: piece.total_pieces,
-                    is_request: piece.is_request,
-                    descriptor: None,
-                    pieces: BTreeMap::new(),
-                    bytes: 0,
-                    deadline: now + timeout,
-                },
-            );
         }
-        let pending = self.pending.get_mut(&key).expect("inserted above");
+        let pending = self.pending.entry(key).or_insert_with(|| Pending {
+            total: piece.total_pieces,
+            is_request: piece.is_request,
+            descriptor: None,
+            pieces: BTreeMap::new(),
+            bytes: 0,
+            deadline: now + timeout,
+        });
         if pending.total != piece.total_pieces {
             self.pending.remove(&key);
             return Err(Dropped::Malformed);
