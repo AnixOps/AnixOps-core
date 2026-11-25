@@ -196,6 +196,8 @@ fn open_checked_dir(dir: &Path) -> io::Result<std::os::fd::OwnedFd> {
     };
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
+    // S_ISVTX; libc's constant is a different integer type on each system.
+    const STICKY: u32 = 0o1000;
     let refuse = |what: &Path, why: &str| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -213,7 +215,7 @@ fn open_checked_dir(dir: &Path) -> io::Result<std::os::fd::OwnedFd> {
                 ));
             }
         } else if (metadata.uid() != 0 && metadata.uid() != euid)
-            || (writable && metadata.mode() & libc::S_ISVTX as u32 == 0)
+            || (writable && metadata.mode() & STICKY == 0)
         {
             return Err(refuse(
                 at,
