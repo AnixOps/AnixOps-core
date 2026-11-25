@@ -1,0 +1,18 @@
+[package]
+name = "outbound-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optional intranet mesh networking: written only from docs/protocols/intranet-mesh.md, intranet-only by construction."
+
+[dependencies]
+# AEADs, HMAC and HKDF; already used by the rest of the kernel.
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"

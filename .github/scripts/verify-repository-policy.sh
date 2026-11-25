@@ -49,6 +49,13 @@ fi
 if git grep -nEI 'raw\.githubusercontent\.com/(Loyalsoldier|gaoyifan|blackmatrix7)|ios_rule_script|\b(BypassChina|GfwList|ReturnChina)\b|BUILTIN_(AD_BLOCK|BILIBILI)|builtin_(ad_block|bilibili)|bilibili_web_ad_block|networkcore\.adblock' -- ':!*.md' ':!docs' ':!**/tests/**' ':!.github/scripts/verify-repository-policy.sh'; then # neutral-terms: allow (removed names this guard rejects)
   fail "preset routing rules or a built-in plugin found in shipped source; see docs/no-presets.md"
 fi
+# The mesh module is a clean-room implementation (docs/architecture/mesh-module.md):
+# the name of the product it interoperates with must not appear outside the
+# historical archive. The name is stored encoded so this check does not carry it.
+mesh_peer_name="$(printf '%s' 'ZWFzeXRpZXI=' | base64 -d)"
+if git grep -nIiE "${mesh_peer_name:0:4}[ _-]?${mesh_peer_name:4}" -- ':!docs/archive'; then
+  fail "third-party mesh product name found; see docs/architecture/mesh-module.md"
+fi
 
 declare -a fast_contracts=(
   $'^name: CI\t.github/workflows/ci.yml'

@@ -1,0 +1,40 @@
+//! Intranet mesh networking: a node joins a virtual network of peers and
+//! reaches the peers' virtual addresses and the subnets they advertise.
+//!
+//! The wire protocol is written only from `docs/protocols/intranet-mesh.md`
+//! (cited as "spec §n"). The crate registers no outbound yet. See
+//! `docs/architecture/mesh-module.md` for the design and its boundaries.
+//!
+//! - [`config`]: the `"type": "mesh"` settings and their validation.
+//! - [`net`]: IPv4/IPv6 networks.
+//! - [`scope`]: what counts as intranet. The module never carries traffic to
+//!   the public Internet and never acts as an exit.
+//! - [`routes`]: the route table filled from peer advertisements, the
+//!   destination check before anything is sent, and the source check on
+//!   every packet a peer delivers.
+//! - [`packet`]: addresses of a raw IP packet, for those checks.
+//! - [`wire`]: framing, the node header and the protobuf subset.
+//! - [`legacy`]: the default handshake mode: digest, static keys, payload
+//!   encryption and the handshake message.
+//! - [`rpc`]: peer RPC packets, pieces, requests and responses.
+//! - [`route`]: route synchronisation messages, topology and path choice.
+
+pub mod config;
+pub mod legacy;
+pub mod net;
+pub mod packet;
+pub mod route;
+pub mod routes;
+pub mod rpc;
+pub mod scope;
+pub mod wire;
+
+pub use config::{
+    Cipher, CustomPath, MeshConfig, MeshSettings, PathTarget, PeerEndpoint, Role, RoutePolicy,
+    SecurityMode, Transport, CONFIG_VERSION,
+};
+pub use net::IpNet;
+pub use routes::{Denied, PeerId, RouteTable};
+
+/// Config `type` name of a mesh outbound.
+pub const TYPE_NAME: &str = "mesh";
