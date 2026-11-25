@@ -356,12 +356,15 @@ pub fn local_networks(skip: &str) -> io::Result<Vec<(IpAddr, u8)>> {
     Ok(networks)
 }
 
+/// The interface's IPv4 address and prefix, and its IPv6 one if any.
+pub type InterfaceAddresses = ((Ipv4Addr, u8), Option<(Ipv6Addr, u8)>);
+
 /// Splits the settings' addresses into the shapes [`Tun::create`] takes.
 pub fn addresses(
     address: IpAddr,
     prefix: u8,
     address_v6: Option<(IpAddr, u8)>,
-) -> Option<((Ipv4Addr, u8), Option<(Ipv6Addr, u8)>)> {
+) -> Option<InterfaceAddresses> {
     let IpAddr::V4(v4) = address else {
         return None;
     };
