@@ -32,7 +32,7 @@ use crate::route::messages::{
 };
 use crate::route::sync::{Notice, RouteSync};
 use crate::route::topology::{Metric, Route};
-use crate::routes::{Denied, Outgoing, PeerId, RouteTable};
+use crate::routes::{self, Denied, PeerId, RouteTable};
 use crate::rpc::packet::{
     split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
     ROUTE_SYNC_TIMEOUT_MS,
@@ -653,8 +653,8 @@ impl Node {
             }
         };
         let sent = match outgoing {
-            Outgoing::Peer(peer) => self.originate(peer.0, packet_type::DATA, packet, now),
-            Outgoing::Neighbours => {
+            routes::Outgoing::Peer(peer) => self.originate(peer.0, packet_type::DATA, packet, now),
+            routes::Outgoing::Neighbours => {
                 let mut any = false;
                 for neighbour in self.neighbours() {
                     any |= self.originate(neighbour, packet_type::DATA, packet, now);
