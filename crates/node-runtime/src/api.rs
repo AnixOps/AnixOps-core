@@ -23,6 +23,15 @@
 //! | `GET /v1/rules/counters[?reset=true]` | | `{"blocked_cidrs": n}` |
 //! | `GET /v1/qos` | | `QosStatus` |
 //! | `PUT /v1/qos` | `QosConfig` | `QosStatus` |
+//! | `GET /v1/mesh` | | `ManagedStatus` |
+//! | `PUT /v1/mesh` | `{"networks": [MeshConfig + "tag"]}` | `ManagedStatus` |
+//!
+//! `PUT /v1/mesh` replaces the managed mesh networks as a whole (see
+//! [`crate::mesh`]); `{"networks": []}` stops them all. An invalid network
+//! refuses the whole body with 400; a network that cannot start is not an
+//! error but answers `running: false` with a `start_refused` alert. No
+//! answer carries a network secret. Both endpoints answer 404 when the
+//! kernel runs no mesh, which `features` then does not list.
 //!
 //! `PUT /v1/qos` replaces the traffic priorities and per-user class caps
 //! ([`engine_inbound::qos`]); `{}` turns them off. An invalid entry refuses
@@ -77,7 +86,9 @@
 //! `shadowsocks_plugins` (a `shadowsocks` inbound takes `obfs` for
 //! simple-obfs clients, and `transport` `ws` with or without `tls` for
 //! v2ray-plugin clients), `inbound_expiry` (the inbound key
-//! `expires_at_ms`: the node removes the inbound at that time). `types`
+//! `expires_at_ms`: the node removes the inbound at that time), `mesh`
+//! (`/v1/mesh`; only when the node program installed the mesh, which may
+//! add `mesh_dns` and later mesh features). `types`
 //! lists `socks` when the kernel has the internal-network SOCKS5 inbound.
 //!
 //! A user may carry `speed_limit` (Mbit/s for each direction, shared by
@@ -94,10 +105,11 @@
 //! endpoint's body limit (413) are all decided before a single body byte is
 //! read, so an unauthorized or oversized request costs no body memory. Bodies
 //! are limited per endpoint: 4 KiB for requests without one (`GET`,
-//! `DELETE`), 4 MiB for `POST /v1/inbounds/{tag}/users/remove` and
-//! `PUT /v1/network`, 32 MiB for the rest. All bodies in flight together
-//! share a 64 MiB budget, and at most 64 connections are served at once;
-//! past either limit a request answers 503 at once instead of waiting.
+//! `DELETE`), 4 MiB for `POST /v1/inbounds/{tag}/users/remove`,
+//! `PUT /v1/network` and `PUT /v1/mesh`, 32 MiB for the rest. All bodies
+//! in flight together share a 64 MiB budget, and at most 64 connections are
+//! served at once; past either limit a request answers 503 at once instead
+//! of waiting.
 
 use std::io;
 use std::sync::Arc;
@@ -251,6 +263,8 @@ enum Endpoint {
     PutQos,
     GetTlsFingerprints,
     PutTlsFingerprints,
+    GetMesh,
+    PutMesh,
 }
 
 impl Endpoint {
@@ -284,6 +298,8 @@ impl Endpoint {
             ("PUT", ["v1", "qos"]) => Self::PutQos,
             ("GET", ["v1", "tls-fingerprints"]) => Self::GetTlsFingerprints,
             ("PUT", ["v1", "tls-fingerprints"]) => Self::PutTlsFingerprints,
+            ("GET", ["v1", "mesh"]) => Self::GetMesh,
+            ("PUT", ["v1", "mesh"]) => Self::PutMesh,
             _ => return None,
         })
     }
@@ -297,7 +313,7 @@ impl Endpoint {
             | Self::PutRules
             | Self::PutQos
             | Self::PutTlsFingerprints => LARGE_BODY_LIMIT,
-            Self::RemoveUsers(_) | Self::PutNetwork => SMALL_BODY_LIMIT,
+            Self::RemoveUsers(_) | Self::PutNetwork | Self::PutMesh => SMALL_BODY_LIMIT,
             Self::Status
             | Self::ListInbounds
             | Self::RemoveInbound(_)
@@ -311,7 +327,8 @@ impl Endpoint {
             | Self::GetRules
             | Self::RuleCounters
             | Self::GetQos
-            | Self::GetTlsFingerprints => BODYLESS_LIMIT,
+            | Self::GetTlsFingerprints
+            | Self::GetMesh => BODYLESS_LIMIT,
         }
     }
 }
@@ -337,15 +354,16 @@ impl Response {
 impl From<NodeError> for Response {
     fn from(error: NodeError) -> Self {
         let status = match &error {
-            NodeError::NotFound => 404,
+            NodeError::NotFound | NodeError::MeshUnavailable => 404,
             NodeError::Exists => 409,
             NodeError::Invalid(_)
             | NodeError::Egress(_)
             | NodeError::Network(_)
             | NodeError::Rules(_)
             | NodeError::Qos(_)
-            | NodeError::TlsFingerprints(_) => 400,
-            NodeError::Io(_) => 500,
+            | NodeError::TlsFingerprints(_)
+            | NodeError::Mesh(_) => 400,
+            NodeError::Io(_) | NodeError::MeshFailed(_) => 500,
         };
         Response::error(status, error.to_string())
     }
@@ -528,7 +546,7 @@ async fn route(node: &Node, endpoint: Endpoint, query: &str, body: &[u8]) -> Res
     let result = match endpoint {
         Endpoint::Status => Ok(Response::ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
-            "features": crate::FEATURES,
+            "features": node.features(),
             "types": node.types(),
             "outbounds": node.outbounds(),
             "inbounds": node.list().len(),
@@ -567,6 +585,11 @@ async fn route(node: &Node, endpoint: Endpoint, query: &str, body: &[u8]) -> Res
                 .map(|status| Response::ok(json!(status))),
             Err(response) => return response,
         },
+        Endpoint::GetMesh => node.mesh_state().map(|status| Response::ok(json!(status))),
+        Endpoint::PutMesh => node
+            .apply_mesh(body)
+            .await
+            .map(|status| Response::ok(json!(status))),
         Endpoint::GetTlsFingerprints => Ok(Response::ok(json!(crate::tls_fingerprints()))),
         Endpoint::PutTlsFingerprints => match parse::<serde_json::Value>(body) {
             Ok(bundle) => {

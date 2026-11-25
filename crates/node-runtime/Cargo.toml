@@ -41,6 +41,9 @@ inbound-vmess = { path = "../inbound-vmess", optional = true }
 # Egress routes reach the exit node's relay with Shadowsocks-2022, or with
 # VLESS (`vless` feature: the cross-border standby channel).
 outbound-shadowsocks = { path = "../outbound-shadowsocks" }
+# `PUT /v1/mesh`: the mesh network config and its validation, and the
+# trait the node program drives the mesh through.
+outbound-mesh = { path = "../outbound-mesh" }
 outbound-vless = { path = "../outbound-vless", optional = true }
 # `regexp:` matchers of egress routes.
 regex = "1"
