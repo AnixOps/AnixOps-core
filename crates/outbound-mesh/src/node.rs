@@ -292,6 +292,13 @@ impl Node {
         self.duplicate_id
     }
 
+    /// Whether the connection finished its handshake.
+    pub fn is_up(&self, conn: ConnId) -> bool {
+        self.conns
+            .get(&conn)
+            .is_some_and(|state| state.peer.is_some())
+    }
+
     /// Direct neighbours that have a connection up.
     pub fn neighbours(&self) -> Vec<u32> {
         let mut peers: Vec<u32> = self.conns.values().filter_map(|conn| conn.peer).collect();

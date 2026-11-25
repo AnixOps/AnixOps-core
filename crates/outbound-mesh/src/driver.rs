@@ -1,0 +1,792 @@
+//! The socket driver of one network (feature `runtime`): TCP and UDP
+//! connections (spec §3.1, §3.2), dialing the configured peers again after a
+//! loss, listening on full nodes, the handshake budget and the timers of
+//! [`Node`]. IP packets come in and go out through two channels, so the
+//! standalone node can attach a virtual interface and the client its own
+//! TCP/IP stack.
+//!
+//! Every connection has a reader and a writer task; the node itself lives
+//! in one task, so it needs no locks.
+
+use std::collections::HashMap;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use ring::rand::{SecureRandom, SystemRandom};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
+
+use crate::config::{MeshSettings, PeerEndpoint, Role, Transport};
+use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
+use crate::node::{Action, ConnId, Counters, Identity, Node};
+use crate::wire::tcp::{encode_frame, FrameDecoder};
+use crate::wire::udp::{self, Datagram};
+
+/// First delay before dialing a peer again.
+pub const REDIAL_MIN: Duration = Duration::from_secs(1);
+/// Longest delay before dialing a peer again.
+pub const REDIAL_MAX: Duration = Duration::from_secs(30);
+/// A connection that lasted this long resets the dial delay.
+const STABLE: Duration = Duration::from_secs(30);
+/// A client waits this long for Sack and never sends Syn again (spec §3.2).
+pub const SACK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Connection attempts that wait for another connection's session try again
+/// after this long (spec §8.1).
+const WAIT_FOR_SESSION_RETRY: Duration = Duration::from_millis(500);
+/// UDP sessions one listening socket keeps.
+pub const MAX_UDP_SESSIONS: usize = 4096;
+/// Packets queued for one connection before new ones are dropped.
+const CONN_QUEUE: usize = 256;
+/// Events queued for the node task.
+const EVENT_QUEUE: usize = 4096;
+/// Largest datagram read.
+const MAX_DATAGRAM: usize = 65_535;
+
+/// Sockets bound before the driver starts, so a caller can learn the ports
+/// (a configured port 0) and fail early on a port in use.
+pub struct Listeners {
+    tcp: Vec<TcpListener>,
+    udp: Vec<UdpSocket>,
+}
+
+impl Listeners {
+    /// Binds every `listen` entry of a full node; access nodes listen on
+    /// nothing (spec §1.3).
+    pub async fn bind(settings: &MeshSettings) -> io::Result<Self> {
+        let mut listeners = Self {
+            tcp: Vec::new(),
+            udp: Vec::new(),
+        };
+        if settings.role != Role::Full {
+            return Ok(listeners);
+        }
+        for listen in &settings.listen {
+            let address = SocketAddr::new(
+                listen.address.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                listen.port,
+            );
+            match listen.transport {
+                Transport::Tcp => listeners.tcp.push(TcpListener::bind(address).await?),
+                Transport::Udp => listeners.udp.push(UdpSocket::bind(address).await?),
+            }
+        }
+        Ok(listeners)
+    }
+
+    /// The bound addresses, TCP first.
+    pub fn local_addrs(&self) -> io::Result<Vec<(Transport, SocketAddr)>> {
+        let mut out = Vec::new();
+        for listener in &self.tcp {
+            out.push((Transport::Tcp, listener.local_addr()?));
+        }
+        for socket in &self.udp {
+            out.push((Transport::Udp, socket.local_addr()?));
+        }
+        Ok(out)
+    }
+}
+
+/// What the driver reports to whoever runs it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub peer_id: u32,
+    pub neighbours: Vec<u32>,
+    /// Node ID, next hop and hop count of every reachable node.
+    pub routes: Vec<(u32, u32, u32)>,
+    pub counters: Counters,
+    /// A neighbour said this node's ID is taken (spec §12.2).
+    pub duplicate_id: bool,
+}
+
+enum Event {
+    Opened {
+        conn: ConnId,
+        writer: mpsc::Sender<Vec<u8>>,
+        closer: Arc<Notify>,
+        /// The source of a connection a peer opened.
+        inbound: Option<(IpAddr, link::Transport)>,
+    },
+    Packet {
+        conn: ConnId,
+        packet: Vec<u8>,
+    },
+    Closed {
+        conn: ConnId,
+    },
+}
+
+struct Open {
+    writer: mpsc::Sender<Vec<u8>>,
+    closer: Arc<Notify>,
+    ticket: Option<Ticket>,
+}
+
+#[derive(Clone)]
+struct Shared {
+    events: mpsc::Sender<Event>,
+    next_conn: Arc<AtomicU64>,
+}
+
+impl Shared {
+    fn conn_id(&self) -> ConnId {
+        self.next_conn.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+fn unix_now() -> (i64, i32) {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (
+        i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+        i32::try_from(since.subsec_nanos()).unwrap_or(0),
+    )
+}
+
+fn random_u32(rng: &dyn SecureRandom) -> u32 {
+    let mut bytes = [0u8; 4];
+    let _ = rng.fill(&mut bytes);
+    u32::from_le_bytes(bytes)
+}
+
+fn random_u64(rng: &dyn SecureRandom) -> u64 {
+    let mut bytes = [0u8; 8];
+    let _ = rng.fill(&mut bytes);
+    u64::from_le_bytes(bytes)
+}
+
+/// Runs one network until `shutdown` turns true. IP packets for the mesh
+/// arrive on `from_interface`; packets for this node leave on
+/// `to_interface`. `snapshots` gets the state after every timer tick.
+pub async fn run(
+    settings: MeshSettings,
+    identity: Identity,
+    listeners: Listeners,
+    mut from_interface: mpsc::Receiver<Vec<u8>>,
+    to_interface: mpsc::Sender<Vec<u8>>,
+    snapshots: watch::Sender<Snapshot>,
+    mut shutdown: watch::Receiver<bool>,
+) -> io::Result<()> {
+    let rng = SystemRandom::new();
+    let started = Instant::now();
+    let peers = settings.peers.clone();
+    let mut node = Node::new(settings, identity, &rng, started)
+        .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
+    let (events, mut event_rx) = mpsc::channel(EVENT_QUEUE);
+    let shared = Shared {
+        events,
+        next_conn: Arc::new(AtomicU64::new(1)),
+    };
+    let mut tasks = Vec::new();
+    for listener in listeners.tcp {
+        tasks.push(tokio::spawn(accept_tcp(listener, shared.clone())));
+    }
+    for socket in listeners.udp {
+        tasks.push(tokio::spawn(serve_udp(socket, shared.clone())));
+    }
+    for peer in peers {
+        tasks.push(tokio::spawn(dial(peer, shared.clone())));
+    }
+
+    let mut conns: HashMap<ConnId, Open> = HashMap::new();
+    let mut budget = HandshakeBudget::new();
+    let mut ticks = interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            event = event_rx.recv() => {
+                let Some(event) = event else { break };
+                let now = Instant::now();
+                match event {
+                    Event::Opened { conn, writer, closer, inbound } => {
+                        let mut open = Open { writer, closer, ticket: None };
+                        match inbound {
+                            Some((address, transport)) => {
+                                match budget.admit(address, transport, false, now) {
+                                    Admission::Dropped => {
+                                        open.closer.notify_one();
+                                        continue;
+                                    }
+                                    Admission::Admitted(ticket, evicted) => {
+                                        open.ticket = Some(ticket);
+                                        if let Some(evicted) = evicted {
+                                            let victim = conns
+                                                .iter()
+                                                .find(|(_, other)| other.ticket == Some(evicted))
+                                                .map(|(&id, _)| id);
+                                            if let Some(victim) = victim {
+                                                close(&mut conns, &mut node, &mut budget, victim, now);
+                                            }
+                                        }
+                                    }
+                                }
+                                node.accept(conn, now);
+                                conns.insert(conn, open);
+                            }
+                            None => {
+                                conns.insert(conn, open);
+                                if let Err(reason) = node.connect(conn, None, &rng, now) {
+                                    if reason == CloseReason::WaitForSession {
+                                        sleep(WAIT_FOR_SESSION_RETRY).await;
+                                    }
+                                    close(&mut conns, &mut node, &mut budget, conn, now);
+                                }
+                            }
+                        }
+                    }
+                    Event::Packet { conn, packet } => {
+                        if conns.contains_key(&conn) {
+                            node.receive(conn, &packet, &rng, now);
+                            if node.is_up(conn) {
+                                if let Some(ticket) = conns.get_mut(&conn).and_then(|open| open.ticket.take()) {
+                                    budget.finished(ticket);
+                                }
+                            }
+                        }
+                    }
+                    Event::Closed { conn } => {
+                        if let Some(open) = conns.remove(&conn) {
+                            if let Some(ticket) = open.ticket {
+                                budget.release(ticket);
+                            }
+                            node.disconnected(conn, now);
+                        }
+                    }
+                }
+            }
+            packet = from_interface.recv() => {
+                let Some(packet) = packet else { break };
+                // Refusals are counted by the node.
+                let _ = node.send_ip(&packet, Instant::now());
+            }
+            _ = ticks.tick() => {
+                node.tick(&rng, Instant::now(), unix_now());
+                let _ = snapshots.send(snapshot(&node));
+            }
+        }
+        carry_out(&mut node, &mut conns, &mut budget, &to_interface);
+    }
+
+    for open in conns.values() {
+        open.closer.notify_one();
+    }
+    for task in tasks {
+        task.abort();
+    }
+    Ok(())
+}
+
+fn snapshot(node: &Node) -> Snapshot {
+    Snapshot {
+        peer_id: node.id(),
+        neighbours: node.neighbours(),
+        routes: node
+            .paths()
+            .into_iter()
+            .map(|(peer, route)| (peer, route.next_hop, route.hops))
+            .collect(),
+        counters: node.counters(),
+        duplicate_id: node.duplicate_id(),
+    }
+}
+
+fn close(
+    conns: &mut HashMap<ConnId, Open>,
+    node: &mut Node,
+    budget: &mut HandshakeBudget,
+    conn: ConnId,
+    now: Instant,
+) {
+    if let Some(open) = conns.remove(&conn) {
+        open.closer.notify_one();
+        if let Some(ticket) = open.ticket {
+            budget.release(ticket);
+        }
+    }
+    node.disconnected(conn, now);
+}
+
+fn carry_out(
+    node: &mut Node,
+    conns: &mut HashMap<ConnId, Open>,
+    budget: &mut HandshakeBudget,
+    to_interface: &mpsc::Sender<Vec<u8>>,
+) {
+    while let Some(action) = node.poll_action() {
+        match action {
+            Action::Send { conn, packet } => {
+                if let Some(open) = conns.get(&conn) {
+                    // A full queue drops the packet, like a full link.
+                    let _ = open.writer.try_send(packet);
+                }
+            }
+            Action::Deliver(packet) => {
+                let _ = to_interface.try_send(packet);
+            }
+            Action::Close { conn, .. } => {
+                if let Some(open) = conns.remove(&conn) {
+                    open.closer.notify_one();
+                    if let Some(ticket) = open.ticket {
+                        budget.release(ticket);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn accept_tcp(listener: TcpListener, shared: Shared) {
+    loop {
+        let Ok((stream, address)) = listener.accept().await else {
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            run_tcp(stream, Some((address.ip(), link::Transport::Tcp)), shared).await;
+        });
+    }
+}
+
+/// Runs one TCP connection until it ends; returns how long it was open.
+async fn run_tcp(
+    stream: TcpStream,
+    inbound: Option<(IpAddr, link::Transport)>,
+    shared: Shared,
+) -> Duration {
+    let opened = Instant::now();
+    let _ = stream.set_nodelay(true);
+    let conn = shared.conn_id();
+    let (mut reader, mut writer) = stream.into_split();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CONN_QUEUE);
+    let closer = Arc::new(Notify::new());
+    if shared
+        .events
+        .send(Event::Opened {
+            conn,
+            writer: tx,
+            closer: closer.clone(),
+            inbound,
+        })
+        .await
+        .is_err()
+    {
+        return opened.elapsed();
+    }
+    let write = tokio::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            let Ok(frame) = encode_frame(&packet) else {
+                continue;
+            };
+            if writer.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = vec![0u8; 8192];
+    'read: loop {
+        let read = tokio::select! {
+            read = reader.read(&mut buffer) => read,
+            _ = closer.notified() => break 'read,
+        };
+        let Ok(n) = read else { break };
+        if n == 0 || decoder.push(&buffer[..n]).is_err() {
+            break;
+        }
+        loop {
+            match decoder.next_packet() {
+                Ok(Some(packet)) => {
+                    if shared
+                        .events
+                        .send(Event::Packet { conn, packet })
+                        .await
+                        .is_err()
+                    {
+                        break 'read;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break 'read,
+            }
+        }
+    }
+    write.abort();
+    let _ = shared.events.send(Event::Closed { conn }).await;
+    opened.elapsed()
+}
+
+/// Keeps one configured peer connected (spec §3).
+async fn dial(peer: PeerEndpoint, shared: Shared) {
+    let rng = SystemRandom::new();
+    let mut delay = REDIAL_MIN;
+    loop {
+        let lasted = match tokio::net::lookup_host((peer.server.as_str(), peer.port)).await {
+            Ok(mut addresses) => match addresses.next() {
+                Some(address) => match peer.transport {
+                    Transport::Tcp => match TcpStream::connect(address).await {
+                        Ok(stream) => run_tcp(stream, None, shared.clone()).await,
+                        Err(_) => Duration::ZERO,
+                    },
+                    Transport::Udp => {
+                        let (conn_id, magic) = (random_u32(&rng), random_u64(&rng));
+                        dial_udp(address, conn_id, magic, shared.clone())
+                            .await
+                            .unwrap_or(Duration::ZERO)
+                    }
+                },
+                None => Duration::ZERO,
+            },
+            Err(_) => Duration::ZERO,
+        };
+        if shared.events.is_closed() {
+            return;
+        }
+        delay = if lasted >= STABLE {
+            REDIAL_MIN
+        } else {
+            (delay * 2).min(REDIAL_MAX)
+        };
+        sleep(delay).await;
+    }
+}
+
+/// A UDP connection this node opens: its own socket, one Syn, no resend
+/// (spec §3.2).
+async fn dial_udp(
+    address: SocketAddr,
+    conn_id: u32,
+    magic: u64,
+    shared: Shared,
+) -> io::Result<Duration> {
+    let local: SocketAddr = match address {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = Arc::new(UdpSocket::bind(local).await?);
+    socket.connect(address).await?;
+    socket.send(&udp::syn(conn_id, magic)).await?;
+    let mut buffer = vec![0u8; MAX_DATAGRAM];
+    let answered = timeout(SACK_TIMEOUT, async {
+        loop {
+            let n = socket.recv(&mut buffer).await?;
+            if udp::parse(&buffer[..n]) == (Datagram::Sack { conn_id, magic }) {
+                return Ok::<(), io::Error>(());
+            }
+        }
+    })
+    .await;
+    match answered {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Ok(Duration::ZERO),
+    }
+
+    let opened = Instant::now();
+    let conn = shared.conn_id();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CONN_QUEUE);
+    let closer = Arc::new(Notify::new());
+    if shared
+        .events
+        .send(Event::Opened {
+            conn,
+            writer: tx,
+            closer: closer.clone(),
+            inbound: None,
+        })
+        .await
+        .is_err()
+    {
+        return Ok(opened.elapsed());
+    }
+    let sender = socket.clone();
+    let write = tokio::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if let Some(datagram) = udp::data(conn_id, &packet) {
+                let _ = sender.send(&datagram).await;
+            }
+        }
+    });
+    loop {
+        let received = tokio::select! {
+            received = socket.recv(&mut buffer) => received,
+            _ = closer.notified() => break,
+        };
+        let Ok(n) = received else { break };
+        if let Datagram::Data {
+            conn_id: id,
+            packet,
+        } = udp::parse(&buffer[..n])
+        {
+            if id == conn_id
+                && shared
+                    .events
+                    .send(Event::Packet {
+                        conn,
+                        packet: packet.to_vec(),
+                    })
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+    }
+    write.abort();
+    let _ = shared.events.send(Event::Closed { conn }).await;
+    Ok(opened.elapsed())
+}
+
+struct UdpSession {
+    conn: ConnId,
+    magic: u64,
+}
+
+/// A listening UDP socket: sessions by (address, conn_id), a repeated Syn
+/// answered with the same Sack (spec §3.2).
+async fn serve_udp(socket: UdpSocket, shared: Shared) {
+    let socket = Arc::new(socket);
+    let mut sessions: HashMap<(SocketAddr, u32), UdpSession> = HashMap::new();
+    let (gone_tx, mut gone_rx) = mpsc::channel::<(SocketAddr, u32)>(CONN_QUEUE);
+    let mut buffer = vec![0u8; MAX_DATAGRAM];
+    loop {
+        let (n, from) = tokio::select! {
+            received = socket.recv_from(&mut buffer) => match received {
+                Ok(received) => received,
+                Err(_) => continue,
+            },
+            gone = gone_rx.recv() => {
+                if let Some(key) = gone {
+                    if let Some(session) = sessions.remove(&key) {
+                        let _ = shared.events.send(Event::Closed { conn: session.conn }).await;
+                    }
+                }
+                continue;
+            }
+        };
+        match udp::parse(&buffer[..n]) {
+            Datagram::Syn { conn_id, magic } => {
+                if let Some(session) = sessions.get(&(from, conn_id)) {
+                    if session.magic == magic {
+                        let _ = socket.send_to(&udp::sack(conn_id, magic), from).await;
+                    }
+                    continue;
+                }
+                if sessions.len() >= MAX_UDP_SESSIONS {
+                    continue;
+                }
+                let conn = shared.conn_id();
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CONN_QUEUE);
+                let closer = Arc::new(Notify::new());
+                if shared
+                    .events
+                    .send(Event::Opened {
+                        conn,
+                        writer: tx,
+                        closer: closer.clone(),
+                        inbound: Some((from.ip(), link::Transport::Udp)),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                sessions.insert((from, conn_id), UdpSession { conn, magic });
+                let sender = socket.clone();
+                let gone = gone_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            packet = rx.recv() => match packet {
+                                Some(packet) => {
+                                    if let Some(datagram) = udp::data(conn_id, &packet) {
+                                        let _ = sender.send_to(&datagram, from).await;
+                                    }
+                                }
+                                None => break,
+                            },
+                            _ = closer.notified() => break,
+                        }
+                    }
+                    let _ = gone.send((from, conn_id)).await;
+                });
+                let _ = socket.send_to(&udp::sack(conn_id, magic), from).await;
+            }
+            Datagram::Data { conn_id, packet } => {
+                if let Some(session) = sessions.get(&(from, conn_id)) {
+                    let _ = shared
+                        .events
+                        .send(Event::Packet {
+                            conn: session.conn,
+                            packet: packet.to_vec(),
+                        })
+                        .await;
+                }
+            }
+            // STUN and hole punching belong to direct connections (spec §20),
+            // not built yet.
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ListenConfig, MeshConfig};
+
+    fn settings(address: &str, role: &str) -> MeshSettings {
+        let config = serde_json::json!({
+            "config_version": 1,
+            "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+            "node": {"address": address, "role": role},
+            "peers": [{"server": "peer.example", "port": 40000}],
+        });
+        let config: MeshConfig = serde_json::from_value(config).unwrap();
+        config.validate().unwrap()
+    }
+
+    struct Running {
+        to_mesh: mpsc::Sender<Vec<u8>>,
+        from_mesh: mpsc::Receiver<Vec<u8>>,
+        snapshots: watch::Receiver<Snapshot>,
+        _shutdown: watch::Sender<bool>,
+    }
+
+    async fn start(settings: MeshSettings, listeners: Listeners, peer_id: u32) -> Running {
+        let rng = SystemRandom::new();
+        let mut identity = Identity::generate(&rng).unwrap();
+        identity.peer_id = peer_id;
+        let (to_mesh, from_interface) = mpsc::channel(16);
+        let (to_interface, from_mesh) = mpsc::channel(16);
+        let (snapshot_tx, snapshots) = watch::channel(Snapshot::default());
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        tokio::spawn(run(
+            settings,
+            identity,
+            listeners,
+            from_interface,
+            to_interface,
+            snapshot_tx,
+            shutdown,
+        ));
+        Running {
+            to_mesh,
+            from_mesh,
+            snapshots,
+            _shutdown: shutdown_tx,
+        }
+    }
+
+    fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    async fn two_nodes(transport: Transport) {
+        let mut server = settings("10.144.0.1/24", "full");
+        server.peers.clear();
+        server.listen = vec![ListenConfig {
+            transport,
+            port: 0,
+            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        }];
+        let listeners = Listeners::bind(&server).await.unwrap();
+        let port = listeners.local_addrs().unwrap()[0].1.port();
+        let mut client = settings("10.144.0.2/24", "full");
+        client.peers = vec![PeerEndpoint {
+            server: "127.0.0.1".into(),
+            port,
+            transport,
+        }];
+        client.listen.clear();
+        let client_listeners = Listeners::bind(&client).await.unwrap();
+
+        let mut a = start(server, listeners, 1).await;
+        let b = start(client, client_listeners, 2).await;
+
+        // Wait until both know each other's address.
+        timeout(Duration::from_secs(20), async {
+            let mut snapshots = b.snapshots.clone();
+            loop {
+                if snapshots.borrow().routes.iter().any(|route| route.0 == 1) {
+                    break;
+                }
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the nodes find each other");
+        sleep(Duration::from_secs(2)).await;
+
+        let packet = ipv4_packet([10, 144, 0, 2], [10, 144, 0, 1]);
+        b.to_mesh.send(packet.clone()).await.unwrap();
+        let received = timeout(Duration::from_secs(5), a.from_mesh.recv())
+            .await
+            .expect("delivered in time");
+        assert_eq!(received, Some(packet));
+        assert_eq!(a.snapshots.borrow().neighbours, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn two_nodes_over_tcp() {
+        two_nodes(Transport::Tcp).await;
+    }
+
+    #[tokio::test]
+    async fn two_nodes_over_udp() {
+        two_nodes(Transport::Udp).await;
+    }
+
+    #[tokio::test]
+    async fn a_repeated_syn_gets_the_same_sack_and_no_new_session() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let (events, mut event_rx) = mpsc::channel(16);
+        let shared = Shared {
+            events,
+            next_conn: Arc::new(AtomicU64::new(1)),
+        };
+        let server = tokio::spawn(serve_udp(socket, shared));
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client.connect(address).await.unwrap();
+        let mut buffer = [0u8; 64];
+        for _ in 0..2 {
+            client.send(&udp::syn(7, 99)).await.unwrap();
+            let n = timeout(Duration::from_secs(2), client.recv(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                udp::parse(&buffer[..n]),
+                Datagram::Sack {
+                    conn_id: 7,
+                    magic: 99
+                }
+            );
+        }
+        let first = event_rx.recv().await.unwrap();
+        assert!(matches!(first, Event::Opened { .. }));
+        sleep(Duration::from_millis(100)).await;
+        assert!(event_rx.try_recv().is_err(), "one session only");
+        server.abort();
+    }
+}
