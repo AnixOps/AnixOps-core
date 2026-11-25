@@ -44,7 +44,7 @@ use crate::rpc::packet::{
     split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
     ROUTE_SYNC_TIMEOUT_MS,
 };
-use crate::rpc::reassembly::Reassembler;
+use crate::rpc::reassembly::{Dropped as RpcDropped, Reassembler};
 use crate::secure::handshake::{
     keeps_initiating, relay_respond, HandshakeError, Local, RelayAnswer, RelayInitiator,
 };
@@ -144,6 +144,18 @@ pub struct Counters {
     pub cut_graphs: u64,
     /// Node information off the native key list (spec §8.3.1 rule 4).
     pub refused_not_native: u64,
+    /// RPC calls dropped for a body over 8 MiB (spec §11.2).
+    pub oversize_calls: u64,
+}
+
+/// The last RPC call dropped for a body over 8 MiB (spec §11.2): the alert
+/// for an oversized synchronisation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncOversize {
+    /// Node ID of the sender.
+    pub peer: u32,
+    /// Bytes the call had reached when it was dropped.
+    pub bytes: usize,
 }
 
 #[derive(Default)]
@@ -223,6 +235,7 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
+    sync_oversize: Option<SyncOversize>,
     /// The last peer refused for a static key off the native key list
     /// (spec §8.3.1 rule 5).
     not_native: Option<u32>,
@@ -355,6 +368,7 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
+            sync_oversize: None,
             not_native: None,
             renewed_at: None,
             relays: BTreeMap::new(),
@@ -447,6 +461,12 @@ impl Node {
     /// warning. Cleared when the node takes a new ID.
     pub fn duplicate_id(&self) -> bool {
         self.duplicate_id
+    }
+
+    /// The last RPC call dropped for a body over 8 MiB; kept while the node
+    /// runs, so an operator sizing a network sees it (spec §11.2).
+    pub fn sync_oversize(&self) -> Option<SyncOversize> {
+        self.sync_oversize
     }
 
     /// The last peer refused because its static key is off the native key
@@ -993,6 +1013,12 @@ impl Node {
         let call = match self.reassembler.push(from, piece, timeout, now) {
             Ok(Some(call)) => call,
             Ok(None) => return,
+            Err(RpcDropped::CallTooLarge(bytes)) => {
+                self.counters.dropped += 1;
+                self.counters.oversize_calls += 1;
+                self.sync_oversize = Some(SyncOversize { peer: from, bytes });
+                return;
+            }
             Err(_) => {
                 self.counters.dropped += 1;
                 return;

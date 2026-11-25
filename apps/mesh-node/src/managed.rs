@@ -488,6 +488,17 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             detail: String::new(),
         })
         .collect();
+    if let Some(oversize) = snapshot.sync_oversize {
+        status.alerts.push(Alert {
+            code: AlertCode::SyncOversize,
+            address: None,
+            peer: String::new(),
+            detail: format!(
+                "rpc body of at least {} bytes from node {} over the 8 MiB limit ({} dropped)",
+                oversize.bytes, oversize.peer, snapshot.counters.oversize_calls
+            ),
+        });
+    }
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -542,6 +553,7 @@ fn instance_id(path: &Path) -> io::Result<String> {
 mod tests {
     use super::*;
     use outbound_mesh::driver::Member;
+    use outbound_mesh::node::SyncOversize;
     use outbound_mesh::{IpNet, MeshConfig};
     use serde_json::json;
 
@@ -672,6 +684,10 @@ mod tests {
             rejected_advertisements: 2,
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
+            sync_oversize: Some(SyncOversize {
+                peer: 9,
+                bytes: 8_400_000,
+            }),
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
@@ -688,5 +704,8 @@ mod tests {
         assert_eq!(status.failure.as_ref().unwrap().detail, "44");
         assert_eq!(status.rejected_advertisements, 2);
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
+        assert_eq!(status.alerts[1].code, AlertCode::SyncOversize);
+        assert!(status.alerts[1].detail.contains("8400000"));
+        assert!(status.alerts[1].detail.contains("node 9"));
     }
 }
