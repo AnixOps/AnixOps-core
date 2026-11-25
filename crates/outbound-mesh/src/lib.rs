@@ -21,7 +21,9 @@ pub mod packet;
 pub mod routes;
 pub mod scope;
 
-pub use config::{MeshConfig, MeshSettings, PeerEndpoint, SecurityMode};
+pub use config::{
+    Cipher, MeshConfig, MeshSettings, PeerEndpoint, RoutePolicy, SecurityMode, Transport,
+};
 pub use net::IpNet;
 pub use routes::{Denied, PeerId, RouteTable};
 

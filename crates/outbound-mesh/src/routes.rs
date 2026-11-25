@@ -317,7 +317,6 @@ mod tests {
             "address": "10.144.144.5/24",
             "address_v6": "fd00:aa::5/64",
             "peers": [{"server": "peer.example", "port": 40000}],
-            "security": "default",
         });
         for (key, value) in extra.as_object().unwrap() {
             config[key] = value.clone();
