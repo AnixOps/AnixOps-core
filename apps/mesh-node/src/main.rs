@@ -136,8 +136,9 @@ fn emit(
     Ok(())
 }
 
+/// Systems detection, takeover and rollback know: Linux, macOS, Windows.
 fn platform_supported() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "macos", windows))
 }
 
 #[cfg(target_os = "linux")]
@@ -184,7 +185,10 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
         "run" => run_node(options),
         "detect" => {
             if !platform_supported() {
-                return Err(fail("platform", "detection is implemented for Linux only"));
+                return Err(fail(
+                    "platform",
+                    "detection is implemented for Linux, macOS and Windows only",
+                ));
             }
             let profile = load_profile(&host, options)?;
             let found = detect(&host, &profile);
@@ -221,7 +225,7 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
                     if !platform_supported() {
                         return Err(fail(
                             "platform",
-                            "detection is implemented for Linux only; pass the command line after --",
+                            "detection is implemented for Linux, macOS and Windows only; pass the command line after --",
                         ));
                     }
                     detect(&host, &profile)
@@ -245,7 +249,10 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
         }
         "takeover" => {
             if !platform_supported() {
-                return Err(fail("platform", "takeover is implemented for Linux only"));
+                return Err(fail(
+                    "platform",
+                    "takeover is implemented for Linux, macOS and Windows only",
+                ));
             }
             let profile = load_profile(&host, options)?;
             let Some(state) = &options.state_dir else {
@@ -260,7 +267,10 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
         }
         "rollback" => {
             if !platform_supported() {
-                return Err(fail("platform", "rollback is implemented for Linux only"));
+                return Err(fail(
+                    "platform",
+                    "rollback is implemented for Linux, macOS and Windows only",
+                ));
             }
             let Some(state) = &options.state_dir else {
                 return Err(fail("usage", "--state-dir is required"));

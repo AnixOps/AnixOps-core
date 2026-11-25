@@ -375,7 +375,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: stable
           cache: true
@@ -598,10 +598,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The installer is POSIX sh (BusyBox and dash included).
-          sh -n apps/mesh-node/install/install-linux.sh
-          shellcheck --shell=sh apps/mesh-node/install/install-linux.sh
+          # The installers are POSIX sh (BusyBox, dash and macOS sh included).
+          for script in install-linux.sh install-macos.sh; do
+            sh -n "apps/mesh-node/install/${script}"
+            shellcheck --shell=sh "apps/mesh-node/install/${script}"
+          done
           shellcheck --shell=bash .github/scripts/build-mesh-node.sh
+          # The Windows installer must at least parse.
+          pwsh -NoProfile -NonInteractive -Command '
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("apps/mesh-node/install/install-windows.ps1", [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_ }; exit 1 }
+          '
 
       - name: Build static anixops-mesh
         shell: bash
@@ -777,7 +785,7 @@ jobs:
 
       # Builds the iwand-server test server (go.mod declares go 1.22).
       - name: Setup Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.22"
           cache: false
@@ -936,7 +944,7 @@ jobs:
 
       - name: Upload fuzz crash artifacts
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: h2-mitm-fuzz-artifacts-${{ github.sha }}
           path: |
