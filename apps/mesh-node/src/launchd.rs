@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::cmdline::command_in_line;
-use crate::detect::{Found, Origin, Process};
+use crate::detect::{descends_from, Found, Origin, Process};
 use crate::host::Host;
 use crate::profile::Profile;
 use crate::source::Invocation;
@@ -214,11 +214,14 @@ pub fn jobs(host: &dyn Host, profile: &Profile, processes: &[Process]) -> Vec<Fo
                 Some(domain) => loaded(host, domain, &job.label),
                 None => (false, None),
             };
-            // Its process: the one launchd names, or one running the same
-            // command line (a shell's child).
+            // Its process: the one launchd names, or one that process
+            // started (a shell's child). A copy started by hand with the
+            // same command line is not the job's.
             let own: Vec<Process> = processes
                 .iter()
-                .filter(|process| Some(process.pid) == pid || (is_loaded && process.argv == argv))
+                .filter(|process| {
+                    pid.is_some_and(|pid| process.pid == pid || descends_from(host, process, pid))
+                })
                 .cloned()
                 .collect();
             let override_off = domain.as_ref().and_then(|domain| {
