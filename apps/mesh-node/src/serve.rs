@@ -14,7 +14,7 @@ use std::time::Duration;
 use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
-use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
+use outbound_mesh::{IpNet, MeshConfig, MeshSettings, Role};
 use ring::rand::SystemRandom;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -240,6 +240,9 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             .map_err(|error| busy(&format!("interface {interface}"), &error))?;
         let stop = signals()?;
         let mut last = String::new();
+        // Kept until the node stops; dropping it puts the host back.
+        let mut forwarding = start_forwarding(&settings, device.name());
+        let virtual_subnets = settings.virtual_subnets();
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
@@ -251,6 +254,13 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             stop,
             native_keys,
             |snapshot, name| {
+                if let Some(forwarding) = forwarding.as_mut() {
+                    let mut sources = virtual_subnets.clone();
+                    sources.extend(snapshot.system_routes.iter().copied());
+                    if let Err(error) = forwarding.set_sources(&sources) {
+                        warn("forwarding", &error.to_string());
+                    }
+                }
                 let line = status_line(snapshot, name);
                 if line != last {
                     println!("{line}");
@@ -260,6 +270,91 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         )
         .await
     })
+}
+
+/// The host side of carrying advertised subnets, held while the node runs.
+trait HostForwarder {
+    /// Replaces the mesh sources translated towards the advertised subnets.
+    fn set_sources(&mut self, sources: &[IpNet]) -> io::Result<()>;
+}
+
+#[cfg(target_os = "macos")]
+impl HostForwarder for crate::forward_macos::HostForwarding {
+    fn set_sources(&mut self, sources: &[IpNet]) -> io::Result<()> {
+        crate::forward_macos::HostForwarding::set_sources(self, sources)
+    }
+}
+
+/// Whether this node carries traffic to its advertised subnets: a full
+/// node with subnets to advertise (requirement R10).
+fn forwards(settings: &MeshSettings) -> bool {
+    settings.role == Role::Full && !settings.advertise_subnets.is_empty()
+}
+
+/// One line saying whether the host forwards for the advertised subnets
+/// (`ipForwarding` in the status: `on`, `off` or `not_needed`).
+fn forwarding_line(state: &str, detail: Option<&str>) {
+    println!(
+        "{}",
+        serde_json::json!({ "ip_forwarding": state, "detail": detail })
+    );
+}
+
+/// macOS: switches forwarding on and translates mesh traffic to the
+/// advertised subnets (`forward_macos`). A failure is reported and the node
+/// runs on without carrying them.
+#[cfg(target_os = "macos")]
+fn start_forwarding(settings: &MeshSettings, interface: &str) -> Option<Box<dyn HostForwarder>> {
+    if !forwards(settings) {
+        forwarding_line("not_needed", None);
+        return None;
+    }
+    let interfaces = match tun::local_interfaces(|name| name == interface) {
+        Ok(found) => found
+            .into_iter()
+            .filter_map(|(name, address, prefix)| Some((name, IpNet::new(address, prefix)?)))
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            return None;
+        }
+    };
+    match crate::forward_macos::HostForwarding::start(
+        Path::new(crate::forward_macos::STATE_DIR),
+        &settings.network_name,
+        interface,
+        &interfaces,
+        &settings.advertise_subnets,
+        &settings.virtual_subnets(),
+        settings.address_v6.is_some(),
+    ) {
+        Ok((forwarding, warnings)) => {
+            for warning in warnings {
+                warn("forwarding", &warning);
+            }
+            forwarding_line("on", None);
+            Some(Box::new(forwarding))
+        }
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            None
+        }
+    }
+}
+
+/// Linux and Windows: the host side is not in place yet; the node says so
+/// instead of advertising subnets it cannot carry silently.
+#[cfg(not(target_os = "macos"))]
+fn start_forwarding(settings: &MeshSettings, _interface: &str) -> Option<Box<dyn HostForwarder>> {
+    if forwards(settings) {
+        forwarding_line(
+            "off",
+            Some("host forwarding is not implemented on this system yet"),
+        );
+    } else {
+        forwarding_line("not_needed", None);
+    }
+    None
 }
 
 /// Resolves on SIGTERM or SIGINT.

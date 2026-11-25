@@ -16,6 +16,8 @@
 pub mod cmdline;
 pub mod convert;
 pub mod detect;
+#[cfg(target_os = "macos")]
+pub mod forward_macos;
 pub mod host;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod host_routes;

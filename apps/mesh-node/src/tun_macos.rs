@@ -506,6 +506,14 @@ fn prefix_of(mask: &[u8]) -> u8 {
 /// The address networks of every interface but loopback and those `skip`
 /// names.
 pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8)>> {
+    Ok(local_interfaces(skip)?
+        .into_iter()
+        .map(|(_, address, prefix)| (address, prefix))
+        .collect())
+}
+
+/// [`local_networks`] with the name of the interface each one is on.
+pub fn local_interfaces(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(String, IpAddr, u8)>> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` fills `head` with a list freed below.
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -524,8 +532,10 @@ pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8
             continue;
         }
         // SAFETY: a non-null name is a C string.
-        let name = unsafe { CStr::from_ptr(entry.ifa_name) };
-        if skip(&name.to_string_lossy()) {
+        let name = unsafe { CStr::from_ptr(entry.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        if skip(&name) {
             continue;
         }
         // SAFETY: a non-null address from `getifaddrs`.
@@ -550,7 +560,7 @@ pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8
             }
             _ => None,
         };
-        networks.extend(network);
+        networks.extend(network.map(|(address, prefix)| (name, address, prefix)));
     }
     // SAFETY: `head` came from `getifaddrs` and is freed once.
     unsafe { libc::freeifaddrs(head) };
