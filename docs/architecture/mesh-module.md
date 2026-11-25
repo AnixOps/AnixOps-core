@@ -142,6 +142,7 @@
 - 管理（需求 R11）：不实现对端程序的本机管理接口（供命令行或网页控制台使用的管理端口）和远程配置服务器接入，不监听、不响应这类请求；本模块的配置、状态和控制只有两条途径：接入 Agent 的节点由 Agent 下发，未接入 Agent 的节点用本地配置手动设置。节点之间的控制消息（路由同步、延迟汇总、打洞协调）属于组网协议本身，按规范实现。
 - 平台（需求 R4）：macOS、iOS、Windows、Linux、Android；首批传输 TCP 和 UDP（R3）。
 - 桌面整机 TUN 模式（把虚拟网段路由进系统）在出站模式稳定后再做。
+- Windows 主机改动（`platform-windows::mesh_host`，客户端只在用户打开「通告子网」或「中继」时调用）：`enable_mesh_forwarding(state_dir, mesh_adapter, lan_interfaces)` 只对组网网卡和所选局域网接口（按接口别名）开接口级转发（`ForwardingEnabled`），不动全局 `IPEnableRouter`；原值先写入 `state_dir/mesh-forwarding.json` 再改，多个 Guard 同时持有同一接口时最后一个释放才恢复。`add_mesh_firewall_rules(network, program_path, listen_ports, mesh_adapter)` 在规则组 `AnixOps Mesh` 中加三条入站规则，名为 `AnixOpsMesh-<网络名>-listen-udp`、`-listen-tcp`、`-adapter`：本程序监听端口的 UDP/TCP，以及组网网卡到本程序的入站；网络名只保留字母、数字、`-`、`_`，有改动时加 8 位哈希后缀。主机转发的流量不受主机入站规则约束，不为它加更宽的规则。Guard 释放时恢复或删除；进程异常退出后，下次启动先调 `recover_mesh_host(state_dir)`：按状态文件恢复转发原值，并删除该规则组中的全部规则。脚本内容固定，所有取值经环境变量传入。
 
 ## 节点程序 `anixops-mesh` 的退出约定
 

@@ -4,6 +4,7 @@
 mod dns_guard;
 pub mod managed;
 pub mod managed_files;
+pub mod mesh_host;
 pub mod mitm_security;
 pub mod system_integration;
 mod trusted_command;
