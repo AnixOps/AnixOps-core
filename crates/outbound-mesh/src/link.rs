@@ -622,16 +622,14 @@ mod tests {
             let mut to_client = Vec::new();
             for received in to_server.drain(..) {
                 let step = with(server, |hs| at_server.handshake(hs, &received));
-                if let Step::Send(out) | Step::Up(out, _) | Step::Close(out, _) = &step {
-                    to_client.extend(out.iter().cloned());
-                }
+                let (Step::Send(out) | Step::Up(out, _) | Step::Close(out, _)) = &step;
+                to_client.extend(out.iter().cloned());
                 last.1 = step;
             }
             for received in to_client {
                 let step = with(client, |hs| at_client.handshake(hs, &received));
-                if let Step::Send(out) | Step::Up(out, _) | Step::Close(out, _) = &step {
-                    to_server.extend(out.iter().cloned());
-                }
+                let (Step::Send(out) | Step::Up(out, _) | Step::Close(out, _)) = &step;
+                to_server.extend(out.iter().cloned());
                 last.0 = step;
             }
         }
