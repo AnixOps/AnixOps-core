@@ -1017,6 +1017,7 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure::traffic::MAX_FAILURES;
     use ring::rand::SystemRandom;
 
     fn key(namespace: Namespace) -> SessionKey {
