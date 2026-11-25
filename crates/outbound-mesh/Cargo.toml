@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Optional intranet mesh networking: config, intranet-only route policy and packet checks; the wire protocol follows docs/protocols/mesh.md."
+description = "Optional intranet mesh networking: config, intranet-only route policy and packet checks; the wire protocol follows docs/protocols/intranet-mesh.md."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

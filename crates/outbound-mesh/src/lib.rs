@@ -2,7 +2,7 @@
 //! reaches the peers' virtual addresses and the subnets they advertise.
 //!
 //! The wire protocol (handshake, framing, peer and route exchange) is written
-//! only from `docs/protocols/mesh.md`; until that specification is merged this
+//! only from `docs/protocols/intranet-mesh.md`; until that specification is merged this
 //! crate holds the protocol-independent parts and registers no outbound. See
 //! `docs/architecture/mesh-module.md` for the design and its boundaries.
 //!
