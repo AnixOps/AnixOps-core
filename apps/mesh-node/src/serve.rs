@@ -374,12 +374,21 @@ fn carried(lan: &[(String, IpNet)]) -> Vec<IpNet> {
     subnets
 }
 
-/// The machine's LAN interfaces as (name, address network) pairs, and the
-/// names of other programs' virtual interfaces. Neither list holds our own
-/// mesh interfaces; virtual interfaces never count as LAN, so a subnet a
-/// VPN also covers is not forwarded into that VPN.
+/// The machine's interfaces as the host side sees them.
 #[cfg(any(target_os = "macos", windows))]
-fn host_interfaces(interface: &str) -> io::Result<(Vec<(String, IpNet)>, Vec<String>)> {
+struct HostInterfaces {
+    /// LAN interfaces as (name, address network) pairs.
+    lan: Vec<(String, IpNet)>,
+    /// Names of other programs' virtual interfaces.
+    others: Vec<String>,
+}
+
+/// The machine's LAN interfaces and the names of other programs' virtual
+/// interfaces. Neither list holds our own mesh interfaces; virtual
+/// interfaces never count as LAN, so a subnet a VPN also covers is not
+/// forwarded into that VPN.
+#[cfg(any(target_os = "macos", windows))]
+fn host_interfaces(interface: &str) -> io::Result<HostInterfaces> {
     let own = |name: &str| host_routes::is_own_interface(name, &[interface]);
     let mut others: Vec<String> = host_routes::host_links()?
         .into_values()
@@ -392,7 +401,7 @@ fn host_interfaces(interface: &str) -> io::Result<(Vec<(String, IpNet)>, Vec<Str
         .into_iter()
         .filter_map(|(name, address, prefix)| Some((name, IpNet::new(address, prefix)?)))
         .collect();
-    Ok((lan, others))
+    Ok(HostInterfaces { lan, others })
 }
 
 /// macOS: puts back what an earlier run left, then switches IPv4
@@ -430,7 +439,10 @@ fn start_host(settings: &MeshSettings, interface: &str, _listen_ports: &[u16]) -
             "IPv6 forwarding stays off, since it stops the system from accepting router advertisements",
         );
     }
-    let (interfaces, others) = match host_interfaces(interface) {
+    let HostInterfaces {
+        lan: interfaces,
+        others,
+    } = match host_interfaces(interface) {
         Ok(found) => found,
         Err(error) => {
             forwarding_line("off", Some(&error.to_string()));
@@ -542,7 +554,7 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
         .filter(|subnet| ipv6 || subnet.is_ipv4())
         .collect();
     let lan = match host_interfaces(interface) {
-        Ok((interfaces, _)) => host_routes::lan_interfaces(&interfaces, &wanted, interface),
+        Ok(found) => host_routes::lan_interfaces(&found.lan, &wanted, interface),
         Err(error) => {
             forwarding_line("off", Some(&error.to_string()));
             return HostSide {
