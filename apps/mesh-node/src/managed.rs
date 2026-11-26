@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{Listeners, Snapshot};
-use outbound_mesh::node::SyncOversize;
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedNetwork, ManagedNetworkStatus,
@@ -591,6 +590,7 @@ fn instance_id(path: &Path) -> io::Result<String> {
 mod tests {
     use super::*;
     use outbound_mesh::driver::Member;
+    use outbound_mesh::node::SyncOversize;
     use outbound_mesh::{IpNet, MeshConfig};
     use serde_json::json;
 
