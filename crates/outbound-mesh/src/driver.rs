@@ -25,7 +25,7 @@ use crate::config::{MeshSettings, PeerEndpoint, Role, SecurityMode, Transport};
 use crate::dns::{DnsSettings, Names};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
-use crate::node::{Action, ConnId, Counters, Node};
+use crate::node::{Action, ConnId, Counters, Node, SyncOversize};
 use crate::routes::PeerId;
 use crate::secure::noise::KeyPair;
 use crate::wire::tcp::{encode_frame, FrameDecoder};
@@ -105,6 +105,8 @@ pub struct Snapshot {
     /// Node ID, next hop and hop count of every reachable node.
     pub routes: Vec<(u32, u32, u32)>,
     pub counters: Counters,
+    /// The last oversized synchronisation (spec §11.2, §12.2).
+    pub sync_oversize: Option<SyncOversize>,
     /// This node's ID is taken and it changed ID less than ten minutes
     /// ago, so it only warns (spec §12.3).
     pub duplicate_id: bool,
@@ -456,6 +458,7 @@ fn snapshot(node: &Node) -> Snapshot {
             .map(|(peer, route)| (peer, route.next_hop, route.hops))
             .collect(),
         counters: node.counters(),
+        sync_oversize: node.sync_oversize(),
         duplicate_id: node.duplicate_id(),
         system_routes: node.system_routes(),
         static_key: (node.settings().security == SecurityMode::ForwardSecrecy)

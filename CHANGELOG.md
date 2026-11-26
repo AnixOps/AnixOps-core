@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+### Release process
+
+- 发布策略加入版本节奏、候选版（RC）流程、维护分支 `release/X.Y` 与补丁维护规则（`docs/release-strategy.md`），新增兼容性承诺清单（`docs/compatibility-surface.md`）。
+- 发布工作流新增 “Release version preconditions”（`.github/scripts/release-version-check.sh`）：手动验证与标签发布都要求 `Cargo.toml` workspace 版本等于发布版本、`CHANGELOG.md` 有该版本小节；自测在 CI `policy-fast` 中运行。
+- CI 对 `release/MAJOR.MINOR` 的 push 运行；`release-policy` 与 `release-ci-gate` 接受 `main` 或与版本同一 `MAJOR.MINOR` 的维护分支，其他分支仍拒绝。
+
 ### Security
 
 - anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。

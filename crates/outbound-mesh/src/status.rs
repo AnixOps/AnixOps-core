@@ -198,6 +198,11 @@ pub enum AlertCode {
     /// address, so it is not intercepted (spec §15.9.2 item 8); `address`
     /// gives it.
     ResolverAddressConflict,
+    /// The network is larger than route synchronisation carries: a call
+    /// over 8 MiB was dropped (spec §11.2), or a neighbour did not take the
+    /// connection graph in time and the session was closed (§12.2). `peer`
+    /// is empty; `detail` says which, with the node ID.
+    SyncOversize,
 }
 
 /// Why a `PUT /v1/mesh` was not applied.

@@ -90,6 +90,16 @@ pub struct WindowsTunSettings {
     /// Points the adapter's DNS at the tunnel. Off for the mesh alone
     /// without internal domain names: the device keeps its own DNS.
     pub announce_dns: bool,
+    /// The adapter's GUID; `None` takes the client's fixed one. A program
+    /// running its own adapters next to the client's (the standalone mesh
+    /// node, one per network) gives each a GUID of its own, stable across
+    /// restarts so that a stale adapter left by a crash is replaced.
+    pub adapter_guid: Option<u128>,
+    /// Refuses to open without a physical default route to pin the
+    /// engine's sockets to. Off for a mesh node that carries only mesh
+    /// routes: its sockets follow the system's routing, and a LAN without
+    /// a default route still reaches its peers.
+    pub require_physical: bool,
 }
 
 impl Default for WindowsTunSettings {
@@ -105,6 +115,8 @@ impl Default for WindowsTunSettings {
             ring_capacity: 0x0040_0000,
             routes: None,
             announce_dns: true,
+            adapter_guid: None,
+            require_physical: true,
         }
     }
 }
@@ -815,7 +827,10 @@ mod native {
                 ipv4_index: best_interface_v4(Ipv4Addr::new(1, 1, 1, 1)),
                 ipv6_index: best_interface_v6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)),
             };
-            if physical.ipv4_index.is_none() && physical.ipv6_index.is_none() {
+            if settings.require_physical
+                && physical.ipv4_index.is_none()
+                && physical.ipv6_index.is_none()
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "no network connection to route around the TUN adapter",
@@ -824,8 +839,9 @@ mod native {
 
             let name = wide(OsStr::new(&settings.adapter_name));
             let tunnel_type = wide(OsStr::new("AnixOps"));
+            let guid = settings.adapter_guid.map_or(ADAPTER_GUID, GUID::from_u128);
             let adapter =
-                unsafe { (api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), &ADAPTER_GUID) };
+                unsafe { (api.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), &guid) };
             if adapter.is_null() {
                 return Err(last_os_error("the Wintun adapter could not be created"));
             }
@@ -1505,7 +1521,11 @@ mod tests {
 
     #[test]
     fn default_settings_are_valid() {
-        WindowsTunSettings::default().validate().unwrap();
+        let settings = WindowsTunSettings::default();
+        settings.validate().unwrap();
+        // The client's adapter: fixed GUID, a physical route required.
+        assert_eq!(settings.adapter_guid, None);
+        assert!(settings.require_physical);
     }
 
     #[test]

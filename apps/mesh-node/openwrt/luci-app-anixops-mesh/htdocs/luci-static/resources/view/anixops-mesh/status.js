@@ -7,6 +7,10 @@
 // Status of the intranet mesh device (docs/deploy/openwrt.md). Read-only:
 // the data comes from the local status socket through rpcd, refreshed every
 // 5 seconds; no network port is involved (R11).
+//
+// Every value that does not come from this file is passed to E() inside an
+// array: LuCI turns array items into text nodes, while a lone string child
+// is assigned to innerHTML.
 
 const callStatus = rpc.declare({
 	object: 'luci.anixops-mesh',
@@ -32,7 +36,9 @@ const FAILURES = {
 const ALERTS = {
 	address_conflict: _('Address conflict'),
 	address_unmanaged: _('Address not managed'),
-	start_refused: _('Start refused')
+	start_refused: _('Start refused'),
+	external_bridge_lock_held: _('External network bridge lock held by another process'),
+	external_bridge_downgrade_residue: _('External network bridge rules may remain from an earlier version')
 };
 
 const CONTROL_STATES = {
@@ -59,25 +65,29 @@ function yesNo(value) {
 function failureText(failure) {
 	if (!failure || typeof failure.code !== 'string')
 		return null;
-	return FAILURES[failure.code] || failure.code;
+	return FAILURES[failure.code] || _('Unknown failure: %s').format(failure.code);
+}
+
+function alertText(code) {
+	return ALERTS[code] || _('Unknown alert: %s').format(text(code));
 }
 
 function row(label, value) {
 	return E('tr', { 'class': 'tr' }, [
-		E('td', { 'class': 'td left', 'width': '33%' }, label),
-		E('td', { 'class': 'td left' }, value)
+		E('td', { 'class': 'td left', 'width': '33%' }, [ label ]),
+		E('td', { 'class': 'td left' }, [ value ])
 	]);
 }
 
 function table(titles, rows, empty) {
 	const head = E('tr', { 'class': 'tr table-titles' },
-		titles.map(function(title) { return E('th', { 'class': 'th' }, title); }));
+		titles.map(function(title) { return E('th', { 'class': 'th' }, [ title ]); }));
 	if (!rows.length)
 		return E('table', { 'class': 'table' }, [ head,
-			E('tr', { 'class': 'tr placeholder' }, [ E('td', { 'class': 'td' }, E('em', {}, empty)) ]) ]);
+			E('tr', { 'class': 'tr placeholder' }, [ E('td', { 'class': 'td' }, [ E('em', {}, [ empty ]) ]) ]) ]);
 	return E('table', { 'class': 'table' }, [ head ].concat(rows.map(function(cells) {
 		return E('tr', { 'class': 'tr' }, cells.map(function(cell) {
-			return E('td', { 'class': 'td' }, cell);
+			return E('td', { 'class': 'td' }, [ cell ]);
 		}));
 	})));
 }
@@ -108,7 +118,7 @@ function renderNetwork(network) {
 	if (overlaps.length)
 		facts.push(row(_('Overlapping subnets'), overlaps.join(', ')));
 	alerts.forEach(function(alert) {
-		const label = ALERTS[alert.code] || text(alert.code);
+		const label = alertText(alert.code);
 		facts.push(row(_('Alert'), alert.address ? label + ': ' + alert.address : label));
 	});
 
@@ -125,9 +135,9 @@ function renderNetwork(network) {
 	});
 
 	return E('div', { 'class': 'cbi-section' }, [
-		E('h3', {}, text(network.tag)),
+		E('h3', {}, [ text(network.tag) ]),
 		E('table', { 'class': 'table' }, facts),
-		E('h4', {}, _('Members')),
+		E('h4', {}, [ _('Members') ]),
 		table([ _('Virtual address'), _('Subnets'), _('Path'), _('Hops'), _('Latency'), _('Forward secrecy') ],
 			members, _('No members'))
 	]);
@@ -141,7 +151,10 @@ function renderStatus(data) {
 	let serviceText;
 	switch (service.result) {
 	case 'ok': serviceText = _('Running'); break;
-	case 'not_running': serviceText = _('Not running'); break;
+	case 'not_running':
+		// Enabled but not running: stopped after an error, or retrying.
+		serviceText = data.enabled ? _('Enabled, not running') : _('Disabled');
+		break;
 	case 'unsupported': serviceText = _('Not supported by the installed program version'); break;
 	default: serviceText = _('Status unavailable');
 	}
@@ -157,13 +170,13 @@ function renderStatus(data) {
 		facts.push(row(_('Last report'), time(device.last_report)));
 	}
 	nodes.push(E('div', { 'class': 'cbi-section' }, [
-		E('h3', {}, _('Device')),
+		E('h3', {}, [ _('Device') ]),
 		E('table', { 'class': 'table' }, facts)
 	]));
 
 	const networks = (service.mesh && Array.isArray(service.mesh.networks)) ? service.mesh.networks : [];
 	if (service.result === 'ok' && !networks.length)
-		nodes.push(E('div', { 'class': 'cbi-section' }, E('em', {}, _('No network assigned to this device'))));
+		nodes.push(E('div', { 'class': 'cbi-section' }, [ E('em', {}, [ _('No network assigned to this device') ]) ]));
 	networks.forEach(function(network) { nodes.push(renderNetwork(network)); });
 	return nodes;
 }
@@ -181,9 +194,9 @@ return view.extend({
 			});
 		}, 5);
 		return E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('Intranet mesh')),
+			E('h2', {}, [ _('Intranet mesh') ]),
 			E('div', { 'class': 'cbi-map-descr' },
-				_('Status of this device in the intranet mesh. Networks are assigned by the panel.')),
+				[ _('Status of this device in the intranet mesh. Networks are assigned by the panel.') ]),
 			body
 		]);
 	},
