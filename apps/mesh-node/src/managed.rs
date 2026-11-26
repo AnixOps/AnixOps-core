@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,13 +57,31 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-/// `mesh_backbone`: `PUT /v1/mesh` takes the top-level `backbone` section
-/// and `GET /v1/mesh` gives its status (spec §17.3, appendix B and C).
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_backbone"];
+pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
 
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
 /// lock, nftables took the probe and the start-up cleanup ran.
 pub const FEATURES_WITH_BRIDGE: &[&str] = &["mesh", "mesh_native_keys", mesh_bridge::FEATURE];
+
+/// Listed only when the operator turned the backbone on
+/// ([`ManagedMesh::with_backbone`]): `PUT /v1/mesh` then takes the
+/// top-level `backbone` section and `GET /v1/mesh` gives its status (spec
+/// §17.3, appendix B and C). Off, a body with the section is refused.
+pub const BACKBONE_FEATURE: &str = "mesh_backbone";
+
+/// [`FEATURES`] with the backbone on.
+pub const FEATURES_WITH_BACKBONE: &[&str] = &["mesh", "mesh_native_keys", BACKBONE_FEATURE];
+
+/// [`FEATURES_WITH_BRIDGE`] with the backbone on.
+pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
+    "mesh",
+    "mesh_native_keys",
+    mesh_bridge::FEATURE,
+    BACKBONE_FEATURE,
+];
+
+/// The refusal of a `backbone` section while the backbone is off.
+pub const BACKBONE_DISABLED: &str = "backbone_disabled";
 
 /// Interface names: `anixmesh-<n>`, the lowest number free (the adapter's
 /// name on Windows). macOS names a `utun` interface itself; the name it
@@ -88,6 +107,10 @@ struct Inner {
     /// One per network of the last request, by tag.
     hubs: Mutex<BTreeMap<String, Arc<Hub>>>,
     backbone: Mutex<Option<BorderInstance>>,
+    /// The operator's switch (`mesh_backbone`, off by default): off, no
+    /// backbone section is taken and this node never carries other
+    /// regions' prefixes.
+    backbone_enabled: AtomicBool,
     bridging: Bridging,
     /// Held by the task that replaces the networks, not by the request:
     /// a request that times out does not let the next one start while
@@ -224,6 +247,7 @@ impl ManagedMesh {
                 networks: Mutex::new(Vec::new()),
                 hubs: Mutex::new(BTreeMap::new()),
                 backbone: Mutex::new(None),
+                backbone_enabled: AtomicBool::new(false),
                 bridging,
                 applying: tokio::sync::Mutex::new(()),
                 previous: Mutex::new(None),
@@ -235,6 +259,20 @@ impl ManagedMesh {
     /// This device's instance ID.
     pub fn instance_id(&self) -> &str {
         &self.inner.instance_id
+    }
+
+    /// Turns the inter-region backbone on or off (the operator's
+    /// `mesh_backbone`; off when not called). Off, `mesh_backbone` is not
+    /// listed and an `apply` with a backbone is refused as invalid
+    /// ([`BACKBONE_DISABLED`]), so the node never becomes a border node.
+    /// Set before the first `apply`.
+    pub fn with_backbone(self, enabled: bool) -> Self {
+        self.inner.backbone_enabled.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    fn backbone_enabled(&self) -> bool {
+        self.inner.backbone_enabled.load(Ordering::SeqCst)
     }
 }
 
@@ -553,10 +591,11 @@ fn bridge_failure(error: &BridgeApplyError) -> String {
 
 impl MeshControl for ManagedMesh {
     fn features(&self) -> &'static [&'static str] {
-        if self.inner.bridging.available() {
-            FEATURES_WITH_BRIDGE
-        } else {
-            FEATURES
+        match (self.inner.bridging.available(), self.backbone_enabled()) {
+            (true, true) => FEATURES_WITH_BRIDGE_AND_BACKBONE,
+            (true, false) => FEATURES_WITH_BRIDGE,
+            (false, true) => FEATURES_WITH_BACKBONE,
+            (false, false) => FEATURES,
         }
     }
 
@@ -573,6 +612,9 @@ impl MeshControl for ManagedMesh {
         networks: Vec<ManagedNetwork>,
         backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>> {
+        if backbone.is_some() && !self.backbone_enabled() {
+            return Box::pin(async { Err(backbone_disabled()) });
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             tokio::spawn(async move {
@@ -589,6 +631,14 @@ impl MeshControl for ManagedMesh {
             })
         })
     }
+}
+
+/// Nothing of the request is applied: the running networks stay as they
+/// are.
+fn backbone_disabled() -> ApplyError {
+    ApplyError::Invalid(format!(
+        "{BACKBONE_DISABLED}: backbone: this node does not run a backbone (mesh_backbone is off in the node configuration)"
+    ))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1375,7 +1425,8 @@ mod tests {
     #[tokio::test]
     async fn a_backbone_without_its_link_kind_reports_why_and_the_network_stays() {
         let dir = temp_dir("backbone");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open").with_backbone(true);
+        assert_eq!(mesh.features(), FEATURES_WITH_BACKBONE);
         let network = || ManagedNetwork {
             tag: "mesh-cn".into(),
             settings: settings(),
@@ -1395,7 +1446,6 @@ mod tests {
         let text = serde_json::to_string(&status).unwrap();
         assert!(!text.contains("SECRET-VALUE"), "{text}");
         assert_eq!(mesh.status(), status);
-        assert!(FEATURES.contains(&"mesh_backbone"));
 
         // Without the section the backbone goes; the network stays.
         let status = mesh.apply(vec![network()], None).await.unwrap();
@@ -1403,6 +1453,62 @@ mod tests {
         assert_eq!(status.networks.len(), 1);
         let _ = mesh.apply(Vec::new(), None).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_backbone_is_off_unless_the_operator_turns_it_on() {
+        let dir = temp_dir("backbone-off");
+        let mesh = open(&dir).expect("open");
+        assert_eq!(mesh.features(), FEATURES);
+        assert!(!mesh.features().contains(&BACKBONE_FEATURE));
+        let network = || ManagedNetwork {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+        };
+        let before = mesh.apply(vec![network()], None).await.unwrap();
+        assert_eq!(before.backbone, None);
+
+        // Refused as a whole: nothing of the request is applied, the
+        // running network stays, no backbone starts and no hub carries
+        // another region's prefixes.
+        let refused = mesh
+            .apply(Vec::new(), Some(backbone("not-registered")))
+            .await
+            .unwrap_err();
+        match refused {
+            ApplyError::Invalid(message) => {
+                assert!(message.starts_with(BACKBONE_DISABLED), "{message}");
+                assert!(!message.contains("SECRET-VALUE"), "{message}");
+            }
+            ApplyError::Failed(message) => panic!("not invalid: {message}"),
+        }
+        assert_eq!(mesh.status(), before);
+        assert!(lock(&mesh.inner.backbone).is_none());
+        assert!(lock(&mesh.inner.hubs)
+            .values()
+            .all(|hub| hub.carried().is_empty()));
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_feature_list_holds_the_base_and_the_backbone_only_when_on() {
+        for list in [
+            FEATURES,
+            FEATURES_WITH_BRIDGE,
+            FEATURES_WITH_BACKBONE,
+            FEATURES_WITH_BRIDGE_AND_BACKBONE,
+        ] {
+            for feature in FEATURES {
+                assert!(list.contains(feature), "{list:?} lacks {feature}");
+            }
+        }
+        assert!(!FEATURES.contains(&BACKBONE_FEATURE));
+        assert!(!FEATURES_WITH_BRIDGE.contains(&BACKBONE_FEATURE));
+        assert!(FEATURES_WITH_BACKBONE.contains(&BACKBONE_FEATURE));
+        assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&BACKBONE_FEATURE));
+        assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&mesh_bridge::FEATURE));
+        assert!(!FEATURES_WITH_BACKBONE.contains(&mesh_bridge::FEATURE));
     }
 
     #[test]

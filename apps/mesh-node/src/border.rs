@@ -132,6 +132,12 @@ impl Hub {
         });
     }
 
+    /// The other regions' prefixes the network now carries.
+    #[cfg(test)]
+    pub fn carried(&self) -> Vec<IpNet> {
+        self.prefixes.borrow().clone()
+    }
+
     /// Withdraws everything carried for other regions.
     pub fn withdraw(&self) {
         self.set_prefixes(Vec::new());

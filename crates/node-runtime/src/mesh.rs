@@ -31,6 +31,13 @@ use serde_json::{Map, Value};
 
 use crate::NodeError;
 
+/// The feature a mesh lists when it takes a `backbone` section.
+pub const BACKBONE_FEATURE: &str = "mesh_backbone";
+
+/// The refusal of a `backbone` section on a mesh that does not list
+/// [`BACKBONE_FEATURE`].
+pub const BACKBONE_DISABLED: &str = "backbone_disabled";
+
 /// The installed mesh, with the lock that keeps `PUT`s one at a time.
 pub(crate) struct Mesh {
     control: Arc<dyn MeshControl>,
@@ -56,6 +63,13 @@ impl Mesh {
     /// Parses, validates and applies a `PUT /v1/mesh` body.
     pub(crate) async fn apply(&self, body: &[u8]) -> Result<ManagedStatus, NodeError> {
         let request = parse(body).map_err(NodeError::Mesh)?;
+        // A node that does not list the backbone never becomes a border
+        // node: the whole body is refused and nothing changes.
+        if request.backbone.is_some() && !self.features().contains(&BACKBONE_FEATURE) {
+            return Err(NodeError::Mesh(format!(
+                "{BACKBONE_DISABLED}: backbone: this node does not run a backbone ({BACKBONE_FEATURE} is not listed)"
+            )));
+        }
         let _one_at_a_time = self.apply.lock().await;
         self.control
             .apply(request.networks, request.backbone)

@@ -21,6 +21,7 @@
 
 ### Security
 
+- 组网区域间骨干（规范 §17.3，内核 0.4，尚未审计）改为默认关闭（内核 0.3 发布策略：未审计功能默认不可达）：`anixcore` 配置新增 `mesh_backbone`（默认 `false`）。关闭时不声明 `mesh_backbone`，`PUT /v1/mesh` 带 `backbone` 节时整份请求体返回 400（`backbone_disabled`），运行中的网络不变，节点不承载其他区域的汇总网段。同时修正节点程序能桥接时少报 `mesh_backbone` 的问题：能力列表按桥接与骨干两个条件给出。
 - 组网自定义路径（规范 §17.2，内核 0.5，尚未审计）在默认配置下对远端不可达：新增 `node.waypoint_relay`（默认 `false`，需要 `node.relay`）。为 `false` 且网络没有 `routing.paths` 时，节点对 `MeshPathRpc` 回 Error 3，丢弃全部类型 40 包并计数；只有打开该开关的节点才作为途经点（`Capabilities.relay`）。
 - anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。
 
