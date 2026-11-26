@@ -243,7 +243,7 @@ build_apk() {
     -e "NAME=${name}" -e "VERSION=${apk_version}" -e "ARCH=${apk_arch}" \
     -e "DESCRIPTION=${description}" -e "DEPENDS=${depends}" -e "LICENSE=${license}" \
     -e "URL=${url}" -e "MAINTAINER=${maintainer}" -e "OUTPUT=${output}" \
-    -e "OWNER=$(id -u):$(id -g)" \
+    -e "OWNER=$(id -u):$(id -g)" -e "SOURCE_DATE_EPOCH=${epoch}" \
     "${APK_IMAGE}" /bin/sh -euc '
       cp -a /stage /tmp/stage
       chown -R 0:0 /tmp/stage
@@ -257,6 +257,7 @@ build_apk() {
         --info "url:${URL}" \
         --info "maintainer:${MAINTAINER}" \
         --info "depends:${DEPENDS}" \
+        --info "build-time:${SOURCE_DATE_EPOCH}" \
         --script "post-install:/tmp/stage/scripts/post-install" \
         --script "post-upgrade:/tmp/stage/scripts/post-upgrade" \
         --script "pre-deinstall:/tmp/stage/scripts/pre-deinstall" \
