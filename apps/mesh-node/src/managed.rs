@@ -1387,11 +1387,11 @@ mod tests {
         let mesh = open_on(&dir, false, &host);
         assert_eq!(mesh.features(), FEATURES);
         let status = mesh
-            .apply(vec![waiting("mesh-cn", "office")])
+            .apply(vec![waiting("mesh-cn", "office")], None)
             .await
             .unwrap();
         assert!(status.alerts.is_empty());
-        mesh.apply(Vec::new()).await.unwrap();
+        mesh.apply(Vec::new(), None).await.unwrap();
         drop(mesh);
         assert_eq!(host.calls(), 0);
         // Not even the host lock is taken.
