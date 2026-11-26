@@ -54,7 +54,7 @@ fn instance_for(settings: MeshSettings) -> io::Result<Arc<Instance>> {
         .and_then(Weak::upgrade)
         .filter(|instance| !instance.is_retired())
     {
-        if *instance.settings() == settings {
+        if same_settings(instance.settings(), &settings) {
             return Ok(instance);
         }
         instance.retire();
@@ -63,6 +63,13 @@ fn instance_for(settings: MeshSettings) -> io::Result<Arc<Instance>> {
     let instance = Instance::new(settings)?;
     instances.insert(name, Arc::downgrade(&instance));
     Ok(instance)
+}
+
+/// Whether a running network can serve `settings` as it is. [`IpNet`]
+/// equality compares networks only, so the node's own addresses are
+/// compared apart: a new address inside the same subnet is a new network.
+fn same_settings(running: &MeshSettings, wanted: &MeshSettings) -> bool {
+    running == wanted && running.local_addresses() == wanted.local_addresses()
 }
 
 /// The running network named `name` (`network.name`), while an outbound
