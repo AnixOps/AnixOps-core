@@ -212,6 +212,8 @@ pub struct Node {
     routes: RouteTable,
     /// Networks of this machine's other interfaces, as last reported.
     local_networks: Vec<IpNet>,
+    /// Routes other mesh programs carry on this machine (spec §15.4).
+    foreign_routes: Vec<IpNet>,
     /// Overlapping subnets the user routes through the mesh anyway.
     route_overrides: Vec<IpNet>,
     conns: BTreeMap<ConnId, Conn>,
@@ -349,6 +351,7 @@ impl Node {
             },
             routes,
             local_networks: Vec::new(),
+            foreign_routes: Vec::new(),
             route_overrides: Vec::new(),
             conns: BTreeMap::new(),
             reassembler: Reassembler::new(),
@@ -427,8 +430,49 @@ impl Node {
     /// The networks of this machine's other interfaces (spec §15.4).
     pub fn set_local_networks(&mut self, interfaces: &[IpNet]) {
         self.local_networks = interfaces.to_vec();
+        self.apply_local_networks();
+    }
+
+    /// Routes that other mesh programs' virtual interfaces carry here, as
+    /// the system actually selects them (spec §15.4): treated like the
+    /// interface networks, and reported apart ([`Self::foreign_overlaps`]).
+    pub fn set_foreign_routes(&mut self, routes: &[IpNet]) {
+        self.foreign_routes = routes.iter().map(IpNet::trunc).collect();
+        self.apply_local_networks();
+    }
+
+    /// Accepted subnets kept local because they overlap a route of another
+    /// mesh program (and no interface network of this machine).
+    pub fn foreign_overlaps(&self) -> Vec<IpNet> {
+        let mut found: Vec<IpNet> = self
+            .routes
+            .local_conflicts()
+            .into_iter()
+            .map(|(_, subnet)| subnet)
+            .filter(|subnet| {
+                self.foreign_routes
+                    .iter()
+                    .any(|route| route.overlaps(subnet))
+                    && !self
+                        .local_networks
+                        .iter()
+                        .any(|network| network.overlaps(subnet))
+            })
+            .collect();
+        found.sort_by_key(ToString::to_string);
+        found.dedup();
+        found
+    }
+
+    fn apply_local_networks(&mut self) {
+        let networks: Vec<IpNet> = self
+            .local_networks
+            .iter()
+            .chain(&self.foreign_routes)
+            .copied()
+            .collect();
         self.routes
-            .set_local_networks(&self.local_networks, &self.route_overrides);
+            .set_local_networks(&networks, &self.route_overrides);
     }
 
     /// Subnets the user routes through the mesh although they overlap a
@@ -443,8 +487,7 @@ impl Node {
                 self.route_overrides.push(subnet);
             }
         }
-        self.routes
-            .set_local_networks(&self.local_networks, &self.route_overrides);
+        self.apply_local_networks();
     }
 
     /// Subnets to route into the virtual interface: accepted and routed,
@@ -1966,6 +2009,21 @@ mod tests {
         assert!(routes(&net).is_empty());
         net.nodes[0].set_route_overrides(&[]);
         assert!(routes(&net).is_empty());
+        // A local network is not another mesh program's route.
+        assert!(net.nodes[0].foreign_overlaps().is_empty());
+        net.nodes[0].set_local_networks(&[]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        // Another mesh program carries 192.168.0.0/16: kept local and
+        // reported apart.
+        net.nodes[0].set_foreign_routes(&[IpNet::parse("192.168.0.0/16").unwrap()]);
+        assert!(routes(&net).is_empty());
+        assert_eq!(
+            net.nodes[0].foreign_overlaps(),
+            [IpNet::parse("192.168.10.0/24").unwrap()]
+        );
+        net.nodes[0].set_foreign_routes(&[]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        assert!(net.nodes[0].foreign_overlaps().is_empty());
     }
 
     #[test]

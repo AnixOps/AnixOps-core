@@ -194,6 +194,10 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
+    /// An advertised subnet overlaps a route another mesh program carries
+    /// on this machine, so it is kept local (spec §15.4); `detail` is the
+    /// subnet.
+    ForeignRouteOverlap,
 }
 
 /// Why a `PUT /v1/mesh` was not applied.
