@@ -102,6 +102,22 @@ try {
     if (-not $parsed.ok -or $parsed.device.device_id -ne 5) { Fail "unexpected status" }
     if (@($parsed.mesh.networks).Count -ne 0) { Fail "unexpected networks" }
     if ($status -match "msd_|mse_") { Fail "a token in the status" }
+    # A local user without administrator rights reads the status too.
+    $user = "meshci" + (Get-Random -Maximum 100000)
+    $password = "P1-" + [Guid]::NewGuid().ToString("N")
+    $secure = ConvertTo-SecureString $password -AsPlainText -Force
+    New-LocalUser -Name $user -Password $secure -AccountNeverExpires | Out-Null
+    try {
+        $out = Join-Path $env:PUBLIC "mesh-device-status-$user.json"
+        $process = Start-Process -FilePath $bin -ArgumentList @("device-status", "--state-dir", "`"$state`"") `
+            -Credential (New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$user", $secure)) `
+            -WorkingDirectory $env:PUBLIC -RedirectStandardOutput $out -NoNewWindow -Wait -PassThru
+        if ($process.ExitCode -ne 0) { Fail "a user without administrator rights could not read the status ($($process.ExitCode))" }
+        if (-not ((Get-Content -Raw -LiteralPath $out) -match '"device_id":5')) { Fail "unexpected status for a user" }
+        Remove-Item -Force -LiteralPath $out
+    } finally {
+        Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+    }
     Wait-For "the first report" 30 { (Count "report") -ge 1 }
     Wait-For "control_state ok" 10 { ((& $bin device-status --state-dir $state) -join "") -match '"control_state":"ok"' }
     if (-not (Test-Path -LiteralPath (Join-Path $state "device.log"))) { Fail "the service wrote no device.log" }

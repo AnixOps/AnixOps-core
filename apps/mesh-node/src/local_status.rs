@@ -221,10 +221,13 @@ mod windows {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use tokio::net::windows::named_pipe::{
-        ClientOptions, NamedPipeServer, PipeMode, ServerOptions,
+        NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
     };
-    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
-    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_WRITE_DATA, OPEN_EXISTING,
+        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    };
 
     use super::{ask, client_runtime, one, TIMEOUT};
     use crate::win_security::{self, SecurityDescriptor, PIPE_SDDL};
@@ -304,6 +307,34 @@ mod windows {
         }
     }
 
+    /// Opens the pipe asking only for what [`PIPE_SDDL`] grants the local
+    /// users: read (with `READ_CONTROL`, for the owner check) and writing
+    /// the request (`FILE_WRITE_DATA`). Generic write would also ask for
+    /// the append right, which on a pipe creates instances, and is refused
+    /// to them. The service may identify the caller but not act as it.
+    fn open_client(name: &str) -> io::Result<NamedPipeClient> {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: `wide` is NUL-terminated; no security attributes or
+        // template are passed.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_READ | FILE_WRITE_DATA,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a pipe handle just opened for overlapped I/O, owned from
+        // here on by the client.
+        unsafe { NamedPipeClient::from_raw_handle(handle) }
+    }
+
     /// `device-status`: asks the service of the state directory of `path`
     /// and returns its answer. The pipe must belong to SYSTEM, the
     /// administrators or the caller; the service may identify the caller
@@ -313,12 +344,7 @@ mod windows {
         client_runtime()?.block_on(async {
             let client = tokio::time::timeout(TIMEOUT, async {
                 loop {
-                    match ClientOptions::new()
-                        .read(true)
-                        .write(true)
-                        .security_qos_flags(SECURITY_IDENTIFICATION)
-                        .open(&name)
-                    {
+                    match open_client(&name) {
                         Ok(client) => return Ok(client),
                         Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
                             tokio::time::sleep(Duration::from_millis(50)).await;

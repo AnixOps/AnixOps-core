@@ -215,7 +215,9 @@ try {
     # refused token (exit code 8) as a clean stop, so it is not restarted
     # until the device is enrolled again.
     & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Stop-Ours; Fail "setting the recovery actions failed ($LASTEXITCODE)" }
     & sc.exe failureflag $ServiceName 1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Stop-Ours; Fail "setting the failure flag failed ($LASTEXITCODE)" }
 
     try { Start-Service -Name $ServiceName } catch { }
     # The service answers on its status pipe once it runs.

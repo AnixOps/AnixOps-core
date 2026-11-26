@@ -72,7 +72,7 @@ if [ "$uninstall" -eq 1 ]; then
   rm -f "$PLIST" "$BIN"
   rmdir "$PREFIX" 2>/dev/null || true
   if [ "$purge" -eq 1 ]; then
-    rm -rf "$STATE" "$CA"
+    rm -rf "$STATE" "$CA" "$LOG"
     log "removed the daemon, the program and the device state; revoke the device in the panel"
   else
     log "removed the daemon and the program; the device identity is kept in $STATE (--purge removes it)"
@@ -175,7 +175,7 @@ install -o root -g wheel -m 0755 "$work/anixops-mesh" "$BIN"
 # Kept alive while the device has a token: when the panel refuses the token
 # the program removes it and stops with exit code 8, and launchd does not
 # start it again until the device is enrolled again. launchd waits the
-# throttle interval between starts.
+# throttle interval between starts. Umask 63 is 077.
 cat >"$work/daemon.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -200,6 +200,8 @@ cat >"$work/daemon.plist" <<EOF
       <true/>
     </dict>
   </dict>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>StandardErrorPath</key>
@@ -208,6 +210,12 @@ cat >"$work/daemon.plist" <<EOF
 </plist>
 EOF
 plutil -lint "$work/daemon.plist" >/dev/null || die "the daemon definition is invalid"
+# The log is for the administrators only, like the state (umask 077 above
+# keeps the files the program makes owner-only too).
+[ ! -L "$LOG" ] || die "$LOG is a link; remove it and run again"
+touch "$LOG"
+chown root:admin "$LOG"
+chmod 0640 "$LOG"
 install -o root -g wheel -m 0644 "$work/daemon.plist" "$PLIST"
 
 launchctl enable "system/$LABEL" >/dev/null 2>&1 || true

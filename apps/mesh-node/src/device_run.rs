@@ -68,6 +68,8 @@ const SUBNET_REQUEST: &str = "/api/v5/mesh/device/subnet-request";
 
 /// Reports on a change come at most this often.
 const CHANGE_INTERVAL: Duration = Duration::from_secs(10);
+/// Wait before binding the status endpoint again.
+const STATUS_RETRY: Duration = Duration::from_secs(10);
 /// Longest credential file read.
 const MAX_CREDENTIAL_FILE: u64 = 4096;
 
@@ -614,17 +616,37 @@ async fn serve(
             json!({ "source": "config.json", "detail": detail }),
         );
     }
-    match local_status::bind(&state.socket()) {
-        Ok(listener) => {
-            let mesh = Arc::clone(&mesh);
-            let shared = Arc::clone(&shared);
-            let device_id = file.device_id;
-            let control = file.control.clone();
-            tokio::spawn(local_status::serve(listener, move || {
-                snapshot(&mesh, &shared, device_id, &control)
-            }));
-        }
-        Err(error) => log("status_socket", json!({ "detail": error.to_string() })),
+    // The status endpoint is bound again every 10 seconds while it cannot
+    // be (on Windows another program may hold the pipe name while the
+    // service was stopped); the networks run either way.
+    {
+        let mesh = Arc::clone(&mesh);
+        let shared = Arc::clone(&shared);
+        let device_id = file.device_id;
+        let control = file.control.clone();
+        let answer = move || snapshot(&mesh, &shared, device_id, &control);
+        let socket = state.socket();
+        tokio::spawn(async move {
+            let mut logged = false;
+            loop {
+                match local_status::bind(&socket) {
+                    Ok(listener) => {
+                        if logged {
+                            log("status_socket_bound", json!({}));
+                        }
+                        local_status::serve(listener, answer.clone()).await;
+                        return;
+                    }
+                    Err(error) => {
+                        if !logged {
+                            log("status_socket", json!({ "detail": error.to_string() }));
+                            logged = true;
+                        }
+                        tokio::time::sleep(STATUS_RETRY).await;
+                    }
+                }
+            }
+        });
     }
     let stop_requested = stop_signal()?;
     tokio::pin!(stop_requested);

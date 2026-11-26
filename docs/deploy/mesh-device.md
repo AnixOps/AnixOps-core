@@ -22,7 +22,7 @@
 | 平台 | 默认状态目录 | 权限 |
 |---|---|---|
 | Linux | `/var/lib/anixops-mesh/device`（OpenWrt 见下文） | 0700，root 所有 |
-| macOS | `/Library/Application Support/AnixOps/mesh/device` | 0710，root 所有，属组 `admin`（管理员只能穿过目录访问状态套接字，不能列出或读取其中文件） |
+| macOS | `/Library/Application Support/AnixOps/mesh/device` | 安装器建为 0710，root 所有，属组 `admin`（管理员只能穿过目录访问状态套接字，不能列出目录；其中文件均为 0600，读不到内容）；程序自行创建时为 0700，此时只有 root 能用状态套接字 |
 | Windows | `%ProgramData%\AnixOps\Mesh\device` | 只有 SYSTEM 与 Administrators 有访问权，不继承上级目录的权限 |
 
 Linux 的默认目录与同机 anixcore 的 `/var/lib/anixcore/mesh` 分开，避免共用实例 ID。目录要求与接管状态目录相同：
@@ -84,7 +84,7 @@ Linux 的默认目录与同机 anixcore 的 `/var/lib/anixcore/mesh` 分开，�
 `device` 在本机状态接口上回答一行 JSON 请求 `{"cmd":"mesh_status"}`：
 
 - Linux、macOS：状态目录中的 `status.sock`（Unix 域套接字，0660，属组 Linux 为 `anixops-mesh`、macOS 为 `admin`）。上次运行留下的套接字会被替换，同名的其他文件则拒绝绑定。
-- Windows：命名管道 `\\.\pipe\anixops-mesh-device-<16 位十六进制>`，十六进制为 `<状态目录>\status.sock` 的绝对路径转小写后 SHA-256 的前 8 字节（管道名是全机共用的命名空间，按状态目录区分）。访问列表 `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;BU)`：SYSTEM 与 Administrators 完全控制；本机 Users 只能连接、读取和写入请求（`FILE_GENERIC_READ | FILE_WRITE_DATA`），不能创建管道实例、修改访问列表或取得所有权。拒绝远程客户端。服务以「首个实例」方式创建管道，管道已存在（已有服务在运行，或被其他程序抢先创建）时不再提供状态接口并记录 `status_socket`，网络照常运行。`device-status` 只接受所有者为 SYSTEM、Administrators 或调用者本人的管道，并以 `SECURITY_IDENTIFICATION` 连接，服务端只能识别、不能冒充调用者。
+- Windows：命名管道 `\\.\pipe\anixops-mesh-device-<16 位十六进制>`，十六进制为 `<状态目录>\status.sock` 的绝对路径转小写后 SHA-256 的前 8 字节（管道名是全机共用的命名空间，按状态目录区分）。访问列表 `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;BU)`：SYSTEM 与 Administrators 完全控制；本机 Users 只能连接、读取和写入请求（`FILE_GENERIC_READ | FILE_WRITE_DATA`），不能创建管道实例、修改访问列表或取得所有权。拒绝远程客户端。服务以「首个实例」方式创建管道；管道已存在（已有服务在运行，或服务停止期间被其他程序抢先创建）时记录一次 `status_socket`，此后每 10 秒重试，网络照常运行（其他平台绑定失败时同样重试）。客户端只请求 `FILE_GENERIC_READ | FILE_WRITE_DATA` 打开管道，不请求通用写权限（其中的追加权限对管道即创建实例）。`device-status` 只接受所有者为 SYSTEM、Administrators 或调用者本人的管道，并以 `SECURITY_IDENTIFICATION` 连接，服务端只能识别、不能冒充调用者。
 
 应答为受管组网状态加上设备字段：
 
@@ -102,7 +102,7 @@ Linux 的默认目录与同机 anixcore 的 `/var/lib/anixcore/mesh` 分开，�
 |---|---|---|
 | Linux | systemd：`Restart=on-failure`，`RestartPreventExitStatus=8` | 不重启 |
 | OpenWrt | procd（见下文） | init 脚本判断后不再拉起 |
-| macOS | launchd 系统守护进程 `com.anixops.mesh.device`（`/Library/LaunchDaemons/com.anixops.mesh.device.plist`），`RunAtLoad`，`KeepAlive` 为 `PathState`：`<状态目录>/token` 存在时保持运行，`ThrottleInterval` 30 秒；标准错误写入 `/Library/Logs/anixops-mesh-device.log` | 程序已删除 `token`，launchd 不再拉起；重新接入写回 `token` 后由 launchd 自动启动。`token` 存在但内容无效时同样以 8 退出，launchd 每 30 秒重试一次，直至重新接入 |
+| macOS | launchd 系统守护进程 `com.anixops.mesh.device`（`/Library/LaunchDaemons/com.anixops.mesh.device.plist`），`RunAtLoad`，`KeepAlive` 为 `PathState`：`<状态目录>/token` 存在时保持运行，`ThrottleInterval` 30 秒；`Umask` 077；标准错误写入 `/Library/Logs/anixops-mesh-device.log`（安装器建为 root:admin 0640，`--purge` 删除；日志只在出错与退避时写入，不轮转） | 程序已删除 `token`，launchd 不再拉起；重新接入写回 `token` 后由 launchd 自动启动。`token` 存在但内容无效时同样以 8 退出，launchd 每 30 秒重试一次，直至重新接入 |
 | Windows | 服务 `AnixOpsMeshDevice`（LocalSystem，自动启动），恢复操作为失败后 5 秒重启，`sc failureflag 1` | 程序向服务管理器报告为正常停止（`WIN32_EXIT_CODE` 0），恢复操作不生效；从控制台运行时退出码仍为 8 |
 
 Windows 服务没有控制台：由服务管理器启动时，`device` 把标准错误改写到状态目录的 `device.log`（追加；每次启动时超过 1 MiB 的旧日志改名为 `device.log.1`，覆盖更早的一份）。日志内容与其他平台的标准错误相同，不含令牌、凭据与网络密钥。

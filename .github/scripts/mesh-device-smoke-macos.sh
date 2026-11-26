@@ -85,6 +85,8 @@ for file in device.json token config.json instance_id; do
   [ "$(sudo stat -f '%Su %Lp' "${state}/${file}")" = "root 600" ] \
     || fail "${file} is $(sudo stat -f '%Su %Lp' "${state}/${file}")"
 done
+[ "$(sudo stat -f '%Su:%Sg %Lp' "${log}")" = "root:admin 640" ] \
+  || fail "the log is $(sudo stat -f '%Su:%Sg %Lp' "${log}")"
 [ "$(sudo stat -f '%Sg %Lp' "${state}/status.sock")" = "admin 660" ] \
   || fail "status.sock is $(sudo stat -f '%Sg %Lp' "${state}/status.sock")"
 id -Gn | tr ' ' '\n' | grep -qx admin || fail "the runner account is not an administrator"
@@ -140,5 +142,6 @@ if sudo launchctl print "system/${label}" >/dev/null 2>&1; then
 fi
 sudo sh "${installer}" --uninstall --purge
 sudo test ! -e "${state}" || fail "--purge kept the state directory"
+[ ! -e "${log}" ] || fail "--purge kept the log"
 echo "::endgroup::"
 echo "macOS device smoke test passed"

@@ -537,12 +537,15 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
 /// list of the state directory, which is open to SYSTEM and the
 /// administrators only (`docs/deploy/mesh-device.md`).
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     match builder.create(dir) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
         _ => Ok(()),
@@ -584,7 +587,27 @@ fn instance_id(path: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::other("no system randomness"))?;
     let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, format!("{id}\n"))?;
+    // Readable by the owner only, whatever the umask (on Windows the file
+    // takes the access list of the state directory).
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        // A file left by an earlier attempt keeps its mode on open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(format!("{id}\n").as_bytes())?;
+        file.sync_all()?;
+    }
     std::fs::rename(&temporary, path)?;
     Ok(id)
 }
@@ -624,6 +647,15 @@ mod tests {
         assert_eq!(first.instance_id().len(), 32);
         let again = ManagedMesh::open(&dir).expect("open again");
         assert_eq!(first.instance_id(), again.instance_id());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("instance_id"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::write(dir.join("instance_id"), "-bad").unwrap();
         assert!(ManagedMesh::open(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
