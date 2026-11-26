@@ -128,6 +128,7 @@
 | `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`，规范 §1），由内核生成，等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
 | `GET /v1/mesh` 顶层 `static_keys` | `[{ "network", "static_key" }]`：本机各网络的安全模式静态公钥，`network` 为该网络配置的 `network.name`，`static_key` 编码同快照的 `self.staticKey`；旧模式网络不列出。Agent 在每个网络实例的状态上报中原样带上 `static_key`，面板只采信 Agent 通道的值来生成 `native_keys`（规范 §8.3.1 第 7 条） | 0.3 |
 | `GET /v1/mesh` 的 `networks[].failure` | `{ "code", "detail" }` 或 `null`，与该网络快照的 `network.failure` 同值（例如 `native_keys_pending`、`peer_not_native`）；Agent 转为告警上报 | 0.3 |
+| `GET /v1/mesh` 的 `networks[].paths` | 与该网络快照的 `paths[]` 同结构同值（`{ "id", "target", "via", "state", "unreachable", "reason" }`，按配置顺序；未配置路径时为空数组）。只有 `features` 列出 `mesh_paths` 的内核给出；Agent 原样转述给面板，内核未列出 `mesh_paths` 时 Agent 下发 `routing.paths = []`，不读取该字段 | 0.5 |
 | `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为该网络配置的 `network.name`，即快照的 `network.id`；每个网络最多一条待处理申请，新申请替换旧的，保留到被删除为止 | 0.4 |
 | `GET /v1/mesh` 顶层 `alerts` | 可选，节点级告警：元素格式与 `networks[].alerts` 相同（`{ "code", "address", "peer", "detail" }`，与网络无关的告警 `address`、`peer` 为空串），缺省或空数组表示没有。用于与具体网络无关、内核没有运行任何网络时也要让 Agent 看到的状态；目前只有 `external_bridge_lock_held`。内核在持锁失败期间把该告警同时放在顶层 `alerts` 与每个网络的 `alerts` 中；Agent 在任一处看到即按持锁处理（规范 §15.12 第 9 条） | 0.4 |
 | `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 由内核在记下申请时生成，为 1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`），不存在时返回 404 | 0.4 |
@@ -153,6 +154,7 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `invalid_kind` | 面板下发的 `network.kind` 不是 `managed` 或 `legacy`：Agent 扣下该网络，不交给内核 |
 | `peer_not_native` | 由内核 `failure.code = peer_not_native` 转来，另带 `peer`（内核给出的 `detail`，被拒对端的节点 ID） |
 | `external_bridge_unsupported` | 网络带 `external_bridge`，但内核 `features` 不含 `mesh_external_bridge`：Agent 照常下发该网络，去掉 `external_bridge` 节，并对该网络上报此告警（面板 #647 审计 M-2，anix-agent #203） |
+| `paths_unsupported` | 网络配置了 `routing.paths`，但内核 `features` 不含 `mesh_paths`：Agent 对该网络下发 `routing.paths = []`，其余配置照常，并对该网络上报此告警（anix-agent #211） |
 
 `mesh.status` 中每个网络的 `externalBridge` 有三种情况（anix-agent #202 审计 M1、#203）：
 
