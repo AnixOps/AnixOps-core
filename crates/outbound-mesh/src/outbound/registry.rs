@@ -71,6 +71,9 @@ pub enum RegistryError {
     NotFound,
     /// The engine stopped.
     Closed,
+    /// `mesh_save_network` of a `managed` network without
+    /// `node.private_key` (`mesh-module.md`): refused, not stored.
+    PrivateKeyRequired,
 }
 
 pub struct Registry {
@@ -104,11 +107,14 @@ impl Registry {
         if inner.closed {
             return;
         }
-        let listed: Vec<String> = profile
-            .iter()
-            .map(|settings| settings.network_name.clone())
-            .collect();
+        let mut listed: Vec<String> = Vec::new();
         for settings in profile {
+            // The same network twice in one profile: the first counts, so
+            // that the second does not replace it at once.
+            if listed.contains(&settings.network_name) {
+                continue;
+            }
+            listed.push(settings.network_name.clone());
             self.put(&mut inner, settings, false);
         }
         let gone: Vec<String> = inner
@@ -118,7 +124,13 @@ impl Registry {
             .map(|(name, _)| name.clone())
             .collect();
         for name in gone {
-            remove(&mut inner, &name);
+            // Its key stays: the network may come back in a later profile
+            // and should keep its identity (spec §8.1).
+            if let Some(network) = inner.networks.remove(&name) {
+                if let Some(instance) = network.instance {
+                    instance.retire();
+                }
+            }
         }
     }
 
@@ -128,6 +140,9 @@ impl Registry {
         let mut inner = self.lock();
         if inner.closed {
             return Err(RegistryError::Closed);
+        }
+        if settings.kind == NetworkKind::Managed && settings.private_key.is_none() {
+            return Err(RegistryError::PrivateKeyRequired);
         }
         self.put(&mut inner, settings, true);
         Ok(())
@@ -251,13 +266,17 @@ impl Registry {
         }
     }
 
-    /// The state of every network, by name.
+    /// The state of every network, by name. The settings leave out the
+    /// private key.
     pub fn networks(&self) -> Vec<NetworkState> {
         self.lock()
             .networks
             .values()
             .map(|network| NetworkState {
-                settings: network.settings.clone(),
+                settings: MeshSettings {
+                    private_key: None,
+                    ..network.settings.clone()
+                },
                 joined: network.joined,
                 instance: network.instance.clone(),
                 failure: network.failure,
@@ -456,12 +475,30 @@ mod tests {
         assert!(registry.instance("office", &office).is_err());
         // Kept by mesh_save_network.
         assert!(registry.instance("home", &home).is_ok());
-        // A network that comes back gets a new key.
+        // A network that comes back keeps its key.
+        registry.commit(vec![office.clone()]);
+        assert_eq!(
+            first.static_public_key(),
+            found(&registry, &office).static_public_key()
+        );
+        // Removed with mesh_remove_network, it gets a new one.
+        registry.remove("office").unwrap();
         registry.commit(vec![office.clone()]);
         assert_ne!(
             first.static_public_key(),
             found(&registry, &office).static_public_key()
         );
+    }
+
+    #[test]
+    fn the_first_of_two_networks_with_one_name_counts() {
+        let (_runtime, registry) = registry();
+        let first = settings("office", "10.155.0.2/24", "legacy");
+        let second = settings("office", "10.155.0.3/24", "legacy");
+        registry.commit(vec![first.clone(), second.clone()]);
+        let running = found(&registry, &first);
+        assert!(!running.is_retired());
+        assert!(registry.instance("office", &second).is_err());
     }
 
     #[test]
@@ -505,6 +542,20 @@ mod tests {
         assert_eq!(state.failure, Some(Failure::PrivateKeyRequired));
         assert_eq!(Failure::PrivateKeyRequired.code(), "private_key_required");
         assert!(registry.instance("office", &office).is_err());
+        // mesh_save_network refuses it outright.
+        let other = settings("other", "10.153.1.2/24", "managed");
+        assert_eq!(registry.save(other), Err(RegistryError::PrivateKeyRequired));
+        assert_eq!(registry.networks().len(), 1);
+    }
+
+    #[test]
+    fn the_reported_settings_leave_out_the_private_key() {
+        let (_runtime, registry) = registry();
+        let mut office = settings("office", "10.156.0.2/24", "legacy");
+        office.private_key = Some(zeroize::Zeroizing::new([7; 32]));
+        registry.commit(vec![office.clone()]);
+        assert!(registry.networks()[0].settings.private_key.is_none());
+        assert!(registry.instance("office", &office).is_ok());
     }
 
     #[test]

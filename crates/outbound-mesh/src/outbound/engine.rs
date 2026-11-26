@@ -53,8 +53,10 @@ impl MeshEngine {
                     let _ = stopped.await;
                 });
                 // The tasks left (retired drivers, a pump) end with the
-                // runtime.
-                drop(runtime);
+                // runtime. A peer name still resolving on the blocking
+                // pool is not waited for: closing the VPN must not hang
+                // on a slow resolver.
+                runtime.shutdown_background();
             })?;
         Ok(Arc::new(Self {
             registry: Registry::new(handle.clone()),
@@ -125,8 +127,18 @@ impl EngineSlot {
     }
 
     /// Holds the engine, starting it if none runs, and cancels a pending
-    /// stop. Every acquire needs one [`Self::release`].
-    pub fn acquire(&self) -> io::Result<Arc<MeshEngine>> {
+    /// stop. Dropping the hold lets go of it; [`EngineHold::close`] lets
+    /// go and stops the engine at once if it was the last hold.
+    pub fn acquire(&'static self) -> io::Result<EngineHold> {
+        let engine = self.take_hold()?;
+        Ok(EngineHold {
+            slot: self,
+            engine,
+            released: false,
+        })
+    }
+
+    fn take_hold(&self) -> io::Result<Arc<MeshEngine>> {
         let mut state = lock(&self.state);
         state.generation += 1;
         let engine = match &state.engine {
@@ -149,7 +161,7 @@ impl EngineSlot {
     /// Lets go of the engine. After the last holder the engine stops once
     /// the grace period passes without a new one, or at once with `now`
     /// (the user closed the VPN).
-    pub fn release(&'static self, now: bool) {
+    fn release(&'static self, now: bool) {
         let mut state = lock(&self.state);
         state.holders = state.holders.saturating_sub(1);
         if state.holders > 0 {
@@ -195,8 +207,42 @@ impl EngineSlot {
     }
 
     #[cfg(test)]
+    fn holders(&self) -> usize {
+        lock(&self.state).holders
+    }
+
+    #[cfg(test)]
     fn generation(&self) -> u64 {
         lock(&self.state).generation
+    }
+}
+
+/// One holder's hold on the engine; see [`EngineSlot::acquire`]. Each
+/// hold is let go exactly once, so one holder cannot release another's.
+pub struct EngineHold {
+    slot: &'static EngineSlot,
+    engine: Arc<MeshEngine>,
+    released: bool,
+}
+
+impl EngineHold {
+    pub fn engine(&self) -> &Arc<MeshEngine> {
+        &self.engine
+    }
+
+    /// Lets go and, if no other hold remains, stops the engine at once
+    /// instead of after the grace period: the user closed the VPN.
+    pub fn close(mut self) {
+        self.released = true;
+        self.slot.release(true);
+    }
+}
+
+impl Drop for EngineHold {
+    fn drop(&mut self) {
+        if !self.released {
+            self.slot.release(false);
+        }
     }
 }
 
@@ -209,44 +255,46 @@ mod tests {
     }
 
     #[test]
-    fn a_new_holder_within_the_grace_period_keeps_the_engine() {
-        let slot = slot(Duration::from_millis(300));
-        let engine = slot.acquire().unwrap();
-        slot.release(false);
+    fn a_new_holder_keeps_the_engine_and_the_last_one_stops_it() {
+        // A long grace period: the timers never fire within the test, which
+        // calls `expire` itself as the timer would.
+        let slot = slot(Duration::from_secs(3600));
+        let first = slot.acquire().unwrap();
+        let engine = first.engine().clone();
+        drop(first);
+        let stale = slot.generation();
+        // A new profile takes the engine over just as the timer fires.
         let again = slot.acquire().unwrap();
-        assert!(Arc::ptr_eq(&engine, &again));
-        std::thread::sleep(Duration::from_millis(900));
+        assert!(Arc::ptr_eq(&engine, again.engine()));
+        slot.expire(stale);
         assert!(!engine.is_stopped());
         assert!(slot.current().is_some());
-        slot.release(false);
-        std::thread::sleep(Duration::from_millis(900));
+        // Let go again: only the newest timer counts.
+        drop(again);
+        slot.expire(stale);
+        assert!(!engine.is_stopped());
+        slot.expire(slot.generation());
         assert!(engine.is_stopped());
         assert!(slot.current().is_none());
         // The next holder starts a new engine.
         let next = slot.acquire().unwrap();
-        assert!(!Arc::ptr_eq(&engine, &next));
-        slot.release(true);
-        assert!(next.is_stopped());
+        assert!(!Arc::ptr_eq(&engine, next.engine()));
+        let next_engine = next.engine().clone();
+        next.close();
+        assert!(next_engine.is_stopped());
     }
 
     #[test]
-    fn a_timer_set_before_a_new_holder_does_not_stop_its_engine() {
-        // A long grace period: the timers never fire, the test calls
-        // `expire` itself.
-        let slot = slot(Duration::from_secs(3600));
-        let engine = slot.acquire().unwrap();
-        slot.release(false);
-        let stale = slot.generation();
-        // A new profile takes the engine over just as the timer fires.
-        let _again = slot.acquire().unwrap();
-        slot.expire(stale);
-        assert!(!engine.is_stopped());
-        assert!(slot.current().is_some());
-        // Released again: only the newest timer counts.
-        slot.release(false);
-        slot.expire(stale);
-        assert!(!engine.is_stopped());
-        slot.expire(slot.generation());
+    fn the_grace_timer_stops_the_engine_on_its_own_thread() {
+        let slot = slot(Duration::from_millis(10));
+        let hold = slot.acquire().unwrap();
+        let engine = hold.engine().clone();
+        drop(hold);
+        // Generous: only the order matters, not the time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !engine.is_stopped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(engine.is_stopped());
         assert!(slot.current().is_none());
     }
@@ -254,13 +302,31 @@ mod tests {
     #[test]
     fn closing_the_vpn_stops_the_engine_at_once() {
         let slot = slot(Duration::from_secs(3600));
-        let engine = slot.acquire().unwrap();
-        let _second = slot.acquire().unwrap();
-        slot.release(true);
+        let first = slot.acquire().unwrap();
+        let second = slot.acquire().unwrap();
+        let engine = first.engine().clone();
+        first.close();
         // Another runtime still holds it.
         assert!(!engine.is_stopped());
-        slot.release(true);
+        assert_eq!(slot.holders(), 1);
+        second.close();
         assert!(engine.is_stopped());
         assert!(slot.current().is_none());
+        assert_eq!(slot.holders(), 0);
+    }
+
+    #[test]
+    fn stopping_does_not_wait_for_a_name_still_resolving() {
+        let slot = slot(Duration::from_secs(3600));
+        let hold = slot.acquire().unwrap();
+        let engine = hold.engine().clone();
+        // A resolver call stuck on the blocking pool.
+        engine
+            .runtime
+            .spawn_blocking(|| std::thread::sleep(Duration::from_secs(60)));
+        let started = std::time::Instant::now();
+        hold.close();
+        assert!(engine.is_stopped());
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }

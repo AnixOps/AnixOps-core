@@ -228,7 +228,8 @@ async fn building_an_outbound_starts_nothing_until_the_engine_commits() {
         .err()
         .unwrap();
     assert_eq!(error.kind(), ErrorKind::NotConnected);
-    let engine = SLOT.acquire().unwrap();
+    let hold = SLOT.acquire().unwrap();
+    let engine = hold.engine().clone();
     engine
         .registry()
         .commit(std::mem::take(&mut *built.lock().unwrap()));
@@ -245,7 +246,7 @@ async fn building_an_outbound_starts_nothing_until_the_engine_commits() {
     let error = draft.connect(&target("10.146.0.1:80")).await.err().unwrap();
     assert_eq!(error.kind(), ErrorKind::NotConnected);
     assert!(!instance.is_retired());
-    SLOT.release(true);
+    hold.close();
     assert!(engine.is_stopped());
     assert!(instance.is_retired());
 }
