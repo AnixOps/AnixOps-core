@@ -146,7 +146,7 @@ LinkCost：
 
 ## B. 边界节点配置 `backbone` 节
 
-`backbone` 是 `PUT /v1/mesh` 请求体中与 `networks` **同级的顶层对象**，每台边界节点一份；普通完整节点与接入端的请求体没有此节。它随请求体整体替换：省略或为 `null` 表示本节点不是边界节点，已运行的骨干全部停止。内核在 `GET /v1/status` 的 `features` 中列出 `mesh_backbone` 时才接受此节；未列出时 Agent 不下发（请求体拒绝未知字段）。详见 [mesh-status.md](../architecture/mesh-status.md)「节点程序管理 API」。
+`backbone` 是 `PUT /v1/mesh` 请求体中与 `networks` **同级的顶层对象**，每台边界节点一份；普通完整节点与接入端的请求体没有此节。它随请求体整体替换：省略或为 `null` 表示本节点不是边界节点，已运行的骨干全部停止。内核在 `GET /v1/status` 的 `features` 中列出 `mesh_backbone` 时才接受此节（`anixcore` 运维开关 `mesh_backbone` 开启才列出，默认关闭；未列出时带此节的请求体整份返回 400，错误以 `backbone_disabled` 开头，运行中的网络不变）；未列出时 Agent 不下发（请求体拒绝未知字段）。详见 [mesh-status.md](../architecture/mesh-status.md)「节点程序管理 API」。
 
 ```json
 {

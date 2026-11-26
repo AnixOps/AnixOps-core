@@ -87,6 +87,7 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
                 node,
                 config.mesh_state_dir.as_deref(),
                 config.mesh_external_bridge,
+                config.mesh_backbone,
             )
         });
         if let Some(bundle) = &config.tls_fingerprints {
@@ -144,6 +145,9 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
         }
         shutdown_signal().await;
         println!("shutting down");
+        // Mesh networks withdraw their advertisements and close a few
+        // seconds later (spec §15.7 rule 6).
+        node.stop_mesh().await;
         Ok(())
     })
 }
@@ -154,12 +158,19 @@ const MESH_STATE_DIR: &str = "/var/lib/anixcore/mesh";
 
 /// Installs the managed mesh networks of `PUT /v1/mesh` (Linux). Without
 /// its state directory the node runs without them: `GET /v1/status` does
-/// not list `mesh` and `/v1/mesh` answers 404.
+/// not list `mesh` and `/v1/mesh` answers 404. The inter-region backbone
+/// stays off unless the config sets `mesh_backbone`.
 #[cfg(target_os = "linux")]
-fn with_mesh(node: Node, dir: Option<&std::path::Path>, external_bridge: bool) -> Node {
+fn with_mesh(
+    node: Node,
+    dir: Option<&std::path::Path>,
+    external_bridge: bool,
+    backbone: bool,
+) -> Node {
     let dir = dir.unwrap_or(std::path::Path::new(MESH_STATE_DIR));
     match mesh_node::managed::ManagedMesh::open_with_options(dir, external_bridge) {
         Ok(mesh) => {
+            let mesh = mesh.with_backbone(backbone);
             println!("mesh: instance {}", mesh.instance_id());
             node.with_mesh(Arc::new(mesh))
         }
@@ -174,7 +185,12 @@ fn with_mesh(node: Node, dir: Option<&std::path::Path>, external_bridge: bool) -
 }
 
 #[cfg(not(target_os = "linux"))]
-fn with_mesh(node: Node, _dir: Option<&std::path::Path>, _external_bridge: bool) -> Node {
+fn with_mesh(
+    node: Node,
+    _dir: Option<&std::path::Path>,
+    _external_bridge: bool,
+    _backbone: bool,
+) -> Node {
     node
 }
 

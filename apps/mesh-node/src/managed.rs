@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,7 @@ use mesh_bridge::{
     ApplyError as BridgeApplyError, Bridge, Forwarding, Host as BridgeHost, HostLock, SystemHost,
 };
 use outbound_mesh::bridge::ExternalBridge;
-use outbound_mesh::config::encode_key;
+use outbound_mesh::config::{encode_key, HostGroup};
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
@@ -60,21 +61,53 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-/// `mesh_backbone`: `PUT /v1/mesh` takes the top-level `backbone` section
-/// and `GET /v1/mesh` gives its status (spec §17.3, appendix B and C).
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_backbone"];
+/// `mesh_host_groups`: the `host_groups` section (spec §15.7).
+pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_host_groups"];
 
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
 /// lock, nftables took the probe and the start-up cleanup ran.
-pub const FEATURES_WITH_BRIDGE: &[&str] = &["mesh", "mesh_native_keys", mesh_bridge::FEATURE];
+pub const FEATURES_WITH_BRIDGE: &[&str] = &[
+    "mesh",
+    "mesh_native_keys",
+    "mesh_host_groups",
+    mesh_bridge::FEATURE,
+];
+
+/// Listed only when the operator turned the backbone on
+/// ([`ManagedMesh::with_backbone`]): `PUT /v1/mesh` then takes the
+/// top-level `backbone` section and `GET /v1/mesh` gives its status (spec
+/// §17.3, appendix B and C). Off, a body with the section is refused.
+pub const BACKBONE_FEATURE: &str = "mesh_backbone";
+
+/// [`FEATURES`] with the backbone on.
+pub const FEATURES_WITH_BACKBONE: &[&str] = &[
+    "mesh",
+    "mesh_native_keys",
+    "mesh_host_groups",
+    BACKBONE_FEATURE,
+];
+
+/// [`FEATURES_WITH_BRIDGE`] with the backbone on.
+pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
+    "mesh",
+    "mesh_native_keys",
+    "mesh_host_groups",
+    mesh_bridge::FEATURE,
+    BACKBONE_FEATURE,
+];
+
+/// The refusal of a `backbone` section while the backbone is off.
+pub const BACKBONE_DISABLED: &str = "backbone_disabled";
 
 /// Interface names: `anixmesh-<n>`, the lowest number free (the adapter's
 /// name on Windows). macOS names a `utun` interface itself; the name it
 /// gave is the one kept.
 const INTERFACE_PREFIX: &str = "anixmesh-";
 
-/// How long a stopped network may take to close before it is cut off.
+/// How long a stopped network may take to close before it is cut off: more
+/// than the wait after withdrawing its advertisements (spec §15.7 rule 6).
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const _: () = assert!(STOP_TIMEOUT.as_secs() > outbound_mesh::node::WITHDRAW_WAIT.as_secs());
 
 /// A running network that has reached none of its configured peers for
 /// this long reports `unreachable_peers`.
@@ -92,6 +125,10 @@ struct Inner {
     /// One per network of the last request, by tag.
     hubs: Mutex<BTreeMap<String, Arc<Hub>>>,
     backbone: Mutex<Option<BorderInstance>>,
+    /// The operator's switch (`mesh_backbone`, off by default): off, no
+    /// backbone section is taken and this node never carries other
+    /// regions' prefixes.
+    backbone_enabled: AtomicBool,
     bridging: Bridging,
     /// Held by the task that replaces the networks, not by the request:
     /// a request that times out does not let the next one start while
@@ -269,6 +306,7 @@ struct Running {
     /// Dropping or sending stops the network.
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    host_groups: watch::Sender<Vec<HostGroup>>,
     snapshot: watch::Receiver<Snapshot>,
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
@@ -314,6 +352,7 @@ impl ManagedMesh {
                 networks: Mutex::new(Vec::new()),
                 hubs: Mutex::new(BTreeMap::new()),
                 backbone: Mutex::new(None),
+                backbone_enabled: AtomicBool::new(false),
                 bridging,
                 applying: tokio::sync::Mutex::new(()),
                 previous: Mutex::new(None),
@@ -325,6 +364,20 @@ impl ManagedMesh {
     /// This device's instance ID.
     pub fn instance_id(&self) -> &str {
         &self.inner.instance_id
+    }
+
+    /// Turns the inter-region backbone on or off (the operator's
+    /// `mesh_backbone`; off when not called). Off, `mesh_backbone` is not
+    /// listed and an `apply` with a backbone is refused as invalid
+    /// ([`BACKBONE_DISABLED`]), so the node never becomes a border node.
+    /// Set before the first `apply`.
+    pub fn with_backbone(self, enabled: bool) -> Self {
+        self.inner.backbone_enabled.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    fn backbone_enabled(&self) -> bool {
+        self.inner.backbone_enabled.load(Ordering::SeqCst)
     }
 }
 
@@ -397,7 +450,9 @@ impl Inner {
             backbone
         };
         let tags: Vec<String> = wanted.iter().map(|network| network.tag.clone()).collect();
-        {
+        // With the backbone off no network gets a hub, so no driver is
+        // handed a border side at all (#401 audit L1).
+        if self.backbone_enabled.load(Ordering::SeqCst) {
             let mut hubs = lock(&self.hubs);
             for tag in &tags {
                 hubs.entry(tag.clone()).or_insert_with(Hub::new);
@@ -444,7 +499,9 @@ impl Inner {
         let mut next: Vec<Option<Instance>> = Vec::with_capacity(wanted.len());
         let mut starts = Vec::new();
         let mut stopping = Vec::new();
-        for (index, network) in wanted.into_iter().enumerate() {
+        for (index, mut network) in wanted.into_iter().enumerate() {
+            // Tells the node which host groups it is a gateway of.
+            network.settings.instance_id = Some(self.instance_id.clone());
             let previous = current
                 .iter()
                 .position(|instance| instance.tag == network.tag)
@@ -468,12 +525,20 @@ impl Inner {
         }
         // Whatever leaves or restarts stops first, so that its ports and
         // interface name are free for the networks that start.
+        // In parallel: each may wait after withdrawing its advertisements
+        // (spec §15.7 rule 6).
         stopping.append(&mut current);
-        for instance in stopping {
+        for instance in &stopping {
             if let Some(hub) = lock(&self.hubs).get(&instance.tag) {
                 hub.publish_region(RegionView::default());
             }
-            stop(instance).await;
+        }
+        let stops: Vec<_> = stopping
+            .into_iter()
+            .map(|instance| tokio::spawn(stop(instance)))
+            .collect();
+        for handle in stops {
+            let _ = handle.await;
         }
         let mut taken: Vec<String> = next
             .iter()
@@ -536,7 +601,7 @@ impl Inner {
         if let Some((code, detail)) = clash(&settings, occupied) {
             return instance(settings, State::Refused(code, detail));
         }
-        let hub = lock(&self.hubs).get(&tag).cloned().unwrap_or_else(Hub::new);
+        let hub = lock(&self.hubs).get(&tag).cloned();
         match launch(&settings, key, taken, &self.routes, &tag, hub).await {
             Ok(mut running) => {
                 if let Some(section) = &settings.external_bridge {
@@ -649,10 +714,11 @@ fn bridge_failure(error: &BridgeApplyError) -> String {
 
 impl MeshControl for ManagedMesh {
     fn features(&self) -> &'static [&'static str] {
-        if self.inner.bridging.available() {
-            FEATURES_WITH_BRIDGE
-        } else {
-            FEATURES
+        match (self.inner.bridging.available(), self.backbone_enabled()) {
+            (true, true) => FEATURES_WITH_BRIDGE_AND_BACKBONE,
+            (true, false) => FEATURES_WITH_BRIDGE,
+            (false, true) => FEATURES_WITH_BACKBONE,
+            (false, false) => FEATURES,
         }
     }
 
@@ -669,6 +735,9 @@ impl MeshControl for ManagedMesh {
         networks: Vec<ManagedNetwork>,
         backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>> {
+        if backbone.is_some() && !self.backbone_enabled() {
+            return Box::pin(async { Err(backbone_disabled()) });
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             tokio::spawn(async move {
@@ -685,6 +754,14 @@ impl MeshControl for ManagedMesh {
             })
         })
     }
+}
+
+/// Nothing of the request is applied: the running networks stay as they
+/// are.
+fn backbone_disabled() -> ApplyError {
+    ApplyError::Invalid(format!(
+        "{BACKBONE_DISABLED}: backbone: this node does not run a backbone (mesh_backbone is off in the node configuration)"
+    ))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -707,12 +784,17 @@ fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
         State::Running(running) => {
             if same {
                 true
-            } else if same_but_native_keys(&instance.settings, settings)
+            } else if same_but_hot(&instance.settings, settings)
                 && instance
                     .public
                     .is_some_and(|public| !settings.waits_for_native_keys(&public))
             {
-                let _ = running.native_keys.send(settings.native_keys.clone());
+                if instance.settings.native_keys != settings.native_keys {
+                    let _ = running.native_keys.send(settings.native_keys.clone());
+                }
+                if instance.settings.host_groups != settings.host_groups {
+                    let _ = running.host_groups.send(settings.host_groups.clone());
+                }
                 true
             } else if same_but_bridge_allow(&instance.settings, settings) {
                 // Only the allow list moved: the bridge takes it without a
@@ -766,9 +848,12 @@ fn running_ok(running: &Running) -> bool {
     !running.task.is_finished()
 }
 
-fn same_but_native_keys(old: &MeshSettings, new: &MeshSettings) -> bool {
+/// Whether `new` differs from `old` only in what a running network takes
+/// without a restart: the native key list and the host groups.
+fn same_but_hot(old: &MeshSettings, new: &MeshSettings) -> bool {
     let mut old = old.clone();
     old.native_keys.clone_from(&new.native_keys);
+    old.host_groups.clone_from(&new.host_groups);
     old == *new
 }
 
@@ -841,7 +926,7 @@ async fn launch(
     taken: &[String],
     routes: &HostRoutes,
     tag: &str,
-    hub: Arc<Hub>,
+    hub: Option<Arc<Hub>>,
 ) -> Result<Running, (FailureCode, String)> {
     let (address, address_v6) = tun::addresses(
         settings.address.address(),
@@ -874,6 +959,7 @@ async fn launch(
     let name = device.name().to_owned();
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
+    let (host_groups, groups) = watch::channel(settings.host_groups.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
     let exit = Arc::new(Mutex::new(None));
     let exit_of_task = Arc::clone(&exit);
@@ -883,7 +969,7 @@ async fn launch(
         let until = async {
             let _ = stopped.await;
         };
-        let border = hub.driver_side();
+        let border = hub.as_ref().map(|hub| hub.driver_side());
         let observed = settings.clone();
         // On a task of its own, so that a panic is seen and reported.
         let serving = tokio::spawn(serve::serve_with(
@@ -892,11 +978,16 @@ async fn launch(
             listeners,
             device,
             until,
-            keys,
-            Some(border),
+            serve::Updates {
+                native_keys: keys,
+                host_groups: groups,
+            },
+            border,
             Some(host),
             move |next, _| {
-                hub.publish_region(RegionView::of(&observed, next));
+                if let Some(hub) = &hub {
+                    hub.publish_region(RegionView::of(&observed, next));
+                }
                 snapshots.send_replace(next.clone());
             },
         ));
@@ -916,6 +1007,7 @@ async fn launch(
         interface: name,
         stop: Some(stop),
         native_keys,
+        host_groups,
         snapshot,
         exit,
         task,
@@ -1617,7 +1709,8 @@ mod tests {
     #[tokio::test]
     async fn a_backbone_without_its_link_kind_reports_why_and_the_network_stays() {
         let dir = temp_dir("backbone");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open").with_backbone(true);
+        assert_eq!(mesh.features(), FEATURES_WITH_BACKBONE);
         let network = || ManagedNetwork {
             tag: "mesh-cn".into(),
             settings: settings(),
@@ -1637,7 +1730,6 @@ mod tests {
         let text = serde_json::to_string(&status).unwrap();
         assert!(!text.contains("SECRET-VALUE"), "{text}");
         assert_eq!(mesh.status(), status);
-        assert!(FEATURES.contains(&"mesh_backbone"));
 
         // Without the section the backbone goes; the network stays.
         let status = mesh.apply(vec![network()], None).await.unwrap();
@@ -1647,15 +1739,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn the_backbone_is_off_unless_the_operator_turns_it_on() {
+        let dir = temp_dir("backbone-off");
+        let mesh = open(&dir).expect("open");
+        assert_eq!(mesh.features(), FEATURES);
+        assert!(!mesh.features().contains(&BACKBONE_FEATURE));
+        let network = || ManagedNetwork {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+        };
+        let before = mesh.apply(vec![network()], None).await.unwrap();
+        assert_eq!(before.backbone, None);
+
+        // Refused as a whole: nothing of the request is applied, the
+        // running network stays, no backbone starts and no hub carries
+        // another region's prefixes.
+        let refused = mesh
+            .apply(Vec::new(), Some(backbone("not-registered")))
+            .await
+            .unwrap_err();
+        match refused {
+            ApplyError::Invalid(message) => {
+                assert!(message.starts_with(BACKBONE_DISABLED), "{message}");
+                assert!(!message.contains("SECRET-VALUE"), "{message}");
+            }
+            ApplyError::Failed(message) => panic!("not invalid: {message}"),
+        }
+        assert_eq!(mesh.status(), before);
+        assert!(lock(&mesh.inner.backbone).is_none());
+        // No hub at all: no driver was handed a border side.
+        assert!(lock(&mesh.inner.hubs).is_empty());
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
-    fn only_a_native_key_change_keeps_a_network_running() {
+    fn every_feature_list_holds_the_base_and_the_backbone_only_when_on() {
+        for list in [
+            FEATURES,
+            FEATURES_WITH_BRIDGE,
+            FEATURES_WITH_BACKBONE,
+            FEATURES_WITH_BRIDGE_AND_BACKBONE,
+        ] {
+            for feature in FEATURES {
+                assert!(list.contains(feature), "{list:?} lacks {feature}");
+            }
+        }
+        assert!(!FEATURES.contains(&BACKBONE_FEATURE));
+        assert!(!FEATURES_WITH_BRIDGE.contains(&BACKBONE_FEATURE));
+        assert!(FEATURES_WITH_BACKBONE.contains(&BACKBONE_FEATURE));
+        assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&BACKBONE_FEATURE));
+        assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&mesh_bridge::FEATURE));
+        assert!(!FEATURES_WITH_BACKBONE.contains(&mesh_bridge::FEATURE));
+    }
+
+    #[test]
+    fn only_native_key_and_host_group_changes_keep_a_network_running() {
         let base = settings();
         let mut listed = base.clone();
         listed.native_keys = Some(vec![[1; 32], [2; 32]]);
-        assert!(same_but_native_keys(&base, &listed));
+        assert!(same_but_hot(&base, &listed));
+        let mut grouped = listed.clone();
+        grouped.host_groups = vec![HostGroup {
+            cidr: outbound_mesh::IpNet::parse("10.127.1.0/24").unwrap(),
+            gateway: "gw-a".into(),
+            backup_gateway: Some("gw-b".into()),
+        }];
+        assert!(same_but_hot(&base, &grouped));
         let mut moved = listed.clone();
         moved.mtu -= 10;
-        assert!(!same_but_native_keys(&base, &moved));
+        assert!(!same_but_hot(&base, &moved));
+        let mut renamed = grouped.clone();
+        renamed.instance_id = Some("other".into());
+        assert!(!same_but_hot(&grouped, &renamed));
         assert_eq!(waiting_detail(&base), "empty");
         assert_eq!(waiting_detail(&listed), "self_missing");
     }
