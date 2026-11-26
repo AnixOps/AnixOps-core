@@ -130,7 +130,8 @@ fn sid_string(sid: PSID) -> Option<String> {
 }
 
 /// The owner of a kernel object (a pipe handle) as a SID string.
-pub fn handle_owner(handle: HANDLE) -> io::Result<String> {
+pub fn handle_owner(object: &impl std::os::windows::io::AsRawHandle) -> io::Result<String> {
+    let handle: HANDLE = object.as_raw_handle();
     let mut owner: PSID = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: `handle` is open; the owner points into the descriptor the

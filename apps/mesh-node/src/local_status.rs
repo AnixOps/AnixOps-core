@@ -214,7 +214,6 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use std::io;
-    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::time::Duration;
 
@@ -355,7 +354,7 @@ mod windows {
             })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-            let owner = win_security::handle_owner(client.as_raw_handle())?;
+            let owner = win_security::handle_owner(&client)?;
             let caller = win_security::current_account()?;
             if !win_security::trusted_pipe_owner(&owner, &caller) {
                 return Err(io::Error::new(
