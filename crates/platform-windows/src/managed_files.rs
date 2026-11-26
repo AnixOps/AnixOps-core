@@ -117,10 +117,34 @@ pub fn read_managed_file(path: &Path) -> io::Result<Vec<u8>> {
     if !is_within_managed_root(path) {
         return fs::read(path);
     }
-    let mut file = native::open_trusted_file(path)?;
+    let mut file = native::open_trusted_file(path, true)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+/// Reads a managed file like [`read_managed_file`], but under the managed
+/// root accepts only SYSTEM or Administrators as its owner: for records a
+/// privileged process acts on, which an unelevated session of the same
+/// account must not be able to plant.
+pub fn read_admin_owned_file(path: &Path) -> io::Result<Vec<u8>> {
+    if !is_within_managed_root(path) {
+        return fs::read(path);
+    }
+    let mut file = native::open_trusted_file(path, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Creates the host-wide named object `name` (in the `Global\` namespace),
+/// open to SYSTEM and Administrators only, and returns the handle that keeps
+/// it alive. `ResourceBusy` when it already exists, that is when another
+/// process holds it; the object goes away with the last handle, so a process
+/// that dies releases it.
+#[cfg(windows)]
+pub(crate) fn create_host_wide_object(name: &str) -> io::Result<std::os::windows::io::OwnedHandle> {
+    native::create_host_wide_object(name)
 }
 
 /// Creates a new file with a random name in the protected `directory` (made
@@ -199,7 +223,8 @@ mod native {
             .open(path)
     }
 
-    pub(super) fn open_trusted_file(path: &Path) -> io::Result<File> {
+    pub(super) fn open_trusted_file(path: &Path, allow_current_user: bool) -> io::Result<File> {
+        let _ = allow_current_user;
         File::open(path)
     }
 
@@ -216,8 +241,8 @@ mod native {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{
-        GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS,
-        HANDLE, INVALID_HANDLE_VALUE, LUID,
+        GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED,
+        ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LUID,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
@@ -239,7 +264,9 @@ mod native {
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::System::Threading::{
+        CreateMutexW, GetCurrentProcess, OpenProcessToken,
+    };
 
     /// Owned by Administrators; SYSTEM and Administrators have full control,
     /// Users may read and list; nothing is inherited from `%ProgramData%`,
@@ -489,7 +516,10 @@ mod native {
         owned_file(handle)
     }
 
-    pub(super) fn open_trusted_file(path: &Path) -> io::Result<File> {
+    /// Opens a managed file for reading when it is not a link or a folder and
+    /// SYSTEM or Administrators own it, or, with `allow_current_user`, the
+    /// account running this process.
+    pub(super) fn open_trusted_file(path: &Path, allow_current_user: bool) -> io::Result<File> {
         let name = wide_path(path);
         let handle = unsafe {
             CreateFileW(
@@ -511,13 +541,45 @@ mod native {
             ));
         }
         let security = object_security(&file)?;
-        if !(security.owner_is_admin_or_system || security.owner_is_current_user) {
+        if !(security.owner_is_admin_or_system
+            || (allow_current_user && security.owner_is_current_user))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "a managed file is owned by another account",
             ));
         }
         Ok(file)
+    }
+
+    /// SYSTEM and Administrators only; nothing for other accounts.
+    const HOST_OBJECT_SDDL: &str = "O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
+
+    pub(super) fn create_host_wide_object(name: &str) -> io::Result<OwnedHandle> {
+        let descriptor = SecurityDescriptor::from_sddl(HOST_OBJECT_SDDL)?;
+        let attributes = descriptor.attributes();
+        let wide = wide_str(name);
+        let handle = unsafe { CreateMutexW(&attributes, 0, wide.as_ptr()) };
+        let error = unsafe { GetLastError() };
+        if handle.is_null() {
+            // Another process created it with an access list that leaves us
+            // out, which also means it is held.
+            if error == ERROR_ACCESS_DENIED {
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "the host-wide object is held by another process",
+                ));
+            }
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        if error == ERROR_ALREADY_EXISTS {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "the host-wide object is held by another process",
+            ));
+        }
+        Ok(handle)
     }
 
     pub(super) fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
@@ -715,7 +777,7 @@ mod native {
                 create_protected_file(&file_path).unwrap_err().kind(),
                 io::ErrorKind::AlreadyExists
             );
-            let mut opened = open_trusted_file(&file_path).expect("own file is trusted");
+            let mut opened = open_trusted_file(&file_path, true).expect("own file is trusted");
             let mut text = String::new();
             opened.read_to_string(&mut text).unwrap();
             assert_eq!(text, "{}");

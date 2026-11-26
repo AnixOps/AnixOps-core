@@ -422,31 +422,46 @@ impl RouteTable {
 
     /// Where a packet this node is about to send goes: one peer
     /// ([`check_outgoing`](Self::check_outgoing)), or every direct
-    /// neighbour for a broadcast or multicast destination. The source must
-    /// be one of this node's virtual addresses either way.
+    /// neighbour for a broadcast or multicast destination. A broadcast or
+    /// multicast must come from one of this node's virtual addresses (spec
+    /// §15.3); a unicast may also come from a subnet this node advertises.
     pub fn classify_outgoing(&self, packet: &[u8]) -> Result<Outgoing, Denied> {
         let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
-        if !self.local.contains(&addresses.source) {
-            return Err(Denied::ForeignSource);
-        }
         if self.is_flood(addresses.destination) {
+            if !self.local.contains(&addresses.source) {
+                return Err(Denied::ForeignSource);
+            }
             return Ok(Outgoing::Neighbours);
         }
-        self.lookup(addresses.destination).map(Outgoing::Peer)
+        self.check_outgoing(packet).map(Outgoing::Peer)
     }
 
-    /// Checks a packet this node is about to send: it must come from one of
-    /// this node's virtual addresses and go to a routed intranet address.
+    /// Checks a unicast packet this node is about to send: it must come from
+    /// one of this node's virtual addresses or a subnet it advertises, and go
+    /// to a routed intranet address.
     pub fn check_outgoing(&self, packet: &[u8]) -> Result<PeerId, Denied> {
         let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
-        if !self.local.contains(&addresses.source) {
+        if !self.is_ours(unmap(addresses.source)) {
             return Err(Denied::ForeignSource);
         }
         self.lookup(addresses.destination)
     }
 
-    /// Checks a packet `peer` delivered: it must be addressed to this node
-    /// (or be a broadcast or multicast, [`is_flood`](Self::is_flood)),
+    /// Whether `address` is this node's: one of its virtual addresses, or
+    /// inside a subnet it advertises (a full node proxying its LAN: the
+    /// interface forwards those packets on, and replies from the LAN leave
+    /// with their own source address).
+    fn is_ours(&self, address: IpAddr) -> bool {
+        self.local.contains(&address)
+            || self
+                .advertised
+                .iter()
+                .any(|subnet| subnet.contains(address))
+    }
+
+    /// Checks a packet `peer` delivered: it must be addressed to this node or
+    /// a subnet it advertises (or be a broadcast or multicast,
+    /// [`is_flood`](Self::is_flood)),
     /// and its source must belong to `peer` by the same rule outgoing
     /// traffic is routed with (a reverse-path check). The source is one of
     /// the peer's virtual addresses, or lies in the longest advertised subnet
@@ -455,7 +470,7 @@ impl RouteTable {
     /// narrower subnet another peer advertises.
     pub fn check_incoming(&self, peer: PeerId, packet: &[u8]) -> Result<(), Denied> {
         let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
-        if !self.local.contains(&addresses.destination) && !self.is_flood(addresses.destination) {
+        if !self.is_ours(unmap(addresses.destination)) && !self.is_flood(addresses.destination) {
             return Err(Denied::NotForUs);
         }
         let routes = self.peers.get(&peer).ok_or(Denied::Spoofed)?;
@@ -735,6 +750,66 @@ mod tests {
             table.check_outgoing(&[0x45]),
             Err(Denied::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn a_node_advertising_a_subnet_carries_its_traffic_both_ways() {
+        let mut config = settings(json!({}));
+        config.advertise_subnets = vec![net("192.168.50.0/24")];
+        let mut table = RouteTable::new(&config);
+        table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.60.0/24")]);
+
+        // From a peer to a host behind this node.
+        assert_eq!(
+            table.check_incoming(A, &ipv4([10, 144, 144, 6], [192, 168, 50, 20], 4)),
+            Ok(())
+        );
+        // From the peer's own LAN to ours.
+        assert_eq!(
+            table.check_incoming(A, &ipv4([192, 168, 60, 9], [192, 168, 50, 20], 4)),
+            Ok(())
+        );
+        // The source check still holds.
+        assert_eq!(
+            table.check_incoming(A, &ipv4([192, 168, 70, 9], [192, 168, 50, 20], 4)),
+            Err(Denied::Spoofed)
+        );
+        // Outside what this node advertises.
+        assert_eq!(
+            table.check_incoming(A, &ipv4([10, 144, 144, 6], [192, 168, 51, 20], 4)),
+            Err(Denied::NotForUs)
+        );
+
+        // Replies from a host behind this node leave with their own source.
+        assert_eq!(
+            table.check_outgoing(&ipv4([192, 168, 50, 20], [10, 144, 144, 6], 4)),
+            Ok(A)
+        );
+        assert_eq!(
+            table.check_outgoing(&ipv4([192, 168, 50, 20], [192, 168, 60, 9], 4)),
+            Ok(A)
+        );
+        assert_eq!(
+            table.check_outgoing(&ipv4([192, 168, 51, 20], [10, 144, 144, 6], 4)),
+            Err(Denied::ForeignSource)
+        );
+
+        assert_eq!(
+            table.classify_outgoing(&ipv4([192, 168, 50, 20], [10, 144, 144, 6], 4)),
+            Ok(Outgoing::Peer(A))
+        );
+        // Broadcasts and multicasts still only from this node's address.
+        assert_eq!(
+            table.classify_outgoing(&ipv4([192, 168, 50, 20], [224, 0, 0, 251], 4)),
+            Err(Denied::ForeignSource)
+        );
+
+        // A node that advertises nothing still only takes its own address.
+        let plain = RouteTable::new(&settings(json!({})));
+        assert_eq!(
+            plain.check_outgoing(&ipv4([192, 168, 50, 20], [10, 144, 144, 6], 4)),
+            Err(Denied::ForeignSource)
+        );
     }
 
     #[test]

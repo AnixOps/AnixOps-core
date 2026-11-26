@@ -1,0 +1,12 @@
+# OpenWrt package architecture -> Rust target of the static program.
+#
+# OpenWrt installs a package only when its architecture is one the device
+# lists (opkg print-architecture, /etc/apk/arch). The program is static, so
+# one build serves every OpenWrt architecture of the same instruction set;
+# .github/scripts/package-openwrt.sh writes one package per line below for
+# which the build exists. 32-bit ARM and MIPS follow with their builds.
+x86_64 x86_64-unknown-linux-musl
+aarch64_generic aarch64-unknown-linux-musl
+aarch64_cortex-a53 aarch64-unknown-linux-musl
+aarch64_cortex-a72 aarch64-unknown-linux-musl
+aarch64_cortex-a76 aarch64-unknown-linux-musl

@@ -1,0 +1,17 @@
+{
+	"luci-app-anixops-mesh": {
+		"description": "Grant access to the intranet mesh device",
+		"read": {
+			"ubus": {
+				"luci.anixops-mesh": [ "status", "lan_networks" ]
+			},
+			"uci": [ "anixops-mesh" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.anixops-mesh": [ "enroll", "request_subnets" ]
+			},
+			"uci": [ "anixops-mesh" ]
+		}
+	}
+}
