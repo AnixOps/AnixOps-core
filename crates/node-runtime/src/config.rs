@@ -99,8 +99,9 @@ pub struct NodeConfig {
     /// Turns on the external network bridges of managed networks (spec
     /// §15.12, `docs/architecture/mesh-bridge.md`). Off by default: the
     /// node then neither lists `mesh_external_bridge` nor touches
-    /// nftables or conntrack, unless its state directory says an earlier
-    /// run installed a bridge, whose tables it then removes once.
+    /// nftables or conntrack, unless `/run/anixops-mesh-bridge-active` says
+    /// a bridge was installed on this host, whose tables it then removes
+    /// once under the host lock.
     #[serde(default)]
     pub mesh_external_bridge: bool,
 }
