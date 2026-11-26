@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn refuses_unknown_fields_and_invalid_configs() {
         let mut item = network("mesh-cn", "a");
-        item["host_groups"] = json!([]);
+        item["not_a_field"] = json!([]);
         assert!(refused(vec![item]).contains("unknown field"));
         let mut item = network("mesh-cn", "a");
         item["dns"] = json!({"enabled": true, "other": 1});
