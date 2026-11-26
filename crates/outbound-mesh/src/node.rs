@@ -1083,13 +1083,28 @@ impl Node {
         self.conns.values().any(|conn| conn.peer == Some(peer))
     }
 
-    /// Whether this node relays type 40 as a waypoint (spec §17.2.4): a
-    /// full node with relaying on, in a network whose packets are
-    /// encrypted (an inner packet must be, spec §17.2.5 rule 3).
-    fn relays_type_40(&self) -> bool {
-        let encrypted =
-            self.settings.security == SecurityMode::ForwardSecrecy || self.legacy.is_some();
-        self.settings.role == Role::Full && self.settings.relay && encrypted
+    /// Whether this node relays for others (spec §17.2.4 `relay`): a full
+    /// node with relaying on.
+    fn relays_for_others(&self) -> bool {
+        self.settings.role == Role::Full && self.settings.relay
+    }
+
+    /// Whether this network's packets are encrypted. Without encryption no
+    /// inner packet can be (spec §17.2.5 rule 3), so there is no
+    /// encapsulation at all (spec §17.2.1 rule 6).
+    fn encrypted(&self) -> bool {
+        self.settings.security == SecurityMode::ForwardSecrecy || self.legacy.is_some()
+    }
+
+    /// This node's `MeshPathRpc.Capabilities` answer (spec §17.2.4):
+    /// version 0 in a network without encryption, `relay` as configured.
+    fn capabilities(&self) -> Capabilities {
+        let mut caps = Capabilities::local(self.relays_for_others());
+        if !self.encrypted() {
+            caps.version = 0;
+            caps.max_waypoints = 0;
+        }
+        caps
     }
 
     fn is_member_address(&self, address: IpAddr) -> bool {
@@ -1245,7 +1260,7 @@ impl Node {
         let from = header.from;
         match decoded {
             Payload::Transit(transit) => {
-                let relays = self.relays_type_40();
+                let relays = self.relays_for_others();
                 let outer = Outer {
                     from,
                     forward_counter: header.forward_counter,
@@ -1561,9 +1576,7 @@ impl Node {
                 Ok(self.centre.get(digest).encode())
             }
             (center::SERVICE, _) => Err(RpcError::InvalidMethod),
-            (waypoint::RPC_SERVICE, waypoint::RPC_CAPABILITIES) => {
-                Ok(Capabilities::local(self.relays_type_40()).encode())
-            }
+            (waypoint::RPC_SERVICE, waypoint::RPC_CAPABILITIES) => Ok(self.capabilities().encode()),
             (waypoint::RPC_SERVICE, _) => Err(RpcError::InvalidMethod),
             _ => Err(RpcError::InvalidService),
         }

@@ -808,9 +808,11 @@ impl PathRuntime {
                 .map(|address| single(facts.owners(*address)))
                 .collect();
         }
-        let kept = self.kept();
-        for id in &kept {
-            self.caps.want(*id, &kept, now);
+        if self.encrypted {
+            let kept = self.kept();
+            for id in &kept {
+                self.caps.want(*id, &kept, now);
+            }
         }
         let Self {
             entries,
@@ -841,8 +843,13 @@ impl PathRuntime {
         }
     }
 
-    /// The capability queries to send now (spec §17.2.4).
+    /// The capability queries to send now (spec §17.2.4). A network
+    /// without encryption asks nobody: every waypoint counts as not
+    /// supported there (spec §17.2.1 rule 6).
     pub fn take_queries(&mut self, facts: &dyn Facts, now: Instant) -> Vec<u32> {
+        if !self.encrypted {
+            return Vec::new();
+        }
         let kept = self.kept();
         self.caps.retain(|id| facts.in_topology(id), now);
         self.caps.take_due(
@@ -1793,11 +1800,14 @@ mod tests {
             .unwrap();
         assert_eq!(out.route, Route::Encapsulate(vec![W]));
         assert_eq!(out.mss, Some(waypoint::max_mss(0, false)));
-        // Without encryption nothing is encapsulable: the first hop is
-        // kept by the connection to the direct neighbour.
+        // Without encryption nothing is asked and nothing encapsulable:
+        // the first hop is kept by the connection to the direct neighbour.
         let mut plain = PathRuntime::new(vec![path(&[W, X])], false, t0);
         plain.evaluate(&world, t0);
-        answer_all(&mut plain, &world, |_| supported(), t0);
+        assert!(plain.take_queries(&world, t0).is_empty());
+        let status = plain.status(&world, t0);
+        assert_eq!(status[0].state, "first_hop_only");
+        assert_eq!(status[0].reason, Some(Reason::Unsupported));
         let out = plain
             .outbound(address(B), true, B, &[address(B)], &world, t0)
             .unwrap();
