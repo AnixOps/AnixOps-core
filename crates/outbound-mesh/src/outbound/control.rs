@@ -352,8 +352,10 @@ fn collect(state: NetworkState) -> Collected {
     }
 }
 
-/// `mesh_status`: the snapshot of `network`, or of the first joined
-/// network, or else of the first saved one.
+/// `mesh_status`: the snapshot of `network`; without it, of the first
+/// running network, else of the first joined one not stopped for its
+/// device ID, else of the first saved one. Which network that is changes
+/// as networks start and stop: a client shows a chosen network by name.
 fn status(registry: &Registry, network: Option<&str>) -> Value {
     let collected: Vec<Collected> = registry.networks().into_iter().map(collect).collect();
     if collected.is_empty() {
@@ -672,6 +674,28 @@ mod tests {
         );
         assert_eq!(old["network"]["state"], "not_joined");
         assert_eq!(old["network"]["failure"]["code"], "instance_id_changed");
+    }
+
+    #[test]
+    fn the_status_defaults_to_a_running_network_before_a_failed_one() {
+        let (_runtime, registry) = registry();
+        let adopt = |value: Value| {
+            serde_json::from_value::<MeshConfig>(value)
+                .unwrap()
+                .validate()
+                .unwrap()
+        };
+        // Joined but not running: a managed network without its key.
+        let failed = adopt(config("a-failed", "10.144.0.2/24", "managed"));
+        let running = adopt(config("b-running", "10.145.0.2/24", "legacy"));
+        registry.commit(vec![failed, running]);
+        let status = run(Some(&registry), json!({"cmd": "mesh_status"}));
+        assert_eq!(status["network"]["id"], "b-running");
+        let named = run(
+            Some(&registry),
+            json!({"cmd": "mesh_status", "network": "a-failed"}),
+        );
+        assert_eq!(named["network"]["failure"]["code"], "private_key_required");
     }
 
     #[test]
