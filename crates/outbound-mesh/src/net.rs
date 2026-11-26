@@ -25,6 +25,20 @@ impl Hash for IpNet {
     }
 }
 
+/// Ordered by masked network, then prefix length (IPv4 before IPv6),
+/// consistent with equality.
+impl Ord for IpNet {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.network(), self.prefix).cmp(&(other.network(), other.prefix))
+    }
+}
+
+impl PartialOrd for IpNet {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl IpNet {
     /// `None` when the prefix is longer than the family allows.
     pub fn new(address: IpAddr, prefix: u8) -> Option<Self> {

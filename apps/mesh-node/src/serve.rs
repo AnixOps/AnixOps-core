@@ -549,6 +549,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             native_keys,
             route_overrides,
             None,
+            None,
             |snapshot, name| {
                 if let Some(forwarding) = forwarding.as_mut() {
                     let mut sources = virtual_subnets.clone();
@@ -649,7 +650,7 @@ fn forwarding_line(state: &str, detail: Option<&str>) {
 }
 
 /// The advertised subnets of `lan`, once each.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn carried(lan: &[(String, IpNet)]) -> Vec<IpNet> {
     let mut subnets: Vec<IpNet> = lan.iter().map(|(_, subnet)| *subnet).collect();
     subnets.sort_by_key(IpNet::to_string);
@@ -658,14 +659,14 @@ fn carried(lan: &[(String, IpNet)]) -> Vec<IpNet> {
 }
 
 /// The machine's interfaces as the host side sees them.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 struct HostInterfaces {
     /// LAN interfaces as (name, address network) pairs.
     lan: Vec<(String, IpNet)>,
     /// Names of other programs' virtual interfaces. Only macOS reads it:
     /// forwarding there is system-wide. Windows forwards per interface and
     /// reports the interfaces that actually forward instead.
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
     others: Vec<String>,
 }
 
@@ -673,7 +674,7 @@ struct HostInterfaces {
 /// interfaces. Neither list holds our own mesh interfaces; virtual
 /// interfaces never count as LAN, so a subnet a VPN also covers is not
 /// forwarded into that VPN.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn host_interfaces(interface: &str) -> io::Result<HostInterfaces> {
     let own = |name: &str| host_routes::is_own_interface(name, &[interface]);
     let mut others: Vec<String> = host_routes::host_links()?
@@ -805,7 +806,7 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
 
     if let Err(error) = mesh_host::recover_mesh_host() {
         let detail = if error.kind() == io::ErrorKind::ResourceBusy {
-            "another administrator process (the client or another node) holds the host changes; what an earlier run left was not cleaned".to_owned()
+            "another process (normally the client or another node) holds the host lock; what an earlier run left was not cleaned".to_owned()
         } else {
             format!("what an earlier run left could not be put back: {error}")
         };
@@ -890,19 +891,78 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
     }
 }
 
-/// Linux: the host side is not in place yet, so the node advertises no
-/// subnets rather than draw traffic it does not carry.
+/// Linux: the node does not change the host's forwarding yet; it relies on
+/// the host's own setting (`net.ipv4.ip_forward`,
+/// `net.ipv6.conf.all.forwarding`), read once at start. An advertised
+/// subnet is carried when a LAN interface is on it and its address family
+/// is forwarded; the others are not advertised (requirement R10).
 #[cfg(target_os = "linux")]
-fn start_host(settings: &MeshSettings, _interface: &str, _listen_ports: &[u16]) -> HostSide {
-    if forwards(settings) {
-        forwarding_line(
-            "off",
-            Some("host forwarding is not implemented on this system yet"),
-        );
-    } else {
+fn start_host(settings: &MeshSettings, interface: &str, _listen_ports: &[u16]) -> HostSide {
+    if !forwards(settings) {
         forwarding_line("not_needed", None);
+        return HostSide::none();
     }
-    HostSide::none()
+    let interfaces = match host_interfaces(interface) {
+        Ok(found) => found,
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            return HostSide::none();
+        }
+    };
+    let advertised = &settings.advertise_subnets;
+    let lan = host_routes::lan_interfaces(&interfaces.lan, advertised, interface);
+    for warning in host_routes::missing_interfaces(&lan, advertised) {
+        warn("forwarding", &warning);
+    }
+    let ipv4 = sysctl_on("/proc/sys/net/ipv4/ip_forward");
+    let ipv6 = sysctl_on("/proc/sys/net/ipv6/conf/all/forwarding");
+    let (carried, off) = linux_carried(carried(&lan), ipv4, ipv6);
+    for family in &off {
+        warn("forwarding", &format!("the host does not forward {family}"));
+    }
+    if carried.is_empty() {
+        let detail = if lan.is_empty() {
+            "no interface of this machine is on the advertised subnets".to_owned()
+        } else {
+            format!("the host does not forward {}", off.join(" or "))
+        };
+        forwarding_line("off", Some(&detail));
+    } else {
+        forwarding_line("on", Some("the host's own forwarding setting"));
+    }
+    HostSide {
+        forwarder: None,
+        carried,
+    }
+}
+
+/// The subnets of `lan_subnets` whose address family the host forwards,
+/// and the families it does not forward that some of them need.
+#[cfg(any(target_os = "linux", test))]
+fn linux_carried(
+    lan_subnets: Vec<IpNet>,
+    ipv4: bool,
+    ipv6: bool,
+) -> (Vec<IpNet>, Vec<&'static str>) {
+    let mut off = Vec::new();
+    if !ipv4 && lan_subnets.iter().any(IpNet::is_ipv4) {
+        off.push("IPv4 (net.ipv4.ip_forward is 0)");
+    }
+    if !ipv6 && lan_subnets.iter().any(|subnet| !subnet.is_ipv4()) {
+        off.push("IPv6 (net.ipv6.conf.all.forwarding is 0)");
+    }
+    let carried = lan_subnets
+        .into_iter()
+        .filter(|subnet| if subnet.is_ipv4() { ipv4 } else { ipv6 })
+        .collect();
+    (carried, off)
+}
+
+/// Whether a forwarding switch under `/proc/sys` reads 1; a missing one
+/// (no IPv6) counts as off.
+#[cfg(target_os = "linux")]
+fn sysctl_on(path: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| text.trim() == "1")
 }
 
 /// Puts back what a node that died left on the host (`anixops-mesh
@@ -992,7 +1052,8 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `native_keys` carries a new native key list into the running driver.
+/// `native_keys` carries a new native key list into the running driver;
+/// `border` connects a border node's network to its backbone.
 /// With `host`, the network installs only routes no other network of the
 /// process holds, under the given owner name.
 #[allow(clippy::too_many_arguments)]
@@ -1004,6 +1065,7 @@ pub(crate) async fn serve_with(
     until: impl std::future::Future<Output = ()>,
     native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
     route_overrides: watch::Receiver<Vec<IpNet>>,
+    border: Option<driver::Border>,
     host: Option<(HostRoutes, String)>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
@@ -1088,6 +1150,7 @@ pub(crate) async fn serve_with(
             route_overrides,
             foreign_routes,
             shutdown,
+            border,
         },
     ));
     let _abort = AbortOnDrop(node.abort_handle());
@@ -1175,6 +1238,25 @@ pub(crate) async fn serve_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_carries_only_the_families_the_host_forwards() {
+        let net = |text: &str| IpNet::parse(text).unwrap();
+        let lan = vec![net("192.168.10.0/24"), net("fd00:10::/64")];
+        let (carried, off) = linux_carried(lan.clone(), true, true);
+        assert_eq!(carried, lan);
+        assert!(off.is_empty());
+        let (carried, off) = linux_carried(lan.clone(), true, false);
+        assert_eq!(carried, [net("192.168.10.0/24")]);
+        assert_eq!(off.len(), 1);
+        assert!(off[0].starts_with("IPv6"));
+        let (carried, off) = linux_carried(lan, false, false);
+        assert!(carried.is_empty());
+        assert_eq!(off.len(), 2);
+        // A family nothing needs is not reported.
+        let (_, off) = linux_carried(vec![net("192.168.10.0/24")], true, false);
+        assert!(off.is_empty());
+    }
 
     fn config(address: &str) -> String {
         serde_json::json!({
