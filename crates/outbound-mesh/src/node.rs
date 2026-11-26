@@ -91,6 +91,10 @@ struct Relay {
     queue: VecDeque<(u8, Vec<u8>)>,
 }
 
+/// A refusal for a key off the native key list is reported for this long
+/// unless another follows (docs/architecture/mesh-status.md).
+pub const NOT_NATIVE_HOLD: Duration = Duration::from_secs(10 * 60);
+
 /// Most subnets installed as system routes for one network: as many as
 /// [`routes::MAX_SUBNETS_PER_PEER`] for sixteen advertising members; any
 /// further subnets are not installed.
@@ -275,8 +279,8 @@ pub struct Node {
     duplicate_id: bool,
     sync_oversize: Option<SyncOversize>,
     /// The last peer refused for a static key off the native key list
-    /// (spec §8.3.1 rule 5).
-    not_native: Option<u32>,
+    /// (spec §8.3.1 rule 5), and when.
+    not_native: Option<(u32, Instant)>,
     /// When this node last took a new identity after a conflict.
     renewed_at: Option<Instant>,
     /// Relay sessions being set up, by destination (secure mode only).
@@ -652,6 +656,27 @@ impl Node {
             self.sessions.invalidate(&key);
             self.relays.remove(&key.peer_id);
         }
+        // Answers not yet confirmed by a packet, and handshakes this node
+        // started under the old list, go too.
+        let settings = &self.settings;
+        self.sessions
+            .drop_pending_refused(|key| settings.admits(key));
+        let stale: Vec<u32> = self
+            .relays
+            .iter()
+            .filter(|(_, relay)| {
+                relay
+                    .initiator
+                    .as_ref()
+                    .is_some_and(|initiator| !settings.admits(&initiator.peer_static()))
+            })
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in stale {
+            self.drop_relay(peer);
+        }
+        // A new list is a new start for refusals (spec §8.3.1 rule 5).
+        self.not_native = None;
         self.refresh_routes();
     }
 
@@ -862,8 +887,21 @@ impl Node {
 
     /// The last peer refused because its static key is off the native key
     /// list (spec §8.3.1 rule 5), for the status reason `peer_not_native`.
+    /// It clears when that peer completes a handshake, when the list
+    /// changes, or [`NOT_NATIVE_HOLD`] after the last refusal.
     pub fn last_not_native(&self) -> Option<u32> {
-        self.not_native
+        self.not_native.map(|(peer, _)| peer)
+    }
+
+    fn refused_not_native(&mut self, peer: u32, now: Instant) {
+        self.not_native = Some((peer, now));
+    }
+
+    /// `peer` completed a handshake: a refusal of it is over.
+    fn admitted_peer(&mut self, peer: u32) {
+        if self.not_native.is_some_and(|(refused, _)| refused == peer) {
+            self.not_native = None;
+        }
     }
 
     /// This node's static public key in the network.
@@ -1100,7 +1138,7 @@ impl Node {
                 }
                 self.close(conn, reason, now);
                 if let CloseReason::NotNative(peer) = reason {
-                    self.not_native = Some(peer);
+                    self.refused_not_native(peer, now);
                 }
                 // Only after the server proved the network secret (§5.3).
                 if reason == CloseReason::IdConflict {
@@ -1120,6 +1158,7 @@ impl Node {
             next_at: Some(now + PING_START),
             ..Ping::default()
         };
+        self.admitted_peer(up.peer_id);
         if self.sync.neighbour_up(up.peer_id, rng, now).is_err() {
             self.close(conn, CloseReason::Unexpected, now);
             return;
@@ -1153,16 +1192,17 @@ impl Node {
             self.forward(packet);
             return;
         }
-        // The session follows the header's sender (spec §8.7): a direct
-        // neighbour's packet may arrive over another connection, as the
-        // inner packet of a custom path does (spec §17.2.5).
-        let session_peer = if header.from != neighbour && self.is_neighbour(header.from) {
-            header.from
-        } else {
-            neighbour
-        };
+        // The session follows the arrival path (spec §8.7): the relay
+        // session for a packet relayed to us, the direct one for a packet
+        // from the neighbour itself. A direct neighbour's packet may still
+        // arrive relayed under the direct session, as the inner packet of a
+        // custom path does (spec §17.2.5), or while the direct connection
+        // comes up or goes: then the other session is tried too, without
+        // counting a failure unless both fail (review of #376, M2).
+        let direct =
+            (header.from != neighbour && self.is_neighbour(header.from)).then_some(header.from);
         let mut crypto = self.crypto();
-        let inbound = match link::open(&mut crypto, session_peer, packet, now) {
+        let inbound = match link::open_either(&mut crypto, neighbour, direct, packet, now) {
             Ok(inbound) => inbound,
             Err(Dropped::Unencrypted) => {
                 self.counters.unencrypted += 1;
@@ -1966,6 +2006,12 @@ impl Node {
         self.centre_round(now);
         self.reassembler.expire(now);
         self.sessions.reclaim(now);
+        if self
+            .not_native
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) >= NOT_NATIVE_HOLD)
+        {
+            self.not_native = None;
+        }
         self.wake(rng, now);
     }
 
@@ -2024,7 +2070,7 @@ impl Node {
         let Some(peer_static) = self.expected_key(peer) else {
             if self.peer_static(peer).is_some() {
                 // Announced, but off the native key list (spec §8.3.1).
-                self.not_native = Some(peer);
+                self.refused_not_native(peer, now);
             }
             self.drop_relay(peer);
             return;
@@ -2106,12 +2152,13 @@ impl Node {
         );
         let (msg2, joined) = match answer {
             Ok(RelayAnswer::Reply(msg2, established)) => {
+                self.admitted_peer(from);
                 (msg2, established.action != SessionAction::Create)
             }
             Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
             Err(error) => {
                 if error == HandshakeError::NotNative {
-                    self.not_native = Some(from);
+                    self.refused_not_native(from, now);
                 }
                 self.counters.dropped += 1;
                 return;
@@ -2145,7 +2192,17 @@ impl Node {
             return;
         };
         match initiator.finish(&self.local, msg2, &mut self.sessions, now) {
-            Ok(_) => self.flush_relay(from, now),
+            Ok(_) => {
+                self.admitted_peer(from);
+                self.flush_relay(from, now);
+            }
+            // Dropped from the native key list since msg1 (spec §8.3.1
+            // rule 6): nothing waits for this session any more.
+            Err(HandshakeError::NotNative) => {
+                self.refused_not_native(from, now);
+                self.counters.dropped += 1;
+                self.drop_relay(from);
+            }
             // The retry is a new handshake.
             Err(_) => self.counters.dropped += 1,
         }
@@ -2925,6 +2982,69 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_is_reported_until_a_handshake_a_new_list_or_ten_minutes() {
+        let refused = || {
+            let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+            let full = net.nodes[0].settings.native_keys.clone();
+            unlist(&mut net, 0, 1);
+            net.link(0, 1);
+            net.settle();
+            assert_eq!(net.nodes[0].last_not_native(), Some(101));
+            (net, full)
+        };
+
+        // Still reported just before ten minutes, gone at ten.
+        let (mut net, _) = refused();
+        net.tick(NOT_NATIVE_HOLD - Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), Some(101));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // A new list clears it.
+        let (mut net, full) = refused();
+        let now = net.now;
+        net.nodes[0].set_native_keys(full, now);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // So does a handshake with the refused peer.
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.nodes[0].not_native = Some((101, net.now));
+        net.link(0, 1);
+        net.settle();
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+    }
+
+    #[test]
+    fn a_relay_handshake_started_before_the_list_changed_is_dropped() {
+        let mut net = three_in_a_row(true);
+        let key = SessionKey {
+            namespace: Namespace::Relay,
+            network: net.nodes[0].local.network_name.clone(),
+            peer_id: 102,
+        };
+        // The latency centre's calls may already have set up a relay
+        // session with node 2; start from none, so that the packet waits
+        // for a new handshake.
+        net.nodes[0].sessions.invalidate(&key);
+        net.nodes[0].relays.remove(&102);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        net.nodes[0].send_ip(&packet, net.now).unwrap();
+        // msg1 goes out; the answer is not delivered yet.
+        net.nodes[0].wake(&SystemRandom::new(), net.now);
+        assert!(net.nodes[0]
+            .relays
+            .get(&102)
+            .is_some_and(|relay| relay.initiator.is_some()));
+        // Node 2 is dropped while its msg2 is on the way.
+        unlist(&mut net, 0, 2);
+        assert!(!net.nodes[0].relays.contains_key(&102));
+        net.settle();
+        assert!(net.nodes[0].sessions.get(&key).is_none());
+        assert!(net.delivered.is_empty());
+    }
+
+    #[test]
     fn a_node_off_the_list_is_not_routed_to_or_relayed_to() {
         let mut net = three_in_a_row(true);
         assert!(net.nodes[0].paths().contains_key(&102));
@@ -3051,6 +3171,55 @@ mod tests {
         assert_eq!(net.nodes[2].next_wake(), None);
         // The relay only carried packets.
         assert!(net.delivered.iter().all(|(i, _)| *i != 1));
+    }
+
+    /// Packets relayed through node 1 keep using the relay session after
+    /// node 0 and node 2 connect directly (review of #376, M2): none fails
+    /// under the direct session, so neither session is discarded.
+    #[test]
+    fn relayed_packets_survive_a_direct_connection_coming_up() {
+        let mut net = three_in_a_row(true);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet.clone())]);
+        // Node 0 and node 2 connect directly; node 0 still has packets in
+        // flight through node 1, sealed under the relay session.
+        net.link(0, 2);
+        net.settle();
+        assert!(net.nodes[2].neighbours().contains(&100));
+        let (_, to_2) = net
+            .wires
+            .iter()
+            .find(|((i, _), (j, _))| *i == 1 && *j == 2)
+            .map(|(_, to)| *to)
+            .unwrap();
+        let rng = SystemRandom::new();
+        net.delivered.clear();
+        let dropped = net.nodes[2].counters().dropped;
+        for _ in 0..12 {
+            let sealed = {
+                let mut crypto = net.nodes[0].crypto();
+                link::seal(
+                    &mut crypto,
+                    100,
+                    102,
+                    101,
+                    packet_type::DATA,
+                    &packet,
+                    net.now,
+                )
+                .unwrap()
+            };
+            net.nodes[2].receive(to_2, &sealed, &rng, net.now);
+            net.settle();
+        }
+        assert_eq!(net.nodes[2].counters().dropped, dropped);
+        assert_eq!(net.delivered.len(), 12);
+        // The direct session is intact too.
+        net.delivered.clear();
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[2].counters().dropped, dropped);
     }
 
     #[test]

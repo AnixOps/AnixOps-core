@@ -162,7 +162,8 @@ pub fn check_paths_against_host_groups(
 pub struct NetworkConfig {
     /// Used byte for byte in the network digest (spec §6.3).
     pub name: String,
-    pub secret: String,
+    #[serde(deserialize_with = "secret_text")]
+    pub secret: Zeroizing<String>,
     /// `managed`, the default: one of our region networks, which always use
     /// the secure mode (spec §5.2, §15.11, requirement R30). `legacy`: an
     /// existing network joined during migration, typically the old-network
@@ -231,8 +232,21 @@ pub struct NodeConfig {
     /// This node's secure-mode static private key for the network, standard
     /// Base64 of 32 bytes, injected from the system key store like the
     /// secret and never written out. Absent: the caller keeps one.
-    #[serde(default)]
-    pub private_key: Option<String>,
+    #[serde(default, deserialize_with = "optional_secret_text")]
+    pub private_key: Option<Zeroizing<String>>,
+}
+
+/// Secret text, wiped from memory when dropped.
+fn secret_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Zeroizing<String>, D::Error> {
+    String::deserialize(deserializer).map(Zeroizing::new)
+}
+
+fn optional_secret_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|text| text.map(Zeroizing::new))
 }
 
 /// What a node does for others (spec §1.3, requirement R10).
@@ -443,7 +457,7 @@ impl MeshSettings {
 #[derive(Clone, PartialEq, Eq)]
 pub struct MeshSettings {
     pub network_name: String,
-    pub network_secret: String,
+    pub network_secret: Zeroizing<String>,
     pub kind: NetworkKind,
     pub security: SecurityMode,
     pub cipher: Cipher,
@@ -722,10 +736,11 @@ impl MeshConfig {
                     return Err("mesh network native_keys lists too many keys");
                 }
                 let mut keys = Vec::with_capacity(texts.len());
+                let mut seen = HashSet::with_capacity(texts.len());
                 for text in texts {
                     let key = decode_key(text)
                         .ok_or("mesh network native_keys entry is not Base64 of 32 bytes")?;
-                    if !keys.contains(&*key) {
+                    if seen.insert(*key) {
                         keys.push(*key);
                     }
                 }
@@ -1401,6 +1416,13 @@ mod tests {
         // Without padding is not the standard form.
         let unpadded = key.trim_end_matches('=').to_owned();
         assert!(validate(with("network.native_keys", json!([unpadded]))).is_err());
+        // Non-zero bits after the last byte are not the canonical form:
+        // one key has exactly one text.
+        let zero = encode_key(&[0; 32]);
+        assert!(zero.ends_with("A="));
+        assert!(validate(with("network.native_keys", json!([zero.clone()]))).is_ok());
+        let noncanonical = format!("{}B=", &zero[..42]);
+        assert!(validate(with("network.native_keys", json!([noncanonical]))).is_err());
     }
 
     #[test]

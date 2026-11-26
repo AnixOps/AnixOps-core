@@ -1,7 +1,7 @@
 //! Finding existing installations (requirement R12). On Linux: systemd
-//! services, OpenRC and other init scripts, autostart lines in `rc.local`
-//! and crontabs, and processes started by hand; containers are found and
-//! reported but never touched. On macOS: launchd jobs (see
+//! services, OpenRC, OpenWrt procd and other init scripts, autostart lines
+//! in `rc.local` and crontabs, and processes started by hand; containers are
+//! found and reported but never touched. On macOS: launchd jobs (see
 //! [`crate::launchd`]) and processes started by hand. On Windows: services
 //! (see [`crate::winsvc`]), scheduled tasks and logon entries (see
 //! [`crate::winstart`]) and processes started by hand.
@@ -45,6 +45,18 @@ pub enum Origin {
     },
     /// A System V style init script.
     Sysv { name: String, script: String },
+    /// An OpenWrt procd init script, possibly installed by a package.
+    Procd {
+        name: String,
+        script: String,
+        /// Linked in `/etc/rc.d`, so it starts on boot.
+        enabled: bool,
+        /// procd has a running instance of the service.
+        running: bool,
+        /// The package that owns the script, when opkg or apk lists it.
+        #[serde(default)]
+        package: Option<String>,
+    },
     /// A line in `rc.local` or a crontab.
     Autostart { file: String, line: usize },
     /// A process with no service or script behind it.
@@ -103,6 +115,7 @@ impl Origin {
             Origin::Systemd { unit, .. } => format!("systemd:{unit}"),
             Origin::Openrc { name, .. } => format!("openrc:{name}"),
             Origin::Sysv { name, .. } => format!("sysv:{name}"),
+            Origin::Procd { name, .. } => format!("procd:{name}"),
             Origin::Autostart { file, line } => format!("autostart:{file}:{line}"),
             Origin::Process { pid } => format!("process:{pid}"),
             Origin::Container { id, .. } => format!("container:{id}"),
@@ -764,6 +777,17 @@ fn init_scripts(
             continue;
         }
         let script = entry.display().to_string();
+        let procd = text
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains("/etc/rc.common"))
+            && text
+                .lines()
+                .any(|line| line.trim().starts_with("USE_PROCD=1"));
+        if procd {
+            out.push(procd_script(host, profile, processes, name, script));
+            continue;
+        }
         let openrc = text
             .lines()
             .next()
@@ -843,6 +867,156 @@ fn init_scripts(
         });
     }
     out
+}
+
+/// An OpenWrt procd init script: whether it starts on boot, what procd runs
+/// for it, and which package installed it.
+fn procd_script(
+    host: &dyn Host,
+    profile: &Profile,
+    processes: &[Process],
+    name: String,
+    script: String,
+) -> Found {
+    let mut notes = Vec::new();
+    let enabled = host
+        .list_dir(Path::new("/etc/rc.d"))
+        .map(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|file| file.to_str())
+                    .and_then(|file| file.strip_prefix('S'))
+                    .and_then(|rest| rest.strip_suffix(name.as_str()))
+                    .is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+        })
+        .unwrap_or(false);
+    let query = serde_json::json!({ "name": name }).to_string();
+    let state = host
+        .run("ubus", &["call", "service", "list", &query])
+        .ok()
+        .and_then(|output| serde_json::from_str::<serde_json::Value>(&output.stdout).ok());
+    let mut running = false;
+    let mut pids: BTreeSet<u32> = BTreeSet::new();
+    let mut first_running: Option<&serde_json::Value> = None;
+    match &state {
+        Some(state) => {
+            let instances = state
+                .get(&name)
+                .and_then(|service| service.get("instances"))
+                .and_then(|instances| instances.as_object());
+            for instance in instances.into_iter().flat_map(|map| map.values()) {
+                if instance.get("running").and_then(|value| value.as_bool()) == Some(true) {
+                    running = true;
+                    if first_running.is_none() {
+                        first_running = Some(instance);
+                    }
+                }
+                if let Some(pid) = instance
+                    .get("pid")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|pid| u32::try_from(pid).ok())
+                {
+                    pids.insert(pid);
+                }
+            }
+        }
+        None => notes.push("procd state cannot be read".into()),
+    }
+    let command: Option<Vec<String>> = first_running
+        .and_then(|instance| instance.get("command"))
+        .and_then(|command| command.as_array())
+        .and_then(|command| {
+            command
+                .iter()
+                .map(|word| word.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+        })
+        .filter(|command: &Vec<String>| {
+            command
+                .first()
+                .is_some_and(|program| is_program(profile, program))
+        });
+    let own: Vec<Process> = processes
+        .iter()
+        .filter(|process| !process.contained && pids.contains(&process.pid))
+        .cloned()
+        .collect();
+    let mut invocation = None;
+    let mut program = None;
+    if let Some(command) = &command {
+        let env = first_running
+            .and_then(|instance| instance.get("env"))
+            .and_then(|env| env.as_object())
+            .map(|env| {
+                env.iter()
+                    .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        invocation = Some(Invocation {
+            args: command[1..].to_vec(),
+            env: wanted_env(profile, env),
+            cwd: None,
+        });
+        program = Some(command[0].clone());
+    }
+    if invocation.is_none() {
+        invocation = own.first().map(|process| Invocation {
+            args: process.argv.iter().skip(1).cloned().collect(),
+            env: process.env.clone(),
+            cwd: process.cwd.clone(),
+        });
+        program = own.first().map(|process| process.exe.clone());
+    }
+    let package = owning_package(host, &script);
+    if let Some(package) = &package {
+        notes.push(format!(
+            "installed by the package {package}; upgrading that package starts the service again"
+        ));
+    }
+    Found {
+        origin: Origin::Procd {
+            name,
+            script,
+            enabled,
+            running,
+            package,
+        },
+        program,
+        invocation,
+        processes: own,
+        notes,
+    }
+}
+
+/// The package whose file list (opkg, or apk on OpenWrt 25.x) names the
+/// script.
+fn owning_package(host: &dyn Host, script: &str) -> Option<String> {
+    for dir in ["/usr/lib/opkg/info", "/lib/apk/packages"] {
+        let Ok(entries) = host.list_dir(Path::new(dir)) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(stem) = entry
+                .file_name()
+                .and_then(|file| file.to_str())
+                .and_then(|file| file.strip_suffix(".list"))
+            else {
+                continue;
+            };
+            if host
+                .read_to_string(&entry)
+                .is_ok_and(|text| text.lines().any(|line| line == script))
+            {
+                return Some(stem.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The command part of a crontab line: skips the schedule and, for system
@@ -1333,6 +1507,107 @@ mod tests {
         assert!(matches!(found[1].origin, Origin::Sysv { .. }));
         assert!(found[1].invocation.is_none());
         assert!(!found[1].notes.is_empty());
+    }
+
+    fn procd_host(listed: bool) -> FakeHost {
+        let host = FakeHost::default();
+        host.file(
+            "/etc/init.d/demo",
+            "#!/bin/sh /etc/rc.common\nUSE_PROCD=1\nSTART=99\nPROG=/usr/bin/demo-meshd\nstart_service() {\n\tprocd_open_instance\n\tprocd_set_param command \"$PROG\" -c /etc/demo.conf\n}\n",
+        );
+        if listed {
+            host.link("/etc/rc.d/S99demo", "../init.d/demo");
+        }
+        host
+    }
+
+    #[test]
+    fn procd_service_enabled_and_running() {
+        let host = procd_host(true);
+        host.file(
+            "/usr/lib/opkg/info/demo.list",
+            "/usr/bin/demo-meshd\n/etc/init.d/demo\n",
+        );
+        host.process(
+            321,
+            "/usr/bin/demo-meshd",
+            &["/usr/bin/demo-meshd", "-c", "/etc/demo.conf"],
+            &[],
+            "0::/\n",
+        );
+        host.answer(
+            "ubus call service list {\"name\":\"demo\"}",
+            0,
+            r#"{"demo":{"instances":{"instance1":{"running":true,"pid":321,"command":["/usr/bin/demo-meshd","-c","/etc/demo.conf"],"term_timeout":5}}}}"#,
+        );
+        let found = detect(&host, &demo());
+        let entry = found
+            .iter()
+            .find(|entry| entry.origin.id() == "procd:demo")
+            .unwrap();
+        assert_eq!(
+            entry.origin,
+            Origin::Procd {
+                name: "demo".into(),
+                script: "/etc/init.d/demo".into(),
+                enabled: true,
+                running: true,
+                package: Some("demo".into()),
+            }
+        );
+        assert_eq!(entry.processes.len(), 1);
+        assert_eq!(entry.processes[0].pid, 321);
+        assert_eq!(entry.program.as_deref(), Some("/usr/bin/demo-meshd"));
+        assert_eq!(
+            entry.invocation.as_ref().unwrap().args,
+            vec!["-c", "/etc/demo.conf"]
+        );
+        assert!(entry.notes.iter().any(|note| note.contains(
+            "installed by the package demo; upgrading that package starts the service again"
+        )));
+    }
+
+    #[test]
+    fn procd_service_not_enabled_and_stopped() {
+        let host = procd_host(false);
+        host.file("/lib/apk/packages/demo.list", "/etc/init.d/demo\n");
+        host.answer("ubus call service list {\"name\":\"demo\"}", 0, "{}");
+        let found = detect(&host, &demo());
+        let entry = found
+            .iter()
+            .find(|entry| entry.origin.id() == "procd:demo")
+            .unwrap();
+        assert_eq!(
+            entry.origin,
+            Origin::Procd {
+                name: "demo".into(),
+                script: "/etc/init.d/demo".into(),
+                enabled: false,
+                running: false,
+                package: Some("demo".into()),
+            }
+        );
+        assert!(entry.processes.is_empty());
+
+        // No package list, and procd cannot be asked.
+        let host = procd_host(false);
+        let found = detect(&host, &demo());
+        let entry = found
+            .iter()
+            .find(|entry| entry.origin.id() == "procd:demo")
+            .unwrap();
+        assert!(matches!(
+            entry.origin,
+            Origin::Procd {
+                running: false,
+                package: None,
+                ..
+            }
+        ));
+        assert!(entry
+            .notes
+            .iter()
+            .any(|note| note == "procd state cannot be read"));
     }
 
     #[test]
