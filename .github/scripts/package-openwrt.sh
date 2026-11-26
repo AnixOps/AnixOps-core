@@ -18,8 +18,10 @@
 #
 #   package-openwrt.sh VERSION BIN_DIR OUT_DIR
 #
-# VERSION is the program version (x.y.z); the packages are VERSION-r1.
-# BIN_DIR holds anixops-mesh-<any>-<rust target> from build-mesh-node.sh.
+# VERSION is the program version (x.y.z, optionally v-prefixed, optionally
+# -alpha.N, -beta.N or -rc.N); the packages are release 1 of it. BIN_DIR
+# holds anixops-mesh-<version>-<rust target> from build-mesh-node.sh, with
+# or without its .sha256 and .buildinfo.json files.
 
 set -euo pipefail
 
@@ -31,11 +33,23 @@ version="$1"
 bin_dir="$2"
 out_dir="$3"
 
-if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "::error::package version must be x.y.z, got '${version}'"
+# The release tag form (v0.5.0, v0.5.0-rc.1) or the bare version. A
+# pre-release must sort before its release in both package managers: opkg
+# sorts "~" first (0.5.0~rc.1), apk has its own suffixes (0.5.0_rc1).
+version="${version#v}"
+if [[ "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  ipk_version="${version}-r1"
+  apk_version="${version}-r1"
+elif [[ "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(alpha|beta|rc)\.([0-9]+)$ ]]; then
+  ipk_version="${BASH_REMATCH[1]}~${BASH_REMATCH[2]}.${BASH_REMATCH[3]}-r1"
+  apk_version="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}${BASH_REMATCH[3]}-r1"
+else
+  echo "::error::package version must be x.y.z or x.y.z-(alpha|beta|rc).N, got '${version}'"
   exit 1
 fi
-pkg_version="${version}-r1"
+# File names carry the release version as tagged: "~" does not survive as a
+# release asset name, and the package managers read the version inside.
+file_version="${version}-r1"
 
 repo="$(git rev-parse --show-toplevel)"
 src="${repo}/apps/mesh-node/openwrt"
@@ -64,13 +78,26 @@ ipk_postinst() {
 default_postinst $0 $@
 EOF
 }
-ipk_prerm() {
+ipk_prerm() { # REMOVAL
   cat <<'EOF'
 #!/bin/sh
 [ -s ${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
 . ${IPKG_INSTROOT}/lib/functions.sh
 default_prerm $0 $@
 EOF
+  if [ "$1" = 1 ]; then
+    echo 'ret=$?'
+    # opkg also runs the old package's prerm on upgrade ("upgrade VERSION"):
+    # the device identity must stay then.
+    cat <<'EOF'
+if [ "$1" = remove ]; then
+EOF
+    removal_cleanup
+    echo 'fi'
+    cat <<'EOF'
+exit ${ret}
+EOF
+  fi
 }
 apk_postinst() { # NAME UPGRADE
   cat <<EOF
@@ -89,7 +116,7 @@ add_group_and_user
 default_postinst
 EOF
 }
-apk_prerm() { # NAME
+apk_prerm() { # NAME REMOVAL
   cat <<EOF
 #!/bin/sh
 [ -s \${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
@@ -97,6 +124,29 @@ apk_prerm() { # NAME
 export root="\${IPKG_INSTROOT}"
 export pkgname="$1"
 default_prerm
+EOF
+  if [ "$2" = 1 ]; then
+    echo 'ret=$?'
+    removal_cleanup
+    cat <<'EOF'
+exit ${ret}
+EOF
+  fi
+}
+# Removal of the mesh device package (opkg runs prerm with "remove" only on
+# removal, including a forced reinstall, and with "upgrade" on upgrade; apk
+# runs pre-deinstall only on removal).
+# The service is already stopped. Its firewall rules and zone go, and so
+# does the device state: the device token, device key and network keys must
+# not stay on the flash of a router that may change hands. The panel still
+# lists the device until an administrator revokes it there.
+removal_cleanup() {
+  cat <<'EOF'
+if [ -z "${IPKG_INSTROOT}" ]; then
+	/usr/libexec/anixops-mesh/firewall remove || true
+	rm -rf /etc/anixops-mesh
+	logger -t anixops-mesh -p daemon.notice "removed with its device identity; revoke the device in the panel" 2>/dev/null || true
+fi
 EOF
 }
 # The web plugin also drops the interface caches and reloads rpcd so that
@@ -119,16 +169,16 @@ tar_gz() { # DIR OUT [ENTRIES...]: deterministic gzip'd tar of DIR
     --mtime="@${epoch}" --format=gnu -C "${dir}" -cf - "$@" | gzip -9n > "${out}"
 }
 
-# NAME ARCH DATA_DIR DEPENDS DESCRIPTION RUSERS LUCI
+# NAME ARCH DATA_DIR DEPENDS DESCRIPTION RUSERS LUCI REMOVAL
 build_ipk() {
-  local name="$1" arch="$2" data="$3" depends="$4" description="$5" rusers="$6" luci="$7"
+  local name="$1" arch="$2" data="$3" depends="$4" description="$5" rusers="$6" luci="$7" removal="$8"
   local stage="${work}/ipk-${name}-${arch}"
   mkdir -p "${stage}/control"
   local size
   size="$(du -sb --apparent-size "${data}" | cut -f1)"
   {
     echo "Package: ${name}"
-    echo "Version: ${pkg_version}"
+    echo "Version: ${ipk_version}"
     if [ -n "${depends}" ]; then
       echo "Depends: ${depends//\ /, }"
     fi
@@ -146,7 +196,7 @@ build_ipk() {
     echo "Description:  ${description}"
   } > "${stage}/control/control"
   ipk_postinst > "${stage}/control/postinst"
-  ipk_prerm > "${stage}/control/prerm"
+  ipk_prerm "${removal}" > "${stage}/control/prerm"
   if [ "${luci}" = 1 ]; then
     # postinst-pkg runs inside default_postinst, whose result is its
     # result: it must not exit and must succeed when rpcd is not running.
@@ -157,16 +207,18 @@ build_ipk() {
   echo "2.0" > "${stage}/debian-binary"
   tar_gz "${data}" "${stage}/data.tar.gz" .
   tar_gz "${stage}/control" "${stage}/control.tar.gz" .
-  tar_gz "${stage}" "${out_dir}/${name}_${pkg_version}_${arch}.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz
-  echo "wrote ${name}_${pkg_version}_${arch}.ipk"
+  tar_gz "${stage}" "${out_dir}/${name}_${file_version}_${arch}.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz
+  echo "wrote ${name}_${file_version}_${arch}.ipk"
 }
 
-# NAME ARCH DATA_DIR DEPENDS DESCRIPTION RUSERS LUCI
+# NAME ARCH DATA_DIR DEPENDS DESCRIPTION RUSERS LUCI REMOVAL
 build_apk() {
-  local name="$1" arch="$2" data="$3" depends="$4" description="$5" rusers="$6" luci="$7"
+  local name="$1" arch="$2" data="$3" depends="$4" description="$5" rusers="$6" luci="$7" removal="$8"
   local stage="${work}/apk-${name}-${arch}"
   mkdir -p "${stage}/scripts"
   cp -a "${data}" "${stage}/data"
+  # apk records file times: fix them like the ipk archives do.
+  find "${stage}/data" -exec touch -h -d "@${epoch}" {} +
   # OpenWrt's apk packages carry their file list (read by default_postinst
   # and sysupgrade) and required users in /lib/apk/packages.
   mkdir -p "${stage}/data/lib/apk/packages"
@@ -180,13 +232,13 @@ build_apk() {
   LC_ALL=C sort -o "${stage}/data/lib/apk/packages/${name}.list" "${stage}/list"
   apk_postinst "${name}" 0 > "${stage}/scripts/post-install"
   apk_postinst "${name}" 1 > "${stage}/scripts/post-upgrade"
-  apk_prerm "${name}" > "${stage}/scripts/pre-deinstall"
+  apk_prerm "${name}" "${removal}" > "${stage}/scripts/pre-deinstall"
   if [ "${luci}" = 1 ]; then
     for script in post-install post-upgrade; do
       luci_refresh >> "${stage}/scripts/${script}"
     done
   fi
-  local output="${name}_${pkg_version}_${arch}.apk"
+  local output="${name}_${file_version}_${arch}.apk"
   # apk names the architecture-independent kind noarch (OpenWrt's
   # package-pack.mk does the same); the file keeps the ipk-style name.
   local apk_arch="${arch}"
@@ -195,10 +247,10 @@ build_apk() {
   fi
   docker run --rm --network none \
     -v "${stage}:/stage:ro" -v "${out_dir}:/out" \
-    -e "NAME=${name}" -e "VERSION=${pkg_version}" -e "ARCH=${apk_arch}" \
+    -e "NAME=${name}" -e "VERSION=${apk_version}" -e "ARCH=${apk_arch}" \
     -e "DESCRIPTION=${description}" -e "DEPENDS=${depends}" -e "LICENSE=${license}" \
     -e "URL=${url}" -e "MAINTAINER=${maintainer}" -e "OUTPUT=${output}" \
-    -e "OWNER=$(id -u):$(id -g)" \
+    -e "OWNER=$(id -u):$(id -g)" -e "SOURCE_DATE_EPOCH=${epoch}" \
     "${APK_IMAGE}" /bin/sh -euc '
       cp -a /stage /tmp/stage
       chown -R 0:0 /tmp/stage
@@ -212,6 +264,7 @@ build_apk() {
         --info "url:${URL}" \
         --info "maintainer:${MAINTAINER}" \
         --info "depends:${DEPENDS}" \
+        --info "build-time:${SOURCE_DATE_EPOCH}" \
         --script "post-install:/tmp/stage/scripts/post-install" \
         --script "post-upgrade:/tmp/stage/scripts/post-upgrade" \
         --script "pre-deinstall:/tmp/stage/scripts/pre-deinstall" \
@@ -235,7 +288,7 @@ files="${src}/anixops-mesh/files"
 built=0
 while read -r arch target; do
   case "${arch}" in "" | \#*) continue ;; esac
-  mapfile -t binaries < <(find "${bin_dir}" -maxdepth 1 -type f -name "anixops-mesh-*-${target}" ! -name '*.*')
+  mapfile -t binaries < <(find "${bin_dir}" -maxdepth 1 -type f -name "anixops-mesh-*-${target}")
   if [ "${#binaries[@]}" -eq 0 ]; then
     continue
   fi
@@ -246,14 +299,17 @@ while read -r arch target; do
   data="${work}/data-anixops-mesh-${arch}"
   mkdir -p "${data}/usr/bin"
   cp -a "${files}/." "${data}/"
+  # Modes set here, not taken from the checkout or the umask.
+  find "${data}" -type d -exec chmod 0755 {} +
+  find "${data}" -type f -exec chmod 0644 {} +
   install -m 0755 "${binaries[0]}" "${data}/usr/bin/anixops-mesh"
   chmod 0755 "${data}/etc/init.d/anixops-mesh" "${data}/usr/libexec/anixops-mesh/service" \
-    "${data}/etc/uci-defaults/90-anixops-mesh"
-  chmod 0644 "${data}/lib/upgrade/keep.d/anixops-mesh"
-  # The virtual interface needs the kernel's TUN driver.
-  build_both anixops-mesh "${arch}" "${data}" "kmod-tun" \
+    "${data}/usr/libexec/anixops-mesh/firewall" "${data}/etc/uci-defaults/90-anixops-mesh"
+  # The virtual interface needs the kernel's TUN driver; the firewall rules
+  # are kept by a ucode script (ucode comes with fw4).
+  build_both anixops-mesh "${arch}" "${data}" "kmod-tun ucode ucode-mod-fs ucode-mod-uci" \
     "Intranet mesh device: joins the mesh networks a panel assigns to this router." \
-    ":anixops-mesh" 0
+    ":anixops-mesh" 0 1
   built=$((built + 1))
 done < "${src}/arches.txt"
 if [ "${built}" -eq 0 ]; then
@@ -281,7 +337,7 @@ done
 find "${data}" -type d -exec chmod 0755 {} +
 find "${data}" -type f -exec chmod 0644 {} +
 build_both luci-app-anixops-mesh all "${data}" "luci-base rpcd-mod-ucode anixops-mesh" \
-  "Web interface of the intranet mesh device: status, enrollment and subnet requests." "" 1
+  "Web interface of the intranet mesh device: status, enrollment and subnet requests." "" 1 0
 
 (
   cd "${out_dir}"
