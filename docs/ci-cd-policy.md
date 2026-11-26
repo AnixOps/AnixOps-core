@@ -192,8 +192,10 @@ Action 固定：所有工作流、可复用工作流和复合 Action 引用的�
   runner 或后续配置的受控 runner 生成。
 - release policy job 检查版本格式与触发来源一致性：允许稳定版本和 `alpha.N`、`beta.N`、`rc.N` 预发布，N 为无前导零的
   正整数，为让同版本号的 AnixOps/anixops-net Windows Installer 版本排序保持有效，分别限制为 `1-499`、`1-399` 和 `1-98`；`workflow_dispatch`
-  placeholder release 必须从 `main` 发起，tag release 版本必须与 tag 名一致。
-- `release-ci-gate` 使用 `actions: read` 读取 `main` 上同 commit 的成功 CI，校验 `CI summary` job，并输出 CI
+  placeholder release 必须从 `main` 或与版本同一 `MAJOR.MINOR` 的维护分支 `release/MAJOR.MINOR` 发起，tag release 版本必须与 tag 名一致；
+  “Release version preconditions” 要求 `Cargo.toml` 的 workspace 版本等于发布版本、`CHANGELOG.md` 有该版本小节
+  （`.github/scripts/release-version-check.sh`，自测在 `policy-fast` 中运行）。
+- CI 对 `main` 与 `release/MAJOR.MINOR` 的 push 都运行；`release-ci-gate` 使用 `actions: read` 读取 `main` 或该维护分支上同 commit 的成功 CI，校验 `CI summary` job，并输出 CI
   run/source 字段及 release CI gate activation/execution/API implementation 字段。
 
 产物 job（`package-linux`、`attest-linux`、`post-release-summary`、`publish-eligibility-gate`、

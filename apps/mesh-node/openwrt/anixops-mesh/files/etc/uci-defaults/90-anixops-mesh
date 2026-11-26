@@ -1,0 +1,18 @@
+#!/bin/sh
+# Creates the default configuration on first install only: an existing
+# /etc/config/anixops-mesh (kept across upgrades and sysupgrade) is never
+# replaced. The device's networks come from the panel, not from UCI
+# (docs/deploy/mesh-device.md).
+
+[ -e /etc/config/anixops-mesh ] && exit 0
+
+umask 022
+cat > /etc/config/anixops-mesh <<'CONFIG'
+
+config device 'main'
+	option enabled '0'
+	option control ''
+	option state_dir '/etc/anixops-mesh'
+CONFIG
+
+exit 0

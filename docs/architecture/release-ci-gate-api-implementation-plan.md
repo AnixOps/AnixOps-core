@@ -1,5 +1,10 @@
 # Release CI Gate API Implementation Plan
 
+> 2026-11-26 更新：查询不再带 `branch=main` 过滤，改为在结果中只接受 `head_branch` 为 `main`
+> 或与发布版本同一 `MAJOR.MINOR` 的 `release/MAJOR.MINOR`，见
+> [Release CI Success Source Contract](release-ci-success-source-contract.md) 与
+> [Release Strategy](../release-strategy.md#维护分支)。下文保留最初实现计划作为记录。
+
 > Current activation note: Linux artifact release path is now `linux-artifact-release-state=confirmed-release-path`. `package-linux`, attestation, publish eligibility, and GitHub Release upload are owned by GitHub Actions; any older blocked, not-defined, or current-placeholder wording below describes the historical pre-activation boundary unless a section explicitly states the post-activation state.
 
 

@@ -1,0 +1,263 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+msgid "Address conflict"
+msgstr ""
+
+msgid "Address not managed"
+msgstr ""
+
+msgid "Advertised LAN subnets"
+msgstr ""
+
+msgid "Alert"
+msgstr ""
+
+msgid "Approved"
+msgstr ""
+
+msgid "Cancel"
+msgstr ""
+
+msgid "Device"
+msgstr ""
+
+msgid "Device identity online elsewhere"
+msgstr ""
+
+msgid "Direct"
+msgstr ""
+
+msgid "Enable service"
+msgstr ""
+
+msgid "Enroll"
+msgstr ""
+
+msgid "Enroll again"
+msgstr ""
+
+msgid "Enroll device"
+msgstr ""
+
+msgid "Enrolled"
+msgstr ""
+
+msgid "Enrollment"
+msgstr ""
+
+msgid "Enrollment completed. The service has been started."
+msgstr ""
+
+msgid "Enrollment credential"
+msgstr ""
+
+msgid "Enrollment failed."
+msgstr ""
+
+msgid "Enter at most 16 private IPv4 subnets in network address form, for example 192.168.1.0/24."
+msgstr ""
+
+msgid "Enter the panel address and the one-time enrollment credential issued by the administrator."
+msgstr ""
+
+msgid "Forward secrecy"
+msgstr ""
+
+msgid "Hops"
+msgstr ""
+
+msgid "Insufficient permission"
+msgstr ""
+
+msgid "Interface"
+msgstr ""
+
+msgid "Intranet mesh"
+msgstr ""
+
+msgid "Last configuration"
+msgstr ""
+
+msgid "Last report"
+msgstr ""
+
+msgid "Latency"
+msgstr ""
+
+msgid "Latest configuration rejected"
+msgstr ""
+
+msgid "Listening port in use"
+msgstr ""
+
+msgid "Members"
+msgstr ""
+
+msgid "Network name or key differs from the peer"
+msgstr ""
+
+msgid "Networks, addresses and peers of this device are assigned by the panel. This page only controls the service, enrollment and subnet requests."
+msgstr ""
+
+msgid "No"
+msgstr ""
+
+msgid "No members"
+msgstr ""
+
+msgid "No network assigned to this device"
+msgstr ""
+
+msgid "No peer reachable"
+msgstr ""
+
+msgid "No private LAN subnet found"
+msgstr ""
+
+msgid "Normal"
+msgstr ""
+
+msgid "Not enrolled"
+msgstr ""
+
+msgid "Not measured"
+msgstr ""
+
+msgid "Not running"
+msgstr ""
+
+msgid "Not supported by the installed program version"
+msgstr ""
+
+msgid "Not supported by the installed program version."
+msgstr ""
+
+msgid "Only full nodes can advertise subnets."
+msgstr ""
+
+msgid "Other subnets"
+msgstr ""
+
+msgid "Overlapping subnets"
+msgstr ""
+
+msgid "Panel address"
+msgstr ""
+
+msgid "Panel connection"
+msgstr ""
+
+msgid "Path"
+msgstr ""
+
+msgid "Peer not admitted to this network refused"
+msgstr ""
+
+msgid "Peer without encryption refused"
+msgstr ""
+
+msgid "Pending approval"
+msgstr ""
+
+msgid "Rejected subnet advertisements"
+msgstr ""
+
+msgid "Request failed."
+msgstr ""
+
+msgid "Request submitted. The subnets take effect after an administrator approves them."
+msgstr ""
+
+msgid "Requested"
+msgstr ""
+
+msgid "Route conflicts with an existing route"
+msgstr ""
+
+msgid "Running"
+msgstr ""
+
+msgid "Security mode differs from the peer"
+msgstr ""
+
+msgid "Select the LAN subnets that other mesh members may reach through this router. The request is sent to the panel and takes effect after an administrator approves it. Submitting an empty selection withdraws a pending request."
+msgstr ""
+
+msgid "Service"
+msgstr ""
+
+msgid "Settings"
+msgstr ""
+
+msgid "Start refused"
+msgstr ""
+
+msgid "State"
+msgstr ""
+
+msgid "Status"
+msgstr ""
+
+msgid "Status of this device in the intranet mesh. Networks are assigned by the panel."
+msgstr ""
+
+msgid "Status unavailable"
+msgstr ""
+
+msgid "Stopped"
+msgstr ""
+
+msgid "Submit request"
+msgstr ""
+
+msgid "Subnet"
+msgstr ""
+
+msgid "Subnets"
+msgstr ""
+
+msgid "The device token has been revoked. Enroll the device again."
+msgstr ""
+
+msgid "The enrollment credential is invalid."
+msgstr ""
+
+msgid "The panel address must be an https address."
+msgstr ""
+
+msgid "The panel is unreachable or returned an invalid response."
+msgstr ""
+
+msgid "The panel refused the request."
+msgstr ""
+
+msgid "The panel rejected one or more subnets."
+msgstr ""
+
+msgid "The panel rejected the enrollment credential. Request a new credential from the administrator."
+msgstr ""
+
+msgid "The service starts only after the device has been enrolled."
+msgstr ""
+
+msgid "This device is not enrolled."
+msgstr ""
+
+msgid "Unreachable"
+msgstr ""
+
+msgid "Virtual address"
+msgstr ""
+
+msgid "Virtual address used by another interface"
+msgstr ""
+
+msgid "Virtual interface name in use"
+msgstr ""
+
+msgid "Waiting for the administrator to admit this device"
+msgstr ""
+
+msgid "Yes"
+msgstr ""

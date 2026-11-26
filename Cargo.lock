@@ -2064,6 +2064,7 @@ dependencies = [
  "engine-outbound",
  "libc",
  "outbound-mesh",
+ "platform-windows",
  "ring",
  "serde",
  "serde_json",
