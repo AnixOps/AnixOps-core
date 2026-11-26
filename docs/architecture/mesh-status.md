@@ -22,12 +22,16 @@
 | `self` | `id`、`name`、`role`、`address`、`addressV6`、`domain`、`relay`、`listen`、`advertised`、`suggestedSubnets`、`ipForwarding` | 0.3 |
 | `self` | `staticKey` | 0.3 |
 | `self` | `addressManaged`、`region`、`regionBasis`、`regionState`、`hostMode` | 0.4 |
+| `self` | `regionRequest`、`regionSuggestion` | 0.4（`regionRequest` 的 `rejected` 需能力 `mesh_region_request_state`） |
 | `members[]` | `id`、`name`、`role`、`state`、`address`、`domain`、`connection`、`hops`、`transport`、`latencyMs`、`path`、`pathState`、`unreachable`、`subnets`、`duplicateOf` | 0.3 |
 | `members[]` | `region`、`addressManaged`、`vms` | 0.4 |
+| `members[]` | `bridgesExternal` | 0.4（能力 `mesh_external_routes`） |
 | `network` | `kind`、`limitations` | 0.3 |
 | `members[]` | `implementation` | 0.3 |
 | `subnets[]` | `cidr`、`advertisers[{member,inUse}]`、`latencyMs`、`path`、`state`、`overlaps`、`localOverlap`、`route` | 0.3 |
 | `subnets[]` | `region` | 0.4 |
+| `subnets[]` | `kind`、`hostGroup` | 0.4 |
+| `subnets[]` | `bridge`、`name`（`kind` 为 `external` 时） | 0.4（能力 `mesh_external_routes`） |
 | `tunnel` | `routes`、`routesVersion`、`dns` | 0.3 |
 | `externalBridge` | `allowDigest`、`allowCount`、`routesDigest`、`appliedAt` | 0.4（能力 `mesh_external_bridge`） |
 | 顶层 | `names`、`refusedNames` | 0.3 |
@@ -49,7 +53,7 @@
 | `role` | 0.3：`server`（完整节点）、`client`（接入节点）；0.4 起另有 `border`、`gateway`、`host` |
 | `id`（成员与本机） | 不透明字符串，取节点实例 UUID，重启后不变；不用每次启动都会变的数字节点号 |
 | `member.state` | `online`、`unreachable` |
-| `connection` | `self`、`direct`、`relay`（`hops` 为中转次数）、`unreachable`；0.4 起另有 `cross_region`、`via_host`、`via_gateway` |
+| `connection` | `self`、`direct`、`relay`（`hops` 为中转次数）、`unreachable`；0.4 起另有 `cross_region`、`via_host`、`via_gateway`。`cross_region` 为保留值：区域之间不传递节点信息（规范 §15.6 第 8 条），`members[]` 只列本区域成员，0.4 内核不产生该值；其他地区只以 `subnets[]` 中 `kind = summary` 的汇总网段出现（`path` 止于出口边界节点），其他地区的主机名只经 `names[]` 出现，不进入 `members[]`。客户端遇到该值时按「经边界节点」显示 |
 | `transport` | `tcp`、`udp` |
 | `latencyMs` | 整数毫秒；未测到为 `null` |
 | `path` | 成员 `id` 列表，从第一跳到目的 |
@@ -62,13 +66,20 @@
 | 宿主组（0.5） | 组内虚拟机（`members[].vms`）没有单独的路径状态。组地址段在 `subnets[]` 中的 `path` 按该地址段匹配到的路径给出：有包含它的 `to_subnet` 路径时按最长前缀的那一条，否则按到网关的路径（规范 §17.2.2 第 6 条，需求 R25） |
 | `subnet.state` | `ok`、`unreachable`、`refused`（内网范围外，列出但不装路由，需求 R17） |
 | `subnet.route` | `mesh`、`local`（与本机网络重叠时默认 `local`） |
+| `subnet.kind`（0.4） | `lan`（成员通告的局域网子网，缺省值）、`host_group`（宿主组地址段）、`external`（外部网络地址，规范 §15.12）、`summary`（边界节点通告的其他地区汇总网段，规范 §15.6 第 3 条）。按下列顺序取第一条成立的：① `cidr` 与本网络配置 `host_groups[].cidr` 完全相同，且当前在用的通告者是该组的网关或备用网关 → `host_group`；② `cidr` 与配置 `external_routes[].cidr` 完全相同，且当前在用的通告者是该项的 `bridge` → `external`；③ 当前在用的通告者全部是本区域的边界节点（`role = border`），且 `cidr` 不在本网络虚拟网段内 → `summary`；④ 其余 → `lan`。只看配置与通告者是否吻合，通告者不符时按 `lan` 显示，不提示冒用。缺省或不认识的取值，客户端按 `lan` 显示（这是「未知枚举按 `other`」的例外） |
+| `subnet.hostGroup`（0.4） | 只在 `kind = host_group` 时给出：`{ "gateway", "backupGateway" }`，为配置中的成员实例 ID（快照成员的 `id`）；没有备用网关时 `backupGateway` 为 `null`。组内设备列表见 `members[].vms` |
+| `subnet.region`（0.4） | `kind = summary` 时为该网段所属的其他地区代码：边界节点上取骨干汇总路由交换（规范 §17.3.3）中通告者所在地区；普通成员上取顶层 `regions[]` 中虚拟子网包含该网段的地区，查不到（例如其他地区的业务网段）时为 `null`。其他 `kind` 为本区域代码或 `null` |
+| `subnet.bridge`、`subnet.name`（0.4，能力 `mesh_external_routes`） | 只在 `kind = external` 时给出：`bridge` 为配置中的桥接节点实例 ID，`name` 为配置中的显示名，未配置时为 `null`。只用于显示，不影响路由与访问控制 |
+| `members[].bridgesExternal`（0.4，能力 `mesh_external_routes`） | 布尔：该成员是本网络某个 `kind = external` 子网的当前在用通告者时为 `true`，否则为 `false`。不与顶层 `externalBridge`（本机桥接配置摘要）混用 |
+| `self.regionRequest`（0.4） | `null`，或 `{ "id", "region", "state", "reason", "rejectReason" }`：本机在该网络最新一次迁区申请（需求 R24，规范 §15.8 第 5 条）。`state` 为 `pending`（已提交、等待网络管理者处理）或 `rejected`（被拒绝，`rejectReason` 为管理者填写的原因，没有填写时为空串；`pending` 时为 `null`）。来源：本机 `mesh_request_region` 记下的申请在被 Agent 取走前直接给出 `pending`；取走之后由面板经 Agent 下发的网络配置 `region_request`（见 `mesh-module.md`）给出，内核未列出 `mesh_region_request_state` 时 Agent 不下发该节，此时申请被取走后为 `null`。申请被批准后迁移开始，面板不再下发该节，字段为 `null`；撤回（`mesh_withdraw_region_request`）后立即为 `null`。界面提示「迁区后虚拟地址将变化」 |
+| `self.regionSuggestion`（0.4） | `null`，或 `{ "region", "currentMedianMs", "suggestedMedianMs", "since" }`：规范 §15.8 第 5 条的迁移建议，`region` 为建议的地区代码，两项为最近一次测量的中位 RTT（整数毫秒），`since` 为条件开始连续成立的时间（RFC 3339，UTC）。条件不再成立、已有 `pending` 申请或节点已在该地区时为 `null`。只是提示，不会自动迁移 |
 | `suggestedSubnets` | `[{ "cidr", "interface", "public" }]`：只在桌面与服务器的完整节点给出；`public` 为 `true` 的不可通告 |
 | `ipForwarding` | `on`、`off`、`not_needed`；只在完整节点给出 |
 | `tunnel.routes` | 应进入隧道的网段（CIDR 列表）：所有已加入网络的虚拟网段，加上当前路由到组网的通告子网（与本机网络冲突、内网范围外、或用户设为 `local` 的不在内），再按 `routing.system_routes` 限制。去重，顺序稳定 |
 | `tunnel.routesVersion` | 整数，`routes` 每变一次加一；引擎重启后从 1 起 |
 | `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate", "answerable" }`：本网络的内网域名名单（不含后缀），一个名字的每种来源各一条。`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址，下发来源在前（需求 R28）；同名中有 `member` 来源时界面提示可能冒名。`answerable` 为 `false` 时地址不在可应答的网段内，不会应答。`source` 以后可能出现 `backbone`、`gateway`，按 `other` 处理 |
 | `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" \| "invalid_name" }`：配置里跳过的名字条目，原因分别为地址在内网范围外、名字不是规范化后的 `名.地区代码` |
-| `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请；每个网络最多一条，新申请替换旧的 |
+| `regionRequests[]` | `{ "id", "network", "region", "reason" }`：本机 `mesh_request_region` 记下、尚未被取走的入区申请；每个网络最多一条，新申请替换旧的。0.4 起另有可省的 `withdraw`：为 `true` 时表示撤回该网络的申请（由 `mesh_withdraw_region_request` 记下，此时 `region` 为空串、`reason` 为空串），面板取消该网络待处理的申请 |
 | `externalBridge` | 三态：**对象**为本机已生效的桥接配置摘要（见下）；**显式 `null`** 表示内核确知本网络当前没有桥接（未配置 `external_bridge`、配置中移除该节、网络停止，或桥接规则已全部撤除），面板以此作为释放桥接相关资源的依据之一；**键缺省**表示状态未知（内核读取防火墙状态失败、配置被拒、网络暂缓等），面板不得据此释放地址占用，也不得视为已应用。Agent 转发规则：内核给出对象或显式 `null` 时原样上报；Agent 已读到内核状态、且内核 `features` 未列出 `mesh_external_bridge` 时，为每个网络（含 `legacy` 与被扣下的网络）上报显式 `null`，只有面板向该网络下发过 `external_bridge` 节时另附告警 `external_bridge_unsupported`（这样的内核不会装桥接规则；Agent 合成的 `null` 以规范 §15.12 第 9 条的规则清理为前提）；网络带告警 `external_bridge_downgrade_residue` 或 `external_bridge_lock_held` 时（见下文 `features` 一行）Agent 省略该键，不合成 `null`，也不附 `external_bridge_unsupported`；内核列出该能力但省略该键，或 Agent 读取内核状态失败时，上报中省略该键。面板把「缺少该键且同一网络带告警 `external_bridge_unsupported`」按显式 `null` 处理，这是「键缺省即未知」的唯一例外（规范 §15.12 第 8 条）。对象即本机已生效的桥接配置摘要（规范 §15.12 第 4 条）：`allowDigest` 为 `allow` 名单的摘要，`routesDigest` 为 `routes` 的摘要，`allowCount` 为名单条目数，`appliedAt` 为生效时间（RFC 3339，UTC）。摘要算法：把各条目规范化为 CIDR 文本（IPv4 点分十进制，IPv6 按 RFC 5952 小写压缩，单个地址也写出前缀长度），去重后按字节序排序，以换行符 `\n` 连接（末尾无换行），取 SHA-256 的小写十六进制。只在新配置的防火墙规则全部装好后才更新；装失败时保持旧值并告警。Agent 原样上报，面板对自己下发的名单按同样算法计算，相等即视为桥接节点已应用；判断「已应用」时，时间以面板收到该上报的观测时间为准（须晚于名单变更时刻），不比较节点时钟给出的 `appliedAt`，`appliedAt` 只供展示 |
 | `tunnel.dns` | `null`，或 `{ "servers": [地址], "matchDomains": [后缀] }`：内网域名开启时只对这些后缀生效（需求 R28）。`matchDomains` 含后缀和内核推算的反向解析区（规范 §15.9.2 第 1 条），客户端只使用这里给出的域，不自行推算；内网域名关闭时为 `null` |
 
@@ -103,7 +114,7 @@
 | `external_bridge_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级锁 `/run/anixops-mesh-host.lock`（同一主机上另有持锁、声明该能力的进程），因此不声明 `mesh_external_bridge`、不清理桥接表（规范 §15.12 第 9 条）。同时出现在 `GET /v1/mesh` 顶层 `alerts` 与每个网络的 `alerts` 中（没有运行任何网络时只在顶层），进程退出前不消除 |
 | `subnet_router_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级锁 `/run/anixops-mesh-host.lock`，因此不安装子网通告的转发规则、不清理路由表（`docs/architecture/mesh-module.md`「Linux 主机改动」），本机配置的通告子网不发出（不通告无法转发的网段）。出现位置与消除时机同 `external_bridge_lock_held` |
 | `ipv6_forwarding_off` | 告警：Linux 完整节点配置了 IPv6 通告子网，而系统 IPv6 转发未开启。内核不改 IPv6 转发设置，这些 IPv6 子网不通告，IPv4 子网照常；`detail` 列出未通告的网段 |
-| `reverse_zones_truncated` | 告警，不是网络失败：该网络推算出的反向解析区超过 256 个，超出部分不推算、不应答，`detail` 为未推算的区数（规范 §15.9.2 第 1 条） |
+| `reverse_zones_truncated` | 告警，不是网络失败：该网络推算出的反向解析区超过 256 个，超出部分不推算、不应答，`detail` 为未推算的区数，`address`、`peer` 为空串（规范 §15.9.2 第 1 条） |
 
 新增取值属于兼容变更，读取方遇到未知取值按失败处理。
 
@@ -123,11 +134,12 @@
 
 | 接口 | 内容 | 自哪个内核版本 |
 |---|---|---|
-| `GET /v1/status` 的 `features` | `mesh`；`mesh_dns`（网络配置接受 `dns` 节）；`mesh_host_groups`（接受 `host_groups` 节）；`mesh_region_requests`（提供下面的申请接口）；`mesh_external_bridge`（接受 `external_bridge` 配置，规范 §15.12，内核 0.4；内核未列出时 Agent 扣下该网络的 `external_bridge` 节，其余配置照常下发，并向面板上报告警 `external_bridge_unsupported`；Linux 上的 Agent 记录过某网络曾在声明该能力的内核上实际作为桥接生效，而当前内核未列出 `mesh_external_bridge` 时，对该网络上报告警 `external_bridge_downgrade_residue`（可能有残留桥接规则）。告警存在期间，Agent 对该网络省略 `externalBridge`（未知），不合成显式 `null`，也不附 `external_bridge_unsupported`；面板不得以任何依据（包括连续两次上报）释放该网络的地址保留。声明该能力的内核运行并完成清理后，或运维手工清除桥接表并删除 Agent 的该项记录后，告警消除。）；`mesh_resolver_address`（`dns` 节接受 `resolver_address`，规范 §15.9.2 第 8 条，内核 0.4；未列出时 Agent 或面板省略该字段）；`mesh_native_keys`（按规范 §8.3.1 处理 `network.kind` 与 `native_keys`：准入、清单未就绪时暂缓并报 `native_keys_pending`、拒绝清单外对端并报 `peer_not_native`，并给出 `static_keys` 与 `self.staticKey`）。`mesh_paths`（按规范 §17.2 应用 `routing.paths`：途经点封装、能力查询服务 `MeshPathRpc`、回落与 `paths[]` 状态，接受 `mesh_set_paths`，内核 0.5；未列出的内核虽然接受 `routing.paths` 的语法但不应用，Agent 与面板不向它下发路径，客户端不显示路径编辑）。Agent 只向列出 `mesh_native_keys` 的内核下发 `kind = managed` 的网络；内核未列出时不下发该网络，向面板上报告警 `native_keys_unsupported`（`legacy` 网络照常下发）；面板下发的 `kind` 不是 `managed` 或 `legacy` 时不下发该网络，上报告警 `invalid_kind`。所有能力都以 `features` 实际列出为准，不按内核版本号推断 | `mesh`、`mesh_dns`、`mesh_native_keys` 0.3；`mesh_paths` 0.5；其余 0.4 |
+| `GET /v1/status` 的 `features` | `mesh`；`mesh_dns`（网络配置接受 `dns` 节）；`mesh_host_groups`（接受 `host_groups` 节）；`mesh_region_requests`（提供下面的申请接口）；`mesh_external_bridge`（接受 `external_bridge` 配置，规范 §15.12，内核 0.4；内核未列出时 Agent 扣下该网络的 `external_bridge` 节，其余配置照常下发，并向面板上报告警 `external_bridge_unsupported`；Linux 上的 Agent 记录过某网络曾在声明该能力的内核上实际作为桥接生效，而当前内核未列出 `mesh_external_bridge` 时，对该网络上报告警 `external_bridge_downgrade_residue`（可能有残留桥接规则）。告警存在期间，Agent 对该网络省略 `externalBridge`（未知），不合成显式 `null`，也不附 `external_bridge_unsupported`；面板不得以任何依据（包括连续两次上报）释放该网络的地址保留。声明该能力的内核运行并完成清理后，或运维手工清除桥接表并删除 Agent 的该项记录后，告警消除。）；`mesh_resolver_address`（`dns` 节接受 `resolver_address`，规范 §15.9.2 第 8 条，内核 0.4；未列出时 Agent 或面板省略该字段）；`mesh_native_keys`（按规范 §8.3.1 处理 `network.kind` 与 `native_keys`：准入、清单未就绪时暂缓并报 `native_keys_pending`、拒绝清单外对端并报 `peer_not_native`，并给出 `static_keys` 与 `self.staticKey`）。`mesh_external_routes`（网络配置接受 `external_routes`，快照给出 `subnets[].kind = external` 的 `bridge`、`name` 与 `members[].bridgesExternal`，内核 0.4；未列出时 Agent 省略该节，不告警，客户端把这些网段显示为 `lan`）；`mesh_region_request_state`（网络配置接受 `region_request`，提供 `mesh_withdraw_region_request` 与撤回记录，内核 0.4；未列出时 Agent 省略 `region_request`，客户端不显示撤回按钮）；`mesh_paths`（按规范 §17.2 应用 `routing.paths`：途经点封装、能力查询服务 `MeshPathRpc`、回落与 `paths[]` 状态，接受 `mesh_set_paths`，内核 0.5；未列出的内核虽然接受 `routing.paths` 的语法但不应用，Agent 与面板不向它下发路径，客户端不显示路径编辑）。Agent 只向列出 `mesh_native_keys` 的内核下发 `kind = managed` 的网络；内核未列出时不下发该网络，向面板上报告警 `native_keys_unsupported`（`legacy` 网络照常下发）；面板下发的 `kind` 不是 `managed` 或 `legacy` 时不下发该网络，上报告警 `invalid_kind`。所有能力都以 `features` 实际列出为准，不按内核版本号推断 | `mesh`、`mesh_dns`、`mesh_native_keys` 0.3；`mesh_paths` 0.5；其余 0.4 |
 | `PUT /v1/mesh` | 每个网络一份 `config_version: 1` 配置，`dns`、`host_groups` 与 `subnets`、`routing` 同级 | 0.3 |
 | `GET /v1/mesh` 顶层 `instance_id` | 本设备的实例 ID：1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`，规范 §1），由内核生成，等于快照的 `self.id`；整台设备一个、各网络共用，与节点静态密钥一起持久保存，只有删除节点数据重新入网才变；网络暂缓或未运行时也给出 | 0.3 |
 | `GET /v1/mesh` 顶层 `static_keys` | `[{ "network", "static_key" }]`：本机各网络的安全模式静态公钥，`network` 为该网络配置的 `network.name`，`static_key` 编码同快照的 `self.staticKey`；旧模式网络不列出。Agent 在每个网络实例的状态上报中原样带上 `static_key`，面板只采信 Agent 通道的值来生成 `native_keys`（规范 §8.3.1 第 7 条） | 0.3 |
 | `GET /v1/mesh` 的 `networks[].failure` | `{ "code", "detail" }` 或 `null`，与该网络快照的 `network.failure` 同值（例如 `native_keys_pending`、`peer_not_native`）；Agent 转为告警上报 | 0.3 |
+| `GET /v1/mesh` 的 `networks[].paths` | 与该网络快照的 `paths[]` 同结构同值（`{ "id", "target", "via", "state", "unreachable", "reason" }`，按配置顺序；未配置路径时为空数组）。只有 `features` 列出 `mesh_paths` 的内核给出；Agent 原样转述给面板，内核未列出 `mesh_paths` 时 Agent 下发 `routing.paths = []`，不读取该字段 | 0.5 |
 | `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为该网络配置的 `network.name`，即快照的 `network.id`；每个网络最多一条待处理申请，新申请替换旧的，保留到被删除为止 | 0.4 |
 | `GET /v1/mesh` 顶层 `alerts` | 可选，节点级告警：元素格式与 `networks[].alerts` 相同（`{ "code", "address", "peer", "detail" }`，与网络无关的告警 `address`、`peer` 为空串），缺省或空数组表示没有。用于与具体网络无关、内核没有运行任何网络时也要让 Agent 看到的状态；目前只有 `external_bridge_lock_held`。内核在持锁失败期间把该告警同时放在顶层 `alerts` 与每个网络的 `alerts` 中；Agent 在任一处看到即按持锁处理（规范 §15.12 第 9 条） | 0.4 |
 | `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 由内核在记下申请时生成，为 1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`），不存在时返回 404 | 0.4 |
@@ -136,7 +148,7 @@
 
 - 请求体 `{"networks": [网络配置]}`：每项是上面的 `config_version: 1` 配置，另带同级的 `tag`，取值 `mesh-<地区代码>`（地区代码与面板一致：2–16 位小写字母、数字或连字符，字母开头，不以连字符结尾）。边界节点同时加入多个网络，所以是数组（需求 R18、R19），最多 64 项。
 - 整体替换：这组网络取代当前运行的全部网络，未变的网络不中断；`{"networks": []}` 停止全部。任一项无效（字段缺失或未知、配置校验不过、`tag` 不合规或重复、`network.name` 重复）时返回 400，整个请求体都不应用，与 `/v1/network`、`/v1/egress` 一致。网络启动不了（R12：端口占用、虚拟网卡或路由冲突、同一节点身份已在线）不算请求无效：应答 200，该网络 `running` 为 `false`，带 `start_refused` 告警。
-- 应答与 `GET` 相同：`{"instance_id", "alerts", "networks": [...]}`（`alerts` 为可选的节点级告警，见上表），每项依请求顺序给出 `tag`、`running`、`error`（运行时为空串）、`address`（本机虚拟地址带前缀长度，如 `10.150.0.5/16`，没有时为空串）、`forward_secrecy`、`peers[{ "address", "subnets", "via", "hops", "latency_ms", "forward_secrecy" }]`（`via` 为途经的中继虚拟地址，直连为空；`latency_ms` 未测到为 `null`，需求 R16）、`failure`（同快照的 `network.failure`：`null` 或 `{ "code", "detail" }`，取值与优先级见上；暂缓的网络 `running` 为 `false`、`failure.code` 为 `native_keys_pending`，**不**发 `start_refused` 告警，Agent 只把 `failure` 转为同码告警上报面板）、`rejected_advertisements`（被拒的子网通告数）、`overlaps`（重叠网段，R16、R17）、`alerts[{ "code", "address", "peer", "detail" }]`。内核给出的 `code`：`address_conflict`、`address_unmanaged`（R29）、`start_refused`（`detail` 写原因）；`address`、`peer`（成员实例 ID）不适用时为空串。字段名与面板 `mesh.status` 一致，Agent 把 `tag` 换回地区代码后原样上报。
+- 应答与 `GET` 相同：`{"instance_id", "alerts", "networks": [...]}`（`alerts` 为可选的节点级告警，见上表），每项依请求顺序给出 `tag`、`running`、`error`（运行时为空串）、`address`（本机虚拟地址带前缀长度，如 `10.150.0.5/16`，没有时为空串）、`forward_secrecy`、`peers[{ "address", "subnets", "via", "hops", "latency_ms", "forward_secrecy" }]`（`via` 为途经的中继虚拟地址，直连为空；`latency_ms` 未测到为 `null`，需求 R16）、`failure`（同快照的 `network.failure`：`null` 或 `{ "code", "detail" }`，取值与优先级见上；暂缓的网络 `running` 为 `false`、`failure.code` 为 `native_keys_pending`，**不**发 `start_refused` 告警，Agent 只把 `failure` 转为同码告警上报面板）、`rejected_advertisements`（被拒的子网通告数）、`overlaps`（重叠网段，R16、R17）、`alerts[{ "code", "address", "peer", "detail" }]`。内核给出的 `code`：`address_conflict`、`address_unmanaged`（R29）、`start_refused`（`detail` 写原因）、`sync_oversize`（同步超限，网络运行期间一直保留最后一次：规范 §11.2 收到的 RPC body 超过 8 MiB 被丢弃，`detail` 以 `received:` 开头，写已达到的字节数与发送方节点 ID；或 §12.2 连接图截短一半后仍未在第二个 60 秒内送达、与该邻居的同步会话被关闭，`detail` 以 `undelivered:` 开头，写邻居节点 ID；或节点信息表已满（4095 条，§12.3、§12.4）而拒收新节点、为直连邻居淘汰可达节点，或超过 16 MiB 存储预算而拒收，`detail` 以 `capacity:` 开头，写两类累计次数，此时成员数不会超过上限，不能据此判断规模。前两种附累计次数；同一网络可同时带多条 `sync_oversize`）；`address`、`peer`（成员实例 ID）不适用时为空串。字段名与面板 `mesh.status` 一致，Agent 把 `tag` 换回地区代码后原样上报。
 - 内核不持久化这些网络：重启后 Agent 重新发送最后一次 `PUT`。内核只在状态目录（`anixcore` 配置的 `mesh_state_dir`，缺省 `/var/lib/anixcore/mesh`，权限 0700）保存本设备的 `instance_id` 与各网络的静态密钥（`keys/` 下按 `network.name` 的摘要命名，0600；配置带 `node.private_key` 时用它）。网络移出列表时密钥保留，再次加入仍用同一密钥，面板已列入的 `native_keys` 不失效。状态目录不可用时内核不列 `mesh`。
 - 实现（Linux，`apps/mesh-node` 的 `managed`）：每个运行中的网络各有一组监听、一块虚拟网卡（`anixmesh-<n>`，取最小未用编号）和一个驱动。`PUT` 中与上次相同的网络不中断；只有 `native_keys` 变化的运行中网络把新清单交给驱动，不重启：清单外对端的直连与中继会话断开、路由信息删除，其余照常；新清单不再含本机公钥时该网络停下并转为暂缓。启动失败的网络在下一次 `PUT` 时重试。端口占用、网卡占用、无权限分别给出 `failure.code` `port_in_use`、`tun_in_use`、`permission_denied`，其余为 `start_refused`，都带 `start_refused` 告警。
 - `peers[]` 每项取该成员的第一个虚拟地址；`latency_ms` 只给直连成员（经中继的成员为 `null`）；`alerts` 中的 `address_conflict` 为声称本机虚拟地址的成员（`peer` 暂为空串）。`address_unmanaged` 待地址分配（0.4）实现。
@@ -152,6 +164,14 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `native_keys_unsupported` | 内核 `features` 不含 `mesh_native_keys`：`kind = managed` 的网络不下发（包括内核重启后的重发），`legacy` 网络照常 |
 | `invalid_kind` | 面板下发的 `network.kind` 不是 `managed` 或 `legacy`：Agent 扣下该网络，不交给内核 |
 | `peer_not_native` | 由内核 `failure.code = peer_not_native` 转来，另带 `peer`（内核给出的 `detail`，被拒对端的节点 ID） |
+| `external_bridge_unsupported` | 网络带 `external_bridge`，但内核 `features` 不含 `mesh_external_bridge`：Agent 照常下发该网络，去掉 `external_bridge` 节，并对该网络上报此告警（面板 #647 审计 M-2，anix-agent #203） |
+| `paths_unsupported` | 网络配置了 `routing.paths`，但内核 `features` 不含 `mesh_paths`：Agent 对该网络下发 `routing.paths = []`，其余配置照常，并对该网络上报此告警（anix-agent #211） |
+
+`mesh.status` 中每个网络的 `externalBridge` 有三种情况（anix-agent #202 审计 M1、#203）：
+
+- 摘要对象：内核给出的桥接摘要，原样上报。
+- `null`：内核明确给出 `null`，表示该网络没有运行桥接，原样上报。
+- 不带该键：Agent 不知道内核当前的桥接情况（网络被扣下、下发失败、等待接管、读不到内核、内核应答没有这个键）。缺省**不能**当作「无桥接」。
 
 ## 命令
 
@@ -166,6 +186,7 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `mesh_set_relay` / `mesh_set_host_mode` | `network`、`enabled`；仅完整节点 | 0.4 |
 | `mesh_advertise` / `mesh_withdraw` | `network`、`cidr`；仅完整节点，须在内网范围内 | 0.4 |
 | `mesh_request_region` | `network`、`region`、可省的 `reason`（去掉首尾空白后截到 500 个字符）；由网络管理者批准。内核生成申请 `id`，每个网络只保留最新一条 | 0.4 |
+| `mesh_withdraw_region_request` | `network`；撤回本机在该网络的迁区申请：替换未被取走的申请记录为一条 `withdraw: true` 的记录（没有记录时新建一条），由 Agent 取走后转给面板。没有待处理申请时返回 `not_found` | 0.4（能力 `mesh_region_request_state`） |
 | `mesh_set_policy` | `network`、`policy` | 0.5 |
 | `mesh_set_paths` | `network`、`paths`（与 `routing.paths` 同结构） | 0.5 |
 | `mesh_join_credential` | `credential`：一次性入网凭据 | 0.5 |
