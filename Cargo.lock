@@ -2064,11 +2064,14 @@ dependencies = [
  "libc",
  "outbound-mesh",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "toml",
+ "webpki-roots",
  "windows-sys 0.61.2",
 ]
 

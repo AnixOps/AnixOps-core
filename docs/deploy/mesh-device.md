@@ -13,7 +13,7 @@
 | `subnet-request --state-dir DIR [--cidr CIDR]...` | 申请通告局域网网段（仅完整节点；至多 16 个内网网段；不带 `--cidr` 为撤回），由管理员在面板批准后经配置下发；面板不提供申请状态查询，LuCI 对比下发的 `subnets.advertise` 自行判断；LuCI 经 rpcd 调用 | 0 已提交（202）；2 用法或状态目录错误（含主机位非零的网段，不做规范化）；8 令牌失效（401）；9 面板不可达或应答无效；10 面板拒绝（400 `invalid_request`，或接入端申请时 409 `mesh_conflict`），标准错误末行 JSON 的 `detail` 带面板返回的 `code` |
 | `device-status --state-dir DIR` | 经本机状态套接字读取快照（JSON），供 LuCI 与排障 | 0；1 服务未运行 |
 
-`capabilities` 的命令列表包含 `enroll`、`device`、`device-status` 时，安装器才走无 Agent 路径。受管组网目前只在 Linux 编译，所以这三个命令首先在 Linux 与 OpenWrt 提供；macOS、Windows 的无 Agent 运行在受管组网移植后再列出。
+`capabilities` 的命令列表包含 `enroll`、`device`、`device-status` 时，安装器才走无 Agent 路径。受管组网目前只在 Linux 编译，所以这四个命令（含 `subnet-request`）只在 Linux 与 OpenWrt 的构建中列出；macOS、Windows 的无 Agent 运行在受管组网移植后再列出。`--state-dir` 省略时为默认状态目录。实现见 `apps/mesh-node/src/device_run.rs`（传输 `https.rs`，状态套接字 `local_status.rs`）。
 
 凭据从文件读取（安装器写入 0600 临时文件，用后删除），不从命令行参数读取，避免出现在进程列表与 shell 历史中。
 
@@ -28,6 +28,7 @@
 | `config.json` | 0600 | 最近一份通过校验的 `networks`（含网络密钥） |
 | `instance_id`、`keys/` | 0600 | 受管组网的实例 ID 与各网络静态密钥（布局同 anixcore） |
 | `status.sock` | 0660，属组 `anixops-mesh` | 本机状态套接字（见下文） |
+| `device.lock` | 0600 | `device` 运行期间持有的排他锁，防止同一状态目录上同时运行两个服务（由系统在进程退出时释放） |
 
 `device_key`：首次接入时由系统随机数生成 32 字节，标准 base64 编码（44 个字符），此后一直沿用；重新接入同一设备必须使用同一值（面板以之核对）。删除状态目录即放弃该设备身份，需要管理员为新设备签发凭据。
 
@@ -37,8 +38,9 @@
 2. `POST {control}/api/v5/mesh/device/enroll`，请求体 `{"token","device_key","latencies","features"}`；不带 `static_key`（网络公钥在取得配置后才生成，由首次上报提交）。
    - `latencies`：`--latency` 给出的地区时延；未给出时为空对象。无 Agent 安装应由管理员在签发凭据时指定地区（完整节点必须指定），面板无法核实设备自报的时延。
    - `features`：本程序受管组网支持的能力名单，与 `GET /v1/status` 的 `features` 同一来源。
-3. 201：校验应答（见「配置校验」），依次写入 `device.json`、`token`、`config.json`（各自先写临时文件再改名）。应答丢失或写入失败时，同一凭据与同一 `device_key` 在 10 分钟内可以重试（面板保证），程序不自动重试，由安装器提示重新执行。
-4. 401、409：退出码 8，不写任何文件。其他状态码、超时或应答无效：退出码 9。
+3. 发出请求之前先写入 `device.json`（还没有 `device_id`）：状态目录里已有 `device.json` 时沿用其中的 `device_key`，否则新生成一个。这样应答丢失后重新执行时用的是同一个 `device_key`。
+4. 201：校验应答（见「配置校验」），依次写入带 `device_id` 的 `device.json`、`token`、`config.json`（各自先写临时文件再改名）。应答丢失或写入失败时，同一凭据与同一 `device_key` 在 10 分钟内可以重试（面板保证），程序不自动重试，由安装器提示重新执行。成功时标准输出为 `{"ok":true,"device_id":5,"networks":1}`。
+5. 401、409：退出码 8，除第 3 步的 `device.json` 外不写任何文件。其他状态码、超时或应答无效：退出码 9。
 
 ## 常驻服务
 
