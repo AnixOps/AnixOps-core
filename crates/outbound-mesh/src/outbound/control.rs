@@ -7,6 +7,7 @@
 //! Every answer is JSON: `{"ok": true}`, the snapshot for `mesh_status`, or
 //! `{"ok": false, "error": {"code", "detail"}}`.
 
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -17,28 +18,72 @@ use crate::{IpNet, MeshConfig};
 
 /// The commands of kernel 0.3 this module answers. Every other `mesh_*`
 /// command answers `unsupported`.
-#[derive(Deserialize)]
-#[serde(tag = "cmd", deny_unknown_fields)]
 pub enum Command {
-    #[serde(rename = "mesh_status")]
     Status {
-        #[serde(default)]
         network: Option<String>,
     },
-    #[serde(rename = "mesh_join")]
-    Join { network: String },
-    #[serde(rename = "mesh_leave")]
-    Leave { network: String },
-    #[serde(rename = "mesh_remove_network")]
-    Remove { network: String },
-    #[serde(rename = "mesh_save_network")]
-    Save { config: Value },
-    #[serde(rename = "mesh_set_subnet_route")]
+    Join {
+        network: String,
+    },
+    Leave {
+        network: String,
+    },
+    Remove {
+        network: String,
+    },
+    /// Read straight from the request into the config, whose secret and
+    /// private key are wiped when dropped: no copy of them stays in an
+    /// intermediate JSON value.
+    Save {
+        config: Box<MeshConfig>,
+    },
     SetSubnetRoute {
         network: String,
         cidr: String,
         route: Route,
     },
+}
+
+/// The command name of a request; every other field is skipped unread.
+#[derive(Deserialize)]
+struct Head {
+    #[serde(default)]
+    cmd: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusArgs {
+    #[allow(dead_code)]
+    cmd: IgnoredAny,
+    #[serde(default)]
+    network: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkArgs {
+    #[allow(dead_code)]
+    cmd: IgnoredAny,
+    network: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveArgs {
+    #[allow(dead_code)]
+    cmd: IgnoredAny,
+    config: Box<MeshConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubnetRouteArgs {
+    #[allow(dead_code)]
+    cmd: IgnoredAny,
+    network: String,
+    cidr: String,
+    route: Route,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -75,34 +120,59 @@ const UNSUPPORTED: &[&str] = &[
 ];
 
 /// Reads `request` when its `cmd` is a `mesh_*` command other than
-/// `mesh_engine_stop` (which the caller answers); `None` otherwise.
-pub fn parse(request: &Value) -> Option<Request> {
-    let name = request.get("cmd")?.as_str()?;
+/// `mesh_engine_stop` (which the caller answers); `None` otherwise,
+/// including for a request that is not a JSON object.
+pub fn parse(request: &[u8]) -> Option<Request> {
+    // An object only: the derived readers would also take an array.
+    if request.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    let name = serde_json::from_slice::<Head>(request).ok()?.cmd?;
     if !name.starts_with("mesh_") || name == "mesh_engine_stop" {
         return None;
     }
-    if UNSUPPORTED.contains(&name) {
-        return Some(Request::Unsupported(name.to_owned()));
+    if UNSUPPORTED.contains(&name.as_str()) {
+        return Some(Request::Unsupported(name));
     }
-    Some(match Command::deserialize(request) {
+    let command = match name.as_str() {
+        "mesh_status" => {
+            serde_json::from_slice::<StatusArgs>(request).map(|args| Command::Status {
+                network: args.network,
+            })
+        }
+        "mesh_join" => serde_json::from_slice::<NetworkArgs>(request).map(|args| Command::Join {
+            network: args.network,
+        }),
+        "mesh_leave" => serde_json::from_slice::<NetworkArgs>(request).map(|args| Command::Leave {
+            network: args.network,
+        }),
+        "mesh_remove_network" => {
+            serde_json::from_slice::<NetworkArgs>(request).map(|args| Command::Remove {
+                network: args.network,
+            })
+        }
+        "mesh_save_network" => {
+            serde_json::from_slice::<SaveArgs>(request).map(|args| Command::Save {
+                config: args.config,
+            })
+        }
+        "mesh_set_subnet_route" => {
+            serde_json::from_slice::<SubnetRouteArgs>(request).map(|args| Command::SetSubnetRoute {
+                network: args.network,
+                cidr: args.cidr,
+                route: args.route,
+            })
+        }
+        _ => return Some(Request::Unsupported(name)),
+    };
+    Some(match command {
         Ok(command) => Request::Command(command),
-        Err(_) if is_known(name) => Request::Invalid(format!(
+        // The parser's message may quote the request: only the command is
+        // named.
+        Err(_) => Request::Invalid(format!(
             "{name}: arguments missing, unknown or of the wrong type"
         )),
-        Err(_) => Request::Unsupported(name.to_owned()),
     })
-}
-
-fn is_known(name: &str) -> bool {
-    matches!(
-        name,
-        "mesh_status"
-            | "mesh_join"
-            | "mesh_leave"
-            | "mesh_remove_network"
-            | "mesh_save_network"
-            | "mesh_set_subnet_route"
-    )
 }
 
 impl Command {
@@ -137,20 +207,16 @@ fn execute(command: Command, registry: Option<&Registry>) -> Value {
             _ => refused(RegistryError::NotFound),
         };
     };
+    let starts = command.starts_engine();
     let result = match command {
         Command::Status { .. } => unreachable!("answered above"),
         Command::Join { network } => registry.join(&network),
         Command::Leave { network } => registry.leave(&network),
         Command::Remove { network } => registry.remove(&network),
-        Command::Save { config } => {
-            let settings = serde_json::from_value::<MeshConfig>(config)
-                .map_err(|_| "mesh config: fields missing, unknown or of the wrong type")
-                .and_then(MeshConfig::validate);
-            match settings {
-                Ok(settings) => registry.save(settings),
-                Err(detail) => return error("invalid_argument", detail),
-            }
-        }
+        Command::Save { config } => match (*config).validate() {
+            Ok(settings) => registry.save(settings),
+            Err(detail) => return error("invalid_argument", detail),
+        },
         Command::SetSubnetRoute {
             network,
             cidr,
@@ -171,6 +237,8 @@ fn execute(command: Command, registry: Option<&Registry>) -> Value {
     };
     match result {
         Ok(()) => json!({"ok": true}),
+        // The engine stopped meanwhile: it holds no network any more.
+        Err(RegistryError::Closed) if !starts => refused(RegistryError::NotFound),
         Err(refusal) => refused(refusal),
     }
 }
@@ -312,7 +380,10 @@ mod tests {
     }
 
     fn run(registry: Option<&Registry>, request: Value) -> Value {
-        answer(parse(&request).expect("a mesh command"), registry)
+        answer(
+            parse(request.to_string().as_bytes()).expect("a mesh command"),
+            registry,
+        )
     }
 
     fn code(answer: &Value) -> &str {
@@ -321,9 +392,36 @@ mod tests {
 
     #[test]
     fn only_mesh_commands_other_than_the_engine_stop_are_parsed_here() {
-        assert!(parse(&json!({"cmd": "traffic"})).is_none());
-        assert!(parse(&json!({"cmd": "mesh_engine_stop"})).is_none());
-        assert!(parse(&json!({"no": "cmd"})).is_none());
+        let parsed = |request: Value| parse(request.to_string().as_bytes());
+        assert!(parsed(json!({"cmd": "traffic"})).is_none());
+        assert!(parsed(json!({"cmd": "mesh_engine_stop"})).is_none());
+        assert!(parsed(json!({"no": "cmd"})).is_none());
+        // `mesh_` elsewhere than in the command does not make it a mesh
+        // request.
+        assert!(parsed(json!({"cmd": "traffic", "note": "mesh_status"})).is_none());
+        assert!(parsed(json!({"cmd": 7, "mesh_status": true})).is_none());
+        assert!(parse(b"mesh_status").is_none());
+        assert!(parse(b"[\"mesh_status\"]").is_none());
+        // Deep nesting is refused, never taken as a command: the command
+        // name is read past it without recursing, the arguments are not.
+        let deep = format!(
+            "{{\"cmd\":\"mesh_status\",\"x\":{}{}}}",
+            "[".repeat(10_000),
+            "]".repeat(10_000)
+        );
+        assert!(matches!(parse(deep.as_bytes()), Some(Request::Invalid(_))));
+        let deep = format!(
+            "{{\"cmd\":\"mesh_status\",\"network\":{}\"a\"{}}}",
+            "[".repeat(10_000),
+            "]".repeat(10_000)
+        );
+        assert!(matches!(parse(deep.as_bytes()), Some(Request::Invalid(_))));
+        // A large request of another command is left alone.
+        let large = format!(
+            "{{\"cmd\":\"traffic\",\"pad\":\"{}\"}}",
+            "mesh_".repeat(100_000)
+        );
+        assert!(parse(large.as_bytes()).is_none());
         for name in ["mesh_set_dns", "mesh_set_paths", "mesh_something_later"] {
             let answer = run(None, json!({"cmd": name}));
             assert_eq!(code(&answer), "unsupported", "{name}");

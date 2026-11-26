@@ -108,15 +108,13 @@ impl OutboundFactory for MeshFactory {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // One device has one instance ID (`mesh-module.md`,
-        // `node.instance_id`): a profile whose networks name different ones,
-        // or another one than a network the engine already holds, is
-        // refused.
+        // `node.instance_id`): a profile whose networks name different ones
+        // is refused. Only the profile is checked, not the engine, so that
+        // building never depends on the networks running now; the engine
+        // takes the profile's ID at commit.
         let conflicting = built.iter().any(|other| {
             other.network_name != settings.network_name && other.instance_id != settings.instance_id
-        }) || binding
-            .slot
-            .current()
-            .is_some_and(|engine| engine.registry().conflicts(&settings));
+        });
         if conflicting {
             return Err("mesh node instance_id differs from that of another mesh network");
         }
