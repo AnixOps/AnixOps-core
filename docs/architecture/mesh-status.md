@@ -66,6 +66,7 @@
 | 宿主组（0.5） | 组内虚拟机（`members[].vms`）没有单独的路径状态。组地址段在 `subnets[]` 中的 `path` 按该地址段匹配到的路径给出：有包含它的 `to_subnet` 路径时按最长前缀的那一条，否则按到网关的路径（规范 §17.2.2 第 6 条，需求 R25） |
 | `subnet.state` | `ok`、`unreachable`、`refused`（内网范围外，列出但不装路由，需求 R17） |
 | `subnet.route` | `mesh`、`local`（与本机网络重叠时默认 `local`） |
+| `refusedAdvertisements` | 整数：该网络被拒绝的子网通告条数（内网范围外、与虚拟网段重叠等，不装路由），与 `GET /v1/mesh` 的 `rejected_advertisements` 同值；被拒的网段本身以 `subnets[]` 中 `state = refused` 列出 |
 | `subnet.kind`（0.4） | `lan`（成员通告的局域网子网，缺省值）、`host_group`（宿主组地址段）、`external`（外部网络地址，规范 §15.12）、`summary`（边界节点通告的其他地区汇总网段，规范 §15.6 第 3 条）。按下列顺序取第一条成立的：① `cidr` 与本网络配置 `host_groups[].cidr` 完全相同 → `host_group`；② `cidr` 与配置 `external_routes[].cidr` 完全相同 → `external`；③ 当前在用的通告者全部是本区域的边界节点（`role = border`），且 `cidr` 不在本网络虚拟网段内 → `summary`；④ 其余 → `lan`。内核无法把配置中的设备实例 ID 对应到线上成员（成员 `id` 见上），所以 ①② 只按 `cidr` 完全相同判断；本机就是配置中的网关或桥接节点时，以本机实际是否在通告为准。这只是显示分类，不作为身份判断，界面不据此提示冒用。缺省或不认识的取值，客户端按 `lan` 显示（这是「未知枚举按 `other`」的例外） |
 | `subnet.hostGroup`（0.4） | 只在 `kind = host_group` 时给出：`{ "gateway", "backupGateway" }`，为配置中的设备实例 ID，与成员 `id` 不是同一命名空间；界面显示当前网关时用 `advertisers[]` 中在用的成员；没有备用网关时 `backupGateway` 为 `null`。组内设备列表见 `members[].vms` |
 | `subnet.region`（0.4） | `kind = summary` 时为该网段所属的其他地区代码：边界节点上取骨干汇总路由交换（规范 §17.3.3）中通告者所在地区；普通成员上取顶层 `regions[]` 中虚拟子网包含该网段的地区，查不到（例如其他地区的业务网段）时为 `null`。其他 `kind` 为本区域代码或 `null` |
