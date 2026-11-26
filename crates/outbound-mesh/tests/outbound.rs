@@ -73,8 +73,9 @@ async fn a_connection_and_a_flow_reach_the_other_node() {
             stream.read_exact(&mut buffer).await.unwrap();
             stream.write_all(&buffer).await.unwrap();
             stream.flush().await.unwrap();
-            // Keep the connection until the client has read the echo.
-            let _ = stream.read(&mut buffer).await;
+            // Keep the connection open while the client checks that
+            // retiring its network ends it.
+            let _ = timeout(Duration::from_secs(3), stream.read(&mut buffer)).await;
         })
     };
 
@@ -97,7 +98,6 @@ async fn a_connection_and_a_flow_reach_the_other_node() {
         .expect("echo in time")
         .unwrap();
     assert_eq!(&echo, b"hello");
-    drop(stream);
     timeout(Duration::from_secs(10), accepting)
         .await
         .expect("server done")
@@ -122,6 +122,18 @@ async fn a_connection_and_a_flow_reach_the_other_node() {
     let health = client.health().unwrap();
     assert_eq!(health["running"], json!(true));
     assert_eq!(health["failure"], json!(null));
+
+    // Retiring the network ends the connection it still carries, and no
+    // new one opens on it.
+    client.instance().retire();
+    assert!(stream.write_all(b"more").await.is_err());
+    let error = client
+        .connect(&target("10.144.0.1:7000"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+    assert_eq!(client.health().unwrap()["running"], json!(false));
 }
 
 #[tokio::test]

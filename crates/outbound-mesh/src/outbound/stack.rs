@@ -372,18 +372,20 @@ impl Instance {
     /// Starts a driver unless one runs. Fails at once for a network that
     /// waits for its key list.
     pub(crate) fn ensure_running(self: &Arc<Self>) -> io::Result<()> {
-        if self.lock().retired {
-            return Err(Failure::Replaced.error());
-        }
-        if self
+        let waits = self
             .settings
-            .waits_for_native_keys(&self.static_key.public())
-        {
-            self.lock().failure = Some(Failure::NativeKeysPending);
-            return Err(Failure::NativeKeysPending.error());
-        }
+            .waits_for_native_keys(&self.static_key.public());
         let run = {
+            // One lock for the checks and the start, so that a retire()
+            // in between cannot be undone.
             let mut core = self.lock();
+            if core.retired {
+                return Err(Failure::Replaced.error());
+            }
+            if waits {
+                core.failure = Some(Failure::NativeKeysPending);
+                return Err(Failure::NativeKeysPending.error());
+            }
             if core.running {
                 return Ok(());
             }
@@ -433,7 +435,7 @@ impl Instance {
     /// other settings: the driver stops at once (it would keep the old
     /// `native_keys` and dial with the same identity as the new one) and
     /// every connection ends, however long it would have lived.
-    pub(crate) fn retire(&self) {
+    pub fn retire(&self) {
         let mut core = self.lock();
         core.retired = true;
         core.running = false;
@@ -558,7 +560,8 @@ impl Instance {
     /// Ends the driver `run`, failing every connection.
     fn stopped(&self, run: u64, failure: Failure) {
         let mut core = self.lock();
-        if core.run != run {
+        // Only the first report of a run counts.
+        if core.run != run || !core.running {
             return;
         }
         core.running = false;
@@ -571,6 +574,13 @@ impl Instance {
 
 /// Binds the listeners, then runs the driver and the pump for `run`.
 async fn start_driver(instance: Arc<Instance>, run: u64) {
+    // Records the run as stopped if the task ends without doing so, such
+    // as when its runtime shuts down; otherwise `running` would stay set
+    // and every later connection would wait for a driver that is gone.
+    let _guard = RunGuard {
+        instance: Arc::downgrade(&instance),
+        run,
+    };
     let settings = instance.settings.clone();
     let listeners = match Listeners::bind(&settings).await {
         Ok(listeners) => listeners,
@@ -616,6 +626,19 @@ async fn start_driver(instance: Arc<Instance>, run: u64) {
     let _ = result;
     if let Some(instance) = weak.upgrade() {
         instance.stopped(run, Failure::Stopped);
+    }
+}
+
+struct RunGuard {
+    instance: Weak<Instance>,
+    run: u64,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if let Some(instance) = self.instance.upgrade() {
+            instance.stopped(self.run, Failure::Stopped);
+        }
     }
 }
 
@@ -861,6 +884,17 @@ mod tests {
         let mut socket = udp::Socket::new(buffer(), buffer());
         socket.bind(port).unwrap();
         socket
+    }
+
+    #[test]
+    fn a_full_stack_refuses_new_sockets() {
+        let mut sockets: SocketSet<'static> = SocketSet::new(Vec::new());
+        for port in 0..MAX_SOCKETS {
+            assert!(check_capacity(&sockets).is_ok());
+            sockets.add(bound_udp(FIRST_LOCAL_PORT + port as u16));
+        }
+        let error = check_capacity(&sockets).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     }
 
     #[test]
