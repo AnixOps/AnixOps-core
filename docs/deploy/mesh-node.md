@@ -26,7 +26,7 @@
 
 | 对象 | 何时输出 | 字段 |
 | --- | --- | --- |
-| 转发状态 | 启动时一次，在第一条状态行之前 | `ip_forwarding`：`on`（已为通告子网打开本机转发）、`off`（需要转发但没有打开，原因见 `detail`）、`not_needed`（本节点不通告子网，或不是完整节点）；`detail`：字符串或 `null`，只给人看。Linux 的 `run` 目前不改本机转发：本机已开转发（`net.ipv4.ip_forward`、`net.ipv6.conf.all.forwarding` 为 1）的地址族，其通告子网照常通告，输出 `on`，`detail` 说明转发由本机开启；未开转发的地址族的通告子网不通告（告警 `advertise_withdrawn`），两族都未开时输出 `off` |
+| 转发状态 | 启动时一次，在第一条状态行之前 | `ip_forwarding`：`on`（已为通告子网打开本机转发）、`off`（需要转发但没有打开，原因见 `detail`）、`not_needed`（本节点不通告子网，或不是完整节点）；`detail`：字符串或 `null`，只给人看。Linux 的 `run` 目前不改本机转发：本机已开转发（`net.ipv4.ip_forward`、`net.ipv6.conf.all.forwarding` 为 1）的地址族，其通告子网照常通告，输出 `on`，`detail` 说明转发由本机开启；未开转发的地址族的通告子网不通告（告警 `advertise_withdrawn`），两族都未开时输出 `off`。转发开关只在启动时读取一次：启动后才开转发，需要重启节点才会通告；启动后关掉转发，节点仍会通告，流量会被丢弃，也应重启节点 |
 | 状态行 | 状态变化时，内容不变不重复输出 | `interface`、`peer_id`、`neighbours`、`reachable`、`duplicate_id`、`static_key`、`not_native`、`system_routes`、`local_networks_read`、`foreign_overlaps`（含义见 `docs/architecture/mesh-status.md`） |
 | 等待公钥 | `managed` 网络的 `native_keys` 不含本机时，代替状态行输出一次 | `state`：`not_joined`；`reason`：`native_keys_pending`；`static_key`：本机静态公钥 |
 
