@@ -105,8 +105,9 @@
 //! endpoint's body limit (413) are all decided before a single body byte is
 //! read, so an unauthorized or oversized request costs no body memory. Bodies
 //! are limited per endpoint: 4 KiB for requests without one (`GET`,
-//! `DELETE`), 4 MiB for `POST /v1/inbounds/{tag}/users/remove`,
-//! `PUT /v1/network` and `PUT /v1/mesh`, 32 MiB for the rest. All bodies
+//! `DELETE`), 4 MiB for `POST /v1/inbounds/{tag}/users/remove` and
+//! `PUT /v1/network`, 32 MiB for the rest (`PUT /v1/mesh` among them: 64
+//! networks with 4096 native keys each come to about 13 MiB). All bodies
 //! in flight together share a 64 MiB budget, and at most 64 connections are
 //! served at once; past either limit a request answers 503 at once instead
 //! of waiting.
@@ -312,8 +313,9 @@ impl Endpoint {
             | Self::PutEgress
             | Self::PutRules
             | Self::PutQos
-            | Self::PutTlsFingerprints => LARGE_BODY_LIMIT,
-            Self::RemoveUsers(_) | Self::PutNetwork | Self::PutMesh => SMALL_BODY_LIMIT,
+            | Self::PutTlsFingerprints
+            | Self::PutMesh => LARGE_BODY_LIMIT,
+            Self::RemoveUsers(_) | Self::PutNetwork => SMALL_BODY_LIMIT,
             Self::Status
             | Self::ListInbounds
             | Self::RemoveInbound(_)

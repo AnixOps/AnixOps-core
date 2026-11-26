@@ -4,14 +4,24 @@
 
 ## Unreleased
 
+### Mesh
+
+- 新增组网端到端实验床（`docs/mesh-e2e.md`、`.github/scripts/mesh-e2e/`、工作流 `mesh-e2e.yml`）：每台机器一个网络命名空间，运行本仓库构建的 `anixops-mesh run`，场景按需求编号登记；12 个场景启用，0.4、0.5 的 11 个场景待对应功能合并后启用。内核 0.4 起 RC 必须该工作流全绿。
+- `anixops-mesh run` 失败时 stderr 最后一行改为符合设计文档的退出约定：启动冲突为 `{"error":"conflict","conflict":"port_in_use"|"tun_in_use","detail"}`（此前为 `{"error":"busy"}`、无冲突代码），其他运行错误为 `"error":"runtime"`（此前为 `"run"`）。退出码不变（2、3、1）。端到端场景 E10 发现。
+
 ### Release process
 
 - 发布策略加入版本节奏、候选版（RC）流程、维护分支 `release/X.Y` 与补丁维护规则（`docs/release-strategy.md`），新增兼容性承诺清单（`docs/compatibility-surface.md`）。
 - 发布工作流新增 “Release version preconditions”（`.github/scripts/release-version-check.sh`）：手动验证与标签发布都要求 `Cargo.toml` workspace 版本等于发布版本、`CHANGELOG.md` 有该版本小节；自测在 CI `policy-fast` 中运行。
 - CI 对 `release/MAJOR.MINOR` 的 push 运行；`release-policy` 与 `release-ci-gate` 接受 `main` 或与版本同一 `MAJOR.MINOR` 的维护分支，其他分支仍拒绝。
 
+### Added
+
+- 组网外部网络桥接（规范 §15.12，需求 R36，内核 0.4）新增独立 crate `mesh-bridge`：`external_bridge { interface, routes, allow }` 的配置校验（单个地址可在 100.64.0.0/10 与 fd7a:115c:a1e0::/48 内，网段须在白名单内且不与这两个范围重叠，拒绝默认路由、主机位非零、名单与通告重叠，各原因码见 `docs/architecture/mesh-bridge.md`）；每个组网网卡一张 nftables 表、整表原子替换：只放行名单内来源到通告地址并做源地址转换，外部网络进来的新连接与名单外来源丢弃并计数；IPv4 转发按需打开并在最后一个桥接拆除后恢复，IPv6 转发只告警不修改；`externalBridge` 状态摘要（`docs/architecture/mesh-status.md` 共用测试向量）只在规则全部装好后更新。CI 新增作业「Mesh external bridge (nftables)」在网络命名空间中用真实 nftables 验证。已接入组网配置与节点程序：`external_bridge` 为每个网络的顶层可选字段（只接受 Linux 完整节点），`routes` 并入本节点的子网通告；节点程序先取主机级锁 `/run/anixops-mesh-host.lock`、探测 nftables 并清除上次运行残留的桥接表，都成功后才声明能力 `mesh_external_bridge`；网络启动后安装桥接、停止时拆除，只改 `allow` 时不重启网络；`GET /v1/mesh` 每个网络给出 `externalBridge`（对象、`null` 或省略），另有节点级 `alerts`（取不到锁时为 `external_bridge_lock_held`）。启动与退出清理、名单收窄时删除经桥接源地址转换的连接跟踪条目。
+
 ### Security
 
+- 组网自定义路径（规范 §17.2，内核 0.5，尚未审计）在默认配置下对远端不可达：新增 `node.waypoint_relay`（默认 `false`，需要 `node.relay`）。为 `false` 且网络没有 `routing.paths` 时，节点对 `MeshPathRpc` 回 Error 3，丢弃全部类型 40 包并计数；只有打开该开关的节点才作为途经点（`Capabilities.relay`）。
 - anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。
 
 - anixops-mesh 接管按 #329 复审修复（mesh-node `detect`、`takeover`、`host`、`winsvc`、`launchd`，三个安装脚本）：K1 数据来源按所运行的系统选择，Windows 上不再读取 `/proc`、`/etc`、`/var/spool/cron`、`/run/systemd`（在 Windows 上是任何用户可建的 `C:\proc` 等目录，可伪造进程、自启行与导入配置）；K2 Windows 安装脚本对 `%ProgramData%\AnixOps`、`Mesh`、`state` 逐级拒绝链接与非管理员属主，属主设为 Administrators 并整体替换访问列表，程序在 Windows 上读写状态与锁之前逐级检查目录属主、访问列表与联接；K3 macOS 程序改放 `/Library/AnixOps/mesh/bin`；K4 Windows 记录手动进程的 SID，回滚账户不同时不启动；K5 包装服务与 K6 launchd 任务按进程树认领进程；K7 缺少延迟启动标志时从注册表读取；K8 安装脚本区分退出码 1 与 7、文档修正、补 `save record` 测试与 Windows 状态目录的实机测试。
@@ -52,6 +62,8 @@
 
 ### Added
 
+- anixops-mesh 无 Agent 设备扩展到 macOS 与 Windows（R31）：受管组网、`enroll`、`device`、`device-status`、`subnet-request` 在 Linux、macOS、Windows 构建中都编译并列入 `capabilities`，行为与退出码相同。macOS 状态目录 `/Library/Application Support/AnixOps/mesh/device`（安装器建为 root:admin 0710，程序自建为 0700；`instance_id` 等文件一律 0600），状态套接字属组 `admin`；Windows 状态目录 `%ProgramData%\AnixOps\Mesh\device` 由 `enroll` 一次性创建并只对 SYSTEM 与 Administrators 开放，状态接口为按状态目录命名的命名管道（本机 Users 只能连接与读写请求，拒绝远程客户端，以首个实例创建；客户端只请求 `FILE_GENERIC_READ | FILE_WRITE_DATA`，非管理员也能读取状态；只信任 SYSTEM、Administrators 或本人所有的管道，并禁止服务端冒充）。状态接口绑定失败时记录 `status_socket` 后每 10 秒重试，成功时记录 `status_socket_bound`。macOS 以 launchd 守护进程 `com.anixops.mesh.device` 运行（`KeepAlive` 以 `token` 存在为条件，令牌失效后不再拉起；`Umask` 077；日志 `/Library/Logs/anixops-mesh-device.log` 为 root:admin 0640，`--purge` 一并删除）；Windows 以服务 `AnixOpsMeshDevice` 运行（复用 `service_windows`，退出码 8 报告为正常停止使恢复操作不重启，标准错误写入状态目录的 `device.log`）。新增安装器 `install-device-macos.sh`、`install-device-windows.ps1`（放置程序、接入、注册并启动服务，`--uninstall`/`-Uninstall` 删除服务与程序，状态目录默认保留），CI 在 macos-26 与 windows-latest 上以模拟面板（私有 CA）冒烟测试安装、接入、上报、重复安装、令牌吊销与卸载。受管组网在这两个平台上暂不做主机转发与防火墙改动（与 Linux 相同）。
+- anixops-mesh 无 Agent 设备（R31、R32、R35，仅 Linux 与 OpenWrt 构建；`capabilities` 在这些构建中列出下列命令）：`enroll` 以一次性凭据接入并保存设备令牌与首份配置；`device` 常驻服务在同一进程运行受管组网，每 60 秒（加 0–5 秒随机偏移）读取配置、每 60 秒以及状态变化时（至多每 10 秒）上报，401 时停止网络并删除令牌后以退出码 8 结束，面板不可达时退避至 10 分钟，429 按 `Retry-After`；`subnet-request` 申请通告局域网网段；`device-status` 经本机状态套接字（`status.sock`，0660，属组 `anixops-mesh`，读写超时 3 秒）读取快照。传输只用 HTTPS，证书按内置公共根证书或 `--ca-file` 校验，连接 10 秒、整个请求 30 秒超时，不跟随重定向，应答体上限 1 MiB。`device_key` 在发出接入请求前写入 `device.json`，应答丢失后重试沿用同一值。
 - anixops-mesh 无 Agent 设备与面板交换的数据层（mesh-node `device`，R31）：接入与读取配置的应答按固定字段白名单整份校验（多余字段、非 `managed` 网络、名称不是 `mesh-<地区>` 一律拒绝，拒绝原因只含字段名与规则）；面板网络转为与 Agent 相同的 `PUT /v1/mesh` 分层配置（按本机能力决定 `dns` 与 `resolver_address`）；上报体由受管组网状态生成（`tag` 换回地区代码、按网络名附静态公钥、顶层 `features`、不报入区申请）；`--control` 只接受 `https://主机[:端口]`；凭据、令牌、时延参数校验；失败退避 60 秒起至 10 分钟与 `Retry-After`；通告网段申请体（至多 16 个内网网段，主机位非零拒绝，不做规范化）与已批准网段（各网络 `subnets.advertise` 的并集）。传输与常驻服务随后接入。
 - anixops-mesh Windows 发布随附 `wintun.dll`（amd64、arm64，Wintun 0.14.1 原样，固定 SHA-256，附许可证；CI 核对 PE 架构），`install-windows.ps1` 新增 `-WintunUrl`/`-WintunSha256` 并装到程序旁边，服务设 `sc.exe failureflag` 使失败重启对服务专用错误生效；macOS 文档注明网卡为 `utunN`（配合 #344）。
 - 文档 `docs/deploy/mesh-device.md`：无 Agent 组网设备（R31、R32、R35）的程序侧约定，即 `enroll`、`device`、`device-status` 子命令、状态目录、配置读取与上报、字段白名单校验、令牌失效与退避、本机状态套接字、OpenWrt 软件包与 LuCI 插件。

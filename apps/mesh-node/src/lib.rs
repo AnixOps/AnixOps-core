@@ -20,6 +20,10 @@ pub mod cmdline;
 pub mod convert;
 pub mod detect;
 pub mod device;
+#[cfg(windows)]
+pub mod device_log;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod device_run;
 #[cfg(target_os = "macos")]
 pub mod forward_macos;
 #[cfg(windows)]
@@ -27,9 +31,13 @@ pub mod forward_windows;
 pub mod host;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod host_routes;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod https;
 pub mod import;
 pub mod launchd;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod local_status;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod managed;
 pub mod net;
 pub mod profile;
@@ -50,6 +58,8 @@ pub mod tun;
 #[cfg(windows)]
 #[path = "tun_windows.rs"]
 pub mod tun;
+#[cfg(windows)]
+pub mod win_security;
 pub mod winstart;
 pub mod winsvc;
 
@@ -62,11 +72,34 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// replace it. `run` exists on Linux but is not listed until the
 /// interoperability tests against third-party nodes pass in CI, so that no
 /// installer replaces a working network with an incomplete node.
+/// `restore-host` puts back host changes a node that died left; the
+/// uninstallers run it.
+///
+/// `enroll`, `device`, `device-status` and `subnet-request` (the device
+/// without the Agent, `docs/deploy/mesh-device.md`) run the managed mesh,
+/// which is built on Linux, macOS and Windows, so they are listed there.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub const COMMANDS: &[&str] = &[
     "capabilities",
     "detect",
     "import",
+    "restore-host",
     "rollback",
+    "takeover",
+    "version",
+];
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub const COMMANDS: &[&str] = &[
+    "capabilities",
+    "detect",
+    "device",
+    "device-status",
+    "enroll",
+    "import",
+    "restore-host",
+    "rollback",
+    "subnet-request",
     "takeover",
     "version",
 ];

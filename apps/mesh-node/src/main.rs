@@ -22,6 +22,12 @@ const USAGE: &str = "usage:
   anixops-mesh takeover --profile FILE --state-dir DIR [--dry-run] [--report FILE]
   anixops-mesh rollback --state-dir DIR [--forget-process PID... --confirm] [--report FILE]
   anixops-mesh run      --config FILE [--interface NAME]
+  anixops-mesh restore-host
+  anixops-mesh enroll   --control URL --token-file FILE --state-dir DIR
+                        [--latency CODE=MS]... [--ca-file FILE]
+  anixops-mesh device   --state-dir DIR
+  anixops-mesh device-status --state-dir DIR
+  anixops-mesh subnet-request --state-dir DIR [--cidr CIDR]...
   anixops-mesh capabilities
   anixops-mesh version";
 
@@ -45,6 +51,14 @@ struct Options {
     confirm: bool,
     /// Arguments after `--`: import this command line instead of detecting.
     manual: Option<Vec<String>>,
+    /// `enroll`: Control's address, the credential file, region latencies
+    /// and a private CA.
+    control: Option<String>,
+    token_file: Option<PathBuf>,
+    latencies: Vec<String>,
+    ca_file: Option<PathBuf>,
+    /// `subnet-request`: the networks asked for.
+    cidrs: Vec<String>,
 }
 
 fn fail(kind: &str, detail: &str) -> ExitCode {
@@ -75,6 +89,11 @@ fn parse(args: &[String]) -> Result<Options, String> {
         forget: Vec::new(),
         confirm: false,
         manual: None,
+        control: None,
+        token_file: None,
+        latencies: Vec::new(),
+        ca_file: None,
+        cidrs: Vec::new(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -101,6 +120,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--confirm" => options.confirm = true,
+            "--control" => options.control = Some(take(args, &mut index, arg)?),
+            "--token-file" => {
+                options.token_file = Some(PathBuf::from(take(args, &mut index, arg)?));
+            }
+            "--latency" => options.latencies.push(take(args, &mut index, arg)?),
+            "--ca-file" => options.ca_file = Some(PathBuf::from(take(args, &mut index, arg)?)),
+            "--cidr" => options.cidrs.push(take(args, &mut index, arg)?),
             "--" => {
                 options.manual = Some(args[index..].to_vec());
                 break;
@@ -149,11 +175,57 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     match mesh_node::serve::run(config, options.interface.as_deref()) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(failure) => {
+            eprintln!("{}", failure.json());
+            Err(ExitCode::from(failure.exit_code()))
+        }
+    }
+}
+
+/// The device without the Agent: `enroll`, `device`, `device-status`,
+/// `subnet-request`. Errors are one JSON line on standard error with the
+/// exit code of `docs/deploy/mesh-device.md`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn run_device(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
+    use mesh_node::device_run::{self, EnrollOptions, Exit};
+
+    let state_dir = options
+        .state_dir
+        .clone()
+        .unwrap_or_else(device_run::default_state_dir);
+    #[cfg(windows)]
+    if command == "device" {
+        return device_service_windows(state_dir);
+    }
+    let result: Result<Option<serde_json::Value>, Exit> = match command {
+        "enroll" => {
+            let (Some(control), Some(token_file)) = (&options.control, &options.token_file) else {
+                return Err(fail("usage", "--control and --token-file are required"));
+            };
+            device_run::enroll(&EnrollOptions {
+                control,
+                token_file,
+                state_dir: &state_dir,
+                latencies: &options.latencies,
+                ca_file: options.ca_file.as_deref(),
+            })
+            .map(Some)
+        }
+        "device" => device_run::device_service(&state_dir).map(|()| None),
+        "device-status" => device_run::device_status(&state_dir).map(Some),
+        _ => device_run::subnet_request(&state_dir, &options.cidrs).map(Some),
+    };
+    match result {
+        Ok(Some(answer)) => {
+            println!("{answer}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(None) => Ok(ExitCode::SUCCESS),
+        Err(exit) => {
             eprintln!(
                 "{}",
-                serde_json::json!({ "error": failure.kind(), "detail": failure.detail() })
+                serde_json::json!({ "error": exit.kind, "detail": exit.detail })
             );
-            Err(ExitCode::from(failure.exit_code()))
+            Err(ExitCode::from(exit.code))
         }
     }
 }
@@ -164,12 +236,55 @@ fn node_exit_code(config: &Path, interface: Option<&str>) -> u8 {
     match mesh_node::serve::run(config, interface) {
         Ok(()) => 0,
         Err(failure) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({ "error": failure.kind(), "detail": failure.detail() })
-            );
+            eprintln!("{}", failure.json());
             failure.exit_code()
         }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn run_device(_command: &str, _options: &Options) -> Result<ExitCode, ExitCode> {
+    Err(fail(
+        "platform",
+        "the device without the Agent runs on Linux, macOS and Windows only",
+    ))
+}
+
+/// `device` on Windows: runs as the service when the service manager
+/// started it, in the console otherwise. Started as a service, what it
+/// writes to standard error goes to `device.log` in the state directory
+/// (see `mesh_node::device_log`), and a refused or missing token (exit
+/// code 8) is reported to the service manager as a clean stop, so that the
+/// recovery actions do not start it again until it is enrolled again.
+#[cfg(windows)]
+fn device_service_windows(state_dir: PathBuf) -> Result<ExitCode, ExitCode> {
+    use mesh_node::device_run::{self, EXIT_TOKEN};
+
+    fn body(state_dir: &Path) -> u8 {
+        match device_run::device_service(state_dir) {
+            Ok(()) => 0,
+            Err(exit) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({ "error": exit.kind, "detail": exit.detail })
+                );
+                exit.code
+            }
+        }
+    }
+    let service_dir = state_dir.clone();
+    let code = mesh_node::service_windows::dispatch_with(
+        move || {
+            mesh_node::device_log::redirect_stderr(&service_dir);
+            body(&service_dir)
+        },
+        &[EXIT_TOKEN],
+    )
+    .unwrap_or_else(|| body(&state_dir));
+    if code == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(ExitCode::from(code))
     }
 }
 
@@ -203,6 +318,27 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     ))
 }
 
+/// Puts back the forwarding, rules and translation a node that died left
+/// on the host. The uninstallers run it after stopping the service.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn restore_host() -> Result<ExitCode, ExitCode> {
+    let warnings =
+        mesh_node::serve::restore_host().map_err(|error| fail("restore", &error.to_string()))?;
+    println!(
+        "{}",
+        serde_json::json!({ "restored": true, "warnings": warnings })
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn restore_host() -> Result<ExitCode, ExitCode> {
+    Err(fail(
+        "platform",
+        "the node runs on Linux, macOS and Windows only",
+    ))
+}
+
 fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
     let host = RealHost::default();
     match command {
@@ -222,6 +358,8 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         "run" => run_node(options),
+        "restore-host" => restore_host(),
+        "enroll" | "device" | "device-status" | "subnet-request" => run_device(command, options),
         "detect" => {
             if !platform_supported() {
                 return Err(fail(

@@ -7,11 +7,14 @@
 //! guard alive is cleaned up by [`recover_mesh_host`] on its next start.
 //!
 //! - One process per host holds these changes: the first call creates the
-//!   host-wide named object [`MESH_HOST_MUTEX`] (open to SYSTEM and
-//!   Administrators only) and keeps it until the process exits; a second
-//!   process, whatever it was started with, is refused instead of undoing the
-//!   first one's changes. A standard user can neither create nor open that
-//!   name in the global namespace, so it cannot be held to block the module.
+//!   named object [`MESH_HOST_MUTEX`] (open to SYSTEM and Administrators
+//!   only) in a private namespace whose boundary holds the Administrators
+//!   SID, and keeps it until the process exits; a second process, whatever it
+//!   was started with, is refused instead of undoing the first one's changes.
+//!   Only an elevated administrator can create or open that namespace, so a
+//!   standard user cannot create the name first to block the module (a name
+//!   in `Global\` could be taken first by anyone, with an access list of
+//!   their choosing).
 //! - The state directory is fixed: [`mesh_host_state_dir`], under
 //!   `%ProgramData%\AnixOps`. It is created or repaired with the protected
 //!   access list of [`crate::managed_files`] (owner Administrators, SYSTEM and
@@ -32,8 +35,10 @@
 //!   a record whose GUID no longer resolves to that LUID is not applied. When
 //!   an earlier restore of an interface failed, a new hold takes the original
 //!   value from that record instead of the current (still switched) one.
-//! - Firewall rules live in one rule group and are named from a fixed prefix
-//!   and the network name. They allow inbound TCP/UDP to this program's listen
+//! - Firewall rules live in one rule group and are named from a fixed prefix,
+//!   the network name and an identifier made once per process, so that a
+//!   removal still running from an earlier process never deletes the rules
+//!   of this one. They allow inbound TCP/UDP to this program's listen
 //!   ports (the underlay, from any address), and block inbound traffic to this
 //!   program arriving on the mesh adapter, so that no other service of the
 //!   program (a proxy inbound, a control port) is reachable from mesh members
@@ -46,13 +51,17 @@
 //!   that an async runtime is not blocked for the second the firewall cmdlets
 //!   take; the network can be added again once that has finished. A failure
 //!   is kept for [`last_firewall_error`]; [`FirewallGuard::remove`] removes
-//!   synchronously and returns the error instead.
+//!   synchronously and returns the error instead. Before the process exits
+//!   (service stop), [`finish_mesh_firewall_removals`] waits for removals
+//!   still running, which would otherwise be cut off with the process.
 //! - Source address translation is one WinNAT object per network, named
-//!   [`nat_name`], whose internal prefix is the network's IPv4 virtual
-//!   subnet, so hosts on an advertised subnet answer this machine's own
-//!   address and need no route back into the mesh. A [`NatGuard`] is held
-//!   and removed the same way as a [`FirewallGuard`] (removal on a separate
-//!   thread, failures kept for [`last_firewall_error`]).
+//!   [`nat_name`] from the network name and this process's identifier,
+//!   whose internal prefix is the network's IPv4 virtual subnet, so hosts on
+//!   an advertised subnet answer this machine's own address and need no
+//!   route back into the mesh. A [`NatGuard`] is held and removed the same
+//!   way as a [`FirewallGuard`] (removal on a separate thread that
+//!   [`finish_mesh_firewall_removals`] waits for, failures kept for
+//!   [`last_firewall_error`]).
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -70,8 +79,9 @@ pub const MESH_FIREWALL_RULE_PREFIX: &str = "AnixOpsMesh";
 pub const MESH_FORWARDING_STATE_FILE: &str = "mesh-forwarding.json";
 /// Folder under `%ProgramData%\AnixOps` that holds the state file.
 pub const MESH_HOST_STATE_DIR: &str = "mesh-host";
-/// Host-wide named object held by the one process that makes host changes.
-pub const MESH_HOST_MUTEX: &str = r"Global\AnixOpsMeshHost";
+/// Named object, in the Administrators-bounded private namespace, held by
+/// the one process that makes host changes.
+pub const MESH_HOST_MUTEX: &str = "MeshHost";
 /// Bytes of the firewall script's error output kept for diagnosis.
 const MAX_SCRIPT_ERROR: usize = 512;
 
@@ -148,21 +158,39 @@ pub fn network_label(network: &str) -> String {
     label
 }
 
-/// Names of the firewall rules created for `network`, in creation order:
-/// listen ports over UDP, listen ports over TCP, the block on the mesh
-/// adapter.
-pub fn firewall_rule_names(network: &str) -> [String; 3] {
+/// Names of the firewall rules created for `network` by the process whose
+/// identifier is `instance`, in creation order: listen ports over UDP,
+/// listen ports over TCP, the block on the mesh adapter.
+pub fn firewall_rule_names(network: &str, instance: &str) -> [String; 3] {
     let label = network_label(network);
     [
-        format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-listen-udp"),
-        format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-listen-tcp"),
-        format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-adapter-block"),
+        format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-{instance}-listen-udp"),
+        format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-{instance}-listen-tcp"),
+        format!("{MESH_FIREWALL_RULE_PREFIX}-{label}-{instance}-adapter-block"),
     ]
 }
 
-/// Name of the WinNAT object created for `network`.
-pub fn nat_name(network: &str) -> String {
-    format!("{MESH_FIREWALL_RULE_PREFIX}-{}", network_label(network))
+/// The name a state file that could not be used is moved to: a fixed name,
+/// or, when that one cannot be replaced (a file planted there), one with
+/// `instance` added.
+fn set_aside_names(instance: &str) -> [String; 2] {
+    [
+        format!("{MESH_FORWARDING_STATE_FILE}.corrupt"),
+        format!("{MESH_FORWARDING_STATE_FILE}.corrupt-{instance}"),
+    ]
+}
+
+/// Name of the WinNAT object created for `network` by the process whose
+/// identifier is `instance`, so that a removal still running from an
+/// earlier process never deletes this one's object.
+pub fn nat_name(network: &str, instance: &str) -> String {
+    format!("{}{instance}", nat_stem(network))
+}
+
+/// What every WinNAT object name of `network` starts with, before the
+/// process identifier.
+fn nat_stem(network: &str) -> String {
+    format!("{MESH_FIREWALL_RULE_PREFIX}-{}-", network_label(network))
 }
 
 /// The internal prefix of a WinNAT object, `a.b.c.d/n`, for the IPv4 subnet
@@ -330,14 +358,14 @@ impl Holdings {
 
 #[cfg(windows)]
 pub use native::{
-    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, last_firewall_error,
-    recover_mesh_host, FirewallGuard, ForwardingGuard, NatGuard,
+    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, finish_mesh_firewall_removals,
+    last_firewall_error, recover_mesh_host, FirewallGuard, ForwardingGuard, NatGuard,
 };
 
 #[cfg(not(windows))]
 pub use unsupported::{
-    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, last_firewall_error,
-    recover_mesh_host, FirewallGuard, ForwardingGuard, NatGuard,
+    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, finish_mesh_firewall_removals,
+    last_firewall_error, recover_mesh_host, FirewallGuard, ForwardingGuard, NatGuard,
 };
 
 #[cfg(not(windows))]
@@ -416,6 +444,8 @@ mod unsupported {
     pub fn last_firewall_error() -> Option<String> {
         None
     }
+    /// Waits for rule removals still running; none here.
+    pub fn finish_mesh_firewall_removals() {}
 }
 
 #[cfg(windows)]
@@ -423,9 +453,9 @@ mod native {
     use super::*;
     use std::mem::zeroed;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::OwnedHandle;
     use std::process::Stdio;
     use std::sync::{Mutex, MutexGuard};
+    use std::thread::JoinHandle;
 
     use windows_sys::core::GUID;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -438,8 +468,8 @@ mod native {
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
 
     use crate::managed_files::{
-        create_host_wide_object, ensure_managed_directory, read_admin_owned_file,
-        write_managed_file_atomic,
+        create_host_wide_object, ensure_managed_directory, random_u64, read_admin_owned_file,
+        write_managed_file_atomic, HostWideObject,
     };
     use crate::trusted_command::native_windows_powershell_command;
 
@@ -447,7 +477,9 @@ mod native {
     struct Host {
         dir: PathBuf,
         /// The host-wide object, held for the life of the process.
-        _lock: OwnedHandle,
+        _lock: HostWideObject,
+        /// This process's identifier in rule names.
+        instance: String,
         holdings: Holdings,
         /// Networks with a live [`FirewallGuard`], or whose rules are still
         /// being removed.
@@ -458,6 +490,8 @@ mod native {
     }
 
     static HOST: Mutex<Option<Host>> = Mutex::new(None);
+    /// Rule removals running on their own threads.
+    static REMOVALS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
     static LAST_FIREWALL_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
     /// The host state of this process, taking the host-wide object on first
@@ -479,9 +513,11 @@ mod native {
         })?;
         let dir = mesh_host_state_dir();
         ensure_managed_directory(&dir)?;
+        let instance = format!("{:08x}", random_u64()? as u32);
         *slot = Some(Host {
             dir,
             _lock: lock,
+            instance,
             holdings: Holdings::default(),
             networks: Vec::new(),
             nats: Vec::new(),
@@ -856,7 +892,11 @@ mod native {
                         let _ = remove_rules(&network, &names);
                     }
                 });
-            if spawned.is_err() {
+            if let Ok(handle) = spawned {
+                let mut removals = REMOVALS.lock().unwrap_or_else(|e| e.into_inner());
+                removals.retain(|removal| !removal.is_finished());
+                removals.push(handle);
+            } else {
                 // No thread: leave the rules to the next recovery, but do not
                 // keep the network blocked for the rest of the process.
                 *LAST_FIREWALL_ERROR
@@ -869,6 +909,19 @@ mod native {
                     host.networks.retain(|held| *held != network);
                 }
             }
+        }
+    }
+
+    /// Waits for the firewall rule and address translation removals of
+    /// dropped guards that are still running. Call before the process exits
+    /// (for example when the service stops): a removal cut off with the
+    /// process leaves its rules or object until the next
+    /// [`recover_mesh_host`].
+    pub fn finish_mesh_firewall_removals() {
+        let pending: Vec<JoinHandle<()>> =
+            std::mem::take(&mut *REMOVALS.lock().unwrap_or_else(|e| e.into_inner()));
+        for removal in pending {
+            let _ = removal.join();
         }
     }
 
@@ -961,7 +1014,7 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
                 "the program path is not Unicode",
             )
         })?;
-        {
+        let instance = {
             let mut slot = host()?;
             let host = slot.as_mut().expect("host state was just taken");
             if host.networks.iter().any(|held| held == network) {
@@ -971,10 +1024,11 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
                 ));
             }
             host.networks.push(network.to_owned());
-        }
+            host.instance.clone()
+        };
         let guard = FirewallGuard {
             network: network.to_owned(),
-            names: firewall_rule_names(network),
+            names: firewall_rule_names(network, &instance),
             removed: false,
         };
         let added = run_firewall_script(
@@ -1021,9 +1075,17 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
                 ) =>
             {
                 let path = state_path(&state_dir);
-                let aside = state_dir.join(format!("{MESH_FORWARDING_STATE_FILE}.corrupt"));
-                let _ = std::fs::remove_file(&aside);
-                std::fs::rename(&path, &aside)?;
+                let [fixed, unique] = set_aside_names(&host.instance);
+                let fixed = state_dir.join(fixed);
+                let _ = std::fs::remove_file(&fixed);
+                // A file planted under the fixed name must not stop
+                // recovery: then a name of this process, and at worst the
+                // record goes.
+                if std::fs::rename(&path, &fixed).is_err()
+                    && std::fs::rename(&path, state_dir.join(unique)).is_err()
+                {
+                    std::fs::remove_file(&path)?;
+                }
                 report.state_set_aside = true;
                 ForwardingState::default()
             }
@@ -1050,10 +1112,25 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
 
     const NAT_FAILURE: &str = "the address translation could not be changed";
 
-    const NAT_ADD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
-Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq $env:ANIX_MESH_NAT } | Remove-NetNat -Confirm:$false
-New-NetNat -Name $env:ANIX_MESH_NAT -InternalIPInterfaceAddressPrefix $env:ANIX_MESH_NAT_PREFIX | Out-Null
-"#;
+    // Objects of the same network left by earlier processes (the stem and
+    // an eight-digit identifier) are replaced: only one process holds the
+    // host at a time, so they are leftovers.
+    /// The match for this network's WinNAT objects of earlier runs: its
+    /// stem followed by exactly one 8-hex-digit instance, so that another
+    /// network whose name extends this one's never matches. Shared by
+    /// [`NAT_ADD_SCRIPT`] and its test.
+    macro_rules! nat_pattern {
+        () => {
+            "$pattern = '^' + [regex]::Escape($env:ANIX_MESH_NAT_STEM) + '[0-9a-f]{8}$'\n"
+        };
+    }
+
+    const NAT_ADD_SCRIPT: &str = concat!(
+        "$ErrorActionPreference = 'Stop'\n",
+        nat_pattern!(),
+        "Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch $pattern } | Remove-NetNat -Confirm:$false\n",
+        "New-NetNat -Name $env:ANIX_MESH_NAT -InternalIPInterfaceAddressPrefix $env:ANIX_MESH_NAT_PREFIX | Out-Null\n",
+    );
 
     const NAT_REMOVE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq $env:ANIX_MESH_NAT } | Remove-NetNat -Confirm:$false
@@ -1118,7 +1195,11 @@ Get-NetNat -ErrorAction SilentlyContinue |
                         let _ = remove_nat(&network, &name);
                     }
                 });
-            if spawned.is_err() {
+            if let Ok(handle) = spawned {
+                let mut removals = REMOVALS.lock().unwrap_or_else(|e| e.into_inner());
+                removals.retain(|removal| !removal.is_finished());
+                removals.push(handle);
+            } else {
                 // No thread: leave the object to the next recovery, but do
                 // not keep the network blocked for the rest of the process.
                 *LAST_FIREWALL_ERROR
@@ -1142,7 +1223,7 @@ Get-NetNat -ErrorAction SilentlyContinue |
     /// per host).
     pub fn add_mesh_nat(network: &str, address: Ipv4Addr, prefix: u8) -> io::Result<NatGuard> {
         let internal = nat_prefix(address, prefix)?;
-        {
+        let instance = {
             let mut slot = host()?;
             let host = slot.as_mut().expect("host state was just taken");
             if host.nats.iter().any(|held| held == network) {
@@ -1152,16 +1233,18 @@ Get-NetNat -ErrorAction SilentlyContinue |
                 ));
             }
             host.nats.push(network.to_owned());
-        }
+            host.instance.clone()
+        };
         let guard = NatGuard {
             network: network.to_owned(),
-            name: nat_name(network),
+            name: nat_name(network, &instance),
             removed: false,
         };
         let added = run_script(
             NAT_ADD_SCRIPT,
             &[
                 ("ANIX_MESH_NAT", guard.name.clone()),
+                ("ANIX_MESH_NAT_STEM", nat_stem(network)),
                 ("ANIX_MESH_NAT_PREFIX", internal),
             ],
             NAT_FAILURE,
@@ -1198,6 +1281,37 @@ Get-NetNat -ErrorAction SilentlyContinue |
             assert!(parse_guid("{0123456g-89ab-cdef-0001-0203040506ff}").is_none());
         }
 
+        /// Runs the add script's own match in PowerShell, not a copy of it.
+        fn script_matches(name: &str, network: &str) -> bool {
+            let script = concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                nat_pattern!(),
+                "if ($env:ANIX_TEST_NAME -cmatch $pattern) { exit 0 } else { exit 1 }\n",
+            );
+            run_script(
+                script,
+                &[
+                    ("ANIX_MESH_NAT_STEM", nat_stem(network)),
+                    ("ANIX_TEST_NAME", name.to_owned()),
+                ],
+                "no match",
+            )
+            .is_ok()
+        }
+
+        #[test]
+        fn the_add_script_removes_only_this_networks_leftovers() {
+            assert!(script_matches(&nat_name("office", "1a2b3c4d"), "office"));
+            assert!(!script_matches(&nat_name("office-1", "1a2b3c4d"), "office"));
+            assert!(!script_matches(&nat_name("office", "1a2b3c4d"), "office-1"));
+            // A label with regex metacharacters is matched literally.
+            assert!(script_matches(&nat_name("a.b", "0000ffff"), "a.b"));
+            assert!(!script_matches(
+                &format!("{}x", nat_name("office", "1a2b3c4d")),
+                "office"
+            ));
+        }
+
         #[test]
         fn the_interface_table_can_be_read() {
             // The loopback interface always exists; reading the table and
@@ -1215,10 +1329,19 @@ mod tests {
     #[test]
     fn plain_network_names_are_kept_in_rule_names() {
         assert_eq!(network_label("office-1"), "office-1");
-        let names = firewall_rule_names("office-1");
-        assert_eq!(names[0], "AnixOpsMesh-office-1-listen-udp");
-        assert_eq!(names[1], "AnixOpsMesh-office-1-listen-tcp");
-        assert_eq!(names[2], "AnixOpsMesh-office-1-adapter-block");
+        let names = firewall_rule_names("office-1", "1a2b3c4d");
+        assert_eq!(names[0], "AnixOpsMesh-office-1-1a2b3c4d-listen-udp");
+        assert_eq!(names[1], "AnixOpsMesh-office-1-1a2b3c4d-listen-tcp");
+        assert_eq!(names[2], "AnixOpsMesh-office-1-1a2b3c4d-adapter-block");
+        // Another process never names the same rules.
+        assert_ne!(firewall_rule_names("office-1", "00000001")[0], names[0]);
+    }
+
+    #[test]
+    fn a_state_file_is_set_aside_under_a_fixed_then_a_process_name() {
+        let [fixed, unique] = set_aside_names("1a2b3c4d");
+        assert_eq!(fixed, "mesh-forwarding.json.corrupt");
+        assert_eq!(unique, "mesh-forwarding.json.corrupt-1a2b3c4d");
     }
 
     #[test]
@@ -1243,13 +1366,27 @@ mod tests {
         let label = network_label(&long);
         assert!(label.len() <= MAX_NETWORK_LABEL);
         assert_ne!(label, network_label(&"n".repeat(201)));
-        assert!(!firewall_rule_names(&long)[0].contains(','));
+        assert!(!firewall_rule_names(&long, "1a2b3c4d")[0].contains(','));
     }
 
     #[test]
     fn translation_objects_are_named_and_cover_the_virtual_subnet() {
-        assert_eq!(nat_name("office-1"), "AnixOpsMesh-office-1");
-        assert!(nat_name("a,b").starts_with("AnixOpsMesh-a_b-"));
+        assert_eq!(
+            nat_name("office-1", "1a2b3c4d"),
+            "AnixOpsMesh-office-1-1a2b3c4d"
+        );
+        assert!(nat_name("a,b", "1a2b3c4d").starts_with("AnixOpsMesh-a_b-"));
+        assert!(nat_name("a,b", "1a2b3c4d").ends_with("-1a2b3c4d"));
+        // The add script removes leftovers matching the stem followed by
+        // exactly an 8-hex-digit instance; another network's objects never
+        // match, even when its name extends this one's.
+        let matches = |name: &str, network: &str| {
+            name.strip_prefix(&nat_stem(network))
+                .is_some_and(|rest| rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+        };
+        assert!(!matches(&nat_name("office-1", "1a2b3c4d"), "office"));
+        assert!(!matches(&nat_name("office", "1a2b3c4d"), "office-1"));
+        assert!(matches(&nat_name("office", "1a2b3c4d"), "office"));
         assert_eq!(
             nat_prefix(Ipv4Addr::new(10, 144, 3, 7), 24).unwrap(),
             "10.144.3.0/24"
@@ -1291,7 +1428,8 @@ mod tests {
         let dir = mesh_host_state_dir();
         assert!(crate::managed_files::is_within_managed_root(&dir));
         assert!(dir.ends_with(MESH_HOST_STATE_DIR));
-        assert!(MESH_HOST_MUTEX.starts_with(r"Global\"));
+        // In the private namespace, not in `Global\`.
+        assert!(!MESH_HOST_MUTEX.contains('\\'));
     }
 
     #[test]

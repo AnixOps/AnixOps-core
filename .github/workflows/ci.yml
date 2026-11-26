@@ -620,16 +620,24 @@ jobs:
         run: |
           set -euo pipefail
           # The installers are POSIX sh (BusyBox, dash and macOS sh included).
-          for script in install-linux.sh install-macos.sh; do
+          for script in install-linux.sh install-macos.sh install-device-macos.sh; do
             sh -n "apps/mesh-node/install/${script}"
             shellcheck --shell=sh "apps/mesh-node/install/${script}"
           done
-          shellcheck --shell=bash .github/scripts/build-mesh-node.sh
-          # The Windows installer must at least parse.
+          for script in build-mesh-node.sh mesh-device-certs.sh mesh-device-smoke-macos.sh; do
+            shellcheck --shell=bash ".github/scripts/${script}"
+          done
+          python3 -m py_compile .github/scripts/mesh-device-mock-control.py
+          # The Windows installers and the smoke test must at least parse;
+          # they run in the desktop build job.
           pwsh -NoProfile -NonInteractive -Command '
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile("apps/mesh-node/install/install-windows.ps1", [ref]$null, [ref]$errors) | Out-Null
-            if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_ }; exit 1 }
+            $failed = $false
+            foreach ($file in @("apps/mesh-node/install/install-windows.ps1", "apps/mesh-node/install/install-device-windows.ps1", ".github/scripts/mesh-device-smoke-windows.ps1")) {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$errors) | Out-Null
+              if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host "${file}: $_" }; $failed = $true }
+            }
+            if ($failed) { exit 1 }
           '
 
       - name: Build static anixops-mesh
@@ -715,6 +723,99 @@ jobs:
           $ErrorActionPreference = "Stop"
           $arch = if ($env:TARGET -like "aarch64-*") { "arm64" } else { "amd64" }
           & .github/scripts/fetch-wintun.ps1 -Destination (Join-Path $env:RUNNER_TEMP "wintun") -Arch $arch
+
+      # The device without the Agent on the runner's own architecture:
+      # install as a launchd daemon or Windows service, enroll against a
+      # stand-in for Control (private CA), report, revoke the token,
+      # uninstall (docs/deploy/mesh-device.md).
+      - name: Device service smoke test (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          .github/scripts/mesh-device-smoke-macos.sh "${PWD}/dist/mesh-node/anixops-mesh-ci-${TARGET}" "${RUNNER_TEMP}/mesh-device"
+
+      - name: Device service smoke certificates (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/scripts/mesh-device-certs.sh "${RUNNER_TEMP}/mesh-device/certs"
+
+      - name: Device service smoke test (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .github/scripts/mesh-device-smoke-windows.ps1 `
+            -Binary (Join-Path $PWD "dist/mesh-node/anixops-mesh-ci-$env:TARGET.exe") `
+            -Wintun (Join-Path $env:RUNNER_TEMP "wintun\wintun.dll") `
+            -Work (Join-Path $env:RUNNER_TEMP "mesh-device")
+
+  mesh-bridge-netns:
+    name: Mesh external bridge (nftables)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+    needs:
+      - changes
+      - policy-fast
+      - detect-projects
+    # Same condition as the other Rust jobs. Loads the external bridge rules
+    # of crates/mesh-bridge (spec §15.12) into the real Linux nftables in
+    # network namespaces and checks what passes, what is translated and
+    # what is dropped.
+    if: >-
+      ${{
+        needs.detect-projects.outputs.rust == 'true' &&
+        (
+          needs.changes.outputs.full_matrix == 'true' ||
+          needs.changes.outputs.rust == 'true' ||
+          needs.changes.outputs.windows == 'true' ||
+          needs.changes.outputs.linux == 'true' ||
+          needs.changes.outputs.apple == 'true' ||
+          needs.changes.outputs.ios == 'true'
+        )
+      }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+
+      - name: Install nftables
+        shell: bash
+        run: |
+          set -euo pipefail
+          # conntrack only lets the script look at the tracked connections;
+          # the bridge itself talks to the kernel directly.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables conntrack
+          shellcheck --shell=bash .github/scripts/mesh-bridge-netns.sh
+
+      - name: Build the bridge driver
+        shell: bash
+        run: cargo build --locked -p mesh-bridge --example bridge-netns
+
+      - name: Bridge in network namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env "BRIDGE_NETNS=${GITHUB_WORKSPACE}/target/debug/examples/bridge-netns" \
+            bash .github/scripts/mesh-bridge-netns.sh
 
   script-runtime-jsc:
     name: JavaScriptCore script conformance
@@ -1107,6 +1208,7 @@ jobs:
       - protocol-features
       - mesh-node-static
       - mesh-node-desktop
+      - mesh-bridge-netns
       - script-runtime-jsc
       - ios-runtime-static-libs
     steps:
@@ -1143,6 +1245,7 @@ jobs:
           RESULT_PROTOCOL_FEATURES: ${{ needs.protocol-features.result }}
           RESULT_MESH_NODE_STATIC: ${{ needs.mesh-node-static.result }}
           RESULT_MESH_NODE_DESKTOP: ${{ needs.mesh-node-desktop.result }}
+          RESULT_MESH_BRIDGE_NETNS: ${{ needs.mesh-bridge-netns.result }}
           RESULT_SCRIPT_RUNTIME_JSC: ${{ needs.script-runtime-jsc.result }}
           RESULT_IOS_RUNTIME_LIBS: ${{ needs.ios-runtime-static-libs.result }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1227,6 +1330,7 @@ jobs:
           record_job "Protocol feature matrix" "${RESULT_PROTOCOL_FEATURES}" "${rust_required}"
           record_job "Mesh node static build" "${RESULT_MESH_NODE_STATIC}" "${rust_required}"
           record_job "Mesh node desktop build" "${RESULT_MESH_NODE_DESKTOP}" "${rust_required}"
+          record_job "Mesh external bridge (nftables)" "${RESULT_MESH_BRIDGE_NETNS}" "${rust_required}"
           record_job "JavaScriptCore script conformance" "${RESULT_SCRIPT_RUNTIME_JSC}" "${rust_required}"
           record_job "iOS runtime static libraries" "${RESULT_IOS_RUNTIME_LIBS}" "${ios_runtime_required}"
 
@@ -1294,6 +1398,7 @@ jobs:
             echo "| Protocol feature matrix | ${rust_required} | ${RESULT_PROTOCOL_FEATURES} |"
             echo "| Mesh node static build | ${rust_required} | ${RESULT_MESH_NODE_STATIC} |"
             echo "| Mesh node desktop build | ${rust_required} | ${RESULT_MESH_NODE_DESKTOP} |"
+            echo "| Mesh external bridge (nftables) | ${rust_required} | ${RESULT_MESH_BRIDGE_NETNS} |"
             echo "| JavaScriptCore script conformance | ${rust_required} | ${RESULT_SCRIPT_RUNTIME_JSC} |"
             echo "| iOS runtime static libraries | ${ios_runtime_required} | ${RESULT_IOS_RUNTIME_LIBS} |"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -19,30 +19,38 @@
 //! answering side keeps its packets until the initiator's first packet
 //! makes the pending session current.
 //!
+//! Custom paths (spec §17.2) run in [`crate::paths`]: this node answers
+//! `MeshPathRpc`, asks waypoints, relays type 40 as a waypoint and sends
+//! its own traffic, probes, errors and echoes.
+//!
 //! Not here yet: shared nodes (spec §16).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use ring::error::Unspecified;
 use ring::rand::SecureRandom;
 
-use crate::config::{MeshSettings, NetworkKind, Role, RoutePolicy, SecurityMode};
+use crate::config::{CustomPath, MeshSettings, NetworkKind, Role, RoutePolicy, SecurityMode};
 use crate::legacy::keys::digest;
 use crate::legacy::LegacyCipher;
 use crate::link::{self, CloseReason, Crypto, Dropped, Handshaking, Link, Step, Up};
 use crate::net::IpNet;
+use crate::paths::{
+    Answer, Facts, Outer, PathCounters, PathRuntime, PathStatus, Route as PathRoute,
+};
 use crate::route::center::{self, CentreServer, GlobalPeerMap, PeerMap, ReportPeers};
 use crate::route::messages::{
     FeatureFlags, RoutePeerInfo, SyncRouteRequest, SyncRouteResponse, Uuid,
 };
-use crate::route::sync::{Notice, RouteSync};
+use crate::route::sync::{Failure, Notice, RouteSync};
 use crate::route::topology::{Metric, Route};
 use crate::routes::{self, Denied, PeerId, RouteTable};
 use crate::rpc::packet::{
-    split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
-    ROUTE_SYNC_TIMEOUT_MS,
+    reassembly_timeout_ms, route_sync_timeout_ms, split, Descriptor, RpcError, RpcPacket,
+    RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
 };
 use crate::rpc::reassembly::{Dropped as RpcDropped, Reassembler};
 use crate::secure::handshake::{
@@ -51,7 +59,8 @@ use crate::secure::handshake::{
 use crate::secure::messages::Action as SessionAction;
 use crate::secure::noise::{KeyPair, LEN};
 use crate::secure::session::{Namespace, SessionKey, Sessions};
-use crate::wire::header::relay_in_place;
+use crate::waypoint::{self, Capabilities, Payload};
+use crate::wire::header::{relay_in_place, LATENCY_FIRST_MAX_COUNTER};
 use crate::wire::{flags, packet_type, NodeHeader, HEADER_LEN};
 
 /// The driver's name for one connection.
@@ -80,6 +89,14 @@ struct Relay {
     queue: VecDeque<(u8, Vec<u8>)>,
 }
 
+/// Largest RPC body this node sends (spec §11.2); larger ones are dropped
+/// and counted.
+pub const MAX_RPC_BODY: usize = 4 * 1024 * 1024;
+
+/// A refusal for a key off the native key list is reported for this long
+/// unless another follows (docs/architecture/mesh-status.md).
+pub const NOT_NATIVE_HOLD: Duration = Duration::from_secs(10 * 60);
+
 /// Most subnets installed as system routes for one network: as many as
 /// [`routes::MAX_SUBNETS_PER_PEER`] for sixteen advertising members; any
 /// further subnets are not installed.
@@ -101,6 +118,8 @@ pub const PING_MISSES: u32 = 5;
 /// that it only warns, so that a member forging information cannot make
 /// it change again and again (spec §12.3).
 pub const ID_RENEW_INTERVAL: Duration = Duration::from_secs(600);
+/// How long a capability query waits (spec §17.2.4).
+pub const PATH_QUERY_TIMEOUT_MS: u32 = 5000;
 /// Version string announced in route information (spec §12.3).
 pub const VERSION_STRING: &str = "2.6.4-compat";
 
@@ -143,10 +162,13 @@ pub struct Counters {
     pub refused_graphs: u64,
     /// Connection rows refused past the stored edge limit (§12.4).
     pub refused_rows: u64,
-    /// Connection graphs sent cut short to fit one request (§12.4).
+    /// Connection graphs sent cut short: past the limits of §12.4, or
+    /// halved for delivery (§12.2).
     pub cut_graphs: u64,
     /// Node information off the native key list (spec §8.3.1 rule 4).
     pub refused_not_native: u64,
+    /// RPC bodies not sent for being over [`MAX_RPC_BODY`].
+    pub oversize_rpc: u64,
     /// RPC calls dropped for a body over 8 MiB (spec §11.2).
     pub oversize_calls: u64,
     /// Route sync sessions closed because a connection graph could not be
@@ -155,18 +177,28 @@ pub struct Counters {
     /// Nodes refused or reachable nodes evicted because the node table is
     /// full (spec §12.3, §12.4).
     pub refused_at_capacity: u64,
+    /// Route sync batches a neighbour answered with an error, or whose call
+    /// failed: closed sessions may come from the link or the neighbour.
+    pub sync_errors: u64,
 }
 
-/// The last oversized synchronisation, for the alert of spec §11.2 and
-/// §12.2: an RPC call received over 8 MiB, or a connection graph that a
-/// neighbour did not take in time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SyncOversize {
-    /// A call from `peer` was dropped at `bytes`, over the 8 MiB limit.
-    Received { peer: u32, bytes: usize },
-    /// The session with the neighbour `peer` was closed: the connection
-    /// graph, even cut by half, was not answered within twice 60 seconds.
-    Undelivered { peer: u32 },
+/// Oversized synchronisations, for the alert of spec §11.2 and §12.2; each
+/// kind keeps its last occurrence while the node runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncOversize {
+    /// A route sync call from the direct neighbour `.0`, over that
+    /// connection, was dropped at `.1` bytes, over the 8 MiB limit.
+    pub received: Option<(u32, usize)>,
+    /// The neighbours whose sessions were closed at the last check that
+    /// closed any: the connection graph, even cut by half, was not
+    /// answered within twice 60 seconds.
+    pub undelivered: Vec<u32>,
+}
+
+impl SyncOversize {
+    pub fn is_empty(&self) -> bool {
+        self.received.is_none() && self.undelivered.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -190,12 +222,16 @@ enum CallKind {
     SyncRoute,
     ReportPeers,
     GetPeerMap,
+    /// `MeshPathRpc.Capabilities` (spec §17.2.4).
+    PathCaps,
 }
 
 struct Outgoing {
     peer: u32,
     kind: CallKind,
     deadline: Instant,
+    /// The route sync batch the call carries (0 for other calls).
+    batch: u64,
 }
 
 /// The node's identity in its network: node ID, instance ID and route ID,
@@ -233,6 +269,16 @@ pub struct Node {
     sessions: Sessions,
     sync: RouteSync,
     routes: RouteTable,
+    /// The system routes chosen from `routes`, and how many routable
+    /// subnets did not fit; chosen again whenever `routes` changes.
+    system_routes: Vec<IpNet>,
+    system_routes_truncated: usize,
+    /// Networks of this machine's other interfaces, as last reported.
+    local_networks: Vec<IpNet>,
+    /// Routes other mesh programs carry on this machine (spec §15.4).
+    foreign_routes: Vec<IpNet>,
+    /// Overlapping subnets the user routes through the mesh anyway.
+    route_overrides: Vec<IpNet>,
     conns: BTreeMap<ConnId, Conn>,
     reassembler: Reassembler,
     calls: BTreeMap<i64, Outgoing>,
@@ -246,14 +292,158 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
-    sync_oversize: Option<SyncOversize>,
+    sync_oversize: SyncOversize,
     /// The last peer refused for a static key off the native key list
-    /// (spec §8.3.1 rule 5).
-    not_native: Option<u32>,
+    /// (spec §8.3.1 rule 5), and when.
+    not_native: Option<(u32, Instant)>,
     /// When this node last took a new identity after a conflict.
     renewed_at: Option<Instant>,
     /// Relay sessions being set up, by destination (secure mode only).
     relays: BTreeMap<u32, Relay>,
+    /// Custom paths and the capability cache (spec §17.2).
+    paths: PathRuntime,
+}
+
+/// Routes from any node of the topology, with the latencies the centre
+/// measured (spec §13).
+fn routes_from(
+    sync: &RouteSync,
+    peer_map: &GlobalPeerMap,
+    source: u32,
+    metric: Metric,
+) -> BTreeMap<u32, Route> {
+    let map = &peer_map.map;
+    sync.topology().routes(source, metric, |a, b| {
+        map.get(&a)
+            .and_then(|row| row.get(&b))
+            .and_then(|&ms| u64::try_from(ms).ok())
+    })
+}
+
+/// What custom paths need to know about the network (spec §17.2.3).
+struct NodeFacts<'a> {
+    id: u32,
+    sync: &'a RouteSync,
+    peer_map: &'a GlobalPeerMap,
+    routes: &'a RouteTable,
+    metric: Metric,
+    own: BTreeMap<u32, Route>,
+    direct: BTreeSet<u32>,
+    unverified_direct: bool,
+    /// Routes from other nodes, computed when first asked.
+    others: RefCell<BTreeMap<u32, BTreeMap<u32, Route>>>,
+}
+
+fn node_facts<'a>(
+    id: u32,
+    settings: &MeshSettings,
+    sync: &'a RouteSync,
+    peer_map: &'a GlobalPeerMap,
+    conns: &BTreeMap<ConnId, Conn>,
+    routes: &'a RouteTable,
+) -> NodeFacts<'a> {
+    let metric = match settings.route_policy {
+        RoutePolicy::Hops => Metric::Hops,
+        RoutePolicy::Latency => Metric::Latency,
+    };
+    NodeFacts {
+        id,
+        sync,
+        peer_map,
+        routes,
+        metric,
+        own: routes_from(sync, peer_map, id, metric),
+        direct: conns.values().filter_map(|conn| conn.peer).collect(),
+        unverified_direct: settings.security == SecurityMode::ForwardSecrecy
+            && settings.native_keys.is_none(),
+        others: RefCell::new(BTreeMap::new()),
+    }
+}
+
+fn info_addresses(info: &RoutePeerInfo) -> impl Iterator<Item = IpAddr> {
+    info.ipv4
+        .map(IpAddr::V4)
+        .into_iter()
+        .chain(info.ipv6.map(|(v6, _)| IpAddr::V6(v6)))
+}
+
+impl Facts for NodeFacts<'_> {
+    fn self_id(&self) -> u32 {
+        self.id
+    }
+
+    fn owners(&self, address: IpAddr) -> Vec<u32> {
+        self.sync
+            .infos()
+            .filter(|info| info.peer_id != self.id && self.reachable(info.peer_id))
+            .filter(|info| info_addresses(info).any(|own| own == address))
+            .map(|info| info.peer_id)
+            .collect()
+    }
+
+    fn reachable(&self, id: u32) -> bool {
+        self.direct.contains(&id) || self.own.contains_key(&id)
+    }
+
+    fn direct(&self, id: u32) -> bool {
+        self.direct.contains(&id)
+    }
+
+    fn hops(&self, from: u32, to: u32) -> Option<u32> {
+        if from == to {
+            return Some(0);
+        }
+        if from == self.id {
+            return self.own.get(&to).map(|route| route.hops);
+        }
+        let mut others = self.others.borrow_mut();
+        let routes = others
+            .entry(from)
+            .or_insert_with(|| routes_from(self.sync, self.peer_map, from, self.metric));
+        routes.get(&to).map(|route| route.hops)
+    }
+
+    fn advertiser(&self, subnet: &IpNet) -> Option<u32> {
+        self.routes
+            .lookup_by(subnet.network(), |peer| {
+                self.own.get(&peer.0).map(|route| route.hops)
+            })
+            .ok()
+            .map(|peer| peer.0)
+    }
+
+    fn unverified_direct(&self) -> bool {
+        self.unverified_direct
+    }
+
+    fn in_topology(&self, id: u32) -> bool {
+        self.sync.info(id).is_some()
+    }
+
+    fn version(&self, id: u32) -> Option<u32> {
+        self.sync.info(id).map(|info| info.version)
+    }
+
+    fn address(&self, id: u32) -> Option<IpAddr> {
+        self.sync
+            .info(id)
+            .and_then(|info| info_addresses(info).next())
+    }
+}
+
+/// The facts of `$node` for its path runtime, borrowing only the fields the
+/// runtime does not live in.
+macro_rules! facts {
+    ($node:expr) => {
+        node_facts(
+            $node.local.id,
+            &$node.settings,
+            &$node.sync,
+            &$node.peer_map,
+            &$node.conns,
+            &$node.routes,
+        )
+    };
 }
 
 fn own_info(
@@ -370,6 +560,9 @@ impl Node {
             native_keys: admitted_keys(&settings),
         };
         let routes = RouteTable::new(&settings);
+        // Without encryption no inner packet can be (spec §17.2.5 rule 3).
+        let encrypted = settings.security == SecurityMode::ForwardSecrecy || legacy.is_some();
+        let paths = PathRuntime::new(settings.paths.clone(), encrypted, now);
         Ok(Self {
             local,
             legacy,
@@ -380,6 +573,11 @@ impl Node {
                 sync
             },
             routes,
+            system_routes: Vec::new(),
+            system_routes_truncated: 0,
+            local_networks: Vec::new(),
+            foreign_routes: Vec::new(),
+            route_overrides: Vec::new(),
             conns: BTreeMap::new(),
             reassembler: Reassembler::new(),
             calls: BTreeMap::new(),
@@ -391,10 +589,11 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
-            sync_oversize: None,
+            sync_oversize: SyncOversize::default(),
             not_native: None,
             renewed_at: None,
             relays: BTreeMap::new(),
+            paths,
             settings,
         })
     }
@@ -418,6 +617,7 @@ impl Node {
             refused_not_native: refused.not_native,
             graph_timeouts: refused.graph_timeouts,
             refused_at_capacity: refused.at_capacity,
+            sync_errors: refused.error_answers,
             ..self.counters
         }
     }
@@ -454,6 +654,27 @@ impl Node {
             self.sessions.invalidate(&key);
             self.relays.remove(&key.peer_id);
         }
+        // Answers not yet confirmed by a packet, and handshakes this node
+        // started under the old list, go too.
+        let settings = &self.settings;
+        self.sessions
+            .drop_pending_refused(|key| settings.admits(key));
+        let stale: Vec<u32> = self
+            .relays
+            .iter()
+            .filter(|(_, relay)| {
+                relay
+                    .initiator
+                    .as_ref()
+                    .is_some_and(|initiator| !settings.admits(&initiator.peer_static()))
+            })
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in stale {
+            self.drop_relay(peer);
+        }
+        // A new list is a new start for refusals (spec §8.3.1 rule 5).
+        self.not_native = None;
         self.refresh_routes();
     }
 
@@ -486,7 +707,7 @@ impl Node {
                 return Err(denied);
             }
         };
-        if self.originate(peer.0, packet_type::DATA, packet, now) {
+        if self.send_data(peer.0, packet, now) {
             Ok(())
         } else {
             Err(Denied::NoRoute)
@@ -495,22 +716,108 @@ impl Node {
 
     /// The networks of this machine's other interfaces (spec §15.4).
     pub fn set_local_networks(&mut self, interfaces: &[IpNet]) {
-        self.routes.set_local_networks(interfaces, &[]);
+        self.local_networks = interfaces.to_vec();
+        self.apply_local_networks();
+    }
+
+    /// Routes that other mesh programs' virtual interfaces carry here, as
+    /// the system actually selects them (spec §15.4): treated like the
+    /// interface networks, and reported apart ([`Self::foreign_overlaps`]).
+    pub fn set_foreign_routes(&mut self, routes: &[IpNet]) {
+        self.foreign_routes = routes.iter().map(IpNet::trunc).collect();
+        self.apply_local_networks();
+    }
+
+    /// Accepted subnets kept local because they overlap a route of another
+    /// mesh program (and no interface network of this machine).
+    pub fn foreign_overlaps(&self) -> Vec<IpNet> {
+        let mut found: Vec<IpNet> = self
+            .routes
+            .local_conflicts()
+            .into_iter()
+            .map(|(_, subnet)| subnet)
+            .filter(|subnet| {
+                self.foreign_routes
+                    .iter()
+                    .any(|route| route.overlaps(subnet))
+                    && !self
+                        .local_networks
+                        .iter()
+                        .any(|network| network.overlaps(subnet))
+            })
+            .collect();
+        found.sort_by_key(ToString::to_string);
+        found.dedup();
+        found
+    }
+
+    fn apply_local_networks(&mut self) {
+        let networks: Vec<IpNet> = self
+            .local_networks
+            .iter()
+            .chain(&self.foreign_routes)
+            .copied()
+            .collect();
+        self.routes
+            .set_local_networks(&networks, &self.route_overrides);
+        self.choose_system_routes();
+    }
+
+    /// Subnets the user routes through the mesh although they overlap a
+    /// network of this machine (`mesh_set_subnet_route` with
+    /// `route = mesh`, spec §15.4): an accepted subnet equal to one of them
+    /// is routed and installed again. Replaces the earlier list; a local
+    /// override, never sent to other members.
+    pub fn set_route_overrides(&mut self, overrides: &[IpNet]) {
+        self.route_overrides.clear();
+        for subnet in overrides.iter().map(IpNet::trunc) {
+            if !self.route_overrides.contains(&subnet) {
+                self.route_overrides.push(subnet);
+            }
+        }
+        self.apply_local_networks();
     }
 
     /// Subnets to route into the virtual interface: accepted and routed,
-    /// limited to `routing.system_routes` when it is set.
-    /// At most [`MAX_SYSTEM_ROUTES`], in the table's stable order, so that
-    /// the members cannot fill the system routing table.
+    /// limited to `routing.system_routes` when it is set, at most
+    /// [`MAX_SYSTEM_ROUTES`] in address order. When more are routable,
+    /// members share the room fairly, nearer members first (see
+    /// [`fair_share`]), so that no member can push out the routes of the
+    /// others by advertising many subnets.
     pub fn system_routes(&self) -> Vec<IpNet> {
-        let routes = self.routes.system_routes().into_iter();
-        match &self.settings.system_routes {
-            None => routes.take(MAX_SYSTEM_ROUTES).collect(),
-            Some(allowed) => routes
-                .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
-                .take(MAX_SYSTEM_ROUTES)
-                .collect(),
-        }
+        self.system_routes.clone()
+    }
+
+    /// Routable subnets left out of [`Node::system_routes`] for want of
+    /// room; more than zero raises `system_routes_truncated`.
+    pub fn system_routes_truncated(&self) -> usize {
+        self.system_routes_truncated
+    }
+
+    fn choose_system_routes(&mut self) {
+        let hops = self.compute_routes(Metric::Hops);
+        let mut by_peer: Vec<(PeerId, Vec<IpNet>)> =
+            self.routes.system_routes_by_peer().into_iter().collect();
+        by_peer.sort_by_key(|(peer, _)| {
+            (
+                hops.get(&peer.0).map_or(u32::MAX, |route| route.hops),
+                peer.0,
+            )
+        });
+        let allowed = self.settings.system_routes.as_deref();
+        let lists = by_peer
+            .into_iter()
+            .map(|(_, subnets)| match allowed {
+                None => subnets,
+                Some(allowed) => subnets
+                    .into_iter()
+                    .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let (chosen, truncated) = fair_share(&lists, MAX_SYSTEM_ROUTES);
+        self.system_routes = chosen;
+        self.system_routes_truncated = truncated;
     }
 
     pub fn route_sync(&self) -> &RouteSync {
@@ -526,14 +833,27 @@ impl Node {
 
     /// The last oversized synchronisation; kept while the node runs, so an
     /// operator sizing a network sees it (spec §11.2, §12.2).
-    pub fn sync_oversize(&self) -> Option<SyncOversize> {
-        self.sync_oversize
+    pub fn sync_oversize(&self) -> &SyncOversize {
+        &self.sync_oversize
     }
 
     /// The last peer refused because its static key is off the native key
     /// list (spec §8.3.1 rule 5), for the status reason `peer_not_native`.
+    /// It clears when that peer completes a handshake, when the list
+    /// changes, or [`NOT_NATIVE_HOLD`] after the last refusal.
     pub fn last_not_native(&self) -> Option<u32> {
-        self.not_native
+        self.not_native.map(|(peer, _)| peer)
+    }
+
+    fn refused_not_native(&mut self, peer: u32, now: Instant) {
+        self.not_native = Some((peer, now));
+    }
+
+    /// `peer` completed a handshake: a refusal of it is over.
+    fn admitted_peer(&mut self, peer: u32) {
+        if self.not_native.is_some_and(|(refused, _)| refused == peer) {
+            self.not_native = None;
+        }
     }
 
     /// This node's static public key in the network.
@@ -641,12 +961,7 @@ impl Node {
     }
 
     fn compute_routes(&self, metric: Metric) -> BTreeMap<u32, Route> {
-        let map = &self.peer_map.map;
-        self.sync.topology().routes(self.local.id, metric, |a, b| {
-            map.get(&a)
-                .and_then(|row| row.get(&b))
-                .and_then(|&ms| u64::try_from(ms).ok())
-        })
+        routes_from(&self.sync, &self.peer_map, self.local.id, metric)
     }
 
     fn with_handshake<T>(
@@ -775,7 +1090,7 @@ impl Node {
                 }
                 self.close(conn, reason, now);
                 if let CloseReason::NotNative(peer) = reason {
-                    self.not_native = Some(peer);
+                    self.refused_not_native(peer, now);
                 }
                 // Only after the server proved the network secret (§5.3).
                 if reason == CloseReason::IdConflict {
@@ -795,6 +1110,7 @@ impl Node {
             next_at: Some(now + PING_START),
             ..Ping::default()
         };
+        self.admitted_peer(up.peer_id);
         if self.sync.neighbour_up(up.peer_id, rng, now).is_err() {
             self.close(conn, CloseReason::Unexpected, now);
             return;
@@ -828,8 +1144,17 @@ impl Node {
             self.forward(packet);
             return;
         }
+        // The session follows the arrival path (spec §8.7): the relay
+        // session for a packet relayed to us, the direct one for a packet
+        // from the neighbour itself. A direct neighbour's packet may still
+        // arrive relayed under the direct session, as the inner packet of a
+        // custom path does (spec §17.2.5), or while the direct connection
+        // comes up or goes: then the other session is tried too, without
+        // counting a failure unless both fail (review of #376, M2).
+        let direct =
+            (header.from != neighbour && self.is_neighbour(header.from)).then_some(header.from);
         let mut crypto = self.crypto();
-        let inbound = match link::open(&mut crypto, neighbour, packet, now) {
+        let inbound = match link::open_either(&mut crypto, neighbour, direct, packet, now) {
             Ok(inbound) => inbound,
             Err(Dropped::Unencrypted) => {
                 self.counters.unencrypted += 1;
@@ -851,12 +1176,19 @@ impl Node {
             }
             packet_type::PONG => self.pong(conn, &inbound.payload, now),
             packet_type::DATA => match self.routes.check_incoming(PeerId(from), &inbound.payload) {
-                Ok(()) if self.routes.for_backbone(&inbound.payload) => {
-                    self.actions.push_back(Action::ToBackbone(inbound.payload))
+                Ok(()) => {
+                    let delivered = self.clamp_inbound(from, inbound.payload);
+                    if self.routes.for_backbone(&delivered) {
+                        self.actions.push_back(Action::ToBackbone(delivered));
+                    } else {
+                        self.actions.push_back(Action::Deliver(delivered));
+                    }
                 }
-                Ok(()) => self.actions.push_back(Action::Deliver(inbound.payload)),
                 Err(_) => self.counters.refused_incoming += 1,
             },
+            packet_type::WAYPOINT => {
+                self.waypoint_packet(conn, neighbour, &inbound.header, &inbound.payload, rng, now)
+            }
             packet_type::RPC_REQ | packet_type::RPC_RESP => {
                 self.rpc_piece(from, neighbour, &inbound.payload, rng, now)
             }
@@ -983,7 +1315,7 @@ impl Node {
             }
         };
         let sent = match outgoing {
-            routes::Outgoing::Peer(peer) => self.originate(peer.0, packet_type::DATA, packet, now),
+            routes::Outgoing::Peer(peer) => self.send_data(peer.0, packet, now),
             routes::Outgoing::Neighbours => {
                 let mut any = false;
                 for neighbour in self.neighbours() {
@@ -996,6 +1328,367 @@ impl Node {
             return Err(Denied::NoRoute);
         }
         Ok(())
+    }
+
+    fn is_neighbour(&self, peer: u32) -> bool {
+        self.conns.values().any(|conn| conn.peer == Some(peer))
+    }
+
+    /// Whether this node relays for others (spec §17.2.4 `relay`): a full
+    /// node with relaying on.
+    fn relays_for_others(&self) -> bool {
+        self.settings.role == Role::Full && self.settings.relay
+    }
+
+    /// Whether this node serves as a waypoint (spec §17.2.4): it relays
+    /// and `node.waypoint_relay` is on.
+    fn relays_waypoints(&self) -> bool {
+        self.relays_for_others() && self.settings.waypoint_relay
+    }
+
+    /// Whether custom paths are on for this network (spec §17.2.4): this
+    /// node has paths of its own or serves as a waypoint. Otherwise it
+    /// answers `MeshPathRpc` like an implementation without the service
+    /// (Error 3) and drops every type-40 packet, counted.
+    fn paths_on(&self) -> bool {
+        self.settings.waypoint_relay || !self.paths.paths().is_empty()
+    }
+
+    /// Whether this network's packets are encrypted. Without encryption no
+    /// inner packet can be (spec §17.2.5 rule 3), so there is no
+    /// encapsulation at all (spec §17.2.1 rule 6).
+    fn encrypted(&self) -> bool {
+        self.settings.security == SecurityMode::ForwardSecrecy || self.legacy.is_some()
+    }
+
+    /// This node's `MeshPathRpc.Capabilities` answer (spec §17.2.4):
+    /// version 0 in a network without encryption, `relay` as configured.
+    fn capabilities(&self) -> Capabilities {
+        let mut caps = Capabilities::local(self.relays_waypoints());
+        if !self.encrypted() {
+            caps.version = 0;
+            caps.max_waypoints = 0;
+        }
+        caps
+    }
+
+    fn is_member_address(&self, address: IpAddr) -> bool {
+        self.settings
+            .virtual_subnets()
+            .iter()
+            .any(|subnet| subnet.contains(address))
+    }
+
+    fn peer_addresses(&self, peer: u32) -> Vec<IpAddr> {
+        self.routes
+            .peer(PeerId(peer))
+            .map(|view| view.addresses.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Lowers the MSS of a TCP SYN or SYN-ACK from `from` whose source
+    /// matches a path (spec §17.2.5, size, rule 2), before it reaches the
+    /// interface.
+    fn clamp_inbound(&self, from: u32, mut ip: Vec<u8>) -> Vec<u8> {
+        if self.paths.paths().is_empty() {
+            return ip;
+        }
+        let Some((source, _)) = waypoint::tcp_syn_addresses(&ip) else {
+            return ip;
+        };
+        let member = self.is_member_address(source);
+        let sender = self.peer_addresses(from);
+        if let Some(max) = self.paths.inbound_mss(source, member, &sender) {
+            waypoint::clamp_mss(&mut ip, max);
+        }
+        ip
+    }
+
+    /// An IP packet for node `to`, on the custom path it matches if any
+    /// (spec §17.2.2, §17.2.5).
+    fn send_data(&mut self, to: u32, packet: &[u8], now: Instant) -> bool {
+        if self.paths.paths().is_empty() {
+            return self.originate(to, packet_type::DATA, packet, now);
+        }
+        let Ok(addresses) = crate::packet::addresses(packet) else {
+            return self.originate(to, packet_type::DATA, packet, now);
+        };
+        let member = self.is_member_address(addresses.destination);
+        let owner = self.peer_addresses(to);
+        let outbound = {
+            let facts = facts!(self);
+            self.paths
+                .outbound(addresses.destination, member, to, &owner, &facts, now)
+        };
+        let Some(outbound) = outbound else {
+            return self.originate(to, packet_type::DATA, packet, now);
+        };
+        let clamped;
+        let packet = match outbound.mss {
+            Some(max) => {
+                let mut ip = packet.to_vec();
+                waypoint::clamp_mss(&mut ip, max);
+                clamped = ip;
+                &clamped[..]
+            }
+            None => packet,
+        };
+        match outbound.route {
+            PathRoute::Default => self.originate(to, packet_type::DATA, packet, now),
+            PathRoute::Encapsulate(waypoints) => self.encapsulate(to, &waypoints, packet, now),
+            PathRoute::FirstHop(neighbour) => self.first_hop(to, neighbour, packet, now),
+        }
+    }
+
+    /// Seals `packet` for `to` the way this node would send it directly
+    /// (spec §17.2.5, inner packet): with `to`'s direct session when it is
+    /// a neighbour, else with the relay session. `via` is the neighbour or
+    /// waypoint it leaves through, never `to` itself.
+    fn seal_for(&mut self, to: u32, via: u32, packet: &[u8], now: Instant) -> Option<Vec<u8>> {
+        let next_hop = if self.is_neighbour(to) { to } else { via };
+        let from = self.local.id;
+        let latency_first = self.settings.route_policy == RoutePolicy::Latency;
+        let mut crypto = self.crypto();
+        let mut sealed = link::seal(
+            &mut crypto,
+            from,
+            to,
+            next_hop,
+            packet_type::DATA,
+            packet,
+            now,
+        )
+        .ok()?;
+        if latency_first {
+            sealed[9] |= flags::LATENCY_FIRST;
+        }
+        Some(sealed)
+    }
+
+    /// Sends `packet` for `to` through `waypoints` (spec §17.2.5, source
+    /// rules 1–3). Without a session with `to` yet, or past the size
+    /// limit, it takes the default route, which sets the session up.
+    fn encapsulate(&mut self, to: u32, waypoints: &[u32], packet: &[u8], now: Instant) -> bool {
+        let Some(inner) = self.seal_for(to, waypoints[0], packet, now) else {
+            return self.originate(to, packet_type::DATA, packet, now);
+        };
+        if !waypoint::fits(inner.len(), waypoints.len() - 1) {
+            self.paths.count_oversize();
+            return self.originate(to, packet_type::DATA, packet, now);
+        }
+        let payload = waypoint::encode_transit(
+            self.local.id,
+            to,
+            &waypoints[1..],
+            waypoint::Body::Data(&inner),
+        );
+        self.originate(waypoints[0], packet_type::WAYPOINT, &payload, now)
+    }
+
+    /// Sends a plain packet for `to` over the connection to `neighbour`
+    /// (spec §17.2.3, `first_hop_only` (b)).
+    fn first_hop(&mut self, to: u32, neighbour: u32, packet: &[u8], now: Instant) -> bool {
+        let conn = self
+            .conns
+            .iter()
+            .filter(|(_, conn)| conn.peer == Some(neighbour))
+            .min_by_key(|(_, conn)| conn.rtt.unwrap_or(Duration::MAX))
+            .map(|(&id, _)| id);
+        let Some(conn) = conn else {
+            return self.originate(to, packet_type::DATA, packet, now);
+        };
+        let Some(sealed) = self.seal_for(to, neighbour, packet, now) else {
+            return self.originate(to, packet_type::DATA, packet, now);
+        };
+        self.actions.push_back(Action::Send {
+            conn,
+            packet: sealed,
+        });
+        true
+    }
+
+    /// A type-40 packet for this node (spec §17.2.5, §17.2.6), arrived on
+    /// `conn` from `neighbour`.
+    fn waypoint_packet(
+        &mut self,
+        conn: ConnId,
+        neighbour: u32,
+        header: &NodeHeader,
+        payload: &[u8],
+        rng: &dyn SecureRandom,
+        now: Instant,
+    ) {
+        if !self.paths_on() {
+            self.paths.count_dropped();
+            return;
+        }
+        let Some(decoded) = waypoint::decode(payload) else {
+            self.paths.count_dropped();
+            return;
+        };
+        let from = header.from;
+        match decoded {
+            Payload::Transit(transit) => {
+                let relays = self.relays_waypoints();
+                let outer = Outer {
+                    from,
+                    forward_counter: header.forward_counter,
+                    latency_first: header.has(flags::LATENCY_FIRST),
+                };
+                let out = {
+                    let facts = facts!(self);
+                    self.paths.relay(&transit, outer, relays, &facts, now)
+                };
+                // Errors and echoes start with counter 1 on the default
+                // route (spec §17.2.5 rule 6, §17.2.6 rule 2).
+                if let Some(echo) = out.echo {
+                    let echo_payload = waypoint::encode_echo(&echo);
+                    self.originate(echo.origin, packet_type::WAYPOINT, &echo_payload, now);
+                }
+                if let Some(error) = out.error {
+                    let error_payload = waypoint::encode_error(&error);
+                    self.originate(error.origin, packet_type::WAYPOINT, &error_payload, now);
+                }
+                if let Some(next) = out.next {
+                    self.send_waypoint(next, now);
+                }
+                if let Some(inner) = out.release {
+                    self.release(conn, neighbour, inner, rng, now);
+                }
+            }
+            Payload::Error(error) => {
+                let facts = facts!(self);
+                if self.paths.on_error(&error, from, &facts, now) {
+                    self.paths.evaluate(&facts, now);
+                }
+            }
+            Payload::Echo(echo) => {
+                if self.paths.on_echo(&echo, from, self.local.id) {
+                    let facts = facts!(self);
+                    self.paths.evaluate(&facts, now);
+                }
+            }
+        }
+    }
+
+    /// Wraps a Forward or Probe again for the next waypoint with its own
+    /// counter and LATENCY_FIRST (spec §17.2.5 rule 5). The waypoint was
+    /// confirmed by a query, which set up the relay session too; without
+    /// one the packet is dropped and counted.
+    fn send_waypoint(&mut self, next: waypoint::Next, now: Instant) {
+        let Some(conn) = self.next_hop_conn(next.to, next.latency_first) else {
+            self.counters.unroutable += 1;
+            return;
+        };
+        let Some(next_hop) = self.conns.get(&conn).and_then(|c| c.peer) else {
+            return;
+        };
+        let from = self.local.id;
+        let mut crypto = self.crypto();
+        let sealed = link::seal(
+            &mut crypto,
+            from,
+            next.to,
+            next_hop,
+            packet_type::WAYPOINT,
+            &next.payload,
+            now,
+        );
+        match sealed {
+            Ok(mut packet) => {
+                packet[10] = next.forward_counter;
+                if next.latency_first {
+                    packet[9] |= flags::LATENCY_FIRST;
+                }
+                self.actions.push_back(Action::Send { conn, packet });
+            }
+            Err(_) => self.paths.count_dropped(),
+        }
+    }
+
+    /// The last waypoint's inner packet (counter already raised): relayed
+    /// to its destination as in spec §14, or handled here when this node is
+    /// the destination (spec §17.2.5 rule 5).
+    fn release(
+        &mut self,
+        conn: ConnId,
+        neighbour: u32,
+        mut packet: Vec<u8>,
+        rng: &dyn SecureRandom,
+        now: Instant,
+    ) {
+        let Some(header) = NodeHeader::decode(&packet) else {
+            return;
+        };
+        if header.to == self.local.id {
+            self.receive_up(conn, neighbour, &packet, rng, now);
+            return;
+        }
+        if header.forward_counter > LATENCY_FIRST_MAX_COUNTER {
+            packet[9] &= !flags::LATENCY_FIRST;
+        }
+        let latency_first = packet[9] & flags::LATENCY_FIRST != 0;
+        match self.next_hop_conn(header.to, latency_first) {
+            Some(conn) => {
+                self.counters.relayed += 1;
+                self.actions.push_back(Action::Send { conn, packet });
+            }
+            None => self.counters.unroutable += 1,
+        }
+    }
+
+    /// Path upkeep once a second: rounds whose wait is over, states,
+    /// capability queries and probes (spec §17.2.3, §17.2.4, §17.2.6).
+    fn path_round(&mut self, rng: &dyn SecureRandom, now: Instant) {
+        let (queries, probes) = {
+            let facts = facts!(self);
+            self.paths.close_rounds(now);
+            self.paths.evaluate(&facts, now);
+            let queries = self.paths.take_queries(&facts, now);
+            let mut random = || {
+                let mut bytes = [0u8; 8];
+                // A failed draw leaves a zero token, which only weakens
+                // matching echoes to their probe.
+                let _ = rng.fill(&mut bytes);
+                u64::from_le_bytes(bytes)
+            };
+            let probes = self.paths.probes(&mut random, now);
+            // A probe that closed the oldest open round counts at once.
+            self.paths.evaluate(&facts, now);
+            (queries, probes)
+        };
+        for id in queries {
+            self.call(id, CallKind::PathCaps, Vec::new(), now);
+        }
+        let from = self.local.id;
+        for probe in probes {
+            let payload = waypoint::encode_transit(
+                from,
+                probe.destination,
+                &probe.waypoints[1..],
+                waypoint::Body::Probe(probe.token),
+            );
+            self.originate(probe.waypoints[0], packet_type::WAYPOINT, &payload, now);
+        }
+    }
+
+    /// Replaces the custom paths of this network (spec §17.2.8; already
+    /// validated as in [`crate::config`]). They take effect at once and
+    /// their waypoints are asked right away.
+    pub fn set_paths(&mut self, paths: Vec<CustomPath>, rng: &dyn SecureRandom, now: Instant) {
+        self.settings.paths = paths.clone();
+        self.paths.set_paths(paths, now);
+        self.path_round(rng, now);
+    }
+
+    /// The custom paths and their states (`mesh-status.md`, `paths[]`).
+    pub fn path_status(&self, now: Instant) -> Vec<PathStatus> {
+        let facts = facts!(self);
+        self.paths.status(&facts, now)
+    }
+
+    pub fn path_counters(&self) -> PathCounters {
+        self.paths.counters()
     }
 
     fn next_transaction(&mut self) -> i64 {
@@ -1020,6 +1713,10 @@ impl Node {
         body: &[u8],
         now: Instant,
     ) {
+        if body.len() > MAX_RPC_BODY {
+            self.counters.oversize_rpc += 1;
+            return;
+        }
         for piece in split(self.local.id, to, transaction, descriptor, is_request, body) {
             let kind = if is_request {
                 packet_type::RPC_REQ
@@ -1032,9 +1729,15 @@ impl Node {
         }
     }
 
-    fn call(&mut self, to: u32, kind: CallKind, request: Vec<u8>, now: Instant) {
+    /// Sends a call; returns its transaction.
+    fn call(&mut self, to: u32, kind: CallKind, request: Vec<u8>, now: Instant) -> i64 {
         let (service, method, timeout_ms) = match kind {
-            CallKind::SyncRoute => (ROUTE_SERVICE, METHOD_SYNC_ROUTE_INFO, ROUTE_SYNC_TIMEOUT_MS),
+            // 3 s plus 2 s per MiB of the request, at most 15 s (spec §11).
+            CallKind::SyncRoute => (
+                ROUTE_SERVICE,
+                METHOD_SYNC_ROUTE_INFO,
+                route_sync_timeout_ms(request.len()),
+            ),
             CallKind::ReportPeers => (
                 center::SERVICE,
                 center::METHOD_REPORT_PEERS,
@@ -1044,6 +1747,11 @@ impl Node {
                 center::SERVICE,
                 center::METHOD_GET_GLOBAL_PEER_MAP,
                 DEFAULT_TIMEOUT_MS,
+            ),
+            CallKind::PathCaps => (
+                waypoint::RPC_SERVICE,
+                waypoint::RPC_CAPABILITIES,
+                PATH_QUERY_TIMEOUT_MS,
             ),
         };
         let transaction = self.next_transaction();
@@ -1059,9 +1767,11 @@ impl Node {
                 peer: to,
                 kind,
                 deadline: now + Duration::from_millis(u64::from(timeout_ms)),
+                batch: 0,
             },
         );
         self.send_rpc(to, transaction, &descriptor, true, &body, now);
+        transaction
     }
 
     /// One RPC piece from `from` (the packet header) that arrived over a
@@ -1078,14 +1788,32 @@ impl Node {
             self.counters.dropped += 1;
             return;
         };
-        let timeout = Duration::from_millis(u64::from(DEFAULT_TIMEOUT_MS));
+        // A request's own timeout is read only once it is whole, so its
+        // reassembly is bounded by what a route sync of its size may take,
+        // at least the default and at most 15 s (spec §11).
+        let timeout_ms = if piece.is_request {
+            reassembly_timeout_ms(piece.total_pieces)
+        } else {
+            DEFAULT_TIMEOUT_MS
+        };
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        // The alert counts only route synchronisation from the neighbour
+        // the connection authenticated, so that no member can raise it, or
+        // skew a size measurement, under another node's ID.
+        let route_sync = from == neighbour
+            && piece.descriptor.as_ref().is_some_and(|descriptor| {
+                descriptor.service == ROUTE_SERVICE
+                    && descriptor.method_index == METHOD_SYNC_ROUTE_INFO
+            });
         let call = match self.reassembler.push(from, piece, timeout, now) {
             Ok(Some(call)) => call,
             Ok(None) => return,
             Err(RpcDropped::CallTooLarge(bytes)) => {
                 self.counters.dropped += 1;
                 self.counters.oversize_calls += 1;
-                self.sync_oversize = Some(SyncOversize::Received { peer: from, bytes });
+                if route_sync {
+                    self.sync_oversize.received = Some((from, bytes));
+                }
                 return;
             }
             Err(_) => {
@@ -1153,6 +1881,9 @@ impl Node {
                 Ok(self.centre.get(digest).encode())
             }
             (center::SERVICE, _) => Err(RpcError::InvalidMethod),
+            (waypoint::RPC_SERVICE, _) if !self.paths_on() => Err(RpcError::InvalidService),
+            (waypoint::RPC_SERVICE, waypoint::RPC_CAPABILITIES) => Ok(self.capabilities().encode()),
+            (waypoint::RPC_SERVICE, _) => Err(RpcError::InvalidMethod),
             _ => Err(RpcError::InvalidService),
         }
     }
@@ -1185,9 +1916,12 @@ impl Node {
         let result = RpcResponse::decode(body).ok().and_then(|r| r.result.ok());
         match outgoing.kind {
             CallKind::SyncRoute => {
-                let response = result.and_then(|bytes| SyncRouteResponse::decode(&bytes).ok());
+                let response = result
+                    .and_then(|bytes| SyncRouteResponse::decode(&bytes).ok())
+                    .ok_or(Failure::Error);
                 if let Ok(Some(Notice::DuplicatePeerId)) =
-                    self.sync.on_response(from, response, rng, now)
+                    self.sync
+                        .on_response(from, outgoing.batch, response, rng, now)
                 {
                     self.id_conflict(rng, now);
                 }
@@ -1200,6 +1934,18 @@ impl Node {
                         self.peer_map = map;
                     }
                 }
+            }
+            CallKind::PathCaps => {
+                let answer = match RpcResponse::decode(body).map(|response| response.result) {
+                    Ok(Ok(bytes)) => {
+                        Capabilities::decode(&bytes).map_or(Answer::Failed, Answer::Capabilities)
+                    }
+                    Ok(Err(RpcError::InvalidService)) => Answer::InvalidService,
+                    _ => Answer::Failed,
+                };
+                self.paths.answered(from, answer, now);
+                let facts = facts!(self);
+                self.paths.evaluate(&facts, now);
             }
         }
     }
@@ -1237,6 +1983,7 @@ impl Node {
         for peer in stale {
             self.routes.remove_peer(peer);
         }
+        self.choose_system_routes();
     }
 
     /// Timers: keep-alive, handshake timeouts, route synchronisation, the
@@ -1246,11 +1993,16 @@ impl Node {
         self.keep_alive(now);
         self.expire_calls(rng, now);
 
-        for (peer, request) in self.sync.poll(now, unix_now) {
-            self.call(peer, CallKind::SyncRoute, request.encode(), now);
+        for batch in self.sync.poll(now, unix_now) {
+            let transaction =
+                self.call(batch.peer, CallKind::SyncRoute, batch.request.encode(), now);
+            if let Some(call) = self.calls.get_mut(&transaction) {
+                call.batch = batch.id;
+            }
         }
-        if let Some(peer) = self.sync.take_graph_timeout() {
-            self.sync_oversize = Some(SyncOversize::Undelivered { peer });
+        let closed = self.sync.take_graph_timeouts();
+        if !closed.is_empty() {
+            self.sync_oversize.undelivered = closed;
         }
         // Rule 1 of spec §12.3, or this node's version ran out.
         if self.sync.take_conflict() {
@@ -1258,9 +2010,16 @@ impl Node {
         }
         self.sync.expire(now);
         self.refresh_routes();
+        self.path_round(rng, now);
         self.centre_round(now);
         self.reassembler.expire(now);
         self.sessions.reclaim(now);
+        if self
+            .not_native
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) >= NOT_NATIVE_HOLD)
+        {
+            self.not_native = None;
+        }
         self.wake(rng, now);
     }
 
@@ -1319,7 +2078,7 @@ impl Node {
         let Some(peer_static) = self.expected_key(peer) else {
             if self.peer_static(peer).is_some() {
                 // Announced, but off the native key list (spec §8.3.1).
-                self.not_native = Some(peer);
+                self.refused_not_native(peer, now);
             }
             self.drop_relay(peer);
             return;
@@ -1351,18 +2110,41 @@ impl Node {
     /// otherwise the announced one, which a managed network takes only
     /// from its native key list.
     fn expected_key(&self, peer: u32) -> Option<[u8; LEN]> {
-        for namespace in [Namespace::Direct, Namespace::Relay] {
-            let key = SessionKey {
-                namespace,
-                network: self.local.network_name.clone(),
-                peer_id: peer,
-            };
-            if let Some(session) = self.sessions.get(&key) {
-                return Some(session.peer_static());
-            }
+        self.bound_key(peer).or_else(|| {
+            self.peer_static(peer)
+                .filter(|announced| self.settings.admits(announced))
+        })
+    }
+
+    /// The static key a handshake bound to `peer`'s node ID: while it has
+    /// a session, direct or relayed, and shortly after (spec §12.3).
+    fn bound_key(&self, peer: u32) -> Option<[u8; LEN]> {
+        [Namespace::Direct, Namespace::Relay]
+            .into_iter()
+            .find_map(|namespace| {
+                self.sessions.bound_static(&SessionKey {
+                    namespace,
+                    network: self.local.network_name.clone(),
+                    peer_id: peer,
+                })
+            })
+    }
+
+    /// Members whose route information announces another static key than
+    /// the one bound to their node ID: the announcement is not used
+    /// (spec §12.3, alert 「节点公钥变更被拒」).
+    pub fn refused_key_changes(&self) -> Vec<u32> {
+        if self.settings.security != SecurityMode::ForwardSecrecy {
+            return Vec::new();
         }
-        self.peer_static(peer)
-            .filter(|announced| self.settings.admits(announced))
+        self.sync
+            .infos()
+            .filter_map(|info| {
+                let announced = <[u8; LEN]>::try_from(&info.noise_pubkey[..]).ok()?;
+                let bound = self.bound_key(info.peer_id)?;
+                (announced != bound).then_some(info.peer_id)
+            })
+            .collect()
     }
 
     /// Sends what waited for the relay session with `peer`.
@@ -1401,12 +2183,13 @@ impl Node {
         );
         let (msg2, joined) = match answer {
             Ok(RelayAnswer::Reply(msg2, established)) => {
+                self.admitted_peer(from);
                 (msg2, established.action != SessionAction::Create)
             }
             Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
             Err(error) => {
                 if error == HandshakeError::NotNative {
-                    self.not_native = Some(from);
+                    self.refused_not_native(from, now);
                 }
                 self.counters.dropped += 1;
                 return;
@@ -1440,7 +2223,17 @@ impl Node {
             return;
         };
         match initiator.finish(&self.local, msg2, &mut self.sessions, now) {
-            Ok(_) => self.flush_relay(from, now),
+            Ok(_) => {
+                self.admitted_peer(from);
+                self.flush_relay(from, now);
+            }
+            // Dropped from the native key list since msg1 (spec §8.3.1
+            // rule 6): nothing waits for this session any more.
+            Err(HandshakeError::NotNative) => {
+                self.refused_not_native(from, now);
+                self.counters.dropped += 1;
+                self.drop_relay(from);
+            }
             // The retry is a new handshake.
             Err(_) => self.counters.dropped += 1,
         }
@@ -1504,8 +2297,18 @@ impl Node {
             .collect();
         for transaction in expired {
             if let Some(call) = self.calls.remove(&transaction) {
-                if call.kind == CallKind::SyncRoute {
-                    let _ = self.sync.on_response(call.peer, None, rng, now);
+                match call.kind {
+                    CallKind::SyncRoute => {
+                        let _ = self.sync.on_response(
+                            call.peer,
+                            call.batch,
+                            Err(Failure::Timeout),
+                            rng,
+                            now,
+                        );
+                    }
+                    CallKind::PathCaps => self.paths.answered(call.peer, Answer::Failed, now),
+                    CallKind::ReportPeers | CallKind::GetPeerMap => {}
                 }
             }
         }
@@ -1581,6 +2384,41 @@ impl Node {
     }
 }
 
+/// Takes at most `limit` distinct subnets from `lists`, one list per
+/// member with the nearest first, a round at a time: one subnet from each
+/// list per round, so every member gets an equal share of the room and a
+/// member with fewer subnets leaves the rest to the others (max-min
+/// fairness). A subnet several members route counts once, for the first.
+/// Returns the subnets in address order and how many did not fit.
+fn fair_share(lists: &[Vec<IpNet>], limit: usize) -> (Vec<IpNet>, usize) {
+    let mut chosen = Vec::new();
+    let mut taken = HashSet::new();
+    let mut cursors = vec![0usize; lists.len()];
+    'rounds: loop {
+        let mut progressed = false;
+        for (list, cursor) in lists.iter().zip(cursors.iter_mut()) {
+            if chosen.len() >= limit {
+                break 'rounds;
+            }
+            while let Some(subnet) = list.get(*cursor) {
+                *cursor += 1;
+                if taken.insert(*subnet) {
+                    chosen.push(*subnet);
+                    progressed = true;
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let candidates: HashSet<IpNet> = lists.iter().flatten().copied().collect();
+    let truncated = candidates.len() - chosen.len();
+    chosen.sort_by_key(|subnet| (subnet.network(), subnet.prefix()));
+    (chosen, truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1597,7 +2435,7 @@ mod tests {
         let config = serde_json::json!({
             "config_version": 1,
             "network": network,
-            "node": {"address": address, "role": "full"},
+            "node": {"address": address, "role": "full", "waypoint_relay": true},
             "peers": [{"server": "peer.example", "port": 40000}],
         });
         let config: MeshConfig = serde_json::from_value(config).expect("config parses");
@@ -1611,6 +2449,9 @@ mod tests {
         delivered: Vec<(usize, Vec<u8>)>,
         to_backbone: Vec<(usize, Vec<u8>)>,
         now: Instant,
+        /// A node that silently drops type-40 packets addressed to it, as
+        /// an implementation without custom paths does.
+        drops_type_40: Option<usize>,
     }
 
     impl Net {
@@ -1651,6 +2492,7 @@ mod tests {
                 delivered: Vec::new(),
                 to_backbone: Vec::new(),
                 now,
+                drops_type_40: None,
             }
         }
 
@@ -1674,7 +2516,14 @@ mod tests {
                         match action {
                             Action::Send { conn, packet } => {
                                 if let Some(&(j, peer_conn)) = self.wires.get(&(i, conn)) {
-                                    self.nodes[j].receive(peer_conn, &packet, &rng, self.now);
+                                    let dropped = self.drops_type_40 == Some(j)
+                                        && NodeHeader::decode(&packet).is_some_and(|header| {
+                                            header.packet_type == packet_type::WAYPOINT
+                                                && header.to == self.nodes[j].local.id
+                                        });
+                                    if !dropped {
+                                        self.nodes[j].receive(peer_conn, &packet, &rng, self.now);
+                                    }
                                 }
                             }
                             Action::Deliver(packet) => self.delivered.push((i, packet)),
@@ -1720,6 +2569,276 @@ mod tests {
             net.tick(Duration::from_secs(1));
         }
         net
+    }
+
+    /// A square: 0–1–2 and 0–3–2. Node 0 reaches node 2 through node 1 by
+    /// default (the smaller first hop).
+    fn square(secure: bool) -> Net {
+        let mut net = Net::new(
+            &[
+                "10.144.0.1/24",
+                "10.144.0.2/24",
+                "10.144.0.3/24",
+                "10.144.0.4/24",
+            ],
+            secure,
+        );
+        net.link(0, 1);
+        net.link(1, 2);
+        net.link(0, 3);
+        net.link(3, 2);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net
+    }
+
+    /// Node 0's path to node 2 through node 3.
+    fn path_through_node_3(net: &mut Net) {
+        let rng = SystemRandom::new();
+        let path = CustomPath {
+            target: crate::config::PathTarget::Peer(IpAddr::from([10, 144, 0, 3])),
+            via: vec![IpAddr::from([10, 144, 0, 4])],
+        };
+        net.nodes[0].set_paths(vec![path], &rng, net.now);
+        net.settle();
+    }
+
+    /// Ticks until node 0's first path leaves `pending`: a few seconds.
+    fn warm_up(net: &mut Net) {
+        for _ in 0..5 {
+            net.tick(Duration::from_secs(1));
+            if net.nodes[0].path_status(net.now)[0].state != "pending" {
+                return;
+            }
+        }
+    }
+
+    /// A TCP SYN (or SYN-ACK) with one MSS option and a correct checksum.
+    fn tcp_syn(source: [u8; 4], destination: [u8; 4], mss: u16, flags: u8) -> Vec<u8> {
+        let mut ip = vec![0x45, 0, 0, 44, 0, 1, 0x40, 0, 64, 6, 0, 0];
+        ip.extend_from_slice(&source);
+        ip.extend_from_slice(&destination);
+        let mut tcp = vec![
+            0x30, 0x39, 0x00, 0x50, 0, 0, 0, 1, 0, 0, 0, 0, 0x60, flags, 0xff, 0xff, 0, 0, 0, 0, 2,
+            4,
+        ];
+        tcp.extend_from_slice(&mss.to_be_bytes());
+        let mut sum = 0u32;
+        let mut words = source.to_vec();
+        words.extend_from_slice(&destination);
+        words.extend_from_slice(&[0, 6]);
+        words.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        words.extend_from_slice(&tcp);
+        for pair in words.chunks(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        tcp[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        ip.extend_from_slice(&tcp);
+        ip
+    }
+
+    fn mss_of(ip: &[u8]) -> u16 {
+        u16::from_be_bytes([ip[42], ip[43]])
+    }
+
+    fn custom_path_carries_data(secure: bool) {
+        let mut net = square(secure);
+        assert_eq!(net.nodes[0].paths()[&102].next_hop, 101);
+        path_through_node_3(&mut net);
+        // Asked at once; warm-up needs one probe answered in full.
+        assert_eq!(net.nodes[0].path_status(net.now)[0].state, "pending");
+        assert_eq!(
+            net.nodes[0].paths.capability(103),
+            crate::waypoint::Capability::Supported
+        );
+        // The waypoint asks about node 0 when the first probe arrives, so
+        // the second or third probe completes warm-up.
+        warm_up(&mut net);
+        let status = net.nodes[0].path_status(net.now);
+        assert_eq!(status[0].state, "active");
+        assert_eq!(status[0].id, "peer:10.144.0.3");
+        assert_eq!(status[0].reason, None);
+
+        // The first packet may set up the end-to-end session first.
+        let warm = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &warm);
+        net.delivered.clear();
+        let through_1 = net.nodes[1].counters().relayed;
+        let through_3 = net.nodes[3].counters().relayed;
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[1].counters().relayed, through_1);
+        assert_eq!(net.nodes[3].counters().relayed, through_3 + 1);
+
+        // A SYN out lowers its MSS for one encapsulation; a SYN-ACK back
+        // from the destination is lowered on the way in.
+        net.delivered.clear();
+        let syn = tcp_syn([10, 144, 0, 1], [10, 144, 0, 3], 1460, 0x02);
+        send(&mut net, 0, &syn);
+        assert_eq!(net.delivered.len(), 1);
+        assert_eq!(mss_of(&net.delivered[0].1), waypoint::max_mss(0, false));
+        net.delivered.clear();
+        let syn_ack = tcp_syn([10, 144, 0, 3], [10, 144, 0, 1], 1460, 0x12);
+        send(&mut net, 2, &syn_ack);
+        assert_eq!(net.delivered.len(), 1);
+        assert_eq!(net.delivered[0].0, 0);
+        assert_eq!(mss_of(&net.delivered[0].1), waypoint::max_mss(0, false));
+        // Untouched without a path.
+        net.delivered.clear();
+        let other = tcp_syn([10, 144, 0, 1], [10, 144, 0, 2], 1460, 0x02);
+        send(&mut net, 0, &other);
+        assert_eq!(mss_of(&net.delivered[0].1), 1460);
+    }
+
+    #[test]
+    fn a_custom_path_carries_data_through_its_waypoint() {
+        custom_path_carries_data(false);
+    }
+
+    #[test]
+    fn a_custom_path_carries_data_in_the_secure_mode() {
+        custom_path_carries_data(true);
+    }
+
+    /// A node with no paths of its own and `waypoint_relay` off: the
+    /// default until custom paths are released (spec §17.2.4).
+    fn square_with_node_3_off(secure: bool) -> Net {
+        let addresses = [
+            "10.144.0.1/24",
+            "10.144.0.2/24",
+            "10.144.0.3/24",
+            "10.144.0.4/24",
+        ];
+        let mut all: Vec<MeshSettings> = addresses
+            .iter()
+            .map(|address| settings(address, secure))
+            .collect();
+        all[3].waypoint_relay = false;
+        let mut net = Net::with(all);
+        net.link(0, 1);
+        net.link(1, 2);
+        net.link(0, 3);
+        net.link(3, 2);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net
+    }
+
+    fn paths_off_by_default(secure: bool) {
+        let mut net = square_with_node_3_off(secure);
+        path_through_node_3(&mut net);
+        // Node 3 answers like an implementation without the service.
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[0].paths.capability(103),
+            crate::waypoint::Capability::Unsupported
+        );
+        for _ in 0..12 {
+            net.tick(Duration::from_secs(1));
+        }
+        // Never encapsulated: at most the first-hop policy (spec §17.2.3).
+        assert_ne!(net.nodes[0].path_status(net.now)[0].state, "active");
+
+        // A type-40 packet for node 3 is dropped and counted, not relayed.
+        let dropped = net.nodes[3].path_counters().dropped;
+        let relayed = net.nodes[3].counters().relayed;
+        let transit = waypoint::encode_transit(
+            100,
+            102,
+            &[],
+            waypoint::Body::Data(&ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3])),
+        );
+        let now = net.now;
+        assert!(net.nodes[0].originate(103, packet_type::WAYPOINT, &transit, now));
+        net.delivered.clear();
+        net.settle();
+        assert_eq!(net.nodes[3].path_counters().dropped, dropped + 1);
+        assert_eq!(net.nodes[3].counters().relayed, relayed);
+        assert!(net.delivered.is_empty());
+        // Dropped before it is read: a waypoint would have asked about the
+        // packet's origin (spec §17.2.5 rule 6) and learnt its answer.
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[3].paths.capability(100),
+            crate::waypoint::Capability::Pending
+        );
+        assert_eq!(net.nodes[3].path_counters().dropped_queries, 0);
+    }
+
+    #[test]
+    fn a_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(false);
+    }
+
+    #[test]
+    fn a_secure_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(true);
+    }
+
+    #[test]
+    fn a_waypoint_that_drops_type_40_is_found_by_probes() {
+        let mut net = square(false);
+        path_through_node_3(&mut net);
+        warm_up(&mut net);
+        assert_eq!(net.nodes[0].path_status(net.now)[0].state, "active");
+        // Node 3 keeps answering that it relays but drops type 40 without
+        // a word: only probes can tell (spec §17.2.6).
+        net.drops_type_40 = Some(3);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        let mut fell_back = None;
+        let mut states = Vec::new();
+        for second in 0..60 {
+            send(&mut net, 0, &packet);
+            net.tick(Duration::from_secs(1));
+            let state = net.nodes[0].path_status(net.now)[0].state;
+            states.push(state);
+            if state == "fallback" {
+                fell_back = Some(second);
+                break;
+            }
+        }
+        // Three probes of ten seconds each, plus their 3 s wait.
+        assert!(
+            fell_back.is_some_and(|second| second >= 20),
+            "fell back at {fell_back:?}; states {states:?}; status {:?}; counters {:?}",
+            net.nodes[0].path_status(net.now),
+            net.nodes[0].path_counters(),
+        );
+        let status = net.nodes[0].path_status(net.now);
+        assert_eq!(status[0].reason, Some(crate::waypoint::Reason::NoEcho));
+        assert_eq!(status[0].unreachable, Some(IpAddr::from([10, 144, 0, 4])));
+        // Traffic takes the default route again.
+        net.delivered.clear();
+        let through_1 = net.nodes[1].counters().relayed;
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[1].counters().relayed, through_1 + 1);
+    }
+
+    #[test]
+    fn every_node_answers_the_capability_query() {
+        let mut net = square(false);
+        // An access node answers that it does not relay.
+        net.nodes[3].settings.role = Role::Access;
+        path_through_node_3(&mut net);
+        assert_eq!(
+            net.nodes[0].paths.capability(103),
+            crate::waypoint::Capability::NotRelay
+        );
+        let status = net.nodes[0].path_status(net.now);
+        // A neighbour that does not relay cannot even keep the first hop.
+        assert_eq!(status[0].state, "fallback");
+        assert_eq!(status[0].reason, Some(crate::waypoint::Reason::NotRelay));
+        assert_eq!(status[0].unreachable, Some(IpAddr::from([10, 144, 0, 4])));
     }
 
     #[test]
@@ -1842,6 +2961,69 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_is_reported_until_a_handshake_a_new_list_or_ten_minutes() {
+        let refused = || {
+            let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+            let full = net.nodes[0].settings.native_keys.clone();
+            unlist(&mut net, 0, 1);
+            net.link(0, 1);
+            net.settle();
+            assert_eq!(net.nodes[0].last_not_native(), Some(101));
+            (net, full)
+        };
+
+        // Still reported just before ten minutes, gone at ten.
+        let (mut net, _) = refused();
+        net.tick(NOT_NATIVE_HOLD - Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), Some(101));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // A new list clears it.
+        let (mut net, full) = refused();
+        let now = net.now;
+        net.nodes[0].set_native_keys(full, now);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // So does a handshake with the refused peer.
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.nodes[0].not_native = Some((101, net.now));
+        net.link(0, 1);
+        net.settle();
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+    }
+
+    #[test]
+    fn a_relay_handshake_started_before_the_list_changed_is_dropped() {
+        let mut net = three_in_a_row(true);
+        let key = SessionKey {
+            namespace: Namespace::Relay,
+            network: net.nodes[0].local.network_name.clone(),
+            peer_id: 102,
+        };
+        // The latency centre's calls may already have set up a relay
+        // session with node 2; start from none, so that the packet waits
+        // for a new handshake.
+        net.nodes[0].sessions.invalidate(&key);
+        net.nodes[0].relays.remove(&102);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        net.nodes[0].send_ip(&packet, net.now).unwrap();
+        // msg1 goes out; the answer is not delivered yet.
+        net.nodes[0].wake(&SystemRandom::new(), net.now);
+        assert!(net.nodes[0]
+            .relays
+            .get(&102)
+            .is_some_and(|relay| relay.initiator.is_some()));
+        // Node 2 is dropped while its msg2 is on the way.
+        unlist(&mut net, 0, 2);
+        assert!(!net.nodes[0].relays.contains_key(&102));
+        net.settle();
+        assert!(net.nodes[0].sessions.get(&key).is_none());
+        assert!(net.delivered.is_empty());
+    }
+
+    #[test]
     fn a_node_off_the_list_is_not_routed_to_or_relayed_to() {
         let mut net = three_in_a_row(true);
         assert!(net.nodes[0].paths().contains_key(&102));
@@ -1881,6 +3063,53 @@ mod tests {
         };
         let now = net.now;
         net.nodes[i].sync.on_request(from, request, now);
+    }
+
+    #[test]
+    fn an_announced_key_change_of_a_bound_node_is_refused_and_reported() {
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.link(0, 1);
+        net.settle();
+        net.tick(Duration::from_secs(1));
+        let bound = net.nodes[1].static_public();
+        assert_eq!(net.nodes[0].expected_key(101), Some(bound));
+        assert!(net.nodes[0].refused_key_changes().is_empty());
+        // Node 1's information now announces another key.
+        let mut changed = net.nodes[0].route_sync().info(101).unwrap().clone();
+        changed.version += 1;
+        changed.noise_pubkey = vec![9; LEN];
+        let request = SyncRouteRequest {
+            my_peer_id: 101,
+            my_session_id: 1,
+            peer_infos: vec![changed],
+            ..SyncRouteRequest::default()
+        };
+        let now = net.now;
+        // Even a listed key does not replace the binding.
+        let mut listed = net.nodes[0].settings.native_keys.clone().unwrap();
+        listed.push([9; LEN]);
+        net.nodes[0].set_native_keys(Some(listed), now);
+        net.nodes[0].sync.on_request(101, request, now);
+        assert_eq!(
+            net.nodes[0].route_sync().info(101).unwrap().noise_pubkey,
+            vec![9; LEN]
+        );
+        assert_eq!(net.nodes[0].expected_key(101), Some(bound));
+        assert_eq!(net.nodes[0].refused_key_changes(), vec![101]);
+    }
+
+    #[test]
+    fn an_rpc_body_over_four_mebibytes_is_not_sent() {
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.link(0, 1);
+        net.settle();
+        let now = net.now;
+        let node = &mut net.nodes[0];
+        while node.poll_action().is_some() {}
+        let descriptor = node.descriptor(ROUTE_SERVICE, METHOD_SYNC_ROUTE_INFO);
+        node.send_rpc(101, 1, &descriptor, true, &vec![0; MAX_RPC_BODY + 1], now);
+        assert_eq!(node.counters().oversize_rpc, 1);
+        assert!(node.poll_action().is_none());
     }
 
     #[test]
@@ -1970,6 +3199,55 @@ mod tests {
         assert!(net.delivered.iter().all(|(i, _)| *i != 1));
     }
 
+    /// Packets relayed through node 1 keep using the relay session after
+    /// node 0 and node 2 connect directly (review of #376, M2): none fails
+    /// under the direct session, so neither session is discarded.
+    #[test]
+    fn relayed_packets_survive_a_direct_connection_coming_up() {
+        let mut net = three_in_a_row(true);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet.clone())]);
+        // Node 0 and node 2 connect directly; node 0 still has packets in
+        // flight through node 1, sealed under the relay session.
+        net.link(0, 2);
+        net.settle();
+        assert!(net.nodes[2].neighbours().contains(&100));
+        let (_, to_2) = net
+            .wires
+            .iter()
+            .find(|((i, _), (j, _))| *i == 1 && *j == 2)
+            .map(|(_, to)| *to)
+            .unwrap();
+        let rng = SystemRandom::new();
+        net.delivered.clear();
+        let dropped = net.nodes[2].counters().dropped;
+        for _ in 0..12 {
+            let sealed = {
+                let mut crypto = net.nodes[0].crypto();
+                link::seal(
+                    &mut crypto,
+                    100,
+                    102,
+                    101,
+                    packet_type::DATA,
+                    &packet,
+                    net.now,
+                )
+                .unwrap()
+            };
+            net.nodes[2].receive(to_2, &sealed, &rng, net.now);
+            net.settle();
+        }
+        assert_eq!(net.nodes[2].counters().dropped, dropped);
+        assert_eq!(net.delivered.len(), 12);
+        // The direct session is intact too.
+        net.delivered.clear();
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[2].counters().dropped, dropped);
+    }
+
     #[test]
     fn both_ends_starting_at_once_end_with_one_session() {
         let mut net = three_in_a_row(true);
@@ -2031,6 +3309,39 @@ mod tests {
     }
 
     #[test]
+    fn members_share_the_system_routes_fairly() {
+        let net = |i: u32| IpNet::parse(&format!("10.{}.{}.0/24", i / 256, i % 256)).unwrap();
+        let near: Vec<IpNet> = (0..10).map(net).collect();
+        let few: Vec<IpNet> = (100..102).map(net).collect();
+        let one = vec![net(200)];
+        let (chosen, truncated) = fair_share(&[near.clone(), few.clone(), one.clone()], 10);
+        assert_eq!(chosen.len(), 10);
+        assert_eq!(truncated, 3);
+        // The members with few subnets keep all of theirs; the rest of the
+        // room goes to the one with many.
+        assert!(few.iter().chain(&one).all(|subnet| chosen.contains(subnet)));
+        assert_eq!(near.iter().filter(|s| chosen.contains(s)).count(), 7);
+        // In address order, not text order.
+        let mut sorted = chosen.clone();
+        sorted.sort_by_key(|subnet| (subnet.network(), subnet.prefix()));
+        assert_eq!(chosen, sorted);
+
+        // A flood from one member cannot push out another's routes.
+        let flood: Vec<IpNet> = (0..MAX_SYSTEM_ROUTES as u32 * 2).map(net).collect();
+        let real = vec![IpNet::parse("192.168.50.0/24").unwrap()];
+        let (chosen, truncated) = fair_share(&[flood, real.clone()], MAX_SYSTEM_ROUTES);
+        assert!(chosen.contains(&real[0]));
+        assert_eq!(chosen.len(), MAX_SYSTEM_ROUTES);
+        assert_eq!(truncated, MAX_SYSTEM_ROUTES + 1);
+
+        // A subnet two members route counts once.
+        let (chosen, truncated) = fair_share(&[vec![net(1), net(2)], vec![net(1)]], 10);
+        assert_eq!(chosen, [net(1), net(2)]);
+        assert_eq!(truncated, 0);
+        assert_eq!(fair_share(&[], 10), (Vec::new(), 0));
+    }
+
+    #[test]
     fn system_routes_skip_local_networks_and_follow_the_configured_limit() {
         let advertising = |address: &str, extra: serde_json::Value| {
             let mut config = serde_json::json!({
@@ -2078,6 +3389,32 @@ mod tests {
         // This machine sits on 192.168.10.0/24 itself.
         net.nodes[0].set_local_networks(&[IpNet::parse("192.168.10.7/24").unwrap()]);
         assert!(routes(&net).is_empty());
+        // The user routes it through the mesh anyway; the override outlives
+        // a rescan of the interfaces and ends when it is withdrawn.
+        net.nodes[0].set_route_overrides(&[IpNet::parse("192.168.10.0/24").unwrap()]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        net.nodes[0].set_local_networks(&[IpNet::parse("192.168.10.7/24").unwrap()]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        // Only the very subnet: a wider override does not cover it.
+        net.nodes[0].set_route_overrides(&[IpNet::parse("192.168.0.0/16").unwrap()]);
+        assert!(routes(&net).is_empty());
+        net.nodes[0].set_route_overrides(&[]);
+        assert!(routes(&net).is_empty());
+        // A local network is not another mesh program's route.
+        assert!(net.nodes[0].foreign_overlaps().is_empty());
+        net.nodes[0].set_local_networks(&[]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        // Another mesh program carries 192.168.0.0/16: kept local and
+        // reported apart.
+        net.nodes[0].set_foreign_routes(&[IpNet::parse("192.168.0.0/16").unwrap()]);
+        assert!(routes(&net).is_empty());
+        assert_eq!(
+            net.nodes[0].foreign_overlaps(),
+            [IpNet::parse("192.168.10.0/24").unwrap()]
+        );
+        net.nodes[0].set_foreign_routes(&[]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        assert!(net.nodes[0].foreign_overlaps().is_empty());
     }
 
     #[test]

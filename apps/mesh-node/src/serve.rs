@@ -5,10 +5,11 @@
 //! Exit codes: 0 stopped by a signal, 2 configuration, 3 a port or the
 //! interface is taken (another program still runs), 1 anything else.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
-
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use outbound_mesh::config::encode_key;
@@ -19,6 +20,7 @@ use ring::rand::SystemRandom;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, watch};
+use zeroize::Zeroizing;
 
 use crate::host_routes;
 use crate::tun::{self, Tun};
@@ -32,32 +34,143 @@ const QUEUE: usize = 256;
 /// How often the networks of the other interfaces are read again.
 const LOCAL_NETWORKS_EVERY: Duration = Duration::from_secs(30);
 
-/// What the host reaches without the mesh (spec §15.4): the networks of the
-/// other interfaces and the routes of other programs' virtual interfaces.
-/// Every interface named like ours, and `device`, is left out.
-fn read_local_networks(device: &str) -> Vec<IpNet> {
+/// How soon the interfaces are read again while they could not be read
+/// yet: no subnet is installed until then.
+const LOCAL_NETWORKS_RETRY: Duration = Duration::from_secs(5);
+
+/// How long one read of the interfaces, or of the routes, may take.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The networks of the other interfaces (spec §15.4). Our own mesh
+/// interfaces, and `device`, are left out.
+fn read_local_networks(device: &str) -> io::Result<Vec<IpNet>> {
     let own = |name: &str| host_routes::is_own_interface(name, &[device]);
-    let mut networks: Vec<IpNet> = match tun::local_networks(own) {
-        Ok(networks) => networks
-            .into_iter()
-            .filter_map(|(address, prefix)| IpNet::new(address, prefix))
-            .collect(),
-        Err(error) => {
-            warn("interfaces", &error.to_string());
-            Vec::new()
+    Ok(tun::local_networks(own)?
+        .into_iter()
+        .filter_map(|(address, prefix)| IpNet::new(address, prefix))
+        .collect())
+}
+
+/// Clears a read's busy flag when the read ends, however it ends.
+struct Reading(Arc<AtomicBool>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Runs `read` off the packet loop, unless the previous read behind `busy`
+/// still runs (a blocking read goes on past its timeout). `None` when
+/// skipped, failed or longer than [`SCAN_TIMEOUT`].
+async fn read_off_loop<T: Send + 'static>(
+    busy: &Arc<AtomicBool>,
+    what: &str,
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> Option<T> {
+    if busy.swap(true, Ordering::AcqRel) {
+        warn(what, "the previous read is still running");
+        return None;
+    }
+    let reading = Reading(busy.clone());
+    let task = tokio::task::spawn_blocking(move || {
+        let _reading = reading;
+        read()
+    });
+    match tokio::time::timeout(SCAN_TIMEOUT, task).await {
+        Ok(Ok(Ok(found))) => Some(found),
+        Ok(Ok(Err(error))) => {
+            warn(what, &error.to_string());
+            None
         }
-    };
-    match host_routes::host_links()
-        .and_then(|links| host_routes::host_routes().map(|routes| (links, routes)))
-    {
-        Ok((links, routes)) => networks.extend(host_routes::foreign_virtual_routes(
-            &routes,
-            &links,
-            &[device],
-        )),
-        Err(error) => warn("routes", &error.to_string()),
+        Ok(Err(error)) => {
+            warn(what, &error.to_string());
+            None
+        }
+        Err(_) => {
+            warn(what, "the read timed out");
+            None
+        }
+    }
+}
+
+/// What the host reaches without the mesh: the networks of the other
+/// interfaces, and the routes of other mesh programs as the system selects
+/// them. The two are read apart, so that the interfaces count even when
+/// the routing tables cannot be read; a part that fails keeps its previous
+/// result.
+struct Scanner {
+    device: String,
+    interfaces: Arc<AtomicBool>,
+    routes: Arc<AtomicBool>,
+}
+
+impl Scanner {
+    fn new(device: &str) -> Self {
+        Self {
+            device: device.to_owned(),
+            interfaces: Arc::default(),
+            routes: Arc::default(),
+        }
+    }
+
+    async fn interfaces(&self) -> Option<Vec<IpNet>> {
+        let device = self.device.clone();
+        read_off_loop(&self.interfaces, "interfaces", move || {
+            read_local_networks(&device)
+        })
+        .await
+    }
+
+    async fn routes(&self) -> Option<Vec<IpNet>> {
+        let device = self.device.clone();
+        let found = read_off_loop(&self.routes, "routes", move || {
+            host_routes::foreign_routes(&device)
+        })
+        .await?;
+        if found.unchecked > 0 {
+            warn(
+                "routes",
+                &format!(
+                    "{} routes of other programs were not checked",
+                    found.unchecked
+                ),
+            );
+        }
+        Some(found.routes)
+    }
+
+    async fn both(&self) -> (Option<Vec<IpNet>>, Option<Vec<IpNet>>) {
+        tokio::join!(self.interfaces(), self.routes())
+    }
+}
+
+/// Stores `fresh` when it differs, so that the driver wakes on changes only.
+fn store<T: PartialEq>(sender: &watch::Sender<T>, fresh: T) {
+    sender.send_if_modified(|current| {
+        let changed = *current != fresh;
+        if changed {
+            *current = fresh;
+        }
+        changed
+    });
+}
+
+/// `networks` with the routes the other networks of this process hold.
+fn with_others(mut networks: Vec<IpNet>, others: Option<&(HostRoutes, String)>) -> Vec<IpNet> {
+    if let Some((routes, owner)) = others {
+        networks.extend(routes.others(owner));
     }
     networks
+}
+
+/// Aborts the task when dropped.
+struct StopTask(tokio::task::JoinHandle<()>);
+
+impl Drop for StopTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Routes to add and to remove to go from `installed` to `wanted`, in
@@ -78,13 +191,117 @@ fn route_changes(installed: &[IpNet], wanted: &[IpNet]) -> (Vec<IpNet>, Vec<IpNe
     (add, remove)
 }
 
+/// The system routes the networks of one process installed, by network,
+/// shared so that no two networks install overlapping subnets: the first
+/// to claim a subnet keeps it, and the others treat it as one of this
+/// machine's networks (spec §15.4), which refuses it as an overlap.
+#[derive(Clone)]
+pub(crate) struct HostRoutes {
+    inner: Arc<HostRoutesInner>,
+}
+
+struct HostRoutesInner {
+    claimed: Mutex<BTreeMap<String, Vec<IpNet>>>,
+    /// Counts changes, so that the other networks look again.
+    changed: watch::Sender<u64>,
+}
+
+impl Default for HostRoutes {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(HostRoutesInner {
+                claimed: Mutex::new(BTreeMap::new()),
+                changed: watch::channel(0).0,
+            }),
+        }
+    }
+}
+
+impl HostRoutes {
+    fn claimed(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<IpNet>>> {
+        self.inner
+            .claimed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claims for `owner` the subnets of `wanted` that overlap none the
+    /// other networks hold, gives up the rest of what it held, and returns
+    /// what it now holds.
+    pub(crate) fn claim(&self, owner: &str, wanted: &[IpNet]) -> Vec<IpNet> {
+        let mut claimed = self.claimed();
+        let held: Vec<IpNet> = wanted
+            .iter()
+            .filter(|net| {
+                !claimed
+                    .iter()
+                    .filter(|(other, _)| other.as_str() != owner)
+                    .any(|(_, theirs)| theirs.iter().any(|their| their.overlaps(net)))
+            })
+            .copied()
+            .collect();
+        let before = claimed.insert(owner.to_owned(), held.clone());
+        if before.as_ref() != Some(&held) {
+            self.inner.changed.send_modify(|count| *count += 1);
+        }
+        held
+    }
+
+    /// What the networks other than `owner` hold.
+    pub(crate) fn others(&self, owner: &str) -> Vec<IpNet> {
+        self.claimed()
+            .iter()
+            .filter(|(other, _)| other.as_str() != owner)
+            .flat_map(|(_, theirs)| theirs.iter().copied())
+            .collect()
+    }
+
+    /// `owner` stopped: what it held is free.
+    pub(crate) fn release(&self, owner: &str) {
+        if self.claimed().remove(owner).is_some() {
+            self.inner.changed.send_modify(|count| *count += 1);
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.changed.subscribe()
+    }
+}
+
+/// Releases a network's routes in [`HostRoutes`] however its serving ends,
+/// including when the task is cut off.
+struct Claim {
+    routes: HostRoutes,
+    owner: String,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.routes.release(&self.owner);
+    }
+}
+
+/// Aborts a task when dropped: the driver of a network that is cut off
+/// stops with it and frees its sockets.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Why `run` stopped.
 #[derive(Debug)]
 pub enum Failure {
     /// Exit code 2.
     Config(String),
-    /// Exit code 3.
-    Busy(String),
+    /// Exit code 3: a startup conflict (requirement R12). `conflict` is one
+    /// of the codes in `docs/architecture/mesh-module.md` (exit codes).
+    Busy {
+        conflict: &'static str,
+        detail: String,
+    },
     /// Exit code 1.
     Other(String),
 }
@@ -93,7 +310,7 @@ impl Failure {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) => 2,
-            Self::Busy(_) => 3,
+            Self::Busy { .. } => 3,
             Self::Other(_) => 1,
         }
     }
@@ -101,15 +318,33 @@ impl Failure {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
-            Self::Busy(_) => "busy",
-            Self::Other(_) => "run",
+            Self::Busy { .. } => "conflict",
+            Self::Other(_) => "runtime",
         }
     }
 
     pub fn detail(&self) -> &str {
         match self {
-            Self::Config(detail) | Self::Busy(detail) | Self::Other(detail) => detail,
+            Self::Config(detail) | Self::Busy { detail, .. } | Self::Other(detail) => detail,
         }
+    }
+
+    /// The conflict code of a startup conflict, `None` otherwise.
+    pub fn conflict(&self) -> Option<&'static str> {
+        match self {
+            Self::Busy { conflict, .. } => Some(conflict),
+            Self::Config(_) | Self::Other(_) => None,
+        }
+    }
+
+    /// The last line written to stderr when `run` fails (exit code
+    /// contract in `docs/architecture/mesh-module.md`).
+    pub fn json(&self) -> serde_json::Value {
+        let mut line = serde_json::json!({ "error": self.kind(), "detail": self.detail() });
+        if let Some(conflict) = self.conflict() {
+            line["conflict"] = serde_json::Value::from(conflict);
+        }
+        line
     }
 }
 
@@ -122,14 +357,16 @@ pub fn settings_from_json(text: &str) -> Result<MeshSettings, Failure> {
         .map_err(|error| Failure::Config(error.into()))
 }
 
-fn busy(what: &str, error: &io::Error) -> Failure {
+fn busy(conflict: &'static str, what: &str, error: &io::Error) -> Failure {
+    let conflict = || Failure::Busy {
+        conflict,
+        detail: format!("{what}: {error}"),
+    };
     match error.kind() {
-        io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => {
-            Failure::Busy(format!("{what}: {error}"))
-        }
+        io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => conflict(),
         // The kernel answers EBUSY for an interface another program holds.
         #[cfg(unix)]
-        _ if error.raw_os_error() == Some(libc::EBUSY) => Failure::Busy(format!("{what}: {error}")),
+        _ if error.raw_os_error() == Some(libc::EBUSY) => conflict(),
         _ => Failure::Other(format!("{what}: {error}")),
     }
 }
@@ -156,6 +393,26 @@ fn status_line(snapshot: &Snapshot, interface: &str) -> String {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
+        "local_networks_read": snapshot.local_networks_read,
+        "foreign_overlaps": snapshot
+            .foreign_overlaps
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        // Measures a network before a bridge is built to it (spec §11.2).
+        "sync_oversize": {
+            "received": snapshot
+                .sync_oversize
+                .received
+                .map(|(peer, bytes)| serde_json::json!({ "peer": peer, "bytes": bytes })),
+            "undelivered": snapshot.sync_oversize.undelivered,
+            "oversize_calls": snapshot.counters.oversize_calls,
+            "graph_timeouts": snapshot.counters.graph_timeouts,
+            "sync_errors": snapshot.counters.sync_errors,
+            "cut_graphs": snapshot.counters.cut_graphs,
+            "refused_at_capacity": snapshot.counters.refused_at_capacity,
+            "refused_over_budget": snapshot.counters.refused_over_budget,
+        },
     })
     .to_string()
 }
@@ -175,18 +432,27 @@ pub fn static_key(path: &Path) -> Result<KeyPair, Failure> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
-    match std::fs::read(path) {
+    match std::fs::read(path).map(Zeroizing::new) {
         Ok(bytes) => {
-            let private: [u8; LEN] = bytes.as_slice().try_into().map_err(|_| {
-                Failure::Config(format!("{}: not a {LEN}-byte key", path.display()))
-            })?;
-            return Ok(KeyPair::from_private(private));
+            let private: Zeroizing<[u8; LEN]> =
+                Zeroizing::new(bytes.as_slice().try_into().map_err(|_| {
+                    Failure::Config(format!("{}: not a {LEN}-byte key", path.display()))
+                })?);
+            return Ok(KeyPair::from_private(*private));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(Failure::Other(format!("{}: {error}", path.display()))),
     }
     let key = KeyPair::generate(&SystemRandom::new())
         .map_err(|_| Failure::Other("no system randomness".into()))?;
+    // Written whole to a temporary file and linked into place, so that a
+    // crash or a full disk never leaves a short key behind, and a key
+    // another process wrote first is kept.
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(name);
+    let _ = std::fs::remove_file(&temporary);
+    let failed = |error: io::Error| Failure::Other(format!("{}: {error}", path.display()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     // Readable by the owner only. On Windows the file takes the access
@@ -194,13 +460,25 @@ pub fn static_key(path: &Path) -> Result<KeyPair, Failure> {
     // Administrators.
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .map_err(|error| Failure::Other(format!("{}: {error}", path.display())))?;
-    file.write_all(&key.private()[..])
-        .and_then(|()| file.sync_all())
-        .map_err(|error| Failure::Other(format!("{}: {error}", path.display())))?;
-    Ok(key)
+    let written = options
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(&key.private()[..])?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::hard_link(&temporary, path));
+    let _ = std::fs::remove_file(&temporary);
+    match written {
+        Ok(()) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
+            }
+            Ok(key)
+        }
+        // Another process made the key meanwhile: use that one.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => static_key(path),
+        Err(error) => Err(failed(error)),
+    }
 }
 
 /// Runs the node from the configuration at `path`.
@@ -235,9 +513,9 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         }
         let listeners = Listeners::bind(&settings)
             .await
-            .map_err(|error| busy("listen", &error))?;
+            .map_err(|error| busy("port_in_use", "listen", &error))?;
         let device = Tun::create(&interface, address, address_v6, settings.mtu)
-            .map_err(|error| busy(&format!("interface {interface}"), &error))?;
+            .map_err(|error| busy("tun_in_use", &format!("interface {interface}"), &error))?;
         let stop = signals()?;
         let mut last = String::new();
         let mut listen_ports: Vec<u16> = listeners
@@ -248,19 +526,25 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             .collect();
         listen_ports.sort_unstable();
         listen_ports.dedup();
-        // Kept until the node stops; dropping it puts the host back.
-        let mut forwarding = start_forwarding(&settings, device.name(), &listen_ports, path);
+        let mut settings = settings;
+        let host = start_host(&settings, device.name(), &listen_ports);
+        if forwards(&settings) {
+            withdraw_uncarried(&mut settings, &host.carried);
+        }
+        // Kept until the node stops, then undone before it reports so.
+        let mut forwarding = host.forwarder;
         let virtual_subnets = settings.virtual_subnets();
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
-        serve_with(
+        let result = serve_with(
             settings,
             static_key,
             listeners,
             device,
             stop,
             native_keys,
+            None,
             None,
             |snapshot, name| {
                 if let Some(forwarding) = forwarding.as_mut() {
@@ -277,7 +561,13 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
                 }
             },
         )
-        .await
+        .await;
+        if let Some(forwarding) = forwarding.take() {
+            for warning in forwarding.shutdown() {
+                warn("host_changes", &warning);
+            }
+        }
+        result
     })
 }
 
@@ -285,6 +575,12 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
 trait HostForwarder {
     /// Replaces the mesh sources translated towards the advertised subnets.
     fn set_sources(&mut self, sources: &[IpNet]) -> io::Result<()>;
+
+    /// Undoes the host changes now, before the node reports that it has
+    /// stopped. Returns problems as warnings.
+    fn shutdown(self: Box<Self>) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -294,10 +590,50 @@ impl HostForwarder for crate::forward_macos::HostForwarding {
     }
 }
 
+/// What the host side gave the node: the guard to hold, and the advertised
+/// subnets the machine actually carries. The others are not advertised.
+struct HostSide {
+    forwarder: Option<Box<dyn HostForwarder>>,
+    carried: Vec<IpNet>,
+}
+
+impl HostSide {
+    fn none() -> Self {
+        Self {
+            forwarder: None,
+            carried: Vec::new(),
+        }
+    }
+}
+
 /// Whether this node carries traffic to its advertised subnets: a full
 /// node with subnets to advertise (requirement R10).
 fn forwards(settings: &MeshSettings) -> bool {
     settings.role == Role::Full && !settings.advertise_subnets.is_empty()
+}
+
+/// Keeps only the advertised subnets the machine carries. A subnet it does
+/// not carry would draw traffic that is dropped, or forwarded by the host
+/// outside our rules.
+fn withdraw_uncarried(settings: &mut MeshSettings, carried: &[IpNet]) {
+    let withdrawn: Vec<String> = settings
+        .advertise_subnets
+        .iter()
+        .filter(|subnet| !carried.contains(subnet))
+        .map(IpNet::to_string)
+        .collect();
+    if !withdrawn.is_empty() {
+        warn(
+            "advertise_withdrawn",
+            &format!(
+                "not advertised, this machine does not carry them: {}",
+                withdrawn.join(", ")
+            ),
+        );
+    }
+    settings
+        .advertise_subnets
+        .retain(|subnet| carried.contains(subnet));
 }
 
 /// One line saying whether the host forwards for the advertised subnets
@@ -309,58 +645,135 @@ fn forwarding_line(state: &str, detail: Option<&str>) {
     );
 }
 
-/// macOS: switches forwarding on and translates mesh traffic to the
-/// advertised subnets (`forward_macos`). A failure is reported and the node
-/// runs on without carrying them.
+/// The advertised subnets of `lan`, once each.
+#[cfg(any(target_os = "macos", windows))]
+fn carried(lan: &[(String, IpNet)]) -> Vec<IpNet> {
+    let mut subnets: Vec<IpNet> = lan.iter().map(|(_, subnet)| *subnet).collect();
+    subnets.sort_by_key(IpNet::to_string);
+    subnets.dedup();
+    subnets
+}
+
+/// The machine's interfaces as the host side sees them.
+#[cfg(any(target_os = "macos", windows))]
+struct HostInterfaces {
+    /// LAN interfaces as (name, address network) pairs.
+    lan: Vec<(String, IpNet)>,
+    /// Names of other programs' virtual interfaces. Only macOS reads it:
+    /// forwarding there is system-wide. Windows forwards per interface and
+    /// reports the interfaces that actually forward instead.
+    #[cfg_attr(windows, allow(dead_code))]
+    others: Vec<String>,
+}
+
+/// The machine's LAN interfaces and the names of other programs' virtual
+/// interfaces. Neither list holds our own mesh interfaces; virtual
+/// interfaces never count as LAN, so a subnet a VPN also covers is not
+/// forwarded into that VPN.
+#[cfg(any(target_os = "macos", windows))]
+fn host_interfaces(interface: &str) -> io::Result<HostInterfaces> {
+    let own = |name: &str| host_routes::is_own_interface(name, &[interface]);
+    let mut others: Vec<String> = host_routes::host_links()?
+        .into_values()
+        .filter(|link| link.is_virtual && !own(&link.name))
+        .map(|link| link.name)
+        .collect();
+    others.sort();
+    others.dedup();
+    let lan = tun::local_interfaces(|name| own(name) || others.iter().any(|other| other == name))?
+        .into_iter()
+        .filter_map(|(name, address, prefix)| Some((name, IpNet::new(address, prefix)?)))
+        .collect();
+    Ok(HostInterfaces { lan, others })
+}
+
+/// macOS: puts back what an earlier run left, then switches IPv4
+/// forwarding on and translates mesh traffic to the advertised IPv4 subnets
+/// (`forward_macos`). IPv6 subnets are not advertised: IPv6 forwarding
+/// stays off. A failure is reported and the node runs on without
+/// advertising subnets.
 #[cfg(target_os = "macos")]
-fn start_forwarding(
-    settings: &MeshSettings,
-    interface: &str,
-    _listen_ports: &[u16],
-    _config: &Path,
-) -> Option<Box<dyn HostForwarder>> {
+fn start_host(settings: &MeshSettings, interface: &str, _listen_ports: &[u16]) -> HostSide {
+    use crate::forward_macos::{self as forward, HostForwarding, MacSystem};
+
+    let dir = Path::new(forward::STATE_DIR);
+    match forward::recover(&MacSystem, dir) {
+        Ok(warnings) => {
+            for warning in warnings {
+                warn("forwarding", &warning);
+            }
+        }
+        Err(error) => warn(
+            "forwarding",
+            &format!("what an earlier run left could not be checked: {error}"),
+        ),
+    }
     if !forwards(settings) {
         forwarding_line("not_needed", None);
-        return None;
+        return HostSide::none();
     }
-    let interfaces = match host_interfaces(interface) {
+    let (v4, v6): (Vec<IpNet>, Vec<IpNet>) = settings
+        .advertise_subnets
+        .iter()
+        .partition(|subnet| subnet.is_ipv4());
+    if !v6.is_empty() {
+        warn(
+            "ipv6_forwarding_off",
+            "IPv6 forwarding stays off, since it stops the system from accepting router advertisements",
+        );
+    }
+    let HostInterfaces {
+        lan: interfaces,
+        others,
+    } = match host_interfaces(interface) {
         Ok(found) => found,
         Err(error) => {
             forwarding_line("off", Some(&error.to_string()));
-            return None;
+            return HostSide::none();
         }
     };
-    match crate::forward_macos::HostForwarding::start(
-        Path::new(crate::forward_macos::STATE_DIR),
+    let lan = host_routes::lan_interfaces(&interfaces, &v4, interface);
+    for warning in host_routes::missing_interfaces(&lan, &v4) {
+        warn("forwarding", &warning);
+    }
+    if lan.is_empty() {
+        forwarding_line(
+            "off",
+            Some("no interface of this machine is on the advertised subnets"),
+        );
+        return HostSide::none();
+    }
+    if !others.is_empty() {
+        warn(
+            "forwarding",
+            &format!(
+                "forwarding is system-wide on macOS: traffic can also pass between the LAN and {}",
+                others.join(", ")
+            ),
+        );
+    }
+    match HostForwarding::start(
+        Box::new(MacSystem),
+        dir,
         &settings.network_name,
-        interface,
-        &interfaces,
-        &settings.advertise_subnets,
+        lan.clone(),
         &settings.virtual_subnets(),
-        settings.address_v6.is_some(),
     ) {
         Ok((forwarding, warnings)) => {
             for warning in warnings {
                 warn("forwarding", &warning);
             }
             forwarding_line("on", None);
-            Some(Box::new(forwarding))
+            HostSide {
+                forwarder: Some(Box::new(forwarding)),
+                carried: carried(&lan),
+            }
         }
         Err(error) => {
             forwarding_line("off", Some(&error.to_string()));
-            None
+            HostSide::none()
         }
     }
-}
-
-/// The machine's (interface name, address network) pairs, leaving out the
-/// mesh interface itself.
-#[cfg(any(target_os = "macos", windows))]
-fn host_interfaces(interface: &str) -> io::Result<Vec<(String, IpNet)>> {
-    Ok(tun::local_interfaces(|name| name == interface)?
-        .into_iter()
-        .filter_map(|(name, address, prefix)| Some((name, IpNet::new(address, prefix)?)))
-        .collect())
 }
 
 #[cfg(windows)]
@@ -370,6 +783,10 @@ impl HostForwarder for crate::forward_windows::HostChanges {
     fn set_sources(&mut self, _sources: &[IpNet]) -> io::Result<()> {
         Ok(())
     }
+
+    fn shutdown(self: Box<Self>) -> Vec<String> {
+        crate::forward_windows::HostChanges::shutdown(*self)
+    }
 }
 
 /// Windows: puts back what an earlier run left, allows inbound traffic to a
@@ -377,22 +794,17 @@ impl HostForwarder for crate::forward_windows::HostChanges {
 /// switches forwarding on and translates the virtual subnet
 /// (`forward_windows`). One process per host makes these changes: when the
 /// client (or another node) holds them, this node says so and runs without
-/// them. Any other failure is reported and the node runs on.
+/// them, advertising no subnets. Any other failure is reported and the node
+/// runs on.
 #[cfg(windows)]
-fn start_forwarding(
-    settings: &MeshSettings,
-    interface: &str,
-    listen_ports: &[u16],
-    _config: &Path,
-) -> Option<Box<dyn HostForwarder>> {
+fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) -> HostSide {
     use platform_windows::mesh_host;
 
     if let Err(error) = mesh_host::recover_mesh_host() {
-        let busy = error.kind() == io::ErrorKind::ResourceBusy;
-        let detail = if busy {
-            "another process holds the host changes".to_owned()
+        let detail = if error.kind() == io::ErrorKind::ResourceBusy {
+            "another administrator process (the client or another node) holds the host changes; what an earlier run left was not cleaned".to_owned()
         } else {
-            error.to_string()
+            format!("what an earlier run left could not be put back: {error}")
         };
         warn("host_changes", &detail);
         if forwards(settings) {
@@ -402,7 +814,7 @@ fn start_forwarding(
         } else {
             forwarding_line("not_needed", None);
         }
-        return None;
+        return HostSide::none();
     }
     let mut host = crate::forward_windows::HostChanges::default();
     if settings.role == Role::Full && !listen_ports.is_empty() {
@@ -412,39 +824,73 @@ fn start_forwarding(
     }
     if !forwards(settings) {
         forwarding_line("not_needed", None);
-    } else {
-        let started = host_interfaces(interface).and_then(|interfaces| {
-            host.forward(
-                &settings.network_name,
-                interface,
-                &interfaces,
-                &settings.advertise_subnets,
-                crate::forward_windows::ipv4(&settings.address),
-                settings.address_v6.is_some(),
-            )
-        });
-        match started {
-            Ok(warnings) => {
-                for warning in warnings {
-                    warn("forwarding", &warning);
-                }
-                forwarding_line("on", None);
+        return HostSide {
+            forwarder: Some(Box::new(host)),
+            carried: Vec::new(),
+        };
+    }
+    let ipv6 = settings.address_v6.is_some();
+    let wanted: Vec<IpNet> = settings
+        .advertise_subnets
+        .iter()
+        .copied()
+        .filter(|subnet| ipv6 || subnet.is_ipv4())
+        .collect();
+    let lan = match host_interfaces(interface) {
+        Ok(found) => host_routes::lan_interfaces(&found.lan, &wanted, interface),
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            return HostSide {
+                forwarder: Some(Box::new(host)),
+                carried: Vec::new(),
+            };
+        }
+    };
+    for warning in host_routes::missing_interfaces(&lan, &wanted) {
+        warn("forwarding", &warning);
+    }
+    if lan.is_empty() {
+        forwarding_line(
+            "off",
+            Some("no interface of this machine is on the advertised subnets"),
+        );
+        return HostSide {
+            forwarder: Some(Box::new(host)),
+            carried: Vec::new(),
+        };
+    }
+    let carried = carried(&lan);
+    match host.forward(
+        &settings.network_name,
+        interface,
+        &lan,
+        crate::forward_windows::ipv4(&settings.address),
+        ipv6,
+    ) {
+        Ok(warnings) => {
+            for warning in warnings {
+                warn("forwarding", &warning);
             }
-            Err(error) => forwarding_line("off", Some(&error.to_string())),
+            forwarding_line("on", None);
+            HostSide {
+                forwarder: Some(Box::new(host)),
+                carried,
+            }
+        }
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            HostSide {
+                forwarder: Some(Box::new(host)),
+                carried: Vec::new(),
+            }
         }
     }
-    Some(Box::new(host))
 }
 
-/// Linux: the host side is not in place yet; the node says so instead of
-/// advertising subnets it cannot carry silently.
+/// Linux: the host side is not in place yet, so the node advertises no
+/// subnets rather than draw traffic it does not carry.
 #[cfg(target_os = "linux")]
-fn start_forwarding(
-    settings: &MeshSettings,
-    _interface: &str,
-    _listen_ports: &[u16],
-    _config: &Path,
-) -> Option<Box<dyn HostForwarder>> {
+fn start_host(settings: &MeshSettings, _interface: &str, _listen_ports: &[u16]) -> HostSide {
     if forwards(settings) {
         forwarding_line(
             "off",
@@ -453,7 +899,48 @@ fn start_forwarding(
     } else {
         forwarding_line("not_needed", None);
     }
-    None
+    HostSide::none()
+}
+
+/// Puts back what a node that died left on the host (`anixops-mesh
+/// restore-host`, run by the uninstallers after the service stops).
+/// Returns warnings.
+#[cfg(target_os = "macos")]
+pub fn restore_host() -> io::Result<Vec<String>> {
+    use crate::forward_macos::{recover, MacSystem, STATE_DIR};
+    recover(&MacSystem, Path::new(STATE_DIR))
+}
+
+/// Puts back what a node that died left on the host (`anixops-mesh
+/// restore-host`, run by the uninstallers after the service stops).
+/// Returns warnings.
+#[cfg(windows)]
+pub fn restore_host() -> io::Result<Vec<String>> {
+    let report = platform_windows::mesh_host::recover_mesh_host()?;
+    let mut warnings = Vec::new();
+    if report.forwarding_kept > 0 {
+        warnings.push(format!(
+            "{} interface forwarding values could not be restored and stay recorded",
+            report.forwarding_kept
+        ));
+    }
+    if report.state_set_aside {
+        warnings.push("the forwarding record could not be read and was set aside".into());
+    }
+    if !report.firewall_cleared {
+        warnings.push("leftover firewall rules could not be removed".into());
+    }
+    if !report.nat_cleared {
+        warnings.push("leftover address translation could not be removed".into());
+    }
+    Ok(warnings)
+}
+
+/// Linux: the node makes no host changes yet, so nothing is left to put
+/// back.
+#[cfg(target_os = "linux")]
+pub fn restore_host() -> io::Result<Vec<String>> {
+    Ok(Vec::new())
 }
 
 /// Resolves on SIGTERM or SIGINT.
@@ -504,6 +991,8 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
 /// with the driver's snapshot and hands each new snapshot to `observe`.
 /// `native_keys` carries a new native key list into the running driver;
 /// `border` connects a border node's network to its backbone.
+/// With `host`, the network installs only routes no other network of the
+/// process holds, under the given owner name.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_with(
     settings: MeshSettings,
@@ -513,6 +1002,7 @@ pub(crate) async fn serve_with(
     until: impl std::future::Future<Output = ()>,
     native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
     border: Option<driver::Border>,
+    host: Option<(HostRoutes, String)>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
     let mtu = usize::from(settings.mtu);
@@ -520,12 +1010,73 @@ pub(crate) async fn serve_with(
     let (to_interface, mut from_node) = mpsc::channel::<Vec<u8>>(QUEUE);
     let (snapshots, mut status) = watch::channel(Snapshot::default());
     let (stop, shutdown) = watch::channel(false);
-    let (networks, local_networks) = watch::channel(read_local_networks(device.name()));
-    let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
+    let claim = host.map(|(routes, owner)| Claim { routes, owner });
+    let mut others_changed = claim.as_ref().map(|claim| claim.routes.subscribe());
+    // Recorded as ours, so that no other network of this process takes
+    // its routes for another program's.
+    let _own = host_routes::claim_own_interface(device.name());
+    // This machine's networks are its other interfaces and the routes the
+    // other networks of this process hold.
+    let others = claim
+        .as_ref()
+        .map(|claim| (claim.routes.clone(), claim.owner.clone()));
+    let scanner = Scanner::new(device.name());
+    let (mut interfaces, foreign) = scanner.both().await;
+    // `None` until the interfaces were read once: the driver installs no
+    // subnet before (spec §15.4).
+    let (networks, local_networks) = watch::channel(
+        interfaces
+            .clone()
+            .map(|found| with_others(found, others.as_ref())),
+    );
+    let (foreign_tx, foreign_routes) = watch::channel(foreign.unwrap_or_default());
+    // Scanned again off the packet loop, one read of each kind at a time,
+    // and whenever another network takes or frees routes.
+    let _scanner = StopTask(tokio::spawn({
+        let mut changed = others.as_ref().map(|(routes, _)| routes.subscribe());
+        async move {
+            let period = |known: bool| {
+                if known {
+                    LOCAL_NETWORKS_EVERY
+                } else {
+                    LOCAL_NETWORKS_RETRY
+                }
+            };
+            let mut next = tokio::time::Instant::now() + period(interfaces.is_some());
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep_until(next) => {
+                        let (local, foreign) = scanner.both().await;
+                        if local.is_some() {
+                            interfaces = local;
+                        }
+                        if let Some(foreign) = foreign {
+                            store(&foreign_tx, foreign);
+                        }
+                        next = tokio::time::Instant::now() + period(interfaces.is_some());
+                    }
+                    Some(Ok(())) = async {
+                        match &mut changed {
+                            Some(changed) => Some(changed.changed().await),
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                }
+                // Only a change wakes the driver (spec §15.4).
+                if let Some(found) = &interfaces {
+                    store(&networks, Some(with_others(found.clone(), others.as_ref())));
+                }
+            }
+        }
+    }));
+    // No entry point sets subnet route overrides here yet; the sender is
+    // kept so that the driver sees an open, empty list.
+    let (_route_overrides, route_overrides) = watch::channel(Vec::new());
     let mut installed: Vec<IpNet> = Vec::new();
+    let mut wanted: Vec<IpNet> = Vec::new();
     tokio::pin!(until);
 
-    let mut node = tokio::spawn(driver::run(
+    let node = tokio::spawn(driver::run(
         settings,
         static_key,
         listeners,
@@ -535,10 +1086,40 @@ pub(crate) async fn serve_with(
             snapshots,
             local_networks,
             native_keys,
+            route_overrides,
+            foreign_routes,
             shutdown,
             border,
         },
     ));
+    let _abort = AbortOnDrop(node.abort_handle());
+    let mut node = node;
+    // Installs what the driver wants, less what other networks hold.
+    let reconcile = |installed: &mut Vec<IpNet>, wanted: &[IpNet]| {
+        let allowed = match &claim {
+            Some(claim) => claim.routes.claim(&claim.owner, wanted),
+            None => wanted.to_vec(),
+        };
+        let (add, remove) = route_changes(installed, &allowed);
+        let mut removed = HashSet::new();
+        for net in remove {
+            if let Err(error) = device.remove_route(net.network(), net.prefix()) {
+                warn("route", &format!("{net}: {error}"));
+            }
+            removed.insert(net);
+        }
+        installed.retain(|net| !removed.contains(net));
+        for net in add {
+            match device.add_route(net.network(), net.prefix()) {
+                Ok(()) => installed.push(net),
+                Err(error) => warn("route", &format!("{net}: {error}")),
+            }
+        }
+        if let Some(claim) = &claim {
+            // Only what is installed stays claimed.
+            claim.routes.claim(&claim.owner, installed);
+        }
+    };
     // Room for one packet larger than the MTU, so that an oversized one is
     // read whole and refused by the node instead of being cut short.
     let mut buffer = vec![0u8; mtu + 1];
@@ -561,32 +1142,19 @@ pub(crate) async fn serve_with(
                     break;
                 }
                 let snapshot = status.borrow_and_update().clone();
-                let (add, remove) = route_changes(&installed, &snapshot.system_routes);
-                let mut removed = HashSet::new();
-                for net in remove {
-                    if let Err(error) = device.remove_route(net.network(), net.prefix()) {
-                        warn("route", &format!("{net}: {error}"));
-                    }
-                    removed.insert(net);
-                }
-                installed.retain(|net| !removed.contains(net));
-                for net in add {
-                    match device.add_route(net.network(), net.prefix()) {
-                        Ok(()) => installed.push(net),
-                        Err(error) => warn("route", &format!("{net}: {error}")),
-                    }
-                }
+                wanted.clone_from(&snapshot.system_routes);
+                reconcile(&mut installed, &wanted);
                 observe(&snapshot, device.name());
             }
-            _ = rescan.tick() => {
-                let fresh = read_local_networks(device.name());
-                networks.send_if_modified(|current| {
-                    let changed = *current != fresh;
-                    if changed {
-                        *current = fresh;
-                    }
-                    changed
-                });
+            Some(Ok(())) = async {
+                match &mut others_changed {
+                    Some(changed) => Some(changed.changed().await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Another network took or freed routes: freed ones may be
+                // ours now (the scanner updates this machine's networks).
+                reconcile(&mut installed, &wanted);
             }
             () = &mut until => break,
             result = &mut node => {
@@ -625,6 +1193,7 @@ mod tests {
         let failure = settings_from_json("{").err().expect("not json");
         assert_eq!(failure.exit_code(), 2);
         assert_eq!(failure.kind(), "config");
+        assert!(failure.json().get("conflict").is_none());
         let failure = settings_from_json("{\"config_version\": 999}")
             .err()
             .expect("missing fields");
@@ -634,14 +1203,23 @@ mod tests {
     #[test]
     fn a_port_in_use_is_busy() {
         let error = io::Error::from(io::ErrorKind::AddrInUse);
-        assert_eq!(busy("listen", &error).exit_code(), 3);
+        let failure = busy("port_in_use", "listen", &error);
+        assert_eq!(failure.exit_code(), 3);
+        let line = failure.json();
+        assert_eq!(line["error"], "conflict");
+        assert_eq!(line["conflict"], "port_in_use");
         #[cfg(unix)]
         {
             let error = io::Error::from_raw_os_error(libc::EBUSY);
-            assert_eq!(busy("interface", &error).exit_code(), 3);
+            let failure = busy("tun_in_use", "interface", &error);
+            assert_eq!(failure.exit_code(), 3);
+            assert_eq!(failure.json()["conflict"], "tun_in_use");
         }
         let error = io::Error::from(io::ErrorKind::PermissionDenied);
-        assert_eq!(busy("interface", &error).exit_code(), 1);
+        let failure = busy("tun_in_use", "interface", &error);
+        assert_eq!(failure.exit_code(), 1);
+        assert_eq!(failure.json()["error"], "runtime");
+        assert!(failure.json().get("conflict").is_none());
     }
 
     #[test]
@@ -659,6 +1237,20 @@ mod tests {
         assert_eq!(line["reachable"], 3);
         assert_eq!(line["duplicate_id"], false);
         assert_eq!(line["static_key"], serde_json::Value::Null);
+        assert_eq!(line["local_networks_read"], false);
+        assert_eq!(line["foreign_overlaps"], serde_json::json!([]));
+        let read = Snapshot {
+            local_networks_read: true,
+            foreign_overlaps: vec![IpNet::parse("100.64.0.0/10").unwrap()],
+            ..Snapshot::default()
+        };
+        let line: serde_json::Value =
+            serde_json::from_str(&status_line(&read, "anixmesh0")).expect("json");
+        assert_eq!(line["local_networks_read"], true);
+        assert_eq!(
+            line["foreign_overlaps"],
+            serde_json::json!(["100.64.0.0/10"])
+        );
         let secure = Snapshot {
             static_key: Some([7; 32]),
             not_native: Some(12),
@@ -668,6 +1260,16 @@ mod tests {
             serde_json::from_str(&status_line(&secure, "anixmesh0")).expect("json");
         assert_eq!(line["static_key"], encode_key(&[7; 32]));
         assert_eq!(line["not_native"], 12);
+        assert_eq!(line["sync_oversize"]["received"], serde_json::Value::Null);
+
+        let mut oversize = Snapshot::default();
+        oversize.sync_oversize.received = Some((9, 8_400_000));
+        oversize.counters.refused_at_capacity = 3;
+        let line: serde_json::Value =
+            serde_json::from_str(&status_line(&oversize, "anixmesh0")).expect("json");
+        assert_eq!(line["sync_oversize"]["received"]["peer"], 9);
+        assert_eq!(line["sync_oversize"]["received"]["bytes"], 8_400_000);
+        assert_eq!(line["sync_oversize"]["refused_at_capacity"], 3);
     }
 
     #[test]
@@ -705,6 +1307,55 @@ mod tests {
         assert_eq!(remove, [net("172.16.0.0/16")]);
         let (add, remove) = route_changes(&wanted, &wanted);
         assert!(add.is_empty() && remove.is_empty());
+    }
+
+    #[test]
+    fn the_first_network_to_claim_a_subnet_keeps_it() {
+        let net = |text: &str| IpNet::parse(text).expect("network");
+        let routes = HostRoutes::default();
+        let mut changes = routes.subscribe();
+        let a = routes.claim("mesh-a", &[net("192.168.50.0/24"), net("172.16.0.0/16")]);
+        assert_eq!(a.len(), 2);
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+        // Overlapping either way is refused; the rest is taken.
+        let b = routes.claim(
+            "mesh-b",
+            &[
+                net("192.168.50.128/25"),
+                net("172.0.0.0/8"),
+                net("10.9.0.0/16"),
+            ],
+        );
+        assert_eq!(b, [net("10.9.0.0/16")]);
+        assert_eq!(routes.others("mesh-b").len(), 2);
+        assert!(routes.others("mesh-a").contains(&net("10.9.0.0/16")));
+        // Claiming the same again changes nothing.
+        changes.mark_unchanged();
+        routes.claim("mesh-a", &a);
+        assert!(!changes.has_changed().unwrap());
+        // Once the first network stops, the subnet is free.
+        drop(Claim {
+            routes: routes.clone(),
+            owner: "mesh-a".into(),
+        });
+        assert!(changes.has_changed().unwrap());
+        let b = routes.claim("mesh-b", &[net("192.168.50.128/25")]);
+        assert_eq!(b, [net("192.168.50.128/25")]);
+    }
+
+    #[test]
+    fn a_key_file_is_written_whole_and_kept() {
+        let dir = std::env::temp_dir().join(format!("mesh-key-whole-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("office.key");
+        let first = static_key(&path).expect("made").public();
+        assert_eq!(std::fs::read(&path).unwrap().len(), LEN);
+        assert_eq!(static_key(&path).expect("read").public(), first);
+        // No temporary file is left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

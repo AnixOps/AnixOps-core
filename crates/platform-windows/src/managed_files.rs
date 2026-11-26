@@ -137,14 +137,46 @@ pub fn read_admin_owned_file(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Creates the host-wide named object `name` (in the `Global\` namespace),
-/// open to SYSTEM and Administrators only, and returns the handle that keeps
-/// it alive. `ResourceBusy` when it already exists, that is when another
-/// process holds it; the object goes away with the last handle, so a process
-/// that dies releases it.
+/// Creates the host-wide named object `name` in the private namespace
+/// [`HOST_NAMESPACE`], whose boundary holds the Administrators SID, and
+/// returns what keeps it alive. Only a process whose token holds that SID
+/// enabled can create or open the namespace, so a standard user can neither
+/// create the object first nor hold it (a name in `Global\` could be created
+/// first by anyone, with an access list of their choice). The object is
+/// open to SYSTEM and Administrators only. `ResourceBusy` when it already
+/// exists, that is when another process holds it; it goes away with the
+/// last handle, so a process that dies releases it.
+///
+/// The namespace is machine-wide, not per session: a private namespace is
+/// identified by its name and boundary only, and the boundary holds no
+/// session number (a session would have to be added to it explicitly), so
+/// the service in session 0 and an elevated client in a user session open
+/// the same namespace and the same object, and exclude each other. A
+/// cross-session check on a real machine is listed in
+/// `docs/manual-intervention.md`.
 #[cfg(windows)]
-pub(crate) fn create_host_wide_object(name: &str) -> io::Result<std::os::windows::io::OwnedHandle> {
+pub(crate) fn create_host_wide_object(name: &str) -> io::Result<HostWideObject> {
     native::create_host_wide_object(name)
+}
+
+/// Alias prefix and boundary name of the private namespace of
+/// [`create_host_wide_object`].
+#[cfg(windows)]
+pub(crate) const HOST_NAMESPACE: &str = "AnixOps";
+
+/// A host-wide object and the private namespace it lives in, both held
+/// until dropped.
+#[cfg(windows)]
+pub(crate) struct HostWideObject {
+    _object: std::os::windows::io::OwnedHandle,
+    _namespace: native::Namespace,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for HostWideObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostWideObject")
+    }
 }
 
 /// Creates a new file with a random name in the protected `directory` (made
@@ -195,7 +227,7 @@ fn create_temporary_file(
     Err(last_error.unwrap_or_else(|| io::Error::other("no free temporary file name")))
 }
 
-fn random_u64() -> io::Result<u64> {
+pub(crate) fn random_u64() -> io::Result<u64> {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut bytes = [0u8; 8];
     SystemRandom::new()
@@ -265,7 +297,9 @@ mod native {
         MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateMutexW, GetCurrentProcess, OpenProcessToken,
+        AddSIDToBoundaryDescriptor, ClosePrivateNamespace, CreateBoundaryDescriptorW, CreateMutexW,
+        CreatePrivateNamespaceW, DeleteBoundaryDescriptor, GetCurrentProcess,
+        OpenPrivateNamespaceW, OpenProcessToken,
     };
 
     /// Owned by Administrators; SYSTEM and Administrators have full control,
@@ -555,10 +589,80 @@ mod native {
     /// SYSTEM and Administrators only; nothing for other accounts.
     const HOST_OBJECT_SDDL: &str = "O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
-    pub(super) fn create_host_wide_object(name: &str) -> io::Result<OwnedHandle> {
+    /// A private namespace handle, closed when dropped.
+    pub(crate) struct Namespace(*mut core::ffi::c_void);
+
+    // The handle is only closed, from whichever thread drops it.
+    unsafe impl Send for Namespace {}
+    unsafe impl Sync for Namespace {}
+
+    impl Drop for Namespace {
+        fn drop(&mut self) {
+            unsafe {
+                ClosePrivateNamespace(self.0 as _, 0);
+            }
+        }
+    }
+
+    /// A boundary descriptor, deleted when dropped.
+    struct Boundary(*mut core::ffi::c_void);
+
+    impl Drop for Boundary {
+        fn drop(&mut self) {
+            unsafe { DeleteBoundaryDescriptor(self.0 as _) };
+        }
+    }
+
+    /// Creates, or opens when another of our processes made it, the private
+    /// namespace whose boundary holds the Administrators SID.
+    fn host_namespace(attributes: &SECURITY_ATTRIBUTES) -> io::Result<Namespace> {
+        let name = wide_str(HOST_NAMESPACE);
+        let created = unsafe { CreateBoundaryDescriptorW(name.as_ptr(), 0) };
+        if created.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut boundary = Boundary(created);
+        let mut administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
+        let mut handle = boundary.0 as _;
+        let added =
+            unsafe { AddSIDToBoundaryDescriptor(&mut handle, administrators.as_mut_ptr() as PSID) };
+        boundary.0 = handle;
+        if added == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let namespace =
+            unsafe { CreatePrivateNamespaceW(attributes, boundary.0 as _, name.as_ptr()) };
+        if !namespace.is_null() {
+            return Ok(Namespace(namespace));
+        }
+        let error = unsafe { GetLastError() };
+        if error != ERROR_ALREADY_EXISTS {
+            return Err(namespace_error(error));
+        }
+        let namespace = unsafe { OpenPrivateNamespaceW(boundary.0 as _, name.as_ptr()) };
+        if namespace.is_null() {
+            return Err(namespace_error(unsafe { GetLastError() }));
+        }
+        Ok(Namespace(namespace))
+    }
+
+    /// A token without the Administrators SID enabled is refused the
+    /// namespace: say so rather than "access denied".
+    fn namespace_error(error: u32) -> io::Error {
+        if error == ERROR_ACCESS_DENIED {
+            return io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the host-wide namespace needs an elevated administrator",
+            );
+        }
+        io::Error::from_raw_os_error(error as i32)
+    }
+
+    pub(super) fn create_host_wide_object(name: &str) -> io::Result<HostWideObject> {
         let descriptor = SecurityDescriptor::from_sddl(HOST_OBJECT_SDDL)?;
         let attributes = descriptor.attributes();
-        let wide = wide_str(name);
+        let namespace = host_namespace(&attributes)?;
+        let wide = wide_str(&format!("{HOST_NAMESPACE}\\{name}"));
         let handle = unsafe { CreateMutexW(&attributes, 0, wide.as_ptr()) };
         let error = unsafe { GetLastError() };
         if handle.is_null() {
@@ -579,7 +683,10 @@ mod native {
                 "the host-wide object is held by another process",
             ));
         }
-        Ok(handle)
+        Ok(HostWideObject {
+            _object: handle,
+            _namespace: namespace,
+        })
     }
 
     pub(super) fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {

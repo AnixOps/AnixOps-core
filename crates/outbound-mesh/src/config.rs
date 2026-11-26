@@ -33,6 +33,7 @@ use std::net::IpAddr;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use crate::bridge::{ExternalBridge, ExternalBridgeConfig};
 use crate::net::IpNet;
 use crate::scope::is_intranet_network;
 
@@ -75,6 +76,9 @@ pub struct MeshConfig {
     pub subnets: SubnetsConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// The external network bridge (spec §15.12): Linux full nodes only.
+    #[serde(default)]
+    pub external_bridge: Option<ExternalBridgeConfig>,
 }
 
 /// The virtual network; every node of it must agree on all of these.
@@ -83,7 +87,8 @@ pub struct MeshConfig {
 pub struct NetworkConfig {
     /// Used byte for byte in the network digest (spec §6.3).
     pub name: String,
-    pub secret: String,
+    #[serde(deserialize_with = "secret_text")]
+    pub secret: Zeroizing<String>,
     /// `managed`, the default: one of our region networks, which always use
     /// the secure mode (spec §5.2, §15.11, requirement R30). `legacy`: an
     /// existing network joined during migration, typically the old-network
@@ -149,11 +154,29 @@ pub struct NodeConfig {
     /// that does not relay is still reachable as a destination.
     #[serde(default)]
     pub relay: Option<bool>,
+    /// Whether this node serves as a waypoint of other nodes' custom paths
+    /// (spec §17.2.4). Absent: `false`. Needs `relay`, so `true` is refused
+    /// on access nodes and with `relay: false`.
+    #[serde(default)]
+    pub waypoint_relay: Option<bool>,
     /// This node's secure-mode static private key for the network, standard
     /// Base64 of 32 bytes, injected from the system key store like the
     /// secret and never written out. Absent: the caller keeps one.
-    #[serde(default)]
-    pub private_key: Option<String>,
+    #[serde(default, deserialize_with = "optional_secret_text")]
+    pub private_key: Option<Zeroizing<String>>,
+}
+
+/// Secret text, wiped from memory when dropped.
+fn secret_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Zeroizing<String>, D::Error> {
+    String::deserialize(deserializer).map(Zeroizing::new)
+}
+
+fn optional_secret_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(|text| text.map(Zeroizing::new))
 }
 
 /// What a node does for others (spec §1.3, requirement R10).
@@ -364,7 +387,7 @@ impl MeshSettings {
 #[derive(Clone, PartialEq, Eq)]
 pub struct MeshSettings {
     pub network_name: String,
-    pub network_secret: String,
+    pub network_secret: Zeroizing<String>,
     pub kind: NetworkKind,
     pub security: SecurityMode,
     pub cipher: Cipher,
@@ -377,6 +400,9 @@ pub struct MeshSettings {
     pub mtu: u16,
     /// Whether this node relays for others; always `false` on access nodes.
     pub relay: bool,
+    /// Whether this node serves as a waypoint of custom paths (spec
+    /// §17.2.4); never without `relay`.
+    pub waypoint_relay: bool,
     pub listen: Vec<ListenConfig>,
     pub peers: Vec<PeerEndpoint>,
     /// Masked networks; empty means no extra limit.
@@ -391,6 +417,9 @@ pub struct MeshSettings {
     pub native_keys: Option<Vec<[u8; 32]>>,
     /// Decoded `node.private_key`, wiped when dropped.
     pub private_key: Option<Zeroizing<[u8; 32]>>,
+    /// The checked `external_bridge` section; its routes are also in
+    /// `advertise_subnets`.
+    pub external_bridge: Option<ExternalBridge>,
 }
 
 impl MeshSettings {
@@ -526,6 +555,10 @@ impl MeshConfig {
             (Role::Access, _) => false,
             (Role::Full, relay) => relay.unwrap_or(true),
         };
+        let waypoint_relay = node.waypoint_relay.unwrap_or(false);
+        if waypoint_relay && !relay {
+            return Err("mesh node waypoint_relay needs relay");
+        }
         let mtu = node.mtu.unwrap_or(DEFAULT_MTU);
         if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
             return Err("mesh node mtu is out of range");
@@ -575,6 +608,26 @@ impl MeshConfig {
         if role == Role::Access && !advertise_subnets.is_empty() {
             return Err("mesh access nodes do not advertise subnets");
         }
+        // Spec §15.12: a Linux full node only. The routes join this node's
+        // advertisement (field 5) under the checks below; the single
+        // addresses inside the overlay ranges are allowed for the bridge
+        // only, `subnets.advertise` itself stays as strict as before.
+        let mut advertise_subnets = advertise_subnets;
+        let external_bridge = match &self.external_bridge {
+            None => None,
+            Some(section) => {
+                if role != Role::Full || !cfg!(target_os = "linux") {
+                    return Err("external_bridge_not_supported");
+                }
+                let bridge = section.validate().map_err(|error| error.reason())?;
+                for route in bridge.routes() {
+                    if !advertise_subnets.contains(route) {
+                        advertise_subnets.push(*route);
+                    }
+                }
+                Some(bridge)
+            }
+        };
         let system_routes = match &self.routing.system_routes {
             None => None,
             Some(texts) => Some(intranet_subnets(texts, "mesh routing.system_routes")?),
@@ -587,10 +640,11 @@ impl MeshConfig {
                     return Err("mesh network native_keys lists too many keys");
                 }
                 let mut keys = Vec::with_capacity(texts.len());
+                let mut seen = HashSet::with_capacity(texts.len());
                 for text in texts {
                     let key = decode_key(text)
                         .ok_or("mesh network native_keys entry is not Base64 of 32 bytes")?;
-                    if !keys.contains(&*key) {
+                    if seen.insert(*key) {
                         keys.push(*key);
                     }
                 }
@@ -620,6 +674,7 @@ impl MeshConfig {
             hostname: node.hostname,
             mtu,
             relay,
+            waypoint_relay,
             listen: node.listen,
             peers,
             accept_subnets,
@@ -629,7 +684,15 @@ impl MeshConfig {
             paths: Vec::new(),
             native_keys,
             private_key,
+            external_bridge,
         };
+        if let Some(bridge) = &settings.external_bridge {
+            // The mesh interface is named at start; [`ExternalBridge`] is
+            // checked against it again then.
+            bridge
+                .check_mesh("", &settings.virtual_subnets(), &settings.local_addresses())
+                .map_err(|error| error.reason())?;
+        }
         if advertise_subnets_overlap_virtual(&settings) {
             return Err("mesh subnets.advertise overlaps the virtual subnet");
         }
@@ -967,6 +1030,68 @@ mod tests {
         );
     }
 
+    fn bridged(section: Value) -> Value {
+        let mut config = with("node.role", json!("full"));
+        config["external_bridge"] = section;
+        config
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bridge_joins_its_routes_to_the_advertisement() {
+        let mut config = bridged(json!({
+            "interface": "ext0",
+            "routes": ["100.100.0.5", "192.168.10.0/24"],
+            "allow": ["10.144.144.7/32"],
+        }));
+        config["subnets"] = json!({"advertise": ["192.168.10.0/24"]});
+        let settings = validate(config).unwrap();
+        let bridge = settings.external_bridge.as_ref().unwrap();
+        assert_eq!(bridge.interface(), "ext0");
+        assert_eq!(
+            settings.advertise_subnets,
+            [
+                IpNet::parse("192.168.10.0/24").unwrap(),
+                IpNet::parse("100.100.0.5/32").unwrap(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bad_bridge_refuses_the_whole_config() {
+        let section = |routes: Value| json!({"interface": "ext0", "routes": routes});
+        assert_eq!(
+            validate(bridged(section(json!([])))).err(),
+            Some("external_bridge_no_routes")
+        );
+        assert_eq!(
+            validate(bridged(section(json!(["100.64.0.0/10"])))).err(),
+            Some("external_bridge_overlay_range")
+        );
+        assert_eq!(
+            validate(bridged(section(json!(["10.144.144.0/25"])))).err(),
+            Some("external_bridge_route_overlaps_mesh")
+        );
+        let mut unknown = section(json!(["100.100.0.5"]));
+        unknown["extra"] = json!(1);
+        assert!(parse(bridged(unknown)).is_err());
+        // Access nodes do not bridge.
+        let mut access = base();
+        access["external_bridge"] = section(json!(["100.100.0.5"]));
+        assert_eq!(
+            validate(access).err(),
+            Some("external_bridge_not_supported")
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn only_linux_bridges() {
+        let config = bridged(json!({"interface": "ext0", "routes": ["100.100.0.5"]}));
+        assert!(validate(config).is_err());
+    }
+
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     #[test]
     fn full_nodes_listen_and_advertise_intranet_subnets() {
@@ -1040,6 +1165,29 @@ mod tests {
         let mut config = with("node.role", json!("full"));
         config["node"]["relay"] = json!(false);
         assert!(!validate(config).unwrap().relay);
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[test]
+    fn waypoint_relay_is_off_unless_asked_and_needs_relay() {
+        // Off by default (spec §17.2.4).
+        assert!(
+            !validate(with("node.role", json!("full")))
+                .unwrap()
+                .waypoint_relay
+        );
+        let mut config = with("node.role", json!("full"));
+        config["node"]["waypoint_relay"] = json!(true);
+        assert!(validate(config.clone()).unwrap().waypoint_relay);
+        config["node"]["relay"] = json!(false);
+        assert_eq!(
+            validate(config).err(),
+            Some("mesh node waypoint_relay needs relay")
+        );
+        assert_eq!(
+            validate(with("node.waypoint_relay", json!(true))).err(),
+            Some("mesh node waypoint_relay needs relay")
+        );
     }
 
     #[test]
@@ -1204,6 +1352,13 @@ mod tests {
         // Without padding is not the standard form.
         let unpadded = key.trim_end_matches('=').to_owned();
         assert!(validate(with("network.native_keys", json!([unpadded]))).is_err());
+        // Non-zero bits after the last byte are not the canonical form:
+        // one key has exactly one text.
+        let zero = encode_key(&[0; 32]);
+        assert!(zero.ends_with("A="));
+        assert!(validate(with("network.native_keys", json!([zero.clone()]))).is_ok());
+        let noncanonical = format!("{}B=", &zero[..42]);
+        assert!(validate(with("network.native_keys", json!([noncanonical]))).is_err());
     }
 
     #[test]
