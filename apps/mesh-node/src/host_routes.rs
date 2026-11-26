@@ -98,8 +98,10 @@ pub fn foreign_virtual_routes(
 }
 
 /// The LAN interfaces that carry each advertised subnet: those with an
-/// address whose network overlaps it. `interfaces` lists (name, address
-/// network) pairs; `own` is the mesh interface.
+/// address network inside it (or equal to it). `interfaces` lists (name,
+/// address network) pairs, other programs' virtual interfaces already left
+/// out; `own` is the mesh interface. An interface on a wider network that
+/// merely overlaps the subnet is not chosen: it may be a VPN covering it.
 pub fn lan_interfaces(
     interfaces: &[(String, IpNet)],
     advertised: &[IpNet],
@@ -108,7 +110,7 @@ pub fn lan_interfaces(
     let mut found = Vec::new();
     for subnet in advertised {
         for (name, network) in interfaces {
-            if name != own && network.overlaps(subnet) {
+            if name != own && inside(network, subnet) {
                 found.push((name.clone(), *subnet));
             }
         }
@@ -116,6 +118,22 @@ pub fn lan_interfaces(
     found.sort_by_key(|(name, net)| (name.clone(), net.to_string()));
     found.dedup();
     found
+}
+
+/// Whether `network` lies inside `subnet`.
+fn inside(network: &IpNet, subnet: &IpNet) -> bool {
+    network.is_ipv4() == subnet.is_ipv4()
+        && network.prefix() >= subnet.prefix()
+        && subnet.contains(network.network())
+}
+
+/// One warning for each advertised subnet that no interface in `lan` is on.
+pub fn missing_interfaces(lan: &[(String, IpNet)], advertised: &[IpNet]) -> Vec<String> {
+    advertised
+        .iter()
+        .filter(|subnet| !lan.iter().any(|(_, net)| net == *subnet))
+        .map(|subnet| format!("{subnet}: no interface of this machine is on it"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -144,6 +162,14 @@ mod tests {
                 ("en0".to_string(), net("192.168.1.0/24")),
                 ("en1".to_string(), net("172.16.0.0/16")),
             ]
+        );
+        // A wider network that only overlaps the subnet (a VPN on 10/8) is
+        // not chosen for 10.20.0.0/16.
+        let vpn = vec![("utun3".to_string(), net("10.0.0.2/8"))];
+        assert!(lan_interfaces(&vpn, &[net("10.20.0.0/16")], "utun4").is_empty());
+        assert_eq!(
+            missing_interfaces(&found, &[net("192.168.1.0/24"), net("10.30.0.0/16")]),
+            vec!["10.30.0.0/16: no interface of this machine is on it".to_string()]
         );
     }
 

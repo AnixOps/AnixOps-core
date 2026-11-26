@@ -9,6 +9,7 @@
 | 子命令 | 作用 | 退出码 |
 | --- | --- | --- |
 | `run --config F [--interface N]` | 运行节点（Linux、macOS、Windows；macOS 网卡为系统分配的 `utunN`；Windows 网卡为 Wintun 适配器，`wintun.dll` 须与程序同目录，由服务管理器启动时以服务运行；监听的完整节点自动添加规则组 `AnixOps Mesh` 中的入站规则，通告子网时开接口级转发并以 WinNAT 转换 IPv4 虚拟网段，退出时撤销）：读取导入或面板写入的组网配置，绑定监听端口，创建 TUN 网卡（默认 `anixmesh0`），直到 SIGTERM/SIGINT。静态私钥取配置的 `node.private_key`，没有时用配置旁的 `<配置>.key`（首次运行生成，0600）。`managed` 网络的 `native_keys` 缺省、为空或不含本机公钥时暂缓（规范 §8.3.1）：不监听、不建网卡，输出一行 `{"state":"not_joined","reason":"native_keys_pending","static_key":…}` 后等待信号，退出码 0；Agent 上报公钥、面板下发含本机公钥的清单后重启服务即入网。状态行带 `static_key`（旧模式为 `null`）与最近一次被拒的非我方节点 `not_native`。与第三方节点的互通测试在 CI 中通过前，`run` 不列入 `capabilities`，安装器因此不会接管现有网络 | 0 收到信号正常停止；1 运行错误；2 用法或配置错误；3 端口或网卡被占用 |
+| `restore-host` | 放回异常退出的节点留在主机上的改动：macOS 的转发开关与 pf 锚点、令牌；Windows 的接口转发、防火墙规则与地址转换对象。卸载脚本在停止服务后调用（Windows 在节点进程退出前会重试几次）。Linux 上没有需要放回的改动 | 0 完成（告警列在输出的 `warnings`）；2 失败 |
 | `capabilities` | 输出版本和本构建支持的子命令（JSON）。安装器只有在列表含 `run` 时才执行接管 | 0 |
 | `detect --profile F` | 列出本机的现有安装（服务、启动脚本、自启行、手动进程、容器）。只输出参数名，不输出任何取值 | 0；2 用法错误 |
 | `import --profile F [--out-dir D] [--report R] [--allow-unencrypted] [--address CIDR] [-- ARGS…]` | 按检测结果（或 `--` 后手动给出的命令行）生成我方配置和导入报告 | 0 全部可用；3 未发现；5 有需确认项；6 有无法自动迁移的实例 |

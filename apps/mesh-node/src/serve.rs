@@ -248,13 +248,18 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             .collect();
         listen_ports.sort_unstable();
         listen_ports.dedup();
-        // Kept until the node stops; dropping it puts the host back.
-        let mut forwarding = start_forwarding(&settings, device.name(), &listen_ports, path);
+        let mut settings = settings;
+        let host = start_host(&settings, device.name(), &listen_ports);
+        if forwards(&settings) {
+            withdraw_uncarried(&mut settings, &host.carried);
+        }
+        // Kept until the node stops, then undone before it reports so.
+        let mut forwarding = host.forwarder;
         let virtual_subnets = settings.virtual_subnets();
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
-        serve_with(
+        let result = serve_with(
             settings,
             static_key,
             listeners,
@@ -276,7 +281,13 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
                 }
             },
         )
-        .await
+        .await;
+        if let Some(forwarding) = forwarding.take() {
+            for warning in forwarding.shutdown() {
+                warn("host_changes", &warning);
+            }
+        }
+        result
     })
 }
 
@@ -284,6 +295,12 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
 trait HostForwarder {
     /// Replaces the mesh sources translated towards the advertised subnets.
     fn set_sources(&mut self, sources: &[IpNet]) -> io::Result<()>;
+
+    /// Undoes the host changes now, before the node reports that it has
+    /// stopped. Returns problems as warnings.
+    fn shutdown(self: Box<Self>) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -293,10 +310,50 @@ impl HostForwarder for crate::forward_macos::HostForwarding {
     }
 }
 
+/// What the host side gave the node: the guard to hold, and the advertised
+/// subnets the machine actually carries. The others are not advertised.
+struct HostSide {
+    forwarder: Option<Box<dyn HostForwarder>>,
+    carried: Vec<IpNet>,
+}
+
+impl HostSide {
+    fn none() -> Self {
+        Self {
+            forwarder: None,
+            carried: Vec::new(),
+        }
+    }
+}
+
 /// Whether this node carries traffic to its advertised subnets: a full
 /// node with subnets to advertise (requirement R10).
 fn forwards(settings: &MeshSettings) -> bool {
     settings.role == Role::Full && !settings.advertise_subnets.is_empty()
+}
+
+/// Keeps only the advertised subnets the machine carries. A subnet it does
+/// not carry would draw traffic that is dropped, or forwarded by the host
+/// outside our rules.
+fn withdraw_uncarried(settings: &mut MeshSettings, carried: &[IpNet]) {
+    let withdrawn: Vec<String> = settings
+        .advertise_subnets
+        .iter()
+        .filter(|subnet| !carried.contains(subnet))
+        .map(IpNet::to_string)
+        .collect();
+    if !withdrawn.is_empty() {
+        warn(
+            "advertise_withdrawn",
+            &format!(
+                "not advertised, this machine does not carry them: {}",
+                withdrawn.join(", ")
+            ),
+        );
+    }
+    settings
+        .advertise_subnets
+        .retain(|subnet| carried.contains(subnet));
 }
 
 /// One line saying whether the host forwards for the advertised subnets
@@ -308,58 +365,120 @@ fn forwarding_line(state: &str, detail: Option<&str>) {
     );
 }
 
-/// macOS: switches forwarding on and translates mesh traffic to the
-/// advertised subnets (`forward_macos`). A failure is reported and the node
-/// runs on without carrying them.
+/// The advertised subnets of `lan`, once each.
+#[cfg(any(target_os = "macos", windows))]
+fn carried(lan: &[(String, IpNet)]) -> Vec<IpNet> {
+    let mut subnets: Vec<IpNet> = lan.iter().map(|(_, subnet)| *subnet).collect();
+    subnets.sort_by_key(IpNet::to_string);
+    subnets.dedup();
+    subnets
+}
+
+/// The machine's LAN interfaces as (name, address network) pairs, and the
+/// names of other programs' virtual interfaces. Neither list holds our own
+/// mesh interfaces; virtual interfaces never count as LAN, so a subnet a
+/// VPN also covers is not forwarded into that VPN.
+#[cfg(any(target_os = "macos", windows))]
+fn host_interfaces(interface: &str) -> io::Result<(Vec<(String, IpNet)>, Vec<String>)> {
+    let own = |name: &str| host_routes::is_own_interface(name, &[interface]);
+    let mut others: Vec<String> = host_routes::host_links()?
+        .into_values()
+        .filter(|link| link.is_virtual && !own(&link.name))
+        .map(|link| link.name)
+        .collect();
+    others.sort();
+    others.dedup();
+    let lan = tun::local_interfaces(|name| own(name) || others.iter().any(|other| other == name))?
+        .into_iter()
+        .filter_map(|(name, address, prefix)| Some((name, IpNet::new(address, prefix)?)))
+        .collect();
+    Ok((lan, others))
+}
+
+/// macOS: puts back what an earlier run left, then switches IPv4
+/// forwarding on and translates mesh traffic to the advertised IPv4 subnets
+/// (`forward_macos`). IPv6 subnets are not advertised: IPv6 forwarding
+/// stays off. A failure is reported and the node runs on without
+/// advertising subnets.
 #[cfg(target_os = "macos")]
-fn start_forwarding(
-    settings: &MeshSettings,
-    interface: &str,
-    _listen_ports: &[u16],
-    _config: &Path,
-) -> Option<Box<dyn HostForwarder>> {
+fn start_host(settings: &MeshSettings, interface: &str, _listen_ports: &[u16]) -> HostSide {
+    use crate::forward_macos::{self as forward, HostForwarding, MacSystem};
+
+    let dir = Path::new(forward::STATE_DIR);
+    match forward::recover(&MacSystem, dir) {
+        Ok(warnings) => {
+            for warning in warnings {
+                warn("forwarding", &warning);
+            }
+        }
+        Err(error) => warn(
+            "forwarding",
+            &format!("what an earlier run left could not be checked: {error}"),
+        ),
+    }
     if !forwards(settings) {
         forwarding_line("not_needed", None);
-        return None;
+        return HostSide::none();
     }
-    let interfaces = match host_interfaces(interface) {
+    let (v4, v6): (Vec<IpNet>, Vec<IpNet>) = settings
+        .advertise_subnets
+        .iter()
+        .partition(|subnet| subnet.is_ipv4());
+    if !v6.is_empty() {
+        warn(
+            "ipv6_forwarding_off",
+            "IPv6 forwarding stays off, since it stops the system from accepting router advertisements",
+        );
+    }
+    let (interfaces, others) = match host_interfaces(interface) {
         Ok(found) => found,
         Err(error) => {
             forwarding_line("off", Some(&error.to_string()));
-            return None;
+            return HostSide::none();
         }
     };
-    match crate::forward_macos::HostForwarding::start(
-        Path::new(crate::forward_macos::STATE_DIR),
+    let lan = host_routes::lan_interfaces(&interfaces, &v4, interface);
+    for warning in host_routes::missing_interfaces(&lan, &v4) {
+        warn("forwarding", &warning);
+    }
+    if lan.is_empty() {
+        forwarding_line(
+            "off",
+            Some("no interface of this machine is on the advertised subnets"),
+        );
+        return HostSide::none();
+    }
+    if !others.is_empty() {
+        warn(
+            "forwarding",
+            &format!(
+                "forwarding is system-wide on macOS: traffic can also pass between the LAN and {}",
+                others.join(", ")
+            ),
+        );
+    }
+    match HostForwarding::start(
+        Box::new(MacSystem),
+        dir,
         &settings.network_name,
-        interface,
-        &interfaces,
-        &settings.advertise_subnets,
+        lan.clone(),
         &settings.virtual_subnets(),
-        settings.address_v6.is_some(),
     ) {
         Ok((forwarding, warnings)) => {
             for warning in warnings {
                 warn("forwarding", &warning);
             }
             forwarding_line("on", None);
-            Some(Box::new(forwarding))
+            HostSide {
+                forwarder: Some(Box::new(forwarding)),
+                carried: carried(&lan),
+            }
         }
         Err(error) => {
             forwarding_line("off", Some(&error.to_string()));
-            None
+            HostSide::none()
         }
     }
-}
-
-/// The machine's (interface name, address network) pairs, leaving out the
-/// mesh interface itself.
-#[cfg(any(target_os = "macos", windows))]
-fn host_interfaces(interface: &str) -> io::Result<Vec<(String, IpNet)>> {
-    Ok(tun::local_interfaces(|name| name == interface)?
-        .into_iter()
-        .filter_map(|(name, address, prefix)| Some((name, IpNet::new(address, prefix)?)))
-        .collect())
 }
 
 #[cfg(windows)]
@@ -369,6 +488,10 @@ impl HostForwarder for crate::forward_windows::HostChanges {
     fn set_sources(&mut self, _sources: &[IpNet]) -> io::Result<()> {
         Ok(())
     }
+
+    fn shutdown(self: Box<Self>) -> Vec<String> {
+        crate::forward_windows::HostChanges::shutdown(*self)
+    }
 }
 
 /// Windows: puts back what an earlier run left, allows inbound traffic to a
@@ -376,22 +499,17 @@ impl HostForwarder for crate::forward_windows::HostChanges {
 /// switches forwarding on and translates the virtual subnet
 /// (`forward_windows`). One process per host makes these changes: when the
 /// client (or another node) holds them, this node says so and runs without
-/// them. Any other failure is reported and the node runs on.
+/// them, advertising no subnets. Any other failure is reported and the node
+/// runs on.
 #[cfg(windows)]
-fn start_forwarding(
-    settings: &MeshSettings,
-    interface: &str,
-    listen_ports: &[u16],
-    _config: &Path,
-) -> Option<Box<dyn HostForwarder>> {
+fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) -> HostSide {
     use platform_windows::mesh_host;
 
     if let Err(error) = mesh_host::recover_mesh_host() {
-        let busy = error.kind() == io::ErrorKind::ResourceBusy;
-        let detail = if busy {
-            "another process holds the host changes".to_owned()
+        let detail = if error.kind() == io::ErrorKind::ResourceBusy {
+            "another administrator process (the client or another node) holds the host changes; what an earlier run left was not cleaned".to_owned()
         } else {
-            error.to_string()
+            format!("what an earlier run left could not be put back: {error}")
         };
         warn("host_changes", &detail);
         if forwards(settings) {
@@ -401,7 +519,7 @@ fn start_forwarding(
         } else {
             forwarding_line("not_needed", None);
         }
-        return None;
+        return HostSide::none();
     }
     let mut host = crate::forward_windows::HostChanges::default();
     if settings.role == Role::Full && !listen_ports.is_empty() {
@@ -411,39 +529,73 @@ fn start_forwarding(
     }
     if !forwards(settings) {
         forwarding_line("not_needed", None);
-    } else {
-        let started = host_interfaces(interface).and_then(|interfaces| {
-            host.forward(
-                &settings.network_name,
-                interface,
-                &interfaces,
-                &settings.advertise_subnets,
-                crate::forward_windows::ipv4(&settings.address),
-                settings.address_v6.is_some(),
-            )
-        });
-        match started {
-            Ok(warnings) => {
-                for warning in warnings {
-                    warn("forwarding", &warning);
-                }
-                forwarding_line("on", None);
+        return HostSide {
+            forwarder: Some(Box::new(host)),
+            carried: Vec::new(),
+        };
+    }
+    let ipv6 = settings.address_v6.is_some();
+    let wanted: Vec<IpNet> = settings
+        .advertise_subnets
+        .iter()
+        .copied()
+        .filter(|subnet| ipv6 || subnet.is_ipv4())
+        .collect();
+    let lan = match host_interfaces(interface) {
+        Ok((interfaces, _)) => host_routes::lan_interfaces(&interfaces, &wanted, interface),
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            return HostSide {
+                forwarder: Some(Box::new(host)),
+                carried: Vec::new(),
+            };
+        }
+    };
+    for warning in host_routes::missing_interfaces(&lan, &wanted) {
+        warn("forwarding", &warning);
+    }
+    if lan.is_empty() {
+        forwarding_line(
+            "off",
+            Some("no interface of this machine is on the advertised subnets"),
+        );
+        return HostSide {
+            forwarder: Some(Box::new(host)),
+            carried: Vec::new(),
+        };
+    }
+    let carried = carried(&lan);
+    match host.forward(
+        &settings.network_name,
+        interface,
+        &lan,
+        crate::forward_windows::ipv4(&settings.address),
+        ipv6,
+    ) {
+        Ok(warnings) => {
+            for warning in warnings {
+                warn("forwarding", &warning);
             }
-            Err(error) => forwarding_line("off", Some(&error.to_string())),
+            forwarding_line("on", None);
+            HostSide {
+                forwarder: Some(Box::new(host)),
+                carried,
+            }
+        }
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            HostSide {
+                forwarder: Some(Box::new(host)),
+                carried: Vec::new(),
+            }
         }
     }
-    Some(Box::new(host))
 }
 
-/// Linux: the host side is not in place yet; the node says so instead of
-/// advertising subnets it cannot carry silently.
+/// Linux: the host side is not in place yet, so the node advertises no
+/// subnets rather than draw traffic it does not carry.
 #[cfg(target_os = "linux")]
-fn start_forwarding(
-    settings: &MeshSettings,
-    _interface: &str,
-    _listen_ports: &[u16],
-    _config: &Path,
-) -> Option<Box<dyn HostForwarder>> {
+fn start_host(settings: &MeshSettings, _interface: &str, _listen_ports: &[u16]) -> HostSide {
     if forwards(settings) {
         forwarding_line(
             "off",
@@ -452,7 +604,48 @@ fn start_forwarding(
     } else {
         forwarding_line("not_needed", None);
     }
-    None
+    HostSide::none()
+}
+
+/// Puts back what a node that died left on the host (`anixops-mesh
+/// restore-host`, run by the uninstallers after the service stops).
+/// Returns warnings.
+#[cfg(target_os = "macos")]
+pub fn restore_host() -> io::Result<Vec<String>> {
+    use crate::forward_macos::{recover, MacSystem, STATE_DIR};
+    recover(&MacSystem, Path::new(STATE_DIR))
+}
+
+/// Puts back what a node that died left on the host (`anixops-mesh
+/// restore-host`, run by the uninstallers after the service stops).
+/// Returns warnings.
+#[cfg(windows)]
+pub fn restore_host() -> io::Result<Vec<String>> {
+    let report = platform_windows::mesh_host::recover_mesh_host()?;
+    let mut warnings = Vec::new();
+    if report.forwarding_kept > 0 {
+        warnings.push(format!(
+            "{} interface forwarding values could not be restored and stay recorded",
+            report.forwarding_kept
+        ));
+    }
+    if report.state_set_aside {
+        warnings.push("the forwarding record could not be read and was set aside".into());
+    }
+    if !report.firewall_cleared {
+        warnings.push("leftover firewall rules could not be removed".into());
+    }
+    if !report.nat_cleared {
+        warnings.push("leftover address translation could not be removed".into());
+    }
+    Ok(warnings)
+}
+
+/// Linux: the node makes no host changes yet, so nothing is left to put
+/// back.
+#[cfg(target_os = "linux")]
+pub fn restore_host() -> io::Result<Vec<String>> {
+    Ok(Vec::new())
 }
 
 /// Resolves on SIGTERM or SIGINT.
