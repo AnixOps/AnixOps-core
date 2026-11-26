@@ -145,7 +145,9 @@ impl Registry {
             return;
         }
         let mut listed: Vec<String> = Vec::new();
-        let profile_id = profile.first().map(|settings| settings.instance_id.clone());
+        let profile_id = profile
+            .first()
+            .and_then(|settings| settings.instance_id.clone());
         for settings in profile {
             // The same network twice in one profile: the first counts, so
             // that the second does not replace it at once.
@@ -157,16 +159,29 @@ impl Registry {
         }
         // The profile names this device's instance ID: a saved network the
         // profile does not list and that carries another one (saved before
-        // the client changed it) is left, not run under a second identity,
-        // until `mesh_save_network` gives it the current one.
+        // the client changed it) stops, not run under a second identity,
+        // and reports `instance_id_changed` until `mesh_save_network` gives
+        // it the current ID or a profile names its ID again. A profile
+        // without an ID (only `legacy` networks) leaves every saved
+        // network as it is.
         if let Some(id) = profile_id {
-            for (name, network) in inner.networks.iter_mut() {
-                if network.saved && !listed.contains(name) && network.settings.instance_id != id {
-                    network.joined = false;
-                    network.failure = None;
+            let Inner {
+                networks,
+                keys,
+                local_networks,
+                ..
+            } = &mut *inner;
+            for (name, network) in networks.iter_mut() {
+                if !network.saved || listed.contains(name) || !network.joined {
+                    continue;
+                }
+                if network.settings.instance_id.as_deref() != Some(id.as_str()) {
+                    network.failure = Some(Failure::InstanceIdChanged);
                     if let Some(instance) = network.instance.take() {
                         instance.retire();
                     }
+                } else if network.failure == Some(Failure::InstanceIdChanged) {
+                    self.start(keys, local_networks, network);
                 }
             }
         }
@@ -222,6 +237,14 @@ impl Registry {
         let mut inner = self.lock();
         if inner.closed {
             return Err(RegistryError::Closed);
+        }
+        let settings = &inner
+            .networks
+            .get(name)
+            .ok_or(RegistryError::NotFound)?
+            .settings;
+        if conflicting_instance_id(&inner, settings) {
+            return Err(RegistryError::InstanceIdMismatch);
         }
         let inner = &mut *inner;
         let network = inner
@@ -395,7 +418,11 @@ impl Registry {
         match networks.get_mut(&name) {
             Some(network) => {
                 network.saved |= saved;
-                if same_settings(&network.settings, &settings) {
+                // A network stopped for its device ID starts again once a
+                // profile or `mesh_save_network` adopts it as it is.
+                if same_settings(&network.settings, &settings)
+                    && network.failure != Some(Failure::InstanceIdChanged)
+                {
                     return;
                 }
                 if let Some(instance) = network.instance.take() {
@@ -463,9 +490,17 @@ impl Registry {
     }
 }
 
+/// Whether another network running now carries another device ID than
+/// `settings`. A network that is left, or stopped for its ID, does not
+/// count: it runs under no identity.
 fn conflicting_instance_id(inner: &Inner, settings: &MeshSettings) -> bool {
     inner.networks.iter().any(|(name, network)| {
-        *name != settings.network_name && network.settings.instance_id != settings.instance_id
+        *name != settings.network_name
+            && network
+                .instance
+                .as_ref()
+                .is_some_and(|instance| !instance.is_retired())
+            && network.settings.instance_id != settings.instance_id
     })
 }
 
@@ -512,34 +547,103 @@ mod tests {
             .expect("the network runs")
     }
 
-    #[test]
-    fn a_profile_with_a_new_device_id_leaves_saved_networks_of_the_old_one() {
-        let (_runtime, registry) = registry();
-        let mut saved = settings("lab", "10.147.0.2/24", "legacy");
-        saved.instance_id = Some("device-1".into());
-        registry.save(saved.clone()).unwrap();
-        let old = found(&registry, &saved);
-        let mut office = settings("office", "10.146.0.2/24", "legacy");
-        office.instance_id = Some("device-2".into());
-        registry.commit(vec![office.clone()]);
-        // Kept, but not run under a second identity.
-        assert!(old.is_retired());
-        let lab = registry
+    fn with_id(name: &str, address: &str, id: &str) -> MeshSettings {
+        let mut settings = settings(name, address, "legacy");
+        settings.instance_id = Some(id.into());
+        settings
+    }
+
+    fn state(registry: &Registry, name: &str) -> NetworkState {
+        registry
             .networks()
             .into_iter()
-            .find(|network| network.settings.network_name == "lab")
-            .expect("still saved");
-        assert!(!lab.joined && lab.instance.is_none());
+            .find(|network| network.settings.network_name == name)
+            .expect("the registry knows the network")
+    }
+
+    #[test]
+    fn a_profile_with_a_new_device_id_stops_saved_networks_of_the_old_one() {
+        let (_runtime, registry) = registry();
+        let mut saved = with_id("lab", "10.147.0.2/24", "device-1");
+        let home = with_id("home", "10.147.1.2/24", "device-1");
+        registry.save(saved.clone()).unwrap();
+        registry.save(home.clone()).unwrap();
+        let old = found(&registry, &saved);
+        let old_home = found(&registry, &home);
+        let office = with_id("office", "10.146.0.2/24", "device-2");
+        registry.commit(vec![office.clone()]);
+        // Both kept, neither run under a second identity, and told apart
+        // from a network the user left.
+        assert!(old.is_retired() && old_home.is_retired());
+        for name in ["lab", "home"] {
+            let network = state(&registry, name);
+            assert!(network.joined && network.instance.is_none());
+            assert_eq!(network.failure, Some(Failure::InstanceIdChanged));
+        }
+        assert_eq!(Failure::InstanceIdChanged.code(), "instance_id_changed");
+        assert!(registry.instance("lab", &saved).is_err());
         found(&registry, &office);
+        // Joining it as it is would run a second identity.
+        assert_eq!(registry.join("lab"), Err(RegistryError::InstanceIdMismatch));
         // Saved again with the current ID, it runs.
         saved.instance_id = Some("device-2".into());
         registry.save(saved.clone()).unwrap();
-        registry.join("lab").unwrap();
         found(&registry, &saved);
+        registry.join("lab").unwrap();
         // A saved network of the same ID is not touched by a commit.
         let lab = found(&registry, &saved);
         registry.commit(vec![office]);
         assert!(!lab.is_retired());
+        // A profile of the old ID again: the network of that ID runs again,
+        // the other one stops.
+        registry.commit(vec![with_id("office", "10.146.0.2/24", "device-1")]);
+        found(&registry, &home);
+        assert!(lab.is_retired());
+        assert_eq!(
+            state(&registry, "lab").failure,
+            Some(Failure::InstanceIdChanged)
+        );
+    }
+
+    #[test]
+    fn a_profile_listing_a_stopped_network_as_it_is_starts_it() {
+        let (_runtime, registry) = registry();
+        let lab = with_id("lab", "10.147.0.2/24", "device-1");
+        registry.save(lab.clone()).unwrap();
+        registry.commit(vec![with_id("office", "10.146.0.2/24", "device-2")]);
+        assert!(registry.instance("lab", &lab).is_err());
+        registry.commit(vec![lab.clone()]);
+        found(&registry, &lab);
+    }
+
+    #[test]
+    fn a_profile_without_a_device_id_leaves_saved_networks_running() {
+        let (_runtime, registry) = registry();
+        let lab = with_id("lab", "10.147.0.2/24", "device-1");
+        registry.save(lab.clone()).unwrap();
+        let running = found(&registry, &lab);
+        registry.commit(vec![settings("office", "10.146.0.2/24", "legacy")]);
+        assert!(!running.is_retired());
+        registry.commit(Vec::new());
+        assert!(!running.is_retired());
+    }
+
+    #[test]
+    fn only_running_networks_count_for_the_device_id() {
+        let (_runtime, registry) = registry();
+        let lab = with_id("lab", "10.147.0.2/24", "device-1");
+        registry.save(lab.clone()).unwrap();
+        registry.leave("lab").unwrap();
+        // A left network runs under no identity: another ID is taken.
+        let home = with_id("home", "10.147.1.2/24", "device-2");
+        registry.save(home.clone()).unwrap();
+        found(&registry, &home);
+        // Joining the left one now would run two identities.
+        assert_eq!(registry.join("lab"), Err(RegistryError::InstanceIdMismatch));
+        assert!(!state(&registry, "lab").joined);
+        registry.leave("home").unwrap();
+        registry.join("lab").unwrap();
+        found(&registry, &lab);
     }
 
     #[test]

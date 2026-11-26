@@ -24,7 +24,6 @@ use outbound_mesh::outbound::control;
 use outbound_mesh::outbound::engine::{EngineHold, EngineSlot, MeshEngine, GRACE};
 use outbound_mesh::outbound::MeshFactory;
 use outbound_mesh::{MeshSettings, TYPE_NAME};
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{RuntimeError, RuntimeErrorCode};
@@ -51,11 +50,15 @@ pub(crate) struct MeshBinding {
     stopped: AtomicBool,
 }
 
-/// The command name of a request; every other field is skipped unread.
-#[derive(Deserialize)]
-struct Head {
-    #[serde(default)]
-    cmd: Option<String>,
+/// The registry of an engine a runtime looked up for a command.
+struct Engine(Arc<MeshEngine>);
+
+impl std::ops::Deref for Engine {
+    type Target = outbound_mesh::outbound::registry::Registry;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.registry()
+    }
 }
 
 impl MeshBinding {
@@ -73,7 +76,15 @@ impl MeshBinding {
     /// profile is adopted only then. A profile without mesh outbounds
     /// stops the networks of the previous one (unless saved with
     /// `mesh_save_network`) without holding the engine.
+    ///
+    /// Only the runtime of the profile the user runs may call it: a
+    /// runtime started for anything else in the same process (a
+    /// diagnostic, say) would stop every network that profile did not
+    /// list. Today only the iOS bridge creates runtimes, one per profile.
     pub(crate) fn commit(&self) {
+        // The tunnel runs (again): a runtime started after a stop may hold
+        // the engine once more.
+        self.stopped.store(false, Ordering::SeqCst);
         let networks = lock(&self.built).clone();
         if networks.is_empty() {
             if let Some(engine) = SLOT.current() {
@@ -109,12 +120,8 @@ impl MeshBinding {
         if !contains(request, b"mesh_") {
             return None;
         }
-        // An object only: the derived reader would also take an array.
-        if request.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
-            return None;
-        }
-        let head: Head = serde_json::from_slice(request).ok()?;
-        if head.cmd.as_deref() == Some("mesh_engine_stop") {
+        let name = control::command_name(request)?;
+        if name == "mesh_engine_stop" {
             if let Some(hold) = lock(&self.hold).take() {
                 hold.close();
             }
@@ -122,26 +129,24 @@ impl MeshBinding {
             return Some(encode(&json!({"ok": true, "stopped": stopped})));
         }
         let request = control::parse(request)?;
-        let starts = matches!(
-            &request,
-            control::Request::Command(command) if command.starts_engine()
-        );
-        if !starts {
-            let engine = SLOT.current();
-            let answer = control::answer(request, engine.as_deref().map(MeshEngine::registry));
-            return Some(encode(&answer));
-        }
-        let engine = self.engine();
-        // The engine this runtime held stopped meanwhile (the user closed
-        // the VPN through another runtime): start a new one, once.
-        let engine = match engine {
-            Some(engine) if engine.is_stopped() => {
-                lock(&self.hold).take();
-                self.engine()
+        // The engine is looked up once the arguments are checked: a
+        // malformed `mesh_save_network` starts nothing.
+        let answer = control::answer_with(request, |starts| {
+            if !starts {
+                return SLOT.current().map(Engine);
             }
-            engine => engine,
-        };
-        let answer = control::answer(request, engine.as_deref().map(MeshEngine::registry));
+            // The engine this runtime held stopped meanwhile (the user
+            // closed the VPN through another runtime): start a new one,
+            // once.
+            let engine = match self.engine() {
+                Some(engine) if engine.is_stopped() => {
+                    lock(&self.hold).take();
+                    self.engine()
+                }
+                engine => engine,
+            };
+            engine.map(Engine)
+        });
         Some(encode(&answer))
     }
 
@@ -339,6 +344,79 @@ mod tests {
         assert_eq!(saved, json!({"ok": true}));
         let engine = SLOT.current().expect("saving started the engine");
         let answer = ask(&third, json!({"cmd": "mesh_engine_stop"}));
+        assert_eq!(answer, json!({"ok": true, "stopped": true}));
+        assert!(engine.is_stopped());
+
+        // A malformed config is refused before the engine is looked at:
+        // it starts nothing, and a stopped runtime refuses it alike.
+        let mut bad = outbound_settings("10.160.0.2/24");
+        bad.insert(
+            "node".into(),
+            json!({"address": "not an address", "role": "access"}),
+        );
+        let save_bad = json!({"cmd": "mesh_save_network", "config": Value::Object(bad)});
+        for binding in [&third, &first] {
+            let refused = ask(binding, save_bad.clone());
+            assert_eq!(refused["error"]["code"], "invalid_argument");
+            assert!(SLOT.current().is_none());
+        }
+
+        // The new profile starts before the old one stops: the network
+        // keeps running.
+        let fourth = MeshBinding::default();
+        let fifth = MeshBinding::default();
+        for binding in [&fourth, &fifth] {
+            binding
+                .bind(&detached)
+                .build(
+                    TYPE_NAME,
+                    &outbound_settings("10.160.0.2/24"),
+                    Arc::new(TcpDialer),
+                )
+                .unwrap();
+        }
+        fourth.commit();
+        let engine = SLOT.current().expect("the engine runs");
+        let instance = engine.registry().networks()[0]
+            .instance
+            .clone()
+            .expect("the network runs");
+        fifth.commit();
+        fourth.release();
+        assert!(!instance.is_retired());
+        assert!(Arc::ptr_eq(
+            &instance,
+            engine.registry().networks()[0].instance.as_ref().unwrap()
+        ));
+
+        // A profile without mesh outbounds stops the networks it does not
+        // list, without holding the engine.
+        let proxy_only = MeshBinding::default();
+        proxy_only.commit();
+        assert!(instance.is_retired());
+        assert!(engine.registry().networks().is_empty());
+        assert!(lock(&proxy_only.hold).is_none());
+        assert!(!engine.is_stopped());
+
+        // A runtime whose tunnel starts again after a stop holds the
+        // engine again, and its commands may start networks.
+        fourth.commit();
+        assert!(lock(&fourth.hold).is_some());
+        let left = ask(
+            &fourth,
+            json!({"cmd": "mesh_leave", "network": "embedded-office"}),
+        );
+        assert_eq!(left, json!({"ok": true}));
+        let joined = ask(
+            &fourth,
+            json!({"cmd": "mesh_join", "network": "embedded-office"}),
+        );
+        assert_eq!(joined, json!({"ok": true}));
+        // Another runtime still holds the engine: closing one does not
+        // stop it; closing the last does.
+        let answer = ask(&fourth, json!({"cmd": "mesh_engine_stop"}));
+        assert_eq!(answer, json!({"ok": true, "stopped": false}));
+        let answer = ask(&fifth, json!({"cmd": "mesh_engine_stop"}));
         assert_eq!(answer, json!({"ok": true, "stopped": true}));
         assert!(engine.is_stopped());
     }
