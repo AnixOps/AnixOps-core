@@ -1,0 +1,25 @@
+[package]
+name = "mesh-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "External network bridge of the intranet mesh on Linux (spec §15.12, requirement R36): config checks, nftables rules, forwarding guard and the applied-config status."
+
+[dependencies]
+# IpNet and the intranet ranges (spec §15.4); read-only use.
+outbound-mesh = { path = "../outbound-mesh", default-features = false }
+serde = { version = "1", features = ["derive"] }
+# Parses `nft -j` counter output; already used by the rest of the kernel.
+serde_json = "1"
+# Digests of the applied lists (docs/architecture/mesh-status.md); already
+# used by the rest of the kernel.
+sha2 = "0.10"
+
+# ctnetlink socket for the tracked connections; already used by the rest
+# of the kernel.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lib]
+path = "src/lib.rs"

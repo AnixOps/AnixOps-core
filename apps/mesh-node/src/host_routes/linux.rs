@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use outbound_mesh::IpNet;
 
-use super::{is_own_interface, select_foreign, HostLink, HostRoute, Lookup, RouteKind};
+use super::{is_own_interface, select_foreign, Foreign, HostLink, HostRoute, Lookup, RouteKind};
 
 /// Link type of a device without a link layer (TUN).
 const ARPHRD_NONE: u16 = 0xfffe;
@@ -415,7 +415,7 @@ pub fn host_routes() -> io::Result<Vec<HostRoute>> {
 /// The routes of other programs' virtual interfaces and the refusing
 /// routes that the system selects (see the module documentation). `own`
 /// names the interface being served, in addition to those recorded.
-pub fn foreign_routes(own: &str) -> io::Result<Vec<IpNet>> {
+pub fn foreign_routes(own: &str) -> io::Result<Foreign> {
     let links = host_links()?;
     let socket = route_socket()?;
     let mut buffer = vec![0u8; 64 * 1024];
@@ -426,22 +426,10 @@ pub fn foreign_routes(own: &str) -> io::Result<Vec<IpNet>> {
             .get(&index)
             .is_some_and(|link| is_own_interface(&link.name, &[own]))
     };
-    let mut failed = None;
-    let found = select_foreign(&routes, &links, &is_own, &mut |address| match lookup(
-        &socket,
-        address,
-        &mut buffer,
-    ) {
-        Ok(found) => found,
-        Err(error) => {
-            failed.get_or_insert(error);
-            Lookup::Unknown
-        }
-    });
-    match failed {
-        Some(error) => Err(error),
-        None => Ok(found),
-    }
+    // A lookup that fails leaves only its candidate unchecked.
+    Ok(select_foreign(&routes, &links, &is_own, &mut |address| {
+        lookup(&socket, address, &mut buffer).unwrap_or(Lookup::Failed)
+    }))
 }
 
 /// Link type and flags as the kernel shows them under `/sys/class/net`.

@@ -76,6 +76,10 @@ pub const MAX_PENDING: usize = 256;
 /// packets that fail on the current session do not count as failures for
 /// this long (spec §9).
 pub const EVICTION_GRACE: Duration = Duration::from_secs(10);
+/// A node ID stays bound to the static key of its last session this long
+/// after the session ended (spec §12.3 期望公钥, the 10 seconds a replaced
+/// session still receives).
+pub const BINDING_GRACE: Duration = Duration::from_secs(10);
 /// Relay msg1 ephemeral keys remembered per initiator (spec §9).
 pub const SEEN_PER_PEER: usize = 4096;
 /// Relay msg1 ephemeral keys remembered in all, unless configured.
@@ -294,6 +298,9 @@ pub struct Sessions {
     max_seen: usize,
     /// Direct peers this node is creating a session with as client.
     creating: HashMap<SessionKey, Instant>,
+    /// The static keys of ended sessions, bound for [`BINDING_GRACE`]
+    /// from the first [`Sessions::reclaim`] after the end.
+    ended: HashMap<SessionKey, ([u8; LEN], Option<Instant>)>,
     tick: u64,
 }
 
@@ -322,6 +329,7 @@ impl Sessions {
             seen_count: 0,
             max_seen: max_seen.max(1),
             creating: HashMap::new(),
+            ended: HashMap::new(),
             tick: 0,
         }
     }
@@ -346,6 +354,15 @@ impl Sessions {
             .filter(|(_, session)| !keep(&session.peer_static()))
             .map(|(key, _)| key.clone())
             .collect()
+    }
+
+    /// The static key `key`'s node ID is bound to (spec §12.3): that of
+    /// its session, or of the session that ended within [`BINDING_GRACE`].
+    pub fn bound_static(&self, key: &SessionKey) -> Option<[u8; LEN]> {
+        self.map
+            .get(key)
+            .map(Session::peer_static)
+            .or_else(|| self.ended.get(key).map(|(peer_static, _)| *peer_static))
     }
 
     /// Drops the pending relay sessions whose peer's static key fails
@@ -561,6 +578,10 @@ impl Sessions {
         let Some(session) = self.map.remove(key) else {
             return;
         };
+        if self.ended.len() < MAX_SESSIONS || self.ended.contains_key(key) {
+            self.ended
+                .insert(key.clone(), (session.peer_static(), None));
+        }
         let used = self.next_tick();
         let record = Record {
             key: key.clone(),
@@ -959,6 +980,18 @@ impl Sessions {
         payload: &mut Vec<u8>,
         now: Instant,
     ) -> Result<(), SessionError> {
+        self.open_counting(key, payload, now, true)
+    }
+
+    /// [`open`](Self::open); with `count` false a failure is not counted
+    /// against the session, for a packet that may belong to another one.
+    pub fn open_counting(
+        &mut self,
+        key: &SessionKey,
+        payload: &mut Vec<u8>,
+        now: Instant,
+        count: bool,
+    ) -> Result<(), SessionError> {
         self.drop_expired_pending(key, now);
         let original = (self.pending_len(key) > 0).then(|| payload.clone());
         let current = self.map.get_mut(key).map(|session| {
@@ -1014,7 +1047,7 @@ impl Sessions {
             return Err(SessionError::NoSession);
         };
         let session = self.map.get_mut(key).expect("opened above");
-        let error = if counts && !grace {
+        let error = if count && counts && !grace {
             session.receiver.count_failure(error)
         } else {
             error
@@ -1083,6 +1116,13 @@ impl Sessions {
         self.evicted
             .retain(|_, at| now.saturating_duration_since(*at) < EVICTION_GRACE);
         self.creating.retain(|_, until| now < *until);
+        for (_, ended) in self.ended.values_mut() {
+            ended.get_or_insert(now);
+        }
+        self.ended.retain(|key, (_, ended)| {
+            !self.map.contains_key(key)
+                && ended.is_some_and(|at| now.saturating_duration_since(at) < BINDING_GRACE)
+        });
     }
 }
 
@@ -1210,6 +1250,34 @@ mod tests {
         );
         assert_eq!(sessions.generation(&key), Some(late.generation));
         assert_eq!(sessions.get(&key).unwrap().connections(), 1);
+    }
+
+    #[test]
+    fn a_node_id_stays_bound_shortly_after_its_session_ends() {
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let key = key(Namespace::Direct);
+        assert_eq!(sessions.bound_static(&key), None);
+        sessions
+            .install(
+                key.clone(),
+                &agreement(Action::Create, 2, 1, 0),
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                Side::Server,
+                now,
+            )
+            .unwrap();
+        assert_eq!(sessions.bound_static(&key), Some(PEER));
+        sessions.invalidate(&key);
+        assert!(sessions.get(&key).is_none());
+        assert_eq!(sessions.bound_static(&key), Some(PEER));
+        sessions.reclaim(now);
+        sessions.reclaim(now + BINDING_GRACE - Duration::from_secs(1));
+        assert_eq!(sessions.bound_static(&key), Some(PEER));
+        sessions.reclaim(now + BINDING_GRACE);
+        assert_eq!(sessions.bound_static(&key), None);
     }
 
     #[test]

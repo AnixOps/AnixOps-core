@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,55 +34,119 @@ const QUEUE: usize = 256;
 /// How often the networks of the other interfaces are read again.
 const LOCAL_NETWORKS_EVERY: Duration = Duration::from_secs(30);
 
-/// How long one scan of the interfaces and routes may take.
+/// How soon the interfaces are read again while they could not be read
+/// yet: no subnet is installed until then.
+const LOCAL_NETWORKS_RETRY: Duration = Duration::from_secs(5);
+
+/// How long one read of the interfaces, or of the routes, may take.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The networks of the other interfaces (spec §15.4). Our own mesh
 /// interfaces, and `device`, are left out.
-fn read_local_networks(device: &str) -> Vec<IpNet> {
+fn read_local_networks(device: &str) -> io::Result<Vec<IpNet>> {
     let own = |name: &str| host_routes::is_own_interface(name, &[device]);
-    match tun::local_networks(own) {
-        Ok(networks) => networks
-            .into_iter()
-            .filter_map(|(address, prefix)| IpNet::new(address, prefix))
-            .collect(),
-        Err(error) => {
-            warn("interfaces", &error.to_string());
-            Vec::new()
+    Ok(tun::local_networks(own)?
+        .into_iter()
+        .filter_map(|(address, prefix)| IpNet::new(address, prefix))
+        .collect())
+}
+
+/// Clears a read's busy flag when the read ends, however it ends.
+struct Reading(Arc<AtomicBool>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Runs `read` off the packet loop, unless the previous read behind `busy`
+/// still runs (a blocking read goes on past its timeout). `None` when
+/// skipped, failed or longer than [`SCAN_TIMEOUT`].
+async fn read_off_loop<T: Send + 'static>(
+    busy: &Arc<AtomicBool>,
+    what: &str,
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> Option<T> {
+    if busy.swap(true, Ordering::AcqRel) {
+        warn(what, "the previous read is still running");
+        return None;
+    }
+    let reading = Reading(busy.clone());
+    let task = tokio::task::spawn_blocking(move || {
+        let _reading = reading;
+        read()
+    });
+    match tokio::time::timeout(SCAN_TIMEOUT, task).await {
+        Ok(Ok(Ok(found))) => Some(found),
+        Ok(Ok(Err(error))) => {
+            warn(what, &error.to_string());
+            None
+        }
+        Ok(Err(error)) => {
+            warn(what, &error.to_string());
+            None
+        }
+        Err(_) => {
+            warn(what, "the read timed out");
+            None
         }
     }
 }
 
 /// What the host reaches without the mesh: the networks of the other
 /// interfaces, and the routes of other mesh programs as the system selects
-/// them. `None` when a scan failed or took longer than [`SCAN_TIMEOUT`];
-/// the previous result then stays.
-async fn scan(device: String) -> Option<(Vec<IpNet>, Vec<IpNet>)> {
-    let read = tokio::task::spawn_blocking(move || {
-        let networks = read_local_networks(&device);
-        match host_routes::foreign_routes(&device) {
-            Ok(routes) => Some((networks, routes)),
-            Err(error) => {
-                warn("routes", &error.to_string());
-                None
-            }
+/// them. The two are read apart, so that the interfaces count even when
+/// the routing tables cannot be read; a part that fails keeps its previous
+/// result.
+struct Scanner {
+    device: String,
+    interfaces: Arc<AtomicBool>,
+    routes: Arc<AtomicBool>,
+}
+
+impl Scanner {
+    fn new(device: &str) -> Self {
+        Self {
+            device: device.to_owned(),
+            interfaces: Arc::default(),
+            routes: Arc::default(),
         }
-    });
-    match tokio::time::timeout(SCAN_TIMEOUT, read).await {
-        Ok(Ok(found)) => found,
-        Ok(Err(error)) => {
-            warn("routes", &error.to_string());
-            None
+    }
+
+    async fn interfaces(&self) -> Option<Vec<IpNet>> {
+        let device = self.device.clone();
+        read_off_loop(&self.interfaces, "interfaces", move || {
+            read_local_networks(&device)
+        })
+        .await
+    }
+
+    async fn routes(&self) -> Option<Vec<IpNet>> {
+        let device = self.device.clone();
+        let found = read_off_loop(&self.routes, "routes", move || {
+            host_routes::foreign_routes(&device)
+        })
+        .await?;
+        if found.unchecked > 0 {
+            warn(
+                "routes",
+                &format!(
+                    "{} routes of other programs were not checked",
+                    found.unchecked
+                ),
+            );
         }
-        Err(_) => {
-            warn("routes", "the scan of the routing tables timed out");
-            None
-        }
+        Some(found.routes)
+    }
+
+    async fn both(&self) -> (Option<Vec<IpNet>>, Option<Vec<IpNet>>) {
+        tokio::join!(self.interfaces(), self.routes())
     }
 }
 
 /// Stores `fresh` when it differs, so that the driver wakes on changes only.
-fn store(sender: &watch::Sender<Vec<IpNet>>, fresh: Vec<IpNet>) {
+fn store<T: PartialEq>(sender: &watch::Sender<T>, fresh: T) {
     sender.send_if_modified(|current| {
         let changed = *current != fresh;
         if changed {
@@ -304,6 +369,26 @@ fn status_line(snapshot: &Snapshot, interface: &str) -> String {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
+        "local_networks_read": snapshot.local_networks_read,
+        "foreign_overlaps": snapshot
+            .foreign_overlaps
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        // Measures a network before a bridge is built to it (spec §11.2).
+        "sync_oversize": {
+            "received": snapshot
+                .sync_oversize
+                .received
+                .map(|(peer, bytes)| serde_json::json!({ "peer": peer, "bytes": bytes })),
+            "undelivered": snapshot.sync_oversize.undelivered,
+            "oversize_calls": snapshot.counters.oversize_calls,
+            "graph_timeouts": snapshot.counters.graph_timeouts,
+            "sync_errors": snapshot.counters.sync_errors,
+            "cut_graphs": snapshot.counters.cut_graphs,
+            "refused_at_capacity": snapshot.counters.refused_at_capacity,
+            "refused_over_budget": snapshot.counters.refused_over_budget,
+        },
     })
     .to_string()
 }
@@ -700,25 +785,40 @@ pub(crate) async fn serve_with(
     let others = claim
         .as_ref()
         .map(|claim| (claim.routes.clone(), claim.owner.clone()));
-    let (local, foreign) = scan(device.name().to_owned()).await.unwrap_or_default();
-    let (networks, local_networks) = watch::channel(with_others(local.clone(), others.as_ref()));
-    let (foreign_tx, foreign_routes) = watch::channel(foreign);
-    // Scanned again off the packet loop, one scan at a time, and whenever
-    // another network takes or frees routes.
+    let scanner = Scanner::new(device.name());
+    let (mut interfaces, foreign) = scanner.both().await;
+    // `None` until the interfaces were read once: the driver installs no
+    // subnet before (spec §15.4).
+    let (networks, local_networks) = watch::channel(
+        interfaces
+            .clone()
+            .map(|found| with_others(found, others.as_ref())),
+    );
+    let (foreign_tx, foreign_routes) = watch::channel(foreign.unwrap_or_default());
+    // Scanned again off the packet loop, one read of each kind at a time,
+    // and whenever another network takes or frees routes.
     let _scanner = StopTask(tokio::spawn({
-        let device = device.name().to_owned();
         let mut changed = others.as_ref().map(|(routes, _)| routes.subscribe());
-        let mut interfaces = local;
         async move {
-            let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
-            rescan.tick().await;
+            let period = |known: bool| {
+                if known {
+                    LOCAL_NETWORKS_EVERY
+                } else {
+                    LOCAL_NETWORKS_RETRY
+                }
+            };
+            let mut next = tokio::time::Instant::now() + period(interfaces.is_some());
             loop {
                 tokio::select! {
-                    _ = rescan.tick() => {
-                        if let Some((local, foreign)) = scan(device.clone()).await {
+                    () = tokio::time::sleep_until(next) => {
+                        let (local, foreign) = scanner.both().await;
+                        if local.is_some() {
                             interfaces = local;
+                        }
+                        if let Some(foreign) = foreign {
                             store(&foreign_tx, foreign);
                         }
+                        next = tokio::time::Instant::now() + period(interfaces.is_some());
                     }
                     Some(Ok(())) = async {
                         match &mut changed {
@@ -728,7 +828,9 @@ pub(crate) async fn serve_with(
                     } => {}
                 }
                 // Only a change wakes the driver (spec §15.4).
-                store(&networks, with_others(interfaces.clone(), others.as_ref()));
+                if let Some(found) = &interfaces {
+                    store(&networks, Some(with_others(found.clone(), others.as_ref())));
+                }
             }
         }
     }));
@@ -889,6 +991,20 @@ mod tests {
         assert_eq!(line["reachable"], 3);
         assert_eq!(line["duplicate_id"], false);
         assert_eq!(line["static_key"], serde_json::Value::Null);
+        assert_eq!(line["local_networks_read"], false);
+        assert_eq!(line["foreign_overlaps"], serde_json::json!([]));
+        let read = Snapshot {
+            local_networks_read: true,
+            foreign_overlaps: vec![IpNet::parse("100.64.0.0/10").unwrap()],
+            ..Snapshot::default()
+        };
+        let line: serde_json::Value =
+            serde_json::from_str(&status_line(&read, "anixmesh0")).expect("json");
+        assert_eq!(line["local_networks_read"], true);
+        assert_eq!(
+            line["foreign_overlaps"],
+            serde_json::json!(["100.64.0.0/10"])
+        );
         let secure = Snapshot {
             static_key: Some([7; 32]),
             not_native: Some(12),
@@ -898,6 +1014,16 @@ mod tests {
             serde_json::from_str(&status_line(&secure, "anixmesh0")).expect("json");
         assert_eq!(line["static_key"], encode_key(&[7; 32]));
         assert_eq!(line["not_native"], 12);
+        assert_eq!(line["sync_oversize"]["received"], serde_json::Value::Null);
+
+        let mut oversize = Snapshot::default();
+        oversize.sync_oversize.received = Some((9, 8_400_000));
+        oversize.counters.refused_at_capacity = 3;
+        let line: serde_json::Value =
+            serde_json::from_str(&status_line(&oversize, "anixmesh0")).expect("json");
+        assert_eq!(line["sync_oversize"]["received"]["peer"], 9);
+        assert_eq!(line["sync_oversize"]["received"]["bytes"], 8_400_000);
+        assert_eq!(line["sync_oversize"]["refused_at_capacity"], 3);
     }
 
     #[test]
