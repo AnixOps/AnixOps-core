@@ -12,7 +12,7 @@
 
 ### Added
 
-- 组网外部网络桥接（规范 §15.12，需求 R36，内核 0.4）新增独立 crate `mesh-bridge`：`external_bridge { interface, routes, allow }` 的配置校验（单个地址可在 100.64.0.0/10 与 fd7a:115c:a1e0::/48 内，网段须在白名单内且不与这两个范围重叠，拒绝默认路由、主机位非零、名单与通告重叠，各原因码见 `docs/architecture/mesh-bridge.md`）；每个组网网卡一张 nftables 表、整表原子替换：只放行名单内来源到通告地址并做源地址转换，外部网络进来的新连接与名单外来源丢弃并计数；IPv4 转发按需打开并在最后一个桥接拆除后恢复，IPv6 转发只告警不修改；`externalBridge` 状态摘要（`docs/architecture/mesh-status.md` 共用测试向量）只在规则全部装好后更新。CI 新增作业「Mesh external bridge (nftables)」在网络命名空间中用真实 nftables 验证。已接入组网配置与节点程序：`external_bridge` 为每个网络的顶层可选字段（只接受 Linux 完整节点），`routes` 并入本节点的子网通告；节点程序先取主机级锁 `/run/anixops-mesh-bridge.lock`、探测 nftables 并清除上次运行残留的桥接表，都成功后才声明能力 `mesh_external_bridge`；网络启动后安装桥接、停止时拆除，只改 `allow` 时不重启网络；`GET /v1/mesh` 每个网络给出 `externalBridge`（对象、`null` 或省略），另有节点级 `alerts`（取不到锁时为 `external_bridge_lock_held`）。启动与退出清理、名单收窄时删除经桥接源地址转换的连接跟踪条目。
+- 组网外部网络桥接（规范 §15.12，需求 R36，内核 0.4）新增独立 crate `mesh-bridge`：`external_bridge { interface, routes, allow }` 的配置校验（单个地址可在 100.64.0.0/10 与 fd7a:115c:a1e0::/48 内，网段须在白名单内且不与这两个范围重叠，拒绝默认路由、主机位非零、名单与通告重叠，各原因码见 `docs/architecture/mesh-bridge.md`）；每个组网网卡一张 nftables 表、整表原子替换：只放行名单内来源到通告地址并做源地址转换，外部网络进来的新连接与名单外来源丢弃并计数；IPv4 转发按需打开并在最后一个桥接拆除后恢复，IPv6 转发只告警不修改；`externalBridge` 状态摘要（`docs/architecture/mesh-status.md` 共用测试向量）只在规则全部装好后更新。CI 新增作业「Mesh external bridge (nftables)」在网络命名空间中用真实 nftables 验证。已接入组网配置与节点程序：`external_bridge` 为每个网络的顶层可选字段（只接受 Linux 完整节点），`routes` 并入本节点的子网通告；节点程序先取主机级锁 `/run/anixops-mesh-host.lock`、探测 nftables 并清除上次运行残留的桥接表，都成功后才声明能力 `mesh_external_bridge`；网络启动后安装桥接、停止时拆除，只改 `allow` 时不重启网络；`GET /v1/mesh` 每个网络给出 `externalBridge`（对象、`null` 或省略），另有节点级 `alerts`（取不到锁时为 `external_bridge_lock_held`）。启动与退出清理、名单收窄时删除经桥接源地址转换的连接跟踪条目。
 
 ### Security
 

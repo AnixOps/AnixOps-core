@@ -59,7 +59,7 @@
 - **规则清理（规范 §15.12 第 9 条）**：`cleanup_all` 列出本机全部 nftables 表，删除 `inet` 族中名称为 `anixops_bridge_` 加偶数位小写十六进制（至多 30 位）的表，即本模块的标记，全部在一个事务中完成；其他表（包括名称相近但不符合该格式的表、其他族中同名的表）一律不动。没有安装 `nft` 的主机视为没有残留。节点程序在启动时、安装任何桥接之前调用一次，清除上一次运行（含崩溃）残留的规则；退出时先丢弃各 `Bridge`，再调用一次。崩溃后 IPv4 转发保持桥接打开时的状态：清理无法判断主机原先是否打开，所以不改转发，见 `docs/manual-intervention.md`。
 - `Bridge::counters` 读取两个丢弃计数（`source_denied`、`inbound_denied`），供状态与诊断使用。
 - **能力探测（#357 复核 Y1）**：`probe` 在一个事务中建立并随即删除测试表 `anixops_bridge_probe`（不符合标记格式，清理不会动它），表中含 `inet` 族源地址转换（`masquerade`）、`ct state` 与区间集合。内核不支持（如 5.2 之前没有 `inet` 族 NAT）或没有 `nft` 时失败，此时不声明能力。
-- **主机锁（#357 复核 Y2）**：`HostLock::acquire` 对 `/run/anixops-mesh-bridge.lock` 加 `flock`（不等待），进程结束时由内核释放，崩溃不留死锁。取不到锁说明同一主机上另有节点程序在运行桥接：不声明能力、不做启动清理，并告警 `external_bridge_lock_held`，避免第二个进程悄悄删掉第一个进程的表。
+- **主机锁（#357 复核 Y2）**：`HostLock::acquire` 对 `/run/anixops-mesh-host.lock` 加 `flock`（不等待），进程结束时由内核释放，崩溃不留死锁。取不到锁说明同一主机上另有节点程序在运行桥接：不声明能力、不做启动清理，并告警 `external_bridge_lock_held`，避免第二个进程悄悄删掉第一个进程的表。
 - `nft` 只从固定路径查找（`/usr/sbin/nft`、`/sbin/nft`、`/usr/bin/nft`），以空环境运行，不经 `PATH`。
 
 ## 接入（`outbound-mesh`、`apps/mesh-node`）

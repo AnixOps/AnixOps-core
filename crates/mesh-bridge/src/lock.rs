@@ -1,4 +1,6 @@
-//! The host-wide bridge lock (recheck of spec #357, Y2).
+//! The host-wide mesh lock (recheck of spec #357, Y2), shared by the
+//! external bridge and the Linux subnet router (spec §15.12 item 9,
+//! `docs/architecture/mesh-module.md`).
 //!
 //! Bridge tables are host-wide, and the start-up cleanup deletes every one
 //! carrying our mark. A second node program on the same host would delete
@@ -13,7 +15,7 @@
 use std::io;
 
 /// Where the lock lives.
-pub const LOCK_PATH: &str = "/run/anixops-mesh-bridge.lock";
+pub const LOCK_PATH: &str = "/run/anixops-mesh-host.lock";
 
 /// Raised when another process holds the lock.
 pub const LOCK_HELD_ALERT: &str = "external_bridge_lock_held";
