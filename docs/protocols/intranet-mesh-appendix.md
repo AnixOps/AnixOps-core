@@ -377,7 +377,7 @@ tag    = HMAC-SHA256(K, 应答[0..28])[0..16]
 - **应答器限速**：每个来源地址（IPv4 按 /32，IPv6 按 /64）令牌桶每秒 50 个、突发 20 个；全局每秒 5000 个。超出直接丢弃并计数。应答器可以缓存最近 1024 个 `E` 对应的 `K`，避免重复做 X25519。
 - **节点校验**：应答的来源地址和端口必须等于该探测包的目标；`nonce` 与 `seq` 必须对应一个已发出、未应答、未超时的探测；`tag` 用常量时间比较。任一不符就丢弃，不算丢包也不算应答。
 - **临时密钥**：每轮对每台边界节点新生成一个临时密钥对，本轮结束即擦除，不落盘。
-- 应答器公钥由边界节点自行生成并保存（D.9.3），私钥不离开节点。
+- 应答器公钥由边界节点自行生成并保存（D.9.3），私钥不离开节点。应答器只读 UDP 请求，不建立任何会话，也不持有任何网络密钥。
 
 **测试向量**：
 
@@ -460,6 +460,7 @@ tag    = HMAC-SHA256(K, 应答[0..28])[0..16]
 | `current` | 节点当前所在区域代码，或 `null`（未分配）。不为 `null` 时请求体中必须有 `tag` 为 `mesh-<current>` 的网络 |
 | `basis` | 当前区域的来由：`latency`（首次按时延自动选区）、`credential`（签发凭据时指定）、`admin`（管理员指定或直接发起迁移）、`migration`（节点申请经批准迁入）；`current` 为 `null` 时为 `null` |
 | `directory` | D.2.2 的目录对象，或 `null`；可省略，视为 `null` |
+| `responder` | 边界节点的探测应答器（D.9.3），或 `null`；可省略，视为 `null` |
 
 未知字段或违反约束时整个请求体返回 400，与 `networks` 相同。设备从 `GET /api/v5/mesh/device/config` 应答的顶层 `region`（同一形态，面板约定第 4 节第 3 项新增的顶层字段）取得同样内容，转成这一节。
 
@@ -487,17 +488,17 @@ tag    = HMAC-SHA256(K, 应答[0..28])[0..16]
 
 Agent 把 `region_probe` 原样随 `mesh.status` 上报；设备在 `POST /api/v5/mesh/device/report` 的载荷顶层带上同一对象。面板用 `regions` 为未分配区域的 Agent 节点选区（D.5 第 2 条），并在节点详情中显示 `suggestion`。
 
-#### D.9.3 边界节点 `backbone.probe`
+#### D.9.3 边界节点的探测应答器 `region.responder`
 
-`PUT /v1/mesh` 的 `backbone`（B 节）增加可选的 `probe`：
+D.9.1 的 `region` 对象另有可选字段 `responder`，只下发给边界节点（面板中标为边界的成员）：
 
 ```json
-{ "probe": { "listen": ["0.0.0.0:11013", "[::]:11013"] } }
+{ "region": { "current": "eu", "basis": "admin", "directory": null, "responder": { "listen": ["0.0.0.0:11013", "[::]:11013"] } } }
 ```
 
-- `listen`：1–4 个 UDP 套接字地址（IP 字面量加端口）。省略 `probe` 或为 `null` 时不开应答器。
+- `listen`：1–4 个 UDP 套接字地址（IP 字面量加端口，不重复）。省略 `responder` 或为 `null` 时不开应答器。应答器与骨干（B 节）相互独立：没有 `backbone` 节、骨干未运行或链路实现不可用时照常应答。
 - 应答器公钥：内核首次需要时生成 X25519 密钥对，私钥保存在状态目录 `keys/region-probe`（0600），重启后不变；只有删除状态目录才会更换。私钥不出现在任何应答、状态、事件和日志中。
-- `GET /v1/mesh` 的 `backbone` 状态增加 `probe`：`null` 或 `{ "public_key", "listening": [地址], "failure", "counters": { "answered", "malformed", "rate_limited", "low_order" } }`。`failure` 为 `null` 或 `{ "code": "region_probe_bind_failed", "detail" }`。Agent 原样上报（`backbone` 本来就原样上报）；面板取 `public_key` 和该节点的公网地址与端口生成目录。
+- `GET /v1/mesh` 的 `region_probe`（D.9.2）增加 `responder`：`null` 或 `{ "public_key", "listening": [地址], "failure", "counters": { "answered", "malformed", "rate_limited", "low_order" } }`。`failure` 为 `null` 或 `{ "code": "region_probe_bind_failed", "detail" }`。边界节点没有目录时 `region_probe` 为只含 `responder` 的对象，其余字段为 `null` 或空。Agent 原样上报；面板取 `public_key`、该节点的公网地址与 `listen` 端口生成目录。
 
 #### D.9.4 快照
 
@@ -513,7 +514,7 @@ Agent 把 `region_probe` 原样随 `mesh.status` 上报；设备在 `POST /api/v
 
 #### D.9.5 能力与命令
 
-- 能力 `mesh_region_probe`（内核 0.4）：接受 D.9.1 的 `region` 与 D.9.3 的 `backbone.probe`，给出 D.9.2、`regionProbe`、`self.regionBasis`、`self.regionSuggestion`。内核未列出时 Agent 与面板不下发 `region` 与 `backbone.probe`。
+- 能力 `mesh_region_probe`（内核 0.4）：接受 D.9.1 的 `region`（含 D.9.3 的 `responder`），给出 D.9.2、`regionProbe`、`self.regionBasis`、`self.regionSuggestion`。内核未列出时 Agent 与面板不下发 `region`。
 - 迁区申请状态与撤回属于能力 `mesh_region_request_state`（mesh-status.md），与本能力独立。
 
 ### D.10 入网凭据只用一次（节点侧）
