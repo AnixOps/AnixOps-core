@@ -1502,7 +1502,21 @@ impl Node {
     /// A broadcast or multicast goes to every direct neighbour, addressed
     /// to each of them, and is not relayed further (spec §15.3).
     pub fn send_ip(&mut self, packet: &[u8], now: Instant) -> Result<(), Denied> {
-        let outgoing = match self.routes.classify_outgoing(packet) {
+        // Among several advertisers of a subnet the one with the fewest hops
+        // is used (spec §15.2, requirement R7); unreachable ones are
+        // skipped. The count is fixed to hops, whatever the path policy,
+        // so that changing latencies do not move the gateway from packet
+        // to packet; the next hop towards it still follows the policy.
+        // The paths are only worked out when a subnet destination needs
+        // them.
+        let paths = std::cell::OnceCell::new();
+        let hops = |peer: PeerId| {
+            paths
+                .get_or_init(|| self.compute_routes(Metric::Hops))
+                .get(&peer.0)
+                .map(|route: &Route| route.hops)
+        };
+        let outgoing = match self.routes.classify_outgoing_by(packet, hops) {
             Ok(outgoing) => outgoing,
             Err(denied) => {
                 self.counters.refused_outgoing += 1;
@@ -3806,6 +3820,53 @@ mod tests {
         assert_eq!(chosen, [net(1), net(2)]);
         assert_eq!(truncated, 0);
         assert_eq!(fair_share(&[], 10), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_subnet_packet_goes_to_the_nearest_advertiser() {
+        let member = |address: &str, advertise: &[&str]| {
+            let config = serde_json::json!({
+                "config_version": 1,
+                "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+                "node": {"address": address, "role": "full"},
+                "peers": [{"server": "peer.example", "port": 40000}],
+                "subnets": {"advertise": advertise},
+            });
+            serde_json::from_value::<MeshConfig>(config)
+                .unwrap()
+                .validate()
+                .unwrap()
+        };
+        // 0–1–2 and 0–3: nodes 2 and 3 both advertise 192.168.40.0/24.
+        // Node 3 is the nearer one but has the larger ID.
+        let mut net = Net::with(vec![
+            member("10.144.0.1/24", &[]),
+            member("10.144.0.2/24", &[]),
+            member("10.144.0.3/24", &["192.168.40.0/24"]),
+            member("10.144.0.4/24", &["192.168.40.0/24"]),
+        ]);
+        net.link(0, 1);
+        net.link(1, 2);
+        net.link(0, 3);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        let packet = ipv4_packet([10, 144, 0, 1], [192, 168, 40, 9]);
+        let now = net.now;
+        net.nodes[0].send_ip(&packet, now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, [(3, packet.clone())]);
+        // With node 3 gone, node 2 takes over.
+        unlink(&mut net, 0, 3);
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net.delivered.clear();
+        let now = net.now;
+        net.nodes[0].send_ip(&packet, now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, [(2, packet)]);
     }
 
     #[test]
