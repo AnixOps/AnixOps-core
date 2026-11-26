@@ -16,6 +16,9 @@
 //!   destination check before anything is sent, and the source check on
 //!   every packet a peer delivers.
 //! - [`packet`]: addresses of a raw IP packet, for those checks.
+//! - [`region`]: region auto-assignment: the directory, the authenticated
+//!   region probe, the measurement and the region change suggestion
+//!   (spec §15.8), without I/O.
 //! - [`wire`]: framing, the node header and the protobuf subset.
 //! - [`legacy`]: the default handshake mode: digest, static keys, payload
 //!   encryption and the handshake message.
@@ -56,6 +59,7 @@ pub mod node;
 pub mod outbound;
 pub mod packet;
 pub mod paths;
+pub mod region;
 pub mod route;
 pub mod routes;
 pub mod rpc;

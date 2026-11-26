@@ -18,6 +18,9 @@
 //!   named like the key. A local override: it outlives restarts and leaving
 //!   the list, and never changes the network's configuration.
 //!
+//! - `region-probe.json` and `keys/region-probe`: the region measurement
+//!   history and the probe responder's key ([`crate::region_probe`]).
+//!
 //! A border node's request also carries a `backbone` section; its backbone
 //! runs beside the networks and meets its region network through that
 //! network's hub ([`crate::border`]).
@@ -30,6 +33,8 @@
 //! does a node program clear the bridge tables, under the host lock, at
 //! start-up (bridges on or off) and when it goes. Off and without the mark,
 //! the node never calls `nft` or touches conntrack.
+//! The top-level `region` object starts the region measurement and, on
+//! border nodes, the probe responder.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -62,8 +67,10 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::border::{BorderInstance, Hub, RegionView};
+use crate::region_probe::RegionRuntime;
 use crate::serve::{self, AbortOnDrop, Failure, HostRoutes};
 use crate::tun::{self, Tun};
+use outbound_mesh::region::directory::RegionSection;
 
 /// Features this implementation adds to `GET /v1/status`. `mesh_dns` and
 /// `mesh_resolver_address`: each network's `dns` section, with the
@@ -77,6 +84,9 @@ use crate::tun::{self, Tun};
 /// `paths` status; a changed path list reaches a running network without a
 /// restart (`mesh_set_paths`).
 /// `mesh_host_groups`: the `host_groups` section (spec §15.7).
+/// `mesh_region_probe`: `PUT /v1/mesh` takes the top-level `region` object
+/// and `GET /v1/mesh` gives `region_probe` (appendix D.9); every list below
+/// has it.
 pub const FEATURES: &[&str] = &[
     "mesh",
     "mesh_dns",
@@ -84,10 +94,15 @@ pub const FEATURES: &[&str] = &[
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
+    REGION_PROBE_FEATURE,
 ];
 
+/// Region measurement and the border probe responder (appendix D.9).
+pub const REGION_PROBE_FEATURE: &str = "mesh_region_probe";
+
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
-/// lock, nftables took the probe and the start-up cleanup ran.
+/// lock, nftables took the probe and the start-up cleanup ran. Every
+/// feature of [`FEATURES`] stays listed.
 pub const FEATURES_WITH_BRIDGE: &[&str] = &[
     "mesh",
     "mesh_dns",
@@ -95,6 +110,7 @@ pub const FEATURES_WITH_BRIDGE: &[&str] = &[
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
+    REGION_PROBE_FEATURE,
     mesh_bridge::FEATURE,
 ];
 
@@ -112,6 +128,7 @@ pub const FEATURES_WITH_BACKBONE: &[&str] = &[
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
+    REGION_PROBE_FEATURE,
     BACKBONE_FEATURE,
 ];
 
@@ -123,6 +140,7 @@ pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
+    REGION_PROBE_FEATURE,
     mesh_bridge::FEATURE,
     BACKBONE_FEATURE,
 ];
@@ -170,6 +188,7 @@ struct Inner {
     previous: Mutex<Option<ManagedStatus>>,
     /// The system routes the running networks installed.
     routes: HostRoutes,
+    region: Mutex<RegionRuntime>,
 }
 
 /// The host side of external bridges.
@@ -383,6 +402,7 @@ impl ManagedMesh {
         let bridging = bridging(&dir);
         Ok(Self {
             inner: Arc::new(Inner {
+                region: Mutex::new(RegionRuntime::new(&dir)),
                 dir,
                 instance_id,
                 networks: Mutex::new(Vec::new()),
@@ -847,6 +867,7 @@ impl Inner {
             } else {
                 Vec::new()
             },
+            region_probe: lock(&self.region).status(),
         }
     }
 }
@@ -924,6 +945,11 @@ impl MeshControl for ManagedMesh {
                 })
             })
         })
+    }
+
+    fn set_region(&self, region: Option<RegionSection>) -> BoxFuture<'_, ()> {
+        lock(&self.inner.region).set(region);
+        Box::pin(async {})
     }
 }
 
@@ -1842,6 +1868,8 @@ mod tests {
         assert_eq!(mesh.features(), FEATURES);
         assert!(!FEATURES.contains(&mesh_bridge::FEATURE));
         assert!(FEATURES_WITH_BRIDGE.contains(&mesh_bridge::FEATURE));
+        // Bridging adds its feature and drops none.
+        assert!(FEATURES.iter().all(|f| FEATURES_WITH_BRIDGE.contains(f)));
         assert!(FEATURES_WITH_BRIDGE.contains(&"mesh_paths"));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -41,6 +41,8 @@ pub mod local_status;
 pub mod managed;
 pub mod net;
 pub mod profile;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod region_probe;
 pub mod report;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod serve;
