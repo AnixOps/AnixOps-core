@@ -1,0 +1,39 @@
+#!/bin/sh
+# Firewall rules of the mesh device (docs/deploy/openwrt.md, 防火墙).
+#
+#   firewall sync    rules from the configuration the panel delivered
+#   firewall clear   remove the rules (the zone stays)
+#   firewall remove  remove the rules and the zone (package removal)
+#   firewall watch   sync every 30 s until SIGTERM, then clear
+#
+# The work is done by firewall.uc through the UCI API; the firewall is
+# reloaded only when the rules change.
+
+RULES=/usr/share/anixops-mesh/firewall.uc
+
+case "$1" in
+sync | clear | remove)
+	exec ucode "${RULES}" "$1"
+	;;
+watch)
+	sleeper=
+	# shellcheck disable=SC2329 # invoked by the trap below
+	finish() {
+		[ -n "${sleeper}" ] && kill "${sleeper}" 2>/dev/null
+		ucode "${RULES}" clear
+		exit 0
+	}
+	trap finish TERM INT
+	while :; do
+		ucode "${RULES}" sync
+		sleep 30 &
+		sleeper=$!
+		wait "${sleeper}"
+		sleeper=
+	done
+	;;
+*)
+	echo "usage: $0 sync|clear|remove|watch" >&2
+	exit 2
+	;;
+esac

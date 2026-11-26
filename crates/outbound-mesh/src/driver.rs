@@ -127,6 +127,9 @@ pub struct Snapshot {
     /// Accepted subnets that overlap this node's own networks: kept, but
     /// neither routed nor installed (R17, spec §15.4).
     pub overlaps: Vec<IpNet>,
+    /// Those of `overlaps` that overlap another mesh program's route
+    /// rather than a network of this machine (spec §15.4).
+    pub foreign_overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
     /// What this node advertises now (field 5), host group ranges
@@ -240,6 +243,14 @@ pub struct Channels {
     /// New `host_groups`, applied without a restart (spec §15.7); the value
     /// at start is ignored, the settings carry it.
     pub host_groups: watch::Receiver<Vec<HostGroup>>,
+    /// Advertised subnets the user routes through the mesh although they
+    /// overlap a network of this machine (`mesh_set_subnet_route`,
+    /// spec §15.4); the value at start applies too.
+    pub route_overrides: watch::Receiver<Vec<IpNet>>,
+    /// Routes other mesh programs' virtual interfaces carry on this
+    /// machine, as the system selects them: handled like `local_networks`
+    /// and reported apart (spec §15.4).
+    pub foreign_routes: watch::Receiver<Vec<IpNet>>,
     /// Stops the node when it turns true. A node that advertises subnets
     /// first withdraws them and keeps running for [`WITHDRAW_WAIT`] (spec
     /// §15.7 rule 6); the caller should allow for that.
@@ -260,6 +271,8 @@ pub async fn run(
         mut local_networks,
         mut native_keys,
         mut host_groups,
+        mut route_overrides,
+        mut foreign_routes,
         mut shutdown,
     } = channels;
     native_keys.mark_unchanged();
@@ -269,6 +282,8 @@ pub async fn run(
     let peers = settings.peers.clone();
     let mut node = Node::new(settings, static_key, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
+    node.set_route_overrides(&route_overrides.borrow_and_update());
+    node.set_foreign_routes(&foreign_routes.borrow_and_update());
     node.set_local_networks(&local_networks.borrow_and_update());
     if node.waits_for_native_keys() {
         // No listening, dialling or packets until the list holds this
@@ -337,6 +352,12 @@ pub async fn run(
             }
             Ok(()) = local_networks.changed() => {
                 node.set_local_networks(&local_networks.borrow_and_update());
+            }
+            Ok(()) = foreign_routes.changed() => {
+                node.set_foreign_routes(&foreign_routes.borrow_and_update());
+            }
+            Ok(()) = route_overrides.changed() => {
+                node.set_route_overrides(&route_overrides.borrow_and_update());
             }
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
@@ -484,6 +505,7 @@ fn snapshot(node: &Node) -> Snapshot {
         members: members(node),
         rejected_advertisements: node.route_table().refused_subnet_count(),
         overlaps: overlaps(node),
+        foreign_overlaps: node.foreign_overlaps(),
         address_conflicts: node
             .route_table()
             .address_conflicts()
@@ -946,6 +968,8 @@ mod tests {
         let (_, local_networks) = watch::channel(Vec::new());
         let (_, native_keys) = watch::channel(None);
         let (_, host_groups) = watch::channel(Vec::new());
+        let (_, route_overrides) = watch::channel(Vec::new());
+        let (_, foreign_routes) = watch::channel(Vec::new());
         tokio::spawn(run(
             settings,
             static_key,
@@ -957,6 +981,8 @@ mod tests {
                 local_networks,
                 native_keys,
                 host_groups,
+                route_overrides,
+                foreign_routes,
                 shutdown,
             },
         ));
@@ -1120,6 +1146,8 @@ mod tests {
         let (_keep_networks, local_networks) = watch::channel(Vec::new());
         let (_keep_keys, native_keys) = watch::channel(None);
         let (_keep_groups, host_groups) = watch::channel(Vec::new());
+        let (_keep_overrides, route_overrides) = watch::channel(Vec::new());
+        let (_keep_routes, foreign_routes) = watch::channel(Vec::new());
         let task = tokio::spawn(run(
             hub,
             KeyPair::generate(&rng).unwrap(),
@@ -1131,6 +1159,8 @@ mod tests {
                 local_networks,
                 native_keys,
                 host_groups,
+                route_overrides,
+                foreign_routes,
                 shutdown,
             },
         ));
