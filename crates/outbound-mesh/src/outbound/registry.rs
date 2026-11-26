@@ -382,12 +382,9 @@ impl Registry {
     pub fn networks(&self) -> Vec<NetworkState> {
         self.lock()
             .networks
-            .values()
+            .values_mut()
             .map(|network| NetworkState {
-                settings: MeshSettings {
-                    private_key: None,
-                    ..network.settings.clone()
-                },
+                settings: without_private_key(&mut network.settings),
                 joined: network.joined,
                 saved: network.saved,
                 instance: network.instance.clone(),
@@ -467,7 +464,7 @@ impl Registry {
     ) {
         let settings = &network.settings;
         let key = match &settings.private_key {
-            Some(private) => KeyPair::from_private(***private),
+            Some(private) => KeyPair::from_private_ref(private),
             None if settings.kind == NetworkKind::Managed => {
                 network.failure = Some(Failure::PrivateKeyRequired);
                 return;
@@ -516,6 +513,15 @@ fn conflicting_instance_id(inner: &Inner, settings: &MeshSettings) -> bool {
                 .as_deref()
                 .is_some_and(|other| other != id)
     })
+}
+
+/// A copy of `settings` without the private key, which is never copied:
+/// its box is set aside while the rest is cloned, then put back.
+fn without_private_key(settings: &mut MeshSettings) -> MeshSettings {
+    let key = settings.private_key.take();
+    let copy = settings.clone();
+    settings.private_key = key;
+    copy
 }
 
 fn remove(inner: &mut Inner, name: &str) {

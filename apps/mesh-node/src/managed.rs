@@ -633,7 +633,7 @@ impl Inner {
 
     fn static_key(&self, settings: &MeshSettings) -> Result<KeyPair, Failure> {
         match &settings.private_key {
-            Some(private) => Ok(KeyPair::from_private(**private)),
+            Some(private) => Ok(KeyPair::from_private_ref(private)),
             None => serve::static_key(&self.key_path(&settings.network_name)),
         }
     }

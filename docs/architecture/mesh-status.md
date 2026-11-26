@@ -51,7 +51,7 @@
 | `network.joining` | `null` 或 `{ "stage": "connecting" \| "assigning_address" \| "measuring_regions", "peersConnected" }` |
 | `routingPolicy` | `hops`、`latency` |
 | `role` | 0.3：`server`（完整节点）、`client`（接入节点）；0.4 起另有 `border`、`gateway`、`host` |
-| `id`（成员与本机） | 不透明字符串，客户端不解析其格式。`self.id` 为本设备的设备实例 ID（规范 §1，持久保存，等于 `GET /v1/mesh` 的 `instance_id`）。`members[].id`：设备实例 ID 不上线，内核从线上只能得到对端的线上实例 UUID（规范 §12.3 字段 2，对端每次启动重新生成），所以取该 UUID 的小写连字符文本，只保证在该成员进程的一次运行内不变，**对端重启后改变**；不用静态公钥派生（旧模式网络没有公钥，且会引入跨会话可关联的标识）。同一次运行内成员第一次出现在快照时就给出最终 `id`，此后不变。客户端不得用成员 `id` 作为需要跨重启保存的设置键（本机设置按网段、虚拟地址保存）。不用每次启动都会变的数字节点号 |
+| `id`（成员与本机） | 不透明字符串，客户端不解析其格式。`self.id` 为本设备的设备实例 ID（规范 §1，持久保存，等于 `GET /v1/mesh` 的 `instance_id`）；嵌入式引擎取所选网络的 `node.instance_id`，该网络没有配置时为 `null`。`members[].id`：设备实例 ID 不上线，内核从线上只能得到对端的线上实例 UUID（规范 §12.3 字段 2，对端每次启动重新生成），所以取该 UUID 的小写连字符文本，只保证在该成员进程的一次运行内不变，**对端重启后改变**；不用静态公钥派生（旧模式网络没有公钥，且会引入跨会话可关联的标识）。同一次运行内成员第一次出现在快照时就给出最终 `id`，此后不变。客户端不得用成员 `id` 作为需要跨重启保存的设置键（本机设置按网段、虚拟地址保存）。不用每次启动都会变的数字节点号 |
 | `member.state` | `online`、`unreachable` |
 | `connection` | `self`、`direct`、`relay`（`hops` 为中转次数）、`unreachable`；0.4 起另有 `cross_region`、`via_host`、`via_gateway`。`cross_region` 为保留值：区域之间不传递节点信息（规范 §15.6 第 8 条），`members[]` 只列本区域成员，0.4 内核不产生该值；其他地区只以 `subnets[]` 中 `kind = summary` 的汇总网段出现（`path` 止于出口边界节点），其他地区的主机名只经 `names[]` 出现，不进入 `members[]`。客户端遇到该值时按「经边界节点」显示 |
 | `transport` | `tcp`、`udp` |

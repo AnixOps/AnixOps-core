@@ -93,6 +93,14 @@ impl KeyPair {
         Self { secret, public }
     }
 
+    /// From a private key kept elsewhere (the heap slot of
+    /// `MeshSettings`): the copy handed over here is wiped once the
+    /// secret is made. Copies the curve library makes itself cannot be
+    /// wiped from outside.
+    pub fn from_private_ref(private: &[u8; LEN]) -> Self {
+        Self::from_private(*private)
+    }
+
     pub fn generate(rng: &dyn SecureRandom) -> Result<Self, NoiseError> {
         let mut private = Zeroizing::new([0u8; LEN]);
         rng.fill(&mut private[..]).map_err(|_| NoiseError::Random)?;
