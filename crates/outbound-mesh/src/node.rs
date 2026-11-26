@@ -26,7 +26,7 @@
 //! Not here yet: shared nodes (spec §16).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -45,12 +45,12 @@ use crate::route::center::{self, CentreServer, GlobalPeerMap, PeerMap, ReportPee
 use crate::route::messages::{
     FeatureFlags, RoutePeerInfo, SyncRouteRequest, SyncRouteResponse, Uuid,
 };
-use crate::route::sync::{Notice, RouteSync};
+use crate::route::sync::{Failure, Notice, RouteSync};
 use crate::route::topology::{Metric, Route};
 use crate::routes::{self, Denied, PeerId, RouteTable};
 use crate::rpc::packet::{
-    split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
-    ROUTE_SYNC_TIMEOUT_MS,
+    reassembly_timeout_ms, route_sync_timeout_ms, split, Descriptor, RpcError, RpcPacket,
+    RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
 };
 use crate::rpc::reassembly::{Dropped as RpcDropped, Reassembler};
 use crate::secure::handshake::{
@@ -88,6 +88,10 @@ struct Relay {
     due: Option<Instant>,
     queue: VecDeque<(u8, Vec<u8>)>,
 }
+
+/// Largest RPC body this node sends (spec §11.2); larger ones are dropped
+/// and counted.
+pub const MAX_RPC_BODY: usize = 4 * 1024 * 1024;
 
 /// A refusal for a key off the native key list is reported for this long
 /// unless another follows (docs/architecture/mesh-status.md).
@@ -155,10 +159,13 @@ pub struct Counters {
     pub refused_graphs: u64,
     /// Connection rows refused past the stored edge limit (§12.4).
     pub refused_rows: u64,
-    /// Connection graphs sent cut short to fit one request (§12.4).
+    /// Connection graphs sent cut short: past the limits of §12.4, or
+    /// halved for delivery (§12.2).
     pub cut_graphs: u64,
     /// Node information off the native key list (spec §8.3.1 rule 4).
     pub refused_not_native: u64,
+    /// RPC bodies not sent for being over [`MAX_RPC_BODY`].
+    pub oversize_rpc: u64,
     /// RPC calls dropped for a body over 8 MiB (spec §11.2).
     pub oversize_calls: u64,
     /// Route sync sessions closed because a connection graph could not be
@@ -167,18 +174,28 @@ pub struct Counters {
     /// Nodes refused or reachable nodes evicted because the node table is
     /// full (spec §12.3, §12.4).
     pub refused_at_capacity: u64,
+    /// Route sync batches a neighbour answered with an error, or whose call
+    /// failed: closed sessions may come from the link or the neighbour.
+    pub sync_errors: u64,
 }
 
-/// The last oversized synchronisation, for the alert of spec §11.2 and
-/// §12.2: an RPC call received over 8 MiB, or a connection graph that a
-/// neighbour did not take in time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SyncOversize {
-    /// A call from `peer` was dropped at `bytes`, over the 8 MiB limit.
-    Received { peer: u32, bytes: usize },
-    /// The session with the neighbour `peer` was closed: the connection
-    /// graph, even cut by half, was not answered within twice 60 seconds.
-    Undelivered { peer: u32 },
+/// Oversized synchronisations, for the alert of spec §11.2 and §12.2; each
+/// kind keeps its last occurrence while the node runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncOversize {
+    /// A route sync call from the direct neighbour `.0`, over that
+    /// connection, was dropped at `.1` bytes, over the 8 MiB limit.
+    pub received: Option<(u32, usize)>,
+    /// The neighbours whose sessions were closed at the last check that
+    /// closed any: the connection graph, even cut by half, was not
+    /// answered within twice 60 seconds.
+    pub undelivered: Vec<u32>,
+}
+
+impl SyncOversize {
+    pub fn is_empty(&self) -> bool {
+        self.received.is_none() && self.undelivered.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -210,6 +227,8 @@ struct Outgoing {
     peer: u32,
     kind: CallKind,
     deadline: Instant,
+    /// The route sync batch the call carries (0 for other calls).
+    batch: u64,
 }
 
 /// The node's identity in its network: node ID, instance ID and route ID,
@@ -247,6 +266,10 @@ pub struct Node {
     sessions: Sessions,
     sync: RouteSync,
     routes: RouteTable,
+    /// The system routes chosen from `routes`, and how many routable
+    /// subnets did not fit; chosen again whenever `routes` changes.
+    system_routes: Vec<IpNet>,
+    system_routes_truncated: usize,
     /// Networks of this machine's other interfaces, as last reported.
     local_networks: Vec<IpNet>,
     /// Routes other mesh programs carry on this machine (spec §15.4).
@@ -266,7 +289,7 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
-    sync_oversize: Option<SyncOversize>,
+    sync_oversize: SyncOversize,
     /// The last peer refused for a static key off the native key list
     /// (spec §8.3.1 rule 5), and when.
     not_native: Option<(u32, Instant)>,
@@ -535,6 +558,8 @@ impl Node {
                 sync
             },
             routes,
+            system_routes: Vec::new(),
+            system_routes_truncated: 0,
             local_networks: Vec::new(),
             foreign_routes: Vec::new(),
             route_overrides: Vec::new(),
@@ -549,7 +574,7 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
-            sync_oversize: None,
+            sync_oversize: SyncOversize::default(),
             not_native: None,
             renewed_at: None,
             relays: BTreeMap::new(),
@@ -577,6 +602,7 @@ impl Node {
             refused_not_native: refused.not_native,
             graph_timeouts: refused.graph_timeouts,
             refused_at_capacity: refused.at_capacity,
+            sync_errors: refused.error_answers,
             ..self.counters
         }
     }
@@ -683,6 +709,7 @@ impl Node {
             .collect();
         self.routes
             .set_local_networks(&networks, &self.route_overrides);
+        self.choose_system_routes();
     }
 
     /// Subnets the user routes through the mesh although they overlap a
@@ -701,18 +728,45 @@ impl Node {
     }
 
     /// Subnets to route into the virtual interface: accepted and routed,
-    /// limited to `routing.system_routes` when it is set.
-    /// At most [`MAX_SYSTEM_ROUTES`], in the table's stable order, so that
-    /// the members cannot fill the system routing table.
+    /// limited to `routing.system_routes` when it is set, at most
+    /// [`MAX_SYSTEM_ROUTES`] in address order. When more are routable,
+    /// members share the room fairly, nearer members first (see
+    /// [`fair_share`]), so that no member can push out the routes of the
+    /// others by advertising many subnets.
     pub fn system_routes(&self) -> Vec<IpNet> {
-        let routes = self.routes.system_routes().into_iter();
-        match &self.settings.system_routes {
-            None => routes.take(MAX_SYSTEM_ROUTES).collect(),
-            Some(allowed) => routes
-                .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
-                .take(MAX_SYSTEM_ROUTES)
-                .collect(),
-        }
+        self.system_routes.clone()
+    }
+
+    /// Routable subnets left out of [`Node::system_routes`] for want of
+    /// room; more than zero raises `system_routes_truncated`.
+    pub fn system_routes_truncated(&self) -> usize {
+        self.system_routes_truncated
+    }
+
+    fn choose_system_routes(&mut self) {
+        let hops = self.compute_routes(Metric::Hops);
+        let mut by_peer: Vec<(PeerId, Vec<IpNet>)> =
+            self.routes.system_routes_by_peer().into_iter().collect();
+        by_peer.sort_by_key(|(peer, _)| {
+            (
+                hops.get(&peer.0).map_or(u32::MAX, |route| route.hops),
+                peer.0,
+            )
+        });
+        let allowed = self.settings.system_routes.as_deref();
+        let lists = by_peer
+            .into_iter()
+            .map(|(_, subnets)| match allowed {
+                None => subnets,
+                Some(allowed) => subnets
+                    .into_iter()
+                    .filter(|subnet| allowed.iter().any(|allowed| allowed.covers(subnet)))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let (chosen, truncated) = fair_share(&lists, MAX_SYSTEM_ROUTES);
+        self.system_routes = chosen;
+        self.system_routes_truncated = truncated;
     }
 
     pub fn route_sync(&self) -> &RouteSync {
@@ -728,8 +782,8 @@ impl Node {
 
     /// The last oversized synchronisation; kept while the node runs, so an
     /// operator sizing a network sees it (spec §11.2, §12.2).
-    pub fn sync_oversize(&self) -> Option<SyncOversize> {
-        self.sync_oversize
+    pub fn sync_oversize(&self) -> &SyncOversize {
+        &self.sync_oversize
     }
 
     /// The last peer refused because its static key is off the native key
@@ -1226,6 +1280,20 @@ impl Node {
         self.settings.role == Role::Full && self.settings.relay
     }
 
+    /// Whether this node serves as a waypoint (spec §17.2.4): it relays
+    /// and `node.waypoint_relay` is on.
+    fn relays_waypoints(&self) -> bool {
+        self.relays_for_others() && self.settings.waypoint_relay
+    }
+
+    /// Whether custom paths are on for this network (spec §17.2.4): this
+    /// node has paths of its own or serves as a waypoint. Otherwise it
+    /// answers `MeshPathRpc` like an implementation without the service
+    /// (Error 3) and drops every type-40 packet, counted.
+    fn paths_on(&self) -> bool {
+        self.settings.waypoint_relay || !self.paths.paths().is_empty()
+    }
+
     /// Whether this network's packets are encrypted. Without encryption no
     /// inner packet can be (spec §17.2.5 rule 3), so there is no
     /// encapsulation at all (spec §17.2.1 rule 6).
@@ -1236,7 +1304,7 @@ impl Node {
     /// This node's `MeshPathRpc.Capabilities` answer (spec §17.2.4):
     /// version 0 in a network without encryption, `relay` as configured.
     fn capabilities(&self) -> Capabilities {
-        let mut caps = Capabilities::local(self.relays_for_others());
+        let mut caps = Capabilities::local(self.relays_waypoints());
         if !self.encrypted() {
             caps.version = 0;
             caps.max_waypoints = 0;
@@ -1390,6 +1458,10 @@ impl Node {
         rng: &dyn SecureRandom,
         now: Instant,
     ) {
+        if !self.paths_on() {
+            self.paths.count_dropped();
+            return;
+        }
         let Some(decoded) = waypoint::decode(payload) else {
             self.paths.count_dropped();
             return;
@@ -1397,7 +1469,7 @@ impl Node {
         let from = header.from;
         match decoded {
             Payload::Transit(transit) => {
-                let relays = self.relays_for_others();
+                let relays = self.relays_waypoints();
                 let outer = Outer {
                     from,
                     forward_counter: header.forward_counter,
@@ -1581,6 +1653,10 @@ impl Node {
         body: &[u8],
         now: Instant,
     ) {
+        if body.len() > MAX_RPC_BODY {
+            self.counters.oversize_rpc += 1;
+            return;
+        }
         for piece in split(self.local.id, to, transaction, descriptor, is_request, body) {
             let kind = if is_request {
                 packet_type::RPC_REQ
@@ -1593,9 +1669,15 @@ impl Node {
         }
     }
 
-    fn call(&mut self, to: u32, kind: CallKind, request: Vec<u8>, now: Instant) {
+    /// Sends a call; returns its transaction.
+    fn call(&mut self, to: u32, kind: CallKind, request: Vec<u8>, now: Instant) -> i64 {
         let (service, method, timeout_ms) = match kind {
-            CallKind::SyncRoute => (ROUTE_SERVICE, METHOD_SYNC_ROUTE_INFO, ROUTE_SYNC_TIMEOUT_MS),
+            // 3 s plus 2 s per MiB of the request, at most 15 s (spec §11).
+            CallKind::SyncRoute => (
+                ROUTE_SERVICE,
+                METHOD_SYNC_ROUTE_INFO,
+                route_sync_timeout_ms(request.len()),
+            ),
             CallKind::ReportPeers => (
                 center::SERVICE,
                 center::METHOD_REPORT_PEERS,
@@ -1625,9 +1707,11 @@ impl Node {
                 peer: to,
                 kind,
                 deadline: now + Duration::from_millis(u64::from(timeout_ms)),
+                batch: 0,
             },
         );
         self.send_rpc(to, transaction, &descriptor, true, &body, now);
+        transaction
     }
 
     /// One RPC piece from `from` (the packet header) that arrived over a
@@ -1644,14 +1728,32 @@ impl Node {
             self.counters.dropped += 1;
             return;
         };
-        let timeout = Duration::from_millis(u64::from(DEFAULT_TIMEOUT_MS));
+        // A request's own timeout is read only once it is whole, so its
+        // reassembly is bounded by what a route sync of its size may take,
+        // at least the default and at most 15 s (spec §11).
+        let timeout_ms = if piece.is_request {
+            reassembly_timeout_ms(piece.total_pieces)
+        } else {
+            DEFAULT_TIMEOUT_MS
+        };
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        // The alert counts only route synchronisation from the neighbour
+        // the connection authenticated, so that no member can raise it, or
+        // skew a size measurement, under another node's ID.
+        let route_sync = from == neighbour
+            && piece.descriptor.as_ref().is_some_and(|descriptor| {
+                descriptor.service == ROUTE_SERVICE
+                    && descriptor.method_index == METHOD_SYNC_ROUTE_INFO
+            });
         let call = match self.reassembler.push(from, piece, timeout, now) {
             Ok(Some(call)) => call,
             Ok(None) => return,
             Err(RpcDropped::CallTooLarge(bytes)) => {
                 self.counters.dropped += 1;
                 self.counters.oversize_calls += 1;
-                self.sync_oversize = Some(SyncOversize::Received { peer: from, bytes });
+                if route_sync {
+                    self.sync_oversize.received = Some((from, bytes));
+                }
                 return;
             }
             Err(_) => {
@@ -1719,6 +1821,7 @@ impl Node {
                 Ok(self.centre.get(digest).encode())
             }
             (center::SERVICE, _) => Err(RpcError::InvalidMethod),
+            (waypoint::RPC_SERVICE, _) if !self.paths_on() => Err(RpcError::InvalidService),
             (waypoint::RPC_SERVICE, waypoint::RPC_CAPABILITIES) => Ok(self.capabilities().encode()),
             (waypoint::RPC_SERVICE, _) => Err(RpcError::InvalidMethod),
             _ => Err(RpcError::InvalidService),
@@ -1753,9 +1856,12 @@ impl Node {
         let result = RpcResponse::decode(body).ok().and_then(|r| r.result.ok());
         match outgoing.kind {
             CallKind::SyncRoute => {
-                let response = result.and_then(|bytes| SyncRouteResponse::decode(&bytes).ok());
+                let response = result
+                    .and_then(|bytes| SyncRouteResponse::decode(&bytes).ok())
+                    .ok_or(Failure::Error);
                 if let Ok(Some(Notice::DuplicatePeerId)) =
-                    self.sync.on_response(from, response, rng, now)
+                    self.sync
+                        .on_response(from, outgoing.batch, response, rng, now)
                 {
                     self.id_conflict(rng, now);
                 }
@@ -1817,6 +1923,7 @@ impl Node {
         for peer in stale {
             self.routes.remove_peer(peer);
         }
+        self.choose_system_routes();
     }
 
     /// Timers: keep-alive, handshake timeouts, route synchronisation, the
@@ -1826,11 +1933,16 @@ impl Node {
         self.keep_alive(now);
         self.expire_calls(rng, now);
 
-        for (peer, request) in self.sync.poll(now, unix_now) {
-            self.call(peer, CallKind::SyncRoute, request.encode(), now);
+        for batch in self.sync.poll(now, unix_now) {
+            let transaction =
+                self.call(batch.peer, CallKind::SyncRoute, batch.request.encode(), now);
+            if let Some(call) = self.calls.get_mut(&transaction) {
+                call.batch = batch.id;
+            }
         }
-        if let Some(peer) = self.sync.take_graph_timeout() {
-            self.sync_oversize = Some(SyncOversize::Undelivered { peer });
+        let closed = self.sync.take_graph_timeouts();
+        if !closed.is_empty() {
+            self.sync_oversize.undelivered = closed;
         }
         // Rule 1 of spec §12.3, or this node's version ran out.
         if self.sync.take_conflict() {
@@ -1938,18 +2050,41 @@ impl Node {
     /// otherwise the announced one, which a managed network takes only
     /// from its native key list.
     fn expected_key(&self, peer: u32) -> Option<[u8; LEN]> {
-        for namespace in [Namespace::Direct, Namespace::Relay] {
-            let key = SessionKey {
-                namespace,
-                network: self.local.network_name.clone(),
-                peer_id: peer,
-            };
-            if let Some(session) = self.sessions.get(&key) {
-                return Some(session.peer_static());
-            }
+        self.bound_key(peer).or_else(|| {
+            self.peer_static(peer)
+                .filter(|announced| self.settings.admits(announced))
+        })
+    }
+
+    /// The static key a handshake bound to `peer`'s node ID: while it has
+    /// a session, direct or relayed, and shortly after (spec §12.3).
+    fn bound_key(&self, peer: u32) -> Option<[u8; LEN]> {
+        [Namespace::Direct, Namespace::Relay]
+            .into_iter()
+            .find_map(|namespace| {
+                self.sessions.bound_static(&SessionKey {
+                    namespace,
+                    network: self.local.network_name.clone(),
+                    peer_id: peer,
+                })
+            })
+    }
+
+    /// Members whose route information announces another static key than
+    /// the one bound to their node ID: the announcement is not used
+    /// (spec §12.3, alert 「节点公钥变更被拒」).
+    pub fn refused_key_changes(&self) -> Vec<u32> {
+        if self.settings.security != SecurityMode::ForwardSecrecy {
+            return Vec::new();
         }
-        self.peer_static(peer)
-            .filter(|announced| self.settings.admits(announced))
+        self.sync
+            .infos()
+            .filter_map(|info| {
+                let announced = <[u8; LEN]>::try_from(&info.noise_pubkey[..]).ok()?;
+                let bound = self.bound_key(info.peer_id)?;
+                (announced != bound).then_some(info.peer_id)
+            })
+            .collect()
     }
 
     /// Sends what waited for the relay session with `peer`.
@@ -2104,7 +2239,13 @@ impl Node {
             if let Some(call) = self.calls.remove(&transaction) {
                 match call.kind {
                     CallKind::SyncRoute => {
-                        let _ = self.sync.on_response(call.peer, None, rng, now);
+                        let _ = self.sync.on_response(
+                            call.peer,
+                            call.batch,
+                            Err(Failure::Timeout),
+                            rng,
+                            now,
+                        );
                     }
                     CallKind::PathCaps => self.paths.answered(call.peer, Answer::Failed, now),
                     CallKind::ReportPeers | CallKind::GetPeerMap => {}
@@ -2183,6 +2324,41 @@ impl Node {
     }
 }
 
+/// Takes at most `limit` distinct subnets from `lists`, one list per
+/// member with the nearest first, a round at a time: one subnet from each
+/// list per round, so every member gets an equal share of the room and a
+/// member with fewer subnets leaves the rest to the others (max-min
+/// fairness). A subnet several members route counts once, for the first.
+/// Returns the subnets in address order and how many did not fit.
+fn fair_share(lists: &[Vec<IpNet>], limit: usize) -> (Vec<IpNet>, usize) {
+    let mut chosen = Vec::new();
+    let mut taken = HashSet::new();
+    let mut cursors = vec![0usize; lists.len()];
+    'rounds: loop {
+        let mut progressed = false;
+        for (list, cursor) in lists.iter().zip(cursors.iter_mut()) {
+            if chosen.len() >= limit {
+                break 'rounds;
+            }
+            while let Some(subnet) = list.get(*cursor) {
+                *cursor += 1;
+                if taken.insert(*subnet) {
+                    chosen.push(*subnet);
+                    progressed = true;
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let candidates: HashSet<IpNet> = lists.iter().flatten().copied().collect();
+    let truncated = candidates.len() - chosen.len();
+    chosen.sort_by_key(|subnet| (subnet.network(), subnet.prefix()));
+    (chosen, truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2199,7 +2375,7 @@ mod tests {
         let config = serde_json::json!({
             "config_version": 1,
             "network": network,
-            "node": {"address": address, "role": "full"},
+            "node": {"address": address, "role": "full", "waypoint_relay": true},
             "peers": [{"server": "peer.example", "port": 40000}],
         });
         let config: MeshConfig = serde_json::from_value(config).expect("config parses");
@@ -2467,6 +2643,84 @@ mod tests {
         custom_path_carries_data(true);
     }
 
+    /// A node with no paths of its own and `waypoint_relay` off: the
+    /// default until custom paths are released (spec §17.2.4).
+    fn square_with_node_3_off(secure: bool) -> Net {
+        let addresses = [
+            "10.144.0.1/24",
+            "10.144.0.2/24",
+            "10.144.0.3/24",
+            "10.144.0.4/24",
+        ];
+        let mut all: Vec<MeshSettings> = addresses
+            .iter()
+            .map(|address| settings(address, secure))
+            .collect();
+        all[3].waypoint_relay = false;
+        let mut net = Net::with(all);
+        net.link(0, 1);
+        net.link(1, 2);
+        net.link(0, 3);
+        net.link(3, 2);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net
+    }
+
+    fn paths_off_by_default(secure: bool) {
+        let mut net = square_with_node_3_off(secure);
+        path_through_node_3(&mut net);
+        // Node 3 answers like an implementation without the service.
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[0].paths.capability(103),
+            crate::waypoint::Capability::Unsupported
+        );
+        for _ in 0..12 {
+            net.tick(Duration::from_secs(1));
+        }
+        // Never encapsulated: at most the first-hop policy (spec §17.2.3).
+        assert_ne!(net.nodes[0].path_status(net.now)[0].state, "active");
+
+        // A type-40 packet for node 3 is dropped and counted, not relayed.
+        let dropped = net.nodes[3].path_counters().dropped;
+        let relayed = net.nodes[3].counters().relayed;
+        let transit = waypoint::encode_transit(
+            100,
+            102,
+            &[],
+            waypoint::Body::Data(&ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3])),
+        );
+        let now = net.now;
+        assert!(net.nodes[0].originate(103, packet_type::WAYPOINT, &transit, now));
+        net.delivered.clear();
+        net.settle();
+        assert_eq!(net.nodes[3].path_counters().dropped, dropped + 1);
+        assert_eq!(net.nodes[3].counters().relayed, relayed);
+        assert!(net.delivered.is_empty());
+        // Dropped before it is read: a waypoint would have asked about the
+        // packet's origin (spec §17.2.5 rule 6) and learnt its answer.
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[3].paths.capability(100),
+            crate::waypoint::Capability::Pending
+        );
+        assert_eq!(net.nodes[3].path_counters().dropped_queries, 0);
+    }
+
+    #[test]
+    fn a_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(false);
+    }
+
+    #[test]
+    fn a_secure_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(true);
+    }
+
     #[test]
     fn a_waypoint_that_drops_type_40_is_found_by_probes() {
         let mut net = square(false);
@@ -2703,6 +2957,53 @@ mod tests {
     }
 
     #[test]
+    fn an_announced_key_change_of_a_bound_node_is_refused_and_reported() {
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.link(0, 1);
+        net.settle();
+        net.tick(Duration::from_secs(1));
+        let bound = net.nodes[1].static_public();
+        assert_eq!(net.nodes[0].expected_key(101), Some(bound));
+        assert!(net.nodes[0].refused_key_changes().is_empty());
+        // Node 1's information now announces another key.
+        let mut changed = net.nodes[0].route_sync().info(101).unwrap().clone();
+        changed.version += 1;
+        changed.noise_pubkey = vec![9; LEN];
+        let request = SyncRouteRequest {
+            my_peer_id: 101,
+            my_session_id: 1,
+            peer_infos: vec![changed],
+            ..SyncRouteRequest::default()
+        };
+        let now = net.now;
+        // Even a listed key does not replace the binding.
+        let mut listed = net.nodes[0].settings.native_keys.clone().unwrap();
+        listed.push([9; LEN]);
+        net.nodes[0].set_native_keys(Some(listed), now);
+        net.nodes[0].sync.on_request(101, request, now);
+        assert_eq!(
+            net.nodes[0].route_sync().info(101).unwrap().noise_pubkey,
+            vec![9; LEN]
+        );
+        assert_eq!(net.nodes[0].expected_key(101), Some(bound));
+        assert_eq!(net.nodes[0].refused_key_changes(), vec![101]);
+    }
+
+    #[test]
+    fn an_rpc_body_over_four_mebibytes_is_not_sent() {
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.link(0, 1);
+        net.settle();
+        let now = net.now;
+        let node = &mut net.nodes[0];
+        while node.poll_action().is_some() {}
+        let descriptor = node.descriptor(ROUTE_SERVICE, METHOD_SYNC_ROUTE_INFO);
+        node.send_rpc(101, 1, &descriptor, true, &vec![0; MAX_RPC_BODY + 1], now);
+        assert_eq!(node.counters().oversize_rpc, 1);
+        assert!(node.poll_action().is_none());
+    }
+
+    #[test]
     fn a_taken_id_is_replaced_at_most_once_in_ten_minutes() {
         let mut net = three_in_a_row(false);
         let old = net.nodes[0].id();
@@ -2896,6 +3197,39 @@ mod tests {
             net.nodes[0].send_ip(&packet, net.now).unwrap();
         }
         assert_eq!(net.nodes[0].send_ip(&packet, net.now), Err(Denied::NoRoute));
+    }
+
+    #[test]
+    fn members_share_the_system_routes_fairly() {
+        let net = |i: u32| IpNet::parse(&format!("10.{}.{}.0/24", i / 256, i % 256)).unwrap();
+        let near: Vec<IpNet> = (0..10).map(net).collect();
+        let few: Vec<IpNet> = (100..102).map(net).collect();
+        let one = vec![net(200)];
+        let (chosen, truncated) = fair_share(&[near.clone(), few.clone(), one.clone()], 10);
+        assert_eq!(chosen.len(), 10);
+        assert_eq!(truncated, 3);
+        // The members with few subnets keep all of theirs; the rest of the
+        // room goes to the one with many.
+        assert!(few.iter().chain(&one).all(|subnet| chosen.contains(subnet)));
+        assert_eq!(near.iter().filter(|s| chosen.contains(s)).count(), 7);
+        // In address order, not text order.
+        let mut sorted = chosen.clone();
+        sorted.sort_by_key(|subnet| (subnet.network(), subnet.prefix()));
+        assert_eq!(chosen, sorted);
+
+        // A flood from one member cannot push out another's routes.
+        let flood: Vec<IpNet> = (0..MAX_SYSTEM_ROUTES as u32 * 2).map(net).collect();
+        let real = vec![IpNet::parse("192.168.50.0/24").unwrap()];
+        let (chosen, truncated) = fair_share(&[flood, real.clone()], MAX_SYSTEM_ROUTES);
+        assert!(chosen.contains(&real[0]));
+        assert_eq!(chosen.len(), MAX_SYSTEM_ROUTES);
+        assert_eq!(truncated, MAX_SYSTEM_ROUTES + 1);
+
+        // A subnet two members route counts once.
+        let (chosen, truncated) = fair_share(&[vec![net(1), net(2)], vec![net(1)]], 10);
+        assert_eq!(chosen, [net(1), net(2)]);
+        assert_eq!(truncated, 0);
+        assert_eq!(fair_share(&[], 10), (Vec::new(), 0));
     }
 
     #[test]

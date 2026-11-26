@@ -4,14 +4,24 @@
 
 ## Unreleased
 
+### Mesh
+
+- 新增组网端到端实验床（`docs/mesh-e2e.md`、`.github/scripts/mesh-e2e/`、工作流 `mesh-e2e.yml`）：每台机器一个网络命名空间，运行本仓库构建的 `anixops-mesh run`，场景按需求编号登记；12 个场景启用，0.4、0.5 的 11 个场景待对应功能合并后启用。内核 0.4 起 RC 必须该工作流全绿。
+- `anixops-mesh run` 失败时 stderr 最后一行改为符合设计文档的退出约定：启动冲突为 `{"error":"conflict","conflict":"port_in_use"|"tun_in_use","detail"}`（此前为 `{"error":"busy"}`、无冲突代码），其他运行错误为 `"error":"runtime"`（此前为 `"run"`）。退出码不变（2、3、1）。端到端场景 E10 发现。
+
 ### Release process
 
 - 发布策略加入版本节奏、候选版（RC）流程、维护分支 `release/X.Y` 与补丁维护规则（`docs/release-strategy.md`），新增兼容性承诺清单（`docs/compatibility-surface.md`）。
 - 发布工作流新增 “Release version preconditions”（`.github/scripts/release-version-check.sh`）：手动验证与标签发布都要求 `Cargo.toml` workspace 版本等于发布版本、`CHANGELOG.md` 有该版本小节；自测在 CI `policy-fast` 中运行。
 - CI 对 `release/MAJOR.MINOR` 的 push 运行；`release-policy` 与 `release-ci-gate` 接受 `main` 或与版本同一 `MAJOR.MINOR` 的维护分支，其他分支仍拒绝。
 
+### Added
+
+- 组网外部网络桥接（规范 §15.12，需求 R36，内核 0.4）新增独立 crate `mesh-bridge`：`external_bridge { interface, routes, allow }` 的配置校验（单个地址可在 100.64.0.0/10 与 fd7a:115c:a1e0::/48 内，网段须在白名单内且不与这两个范围重叠，拒绝默认路由、主机位非零、名单与通告重叠，各原因码见 `docs/architecture/mesh-bridge.md`）；每个组网网卡一张 nftables 表、整表原子替换：只放行名单内来源到通告地址并做源地址转换，外部网络进来的新连接与名单外来源丢弃并计数；IPv4 转发按需打开并在最后一个桥接拆除后恢复，IPv6 转发只告警不修改；`externalBridge` 状态摘要（`docs/architecture/mesh-status.md` 共用测试向量）只在规则全部装好后更新。CI 新增作业「Mesh external bridge (nftables)」在网络命名空间中用真实 nftables 验证。已接入组网配置与节点程序：`external_bridge` 为每个网络的顶层可选字段（只接受 Linux 完整节点），`routes` 并入本节点的子网通告；节点程序先取主机级锁 `/run/anixops-mesh-host.lock`、探测 nftables 并清除上次运行残留的桥接表，都成功后才声明能力 `mesh_external_bridge`；网络启动后安装桥接、停止时拆除，只改 `allow` 时不重启网络；`GET /v1/mesh` 每个网络给出 `externalBridge`（对象、`null` 或省略），另有节点级 `alerts`（取不到锁时为 `external_bridge_lock_held`）。启动与退出清理、名单收窄时删除经桥接源地址转换的连接跟踪条目。
+
 ### Security
 
+- 组网自定义路径（规范 §17.2，内核 0.5，尚未审计）在默认配置下对远端不可达：新增 `node.waypoint_relay`（默认 `false`，需要 `node.relay`）。为 `false` 且网络没有 `routing.paths` 时，节点对 `MeshPathRpc` 回 Error 3，丢弃全部类型 40 包并计数；只有打开该开关的节点才作为途经点（`Capabilities.relay`）。
 - anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。
 
 - anixops-mesh 接管按 #329 复审修复（mesh-node `detect`、`takeover`、`host`、`winsvc`、`launchd`，三个安装脚本）：K1 数据来源按所运行的系统选择，Windows 上不再读取 `/proc`、`/etc`、`/var/spool/cron`、`/run/systemd`（在 Windows 上是任何用户可建的 `C:\proc` 等目录，可伪造进程、自启行与导入配置）；K2 Windows 安装脚本对 `%ProgramData%\AnixOps`、`Mesh`、`state` 逐级拒绝链接与非管理员属主，属主设为 Administrators 并整体替换访问列表，程序在 Windows 上读写状态与锁之前逐级检查目录属主、访问列表与联接；K3 macOS 程序改放 `/Library/AnixOps/mesh/bin`；K4 Windows 记录手动进程的 SID，回滚账户不同时不启动；K5 包装服务与 K6 launchd 任务按进程树认领进程；K7 缺少延迟启动标志时从注册表读取；K8 安装脚本区分退出码 1 与 7、文档修正、补 `save record` 测试与 Windows 状态目录的实机测试。

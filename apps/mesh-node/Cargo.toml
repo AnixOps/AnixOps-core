@@ -24,6 +24,8 @@ libc = "0.2"
 # `run`: system randomness for the node identity (already used by the mesh
 # module), and the TUN interface, signals and the driver's runtime.
 ring = "0.17"
+# External network bridges of managed networks (spec §15.12).
+mesh-bridge = { path = "../../crates/mesh-bridge" }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "signal", "io-util"] }
 # `enroll`, `device`, `subnet-request`: HTTPS to Control, verified against
 # the built-in public roots (a static binary has no system store) or the

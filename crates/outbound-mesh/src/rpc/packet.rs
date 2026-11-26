@@ -9,8 +9,28 @@ pub const PIECE_BODY: usize = 1000;
 pub const MAX_PIECES: u32 = 32768;
 /// Default timeout of a call, and of reassembly (spec §11.5).
 pub const DEFAULT_TIMEOUT_MS: u32 = 5000;
-/// Timeout of route synchronisation (spec §11.5).
+/// Timeout of an empty route synchronisation (spec §11.5); larger ones get
+/// more, see [`route_sync_timeout_ms`].
 pub const ROUTE_SYNC_TIMEOUT_MS: u32 = 3000;
+/// Longest timeout of any call, and of reassembly (spec §11.5).
+pub const MAX_TIMEOUT_MS: u32 = 15_000;
+
+/// Timeout of a route synchronisation request of `bytes` encoded bytes,
+/// written into its `timeout_ms` (spec §11.5): 3 s plus 2 s per MiB, pro
+/// rata, at most 15 s.
+pub fn route_sync_timeout_ms(bytes: usize) -> u32 {
+    let extra = (bytes as u64).saturating_mul(2000) / (1024 * 1024);
+    (u64::from(ROUTE_SYNC_TIMEOUT_MS) + extra).min(u64::from(MAX_TIMEOUT_MS)) as u32
+}
+
+/// Reassembly timeout of a request of `total_pieces` pieces (spec §11.5).
+/// The request's own `timeout_ms` is known only once it is whole, so the
+/// receiver bounds the wait by what a route synchronisation of that size
+/// is given: at least [`DEFAULT_TIMEOUT_MS`], at most [`MAX_TIMEOUT_MS`].
+pub fn reassembly_timeout_ms(total_pieces: u32) -> u32 {
+    route_sync_timeout_ms((total_pieces as usize).saturating_mul(PIECE_BODY))
+        .max(DEFAULT_TIMEOUT_MS)
+}
 
 /// Compression algorithms (spec §11.3).
 pub mod compression {
@@ -433,5 +453,24 @@ mod tests {
             };
             assert_eq!(RpcResponse::decode(&response.encode()).unwrap(), response);
         }
+    }
+
+    #[test]
+    fn route_sync_timeouts_grow_with_size_up_to_fifteen_seconds() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(route_sync_timeout_ms(0), 3000);
+        assert_eq!(route_sync_timeout_ms(MIB / 2), 4000);
+        assert_eq!(route_sync_timeout_ms(MIB), 5000);
+        assert_eq!(route_sync_timeout_ms(4 * MIB), 11_000);
+        assert_eq!(route_sync_timeout_ms(6 * MIB), 15_000);
+        assert_eq!(route_sync_timeout_ms(usize::MAX), MAX_TIMEOUT_MS);
+        // Reassembly: never under the default, never over the top.
+        assert_eq!(reassembly_timeout_ms(1), DEFAULT_TIMEOUT_MS);
+        assert_eq!(
+            reassembly_timeout_ms(2098),
+            route_sync_timeout_ms(2_098_000)
+        );
+        assert!(reassembly_timeout_ms(2098) > DEFAULT_TIMEOUT_MS);
+        assert_eq!(reassembly_timeout_ms(MAX_PIECES), MAX_TIMEOUT_MS);
     }
 }
