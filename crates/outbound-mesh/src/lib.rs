@@ -34,6 +34,9 @@
 //!   the embedded engine, on a private TCP/IP stack per network.
 //! - [`node`]: one node of one network without I/O: connections,
 //!   keep-alive, RPC, route synchronisation, forwarding and traffic checks.
+//! - [`dns`]: intranet names (requirement R28): the `dns` section, the name
+//!   list and the answers, including the resolver address on the virtual
+//!   interface.
 //! - [`paths`]: custom paths at run time: capability queries, path states,
 //!   probes and the rate limits of a waypoint.
 //! - [`waypoint`]: custom paths: path matching, the path state and the
@@ -45,6 +48,7 @@
 pub mod backbone;
 pub mod bridge;
 pub mod config;
+pub mod dns;
 #[cfg(feature = "runtime")]
 pub mod driver;
 pub mod legacy;

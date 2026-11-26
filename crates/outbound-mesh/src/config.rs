@@ -34,6 +34,7 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::bridge::{ExternalBridge, ExternalBridgeConfig};
+use crate::dns::{DnsConfig, DnsSettings};
 use crate::net::IpNet;
 use crate::scope::is_intranet_network;
 
@@ -76,6 +77,9 @@ pub struct MeshConfig {
     pub subnets: SubnetsConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// Intranet names (requirement R28, spec §15.9.2); absent: off.
+    #[serde(default)]
+    pub dns: Option<DnsConfig>,
     /// The external network bridge (spec §15.12): Linux full nodes only.
     #[serde(default)]
     pub external_bridge: Option<ExternalBridgeConfig>,
@@ -497,6 +501,8 @@ pub struct MeshSettings {
     pub native_keys: Option<Vec<[u8; 32]>>,
     /// Decoded `node.private_key`, wiped when dropped.
     pub private_key: Option<Zeroizing<[u8; 32]>>,
+    /// The `dns` section; names are off without one.
+    pub dns: DnsSettings,
     /// Host groups of the network (spec §15.7).
     pub host_groups: Vec<HostGroup>,
     /// This device's instance ID, set by the node program that runs the
@@ -536,6 +542,7 @@ impl PartialEq for MeshSettings {
             paths,
             native_keys,
             private_key,
+            dns,
             external_bridge,
             host_groups,
             instance_id,
@@ -562,6 +569,7 @@ impl PartialEq for MeshSettings {
             && *paths == other.paths
             && *native_keys == other.native_keys
             && *private_key == other.private_key
+            && *dns == other.dns
             && *external_bridge == other.external_bridge
             && *host_groups == other.host_groups
             && *instance_id == other.instance_id
@@ -853,6 +861,13 @@ impl MeshConfig {
             }
         };
 
+        let mut virtual_subnets = vec![address.trunc()];
+        virtual_subnets.extend(address_v6.map(|address| address.trunc()));
+        let dns = match self.dns {
+            None => DnsSettings::default(),
+            Some(dns) => dns.validate(&virtual_subnets)?,
+        };
+
         let mut settings = MeshSettings {
             network_name: network.name,
             network_secret: network.secret,
@@ -879,6 +894,7 @@ impl MeshConfig {
             paths: Vec::new(),
             native_keys,
             private_key,
+            dns,
             host_groups: Vec::new(),
             instance_id: None,
             external_bridge,

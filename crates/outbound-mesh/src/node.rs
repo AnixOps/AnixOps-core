@@ -28,6 +28,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ring::error::Unspecified;
@@ -36,6 +37,8 @@ use ring::rand::SecureRandom;
 use crate::config::{
     CustomPath, GatewayRole, HostGroup, MeshSettings, NetworkKind, Role, RoutePolicy, SecurityMode,
 };
+use crate::dns::intercept::Interceptor;
+use crate::dns::{DnsSettings, MemberNames, Names, NetworkView};
 use crate::legacy::keys::digest;
 use crate::legacy::LegacyCipher;
 use crate::link::{self, CloseReason, Crypto, Dropped, Handshaking, Link, Step, Up};
@@ -311,6 +314,11 @@ pub struct Node {
     renewed_at: Option<Instant>,
     /// Relay sessions being set up, by destination (secure mode only).
     relays: BTreeMap<u32, Relay>,
+    /// The intranet name list (requirement R28), built again when the
+    /// members or the `dns` settings change.
+    names: Arc<Names>,
+    /// Answers the resolver address on the virtual interface.
+    resolver: Interceptor,
     /// What this node advertises now in field 5 (spec §15.2, §15.7).
     advertising: Vec<IpNet>,
     /// Host group ranges this node advertises as the standby gateway
@@ -587,6 +595,24 @@ impl Node {
             native_keys: admitted_keys(&settings),
         };
         let routes = RouteTable::new(&settings);
+        let mut seed = [0u8; 8];
+        rng.fill(&mut seed)?;
+        let resolver = Interceptor::new(u64::from_le_bytes(seed), settings.mtu);
+        let host_groups: Vec<IpNet> = settings
+            .host_groups
+            .iter()
+            .map(|group| group.cidr)
+            .collect();
+        let names = Arc::new(Names::build(
+            &settings.dns,
+            &NetworkView {
+                virtual_subnets: &settings.virtual_subnets(),
+                host_groups: &host_groups,
+                local_addresses: &settings.local_addresses(),
+                own_hostname: settings.hostname.as_deref(),
+                members: &[],
+            },
+        ));
         // Without encryption no inner packet can be (spec §17.2.5 rule 3).
         let encrypted = settings.security == SecurityMode::ForwardSecrecy || legacy.is_some();
         let paths = PathRuntime::new(settings.paths.clone(), encrypted, now);
@@ -620,6 +646,8 @@ impl Node {
             not_native: None,
             renewed_at: None,
             relays: BTreeMap::new(),
+            names,
+            resolver,
             advertising: advertise,
             standing_in: Vec::new(),
             neighbours_since: None,
@@ -665,6 +693,55 @@ impl Node {
 
     pub fn route_table(&self) -> &RouteTable {
         &self.routes
+    }
+
+    /// The intranet name list as of the last [`tick`](Self::tick): what
+    /// the engine's split DNS answers from, and what the status shows.
+    pub fn names(&self) -> &Arc<Names> {
+        &self.names
+    }
+
+    /// Replaces the `dns` settings while the node runs: the panel names a
+    /// new member, or the resolver address changes. Nothing else restarts.
+    pub fn set_dns(&mut self, dns: DnsSettings) {
+        self.settings.dns = dns;
+        self.refresh_names();
+    }
+
+    /// Builds the name list again from the settings and the reachable
+    /// members' route information; keeps the old one when nothing changed.
+    fn refresh_names(&mut self) {
+        let members: Vec<MemberNames> = self
+            .paths()
+            .into_keys()
+            .filter_map(|peer| {
+                let view = self.routes.peer(PeerId(peer))?;
+                Some(MemberNames {
+                    hostname: self.sync.info(peer).and_then(|info| info.hostname.clone()),
+                    addresses: view.addresses.to_vec(),
+                    subnets: view.subnets.to_vec(),
+                })
+            })
+            .collect();
+        let host_groups: Vec<IpNet> = self
+            .settings
+            .host_groups
+            .iter()
+            .map(|group| group.cidr)
+            .collect();
+        let names = Names::build(
+            &self.settings.dns,
+            &NetworkView {
+                virtual_subnets: &self.settings.virtual_subnets(),
+                host_groups: &host_groups,
+                local_addresses: &self.settings.local_addresses(),
+                own_hostname: self.settings.hostname.as_deref(),
+                members: &members,
+            },
+        );
+        if *self.names != names {
+            self.names = Arc::new(names);
+        }
     }
 
     /// Replaces the native key list of a managed network while it runs
@@ -731,6 +808,7 @@ impl Node {
         self.standing_in.retain(|cidr| backups.contains(cidr));
         self.update_advertising(now);
         self.refresh_routes_now();
+        self.refresh_names();
     }
 
     /// What this node advertises now (field 5).
@@ -1502,6 +1580,13 @@ impl Node {
     /// A broadcast or multicast goes to every direct neighbour, addressed
     /// to each of them, and is not relayed further (spec §15.3).
     pub fn send_ip(&mut self, packet: &[u8], now: Instant) -> Result<(), Denied> {
+        // Queries to the network's resolver address are answered here and
+        // never routed (spec §15.9.2 item 8).
+        if let Some(replies) = self.resolver.handle(packet, &self.names, now) {
+            self.actions
+                .extend(replies.into_iter().map(Action::Deliver));
+            return Ok(());
+        }
         // Among several advertisers of a subnet the one with the fewest hops
         // is used (spec §15.2, requirement R7); unreachable ones are
         // skipped. The count is fixed to hops, whatever the path policy,
@@ -2219,6 +2304,7 @@ impl Node {
         }
         self.sync.expire(now);
         self.refresh_routes();
+        self.refresh_names();
         self.path_round(rng, now);
         self.centre_round(now);
         self.reassembler.expire(now);
@@ -4135,6 +4221,115 @@ mod tests {
             net.nodes[1].serve(100, &descriptor, &request, net.now),
             Err(RpcError::InvalidMethod)
         );
+    }
+
+    /// A UDP DNS query from `source` to `resolver`, port 53.
+    fn dns_packet(source: [u8; 4], resolver: [u8; 4], name: &str) -> Vec<u8> {
+        let message = crate::dns::message::tests::query(5, name, crate::dns::message::TYPE_A, None);
+        let total = 28 + message.len();
+        let mut packet = ipv4_packet(source, resolver);
+        packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        packet[20..22].copy_from_slice(&50000u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&53u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&((8 + message.len()) as u16).to_be_bytes());
+        packet.extend_from_slice(&message);
+        packet
+    }
+
+    /// The A records of the DNS answer in a UDP packet node `i` delivered.
+    fn delivered_answer(net: &Net, i: usize) -> Vec<Vec<u8>> {
+        let (_, packet) = net
+            .delivered
+            .iter()
+            .rev()
+            .find(|(node, _)| *node == i)
+            .expect("an answer");
+        assert_eq!(&packet[12..16], &[10, 144, 0, 254], "from the resolver");
+        let parsed = crate::dns::message::tests::parse_answer(&packet[28..]);
+        parsed
+            .records
+            .into_iter()
+            .map(|(_, _, data)| data)
+            .collect()
+    }
+
+    #[test]
+    fn members_names_answer_at_the_resolver_address() {
+        let named = |address: &str, hostname: &str, dns: serde_json::Value| {
+            let config = serde_json::json!({
+                "config_version": 1,
+                "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+                "node": {"address": address, "role": "full", "hostname": hostname},
+                "peers": [{"server": "peer.example", "port": 40000}],
+                "dns": dns,
+            });
+            let config: MeshConfig = serde_json::from_value(config).unwrap();
+            config.validate().unwrap()
+        };
+        let dns = serde_json::json!({
+            "enabled": true,
+            "region": "cn",
+            "resolver_address": "10.144.0.254",
+        });
+        let mut net = Net::with(vec![
+            named("10.144.0.1/24", "alpha", dns.clone()),
+            named("10.144.0.2/24", "beta", dns.clone()),
+            named("10.144.0.3/24", "gamma", dns.clone()),
+        ]);
+        net.link(0, 1);
+        net.link(1, 2);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        let listed: Vec<&str> = net.nodes[0]
+            .names()
+            .entries()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(listed, ["alpha.cn", "beta.cn", "gamma.cn"]);
+
+        // Answered on node 0 itself, never sent into the mesh.
+        let sent = net.nodes[0].counters();
+        let query = dns_packet([10, 144, 0, 1], [10, 144, 0, 254], "gamma.cn.mesh.internal");
+        send(&mut net, 0, &query);
+        assert_eq!(delivered_answer(&net, 0), [vec![10, 144, 0, 3]]);
+        assert_eq!(net.nodes[0].counters(), sent);
+        assert!(net.delivered.iter().all(|(node, _)| *node == 0));
+
+        // A new dns section takes effect without a restart.
+        net.nodes[0].set_dns(
+            named(
+                "10.144.0.1/24",
+                "alpha",
+                serde_json::json!({
+                    "enabled": true,
+                    "region": "cn",
+                    "names": [{"name": "gamma.cn", "address": "10.144.0.9"}],
+                    "resolver_address": "10.144.0.254",
+                }),
+            )
+            .dns,
+        );
+        assert!(net.nodes[0].is_up(10));
+        send(&mut net, 0, &query);
+        assert_eq!(
+            delivered_answer(&net, 0),
+            [vec![10, 144, 0, 9], vec![10, 144, 0, 3]]
+        );
+
+        // Without a resolver address the packet goes into the mesh as usual
+        // and, with no member at that address, is refused.
+        net.nodes[0].set_dns(
+            named(
+                "10.144.0.1/24",
+                "alpha",
+                serde_json::json!({"enabled": true}),
+            )
+            .dns,
+        );
+        assert_eq!(net.nodes[0].send_ip(&query, net.now), Err(Denied::NoRoute));
     }
 
     #[test]

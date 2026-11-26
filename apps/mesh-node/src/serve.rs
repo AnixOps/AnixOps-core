@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use outbound_mesh::config::{encode_key, CustomPath, HostGroup, NetworkKind};
+use outbound_mesh::dns::DnsSettings;
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
@@ -633,6 +634,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
+        let (_keep_dns, dns) = watch::channel(settings.dns.clone());
         let (_keep_paths, paths) = watch::channel(Vec::new());
         let (_keep_groups, host_groups) = watch::channel(Vec::new());
         // Subnet route overrides belong to the managed networks
@@ -646,6 +648,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             stop,
             Updates {
                 native_keys,
+                dns,
                 paths,
                 host_groups,
                 route_overrides,
@@ -1155,6 +1158,8 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
 pub(crate) struct Updates {
     /// A new native key list (spec §8.3.1).
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// A new `dns` section (R28, spec §15.9.2).
+    pub dns: watch::Receiver<DnsSettings>,
     /// A new list of custom paths (spec §17.2.8).
     pub paths: watch::Receiver<Vec<CustomPath>>,
     /// New host groups (spec §15.7).
@@ -1166,10 +1171,10 @@ pub(crate) struct Updates {
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `updates` carries new native keys, custom paths, host groups and subnet
-/// route overrides into the running driver; `border` connects a border
-/// node's network to its backbone.
-/// With `host`, the network installs only routes no other network of the
+/// `updates` carries new native keys, a new `dns` section, custom paths,
+/// host groups and subnet route overrides into the running driver;
+/// `border` connects a border node's network to its backbone. With
+/// `host`, the network installs only routes no other network of the
 /// process holds, under the given owner name.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_with(
@@ -1185,6 +1190,7 @@ pub(crate) async fn serve_with(
 ) -> Result<(), Failure> {
     let Updates {
         native_keys,
+        dns,
         paths,
         host_groups,
         route_overrides,
@@ -1279,6 +1285,7 @@ pub(crate) async fn serve_with(
             snapshots,
             local_networks,
             native_keys,
+            dns,
             paths,
             host_groups,
             route_overrides,

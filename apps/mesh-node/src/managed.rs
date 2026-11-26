@@ -50,6 +50,7 @@ use mesh_bridge::{
 };
 use outbound_mesh::bridge::ExternalBridge;
 use outbound_mesh::config::{encode_key, CustomPath, HostGroup, PathTarget};
+use outbound_mesh::dns::DnsSettings;
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
@@ -71,7 +72,10 @@ use crate::serve::{self, AbortOnDrop, Failure, HostRoutes};
 use crate::tun::{self, Tun};
 use outbound_mesh::region::directory::RegionSection;
 
-/// Features this implementation adds to `GET /v1/status`. `mesh_native_keys`
+/// Features this implementation adds to `GET /v1/status`. `mesh_dns` and
+/// `mesh_resolver_address`: each network's `dns` section, with the
+/// resolver address answered on the network's interface (spec §15.9.2).
+/// `mesh_native_keys`
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
@@ -85,6 +89,8 @@ use outbound_mesh::region::directory::RegionSection;
 /// has it.
 pub const FEATURES: &[&str] = &[
     "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
@@ -99,6 +105,8 @@ pub const REGION_PROBE_FEATURE: &str = "mesh_region_probe";
 /// feature of [`FEATURES`] stays listed.
 pub const FEATURES_WITH_BRIDGE: &[&str] = &[
     "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
@@ -115,6 +123,8 @@ pub const BACKBONE_FEATURE: &str = "mesh_backbone";
 /// [`FEATURES`] with the backbone on.
 pub const FEATURES_WITH_BACKBONE: &[&str] = &[
     "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
@@ -125,6 +135,8 @@ pub const FEATURES_WITH_BACKBONE: &[&str] = &[
 /// [`FEATURES_WITH_BRIDGE`] with the backbone on.
 pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
     "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
     "mesh_paths",
@@ -344,6 +356,7 @@ struct Running {
     /// Dropping or sending stops the network.
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    dns: watch::Sender<DnsSettings>,
     paths: watch::Sender<Vec<CustomPath>>,
     host_groups: watch::Sender<Vec<HostGroup>>,
     /// The subnet route overrides, handed to the running driver.
@@ -955,9 +968,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Whether `instance` can go on under `settings` without a restart: the
-/// same settings, or, while it runs, the same but for the native key list
-/// and the custom paths, which are handed to the running driver. A network
-/// that failed to start is tried again. `false` means the instance is to be stopped.
+/// same settings, or, while it runs, the same but for the native key
+/// list, the `dns` section, the custom paths and the host groups, which
+/// are handed to the running driver. A network that failed to start is
+/// tried again. `false` means the instance is to be stopped.
 fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
     let same = instance.settings == *settings;
     let mut next = settings.clone();
@@ -975,6 +989,9 @@ fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
             {
                 if instance.settings.native_keys != settings.native_keys {
                     let _ = running.native_keys.send(settings.native_keys.clone());
+                }
+                if instance.settings.dns != settings.dns {
+                    let _ = running.dns.send(settings.dns.clone());
                 }
                 if instance.settings.paths != settings.paths {
                     let _ = running.paths.send(settings.paths.clone());
@@ -1036,11 +1053,12 @@ fn running_ok(running: &Running) -> bool {
 }
 
 /// Whether `new` differs from `old` only in what a running network takes
-/// without a restart: the native key list, the custom paths and the host
-/// groups.
+/// without a restart: the native key list, the `dns` section, the custom
+/// paths and the host groups.
 fn same_but_hot(old: &MeshSettings, new: &MeshSettings) -> bool {
     let mut old = old.clone();
     old.native_keys.clone_from(&new.native_keys);
+    old.dns.clone_from(&new.dns);
     old.paths.clone_from(&new.paths);
     old.host_groups.clone_from(&new.host_groups);
     old == *new
@@ -1149,6 +1167,7 @@ async fn launch(
     let name = device.name().to_owned();
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
+    let (dns, dns_settings) = watch::channel(settings.dns.clone());
     let (paths, path_list) = watch::channel(settings.paths.clone());
     let (host_groups, groups) = watch::channel(settings.host_groups.clone());
     let (route_overrides, overrides) = watch::channel(overrides);
@@ -1172,6 +1191,7 @@ async fn launch(
             until,
             serve::Updates {
                 native_keys: keys,
+                dns: dns_settings,
                 paths: path_list,
                 host_groups: groups,
                 route_overrides: overrides,
@@ -1201,6 +1221,7 @@ async fn launch(
         interface: name,
         stop: Some(stop),
         native_keys,
+        dns,
         paths,
         host_groups,
         route_overrides,
@@ -1242,6 +1263,11 @@ fn network_status(instance: &Instance) -> ManagedNetworkStatus {
         }
     }
     let mut status = ManagedNetworkStatus::stopped(instance.tag.clone(), "");
+    // Skipped entries are known from the configuration alone, also while
+    // the network waits or was refused.
+    if instance.settings.dns.enabled {
+        status.refused_names = instance.settings.dns.refused.clone();
+    }
     status.forward_secrecy = instance.settings.security.has_forward_secrecy();
     match &instance.state {
         State::Waiting(detail) => {
@@ -1316,6 +1342,11 @@ fn fill_running(
 ) {
     status.running = true;
     status.address = Some(settings.address);
+    // Names only while they are on (spec §15.9.2 item 8).
+    if let Some(names) = snapshot.names.as_ref().filter(|names| names.enabled()) {
+        status.names = names.entries().to_vec();
+        status.refused_names = names.refused().to_vec();
+    }
     let address_of = |peer: u32| -> Option<IpAddr> {
         snapshot
             .members
@@ -1391,6 +1422,33 @@ fn fill_running(
             detail: subnet.to_string(),
         }))
         .collect();
+    // The panel's resolver address is this node's own: it is not
+    // intercepted (spec §15.9.2 item 8).
+    if snapshot
+        .names
+        .as_ref()
+        .is_some_and(|names| names.resolver_conflict())
+    {
+        status.alerts.push(Alert {
+            code: AlertCode::ResolverAddressConflict,
+            address: settings.dns.resolver_address,
+            peer: String::new(),
+            detail: String::new(),
+        });
+    }
+    if let Some(left_out) = snapshot
+        .names
+        .as_ref()
+        .map(|names| names.reverse_zones_truncated())
+        .filter(|&left_out| left_out > 0)
+    {
+        status.alerts.push(Alert {
+            code: AlertCode::ReverseZonesTruncated,
+            address: None,
+            peer: String::new(),
+            detail: left_out.to_string(),
+        });
+    }
     for peer in &snapshot.refused_key_changes {
         status.alerts.push(Alert {
             code: AlertCode::PeerKeyChanged,
@@ -1877,6 +1935,7 @@ mod tests {
         let net = |text: &str| IpNet::parse(text).unwrap();
         let (stop, _stopped) = oneshot::channel();
         let (native_keys, _keys) = watch::channel(None);
+        let (dns, _dns) = watch::channel(DnsSettings::default());
         let (paths, _paths) = watch::channel(Vec::new());
         let (host_groups, _groups) = watch::channel(Vec::new());
         let (route_overrides, mut overrides) = watch::channel(Vec::new());
@@ -1889,6 +1948,7 @@ mod tests {
                 interface: "anixmesh-0".into(),
                 stop: Some(stop),
                 native_keys,
+                dns,
                 paths,
                 host_groups,
                 route_overrides,
@@ -2098,11 +2158,15 @@ mod tests {
     }
 
     #[test]
-    fn only_native_key_and_host_group_changes_keep_a_network_running() {
+    fn only_native_key_dns_and_host_group_changes_keep_a_network_running() {
         let base = settings();
         let mut listed = base.clone();
         listed.native_keys = Some(vec![[1; 32], [2; 32]]);
         assert!(same_but_hot(&base, &listed));
+        let mut named = listed.clone();
+        named.dns.enabled = true;
+        named.dns.resolver_address = Some("10.150.255.254".parse().unwrap());
+        assert!(same_but_hot(&base, &named));
         let mut grouped = listed.clone();
         grouped.host_groups = vec![HostGroup {
             cidr: outbound_mesh::IpNet::parse("10.127.1.0/24").unwrap(),
@@ -2124,6 +2188,54 @@ mod tests {
         assert!(!same_but_hot(&grouped, &renamed));
         assert_eq!(waiting_detail(&base), "empty");
         assert_eq!(waiting_detail(&listed), "self_missing");
+    }
+
+    #[test]
+    fn a_running_status_lists_names_and_skipped_entries_only_while_on() {
+        use outbound_mesh::dns::{DnsConfig, NameSource, Names, NetworkView};
+        let base = settings();
+        let subnets = base.virtual_subnets();
+        let build = |enabled: bool| {
+            let config: DnsConfig = serde_json::from_value(serde_json::json!({
+                "enabled": enabled,
+                "names": [
+                    { "name": "web.cn", "address": "10.150.0.7" },
+                    { "name": "far.cn", "address": "8.8.8.8" },
+                ],
+            }))
+            .unwrap();
+            let dns = config.validate(&subnets).unwrap();
+            let names = Names::build(
+                &dns,
+                &NetworkView {
+                    virtual_subnets: &subnets,
+                    host_groups: &[],
+                    local_addresses: &[],
+                    own_hostname: None,
+                    members: &[],
+                },
+            );
+            Snapshot {
+                names: Some(Arc::new(names)),
+                ..Snapshot::default()
+            }
+        };
+        let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut status, &base, &build(true), Duration::ZERO);
+        assert_eq!(status.names.len(), 1);
+        assert_eq!(status.names[0].name, "web.cn");
+        assert_eq!(status.names[0].source, NameSource::Panel);
+        assert_eq!(status.refused_names.len(), 1);
+        assert_eq!(status.refused_names[0].name, "far.cn");
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["names"][0]["source"], "panel");
+        assert_eq!(json["refusedNames"][0]["reason"], "not_intranet");
+
+        let mut off = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut off, &base, &build(false), Duration::ZERO);
+        assert!(off.names.is_empty() && off.refused_names.is_empty());
+        let json = serde_json::to_value(&off).unwrap();
+        assert!(json.get("names").is_none() && json.get("refusedNames").is_none());
     }
 
     #[test]

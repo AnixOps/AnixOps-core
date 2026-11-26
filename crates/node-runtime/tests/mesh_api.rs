@@ -109,6 +109,8 @@ fn network_status(network: &ManagedNetwork) -> ManagedNetworkStatus {
         rejected_advertisements: 0,
         overlaps: Vec::new(),
         alerts: Vec::new(),
+        names: Vec::new(),
+        refused_names: Vec::new(),
         paths: Vec::new(),
         external_bridge: None,
     }

@@ -388,6 +388,28 @@ mod tests {
     }
 
     #[test]
+    fn takes_the_dns_section() {
+        let mut item = network("mesh-cn", "mesh-cn");
+        item["dns"] = json!({
+            "enabled": true,
+            "names": [
+                {"name": "web.cn", "address": "10.150.0.7"},
+                {"name": "pub.cn", "address": "8.8.8.8"}
+            ],
+            "resolver_address": "10.150.255.254"
+        });
+        let networks = put(vec![item]).unwrap();
+        let dns = &networks[0].settings.dns;
+        assert!(dns.enabled);
+        assert_eq!(dns.names.len(), 1);
+        assert_eq!(dns.refused.len(), 1);
+        assert_eq!(
+            dns.resolver_address,
+            Some("10.150.255.254".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn takes_several_networks_in_order() {
         let networks = put(vec![
             network("mesh-cn", "mesh-cn"),
@@ -427,8 +449,15 @@ mod tests {
     #[test]
     fn refuses_unknown_fields_and_invalid_configs() {
         let mut item = network("mesh-cn", "a");
-        item["dns"] = json!({"enabled": true});
+        item["not_a_field"] = json!([]);
         assert!(refused(vec![item]).contains("unknown field"));
+        let mut item = network("mesh-cn", "a");
+        item["dns"] = json!({"enabled": true, "other": 1});
+        assert!(refused(vec![item]).contains("unknown field"));
+        // A bad suffix refuses the whole body; a bad name entry does not.
+        let mut item = network("mesh-cn", "a");
+        item["dns"] = json!({"enabled": true, "suffix": "example.com"});
+        assert!(refused(vec![item]).contains("dns suffix"));
         let mut item = network("mesh-cn", "a");
         item["config_version"] = json!(2);
         assert!(put(vec![item]).is_err());

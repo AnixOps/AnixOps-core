@@ -20,6 +20,7 @@ use crate::backbone::config::{BackboneSettings, LinkConfig};
 use crate::backbone::engine::{RouteEvent, Status as BackboneEngineStatus};
 use crate::backbone::BackboneId;
 use crate::config::MeshSettings;
+use crate::dns::{NameStatus, RefusedName};
 use crate::net::IpNet;
 
 /// Most networks one `PUT /v1/mesh` may carry. A border node joins one
@@ -258,6 +259,14 @@ pub struct ManagedNetworkStatus {
     #[serde(serialize_with = "display_all")]
     pub overlaps: Vec<IpNet>,
     pub alerts: Vec<Alert>,
+    /// The intranet name list (requirement R28, `names[]` of
+    /// `docs/architecture/mesh-status.md`); left out while empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<NameStatus>,
+    /// `dns.names` entries skipped at load (`refusedNames[]`); left out
+    /// while empty.
+    #[serde(rename = "refusedNames", skip_serializing_if = "Vec::is_empty")]
+    pub refused_names: Vec<RefusedName>,
     /// The custom paths and their states, in configuration order (spec
     /// §17.2.7). Members are named by their virtual address, as in `peers`.
     pub paths: Vec<ManagedPath>,
@@ -294,6 +303,8 @@ impl ManagedNetworkStatus {
             rejected_advertisements: 0,
             overlaps: Vec::new(),
             alerts: Vec::new(),
+            names: Vec::new(),
+            refused_names: Vec::new(),
             paths: Vec::new(),
             external_bridge: None,
         }
@@ -377,6 +388,14 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
+    /// The network's `dns.resolver_address` is this node's own virtual
+    /// address, so it is not intercepted (spec §15.9.2 item 8); `address`
+    /// gives it.
+    ResolverAddressConflict,
+    /// The network's reverse zones are more than 256; the rest are not
+    /// worked out or answered (spec §15.9.2 item 1). `detail` is how many
+    /// were left out; `address` and `peer` are empty.
+    ReverseZonesTruncated,
     /// More subnets are routable than the system routes take; `detail` is
     /// how many were left out.
     SystemRoutesTruncated,
@@ -458,7 +477,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// features and `/v1/mesh` answers 404.
 pub trait MeshControl: Send + Sync {
     /// Feature names this implementation adds to `GET /v1/status`:
-    /// at least `mesh`; `mesh_dns` once the network config takes `dns`.
+    /// at least `mesh`; `mesh_dns` when the network config takes `dns`,
+    /// `mesh_resolver_address` when it also takes `dns.resolver_address`.
     fn features(&self) -> &'static [&'static str];
 
     /// The current status.
@@ -600,6 +620,8 @@ mod tests {
                         detail: "tcp port 11010 in use".into(),
                     },
                 ],
+                names: Vec::new(),
+                refused_names: Vec::new(),
                 paths: vec![
                     ManagedPath {
                         id: "peer:10.150.0.1".into(),
