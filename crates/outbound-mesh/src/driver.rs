@@ -1393,6 +1393,7 @@ mod tests {
                 route_overrides,
                 foreign_routes,
                 shutdown,
+                border: None,
             },
         ));
         // Running: the first snapshot is out.
