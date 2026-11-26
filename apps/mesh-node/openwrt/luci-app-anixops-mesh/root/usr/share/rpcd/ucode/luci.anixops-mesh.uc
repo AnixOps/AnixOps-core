@@ -51,22 +51,6 @@ function error_kind(output) {
 	return (type(kind) == 'string' && match(kind, /^[a-z0-9_]{1,64}$/)) ? kind : null;
 }
 
-// UCI can also be changed outside this backend (LuCI's generic UCI access,
-// the command line): values are checked again before they are returned.
-function settings() {
-	const uci = cursor();
-	uci.load('anixops-mesh');
-	let advertise = uci.get('anixops-mesh', 'main', 'advertise') ?? [];
-	if (type(advertise) != 'array')
-		advertise = [ advertise ];
-	const control = uci.get('anixops-mesh', 'main', 'control') ?? '';
-	return {
-		enabled: uci.get('anixops-mesh', 'main', 'enabled') == '1',
-		control: valid_control(control) ? control : '',
-		advertise: filter(advertise, valid_subnet)
-	};
-}
-
 // The program's subcommands, read once per installed program (rpcd keeps
 // this script loaded): the status page polls every 5 seconds.
 let capability_cache = null;
@@ -161,6 +145,22 @@ function valid_subnet(text) {
 	if (network_of(parsed.parts, parsed.prefix) != to_number(parsed.parts))
 		return false;
 	return is_private(parsed.parts, parsed.prefix);
+}
+
+// UCI can also be changed outside this backend (LuCI's generic UCI access,
+// the command line): values are checked again before they are returned.
+function settings() {
+	const uci = cursor();
+	uci.load('anixops-mesh');
+	let advertise = uci.get('anixops-mesh', 'main', 'advertise') ?? [];
+	if (type(advertise) != 'array')
+		advertise = [ advertise ];
+	const control = uci.get('anixops-mesh', 'main', 'control') ?? '';
+	return {
+		enabled: uci.get('anixops-mesh', 'main', 'enabled') == '1',
+		control: valid_control(control) ? control : '',
+		advertise: filter(advertise, valid_subnet)
+	};
 }
 
 function token_present(state_dir) {
