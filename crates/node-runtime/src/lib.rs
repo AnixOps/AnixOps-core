@@ -467,6 +467,15 @@ impl Node {
         self
     }
 
+    /// Stops the managed mesh networks before the node program exits, so
+    /// that each withdraws its subnet advertisements first (spec §15.7
+    /// rule 6); returns at once without a mesh.
+    pub async fn stop_mesh(&self) {
+        if let Some(mesh) = &self.mesh {
+            mesh.stop_all().await;
+        }
+    }
+
     /// [`FEATURES`] and those of the installed mesh, as `GET /v1/status`
     /// lists them.
     pub fn features(&self) -> Vec<&'static str> {

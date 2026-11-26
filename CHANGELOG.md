@@ -6,8 +6,11 @@
 
 ### Mesh
 
+- 宿主组网关（规范 §15.7，需求 R21、R25、R26，内核 0.4，能力 `mesh_host_groups`）：网络配置新增 `host_groups`（最多 256 组；组地址段须在内网范围、主机位为零、不与虚拟网段、本机 `subnets.advertise` 中的汇总网段及其他组重叠；网关与备用网关为设备实例 ID）。网关自动通告组地址段；备用网关只在没有其他可达成员通告该段、且自身有邻居满 3 秒时通告，网关回来即撤回；两台网关都承载该段的转发。`routing.paths` 的 `to_subnet` 落在组地址段内且前缀更长时整份配置被拒（审计 F-01），`check_paths_against_host_groups` 供路径热更新共用。`host_groups` 变化不重启网络。
+- 正常停机先撤回通告（规范 §15.7 第 6 条、§15.8 第 6 条）：通告了子网的网络停止时先从字段 5 删除全部子网、version 加 1 并立即同步，继续转发 3 秒再断开；`PUT /v1/mesh` 中要停止的网络并行撤回；`anixcore` 退出前停止全部受管网络。
 - 新增组网端到端实验床（`docs/mesh-e2e.md`、`.github/scripts/mesh-e2e/`、工作流 `mesh-e2e.yml`）：每台机器一个网络命名空间，运行本仓库构建的 `anixops-mesh run`，场景按需求编号登记；12 个场景启用，0.4、0.5 的 11 个场景待对应功能合并后启用。内核 0.4 起 RC 必须该工作流全绿。
 - `anixops-mesh run` 失败时 stderr 最后一行改为符合设计文档的退出约定：启动冲突为 `{"error":"conflict","conflict":"port_in_use"|"tun_in_use","detail"}`（此前为 `{"error":"busy"}`、无冲突代码），其他运行错误为 `"error":"runtime"`（此前为 `"run"`）。退出码不变（2、3、1）。端到端场景 E10 发现。
+- 嵌入式引擎可把组网网络作为 `"type": "mesh"` 出站（`engine-embedded` feature `mesh`，`outbound-mesh` feature `outbound`）：每个网络一个私有 TCP/IP 协议栈，只连本网络成员与当前路由的通告子网，其余目的地址在发包前拒绝；同一 `network.name` 且配置相同的重新构建沿用运行中的网络。暂不进入默认 feature，控制命令与自动分流随后补上。
 
 ### Release process
 
@@ -21,6 +24,7 @@
 
 ### Security
 
+- 组网区域间骨干（规范 §17.3，内核 0.4，尚未审计）改为默认关闭（内核 0.3 发布策略：未审计功能默认不可达）：`anixcore` 配置新增 `mesh_backbone`（默认 `false`）。关闭时不声明 `mesh_backbone`，`PUT /v1/mesh` 带 `backbone` 节时整份请求体返回 400（`backbone_disabled`），运行中的网络不变，节点不承载其他区域的汇总网段。同时修正节点程序能桥接时少报 `mesh_backbone` 的问题：能力列表按桥接与骨干两个条件给出。
 - 组网自定义路径（规范 §17.2，内核 0.5，尚未审计）在默认配置下对远端不可达：新增 `node.waypoint_relay`（默认 `false`，需要 `node.relay`）。为 `false` 且网络没有 `routing.paths` 时，节点对 `MeshPathRpc` 回 Error 3，丢弃全部类型 40 包并计数；只有打开该开关的节点才作为途经点（`Capabilities.relay`）。
 - anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。
 

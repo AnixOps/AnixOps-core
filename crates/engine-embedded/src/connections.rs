@@ -1589,7 +1589,7 @@ fn single_route(outbound: &dyn TcpOutbound) -> RouteInfo {
 /// Outbounds that reach an address themselves rather than through a proxy
 /// that resolves names on the far side.
 // "wireguard" is `crate::wireguard::PROTOCOL`, which only exists with that feature.
-const ADDRESS_OUTBOUNDS: [&str; 3] = [crate::direct::PROTOCOL, "wireguard", "iwan"];
+const ADDRESS_OUTBOUNDS: [&str; 4] = [crate::direct::PROTOCOL, "wireguard", "iwan", "mesh"];
 
 /// The name to send a proxy instead of an IPv6 address the flow announced.
 ///
