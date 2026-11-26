@@ -1066,6 +1066,8 @@ mod tests {
         ManagedMesh::open_with(dir, Bridging::off())
     }
 
+    // A bridge passes the config checks on Linux only.
+    #[cfg(target_os = "linux")]
     fn bridged(allow: &[&str]) -> MeshSettings {
         let config = json!({
             "config_version": 1,
@@ -1084,6 +1086,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn only_an_allow_list_change_keeps_a_bridge_running() {
         let before = bridged(&["10.150.0.2/32"]);
