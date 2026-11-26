@@ -299,6 +299,16 @@ pub fn approved_advertise(networks: &[Network]) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// `config.json`: the accepted networks written as a config answer, so
+/// that [`parse_config`] reads them back with the same checks.
+pub fn config_file(networks: &[Network]) -> Vec<u8> {
+    let list: Vec<Value> = networks
+        .iter()
+        .map(|network| Value::Object(network.fields.clone()))
+        .collect();
+    serde_json::to_vec(&json!({ "data": { "networks": list } })).unwrap_or_default()
+}
+
 /// One network of a device answer, checked against the fixed field set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Network {
@@ -983,5 +993,12 @@ mod tests {
         assert_eq!(retry_after(Some("99999")), Some(MAX_WAIT));
         assert_eq!(retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")), None);
         assert_eq!(retry_after(None), None);
+    }
+
+    #[test]
+    fn the_config_file_reads_back_as_written() {
+        let networks = parse_config(&config(vec![network("cn"), network("eu")])).unwrap();
+        assert_eq!(parse_config(&config_file(&networks)).unwrap(), networks);
+        assert_eq!(parse_config(&config_file(&[])).unwrap(), Vec::new());
     }
 }
