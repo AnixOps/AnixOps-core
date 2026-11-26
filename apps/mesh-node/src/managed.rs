@@ -13,6 +13,9 @@
 //!   carries `node.private_key`. Keys stay when a network leaves the list,
 //!   so that taking it back keeps the key the panel already lists.
 //!
+//! A border node's request also carries a `backbone` section; its backbone
+//! runs beside the networks and meets its region network through that
+//! network's hub ([`crate::border`]).
 //! External network bridges (spec §15.12, `docs/architecture/mesh-bridge.md`)
 //! run beside the networks that carry an `external_bridge` section, only
 //! when the operator turned them on (`mesh_external_bridge`). Then the node
@@ -23,6 +26,7 @@
 //! start-up (bridges on or off) and when it goes. Off and without the mark,
 //! the node never calls `nft` or touches conntrack.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -38,8 +42,8 @@ use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
-    Alert, AlertCode, ApplyError, BoxFuture, ExternalBridgeStatus, FailureCode, ManagedNetwork,
-    ManagedNetworkStatus, ManagedPeer, ManagedStatus, MeshControl, NetworkFailure,
+    Alert, AlertCode, ApplyError, BoxFuture, ExternalBridgeStatus, FailureCode, ManagedBackbone,
+    ManagedNetwork, ManagedNetworkStatus, ManagedPeer, ManagedStatus, MeshControl, NetworkFailure,
     NetworkStaticKey,
 };
 use outbound_mesh::{IpNet, MeshSettings};
@@ -48,6 +52,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::border::{BorderInstance, Hub, RegionView};
 use crate::serve::{self, AbortOnDrop, Failure, HostRoutes};
 use crate::tun::{self, Tun};
 
@@ -55,13 +60,17 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
+/// `mesh_backbone`: `PUT /v1/mesh` takes the top-level `backbone` section
+/// and `GET /v1/mesh` gives its status (spec §17.3, appendix B and C).
+pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_backbone"];
 
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
 /// lock, nftables took the probe and the start-up cleanup ran.
 pub const FEATURES_WITH_BRIDGE: &[&str] = &["mesh", "mesh_native_keys", mesh_bridge::FEATURE];
 
-/// Interface names: `anixmesh-<n>`, the lowest number free.
+/// Interface names: `anixmesh-<n>`, the lowest number free (the adapter's
+/// name on Windows). macOS names a `utun` interface itself; the name it
+/// gave is the one kept.
 const INTERFACE_PREFIX: &str = "anixmesh-";
 
 /// How long a stopped network may take to close before it is cut off.
@@ -80,6 +89,9 @@ struct Inner {
     dir: PathBuf,
     instance_id: String,
     networks: Mutex<Vec<Instance>>,
+    /// One per network of the last request, by tag.
+    hubs: Mutex<BTreeMap<String, Arc<Hub>>>,
+    backbone: Mutex<Option<BorderInstance>>,
     bridging: Bridging,
     /// Held by the task that replaces the networks, not by the request:
     /// a request that times out does not let the next one start while
@@ -151,10 +163,13 @@ impl Bridging {
             Ok(lock) => lock,
             Err(error) => {
                 bridging.lock_held = error.kind() == io::ErrorKind::WouldBlock;
-                if enabled {
-                    eprintln!("mesh: external bridge unavailable: {error}");
-                } else {
-                    eprintln!("mesh: bridge tables may be left on this host: {error}");
+                // macOS and Windows have no external bridge; nothing to say.
+                if error.kind() != io::ErrorKind::Unsupported {
+                    if enabled {
+                        eprintln!("mesh: external bridge unavailable: {error}");
+                    } else {
+                        eprintln!("mesh: bridge tables may be left on this host: {error}");
+                    }
                 }
                 return bridging;
             }
@@ -297,6 +312,8 @@ impl ManagedMesh {
                 dir,
                 instance_id,
                 networks: Mutex::new(Vec::new()),
+                hubs: Mutex::new(BTreeMap::new()),
+                backbone: Mutex::new(None),
                 bridging,
                 applying: tokio::sync::Mutex::new(()),
                 previous: Mutex::new(None),
@@ -329,7 +346,10 @@ impl Inner {
     /// [`Inner::finish`] the status still describes them.
     fn take_for_replace(&self) -> Vec<Instance> {
         let mut networks = lock(&self.networks);
-        *lock(&self.previous) = Some(self.describe(&networks));
+        let mut previous = lock(&self.previous);
+        if previous.is_none() {
+            *previous = Some(self.describe(&networks));
+        }
         std::mem::take(&mut *networks)
     }
 
@@ -345,7 +365,72 @@ impl Inner {
         self.describe(&lock(&self.networks))
     }
 
-    async fn replace(&self, wanted: Vec<ManagedNetwork>) -> ManagedStatus {
+    async fn replace(
+        &self,
+        wanted: Vec<ManagedNetwork>,
+        backbone: Option<ManagedBackbone>,
+    ) -> ManagedStatus {
+        // The status keeps describing the backbone being replaced too
+        // (`replace_networks` clears it when done).
+        {
+            let networks = lock(&self.networks);
+            *lock(&self.previous) = Some(self.describe(&networks));
+        }
+        // The backbone first: one that stays keeps running through the
+        // network changes, the others stop before their network does.
+        let current_backbone = lock(&self.backbone).take();
+        let kept_backbone = match current_backbone {
+            Some(mut running) => {
+                if backbone.as_ref().is_some_and(|next| running.keep(next)) {
+                    Some(running)
+                } else {
+                    let hub = lock(&self.hubs).get(&running.tag).cloned();
+                    running.stop(hub.as_deref()).await;
+                    None
+                }
+            }
+            None => None,
+        };
+        let backbone = if kept_backbone.is_some() {
+            None
+        } else {
+            backbone
+        };
+        let tags: Vec<String> = wanted.iter().map(|network| network.tag.clone()).collect();
+        {
+            let mut hubs = lock(&self.hubs);
+            for tag in &tags {
+                hubs.entry(tag.clone()).or_insert_with(Hub::new);
+            }
+        }
+        let mut status = self.replace_networks(wanted).await;
+        {
+            let mut hubs = lock(&self.hubs);
+            hubs.retain(|tag, hub| {
+                let stays = tags.contains(tag);
+                if !stays {
+                    hub.withdraw();
+                }
+                stays
+            });
+        }
+        let started = backbone.map(|backbone| {
+            let tag = format!(
+                "{}{}",
+                outbound_mesh::status::TAG_PREFIX,
+                backbone.settings.region
+            );
+            // The management API checked that the region network is in the
+            // request, so its hub exists.
+            let hub = lock(&self.hubs).get(&tag).cloned().unwrap_or_else(Hub::new);
+            BorderInstance::start(backbone, &hub)
+        });
+        *lock(&self.backbone) = kept_backbone.or(started);
+        status.backbone = lock(&self.backbone).as_ref().map(BorderInstance::status);
+        status
+    }
+
+    async fn replace_networks(&self, wanted: Vec<ManagedNetwork>) -> ManagedStatus {
         // Should the replacement fail midway, the status stops describing
         // networks that are gone.
         struct Finished<'a>(&'a Inner);
@@ -385,6 +470,9 @@ impl Inner {
         // interface name are free for the networks that start.
         stopping.append(&mut current);
         for instance in stopping {
+            if let Some(hub) = lock(&self.hubs).get(&instance.tag) {
+                hub.publish_region(RegionView::default());
+            }
             stop(instance).await;
         }
         let mut taken: Vec<String> = next
@@ -448,7 +536,8 @@ impl Inner {
         if let Some((code, detail)) = clash(&settings, occupied) {
             return instance(settings, State::Refused(code, detail));
         }
-        match launch(&settings, key, taken, &self.routes, &tag).await {
+        let hub = lock(&self.hubs).get(&tag).cloned().unwrap_or_else(Hub::new);
+        match launch(&settings, key, taken, &self.routes, &tag, hub).await {
             Ok(mut running) => {
                 if let Some(section) = &settings.external_bridge {
                     if let Err(detail) = self.bridge_up(&mut running, section, &settings) {
@@ -530,6 +619,7 @@ impl Inner {
                     })
                 })
                 .collect(),
+            backbone: lock(&self.backbone).as_ref().map(BorderInstance::status),
             alerts: if lock_held {
                 vec![lock_held_alert()]
             } else {
@@ -577,12 +667,13 @@ impl MeshControl for ManagedMesh {
     fn apply(
         &self,
         networks: Vec<ManagedNetwork>,
+        backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             tokio::spawn(async move {
                 let _turn = inner.applying.lock().await;
-                inner.replace(networks).await
+                inner.replace(networks, backbone).await
             })
             .await
             .map_err(|error| {
@@ -750,6 +841,7 @@ async fn launch(
     taken: &[String],
     routes: &HostRoutes,
     tag: &str,
+    hub: Arc<Hub>,
 ) -> Result<Running, (FailureCode, String)> {
     let (address, address_v6) = tun::addresses(
         settings.address.address(),
@@ -779,6 +871,7 @@ async fn launch(
         )
     })?;
 
+    let name = device.name().to_owned();
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
@@ -790,6 +883,8 @@ async fn launch(
         let until = async {
             let _ = stopped.await;
         };
+        let border = hub.driver_side();
+        let observed = settings.clone();
         // On a task of its own, so that a panic is seen and reported.
         let serving = tokio::spawn(serve::serve_with(
             settings,
@@ -798,8 +893,10 @@ async fn launch(
             device,
             until,
             keys,
+            Some(border),
             Some(host),
             move |next, _| {
+                hub.publish_region(RegionView::of(&observed, next));
                 snapshots.send_replace(next.clone());
             },
         ));
@@ -816,7 +913,7 @@ async fn launch(
         }
     });
     Ok(Running {
-        interface,
+        interface: name,
         stop: Some(stop),
         native_keys,
         snapshot,
@@ -832,7 +929,9 @@ fn refusal(what: &str, error: &io::Error, busy: FailureCode) -> (FailureCode, St
     let code = match error.kind() {
         io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => busy,
         io::ErrorKind::PermissionDenied => FailureCode::PermissionDenied,
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EBUSY) => busy,
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EPERM) => FailureCode::PermissionDenied,
         _ => FailureCode::StartRefused,
     };
@@ -1059,9 +1158,20 @@ fn fill_running(
     }
 }
 
+/// Creates `dir` readable by the owner only. On Windows it takes the access
+/// list of the state directory, which is open to SYSTEM and the
+/// administrators only (`docs/deploy/mesh-device.md`).
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    match builder.create(dir) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
         _ => Ok(()),
     }
@@ -1102,7 +1212,27 @@ fn instance_id(path: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::other("no system randomness"))?;
     let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, format!("{id}\n"))?;
+    // Readable by the owner only, whatever the umask (on Windows the file
+    // takes the access list of the state directory).
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        // A file left by an earlier attempt keeps its mode on open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(format!("{id}\n").as_bytes())?;
+        file.sync_all()?;
+    }
     std::fs::rename(&temporary, path)?;
     Ok(id)
 }
@@ -1134,6 +1264,8 @@ mod tests {
         ManagedMesh::open_with(dir, |_| Bridging::off())
     }
 
+    // A bridge passes the config checks on Linux only.
+    #[cfg(target_os = "linux")]
     fn bridged(allow: &[&str]) -> MeshSettings {
         let config = json!({
             "config_version": 1,
@@ -1152,6 +1284,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn only_an_allow_list_change_keeps_a_bridge_running() {
         let before = bridged(&["10.150.0.2/32"]);
@@ -1346,10 +1479,13 @@ mod tests {
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].code, AlertCode::ExternalBridgeLockHeld);
         let status = mesh
-            .apply(vec![ManagedNetwork {
-                tag: "mesh-cn".into(),
-                settings: settings(),
-            }])
+            .apply(
+                vec![ManagedNetwork {
+                    tag: "mesh-cn".into(),
+                    settings: settings(),
+                }],
+                None,
+            )
             .await
             .unwrap();
         let network = &status.networks[0];
@@ -1385,6 +1521,15 @@ mod tests {
         assert_eq!(first.instance_id().len(), 32);
         let again = open(&dir).expect("open again");
         assert_eq!(first.instance_id(), again.instance_id());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("instance_id"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::write(dir.join("instance_id"), "-bad").unwrap();
         assert!(open(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1422,10 +1567,13 @@ mod tests {
         let mesh = open(&dir).expect("open");
         let waiting = settings();
         let status = mesh
-            .apply(vec![ManagedNetwork {
-                tag: "mesh-cn".into(),
-                settings: waiting,
-            }])
+            .apply(
+                vec![ManagedNetwork {
+                    tag: "mesh-cn".into(),
+                    settings: waiting,
+                }],
+                None,
+            )
             .await
             .unwrap();
         let network = &status.networks[0];
@@ -1442,8 +1590,60 @@ mod tests {
         assert_eq!(status.instance_id, mesh.instance_id());
         assert_eq!(mesh.status(), status);
 
-        let stopped = mesh.apply(Vec::new()).await.unwrap();
+        assert_eq!(status.backbone, None);
+
+        let stopped = mesh.apply(Vec::new(), None).await.unwrap();
         assert!(stopped.networks.is_empty() && stopped.static_keys.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn backbone(kind: &str) -> ManagedBackbone {
+        let config = json!({
+            "id": 11,
+            "region": "cn",
+            "members": [
+                { "id": 11, "region": "cn", "link": { "kind": kind } },
+                { "id": 21, "region": "ap", "link": { "kind": kind, "params": { "key": "SECRET-VALUE" } } }
+            ]
+        });
+        let config: outbound_mesh::backbone::BackboneConfig =
+            serde_json::from_value(config).unwrap();
+        ManagedBackbone {
+            settings: config.validate().unwrap(),
+            links: config.links(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backbone_without_its_link_kind_reports_why_and_the_network_stays() {
+        let dir = temp_dir("backbone");
+        let mesh = ManagedMesh::open(&dir).expect("open");
+        let network = || ManagedNetwork {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+        };
+        let status = mesh
+            .apply(vec![network()], Some(backbone("not-registered")))
+            .await
+            .unwrap();
+        assert_eq!(status.networks.len(), 1);
+        let backbone_status = status.backbone.clone().expect("backbone status");
+        assert!(!backbone_status.running);
+        assert_eq!(backbone_status.status.id, 11);
+        assert_eq!(backbone_status.status.region, "cn");
+        let failure = backbone_status.failure.expect("failure");
+        assert_eq!(failure.code, "backbone_kind_unavailable");
+        assert_eq!(failure.detail, "backbone.members[0].link.kind");
+        let text = serde_json::to_string(&status).unwrap();
+        assert!(!text.contains("SECRET-VALUE"), "{text}");
+        assert_eq!(mesh.status(), status);
+        assert!(FEATURES.contains(&"mesh_backbone"));
+
+        // Without the section the backbone goes; the network stays.
+        let status = mesh.apply(vec![network()], None).await.unwrap();
+        assert_eq!(status.backbone, None);
+        assert_eq!(status.networks.len(), 1);
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1611,7 +1811,7 @@ mod tests {
         let dir = temp_dir("previous");
         let mesh = open(&dir).expect("open");
         let before = mesh
-            .apply(vec![waiting("mesh-cn", "office")])
+            .apply(vec![waiting("mesh-cn", "office")], None)
             .await
             .unwrap();
         let taken = mesh.inner.take_for_replace();
@@ -1631,14 +1831,17 @@ mod tests {
         // The caller gives up: its replacement still waits for its turn.
         let gave_up = tokio::time::timeout(
             Duration::from_millis(50),
-            mesh.apply(vec![waiting("mesh-cn", "office")]),
+            mesh.apply(vec![waiting("mesh-cn", "office")], None),
         )
         .await;
         assert!(gave_up.is_err());
         assert!(mesh.status().networks.is_empty());
         drop(held);
         // The next one runs after it, never beside it.
-        let after = mesh.apply(vec![waiting("mesh-hk", "lab")]).await.unwrap();
+        let after = mesh
+            .apply(vec![waiting("mesh-hk", "lab")], None)
+            .await
+            .unwrap();
         assert_eq!(after.networks.len(), 1);
         assert_eq!(after.networks[0].tag, "mesh-hk");
         assert_eq!(mesh.status(), after);
