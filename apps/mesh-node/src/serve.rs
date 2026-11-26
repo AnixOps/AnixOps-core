@@ -801,7 +801,7 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
 
     if let Err(error) = mesh_host::recover_mesh_host() {
         let detail = if error.kind() == io::ErrorKind::ResourceBusy {
-            "another administrator process (the client or another node) holds the host changes; what an earlier run left was not cleaned".to_owned()
+            "another process (normally the client or another node) holds the host lock; what an earlier run left was not cleaned".to_owned()
         } else {
             format!("what an earlier run left could not be put back: {error}")
         };
