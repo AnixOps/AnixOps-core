@@ -83,7 +83,12 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
         let node = Arc::new(if check_only {
             node
         } else {
-            with_mesh(node, config.mesh_state_dir.as_deref(), config.mesh_backbone)
+            with_mesh(
+                node,
+                config.mesh_state_dir.as_deref(),
+                config.mesh_external_bridge,
+                config.mesh_backbone,
+            )
         });
         if let Some(bundle) = &config.tls_fingerprints {
             let status = node_runtime::apply_tls_fingerprints(bundle)
@@ -156,9 +161,14 @@ const MESH_STATE_DIR: &str = "/var/lib/anixcore/mesh";
 /// not list `mesh` and `/v1/mesh` answers 404. The inter-region backbone
 /// stays off unless the config sets `mesh_backbone`.
 #[cfg(target_os = "linux")]
-fn with_mesh(node: Node, dir: Option<&std::path::Path>, backbone: bool) -> Node {
+fn with_mesh(
+    node: Node,
+    dir: Option<&std::path::Path>,
+    external_bridge: bool,
+    backbone: bool,
+) -> Node {
     let dir = dir.unwrap_or(std::path::Path::new(MESH_STATE_DIR));
-    match mesh_node::managed::ManagedMesh::open(dir) {
+    match mesh_node::managed::ManagedMesh::open_with_options(dir, external_bridge) {
         Ok(mesh) => {
             let mesh = mesh.with_backbone(backbone);
             println!("mesh: instance {}", mesh.instance_id());
@@ -175,7 +185,12 @@ fn with_mesh(node: Node, dir: Option<&std::path::Path>, backbone: bool) -> Node 
 }
 
 #[cfg(not(target_os = "linux"))]
-fn with_mesh(node: Node, _dir: Option<&std::path::Path>, _backbone: bool) -> Node {
+fn with_mesh(
+    node: Node,
+    _dir: Option<&std::path::Path>,
+    _external_bridge: bool,
+    _backbone: bool,
+) -> Node {
     node
 }
 
