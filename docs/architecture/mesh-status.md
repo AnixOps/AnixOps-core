@@ -199,10 +199,11 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `mesh_set_paths` | `network`、`paths`（与 `routing.paths` 同结构） | 0.5 |
 | `mesh_join_credential` | `credential`：一次性入网凭据 | 0.5 |
 
-成功返回 `{"ok":true}`，`mesh_status` 返回快照。失败返回 `{"ok":false,"error":{"code","detail"}}`。`code` 为 `unsupported`、`invalid_argument`、`not_found`、`not_allowed`（例如接入节点通告子网），或上面的失败原因之一。
+成功返回 `{"ok":true}`，`mesh_status` 返回快照。失败返回 `{"ok":false,"error":{"code","detail"}}`。`code` 为 `unsupported`、`invalid_argument`、`not_found`、`not_allowed`（例如接入节点通告子网）、`engine_unavailable`（嵌入式引擎：组网引擎未运行且无法由该运行时启动，见下），或上面的失败原因之一。
 
 嵌入式引擎的补充约定：
-- 任一运行时的控制通道都可发 `mesh_*` 命令。没有组网引擎在运行时，`mesh_save_network` 与 `mesh_join` 启动组网引擎，并由收到命令的运行时持有到它停止（只开代理时保存的网络因此继续运行）；其余命令返回 `not_found`，`mesh_status` 返回空快照 `{"statusVersion":1,"networks":[],"network":null,"self":null,"members":[],"subnets":[],"refusedAdvertisements":0,"tunnel":{"routes":[],"routesVersion":0,"dns":null}}`（带 `network` 参数时返回 `not_found`）。
-- `mesh_save_network` 的 `config` 不合规、`kind = managed` 缺 `node.private_key`（`detail` 以 `private_key_required` 开头）、`node.instance_id` 与其他网络不同，都返回 `invalid_argument`，不保存。profile 中组网出站的 `node.instance_id` 彼此不同或与组网引擎中其他网络不同时，该 profile 构建失败。
+- 任一运行时的控制通道都可发 `mesh_*` 命令。没有组网引擎在运行时，`mesh_save_network` 与 `mesh_join` 启动组网引擎，并由收到命令的运行时持有到它停止（只开代理时保存的网络因此继续运行）；已停止的运行时不再持有组网引擎，这两条命令返回 `engine_unavailable`（组网引擎线程无法启动时同样），宿主停止隧道后应释放该运行时的句柄，不再经它发 `mesh_*` 命令；其余命令返回 `not_found`，`mesh_status` 返回空快照 `{"statusVersion":1,"networks":[],"network":null,"self":null,"members":[],"subnets":[],"refusedAdvertisements":0,"tunnel":{"routes":[],"routesVersion":0,"dns":null}}`（带 `network` 参数时返回 `not_found`）。
+- `mesh_save_network` 的 `config` 不合规、`kind = managed` 缺 `node.private_key`（`detail` 以 `private_key_required` 开头）、`node.instance_id` 与其他网络不同，都返回 `invalid_argument`，不保存。profile 中组网出站的 `node.instance_id` 彼此不同时该 profile 构建失败（构建只看 profile 本身）；profile 提交后以它的 `node.instance_id` 为准，未列在其中、`node.instance_id` 不同的已保存网络退出（保留配置，`state` 为 `not_joined`），以当前值重新 `mesh_save_network` 后可再加入。
+- 私钥只由运行引擎的进程注入（#408）：引擎无法分辨 `mesh_save_network` 的配置来自哪个进程，网络扩展、VPN 服务收到 App 经进程间通道转来的、带 `node.private_key` 的配置时应拒绝，只用自己专用安全存储中的私钥填入。
 - `mesh_set_subnet_route` 的 `cidr` 须为主机位为零的网段。
 - `mesh_set_dns` 在内网域名接入嵌入式引擎之前返回 `unsupported`；上表 0.4、0.5 的命令与未知的 `mesh_*` 命令返回 `unsupported`。

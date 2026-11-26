@@ -96,7 +96,7 @@ impl RegistryError {
     pub fn answer(self) -> (&'static str, &'static str) {
         match self {
             Self::NotFound => ("not_found", "no saved mesh network of that name"),
-            Self::Closed => ("start_refused", "the mesh engine stopped"),
+            Self::Closed => ("engine_unavailable", "the mesh engine is not running"),
             Self::PrivateKeyRequired => (
                 "invalid_argument",
                 "private_key_required: a managed network needs node.private_key",
@@ -145,6 +145,7 @@ impl Registry {
             return;
         }
         let mut listed: Vec<String> = Vec::new();
+        let profile_id = profile.first().map(|settings| settings.instance_id.clone());
         for settings in profile {
             // The same network twice in one profile: the first counts, so
             // that the second does not replace it at once.
@@ -153,6 +154,21 @@ impl Registry {
             }
             listed.push(settings.network_name.clone());
             self.put(&mut inner, settings, false);
+        }
+        // The profile names this device's instance ID: a saved network the
+        // profile does not list and that carries another one (saved before
+        // the client changed it) is left, not run under a second identity,
+        // until `mesh_save_network` gives it the current one.
+        if let Some(id) = profile_id {
+            for (name, network) in inner.networks.iter_mut() {
+                if network.saved && !listed.contains(name) && network.settings.instance_id != id {
+                    network.joined = false;
+                    network.failure = None;
+                    if let Some(instance) = network.instance.take() {
+                        instance.retire();
+                    }
+                }
+            }
         }
         let gone: Vec<String> = inner
             .networks
@@ -186,12 +202,6 @@ impl Registry {
         }
         self.put(&mut inner, settings, true);
         Ok(())
-    }
-
-    /// Whether `settings` names another `node.instance_id` than a network
-    /// of another name already adopted: a profile with it is refused.
-    pub fn conflicts(&self, settings: &MeshSettings) -> bool {
-        conflicting_instance_id(&self.lock(), settings)
     }
 
     /// The `routesVersion` of `routes` (snapshot `tunnel`): 1 for the
@@ -500,6 +510,52 @@ mod tests {
         registry
             .instance(&settings.network_name, settings)
             .expect("the network runs")
+    }
+
+    #[test]
+    fn a_profile_with_a_new_device_id_leaves_saved_networks_of_the_old_one() {
+        let (_runtime, registry) = registry();
+        let mut saved = settings("lab", "10.147.0.2/24", "legacy");
+        saved.instance_id = Some("device-1".into());
+        registry.save(saved.clone()).unwrap();
+        let old = found(&registry, &saved);
+        let mut office = settings("office", "10.146.0.2/24", "legacy");
+        office.instance_id = Some("device-2".into());
+        registry.commit(vec![office.clone()]);
+        // Kept, but not run under a second identity.
+        assert!(old.is_retired());
+        let lab = registry
+            .networks()
+            .into_iter()
+            .find(|network| network.settings.network_name == "lab")
+            .expect("still saved");
+        assert!(!lab.joined && lab.instance.is_none());
+        found(&registry, &office);
+        // Saved again with the current ID, it runs.
+        saved.instance_id = Some("device-2".into());
+        registry.save(saved.clone()).unwrap();
+        registry.join("lab").unwrap();
+        found(&registry, &saved);
+        // A saved network of the same ID is not touched by a commit.
+        let lab = found(&registry, &saved);
+        registry.commit(vec![office]);
+        assert!(!lab.is_retired());
+    }
+
+    #[test]
+    fn the_routes_version_changes_only_with_the_routes() {
+        let (_runtime, registry) = registry();
+        let a = [IpNet::parse("10.146.0.0/24").unwrap()];
+        let b = [
+            IpNet::parse("10.146.0.0/24").unwrap(),
+            IpNet::parse("192.168.10.0/24").unwrap(),
+        ];
+        assert_eq!(registry.routes_version(&[]), 1);
+        assert_eq!(registry.routes_version(&[]), 1);
+        assert_eq!(registry.routes_version(&a), 2);
+        assert_eq!(registry.routes_version(&a), 2);
+        assert_eq!(registry.routes_version(&b), 3);
+        assert_eq!(registry.routes_version(&a), 4);
     }
 
     #[test]
