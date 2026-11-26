@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn a_key_file_is_written_whole_and_kept() {
-        let dir = std::env::temp_dir().join(format!("mesh-key-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mesh-key-whole-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("office.key");
