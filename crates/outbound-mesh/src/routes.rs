@@ -508,7 +508,20 @@ impl RouteTable {
     /// neighbour for a broadcast or multicast destination. A broadcast or
     /// multicast must come from one of this node's virtual addresses (spec
     /// §15.3); a unicast may also come from a subnet this node advertises.
+    /// With every peer at the same distance; the data path uses
+    /// [`classify_outgoing_by`](Self::classify_outgoing_by).
     pub fn classify_outgoing(&self, packet: &[u8]) -> Result<Outgoing, Denied> {
+        self.classify_outgoing_by(packet, |_| Some(0))
+    }
+
+    /// [`classify_outgoing`](Self::classify_outgoing) choosing among the
+    /// advertisers of a subnet by `hops`, as
+    /// [`lookup_by`](Self::lookup_by) does (spec §15.2, requirement R7).
+    pub fn classify_outgoing_by(
+        &self,
+        packet: &[u8],
+        hops: impl Fn(PeerId) -> Option<u32>,
+    ) -> Result<Outgoing, Denied> {
         let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
         if self.is_flood(addresses.destination) {
             if !self.local.contains(&addresses.source) {
@@ -516,18 +529,28 @@ impl RouteTable {
             }
             return Ok(Outgoing::Neighbours);
         }
-        self.check_outgoing(packet).map(Outgoing::Peer)
+        self.check_outgoing_by(packet, hops).map(Outgoing::Peer)
     }
 
     /// Checks a unicast packet this node is about to send: it must come from
     /// one of this node's virtual addresses or a subnet it advertises, and go
-    /// to a routed intranet address.
+    /// to a routed intranet address. Every peer counts as the same distance.
     pub fn check_outgoing(&self, packet: &[u8]) -> Result<PeerId, Denied> {
+        self.check_outgoing_by(packet, |_| Some(0))
+    }
+
+    /// [`check_outgoing`](Self::check_outgoing) choosing among the
+    /// advertisers of a subnet by `hops` ([`lookup_by`](Self::lookup_by)).
+    pub fn check_outgoing_by(
+        &self,
+        packet: &[u8],
+        hops: impl Fn(PeerId) -> Option<u32>,
+    ) -> Result<PeerId, Denied> {
         let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
         if !self.is_ours(unmap(addresses.source)) {
             return Err(Denied::ForeignSource);
         }
-        self.lookup(addresses.destination)
+        self.lookup_by(addresses.destination, hops)
     }
 
     /// Where a packet the backbone delivered goes (spec §17.3.6): its source
@@ -1187,5 +1210,29 @@ mod tests {
         assert_eq!(table.set_border(&[]), 0);
         assert_eq!(table.lookup(ip("10.20.1.1")), Ok(B));
         assert_eq!(table.check_incoming(A, &to_region), Err(Denied::NotForUs));
+    }
+
+    #[test]
+    fn the_data_path_takes_the_nearest_reachable_advertiser() {
+        let mut table = RouteTable::new(&settings(json!({})));
+        table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.10.0/24")]);
+        table.set_peer(B, &[ip("10.144.144.7")], &[net("192.168.10.0/24")]);
+        let packet = ipv4([10, 144, 144, 5], [192, 168, 10, 9], 0);
+        // Same distance: the smallest node ID.
+        assert_eq!(table.check_outgoing(&packet), Ok(A));
+        // B is nearer although A has the smaller ID (spec §15.2, R7).
+        let hops = |peer: PeerId| Some(if peer == A { 3 } else { 1 });
+        assert_eq!(table.check_outgoing_by(&packet, hops), Ok(B));
+        assert_eq!(
+            table.classify_outgoing_by(&packet, hops),
+            Ok(Outgoing::Peer(B))
+        );
+        // An unreachable advertiser is skipped, however small its ID.
+        let only_b = |peer: PeerId| (peer == B).then_some(4);
+        assert_eq!(table.check_outgoing_by(&packet, only_b), Ok(B));
+        assert_eq!(
+            table.check_outgoing_by(&packet, |_| None),
+            Err(Denied::NoRoute)
+        );
     }
 }
