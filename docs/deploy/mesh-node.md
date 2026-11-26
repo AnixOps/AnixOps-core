@@ -26,7 +26,7 @@
 
 | 对象 | 何时输出 | 字段 |
 | --- | --- | --- |
-| 转发状态 | 启动时一次，在第一条状态行之前 | `ip_forwarding`：`on`（已为通告子网打开本机转发）、`off`（需要转发但没有打开，原因见 `detail`）、`not_needed`（本节点不通告子网，或不是完整节点）；`detail`：字符串或 `null`，只给人看。Linux 的 `run` 目前不改本机转发，通告子网时为 `off`，`detail` 为 `host forwarding is not implemented on this system yet` |
+| 转发状态 | 启动时一次，在第一条状态行之前 | `ip_forwarding`：`on`（已为通告子网打开本机转发）、`off`（需要转发但没有打开，原因见 `detail`）、`not_needed`（本节点不通告子网，或不是完整节点）；`detail`：字符串或 `null`，只给人看。Linux 的 `run` 目前不改本机转发，启动时读一次主机自己的 `net.ipv4.ip_forward` 与 `net.ipv6.conf.all.forwarding`：有局域网接口在通告网段上且该地址族已转发的网段照常通告，此时为 `on`（`detail` 说明用的是主机自己的设置）；其余网段撤销通告并告警 `advertise_withdrawn`，全部撤销时为 `off`。启动后再改这两个设置要重启节点才生效 |
 | 状态行 | 状态变化时，内容不变不重复输出 | `interface`、`peer_id`、`neighbours`、`reachable`、`duplicate_id`、`static_key`、`not_native`、`system_routes`、`local_networks_read`、`foreign_overlaps`（含义见 `docs/architecture/mesh-status.md`） |
 | 等待公钥 | `managed` 网络的 `native_keys` 不含本机时，代替状态行输出一次 | `state`：`not_joined`；`reason`：`native_keys_pending`；`static_key`：本机静态公钥 |
 
