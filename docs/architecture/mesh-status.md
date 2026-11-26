@@ -103,7 +103,7 @@
 | `external_bridge_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级锁 `/run/anixops-mesh-host.lock`（同一主机上另有持锁、声明该能力的进程），因此不声明 `mesh_external_bridge`、不清理桥接表（规范 §15.12 第 9 条）。同时出现在 `GET /v1/mesh` 顶层 `alerts` 与每个网络的 `alerts` 中（没有运行任何网络时只在顶层），进程退出前不消除 |
 | `subnet_router_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级锁 `/run/anixops-mesh-host.lock`，因此不安装子网通告的转发规则、不清理路由表（`docs/architecture/mesh-module.md`「Linux 主机改动」），本机配置的通告子网不发出（不通告无法转发的网段）。出现位置与消除时机同 `external_bridge_lock_held` |
 | `ipv6_forwarding_off` | 告警：Linux 完整节点配置了 IPv6 通告子网，而系统 IPv6 转发未开启。内核不改 IPv6 转发设置，这些 IPv6 子网不通告，IPv4 子网照常；`detail` 列出未通告的网段 |
-| `reverse_zones_truncated` | 告警，不是网络失败：该网络推算出的反向解析区超过 256 个，超出部分不推算、不应答，`detail` 为未推算的区数（规范 §15.9.2 第 1 条） |
+| `reverse_zones_truncated` | 告警，不是网络失败：该网络推算出的反向解析区超过 256 个，超出部分不推算、不应答，`detail` 为未推算的区数，`address`、`peer` 为空串（规范 §15.9.2 第 1 条） |
 
 新增取值属于兼容变更，读取方遇到未知取值按失败处理。
 
