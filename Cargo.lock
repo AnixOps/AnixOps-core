@@ -858,6 +858,7 @@ dependencies = [
  "outbound-http",
  "outbound-hysteria2",
  "outbound-iwan",
+ "outbound-mesh",
  "outbound-mieru",
  "outbound-shadowsocks",
  "outbound-snell",
@@ -2370,10 +2371,12 @@ name = "outbound-mesh"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
+ "engine-outbound",
  "ring",
  "ruzstd",
  "serde",
  "serde_json",
+ "smoltcp",
  "tokio",
  "x25519-dalek",
  "zeroize",

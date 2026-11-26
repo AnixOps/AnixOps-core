@@ -568,12 +568,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for features in "" dns-tls dns-quic http hysteria2 iwan mieru shadowsocks snell socks trojan tuic vless vmess wireguard local-proxy mitm scripts; do
+          for features in "" dns-tls dns-quic http hysteria2 iwan mesh mieru shadowsocks snell socks trojan tuic vless vmess wireguard local-proxy mitm scripts; do
             echo "::group::engine-embedded features=[${features}]"
             cargo clippy --locked -p engine-embedded --no-default-features --features "${features}" --all-targets -- -D warnings
             cargo test --locked -p engine-embedded --no-default-features --features "${features}" --tests
             echo "::endgroup::"
           done
+          # The mesh outbound itself; the workspace build leaves the feature off.
+          echo "::group::outbound-mesh features=[outbound]"
+          cargo clippy --locked -p outbound-mesh --features outbound --all-targets -- -D warnings
+          cargo test --locked -p outbound-mesh --features outbound --lib --test outbound
+          echo "::endgroup::"
 
   mesh-node-static:
     name: Mesh node static build
