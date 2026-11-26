@@ -21,10 +21,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
-use crate::config::{HostGroup, MeshSettings, PeerEndpoint, Role, SecurityMode, Transport};
+use crate::config::{
+    CustomPath, HostGroup, MeshSettings, PathTarget, PeerEndpoint, Role, SecurityMode, Transport,
+};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
 use crate::node::{Action, ConnId, Counters, Node, SyncOversize, WITHDRAW_WAIT};
+use crate::paths::PathStatus;
 use crate::routes::PeerId;
 use crate::secure::noise::KeyPair;
 use crate::wire::tcp::{encode_frame, FrameDecoder};
@@ -143,6 +146,9 @@ pub struct Snapshot {
     pub foreign_overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
+    /// The custom paths and their states, in configuration order (spec
+    /// §17.2.7).
+    pub paths: Vec<PathStatus>,
     /// What this node advertises now (field 5), host group ranges
     /// included (spec §15.7).
     pub advertising: Vec<IpNet>,
@@ -161,12 +167,19 @@ pub struct Snapshot {
     /// Members announcing another static key than the one bound to their
     /// node ID (spec §12.3).
     pub refused_key_changes: Vec<u32>,
+    /// This node's instance ID in the network, as a UUID text.
+    pub instance: String,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Member {
     pub peer_id: u32,
+    /// Its instance ID, as a UUID text; empty before its route information
+    /// arrived.
+    pub instance: String,
+    /// The host name it advertises, if any.
+    pub hostname: Option<String>,
     /// Its virtual addresses, as accepted.
     pub addresses: Vec<IpAddr>,
     /// The subnets it advertises, as accepted.
@@ -176,10 +189,20 @@ pub struct Member {
     pub via: Vec<u32>,
     /// 1 for a direct connection.
     pub hops: u32,
+    /// The fewest hops to it, whatever the path policy; the driver picks
+    /// among the advertisers of a subnet by this count (spec §15.2), while
+    /// `hops` and `via` follow the policy's path.
+    pub fewest_hops: u32,
     /// Round-trip time to a direct neighbour, in milliseconds; `None`
     /// before the first keep-alive answer and for members reached through
     /// relays.
     pub latency_ms: Option<u32>,
+    /// `auto`, `custom`, `first_hop_only` or `fallback`: the state of the
+    /// custom path to this member, if it has one (`mesh-status.md`,
+    /// `members[].pathState`).
+    pub path_state: &'static str,
+    /// The node that path names as unreachable.
+    pub unreachable: Option<IpAddr>,
 }
 
 enum Event {
@@ -266,6 +289,10 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// A new list of custom paths, already validated, which replaces the
+    /// current one at once (spec §17.2.8); the value at start is ignored,
+    /// the settings carry it.
+    pub paths: watch::Receiver<Vec<CustomPath>>,
     /// New `host_groups`, applied without a restart (spec §15.7); the value
     /// at start is ignored, the settings carry it.
     pub host_groups: watch::Receiver<Vec<HostGroup>>,
@@ -311,6 +338,7 @@ pub async fn run(
         snapshots,
         mut local_networks,
         mut native_keys,
+        mut paths,
         mut host_groups,
         mut route_overrides,
         mut foreign_routes,
@@ -335,6 +363,7 @@ pub async fn run(
     };
     let mut from_backbone = from_backbone.lock_owned().await;
     native_keys.mark_unchanged();
+    paths.mark_unchanged();
     host_groups.mark_unchanged();
     let rng = SystemRandom::new();
     let started = Instant::now();
@@ -455,6 +484,11 @@ pub async fn run(
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
                 node.set_native_keys(keys, Instant::now());
+                publish(&snapshots, snapshot(&node, local_read));
+            }
+            Ok(()) = paths.changed() => {
+                let list = paths.borrow_and_update().clone();
+                node.set_paths(list, &rng, Instant::now());
                 publish(&snapshots, snapshot(&node, local_read));
             }
             event = event_rx.recv() => {
@@ -583,6 +617,7 @@ async fn until(at: Option<Instant>) {
 }
 
 fn snapshot(node: &Node, local_read: bool) -> Snapshot {
+    let paths = node.path_status(Instant::now());
     Snapshot {
         peer_id: node.id(),
         neighbours: node.neighbours(),
@@ -610,7 +645,7 @@ fn snapshot(node: &Node, local_read: bool) -> Snapshot {
             .then(|| node.static_public()),
         waiting_for_native_keys: node.waits_for_native_keys(),
         not_native: node.last_not_native(),
-        members: members(node),
+        members: members(node, &paths),
         rejected_advertisements: node.route_table().refused_subnet_count(),
         overlaps: overlaps(node),
         foreign_overlaps: node.foreign_overlaps(),
@@ -620,15 +655,40 @@ fn snapshot(node: &Node, local_read: bool) -> Snapshot {
             .into_iter()
             .map(|(peer, address)| (peer.0, address))
             .collect(),
+        paths,
         advertising: node.advertising().to_vec(),
         standing_in: node.standing_in().to_vec(),
         withdrawing: node.is_withdrawn(),
         border: node.route_table().border().to_vec(),
+        instance: node.own_info().inst_id.to_string(),
     }
 }
 
-fn members(node: &Node) -> Vec<Member> {
+/// `members[].pathState` and `unreachable` of a member with these
+/// addresses: those of the `to_peer` path to it, if any. `active` is shown
+/// as `custom` and `pending` as `auto`; a member that only a `to_subnet`
+/// path covers stays `auto`.
+fn member_path_state(paths: &[PathStatus], addresses: &[IpAddr]) -> (&'static str, Option<IpAddr>) {
+    let path = paths.iter().find(|path| match path.target {
+        PathTarget::Peer(address) => addresses.contains(&address),
+        PathTarget::Subnet(_) => false,
+    });
+    match path {
+        None => ("auto", None),
+        Some(path) => {
+            let state = match path.state {
+                "active" => "custom",
+                "pending" => "auto",
+                other => other,
+            };
+            (state, path.unreachable)
+        }
+    }
+}
+
+fn members(node: &Node, paths: &[PathStatus]) -> Vec<Member> {
     let table = node.route_table();
+    let fewest = node.fewest_hops();
     node.paths()
         .into_iter()
         .map(|(peer, route)| {
@@ -646,13 +706,22 @@ fn members(node: &Node) -> Vec<Member> {
                 None
             };
             let latency_ms = rtt.map(|rtt| u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
+            let (path_state, unreachable) = member_path_state(paths, &addresses);
+            let info = node.peer_info(peer);
             Member {
                 peer_id: peer,
+                instance: info
+                    .map(|info| info.inst_id.to_string())
+                    .unwrap_or_default(),
+                hostname: info.and_then(|info| info.hostname.clone()),
                 addresses,
                 subnets,
                 via,
                 hops: route.hops,
+                fewest_hops: fewest.get(&peer).copied().unwrap_or(route.hops),
                 latency_ms,
+                path_state,
+                unreachable,
             }
         })
         .collect()
@@ -1159,6 +1228,47 @@ mod tests {
         config.validate().unwrap()
     }
 
+    #[test]
+    fn a_member_takes_the_state_of_its_to_peer_path() {
+        let ip = |text: &str| -> IpAddr { text.parse().unwrap() };
+        let path = |target, state, unreachable| PathStatus {
+            id: String::new(),
+            target,
+            via: vec![ip("10.144.0.3")],
+            state,
+            reason: None,
+            unreachable,
+        };
+        let seven = PathTarget::Peer(ip("10.144.0.7"));
+        let subnet = PathTarget::Subnet(IpNet::parse("192.168.10.0/24").unwrap());
+        let of = |state, unreachable| {
+            member_path_state(
+                &[
+                    path(subnet, "fallback", None),
+                    path(seven, state, unreachable),
+                ],
+                &[ip("10.144.0.7")],
+            )
+        };
+        assert_eq!(of("active", None), ("custom", None));
+        assert_eq!(of("pending", None), ("auto", None));
+        assert_eq!(
+            of("first_hop_only", Some(ip("10.144.0.4"))).0,
+            "first_hop_only"
+        );
+        assert_eq!(
+            of("fallback", Some(ip("10.144.0.3"))),
+            ("fallback", Some(ip("10.144.0.3")))
+        );
+        // Another member, a node only a subnet path covers, and no paths.
+        let paths = [path(seven, "active", None), path(subnet, "active", None)];
+        assert_eq!(
+            member_path_state(&paths, &[ip("10.144.0.8")]),
+            ("auto", None)
+        );
+        assert_eq!(member_path_state(&[], &[ip("10.144.0.7")]), ("auto", None));
+    }
+
     struct Running {
         to_mesh: mpsc::Sender<Vec<u8>>,
         from_mesh: mpsc::Receiver<Vec<u8>>,
@@ -1184,6 +1294,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (local_tx, local_networks) = watch::channel(local);
         let (_, native_keys) = watch::channel(None);
+        let (_, paths) = watch::channel(Vec::new());
         let (_, host_groups) = watch::channel(Vec::new());
         let (_, route_overrides) = watch::channel(Vec::new());
         let (_, foreign_routes) = watch::channel(Vec::new());
@@ -1197,6 +1308,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                paths,
                 host_groups,
                 route_overrides,
                 foreign_routes,
@@ -1424,6 +1536,7 @@ mod tests {
         let (_local, local_networks) = watch::channel(Some(Vec::new()));
         let (_keys, native_keys) = watch::channel(None);
         let (_groups, host_groups) = watch::channel(Vec::new());
+        let (_paths, paths) = watch::channel(Vec::new());
         let (_overrides, route_overrides) = watch::channel(Vec::new());
         let (_foreign, foreign_routes) = watch::channel(Vec::new());
         let task = tokio::spawn(run(
@@ -1436,6 +1549,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                paths,
                 host_groups,
                 route_overrides,
                 foreign_routes,
@@ -1551,6 +1665,7 @@ mod tests {
         let (_keep_networks, local_networks) = watch::channel(Some(Vec::new()));
         let (_keep_keys, native_keys) = watch::channel(None);
         let (_keep_groups, host_groups) = watch::channel(Vec::new());
+        let (_keep_paths, paths) = watch::channel(Vec::new());
         let (_keep_overrides, route_overrides) = watch::channel(Vec::new());
         let (_keep_routes, foreign_routes) = watch::channel(Vec::new());
         let task = tokio::spawn(run(
@@ -1563,6 +1678,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                paths,
                 host_groups,
                 route_overrides,
                 foreign_routes,
