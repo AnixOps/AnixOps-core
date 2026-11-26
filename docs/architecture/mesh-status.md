@@ -154,6 +154,7 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `invalid_kind` | 面板下发的 `network.kind` 不是 `managed` 或 `legacy`：Agent 扣下该网络，不交给内核 |
 | `peer_not_native` | 由内核 `failure.code = peer_not_native` 转来，另带 `peer`（内核给出的 `detail`，被拒对端的节点 ID） |
 | `external_bridge_unsupported` | 网络带 `external_bridge`，但内核 `features` 不含 `mesh_external_bridge`：Agent 照常下发该网络，去掉 `external_bridge` 节，并对该网络上报此告警（面板 #647 审计 M-2，anix-agent #203） |
+| `paths_unsupported` | 网络配置了 `routing.paths`，但内核 `features` 不含 `mesh_paths`：Agent 对该网络下发 `routing.paths = []`，其余配置照常，并对该网络上报此告警（anix-agent #211） |
 
 `mesh.status` 中每个网络的 `externalBridge` 有三种情况（anix-agent #202 审计 M1、#203）：
 
