@@ -34,6 +34,7 @@
 //!   management API (`/v1/mesh`), and the trait that API drives the mesh
 //!   through.
 
+pub mod bridge;
 pub mod config;
 #[cfg(feature = "runtime")]
 pub mod driver;

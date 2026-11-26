@@ -188,9 +188,29 @@ impl RouteTable {
             .flat_map(|routes| routes.subnets.iter().copied())
             .filter(|subnet| self.routable(subnet))
             .collect();
-        routes.sort_by_key(|subnet| subnet.to_string());
+        routes.sort_by_key(order);
         routes.dedup();
         routes
+    }
+
+    /// The routed subnets of each member, each list in address order
+    /// without repeats, for choosing system routes member by member.
+    pub fn system_routes_by_peer(&self) -> BTreeMap<PeerId, Vec<IpNet>> {
+        self.peers
+            .iter()
+            .map(|(peer, routes)| {
+                let mut subnets: Vec<IpNet> = routes
+                    .subnets
+                    .iter()
+                    .copied()
+                    .filter(|subnet| self.routable(subnet))
+                    .collect();
+                subnets.sort_by_key(order);
+                subnets.dedup();
+                (*peer, subnets)
+            })
+            .filter(|(_, subnets)| !subnets.is_empty())
+            .collect()
     }
 
     fn routable(&self, subnet: &IpNet) -> bool {
@@ -513,6 +533,12 @@ fn unmap(address: IpAddr) -> IpAddr {
             .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
+}
+
+/// Subnets in address order, then by prefix length: a stable order that
+/// does not depend on how the text was written.
+fn order(subnet: &IpNet) -> (IpAddr, u8) {
+    (subnet.network(), subnet.prefix())
 }
 
 #[cfg(test)]
