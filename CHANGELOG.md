@@ -21,6 +21,7 @@
 
 ### Security
 
+- 组网自定义路径（规范 §17.2，内核 0.5，尚未审计）在默认配置下对远端不可达：新增 `node.waypoint_relay`（默认 `false`，需要 `node.relay`）。为 `false` 且网络没有 `routing.paths` 时，节点对 `MeshPathRpc` 回 Error 3，丢弃全部类型 40 包并计数；只有打开该开关的节点才作为途经点（`Capabilities.relay`）。
 - anixops-mesh 接管按 #330 复审修复（mesh-node `winstart`、`takeover`）：用户注销后回滚登录自启项时，临时加载该用户的 `NTUSER.DAT` 恢复后卸载，加载不了则该步骤失败并保留，不再当作「已被他人改动」而静默留在关闭状态（L1）；停用计划任务前导出任务定义存入记录，回滚后比较，不同时在报告中注明（L3）；文档写明未检测的自启位置（L2）。L4、L5 留待下一个小版本。
 
 - anixops-mesh 接管按 #329 复审修复（mesh-node `detect`、`takeover`、`host`、`winsvc`、`launchd`，三个安装脚本）：K1 数据来源按所运行的系统选择，Windows 上不再读取 `/proc`、`/etc`、`/var/spool/cron`、`/run/systemd`（在 Windows 上是任何用户可建的 `C:\proc` 等目录，可伪造进程、自启行与导入配置）；K2 Windows 安装脚本对 `%ProgramData%\AnixOps`、`Mesh`、`state` 逐级拒绝链接与非管理员属主，属主设为 Administrators 并整体替换访问列表，程序在 Windows 上读写状态与锁之前逐级检查目录属主、访问列表与联接；K3 macOS 程序改放 `/Library/AnixOps/mesh/bin`；K4 Windows 记录手动进程的 SID，回滚账户不同时不启动；K5 包装服务与 K6 launchd 任务按进程树认领进程；K7 缺少延迟启动标志时从注册表读取；K8 安装脚本区分退出码 1 与 7、文档修正、补 `save record` 测试与 Windows 状态目录的实机测试。
