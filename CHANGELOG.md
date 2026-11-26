@@ -4,6 +4,31 @@
 
 ## Unreleased
 
+## v0.3.0-rc.1 - 2026-11-26
+
+内核 0.3 的第一个候选版，从维护分支 `release/0.3` 发布（分支切自 `main` 的 `9197d59`），随客户端 1.1 验收。0.3 的组网范围：互通、TCP/UDP、前向保密、只走内网、成员与子网视图、内网域名。兼容性承诺见 [docs/compatibility-surface.md](docs/compatibility-surface.md)，候选版流程见 [docs/release-strategy.md](docs/release-strategy.md#版本节奏与候选版)。以下为自 `v0.2.0` 以来的全部变更。
+
+### 从 0.2.0 升级
+
+- 仓库拆分：客户端迁到 AnixOps/anixops-net，本仓库只发布 Linux CLI（`networkcore-linux`）、`anixops-mesh` 与 `anixcore` 相关产物；客户端以 git 提交固定引用内核 crate，升级时把固定提交改到本候选版的提交。
+- 不再内置第三方内核与预设规则：`networkcore-linux` 删除 `install-sing-box`/`sing-box install`、`core install|start|stop|status mieru`、`node switch`、`node health`，`run-url`/`run-catalog` 去掉 `--engine`、`--install-dir`、`--force`、`--binary`、`--sha256`；内置引擎不支持的节点直接报错。`engine-embedded::profile::RoutingMode` 只剩 `rule`/`direct`；MITM 不带内置插件，需要时用 `--mitm-plugin <path>` 加载用户插件。依赖这些命令或参数的脚本需要改写。
+- Windows 托管配置与状态里旧的 `tunnel` 字段被忽略；旧版本拉起的隧道进程需先用旧版本停止。
+- `/v1/mesh` 只新增字段，唯一收紧的是 `dns.suffix`：必须在 `internal` 之下且至少两个标签（`home.arpa`、单独的 `internal` 会使整份配置返回 400）。管理接口请求体上限为 32 MiB。
+- `anixops-mesh run` 失败时 stderr 最后一行：启动冲突为 `{"error":"conflict","conflict":"port_in_use"|"tun_in_use","detail"}`，其他运行错误为 `"error":"runtime"`；退出码不变。`run` 启动时输出 `ip_forwarding` 对象（[docs/deploy/mesh-node.md](docs/deploy/mesh-node.md)「`run` 的输出」）。
+- 指纹包：带 `hybrid_x25519` 的指纹包会被 0.2.0 整包拒绝，含 Firefox 指纹的包需按接收方版本分别下发（见下文 Fixed 中 `tls-mimic` 一条）。
+- 回退：候选版验收用脱敏的 0.2.0 配置实际验证加载、启动、连接与回退到 0.2.0，验证结果与回退步骤写入 `v0.3.0` 正式版说明。用 `anixops-mesh takeover` 接管过的设备，回退前先运行 `anixops-mesh rollback`。
+
+### 未启用与未审计功能
+
+以下功能已在代码中，但默认关闭、未纳入本轮审计，不属于 0.3 的承诺范围（[docs/compatibility-surface.md](docs/compatibility-surface.md) 第 7 节）。默认配置下组网能力正好是 `mesh`、`mesh_dns`、`mesh_resolver_address`、`mesh_native_keys`，有防回归测试固定。
+
+- 组网区域间骨干（`mesh_backbone`）、外部网络桥接（`mesh_external_bridge`）、自定义路径与途经点中继（`mesh_paths`、`node.waypoint_relay`）、区域测量（`mesh_regions`）、宿主组（`mesh_host_groups`）：`anixcore` 运维开关默认 `false`，关闭时不声明能力，带对应配置的 `PUT /v1/mesh` 整份返回 400。
+- 嵌入式引擎的 `"type": "mesh"` 出站（`engine-embedded` feature `mesh`）不在默认 feature 中。
+- 上述开关只约束 `anixcore` 受管组网。独立运行的 `anixops-mesh run` 按本地配置原样应用，不受这些开关约束；只有在本地配置里写了对应字段才会启用。
+- macOS 与 Windows 版 `anixops-mesh` 为实验性，未审计。
+- 内网域名的解析地址依赖面板为它保留（审计 L-5），需要与支持保留的面板版本一起使用。
+- 本轮审计的低危遗留项在 0.3.x 补丁中处理，不阻断本候选版。
+
 ### Mesh
 
 - 宿主组默认关闭（0.3 RC 门槛，审计结论：宿主组属内核 0.4）：`anixcore` 新增运维开关 `mesh_host_groups`（默认 `false`）。关闭时不声明 `mesh_host_groups`（设备模式同样不声明），任一网络带非空 `host_groups` 的 `PUT /v1/mesh` 整份返回 400（`host_groups_disabled`），node-runtime 与受管组网两层拦截，运行中的网络不变，组地址段不通告、不进入 DNS 应答与反向区。`mesh-status.md` 把 `mesh_resolver_address` 更正为 0.3 能力。
