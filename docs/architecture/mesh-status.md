@@ -75,7 +75,7 @@
 | `self.regionSuggestion`（0.4） | `null`，或 `{ "region", "currentMedianMs", "suggestedMedianMs", "since" }`：规范 §15.8 第 5 条的迁移建议，`region` 为建议的地区代码，两项为最近一次测量的中位 RTT（整数毫秒），`since` 为条件开始连续成立的时间（RFC 3339，UTC）。条件不再成立、已有 `pending` 申请或节点已在该地区时为 `null`。只是提示，不会自动迁移 |
 | `suggestedSubnets` | `[{ "cidr", "interface", "public" }]`：只在桌面与服务器的完整节点给出；`public` 为 `true` 的不可通告 |
 | `ipForwarding` | `on`、`off`、`not_needed`；只在完整节点给出 |
-| `tunnel.routes` | 应进入隧道的网段（CIDR 列表）：所有已加入网络的虚拟网段，加上当前路由到组网的通告子网（与本机网络冲突、内网范围外、或用户设为 `local` 的不在内），再按 `routing.system_routes` 限制。去重，顺序稳定 |
+| `tunnel.routes` | 应进入隧道的网段（CIDR 列表）：所有已加入网络的虚拟网段，加上当前路由到组网的通告子网（与本机网络冲突、内网范围外、或用户设为 `local` 的不在内），再按 `routing.system_routes` 限制。本机网卡网段在网络启动后成功读取之前，通告子网一律不列入（规范 §15.4）。去重，顺序稳定 |
 | `tunnel.routesVersion` | 整数，`routes` 每变一次加一；引擎重启后从 1 起 |
 | `names[]` | `{ "name", "addresses": [地址], "source": "panel" \| "member", "duplicate", "answerable" }`：本网络的内网域名名单（不含后缀），一个名字的每种来源各一条。`duplicate` 为 `true` 时该名对应多个成员或条目，解析返回全部地址，下发来源在前（需求 R28）；同名中有 `member` 来源时界面提示可能冒名。`answerable` 为 `false` 时地址不在可应答的网段内，不会应答。`source` 以后可能出现 `backbone`、`gateway`，按 `other` 处理 |
 | `refusedNames[]` | `{ "name", "address", "reason": "not_intranet" \| "invalid_name" }`：配置里跳过的名字条目，原因分别为地址在内网范围外、名字不是规范化后的 `名.地区代码` |
