@@ -102,6 +102,14 @@ pub enum FailureCode {
     PeerNotNative,
     PortInUse,
     TunInUse,
+    /// The virtual subnet overlaps one another network of this node runs
+    /// on; `detail` is the subnet.
+    RouteOverlap,
+    /// The virtual address is one another network of this node uses.
+    AddressInUse,
+    /// None of the configured peers has been reached since the network
+    /// started.
+    UnreachablePeers,
     PermissionDenied,
     /// Any other reason the network could not start.
     StartRefused,

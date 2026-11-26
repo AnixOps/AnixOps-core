@@ -1115,11 +1115,22 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
     // Objects of the same network left by earlier processes (the stem and
     // an eight-digit identifier) are replaced: only one process holds the
     // host at a time, so they are leftovers.
-    const NAT_ADD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
-$pattern = '^' + [regex]::Escape($env:ANIX_MESH_NAT_STEM) + '[0-9a-f]{8}$'
-Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch $pattern } | Remove-NetNat -Confirm:$false
-New-NetNat -Name $env:ANIX_MESH_NAT -InternalIPInterfaceAddressPrefix $env:ANIX_MESH_NAT_PREFIX | Out-Null
-"#;
+    /// The match for this network's WinNAT objects of earlier runs: its
+    /// stem followed by exactly one 8-hex-digit instance, so that another
+    /// network whose name extends this one's never matches. Shared by
+    /// [`NAT_ADD_SCRIPT`] and its test.
+    macro_rules! nat_pattern {
+        () => {
+            "$pattern = '^' + [regex]::Escape($env:ANIX_MESH_NAT_STEM) + '[0-9a-f]{8}$'\n"
+        };
+    }
+
+    const NAT_ADD_SCRIPT: &str = concat!(
+        "$ErrorActionPreference = 'Stop'\n",
+        nat_pattern!(),
+        "Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch $pattern } | Remove-NetNat -Confirm:$false\n",
+        "New-NetNat -Name $env:ANIX_MESH_NAT -InternalIPInterfaceAddressPrefix $env:ANIX_MESH_NAT_PREFIX | Out-Null\n",
+    );
 
     const NAT_REMOVE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq $env:ANIX_MESH_NAT } | Remove-NetNat -Confirm:$false
@@ -1268,6 +1279,37 @@ Get-NetNat -ErrorAction SilentlyContinue |
             assert!(parse_guid("01234567-89ab-cdef-0001-0203040506ff").is_none());
             assert!(parse_guid("{0123456-89ab-cdef-0001-0203040506ff}").is_none());
             assert!(parse_guid("{0123456g-89ab-cdef-0001-0203040506ff}").is_none());
+        }
+
+        /// Runs the add script's own match in PowerShell, not a copy of it.
+        fn script_matches(name: &str, network: &str) -> bool {
+            let script = concat!(
+                "$ErrorActionPreference = 'Stop'\n",
+                nat_pattern!(),
+                "if ($env:ANIX_TEST_NAME -cmatch $pattern) { exit 0 } else { exit 1 }\n",
+            );
+            run_script(
+                script,
+                &[
+                    ("ANIX_MESH_NAT_STEM", nat_stem(network)),
+                    ("ANIX_TEST_NAME", name.to_owned()),
+                ],
+                "no match",
+            )
+            .is_ok()
+        }
+
+        #[test]
+        fn the_add_script_removes_only_this_networks_leftovers() {
+            assert!(script_matches(&nat_name("office", "1a2b3c4d"), "office"));
+            assert!(!script_matches(&nat_name("office-1", "1a2b3c4d"), "office"));
+            assert!(!script_matches(&nat_name("office", "1a2b3c4d"), "office-1"));
+            // A label with regex metacharacters is matched literally.
+            assert!(script_matches(&nat_name("a.b", "0000ffff"), "a.b"));
+            assert!(!script_matches(
+                &format!("{}x", nat_name("office", "1a2b3c4d")),
+                "office"
+            ));
         }
 
         #[test]

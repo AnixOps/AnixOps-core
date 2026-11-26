@@ -48,7 +48,7 @@ impl MeshControl for FakeMesh {
             self.applied.lock().unwrap().push(
                 networks
                     .iter()
-                    .map(|n| (n.tag.clone(), n.settings.network_secret.clone()))
+                    .map(|n| (n.tag.clone(), (*n.settings.network_secret).clone()))
                     .collect(),
             );
             let status = ManagedStatus {
