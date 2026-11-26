@@ -125,8 +125,13 @@ struct PutBody {
     networks: Vec<Map<String, Value>>,
     #[serde(default)]
     backbone: Option<Value>,
-    #[serde(default)]
+    /// `Some(Value::Null)` for `"region": null`, unlike a missing key.
+    #[serde(default, deserialize_with = "present")]
     region: Option<Value>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// A validated `PUT /v1/mesh` body.
