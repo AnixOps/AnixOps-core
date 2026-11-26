@@ -993,12 +993,6 @@ mod tests {
     async fn two_nodes(transport: Transport) {
         let mut server = settings("10.144.0.1/24", "full");
         server.peers.clear();
-        // Port 0 is refused in a configuration; a test binds any free one.
-        server.listen = vec![ListenConfig {
-            transport: Transport::Tcp,
-            port: 0,
-            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        }];
         server.listen = vec![ListenConfig {
             transport,
             port: 0,
@@ -1099,6 +1093,12 @@ mod tests {
             .validate()
             .unwrap();
         server.peers.clear();
+        // Port 0 is refused in a configuration; a test binds any free one.
+        server.listen = vec![ListenConfig {
+            transport: Transport::Tcp,
+            port: 0,
+            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        }];
         let listeners = Listeners::bind(&server).await.unwrap();
         let port = listeners.local_addrs().unwrap()[0].1.port();
         let mut client = settings("10.144.0.2/24", "full");
