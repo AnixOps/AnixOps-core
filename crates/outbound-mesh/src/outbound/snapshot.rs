@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn no_secret_is_in_the_snapshot() {
         let mut settings = settings("managed", true);
-        settings.private_key = Some(zeroize::Zeroizing::new([7; 32]));
+        settings.private_key = Some(Box::new(zeroize::Zeroizing::new([7; 32])));
         let view = NetworkView {
             settings: &settings,
             joined: None,

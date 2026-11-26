@@ -467,7 +467,7 @@ impl Registry {
     ) {
         let settings = &network.settings;
         let key = match &settings.private_key {
-            Some(private) => KeyPair::from_private(**private),
+            Some(private) => KeyPair::from_private(***private),
             None if settings.kind == NetworkKind::Managed => {
                 network.failure = Some(Failure::PrivateKeyRequired);
                 return;
@@ -497,9 +497,9 @@ impl Registry {
 
 /// Whether another network that has an instance now carries another
 /// device ID than `settings`. A network that is left, or stopped for its
-/// ID, does not count: it runs under no identity. A network without an ID
-/// (`legacy`, the node then has a random one per network) conflicts with
-/// none.
+/// ID, does not count: it runs under no identity. A network configured
+/// without an ID, of either kind, conflicts with none: the node then has
+/// a random one for that network only.
 fn conflicting_instance_id(inner: &Inner, settings: &MeshSettings) -> bool {
     let Some(id) = settings.instance_id.as_deref() else {
         return false;
@@ -848,7 +848,7 @@ mod tests {
     fn the_reported_settings_leave_out_the_private_key() {
         let (_runtime, registry) = registry();
         let mut office = settings("office", "10.156.0.2/24", "legacy");
-        office.private_key = Some(zeroize::Zeroizing::new([7; 32]));
+        office.private_key = Some(Box::new(zeroize::Zeroizing::new([7; 32])));
         registry.commit(vec![office.clone()]);
         assert!(registry.networks()[0].settings.private_key.is_none());
         assert!(registry.instance("office", &office).is_ok());
