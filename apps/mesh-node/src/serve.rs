@@ -601,7 +601,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
     // The key the configuration carries (from the system key store), or
     // the one kept next to the configuration.
     let static_key = match &settings.private_key {
-        Some(private) => KeyPair::from_private(**private),
+        Some(private) => KeyPair::from_private_ref(private),
         None => static_key(&key_path(path))?,
     };
     runtime.block_on(async move {
