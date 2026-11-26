@@ -10,7 +10,7 @@ use std::time::Duration;
 use node_runtime::{api, default_registry, Node};
 use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, ManagedBackbone, ManagedNetwork, ManagedNetworkStatus,
-    ManagedPeer, ManagedStatus, MeshControl,
+    ManagedPeer, ManagedStatus, MeshControl, RegionProbeStatus,
 };
 use outbound_mesh::IpNet;
 use serde_json::{json, Value};
@@ -33,19 +33,47 @@ struct FakeMesh {
     backbones: Mutex<Vec<Option<u32>>>,
     /// Does not list `mesh_backbone`, as a node with the backbone off.
     no_backbone: bool,
+    /// Lists `mesh_region_probe`, as a node with regions on.
+    regions: bool,
+    /// Lists `mesh_host_groups`, as a node with host groups on.
+    host_groups: bool,
+    /// Reports a `region_probe` whatever it was handed, so that a test can
+    /// tell the management API keeps it out while regions are off.
+    reports_probe: bool,
+    /// Every `set_region` call: whether it carried a region object.
+    regions_set: Mutex<Vec<bool>>,
 }
 
 impl MeshControl for FakeMesh {
     fn features(&self) -> Vec<&'static str> {
-        if self.no_backbone {
+        let mut features = if self.no_backbone {
             vec!["mesh", "mesh_dns"]
         } else {
             vec!["mesh", "mesh_dns", "mesh_backbone"]
+        };
+        if self.regions {
+            features.push("mesh_region_probe");
         }
+        if self.host_groups {
+            features.push("mesh_host_groups");
+        }
+        features
     }
 
     fn status(&self) -> ManagedStatus {
-        self.running.lock().unwrap().clone()
+        let mut status = self.running.lock().unwrap().clone();
+        if self.reports_probe {
+            status.region_probe = Some(RegionProbeStatus::default());
+        }
+        status
+    }
+
+    fn set_region(
+        &self,
+        region: Option<outbound_mesh::region::directory::RegionSection>,
+    ) -> BoxFuture<'_, ()> {
+        self.regions_set.lock().unwrap().push(region.is_some());
+        Box::pin(async {})
     }
 
     fn apply(
@@ -355,9 +383,145 @@ async fn a_region_object_needs_the_region_probe_feature() {
     });
     let (status, raw, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
     assert_eq!(status, 400, "{answer}");
-    assert!(answer["error"].as_str().unwrap().starts_with("region"));
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("regions_disabled: region"),
+        "{answer}"
+    );
     assert!(!raw.contains(SECRET), "{raw}");
     assert!(mesh.applied.lock().unwrap().is_empty());
+    assert!(mesh.regions_set.lock().unwrap().is_empty());
+}
+
+fn grouped(tag: &str, name: &str, address: &str) -> Value {
+    let mut network = network(tag, name, address);
+    network["host_groups"] = json!([
+        {"cidr": "10.127.1.0/24", "gateway": "gw-a", "backup_gateway": "gw-b"}
+    ]);
+    network
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_with_host_groups_off_refuses_them_and_keeps_its_networks() {
+    let mesh = Arc::new(FakeMesh::default());
+    let api = start_api(Some(mesh.clone())).await;
+    let (_, _, status) = call(api, "GET", "/v1/status", None).await;
+    assert!(!features(&status).contains(&"mesh_host_groups".to_owned()));
+
+    let body = json!({"networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")]});
+    let (status, _, before) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 200, "{before}");
+
+    // A valid body whose second network carries a group: refused as a
+    // whole, nothing reaches the mesh, the running network stays.
+    let body = json!({"networks": [
+        network("mesh-cn", "mesh-cn", "10.150.0.5/16"),
+        grouped("mesh-eu", "mesh-eu", "10.151.0.5/16")
+    ]});
+    let (status, raw, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("host_groups_disabled: networks[1].host_groups"),
+        "{answer}"
+    );
+    assert!(!raw.contains(SECRET), "{raw}");
+    assert_eq!(mesh.applied.lock().unwrap().len(), 1);
+    let (status, _, after) = call(api, "GET", "/v1/mesh", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(after, before);
+
+    // An empty list is no group: taken.
+    let mut empty = network("mesh-cn", "mesh-cn", "10.150.0.5/16");
+    empty["host_groups"] = json!([]);
+    let (status, _, answer) =
+        call(api, "PUT", "/v1/mesh", Some(json!({"networks": [empty]}))).await;
+    assert_eq!(status, 200, "{answer}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_with_host_groups_on_takes_them() {
+    let mesh = Arc::new(FakeMesh {
+        host_groups: true,
+        ..FakeMesh::default()
+    });
+    let api = start_api(Some(mesh.clone())).await;
+    let (_, _, status) = call(api, "GET", "/v1/status", None).await;
+    assert!(features(&status).contains(&"mesh_host_groups".to_owned()));
+    let body = json!({"networks": [grouped("mesh-cn", "mesh-cn", "10.150.0.5/16")]});
+    let (status, _, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(mesh.applied.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_with_regions_off_refuses_the_object_and_gives_no_region_probe() {
+    let mesh = Arc::new(FakeMesh {
+        reports_probe: true,
+        ..FakeMesh::default()
+    });
+    let api = start_api(Some(mesh.clone())).await;
+    let (_, _, status) = call(api, "GET", "/v1/status", None).await;
+    assert!(!features(&status).contains(&"mesh_region_probe".to_owned()));
+
+    let body = json!({"networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")]});
+    let (status, _, before) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(before["region_probe"], Value::Null, "{before}");
+
+    // With an object, and with `null`: refused as a whole, nothing reaches
+    // the mesh, the running network stays.
+    for region in [
+        json!({ "current": "cn", "basis": "admin", "directory": null }),
+        Value::Null,
+    ] {
+        let body = json!({
+            "networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")],
+            "region": region
+        });
+        let (status, raw, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+        assert_eq!(status, 400, "{answer}");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("regions_disabled"),
+            "{answer}"
+        );
+        assert!(!raw.contains(SECRET), "{raw}");
+    }
+    assert_eq!(mesh.applied.lock().unwrap().len(), 1);
+    assert!(mesh.regions_set.lock().unwrap().is_empty());
+    let (status, _, after) = call(api, "GET", "/v1/mesh", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(after["region_probe"], Value::Null, "{after}");
+    assert_eq!(after, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_with_regions_on_takes_the_object_and_gives_its_region_probe() {
+    let mesh = Arc::new(FakeMesh {
+        regions: true,
+        reports_probe: true,
+        ..FakeMesh::default()
+    });
+    let api = start_api(Some(mesh.clone())).await;
+    let (_, _, status) = call(api, "GET", "/v1/status", None).await;
+    assert!(features(&status).contains(&"mesh_region_probe".to_owned()));
+    let body = json!({
+        "networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")],
+        "region": { "current": "cn", "basis": "admin", "directory": null }
+    });
+    let (status, _, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 200, "{answer}");
+    assert!(answer["region_probe"].is_object(), "{answer}");
+    assert_eq!(*mesh.regions_set.lock().unwrap(), [true]);
+    let (_, _, after) = call(api, "GET", "/v1/mesh", None).await;
+    assert!(after["region_probe"].is_object(), "{after}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

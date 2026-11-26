@@ -61,6 +61,22 @@ the config sets `"mesh_paths": true`. Off, `GET /v1/status` does not list
 standalone `anixops-mesh run` does not follow this switch: it applies its
 config file as written.
 
+Regions (the top-level `region` object: the region measurement and a
+border node's probe responder) stay off unless the config sets
+`"mesh_regions": true`. Off, `GET /v1/status` does not list
+`mesh_region_probe`, a `PUT /v1/mesh` body carrying `region` (even `null`)
+is refused as a whole with 400 (`regions_disabled`), leaving the running
+networks as they are, and `region_probe` is always `null`. The standalone
+`anixops-mesh run` has no `region` object to take.
+
+Host groups (a network's `host_groups`) stay off unless the config sets
+`"mesh_host_groups": true`. Off, `GET /v1/status` does not list
+`mesh_host_groups` and a `PUT /v1/mesh` body any of whose networks carries
+a non-empty `host_groups` is refused as a whole with 400
+(`host_groups_disabled`), leaving the running networks as they are. The
+standalone `anixops-mesh run` does not follow this switch: it applies the
+`host_groups` of its config file as written.
+
 Users may carry `"speed_limit"` (Mbit/s for each direction, shared by all
 of the user's connections) and `"device_limit"` (most client IPs online at
 once); both default to 0, no limit.

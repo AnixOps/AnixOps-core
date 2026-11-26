@@ -118,6 +118,19 @@ pub struct NodeConfig {
     /// or sent for a path.
     #[serde(default)]
     pub mesh_paths: bool,
+    /// Turns on regions of managed networks (appendix D.9: the region
+    /// measurement and, on a border node, the probe responder). Off by
+    /// default: the node then does not list `mesh_region_probe`, refuses a
+    /// `PUT /v1/mesh` body that carries a top-level `region` object
+    /// (`regions_disabled`) and gives no `region_probe`.
+    #[serde(default)]
+    pub mesh_regions: bool,
+    /// Turns on host groups of managed networks (`host_groups`, spec
+    /// §15.7). Off by default: the node then does not list
+    /// `mesh_host_groups` and refuses a `PUT /v1/mesh` body whose networks
+    /// carry a non-empty `host_groups` (`host_groups_disabled`).
+    #[serde(default)]
+    pub mesh_host_groups: bool,
 }
 
 /// Has no `Debug`: `token` is a credential.
@@ -355,6 +368,34 @@ mod tests {
                 "{listen}"
             );
         }
+    }
+
+    #[test]
+    fn regions_are_off_unless_the_config_turns_them_on() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.mesh_regions);
+        let config: NodeConfig =
+            serde_json::from_value(serde_json::json!({"mesh_regions": true})).unwrap();
+        assert!(config.mesh_regions);
+    }
+
+    /// Every operator switch of a later kernel version is off when the
+    /// config does not name it.
+    #[test]
+    fn every_mesh_switch_is_off_by_default() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.mesh_external_bridge);
+        assert!(!config.mesh_backbone);
+        assert!(!config.mesh_paths);
+        assert!(!config.mesh_regions);
+        assert!(!config.mesh_host_groups);
+    }
+
+    #[test]
+    fn host_groups_are_off_unless_the_config_turns_them_on() {
+        let config: NodeConfig =
+            serde_json::from_value(serde_json::json!({"mesh_host_groups": true})).unwrap();
+        assert!(config.mesh_host_groups);
     }
 
     #[test]

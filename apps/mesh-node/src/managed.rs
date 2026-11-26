@@ -79,21 +79,34 @@ use outbound_mesh::region::directory::RegionSection;
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-/// `mesh_host_groups`: the `host_groups` section (spec §15.7).
-/// `mesh_region_probe`: `PUT /v1/mesh` takes the top-level `region` object
-/// and `GET /v1/mesh` gives `region_probe` (appendix D.9); every list below
-/// has it. [`PATHS_FEATURE`] is added only when the operator turned custom
-/// paths on ([`ManagedMesh::with_paths`]).
+/// [`HOST_GROUPS_FEATURE`], [`REGION_PROBE_FEATURE`] and [`PATHS_FEATURE`]
+/// are added only when the operator turned host groups
+/// ([`ManagedMesh::with_host_groups`]), regions
+/// ([`ManagedMesh::with_regions`]) or custom paths
+/// ([`ManagedMesh::with_paths`]) on; no list below has them.
 pub const FEATURES: &[&str] = &[
     "mesh",
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
-    "mesh_host_groups",
-    REGION_PROBE_FEATURE,
 ];
 
-/// Region measurement and the border probe responder (appendix D.9).
+/// Listed only when the operator turned host groups on (`mesh_host_groups`,
+/// off by default): the `host_groups` section of a network is then applied
+/// (spec §15.7: gateway and standby gateway advertisement, DNS answers and
+/// reverse zones for the group ranges). Off, an `apply` whose networks
+/// carry a non-empty `host_groups` is refused ([`HOST_GROUPS_DISABLED`]).
+pub const HOST_GROUPS_FEATURE: &str = "mesh_host_groups";
+
+/// The refusal of `host_groups` while host groups are off.
+pub const HOST_GROUPS_DISABLED: &str = "host_groups_disabled";
+
+/// Listed only when the operator turned regions on (`mesh_regions`, off by
+/// default): `PUT /v1/mesh` then takes the top-level `region` object, which
+/// starts the region measurement and, on a border node, the probe
+/// responder, and `GET /v1/mesh` gives `region_probe` (appendix D.9). Off,
+/// the management API refuses the object (`regions_disabled`), a region
+/// handed over anyway is dropped and no `region_probe` is given.
 pub const REGION_PROBE_FEATURE: &str = "mesh_region_probe";
 
 /// Listed only when the operator turned custom paths on (`mesh_paths`, off
@@ -115,8 +128,6 @@ pub const FEATURES_WITH_BRIDGE: &[&str] = &[
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
-    "mesh_host_groups",
-    REGION_PROBE_FEATURE,
     mesh_bridge::FEATURE,
 ];
 
@@ -132,8 +143,6 @@ pub const FEATURES_WITH_BACKBONE: &[&str] = &[
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
-    "mesh_host_groups",
-    REGION_PROBE_FEATURE,
     BACKBONE_FEATURE,
 ];
 
@@ -143,8 +152,6 @@ pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
-    "mesh_host_groups",
-    REGION_PROBE_FEATURE,
     mesh_bridge::FEATURE,
     BACKBONE_FEATURE,
 ];
@@ -185,6 +192,13 @@ struct Inner {
     /// The operator's switch (`mesh_paths`, off by default): off, no
     /// network takes `routing.paths`, so the waypoint code stays closed.
     paths_enabled: AtomicBool,
+    /// The operator's switch (`mesh_regions`, off by default): off, no
+    /// region object is taken, so neither the measurement nor the probe
+    /// responder runs.
+    regions_enabled: AtomicBool,
+    /// The operator's switch (`mesh_host_groups`, off by default): off, no
+    /// network takes `host_groups`.
+    host_groups_enabled: AtomicBool,
     bridging: Bridging,
     /// Held by the task that replaces the networks, not by the request:
     /// a request that times out does not let the next one start while
@@ -417,6 +431,8 @@ impl ManagedMesh {
                 backbone: Mutex::new(None),
                 backbone_enabled: AtomicBool::new(false),
                 paths_enabled: AtomicBool::new(false),
+                regions_enabled: AtomicBool::new(false),
+                host_groups_enabled: AtomicBool::new(false),
                 bridging,
                 applying: tokio::sync::Mutex::new(()),
                 previous: Mutex::new(None),
@@ -456,6 +472,35 @@ impl ManagedMesh {
 
     fn paths_enabled(&self) -> bool {
         self.inner.paths_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Turns regions on or off (the operator's `mesh_regions`; off when not
+    /// called). Off, `mesh_region_probe` is not listed, a region handed
+    /// over is dropped (no measurement, no probe responder) and the status
+    /// has no `region_probe`. Set before the first `apply`.
+    pub fn with_regions(self, enabled: bool) -> Self {
+        self.inner.regions_enabled.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    fn regions_enabled(&self) -> bool {
+        self.inner.regions_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Turns host groups on or off (the operator's `mesh_host_groups`; off
+    /// when not called). Off, `mesh_host_groups` is not listed and an
+    /// `apply` whose networks carry a non-empty `host_groups` is refused as
+    /// invalid ([`HOST_GROUPS_DISABLED`]); the running networks stay as
+    /// they are. Set before the first `apply`.
+    pub fn with_host_groups(self, enabled: bool) -> Self {
+        self.inner
+            .host_groups_enabled
+            .store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    fn host_groups_enabled(&self) -> bool {
+        self.inner.host_groups_enabled.load(Ordering::SeqCst)
     }
 }
 
@@ -889,7 +934,11 @@ impl Inner {
             } else {
                 Vec::new()
             },
-            region_probe: lock(&self.region).status(),
+            region_probe: if self.regions_enabled.load(Ordering::SeqCst) {
+                lock(&self.region).status()
+            } else {
+                None
+            },
         }
     }
 }
@@ -921,6 +970,12 @@ impl MeshControl for ManagedMesh {
             (false, false) => FEATURES,
         }
         .to_vec();
+        if self.host_groups_enabled() {
+            features.push(HOST_GROUPS_FEATURE);
+        }
+        if self.regions_enabled() {
+            features.push(REGION_PROBE_FEATURE);
+        }
         if self.paths_enabled() {
             features.push(PATHS_FEATURE);
         }
@@ -957,6 +1012,14 @@ impl MeshControl for ManagedMesh {
         if backbone.is_some() && !self.backbone_enabled() {
             return Box::pin(async { Err(backbone_disabled()) });
         }
+        if !self.host_groups_enabled() {
+            if let Some(index) = networks
+                .iter()
+                .position(|network| !network.settings.host_groups.is_empty())
+            {
+                return Box::pin(async move { Err(host_groups_disabled(index)) });
+            }
+        }
         if !self.paths_enabled() {
             if let Some(field) = networks
                 .iter()
@@ -982,7 +1045,11 @@ impl MeshControl for ManagedMesh {
         })
     }
 
+    /// Off (`mesh_regions`), the region is dropped: the management API
+    /// refuses it first, this keeps a caller that skips that check from
+    /// starting the measurement or the probe responder.
     fn set_region(&self, region: Option<RegionSection>) -> BoxFuture<'_, ()> {
+        let region = if self.regions_enabled() { region } else { None };
         lock(&self.inner.region).set(region);
         Box::pin(async {})
     }
@@ -993,6 +1060,14 @@ impl MeshControl for ManagedMesh {
 fn backbone_disabled() -> ApplyError {
     ApplyError::Invalid(format!(
         "{BACKBONE_DISABLED}: backbone: this node does not run a backbone (mesh_backbone is off in the node configuration)"
+    ))
+}
+
+/// Nothing of the request is applied: the running networks stay as they
+/// are.
+fn host_groups_disabled(index: usize) -> ApplyError {
+    ApplyError::Invalid(format!(
+        "{HOST_GROUPS_DISABLED}: networks[{index}].host_groups: this node does not apply host groups (mesh_host_groups is off in the node configuration)"
     ))
 }
 
@@ -2281,7 +2356,134 @@ mod tests {
             FEATURES_WITH_BRIDGE_AND_BACKBONE,
         ] {
             assert!(!list.contains(&PATHS_FEATURE), "{list:?}");
+            assert!(!list.contains(&REGION_PROBE_FEATURE), "{list:?}");
+            assert!(!list.contains(&HOST_GROUPS_FEATURE), "{list:?}");
         }
+    }
+
+    /// The features of kernel 0.3, written out: a node with every switch at
+    /// its default declares exactly these, and so does the device mode,
+    /// which reports [`FEATURES`]. A feature of a later version is listed
+    /// only behind its switch; adding one here is a change reviewers see.
+    const FEATURES_0_3: &[&str] = &[
+        "mesh",
+        "mesh_dns",
+        "mesh_resolver_address",
+        "mesh_native_keys",
+    ];
+
+    #[test]
+    fn every_switch_at_its_default_declares_the_0_3_features_only() {
+        assert_eq!(FEATURES, FEATURES_0_3);
+        let dir = temp_dir("defaults");
+        let mesh = open(&dir).expect("open");
+        assert_eq!(mesh.features(), FEATURES_0_3);
+        let mesh = mesh
+            .with_backbone(false)
+            .with_paths(false)
+            .with_regions(false)
+            .with_host_groups(false);
+        assert_eq!(mesh.features(), FEATURES_0_3);
+        let _ = std::fs::remove_dir_all(&dir);
+        // The public constructor, with the external bridge at its default.
+        let dir = temp_dir("defaults-public");
+        let mesh = ManagedMesh::open(&dir).expect("open");
+        assert_eq!(mesh.features(), FEATURES_0_3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn host_groups_are_off_unless_the_operator_turns_them_on() {
+        let plain = || ManagedNetwork {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+        };
+        let grouped = || {
+            let mut settings = settings();
+            settings.host_groups = vec![HostGroup {
+                cidr: outbound_mesh::IpNet::parse("10.127.1.0/24").unwrap(),
+                gateway: "gw-a".into(),
+                backup_gateway: Some("gw-b".into()),
+            }];
+            ManagedNetwork {
+                tag: "mesh-cn".into(),
+                settings,
+            }
+        };
+        let dir = temp_dir("host-groups-off");
+        let mesh = open(&dir).expect("open");
+        assert!(!mesh.features().contains(&HOST_GROUPS_FEATURE));
+        let before = mesh.apply(vec![plain()], None).await.unwrap();
+        // Refused as a whole: the running network stays as it was and
+        // takes no group, so no group range reaches its routes or its DNS
+        // answers and reverse zones (built from `settings.host_groups`).
+        match mesh
+            .apply(vec![plain(), grouped()], None)
+            .await
+            .unwrap_err()
+        {
+            ApplyError::Invalid(message) => {
+                assert!(
+                    message
+                        .starts_with(&format!("{HOST_GROUPS_DISABLED}: networks[1].host_groups")),
+                    "{message}"
+                );
+            }
+            ApplyError::Failed(message) => panic!("not invalid: {message}"),
+        }
+        assert_eq!(mesh.status(), before);
+        assert!(lock(&mesh.inner.networks)
+            .iter()
+            .all(|instance| instance.settings.host_groups.is_empty()));
+        // An empty list is no group: taken.
+        let mut empty = plain();
+        empty.settings.host_groups = Vec::new();
+        assert!(mesh.apply(vec![empty], None).await.is_ok());
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Turned on, it is listed and the groups are taken.
+        let dir = temp_dir("host-groups-on");
+        let mesh = open(&dir).expect("open").with_host_groups(true);
+        assert!(mesh.features().contains(&HOST_GROUPS_FEATURE));
+        let status = mesh.apply(vec![grouped()], None).await.unwrap();
+        assert_eq!(status.networks.len(), 1);
+        assert!(lock(&mesh.inner.networks).iter().all(|instance| instance
+            .settings
+            .host_groups
+            .len()
+            == 1));
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn regions_are_off_unless_the_operator_turns_them_on() {
+        let section = || {
+            let value = json!({
+                "current": "cn",
+                "basis": "admin",
+                "directory": { "version": 1, "preferred": null, "regions": [] }
+            });
+            RegionSection::from_value(&value, &["mesh-cn"])
+                .expect("valid")
+                .expect("not null")
+        };
+        let dir = temp_dir("regions-off");
+        let mesh = open(&dir).expect("open");
+        assert!(!mesh.features().contains(&REGION_PROBE_FEATURE));
+        mesh.set_region(Some(section())).await;
+        assert!(lock(&mesh.inner.region).status().is_none());
+        assert_eq!(mesh.status().region_probe, None);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("regions-on");
+        let mesh = open(&dir).expect("open").with_regions(true);
+        assert!(mesh.features().contains(&REGION_PROBE_FEATURE));
+        mesh.set_region(Some(section())).await;
+        assert!(mesh.status().region_probe.is_some());
+        mesh.set_region(None).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

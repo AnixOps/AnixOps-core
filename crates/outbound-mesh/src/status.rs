@@ -479,7 +479,7 @@ pub trait MeshControl: Send + Sync {
     /// Feature names this implementation adds to `GET /v1/status`:
     /// at least `mesh`; `mesh_dns` when the network config takes `dns`,
     /// `mesh_resolver_address` when it also takes `dns.resolver_address`.
-    /// Operator switches (`mesh_paths`, `mesh_backbone`, the external
+    /// Operator switches (`mesh_paths`, `mesh_regions`, `mesh_backbone`, the external
     /// bridge) decide some of them, so the list is made at each call.
     fn features(&self) -> Vec<&'static str>;
 

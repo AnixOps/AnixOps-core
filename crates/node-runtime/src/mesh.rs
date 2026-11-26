@@ -54,6 +54,14 @@ pub fn waypoint_field(settings: &outbound_mesh::MeshSettings) -> Option<&'static
     }
 }
 
+/// Listed only when the operator turned host groups on (`mesh_host_groups`
+/// in the node configuration, off by default).
+pub const HOST_GROUPS_FEATURE: &str = "mesh_host_groups";
+
+/// The refusal of a body whose networks carry `host_groups` while host
+/// groups are off.
+pub const HOST_GROUPS_DISABLED: &str = "host_groups_disabled";
+
 /// Listed only when the operator turned custom paths on (`mesh_paths` in
 /// the node configuration, off by default).
 pub const PATHS_FEATURE: &str = "mesh_paths";
@@ -80,8 +88,17 @@ impl Mesh {
         self.control.features()
     }
 
+    /// Without [`REGION_FEATURE`] listed (`mesh_regions` off) the answer
+    /// has no `region_probe`, whatever the mesh reports.
     pub(crate) fn status(&self) -> ManagedStatus {
-        self.control.status()
+        self.gated(self.control.status())
+    }
+
+    fn gated(&self, mut status: ManagedStatus) -> ManagedStatus {
+        if !self.features().contains(&REGION_FEATURE) {
+            status.region_probe = None;
+        }
+        status
     }
 
     /// Parses and saves a `PUT /v1/mesh/subnet_route` body; answers the
@@ -97,7 +114,7 @@ impl Mesh {
                 OverrideError::Invalid(message) => NodeError::Mesh(message),
                 OverrideError::Failed(message) => NodeError::MeshFailed(message),
             })?;
-        Ok(self.control.status())
+        Ok(self.status())
     }
 
     /// Parses, validates and applies a `PUT /v1/mesh` body.
@@ -126,10 +143,27 @@ impl Mesh {
                 )));
             }
         }
-        let region = match request.region {
-            Some(_) if !self.features().contains(&REGION_FEATURE) => {
+        // And for host groups: a node that does not list them takes no
+        // network with a non-empty `host_groups`, so no group range is
+        // advertised, routed or answered in DNS.
+        if !features.contains(&HOST_GROUPS_FEATURE) {
+            if let Some(index) = request
+                .networks
+                .iter()
+                .position(|network| !network.settings.host_groups.is_empty())
+            {
                 return Err(NodeError::Mesh(format!(
-                    "region: not supported (the mesh does not list {REGION_FEATURE})"
+                    "{HOST_GROUPS_DISABLED}: networks[{index}].host_groups: this node does not apply host groups ({HOST_GROUPS_FEATURE} is not listed)"
+                )));
+            }
+        }
+        // And for regions: a node that does not list them takes no
+        // `region` object (not even `null`), so neither the measurement
+        // nor the probe responder starts; the running networks stay.
+        let region = match request.region {
+            Some(_) if !features.contains(&REGION_FEATURE) => {
+                return Err(NodeError::Mesh(format!(
+                    "{REGIONS_DISABLED}: region: this node does not run regions ({REGION_FEATURE} is not listed)"
                 )))
             }
             region => region,
@@ -147,10 +181,10 @@ impl Mesh {
                 ApplyError::Failed(message) => NodeError::MeshFailed(message),
             })?;
         if !self.features().contains(&REGION_FEATURE) {
-            return Ok(status);
+            return Ok(self.gated(status));
         }
         self.control.set_region(region.flatten()).await;
-        Ok(self.control.status())
+        Ok(self.status())
     }
 
     /// Stops every network for good, as the node program shuts down: each
@@ -167,8 +201,13 @@ impl Mesh {
     }
 }
 
-/// The feature that makes the top-level `region` object acceptable.
+/// The feature that makes the top-level `region` object acceptable. Listed
+/// only when the operator turned regions on (`mesh_regions` in the node
+/// configuration, off by default).
 pub const REGION_FEATURE: &str = "mesh_region_probe";
+
+/// The refusal of a top-level `region` object while regions are off.
+pub const REGIONS_DISABLED: &str = "regions_disabled";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -462,6 +462,9 @@ mod tests {
             [IpNet::parse("192.168.10.0/24").unwrap()]
         );
         assert_eq!(code(&set("mesh", "192.168.10.1/24")), "invalid_argument");
+        assert_eq!(code(&set("mesh", "fd00:10::1/64")), "invalid_argument");
+        assert_eq!(set("mesh", "fd00:10::/64"), json!({"ok": true}));
+        assert_eq!(set("local", "fd00:10::/64"), json!({"ok": true}));
         assert_eq!(set("local", "192.168.10.0/24"), json!({"ok": true}));
         assert!(overrides(&registry).is_empty());
         let unknown = run(
