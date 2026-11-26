@@ -1806,12 +1806,19 @@ mod tests {
         for allowed in [
             "10.127.1.0/24",
             "10.127.0.0/16",
-            "10.0.0.0/8",
+            "10.120.0.0/13",
             "192.168.1.0/24",
         ] {
             config["routing"] = json!({"paths": path(allowed)});
             assert!(validate(config.clone()).is_ok(), "{allowed}");
         }
+        // A network covering the virtual subnet is refused for that reason
+        // (spec §17.2.2), not for the host group.
+        config["routing"] = json!({"paths": path("10.0.0.0/8")});
+        assert_eq!(
+            validate(config.clone()).err().unwrap(),
+            "mesh path to_subnet overlaps the virtual subnet"
+        );
         // A path to a member of the network is not affected.
         config["routing"] =
             json!({"paths": [{"to_peer": "10.144.144.7", "via": ["10.144.144.9"]}]});
