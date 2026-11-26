@@ -146,6 +146,14 @@ pub fn read_admin_owned_file(path: &Path) -> io::Result<Vec<u8>> {
 /// open to SYSTEM and Administrators only. `ResourceBusy` when it already
 /// exists, that is when another process holds it; it goes away with the
 /// last handle, so a process that dies releases it.
+///
+/// The namespace is machine-wide, not per session: a private namespace is
+/// identified by its name and boundary only, and the boundary holds no
+/// session number (a session would have to be added to it explicitly), so
+/// the service in session 0 and an elevated client in a user session open
+/// the same namespace and the same object, and exclude each other. A
+/// cross-session check on a real machine is listed in
+/// `docs/manual-intervention.md`.
 #[cfg(windows)]
 pub(crate) fn create_host_wide_object(name: &str) -> io::Result<HostWideObject> {
     native::create_host_wide_object(name)
