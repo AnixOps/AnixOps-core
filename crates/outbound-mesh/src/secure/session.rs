@@ -76,6 +76,10 @@ pub const MAX_PENDING: usize = 256;
 /// packets that fail on the current session do not count as failures for
 /// this long (spec §9).
 pub const EVICTION_GRACE: Duration = Duration::from_secs(10);
+/// A node ID stays bound to the static key of its last session this long
+/// after the session ended (spec §12.3 期望公钥, the 10 seconds a replaced
+/// session still receives).
+pub const BINDING_GRACE: Duration = Duration::from_secs(10);
 /// Relay msg1 ephemeral keys remembered per initiator (spec §9).
 pub const SEEN_PER_PEER: usize = 4096;
 /// Relay msg1 ephemeral keys remembered in all, unless configured.
@@ -273,8 +277,9 @@ struct Pending {
 pub enum RelayLookup {
     /// Not seen before: handle it.
     New,
-    /// The msg1 of a session still pending: send this msg2 again.
-    Repeat(Vec<u8>),
+    /// The msg1 of a session still pending: send this msg2 again, after
+    /// admitting the peer's static key once more.
+    Repeat(Vec<u8>, [u8; LEN]),
     /// Seen before and no longer pending: drop it without an answer.
     Replayed,
 }
@@ -293,6 +298,9 @@ pub struct Sessions {
     max_seen: usize,
     /// Direct peers this node is creating a session with as client.
     creating: HashMap<SessionKey, Instant>,
+    /// The static keys of ended sessions, bound for [`BINDING_GRACE`]
+    /// from the first [`Sessions::reclaim`] after the end.
+    ended: HashMap<SessionKey, ([u8; LEN], Option<Instant>)>,
     tick: u64,
 }
 
@@ -321,6 +329,7 @@ impl Sessions {
             seen_count: 0,
             max_seen: max_seen.max(1),
             creating: HashMap::new(),
+            ended: HashMap::new(),
             tick: 0,
         }
     }
@@ -345,6 +354,30 @@ impl Sessions {
             .filter(|(_, session)| !keep(&session.peer_static()))
             .map(|(key, _)| key.clone())
             .collect()
+    }
+
+    /// The static key `key`'s node ID is bound to (spec §12.3): that of
+    /// its session, or of the session that ended within [`BINDING_GRACE`].
+    pub fn bound_static(&self, key: &SessionKey) -> Option<[u8; LEN]> {
+        self.map
+            .get(key)
+            .map(Session::peer_static)
+            .or_else(|| self.ended.get(key).map(|(peer_static, _)| *peer_static))
+    }
+
+    /// Drops the pending relay sessions whose peer's static key fails
+    /// `keep`, so that none of them is promoted by a later packet (spec
+    /// §8.3.1 rule 6). Returns how many went.
+    pub fn drop_pending_refused(&mut self, keep: impl Fn(&[u8; LEN]) -> bool) -> usize {
+        let mut dropped = 0;
+        for pending in self.pending.values_mut() {
+            let before = pending.len();
+            pending.retain(|p| keep(&p.session.peer_static()));
+            dropped += before - pending.len();
+        }
+        self.pending.retain(|_, pending| !pending.is_empty());
+        self.pending_count -= dropped;
+        dropped
     }
 
     pub fn get_mut(&mut self, key: &SessionKey) -> Option<&mut Session> {
@@ -545,6 +578,10 @@ impl Sessions {
         let Some(session) = self.map.remove(key) else {
             return;
         };
+        if self.ended.len() < MAX_SESSIONS || self.ended.contains_key(key) {
+            self.ended
+                .insert(key.clone(), (session.peer_static(), None));
+        }
         let used = self.next_tick();
         let record = Record {
             key: key.clone(),
@@ -790,7 +827,7 @@ impl Sessions {
             .get(key)
             .and_then(|pending| pending.iter().find(|p| p.seen == *seen && now < p.until));
         if let Some(pending) = pending {
-            return RelayLookup::Repeat(pending.msg2.clone());
+            return RelayLookup::Repeat(pending.msg2.clone(), pending.session.peer_static());
         }
         if self
             .seen
@@ -1067,6 +1104,13 @@ impl Sessions {
         self.evicted
             .retain(|_, at| now.saturating_duration_since(*at) < EVICTION_GRACE);
         self.creating.retain(|_, until| now < *until);
+        for (_, ended) in self.ended.values_mut() {
+            ended.get_or_insert(now);
+        }
+        self.ended.retain(|key, (_, ended)| {
+            !self.map.contains_key(key)
+                && ended.is_some_and(|at| now.saturating_duration_since(at) < BINDING_GRACE)
+        });
     }
 }
 
@@ -1194,6 +1238,34 @@ mod tests {
         );
         assert_eq!(sessions.generation(&key), Some(late.generation));
         assert_eq!(sessions.get(&key).unwrap().connections(), 1);
+    }
+
+    #[test]
+    fn a_node_id_stays_bound_shortly_after_its_session_ends() {
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let key = key(Namespace::Direct);
+        assert_eq!(sessions.bound_static(&key), None);
+        sessions
+            .install(
+                key.clone(),
+                &agreement(Action::Create, 2, 1, 0),
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                Side::Server,
+                now,
+            )
+            .unwrap();
+        assert_eq!(sessions.bound_static(&key), Some(PEER));
+        sessions.invalidate(&key);
+        assert!(sessions.get(&key).is_none());
+        assert_eq!(sessions.bound_static(&key), Some(PEER));
+        sessions.reclaim(now);
+        sessions.reclaim(now + BINDING_GRACE - Duration::from_secs(1));
+        assert_eq!(sessions.bound_static(&key), Some(PEER));
+        sessions.reclaim(now + BINDING_GRACE);
+        assert_eq!(sessions.bound_static(&key), None);
     }
 
     #[test]
@@ -1502,6 +1574,46 @@ mod tests {
     }
 
     #[test]
+    fn pending_relay_sessions_of_a_refused_key_are_dropped() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let key = key(Namespace::Relay);
+        let seen = seen_digest(b"ephemeral");
+        let choice = sessions
+            .server_choice(&key, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions.remember_seen(&key, seen);
+        sessions
+            .add_pending(
+                &key,
+                seen,
+                &choice,
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                b"msg2".to_vec(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(sessions.drop_pending_refused(|_| true), 0);
+        assert_eq!(sessions.pending_len(&key), 1);
+        assert_eq!(sessions.drop_pending_refused(|key| *key != PEER), 1);
+        assert_eq!(sessions.pending_len(&key), 0);
+        // A repeated msg1 is now a replay, not an answer.
+        assert_eq!(
+            sessions.relay_lookup(&key, &seen, now),
+            RelayLookup::Replayed
+        );
+        // The first packet under the dropped session is not promoted.
+        let mut sender = Sender::new(AES, choice.root_key, 7, LOCAL_ID, 0, now).unwrap();
+        let mut packet = b"new".to_vec();
+        sender.seal(&mut packet, now).unwrap();
+        assert!(sessions.open(&key, &mut packet, now).is_err());
+        assert!(sessions.get(&key).is_none());
+    }
+
+    #[test]
     fn a_relay_create_waits_for_its_first_packet() {
         let rng = SystemRandom::new();
         let now = Instant::now();
@@ -1538,7 +1650,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions.relay_lookup(&key, &seen, now),
-            RelayLookup::Repeat(b"msg2".to_vec())
+            RelayLookup::Repeat(b"msg2".to_vec(), PEER)
         );
         // The old session still works and nothing moved.
         assert_eq!(sessions.generation(&key), Some(2));
