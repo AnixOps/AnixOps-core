@@ -128,7 +128,7 @@
 - **代理开关不打断组网**：代理连上或断开时，客户端重新下发 profile（增加或去掉代理出站）。只要网络配置没变，组网实例按 `network.id` 保留，会话与成员连接不断；配置变了才重建该网络。
 - **路由由引擎给出**：客户端不自己算网段，通告子网是动态的。客户端在组网加入期间读取 `mesh_status`（前台每 2 秒、后台每 10 秒，或在现有状态变化通知到来时），`tunnel.routesVersion` 变化时重新应用一次隧道网络设置（手机上的 `includedRoutes`、DNS 匹配域），重新应用之间至少间隔 1 秒。
 - 组网与代理都关闭时，客户端关闭 VPN。
-- **嵌入式引擎的组网引擎**：组网网络由进程内的组网引擎持有（自有线程与运行时），不属于某一份 profile。每份 profile 的引擎运行时在隧道启动后提交其中的组网网络，停止隧道时放手；最后一份放手后组网引擎再保留 5 秒，供下一份 profile 接手（先停旧再起新、先起新再停旧都不打断组网）。用户关闭 VPN 时，客户端在停止隧道前发 `mesh_engine_stop`，组网引擎立即停止；不发时组网会多运行最多 5 秒，期间仍用本机网络与成员通信。组网引擎停止后，`mesh_save_network`、`mesh_leave`、`mesh_set_subnet_route` 的本机状态随之清除，客户端须自己保存，在下次启动后重新下发。延迟测试、体检中的组网出站返回 `unsupported`，不启动、不替换任何网络。
+- **嵌入式引擎的组网引擎**：组网网络由进程内的组网引擎持有（自有线程与运行时），不属于某一份 profile。每份 profile 的引擎运行时在隧道启动后提交其中的组网网络，停止隧道时放手；最后一份放手后组网引擎再保留 5 秒，供下一份 profile 接手（先停旧再起新、先起新再停旧都不打断组网）。用户关闭 VPN 时，客户端在停止隧道前发 `mesh_engine_stop`，组网引擎立即停止；不发时组网会多运行最多 5 秒，期间仍用本机网络与成员通信。组网引擎停止后，`mesh_save_network`、`mesh_leave`、`mesh_set_subnet_route` 的本机状态随之清除，客户端须自己保存，在下次启动后重新下发。延迟测试、体检中的组网出站返回 `unsupported`，不启动、不替换任何网络，组网出站因此不宜放进按公网 URL 测速的分组。只开代理的 profile 提交空列表、不持有组网引擎：未经 `mesh_save_network` 保存的网络随之停止，已保存的网络只在某个运行时持有组网引擎时继续运行（经该运行时发出的 `mesh_save_network` 或 `mesh_join` 即持有）。
 
 ## 节点程序管理 API
 
@@ -186,7 +186,7 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 |---|---|---|
 | `mesh_status` | `network`（可省略，见「快照」） | 0.3 |
 | `mesh_join` / `mesh_leave` | `network` | 0.3 |
-| `mesh_engine_stop` | 无；用户关闭 VPN 时在停止隧道前发送，立即停止组网引擎（仅嵌入式引擎，见「隧道生命周期」） | 0.3 |
+| `mesh_engine_stop` | 无；用户关闭 VPN 时在停止隧道前发送，立即停止组网引擎（仅嵌入式引擎，见「隧道生命周期」）；应答 `{"ok":true,"stopped":布尔}`，`stopped` 为 `false` 表示另一份运行中的 profile 仍持有组网引擎 | 0.3 |
 | `mesh_save_network` | `config`：`config_version: 1` 网络配置（见 `mesh-module.md`；密钥由钥匙串注入） | 0.3 |
 | `mesh_remove_network` | `network` | 0.3 |
 | `mesh_set_dns` | 可省的 `network`、`enabled`、可省的 `suffix`；`network` 省略时作用于本设备全部网络（已有的按网络覆盖一并清除），给出时只作用于该网络，按网络的覆盖优先于全部网络的覆盖。本机覆盖，优先于网络配置的 `dns`，`suffix` 须位于 `internal` 之下且至少两个标签（规范 §15.9.2 第 1 条，见 `mesh-module.md`），不合规时拒绝该次设置 | 0.3 |
@@ -200,3 +200,9 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `mesh_join_credential` | `credential`：一次性入网凭据 | 0.5 |
 
 成功返回 `{"ok":true}`，`mesh_status` 返回快照。失败返回 `{"ok":false,"error":{"code","detail"}}`。`code` 为 `unsupported`、`invalid_argument`、`not_found`、`not_allowed`（例如接入节点通告子网），或上面的失败原因之一。
+
+嵌入式引擎的补充约定：
+- 任一运行时的控制通道都可发 `mesh_*` 命令。没有组网引擎在运行时，`mesh_save_network` 与 `mesh_join` 启动组网引擎，并由收到命令的运行时持有到它停止（只开代理时保存的网络因此继续运行）；其余命令返回 `not_found`，`mesh_status` 返回空快照 `{"statusVersion":1,"networks":[],"network":null,"self":null,"members":[],"subnets":[],"refusedAdvertisements":0,"tunnel":{"routes":[],"routesVersion":0,"dns":null}}`（带 `network` 参数时返回 `not_found`）。
+- `mesh_save_network` 的 `config` 不合规、`kind = managed` 缺 `node.private_key`（`detail` 以 `private_key_required` 开头）、`node.instance_id` 与其他网络不同，都返回 `invalid_argument`，不保存。profile 中组网出站的 `node.instance_id` 彼此不同或与组网引擎中其他网络不同时，该 profile 构建失败。
+- `mesh_set_subnet_route` 的 `cidr` 须为主机位为零的网段。
+- `mesh_set_dns` 在内网域名接入嵌入式引擎之前返回 `unsupported`；上表 0.4、0.5 的命令与未知的 `mesh_*` 命令返回 `unsupported`。
