@@ -7,8 +7,8 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use outbound_mesh::scope::is_intranet_network;
-use outbound_mesh::IpNet;
+use crate::net::IpNet;
+use crate::scope::is_intranet_network;
 use serde::Deserialize;
 
 /// Most `routes` entries. The panel allows 64; the kernel keeps the same

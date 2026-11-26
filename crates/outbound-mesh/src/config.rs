@@ -33,6 +33,7 @@ use std::net::IpAddr;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use crate::bridge::{ExternalBridge, ExternalBridgeConfig};
 use crate::net::IpNet;
 use crate::scope::is_intranet_network;
 
@@ -75,6 +76,9 @@ pub struct MeshConfig {
     pub subnets: SubnetsConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// The external network bridge (spec §15.12): Linux full nodes only.
+    #[serde(default)]
+    pub external_bridge: Option<ExternalBridgeConfig>,
 }
 
 /// The virtual network; every node of it must agree on all of these.
@@ -391,6 +395,9 @@ pub struct MeshSettings {
     pub native_keys: Option<Vec<[u8; 32]>>,
     /// Decoded `node.private_key`, wiped when dropped.
     pub private_key: Option<Zeroizing<[u8; 32]>>,
+    /// The checked `external_bridge` section; its routes are also in
+    /// `advertise_subnets`.
+    pub external_bridge: Option<ExternalBridge>,
 }
 
 impl MeshSettings {
@@ -575,6 +582,26 @@ impl MeshConfig {
         if role == Role::Access && !advertise_subnets.is_empty() {
             return Err("mesh access nodes do not advertise subnets");
         }
+        // Spec §15.12: a Linux full node only. The routes join this node's
+        // advertisement (field 5) under the checks below; the single
+        // addresses inside the overlay ranges are allowed for the bridge
+        // only, `subnets.advertise` itself stays as strict as before.
+        let mut advertise_subnets = advertise_subnets;
+        let external_bridge = match &self.external_bridge {
+            None => None,
+            Some(section) => {
+                if role != Role::Full || !cfg!(target_os = "linux") {
+                    return Err("external_bridge_not_supported");
+                }
+                let bridge = section.validate().map_err(|error| error.reason())?;
+                for route in bridge.routes() {
+                    if !advertise_subnets.contains(route) {
+                        advertise_subnets.push(*route);
+                    }
+                }
+                Some(bridge)
+            }
+        };
         let system_routes = match &self.routing.system_routes {
             None => None,
             Some(texts) => Some(intranet_subnets(texts, "mesh routing.system_routes")?),
@@ -629,7 +656,15 @@ impl MeshConfig {
             paths: Vec::new(),
             native_keys,
             private_key,
+            external_bridge,
         };
+        if let Some(bridge) = &settings.external_bridge {
+            // The mesh interface is named at start; [`ExternalBridge`] is
+            // checked against it again then.
+            bridge
+                .check_mesh("", &settings.virtual_subnets(), &settings.local_addresses())
+                .map_err(|error| error.reason())?;
+        }
         if advertise_subnets_overlap_virtual(&settings) {
             return Err("mesh subnets.advertise overlaps the virtual subnet");
         }
@@ -965,6 +1000,68 @@ mod tests {
             validate(with("subnets.advertise", json!(["192.168.10.0/24"]))).err(),
             Some("mesh access nodes do not advertise subnets")
         );
+    }
+
+    fn bridged(section: Value) -> Value {
+        let mut config = with("node.role", json!("full"));
+        config["external_bridge"] = section;
+        config
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bridge_joins_its_routes_to_the_advertisement() {
+        let mut config = bridged(json!({
+            "interface": "ext0",
+            "routes": ["100.100.0.5", "192.168.10.0/24"],
+            "allow": ["10.144.144.7/32"],
+        }));
+        config["subnets"] = json!({"advertise": ["192.168.10.0/24"]});
+        let settings = validate(config).unwrap();
+        let bridge = settings.external_bridge.as_ref().unwrap();
+        assert_eq!(bridge.interface(), "ext0");
+        assert_eq!(
+            settings.advertise_subnets,
+            [
+                IpNet::parse("192.168.10.0/24").unwrap(),
+                IpNet::parse("100.100.0.5/32").unwrap(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bad_bridge_refuses_the_whole_config() {
+        let section = |routes: Value| json!({"interface": "ext0", "routes": routes});
+        assert_eq!(
+            validate(bridged(section(json!([])))).err(),
+            Some("external_bridge_no_routes")
+        );
+        assert_eq!(
+            validate(bridged(section(json!(["100.64.0.0/10"])))).err(),
+            Some("external_bridge_overlay_range")
+        );
+        assert_eq!(
+            validate(bridged(section(json!(["10.144.144.0/25"])))).err(),
+            Some("external_bridge_route_overlaps_mesh")
+        );
+        let mut unknown = section(json!(["100.100.0.5"]));
+        unknown["extra"] = json!(1);
+        assert!(parse(bridged(unknown)).is_err());
+        // Access nodes do not bridge.
+        let mut access = base();
+        access["external_bridge"] = section(json!(["100.100.0.5"]));
+        assert_eq!(
+            validate(access).err(),
+            Some("external_bridge_not_supported")
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn only_linux_bridges() {
+        let config = bridged(json!({"interface": "ext0", "routes": ["100.100.0.5"]}));
+        assert!(validate(config).is_err());
     }
 
     #[cfg(not(any(target_os = "ios", target_os = "android")))]

@@ -63,6 +63,11 @@ pub struct ManagedStatus {
     /// also while the network waits for its native key list; networks of
     /// the default mode are not listed (spec §8.3.1 rule 7).
     pub static_keys: Vec<NetworkStaticKey>,
+    /// Node-level alerts, given also when no network runs; absent when
+    /// there are none. `external_bridge_lock_held` is one (spec §15.12
+    /// item 9).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<Alert>,
 }
 
 /// One entry of [`ManagedStatus::static_keys`].
@@ -127,6 +132,23 @@ pub struct ManagedNetworkStatus {
     #[serde(serialize_with = "display_all")]
     pub overlaps: Vec<IpNet>,
     pub alerts: Vec<Alert>,
+    /// `externalBridge` (spec §15.12 item 8, three states): absent while
+    /// unknown, `null` when the network surely has no bridge, otherwise
+    /// the bridge in force.
+    #[serde(rename = "externalBridge", skip_serializing_if = "Option::is_none")]
+    pub external_bridge: Option<Option<ExternalBridgeStatus>>,
+}
+
+/// The bridge in force in one network: digests of the lists whose rules
+/// are all loaded (`docs/architecture/mesh-status.md`, `externalBridge`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalBridgeStatus {
+    pub allow_digest: String,
+    pub allow_count: usize,
+    pub routes_digest: String,
+    /// RFC 3339, UTC.
+    pub applied_at: String,
 }
 
 impl ManagedNetworkStatus {
@@ -143,6 +165,7 @@ impl ManagedNetworkStatus {
             rejected_advertisements: 0,
             overlaps: Vec::new(),
             alerts: Vec::new(),
+            external_bridge: None,
         }
     }
 }
@@ -194,6 +217,14 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
+    /// The bridge's new rules or the deletion of tracked connections
+    /// failed; the old rules and `externalBridge` stay (spec §15.12).
+    ExternalBridgeApplyFailed,
+    /// The bridge has IPv6 routes but the host does not forward IPv6.
+    ExternalBridgeIpv6ForwardingOff,
+    /// Another process holds the host's bridge lock: this one does not
+    /// bridge, declare the capability or clean up (spec §15.12 item 9).
+    ExternalBridgeLockHeld,
 }
 
 /// Why a `PUT /v1/mesh` was not applied.
@@ -329,11 +360,13 @@ mod tests {
                         detail: "tcp port 11010 in use".into(),
                     },
                 ],
+                external_bridge: None,
             }],
             static_keys: vec![NetworkStaticKey {
                 network: "office".into(),
                 static_key: "a2V5".into(),
             }],
+            alerts: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -363,6 +396,51 @@ mod tests {
                 }],
                 "static_keys": [{"network": "office", "static_key": "a2V5"}]
             })
+        );
+    }
+
+    #[test]
+    fn the_bridge_state_has_three_forms_and_node_alerts_show_when_present() {
+        let mut network = ManagedNetworkStatus::stopped("mesh-cn", "stopped");
+        let key = |network: &ManagedNetworkStatus| {
+            serde_json::to_value(network)
+                .unwrap()
+                .get("externalBridge")
+                .cloned()
+        };
+        assert_eq!(key(&network), None);
+        network.external_bridge = Some(None);
+        assert_eq!(key(&network), Some(json!(null)));
+        network.external_bridge = Some(Some(ExternalBridgeStatus {
+            allow_digest: "aa".into(),
+            allow_count: 1,
+            routes_digest: "bb".into(),
+            applied_at: "2026-11-26T00:00:00Z".into(),
+        }));
+        assert_eq!(
+            key(&network),
+            Some(json!({
+                "allowDigest": "aa",
+                "allowCount": 1,
+                "routesDigest": "bb",
+                "appliedAt": "2026-11-26T00:00:00Z"
+            }))
+        );
+
+        let mut status = ManagedStatus::default();
+        assert!(serde_json::to_value(&status)
+            .unwrap()
+            .get("alerts")
+            .is_none());
+        status.alerts.push(Alert {
+            code: AlertCode::ExternalBridgeLockHeld,
+            address: None,
+            peer: String::new(),
+            detail: String::new(),
+        });
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["alerts"][0]["code"],
+            "external_bridge_lock_held"
         );
     }
 

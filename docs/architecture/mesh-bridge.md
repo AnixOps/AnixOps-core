@@ -7,7 +7,7 @@
 ## 范围
 
 - 只用于 Linux 完整节点：源地址转换与连接跟踪用系统的 nftables 实现。其他平台不列出能力 `mesh_external_bridge`，Agent 不向它们下发 `external_bridge`。
-- 本 crate 只读取 `outbound-mesh` 的 `IpNet` 与内网白名单，不修改组网模块。把 `external_bridge` 接入网络配置、把 `routes` 并入本节点路由信息字段 5、在网络启动与停止时安装与拆除、上报 `externalBridge` 与告警、列出能力名，在 `outbound-mesh` 与 `apps/mesh-node` 中另行接入（下文「接入要求」）。
+- 本 crate 负责规则、转发、连接跟踪、锁与探测；配置类型与校验放在 `outbound-mesh`，接入网络配置、路由通告、启停、状态与能力名见下文「接入」。
 
 ## 配置校验（`config`）
 
@@ -27,6 +27,7 @@
 | `external_bridge_allow_overlaps_route` | `allow` 中的条目与某条 `routes` 重叠 |
 | `external_bridge_same_interface` | 外部网卡就是本网络的组网网卡 |
 | `external_bridge_route_overlaps_mesh` | `routes` 与本网络的虚拟子网或本机虚拟地址重叠 |
+| `external_bridge_not_supported` | 本节点不是 Linux 完整节点（`role = full`） |
 
 不带前缀的单个地址按 /32、/128 处理。通过校验后两份名单按规范化 CIDR 文本去重排序，即摘要使用的顺序。
 
@@ -61,15 +62,13 @@
 - **主机锁（#357 复核 Y2）**：`HostLock::acquire` 对 `/run/anixops-mesh-bridge.lock` 加 `flock`（不等待），进程结束时由内核释放，崩溃不留死锁。取不到锁说明同一主机上另有节点程序在运行桥接：不声明能力、不做启动清理，并告警 `external_bridge_lock_held`，避免第二个进程悄悄删掉第一个进程的表。
 - `nft` 只从固定路径查找（`/usr/sbin/nft`、`/sbin/nft`、`/usr/bin/nft`），以空环境运行，不经 `PATH`。
 
-## 接入要求（集成步骤）
+## 接入（`outbound-mesh`、`apps/mesh-node`）
 
-由内核线程的 #331 合并后另行提交：
-
-1. `outbound-mesh` 的网络配置加顶层可选字段 `external_bridge`（类型 `mesh_bridge::ExternalBridgeConfig`）；只有 `role = full` 的 Linux 节点接受，其他情况以 `invalid_argument` 拒绝。
-2. 校验通过后，`routes` 并入本节点路由信息字段 5，与 `subnets.advertise` 合并去重。
-3. 节点程序启动时先取 `HostLock`（失败则告警 `external_bridge_lock_held`，不清理、不声明能力），再调用 `probe`（失败则不声明能力），两者都成功才声明 `mesh_external_bridge` 并调用 `cleanup_all`；锁持有到进程退出，退出时在丢弃全部 `Bridge` 之后再调用一次；`apps/mesh-node` 在网络启动成功之后调用 `Bridge::apply`（参数为本网络的组网网卡名、虚拟子网与本机虚拟地址），配置更新时再次调用，网络停止（正常停止与丢弃两条路径）时调用 `Bridge::remove`。应用失败映射为网络失败码 `start_refused`（详情为告警原因），并上报告警。
-4. 取不到 `HostLock` 时，`external_bridge_lock_held` 放进 `GET /v1/mesh` 顶层可选的 `alerts` 数组（节点级告警，内核没有运行任何网络时也要出现），同时放进每个网络的 `alerts`；字段措辞以规格 PR 为准。
-5. Linux 的 `FEATURES` 加 `mesh_external_bridge`；`networks[].externalBridge` 取 `Bridge::status()`。
+1. 配置：`external_bridge` 的类型与校验在 `outbound_mesh::bridge`（`mesh_bridge::config` 为其别名，避免两个 crate 互相依赖）。网络配置 `MeshConfig.external_bridge` 为顶层可选字段；只有 `role = full` 的 Linux 节点接受，其他情况整份配置以 `external_bridge_not_supported` 拒绝；其余原因码见上表。
+2. 通告：校验通过后 `routes` 与 `subnets.advertise` 合并去重，作为本节点路由信息字段 5，并照常检查不与虚拟子网重叠；`MeshSettings.external_bridge` 保存校验后的结果。
+3. 启动：节点程序（`ManagedMesh::open`）先取 `HostLock`，取到后调用 `probe`，再调用 `cleanup_all`；三步都成功才在 `features` 中列出 `mesh_external_bridge`，锁持有到进程退出。任何一步失败都不列出该能力；其中取不到锁（另一进程持有）时不清理，并在 `GET /v1/mesh` 顶层 `alerts`（没有网络时也给出）与每个网络的 `alerts` 中给出 `external_bridge_lock_held`（`detail` 为锁文件路径），各网络省略 `externalBridge`（未知）。
+4. 网络：网络启动成功后以其组网网卡名、虚拟子网与本机虚拟地址调用 `Bridge::apply`；失败时停止该网络，失败码 `start_refused`，详情为原因码（安装失败为 `external_bridge_apply_failed: <nft 或内核的错误>`，本进程不能桥接时为 `external_bridge_lock_held` 或 `external_bridge_unsupported`）。配置更新只改 `allow` 时网络不重启，就地再次调用 `Bridge::apply`；失败时旧规则与 `externalBridge` 保留并告警 `external_bridge_apply_failed`，下一次 `PUT` 重试。其他改动（含 `routes`、`interface`）照常重启该网络。网络停止或被替换时先调用 `Bridge::remove`，再停网络；丢弃路径由 `Bridge` 的 `Drop` 尽力删除；进程退出时先丢弃全部网络（及其 `Bridge`），再调用一次 `cleanup_all`。
+5. 状态：`networks[].externalBridge` 运行中为 `Bridge::status()`（尚未生效为 `null`），没有桥接或启动失败为 `null`，暂缓与锁被占用时省略；桥接的告警 `external_bridge_apply_failed`、`external_bridge_ipv6_forwarding_off` 并入该网络的 `alerts`。
 
 ## 验证
 

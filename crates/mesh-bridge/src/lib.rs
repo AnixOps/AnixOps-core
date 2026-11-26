@@ -18,13 +18,15 @@
 //! - [`lock`]: the host-wide lock that keeps a second node program from
 //!   cleaning up the first one's tables.
 //!
-//! The mesh module itself (`outbound-mesh`) is only read from: wiring the
-//! section into the network config, the route advertisement (field 5) and
-//! the node program's start and stop is a separate step. See
-//! `docs/architecture/mesh-bridge.md`.
+//! The section's type and checks live in `outbound-mesh` (re-exported here
+//! as [`config`]) so that the network config can carry it; the node
+//! program (`apps/mesh-node`, `managed`) installs and removes the bridges.
+//! See `docs/architecture/mesh-bridge.md`.
 
 pub mod apply;
-pub mod config;
+/// The `external_bridge` section and its checks; lives in `outbound-mesh`
+/// so that the network config can carry it.
+pub use outbound_mesh::bridge as config;
 pub mod conntrack;
 pub mod lock;
 pub mod ruleset;
