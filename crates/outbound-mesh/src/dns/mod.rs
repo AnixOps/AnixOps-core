@@ -939,7 +939,16 @@ mod tests {
 
     #[test]
     fn answers_full_short_and_bare_names() {
-        let members = [member("gw", &["10.150.0.1"], &["192.168.10.0/24"])];
+        // The other region is reachable here through a member's accepted
+        // advertisement (a summary range does the same once the backbone
+        // carries them); without it its names are not answered.
+        let alone = names(region_dns(), &[member("gw", &["10.150.0.1"], &["192.168.10.0/24"])]);
+        let unreachable = ask(&alone, "web.eu.mesh.internal", TYPE_A).unwrap();
+        assert_eq!(unreachable.rcode, Rcode::NxDomain as u8);
+        let members = [
+            member("gw", &["10.150.0.1"], &["192.168.10.0/24"]),
+            member("eu-border", &["10.150.0.2"], &["10.151.0.0/16"]),
+        ];
         let names = names(region_dns(), &members);
         // This node's own entry gives the region.
         assert_eq!(names.region(), Some("cn"));
