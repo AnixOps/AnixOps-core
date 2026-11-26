@@ -567,9 +567,6 @@ impl MeshSettings {
     /// gateway of, whether or not it advertises them at the moment. The
     /// host forwards for these and the node accepts packets from them.
     pub fn carried_subnets(&self) -> Vec<IpNet> {
-        if self.role != Role::Full {
-            return Vec::new();
-        }
         let mut carried = self.plain_advertised();
         for (group, _) in self.gateway_groups() {
             if !carried.contains(&group.cidr) {

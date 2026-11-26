@@ -470,7 +470,7 @@ impl HostForwarder for crate::forward_macos::HostForwarding {
 /// Whether this node carries traffic to its advertised subnets: a full
 /// node with subnets to advertise (requirement R10).
 fn forwards(settings: &MeshSettings) -> bool {
-    !settings.carried_subnets().is_empty()
+    settings.role == outbound_mesh::Role::Full && !settings.carried_subnets().is_empty()
 }
 
 /// One line saying whether the host forwards for the advertised subnets
