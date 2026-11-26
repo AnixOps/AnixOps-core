@@ -149,6 +149,9 @@ pub struct Snapshot {
     /// The custom paths and their states, in configuration order (spec
     /// §17.2.7).
     pub paths: Vec<PathStatus>,
+    /// The other regions' summary prefixes this border node carries
+    /// ([`Border`]); empty on other nodes.
+    pub border: Vec<IpNet>,
     /// Routable subnets not installed because [`Snapshot::system_routes`]
     /// is full.
     pub system_routes_truncated: usize,
@@ -280,6 +283,21 @@ pub struct Channels {
     pub foreign_routes: watch::Receiver<Vec<IpNet>>,
     /// Stops the node when it turns true.
     pub shutdown: watch::Receiver<bool>,
+    /// A border node's side of the backbone; `None` on other nodes.
+    pub border: Option<Border>,
+}
+
+/// What a border node exchanges with the backbone (spec §15.6, §17.3).
+pub struct Border {
+    /// The other regions' summary prefixes to carry: advertised to the
+    /// members, packets to them go to `to_backbone`. Empty withdraws them.
+    pub prefixes: watch::Receiver<Vec<IpNet>>,
+    /// IP packets from this network for another region.
+    pub to_backbone: mpsc::Sender<Vec<u8>>,
+    /// IP packets the backbone delivered for this network; their sources
+    /// must lie in `prefixes`. Shared, so that the channel outlives a
+    /// restart of either side: the running driver holds the lock.
+    pub from_backbone: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
 }
 
 /// Runs one network until `shutdown` turns true.
@@ -299,7 +317,25 @@ pub async fn run(
         mut route_overrides,
         mut foreign_routes,
         mut shutdown,
+        border,
     } = channels;
+    // Without a border the branches below never fire; the senders are kept
+    // so that the receivers stay open.
+    let (mut border_prefixes, to_backbone, from_backbone, _no_border) = match border {
+        Some(border) => (
+            border.prefixes,
+            Some(border.to_backbone),
+            border.from_backbone,
+            None,
+        ),
+        None => {
+            let (prefixes_tx, prefixes) = watch::channel(Vec::new());
+            let (packets_tx, packets) = mpsc::channel(1);
+            let packets = Arc::new(tokio::sync::Mutex::new(packets));
+            (prefixes, None, packets, Some((prefixes_tx, packets_tx)))
+        }
+    };
+    let mut from_backbone = from_backbone.lock_owned().await;
     native_keys.mark_unchanged();
     paths.mark_unchanged();
     let rng = SystemRandom::new();
@@ -313,6 +349,10 @@ pub async fn run(
     if let Some(networks) = &*local_networks.borrow_and_update() {
         node.set_local_networks(networks);
         local_read = true;
+    }
+    let initial = border_prefixes.borrow_and_update().clone();
+    if !initial.is_empty() {
+        node.set_border(&initial, started);
     }
     if node.waits_for_native_keys() {
         // No listening, dialling or packets until the list holds this
@@ -377,6 +417,17 @@ pub async fn run(
                     local_read = true;
                 }
             }
+            Ok(()) = border_prefixes.changed() => {
+                let prefixes = border_prefixes.borrow_and_update().clone();
+                node.set_border(&prefixes, Instant::now());
+                publish(&snapshots, snapshot(&node, local_read));
+            }
+            Some(packet) = from_backbone.recv() => {
+                // Refusals are counted by the node.
+                let now = Instant::now();
+                let _ = node.send_from_backbone(&packet, now);
+                node.wake(&rng, now);
+            }
             Ok(()) = foreign_routes.changed() => {
                 node.set_foreign_routes(&foreign_routes.borrow_and_update());
             }
@@ -391,7 +442,7 @@ pub async fn run(
             Ok(()) = paths.changed() => {
                 let list = paths.borrow_and_update().clone();
                 node.set_paths(list, &rng, Instant::now());
-                publish(&snapshots, snapshot(&node));
+                publish(&snapshots, snapshot(&node, local_read));
             }
             event = event_rx.recv() => {
                 let Some(event) = event else { break };
@@ -494,7 +545,13 @@ pub async fn run(
                 publish(&snapshots, snapshot(&node, local_read));
             }
         }
-        carry_out(&mut node, &mut conns, &mut budget, &to_interface);
+        carry_out(
+            &mut node,
+            &mut conns,
+            &mut budget,
+            &to_interface,
+            to_backbone.as_ref(),
+        );
     }
 
     for open in conns.values() {
@@ -554,6 +611,7 @@ fn snapshot(node: &Node, local_read: bool) -> Snapshot {
             .map(|(peer, address)| (peer.0, address))
             .collect(),
         paths,
+        border: node.route_table().border().to_vec(),
     }
 }
 
@@ -658,6 +716,7 @@ fn carry_out(
     conns: &mut HashMap<ConnId, Open>,
     budget: &mut HandshakeBudget,
     to_interface: &mpsc::Sender<Vec<u8>>,
+    to_backbone: Option<&mpsc::Sender<Vec<u8>>>,
 ) {
     while let Some(action) = node.poll_action() {
         match action {
@@ -669,6 +728,12 @@ fn carry_out(
             }
             Action::Deliver(packet) => {
                 let _ = to_interface.try_send(packet);
+            }
+            Action::ToBackbone(packet) => {
+                // A full queue drops the packet, like a full link.
+                if let Some(to_backbone) = to_backbone {
+                    let _ = to_backbone.try_send(packet);
+                }
             }
             Action::Close { conn, reason } => {
                 if let Some(open) = conns.remove(&conn) {
@@ -1152,6 +1217,7 @@ mod tests {
                 route_overrides,
                 foreign_routes,
                 shutdown,
+                border: None,
             },
         ));
         Running {

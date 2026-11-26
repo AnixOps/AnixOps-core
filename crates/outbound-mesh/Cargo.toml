@@ -13,6 +13,9 @@ base64 = "0.22"
 # AEADs, HMAC and HKDF; already used by the rest of the kernel.
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
+# The opaque `params` of backbone links (`backbone::config`); already used
+# by the rest of the kernel.
+serde_json = "1"
 # X25519 for the secure handshake; already used by the rest of the kernel.
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 # Wipes root, traffic and handshake keys when they are dropped (MIT or

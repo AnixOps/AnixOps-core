@@ -546,6 +546,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             stop,
             Updates { native_keys, paths },
             None,
+            None,
             |snapshot, name| {
                 if let Some(forwarding) = forwarding.as_mut() {
                     let mut sources = virtual_subnets.clone();
@@ -999,6 +1000,7 @@ pub(crate) struct Updates {
 /// with the driver's snapshot and hands each new snapshot to `observe`.
 /// `updates` carries a new native key list or path list into the running
 /// driver.
+/// `border` connects a border node's network to its backbone.
 /// With `host`, the network installs only routes no other network of the
 /// process holds, under the given owner name.
 #[allow(clippy::too_many_arguments)]
@@ -1009,6 +1011,7 @@ pub(crate) async fn serve_with(
     device: Tun,
     until: impl std::future::Future<Output = ()>,
     updates: Updates,
+    border: Option<driver::Border>,
     host: Option<(HostRoutes, String)>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
@@ -1097,6 +1100,7 @@ pub(crate) async fn serve_with(
             route_overrides,
             foreign_routes,
             shutdown,
+            border,
         },
     ));
     let _abort = AbortOnDrop(node.abort_handle());

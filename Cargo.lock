@@ -2072,6 +2072,7 @@ dependencies = [
 name = "mesh-node"
 version = "0.2.0"
 dependencies = [
+ "engine-outbound",
  "libc",
  "mesh-bridge",
  "outbound-mesh",
