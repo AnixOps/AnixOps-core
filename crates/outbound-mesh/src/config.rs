@@ -1459,7 +1459,7 @@ mod tests {
         assert!(validate(base()).unwrap().host_groups.is_empty());
         assert!(validate(grouped(json!([]))).unwrap().host_groups.is_empty());
 
-        let refused = |groups: Value| validate(grouped(groups)).unwrap_err();
+        let refused = |groups: Value| validate(grouped(groups)).err().unwrap();
         assert_eq!(
             refused(json!([group("10.127.1.5/24")])),
             "mesh host_groups cidr has host bits set"
@@ -1539,7 +1539,7 @@ mod tests {
         let mut config = grouped(json!([group("10.127.1.0/24")]));
         config["subnets"] = json!({"advertise": ["10.127.0.0/16"]});
         assert_eq!(
-            validate(config).unwrap_err(),
+            validate(config).err().unwrap(),
             "mesh host_groups cidr overlaps a subnet in subnets.advertise"
         );
         // The range itself in subnets.advertise is allowed, and only the
@@ -1571,7 +1571,7 @@ mod tests {
         ] {
             config["routing"] = json!({"paths": path(inside)});
             assert_eq!(
-                validate(config.clone()).unwrap_err(),
+                validate(config.clone()).err().unwrap(),
                 "mesh path to_subnet is inside a host group range; members of a host group follow the gateway's path",
                 "{inside}"
             );
