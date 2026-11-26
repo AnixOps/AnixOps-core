@@ -216,6 +216,11 @@ pub enum Failure {
     /// the one `native_keys` lists, so the engine does not make one
     /// (spec §8.1, §8.3.1).
     PrivateKeyRequired,
+    /// A saved network whose `node.instance_id` differs from that of the
+    /// profile adopted later: it does not run under a second identity
+    /// until saved again with the current ID, or until a profile names
+    /// its ID again (`mesh-status.md`).
+    InstanceIdChanged,
 }
 
 impl Failure {
@@ -225,6 +230,7 @@ impl Failure {
             Self::NativeKeysPending => "native_keys_pending",
             Self::PortInUse => "port_in_use",
             Self::PrivateKeyRequired => "private_key_required",
+            Self::InstanceIdChanged => "instance_id_changed",
             Self::Stopped | Self::Replaced => "start_refused",
         }
     }
@@ -247,6 +253,10 @@ impl Failure {
             Self::PrivateKeyRequired => io::Error::new(
                 io::ErrorKind::NotConnected,
                 "mesh network needs its private key",
+            ),
+            Self::InstanceIdChanged => io::Error::new(
+                io::ErrorKind::NotConnected,
+                "mesh network carries another device instance ID",
             ),
         }
     }

@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use super::registry::{NetworkState, Registry, RegistryError};
 use super::snapshot::{self, Joined, NetworkView, Tunnel};
 use crate::driver::Snapshot;
-use crate::{IpNet, MeshConfig};
+use crate::{IpNet, MeshConfig, MeshSettings};
 
 /// The commands of kernel 0.3 this module answers. Every other `mesh_*`
 /// command answers `unsupported`.
@@ -119,15 +119,21 @@ const UNSUPPORTED: &[&str] = &[
     "mesh_join_credential",
 ];
 
-/// Reads `request` when its `cmd` is a `mesh_*` command other than
-/// `mesh_engine_stop` (which the caller answers); `None` otherwise,
-/// including for a request that is not a JSON object.
-pub fn parse(request: &[u8]) -> Option<Request> {
+/// The `cmd` of a request that is a JSON object; `None` for any other
+/// request. Every other field is skipped unread, nested values included.
+pub fn command_name(request: &[u8]) -> Option<String> {
     // An object only: the derived readers would also take an array.
     if request.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
         return None;
     }
-    let name = serde_json::from_slice::<Head>(request).ok()?.cmd?;
+    serde_json::from_slice::<Head>(request).ok()?.cmd
+}
+
+/// Reads `request` when its `cmd` is a `mesh_*` command other than
+/// `mesh_engine_stop` (which the caller answers); `None` otherwise,
+/// including for a request that is not a JSON object.
+pub fn parse(request: &[u8]) -> Option<Request> {
+    let name = command_name(request)?;
     if !name.starts_with("mesh_") || name == "mesh_engine_stop" {
         return None;
     }
@@ -185,37 +191,63 @@ impl Command {
 
 /// The answer to `request`; `registry` is `None` when no engine runs.
 pub fn answer(request: Request, registry: Option<&Registry>) -> Value {
-    match request {
-        Request::Unsupported(name) => error("unsupported", &format!("{name} is not supported")),
-        Request::Invalid(detail) => error("invalid_argument", &detail),
-        Request::Command(command) => execute(command, registry),
-    }
+    answer_with(request, |_| registry)
 }
 
-fn execute(command: Command, registry: Option<&Registry>) -> Value {
+/// The answer to `request`, with the engine looked up only once the
+/// arguments are checked: `engine(starts)` gives the registry, `starts`
+/// telling whether the command may start the engine for it
+/// ([`Command::starts_engine`]). A malformed request therefore starts no
+/// engine.
+pub fn answer_with<E>(request: Request, engine: impl FnOnce(bool) -> Option<E>) -> Value
+where
+    E: std::ops::Deref<Target = Registry>,
+{
+    let command = match request {
+        Request::Unsupported(name) => {
+            return error("unsupported", &format!("{name} is not supported"))
+        }
+        Request::Invalid(detail) => return error("invalid_argument", &detail),
+        Request::Command(command) => command,
+    };
     if let Command::Status { network } = &command {
-        return match registry {
+        let registry = engine(false);
+        return match registry.as_deref() {
             Some(registry) => status(registry, network.as_deref()),
             None if network.is_some() => refused(RegistryError::NotFound),
             None => empty_status(),
         };
     }
-    let Some(registry) = registry else {
-        return match command {
-            // The caller could not start the engine.
-            Command::Save { .. } | Command::Join { .. } => refused(RegistryError::Closed),
-            _ => refused(RegistryError::NotFound),
-        };
-    };
     let starts = command.starts_engine();
-    let result = match command {
-        Command::Status { .. } => unreachable!("answered above"),
-        Command::Join { network } => registry.join(&network),
-        Command::Leave { network } => registry.leave(&network),
-        Command::Remove { network } => registry.remove(&network),
+    let command = match check(command) {
+        Ok(command) => command,
+        Err(answer) => return answer,
+    };
+    let registry = engine(starts);
+    execute(command, starts, registry.as_deref())
+}
+
+/// A command whose arguments were checked: the config of
+/// `mesh_save_network` validated, the `cidr` of `mesh_set_subnet_route`
+/// read. Checked before the engine is looked at, so that a malformed
+/// request answers `invalid_argument` whether an engine runs or not.
+enum Checked {
+    Join(String),
+    Leave(String),
+    Remove(String),
+    Save(MeshSettings),
+    SetSubnetRoute(String, IpNet, Route),
+}
+
+fn check(command: Command) -> Result<Checked, Value> {
+    Ok(match command {
+        Command::Status { .. } => unreachable!("answered before it is checked"),
+        Command::Join { network } => Checked::Join(network),
+        Command::Leave { network } => Checked::Leave(network),
+        Command::Remove { network } => Checked::Remove(network),
         Command::Save { config } => match (*config).validate() {
-            Ok(settings) => registry.save(settings),
-            Err(detail) => return error("invalid_argument", detail),
+            Ok(settings) => Checked::Save(settings),
+            Err(detail) => return Err(error("invalid_argument", detail)),
         },
         Command::SetSubnetRoute {
             network,
@@ -227,11 +259,31 @@ fn execute(command: Command, registry: Option<&Registry>) -> Value {
             let Some(cidr) =
                 IpNet::parse(&cidr).filter(|net| net.trunc().address() == net.address())
             else {
-                return error(
+                return Err(error(
                     "invalid_argument",
                     "cidr is not a network with its host bits zero",
-                );
+                ));
             };
+            Checked::SetSubnetRoute(network, cidr, route)
+        }
+    })
+}
+
+fn execute(command: Checked, starts: bool, registry: Option<&Registry>) -> Value {
+    let Some(registry) = registry else {
+        // The caller could not start the engine, or no engine runs.
+        return refused(if starts {
+            RegistryError::Closed
+        } else {
+            RegistryError::NotFound
+        });
+    };
+    let result = match command {
+        Checked::Join(network) => registry.join(&network),
+        Checked::Leave(network) => registry.leave(&network),
+        Checked::Remove(network) => registry.remove(&network),
+        Checked::Save(settings) => registry.save(settings),
+        Checked::SetSubnetRoute(network, cidr, route) => {
             registry.set_route_override(&network, cidr, route == Route::Mesh)
         }
     };
@@ -536,6 +588,57 @@ mod tests {
         assert_eq!(status["networks"].as_array().unwrap().len(), 1);
         // The private key is never given out.
         assert!(!status.to_string().contains(&encode_key(&[9; 32])));
+    }
+
+    #[test]
+    fn malformed_arguments_are_refused_before_the_engine_is_looked_at() {
+        let looked = std::cell::Cell::new(false);
+        let (_runtime, registry) = registry();
+        let ask = |request: Value| {
+            answer_with(
+                parse(request.to_string().as_bytes()).expect("a mesh command"),
+                |_| {
+                    looked.set(true);
+                    Some(&registry)
+                },
+            )
+        };
+        let mut bad = config("office", "10.144.0.2/24", "legacy");
+        bad["node"]["address"] = json!("not an address");
+        // Over the peer limit: refused whole, nothing stored.
+        let mut oversized = config("office", "10.144.0.2/24", "legacy");
+        oversized["peers"] = Value::Array(
+            (0..=crate::config::MAX_PEERS)
+                .map(|port| json!({"server": "127.0.0.1", "port": port + 1}))
+                .collect(),
+        );
+        for request in [
+            json!({"cmd": "mesh_save_network", "config": bad}),
+            json!({"cmd": "mesh_save_network", "config": oversized}),
+            json!({"cmd": "mesh_set_subnet_route", "network": "office", "cidr": "10.0.0.1/8", "route": "mesh"}),
+        ] {
+            assert_eq!(code(&ask(request.clone())), "invalid_argument", "{request}");
+            assert!(!looked.get(), "{request}");
+        }
+        assert!(registry.networks().is_empty());
+        // Without an engine, a malformed config is refused alike, and a
+        // well-formed one finds no engine.
+        let bad_without = run(
+            None,
+            json!({"cmd": "mesh_save_network", "config": {"config_version": 1}}),
+        );
+        assert_eq!(code(&bad_without), "invalid_argument");
+        let good_without = run(
+            None,
+            json!({"cmd": "mesh_save_network", "config": config("office", "10.144.0.2/24", "legacy")}),
+        );
+        assert_eq!(code(&good_without), "engine_unavailable");
+        // A well-formed command looks the engine up.
+        let saved = ask(
+            json!({"cmd": "mesh_save_network", "config": config("office", "10.144.0.2/24", "legacy")}),
+        );
+        assert_eq!(saved, json!({"ok": true}));
+        assert!(looked.get());
     }
 
     #[test]
