@@ -633,6 +633,16 @@ impl Node {
         self.local.id
     }
 
+    /// This node's own route information, as it advertises it.
+    pub fn own_info(&self) -> &RoutePeerInfo {
+        self.sync.own()
+    }
+
+    /// The route information a reachable member last advertised.
+    pub fn peer_info(&self, id: u32) -> Option<&RoutePeerInfo> {
+        self.sync.info(id)
+    }
+
     pub fn settings(&self) -> &MeshSettings {
         &self.settings
     }
@@ -1128,6 +1138,16 @@ impl Node {
             RoutePolicy::Hops => Metric::Hops,
             RoutePolicy::Latency => Metric::Latency,
         }
+    }
+
+    /// The fewest hops to each reachable member, whatever the path
+    /// policy: what [`send_ip`](Self::send_ip) chooses a subnet's
+    /// advertiser by.
+    pub fn fewest_hops(&self) -> BTreeMap<u32, u32> {
+        self.compute_routes(Metric::Hops)
+            .into_iter()
+            .map(|(peer, route)| (peer, route.hops))
+            .collect()
     }
 
     fn compute_routes(&self, metric: Metric) -> BTreeMap<u32, Route> {

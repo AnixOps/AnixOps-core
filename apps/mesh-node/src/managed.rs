@@ -2057,6 +2057,7 @@ mod tests {
             via,
             hops,
             latency_ms: (hops == 1).then_some(7),
+            ..Member::default()
         };
         let snapshot = Snapshot {
             members: vec![
