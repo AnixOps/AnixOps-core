@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ring::rand::SystemRandom;
@@ -332,6 +333,37 @@ impl Registry {
         }
         network.route_overrides = overrides;
         Ok(())
+    }
+
+    /// The joined, running network whose `tunnel.routes` (its virtual
+    /// subnets and the advertised subnets routed into the mesh) hold
+    /// `address`; the most specific route wins when networks overlap. The
+    /// embedded engine sends such flows to that network ahead of the
+    /// profile's rules (`mesh-status.md`).
+    pub fn network_for(&self, address: IpAddr) -> Option<String> {
+        let inner = self.lock();
+        let mut best: Option<(u8, &String)> = None;
+        for (name, network) in &inner.networks {
+            if !network.joined {
+                continue;
+            }
+            let Some(instance) = network
+                .instance
+                .as_ref()
+                .filter(|instance| !instance.is_retired() && instance.state().0)
+            else {
+                continue;
+            };
+            let snapshot = instance.snapshot();
+            let current = snapshot.borrow();
+            for route in super::snapshot::tunnel_routes([(&network.settings, &*current)]) {
+                if route.contains(address) && best.is_none_or(|(prefix, _)| route.prefix() > prefix)
+                {
+                    best = Some((route.prefix(), name));
+                }
+            }
+        }
+        best.map(|(_, name)| name.clone())
     }
 
     /// The networks of this machine's interfaces, for every network.
@@ -702,6 +734,35 @@ mod tests {
         registry.leave("home").unwrap();
         registry.join("lab").unwrap();
         found(&registry, &lab);
+    }
+
+    #[test]
+    fn an_address_is_routed_to_the_joined_network_that_holds_it() {
+        let (_runtime, registry) = registry();
+        let office = settings("office", "10.157.0.2/24", "legacy");
+        let lab = settings("lab", "10.157.0.130/25", "legacy");
+        let address = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(registry.network_for(address("10.157.0.9")), None);
+        registry.commit(vec![office.clone(), lab.clone()]);
+        assert_eq!(
+            registry.network_for(address("10.157.0.9")).as_deref(),
+            Some("office")
+        );
+        // The more specific route wins.
+        assert_eq!(
+            registry.network_for(address("10.157.0.200")).as_deref(),
+            Some("lab")
+        );
+        assert_eq!(registry.network_for(address("10.158.0.1")), None);
+        assert_eq!(registry.network_for(address("fd00::1")), None);
+        // A left network routes nothing.
+        registry.leave("lab").unwrap();
+        assert_eq!(
+            registry.network_for(address("10.157.0.200")).as_deref(),
+            Some("office")
+        );
+        registry.leave("office").unwrap();
+        assert_eq!(registry.network_for(address("10.157.0.9")), None);
     }
 
     #[test]
