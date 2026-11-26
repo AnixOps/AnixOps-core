@@ -2315,16 +2315,24 @@ mod tests {
         net.drops_type_40 = Some(3);
         let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
         let mut fell_back = None;
+        let mut states = Vec::new();
         for second in 0..60 {
             send(&mut net, 0, &packet);
             net.tick(Duration::from_secs(1));
-            if net.nodes[0].path_status(net.now)[0].state == "fallback" {
+            let state = net.nodes[0].path_status(net.now)[0].state;
+            states.push(state);
+            if state == "fallback" {
                 fell_back = Some(second);
                 break;
             }
         }
         // Three probes of ten seconds each, plus their 3 s wait.
-        assert!(fell_back.is_some_and(|second| second >= 20));
+        assert!(
+            fell_back.is_some_and(|second| second >= 20),
+            "fell back at {fell_back:?}; states {states:?}; status {:?}; counters {:?}",
+            net.nodes[0].path_status(net.now),
+            net.nodes[0].path_counters(),
+        );
         let status = net.nodes[0].path_status(net.now);
         assert_eq!(status[0].reason, Some(crate::waypoint::Reason::NoEcho));
         assert_eq!(status[0].unreachable, Some(IpAddr::from([10, 144, 0, 4])));
