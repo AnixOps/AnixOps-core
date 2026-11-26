@@ -17,7 +17,7 @@ use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{Listeners, Snapshot};
@@ -27,13 +27,13 @@ use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedNetwork, ManagedNetworkStatus,
     ManagedPeer, ManagedStatus, MeshControl, NetworkFailure, NetworkStaticKey,
 };
-use outbound_mesh::MeshSettings;
+use outbound_mesh::{IpNet, MeshSettings};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::serve::{self, Failure};
+use crate::serve::{self, AbortOnDrop, Failure, HostRoutes};
 use crate::tun::{self, Tun};
 
 /// Features this implementation adds to `GET /v1/status`. `mesh_native_keys`
@@ -48,6 +48,10 @@ const INTERFACE_PREFIX: &str = "anixmesh-";
 /// How long a stopped network may take to close before it is cut off.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A running network that has reached none of its configured peers for
+/// this long reports `unreachable_peers`.
+const UNREACHABLE_AFTER: Duration = Duration::from_secs(30);
+
 /// The managed mesh of one node program.
 pub struct ManagedMesh {
     inner: Arc<Inner>,
@@ -57,6 +61,15 @@ struct Inner {
     dir: PathBuf,
     instance_id: String,
     networks: Mutex<Vec<Instance>>,
+    /// Held by the task that replaces the networks, not by the request:
+    /// a request that times out does not let the next one start while
+    /// the first is still at work.
+    applying: tokio::sync::Mutex<()>,
+    /// The status from before the replacement in progress, given while
+    /// the networks are being replaced.
+    previous: Mutex<Option<ManagedStatus>>,
+    /// The system routes the running networks installed.
+    routes: HostRoutes,
 }
 
 struct Instance {
@@ -86,6 +99,7 @@ struct Running {
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
     task: JoinHandle<()>,
+    started: Instant,
 }
 
 impl ManagedMesh {
@@ -101,6 +115,9 @@ impl ManagedMesh {
                 dir,
                 instance_id,
                 networks: Mutex::new(Vec::new()),
+                applying: tokio::sync::Mutex::new(()),
+                previous: Mutex::new(None),
+                routes: HostRoutes::default(),
             }),
         })
     }
@@ -125,8 +142,37 @@ impl Inner {
         }
     }
 
+    /// Takes the running networks for a replacement; until
+    /// [`Inner::finish`] the status still describes them.
+    fn take_for_replace(&self) -> Vec<Instance> {
+        let mut networks = lock(&self.networks);
+        *lock(&self.previous) = Some(self.describe(&networks));
+        std::mem::take(&mut *networks)
+    }
+
+    fn finish(&self, networks: Vec<Instance>) {
+        *lock(&self.networks) = networks;
+        *lock(&self.previous) = None;
+    }
+
+    fn status(&self) -> ManagedStatus {
+        if let Some(previous) = lock(&self.previous).clone() {
+            return previous;
+        }
+        self.describe(&lock(&self.networks))
+    }
+
     async fn replace(&self, wanted: Vec<ManagedNetwork>) -> ManagedStatus {
-        let mut current: Vec<Instance> = std::mem::take(&mut *lock(&self.networks));
+        // Should the replacement fail midway, the status stops describing
+        // networks that are gone.
+        struct Finished<'a>(&'a Inner);
+        impl Drop for Finished<'_> {
+            fn drop(&mut self) {
+                *lock(&self.0.previous) = None;
+            }
+        }
+        let _finished = Finished(self);
+        let mut current: Vec<Instance> = self.take_for_replace();
         let mut next: Vec<Option<Instance>> = Vec::with_capacity(wanted.len());
         let mut starts = Vec::new();
         let mut stopping = Vec::new();
@@ -166,17 +212,33 @@ impl Inner {
                 _ => None,
             })
             .collect();
+        // The virtual subnets in use: no two networks share one (spec
+        // §15.4), or packets for one would go into the other.
+        let mut occupied: Vec<IpNet> = next
+            .iter()
+            .flatten()
+            .filter(|instance| matches!(instance.state, State::Running(_)))
+            .flat_map(|instance| virtual_subnets(&instance.settings))
+            .collect();
         for (index, network) in starts {
-            let instance = self.start(network, &mut taken).await;
+            let instance = self.start(network, &mut taken, &occupied).await;
+            if let State::Running(_) = instance.state {
+                occupied.extend(virtual_subnets(&instance.settings));
+            }
             next[index] = Some(instance);
         }
         let networks: Vec<Instance> = next.into_iter().flatten().collect();
         let status = self.describe(&networks);
-        *lock(&self.networks) = networks;
+        self.finish(networks);
         status
     }
 
-    async fn start(&self, network: ManagedNetwork, taken: &mut Vec<String>) -> Instance {
+    async fn start(
+        &self,
+        network: ManagedNetwork,
+        taken: &mut Vec<String>,
+        occupied: &[IpNet],
+    ) -> Instance {
         let ManagedNetwork { tag, settings } = network;
         let key = match self.static_key(&settings) {
             Ok(key) => key,
@@ -200,7 +262,10 @@ impl Inner {
             let detail = waiting_detail(&settings);
             return instance(settings, State::Waiting(detail));
         }
-        match launch(&settings, key, taken).await {
+        if let Some((code, detail)) = clash(&settings, occupied) {
+            return instance(settings, State::Refused(code, detail));
+        }
+        match launch(&settings, key, taken, &self.routes, &tag).await {
             Ok(running) => {
                 taken.push(running.interface.clone());
                 instance(settings, State::Running(running))
@@ -232,21 +297,32 @@ impl MeshControl for ManagedMesh {
         FEATURES
     }
 
+    /// While networks are being replaced: the status from before.
     fn status(&self) -> ManagedStatus {
-        self.inner.describe(&lock(&self.inner.networks))
+        self.inner.status()
     }
 
     /// Runs on a task of its own, so that a caller that goes away midway
-    /// does not leave the networks half replaced.
+    /// does not leave the networks half replaced; the task, not the
+    /// caller, holds the turn, so replacements never overlap.
     fn apply(
         &self,
         networks: Vec<ManagedNetwork>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            tokio::spawn(async move { inner.replace(networks).await })
-                .await
-                .map_err(|error| ApplyError::Failed(format!("mesh apply: {error}")))
+            tokio::spawn(async move {
+                let _turn = inner.applying.lock().await;
+                inner.replace(networks).await
+            })
+            .await
+            .map_err(|error| {
+                ApplyError::Failed(if error.is_panic() {
+                    "mesh apply stopped unexpectedly".to_owned()
+                } else {
+                    format!("mesh apply: {error}")
+                })
+            })
         })
     }
 }
@@ -305,6 +381,30 @@ fn waiting_detail(settings: &MeshSettings) -> &'static str {
     }
 }
 
+/// The virtual subnets of a network.
+fn virtual_subnets(settings: &MeshSettings) -> Vec<IpNet> {
+    std::iter::once(settings.address)
+        .chain(settings.address_v6)
+        .collect()
+}
+
+/// Why a network cannot start next to the running ones whose virtual
+/// subnets are `occupied`: the same virtual address (`address_in_use`), or
+/// overlapping subnets (`route_overlap`, the subnet as detail).
+fn clash(settings: &MeshSettings, occupied: &[IpNet]) -> Option<(FailureCode, String)> {
+    for own in virtual_subnets(settings) {
+        for other in occupied {
+            if other.address() == own.address() {
+                return Some((FailureCode::AddressInUse, own.address().to_string()));
+            }
+            if other.trunc().overlaps(&own.trunc()) {
+                return Some((FailureCode::RouteOverlap, own.trunc().to_string()));
+            }
+        }
+    }
+    None
+}
+
 async fn stop(instance: Instance) {
     if let State::Running(mut running) = instance.state {
         if let Some(stop) = running.stop.take() {
@@ -314,7 +414,10 @@ async fn stop(instance: Instance) {
             .await
             .is_err()
         {
+            // Cutting the task off drops the serving, which aborts the
+            // driver and frees its sockets and routes; wait for that.
             running.task.abort();
+            let _ = (&mut running.task).await;
         }
     }
 }
@@ -324,6 +427,8 @@ async fn launch(
     settings: &MeshSettings,
     key: KeyPair,
     taken: &[String],
+    routes: &HostRoutes,
+    tag: &str,
 ) -> Result<Running, (FailureCode, String)> {
     let (address, address_v6) = tun::addresses(
         settings.address.address(),
@@ -359,24 +464,34 @@ async fn launch(
     let exit = Arc::new(Mutex::new(None));
     let exit_of_task = Arc::clone(&exit);
     let settings = settings.clone();
+    let host = (routes.clone(), tag.to_owned());
     let task = tokio::spawn(async move {
         let until = async {
             let _ = stopped.await;
         };
-        let result = serve::serve_with(
+        // On a task of its own, so that a panic is seen and reported.
+        let serving = tokio::spawn(serve::serve_with(
             settings,
             key,
             listeners,
             device,
             until,
             keys,
+            Some(host),
             move |next, _| {
                 snapshots.send_replace(next.clone());
             },
-        )
-        .await;
-        if let Err(failure) = result {
-            *lock(&exit_of_task) = Some(failure.detail().to_owned());
+        ));
+        let _cut_off_together = AbortOnDrop(serving.abort_handle());
+        let exit = match serving.await {
+            Ok(Ok(())) => None,
+            Ok(Err(failure)) => Some(failure.detail().to_owned()),
+            // The panic message is not shown: it may carry anything.
+            Err(error) if error.is_panic() => Some("the network stopped unexpectedly".to_owned()),
+            Err(error) => Some(error.to_string()),
+        };
+        if exit.is_some() {
+            *lock(&exit_of_task) = exit;
         }
     });
     Ok(Running {
@@ -386,6 +501,7 @@ async fn launch(
         snapshot,
         exit,
         task,
+        started: Instant::now(),
     })
 }
 
@@ -440,14 +556,25 @@ fn network_status(instance: &Instance) -> ManagedNetworkStatus {
                 return status;
             }
             let snapshot = running.snapshot.borrow();
-            fill_running(&mut status, &instance.settings, &snapshot);
+            fill_running(
+                &mut status,
+                &instance.settings,
+                &snapshot,
+                running.started.elapsed(),
+            );
         }
     }
     status
 }
 
-/// The status of a running network from its driver's snapshot.
-fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snapshot: &Snapshot) {
+/// The status of a running network from its driver's snapshot, `up` after
+/// it started.
+fn fill_running(
+    status: &mut ManagedNetworkStatus,
+    settings: &MeshSettings,
+    snapshot: &Snapshot,
+    up: Duration,
+) {
     status.running = true;
     status.address = Some(settings.address);
     let address_of = |peer: u32| -> Option<IpAddr> {
@@ -475,10 +602,21 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             })
         })
         .collect();
-    status.failure = snapshot.not_native.map(|peer| NetworkFailure {
-        code: FailureCode::PeerNotNative,
-        detail: peer.to_string(),
-    });
+    // One reason, the more pressing first: no configured peer reached,
+    // then a refused member (docs/architecture/mesh-status.md).
+    let unreachable =
+        !settings.peers.is_empty() && snapshot.neighbours.is_empty() && up >= UNREACHABLE_AFTER;
+    status.failure = if unreachable {
+        Some(NetworkFailure {
+            code: FailureCode::UnreachablePeers,
+            detail: settings.peers.len().to_string(),
+        })
+    } else {
+        snapshot.not_native.map(|peer| NetworkFailure {
+            code: FailureCode::PeerNotNative,
+            detail: peer.to_string(),
+        })
+    };
     status.rejected_advertisements = snapshot.rejected_advertisements;
     status.overlaps.clone_from(&snapshot.overlaps);
     status.alerts = snapshot
@@ -724,7 +862,7 @@ mod tests {
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
-        fill_running(&mut status, &base, &snapshot);
+        fill_running(&mut status, &base, &snapshot, Duration::ZERO);
         assert!(status.running);
         assert_eq!(status.address, Some(base.address));
         assert_eq!(status.peers.len(), 2);
@@ -749,17 +887,116 @@ mod tests {
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
-        fill_running(&mut status, &base, &undelivered);
+        fill_running(&mut status, &base, &undelivered, Duration::ZERO);
         assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
         assert!(status.alerts[0].detail.starts_with("undelivered:"));
 
         let mut full = Snapshot::default();
         full.counters.refused_at_capacity = 3;
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
-        fill_running(&mut status, &base, &full);
+        fill_running(&mut status, &base, &full, Duration::ZERO);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
         assert!(status.alerts[0].detail.starts_with("capacity:"));
         assert!(status.alerts[0].detail.contains("3 refused"));
+    }
+
+    #[test]
+    fn no_peer_reached_comes_before_a_refused_member() {
+        let base = settings();
+        let snapshot = Snapshot {
+            not_native: Some(44),
+            ..Snapshot::default()
+        };
+        let failure = |up, snapshot: &Snapshot| {
+            let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+            fill_running(&mut status, &base, snapshot, up);
+            status.failure.map(|failure| failure.code)
+        };
+        // Just started: not yet unreachable.
+        assert_eq!(
+            failure(Duration::from_secs(1), &snapshot),
+            Some(FailureCode::PeerNotNative)
+        );
+        assert_eq!(
+            failure(UNREACHABLE_AFTER, &snapshot),
+            Some(FailureCode::UnreachablePeers)
+        );
+        let connected = Snapshot {
+            neighbours: vec![3],
+            ..snapshot
+        };
+        assert_eq!(
+            failure(UNREACHABLE_AFTER, &connected),
+            Some(FailureCode::PeerNotNative)
+        );
+        let quiet = Snapshot {
+            neighbours: vec![3],
+            ..Snapshot::default()
+        };
+        assert_eq!(failure(UNREACHABLE_AFTER, &quiet), None);
+    }
+
+    #[test]
+    fn networks_may_not_share_a_virtual_subnet_or_address() {
+        let base = settings();
+        let net = |text: &str| IpNet::parse(text).unwrap();
+        assert_eq!(clash(&base, &[net("10.151.0.1/16")]), None);
+        assert_eq!(
+            clash(&base, &[net("10.150.9.1/24")]),
+            Some((FailureCode::RouteOverlap, "10.150.0.0/16".to_owned()))
+        );
+        assert_eq!(
+            clash(&base, &[net("10.150.0.5/24")]),
+            Some((FailureCode::AddressInUse, "10.150.0.5".to_owned()))
+        );
+    }
+
+    fn waiting(tag: &str, name: &str) -> ManagedNetwork {
+        let mut settings = settings();
+        settings.network_name = name.into();
+        ManagedNetwork {
+            tag: tag.into(),
+            settings,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_status_keeps_the_old_networks_while_they_are_replaced() {
+        let dir = temp_dir("previous");
+        let mesh = ManagedMesh::open(&dir).expect("open");
+        let before = mesh
+            .apply(vec![waiting("mesh-cn", "office")])
+            .await
+            .unwrap();
+        let taken = mesh.inner.take_for_replace();
+        assert_eq!(mesh.status(), before);
+        mesh.inner.finish(Vec::new());
+        assert!(mesh.status().networks.is_empty());
+        mesh.inner.finish(taken);
+        assert_eq!(mesh.status(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_keeps_its_turn_after_the_caller_gives_up() {
+        let dir = temp_dir("turn");
+        let mesh = ManagedMesh::open(&dir).expect("open");
+        let held = mesh.inner.applying.lock().await;
+        // The caller gives up: its replacement still waits for its turn.
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            mesh.apply(vec![waiting("mesh-cn", "office")]),
+        )
+        .await;
+        assert!(gave_up.is_err());
+        assert!(mesh.status().networks.is_empty());
+        drop(held);
+        // The next one runs after it, never beside it.
+        let after = mesh.apply(vec![waiting("mesh-hk", "lab")]).await.unwrap();
+        assert_eq!(after.networks.len(), 1);
+        assert_eq!(after.networks[0].tag, "mesh-hk");
+        assert_eq!(mesh.status(), after);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
