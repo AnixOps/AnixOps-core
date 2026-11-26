@@ -25,6 +25,8 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use outbound_mesh::IpNet;
 use platform_windows::mesh_host::{self, FirewallGuard, ForwardingGuard, NatGuard};
@@ -120,9 +122,37 @@ impl HostChanges {
             }
         }
         // Guards dropped earlier (a start that failed half way) remove on
-        // threads of their own: wait for those too.
-        mesh_host::finish_mesh_firewall_removals();
+        // threads of their own: wait for those too, but not forever.
+        if !finish_removals(REMOVAL_WAIT) {
+            warnings.push(format!(
+                "earlier firewall or translation removals still running after {} s; \
+                 the next start or restore-host puts back what they leave",
+                REMOVAL_WAIT.as_secs()
+            ));
+        }
         warnings
+    }
+}
+
+/// How long shutdown waits for removals of guards dropped earlier.
+const REMOVAL_WAIT: Duration = Duration::from_secs(10);
+
+/// Waits up to `limit` for the removals of dropped guards. Returns whether
+/// they finished; if not, the waiting thread is left to finish them.
+fn finish_removals(limit: Duration) -> bool {
+    let (done, finished) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("mesh-removals-wait".into())
+        .spawn(move || {
+            mesh_host::finish_mesh_firewall_removals();
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(_) => finished.recv_timeout(limit).is_ok(),
+        Err(_) => {
+            mesh_host::finish_mesh_firewall_removals();
+            true
+        }
     }
 }
 
@@ -156,5 +186,11 @@ mod tests {
         let host = HostChanges::default();
         assert!(!host.forwarding());
         drop(host);
+    }
+
+    #[test]
+    fn shutdown_with_nothing_pending_returns_at_once() {
+        assert!(finish_removals(Duration::from_secs(10)));
+        assert!(HostChanges::default().shutdown().is_empty());
     }
 }
