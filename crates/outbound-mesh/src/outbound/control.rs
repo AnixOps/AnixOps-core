@@ -156,38 +156,23 @@ fn execute(command: Command, registry: Option<&Registry>) -> Value {
             cidr,
             route,
         } => {
-            let Some(cidr) = IpNet::parse(&cidr).filter(|net| net.trunc() == *net) else {
+            // `IpNet` equality compares networks only: the address is
+            // compared apart, as the config checks do.
+            let Some(cidr) =
+                IpNet::parse(&cidr).filter(|net| net.trunc().address() == net.address())
+            else {
                 return error(
                     "invalid_argument",
                     "cidr is not a network with its host bits zero",
                 );
             };
-            set_subnet_route(registry, &network, cidr, route)
+            registry.set_route_override(&network, cidr, route == Route::Mesh)
         }
     };
     match result {
         Ok(()) => json!({"ok": true}),
         Err(refusal) => refused(refusal),
     }
-}
-
-fn set_subnet_route(
-    registry: &Registry,
-    name: &str,
-    cidr: IpNet,
-    route: Route,
-) -> Result<(), RegistryError> {
-    let network = registry
-        .networks()
-        .into_iter()
-        .find(|network| network.settings.network_name == name)
-        .ok_or(RegistryError::NotFound)?;
-    let mut overrides = network.route_overrides;
-    overrides.retain(|net| *net != cidr);
-    if route == Route::Mesh {
-        overrides.push(cidr);
-    }
-    registry.set_route_overrides(name, overrides)
 }
 
 fn error(code: &str, detail: &str) -> Value {
@@ -484,5 +469,16 @@ mod tests {
             json!({"cmd": "mesh_set_subnet_route", "network": "lab", "cidr": "10.0.0.0/8", "route": "mesh"}),
         );
         assert_eq!(code(&unknown), "not_found");
+        // At most 256 overrides per network; removing one makes room.
+        for index in 0..256 {
+            let cidr = format!("10.{}.{}.0/24", 200 + index / 256, index % 256);
+            assert_eq!(set("mesh", &cidr), json!({"ok": true}), "{cidr}");
+        }
+        assert_eq!(code(&set("mesh", "10.201.0.0/24")), "invalid_argument");
+        // Already listed: no new entry.
+        assert_eq!(set("mesh", "10.200.0.0/24"), json!({"ok": true}));
+        assert_eq!(set("local", "10.200.0.0/24"), json!({"ok": true}));
+        assert_eq!(set("mesh", "10.201.0.0/24"), json!({"ok": true}));
+        assert_eq!(overrides(&registry).len(), 256);
     }
 }

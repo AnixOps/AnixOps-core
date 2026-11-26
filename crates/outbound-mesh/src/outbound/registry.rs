@@ -83,7 +83,12 @@ pub enum RegistryError {
     /// `node.instance_id` differs from that of another network: one device
     /// has one instance ID (`mesh-module.md`).
     InstanceIdMismatch,
+    /// `mesh_set_subnet_route` beyond [`MAX_ROUTE_OVERRIDES`].
+    TooManyOverrides,
 }
+
+/// Most `mesh_set_subnet_route` overrides kept for one network.
+pub const MAX_ROUTE_OVERRIDES: usize = 256;
 
 impl RegistryError {
     /// The `error.code` and `error.detail` of a refused command
@@ -99,6 +104,10 @@ impl RegistryError {
             Self::InstanceIdMismatch => (
                 "invalid_argument",
                 "node.instance_id differs from that of another mesh network",
+            ),
+            Self::TooManyOverrides => (
+                "invalid_argument",
+                "the network already has 256 subnet route overrides",
             ),
         }
     }
@@ -255,10 +264,14 @@ impl Registry {
 
     /// `mesh_set_subnet_route`: the subnets of `name` routed through the
     /// mesh although they overlap a network of this machine.
-    pub fn set_route_overrides(
+    /// `mesh` adds `cidr` to the overrides of `name`, otherwise removes
+    /// it; read and written under one lock, at most
+    /// [`MAX_ROUTE_OVERRIDES`] per network.
+    pub fn set_route_override(
         &self,
         name: &str,
-        overrides: Vec<IpNet>,
+        cidr: IpNet,
+        mesh: bool,
     ) -> Result<(), RegistryError> {
         let mut inner = self.lock();
         if inner.closed {
@@ -268,6 +281,14 @@ impl Registry {
             .networks
             .get_mut(name)
             .ok_or(RegistryError::NotFound)?;
+        let mut overrides = network.route_overrides.clone();
+        overrides.retain(|net| *net != cidr);
+        if mesh {
+            if overrides.len() >= MAX_ROUTE_OVERRIDES {
+                return Err(RegistryError::TooManyOverrides);
+            }
+            overrides.push(cidr);
+        }
         if let Some(instance) = &network.instance {
             instance.set_route_overrides(overrides.clone());
         }
