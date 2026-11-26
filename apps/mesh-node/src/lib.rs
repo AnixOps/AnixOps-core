@@ -16,6 +16,7 @@
 pub mod cmdline;
 pub mod convert;
 pub mod detect;
+pub mod device;
 #[cfg(target_os = "macos")]
 pub mod forward_macos;
 #[cfg(windows)]
