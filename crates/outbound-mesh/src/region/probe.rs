@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn answers_are_smaller_than_requests() {
-        assert!(ANSWER_LEN < REQUEST_LEN);
+        const { assert!(ANSWER_LEN < REQUEST_LEN) };
     }
 
     #[test]

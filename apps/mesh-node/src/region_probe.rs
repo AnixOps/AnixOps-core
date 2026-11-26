@@ -17,6 +17,7 @@
 
 use std::io::{self, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -279,12 +280,12 @@ fn save_history(dir: &Path, history: &History) {
     let temporary = dir.join(format!("{HISTORY_FILE}.tmp"));
     let result = (|| -> io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Windows: the state directory's own access list applies.
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&temporary)?;
         file.write_all(history.save().as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temporary, &path)
@@ -430,17 +431,32 @@ fn bind(address: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(socket)
 }
 
+/// Windows binds an IPv6 socket to IPv6 only by default, so the plain bind
+/// above already was one; its failure stands.
+#[cfg(windows)]
+fn bind_v6_only(_address: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    Err(io::Error::from(io::ErrorKind::AddrInUse))
+}
+
+#[cfg(unix)]
 fn bind_v6_only(address: SocketAddr) -> io::Result<std::net::UdpSocket> {
     use std::os::fd::FromRawFd;
     // SAFETY: plain socket(2) / setsockopt(2) / bind(2) on a descriptor we
     // own; it is closed on every error path and handed to UdpSocket on
     // success.
     unsafe {
+        #[cfg(target_os = "linux")]
         let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        #[cfg(not(target_os = "linux"))]
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
         let socket = std::net::UdpSocket::from_raw_fd(fd);
+        #[cfg(not(target_os = "linux"))]
+        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != 0 {
+            return Err(io::Error::last_os_error());
+        }
         let one: libc::c_int = 1;
         if libc::setsockopt(
             fd,
@@ -530,11 +546,14 @@ mod tests {
         assert_eq!(responder.public_key.len(), 44);
         let first_key = responder.public_key.clone();
         assert!(status.suggestion.is_none());
-        let mode = std::fs::metadata(dir.join("keys").join(RESPONDER_KEY)).unwrap();
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(dir.join("keys").join(RESPONDER_KEY)).unwrap();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
+                0o600
+            );
+        }
 
         // Measure against it on a known port (port 0 hides the bound one).
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

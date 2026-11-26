@@ -477,9 +477,12 @@ mod tests {
         assert_eq!(d.rejected, 1);
     }
 
+    /// A change to a valid directory and the field it breaks.
+    type Fault = (Box<dyn Fn(&mut Value)>, &'static str);
+
     #[test]
     fn top_level_faults_refuse_the_whole_directory() {
-        let cases: Vec<(Box<dyn Fn(&mut Value)>, &str)> = vec![
+        let cases: Vec<Fault> = vec![
             (Box::new(|v| v["version"] = json!(2)), "directory.version"),
             (Box::new(|v| v["extra"] = json!(1)), "directory"),
             (
