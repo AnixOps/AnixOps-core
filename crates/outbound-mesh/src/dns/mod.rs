@@ -131,7 +131,8 @@ impl Default for DnsSettings {
 /// and in lower case: it must lie under `internal` with at least two
 /// labels (so the root, any single label, `arpa`, `home.arpa`, the reverse
 /// zones and `local` are all refused), at most [`MAX_SUFFIX_BYTES`] bytes,
-/// each label 1 to 63 bytes of letters, digits and hyphens. The reverse
+/// each label 1 to 63 bytes of ASCII letters, digits and inner hyphens
+/// (anything else, non-ASCII included, is refused). The reverse
 /// zones are worked out from the virtual subnets, never configured. The
 /// same rule applies to the local override (`mesh_set_dns`).
 pub fn normalize_suffix(suffix: &str) -> Option<String> {
@@ -139,6 +140,8 @@ pub fn normalize_suffix(suffix: &str) -> Option<String> {
     let labels: Vec<&str> = suffix.split('.').collect();
     let labels_ok = labels.iter().all(|label| {
         (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
             && label
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -174,7 +177,10 @@ impl DnsConfig {
         if self.names.len() > MAX_NAMES {
             return Err("mesh dns lists too many names");
         }
+        // With the section off the resolver address is ignored, unchecked:
+        // nothing is intercepted or answered at all (spec §15.9.2).
         let resolver_address = match &self.resolver_address {
+            _ if !self.enabled => None,
             None => None,
             Some(text) => {
                 let address: IpAddr = text
@@ -858,6 +864,10 @@ mod tests {
             "a..internal",
             "",
             "a_b.internal",
+            "-mesh.internal",
+            "mesh-.internal",
+            ".mesh.internal",
+            "网.internal",
         ] {
             assert!(settings(json!({ "suffix": bad })).is_err(), "{bad}");
         }
@@ -868,7 +878,7 @@ mod tests {
         assert!(settings(json!({ "region": "CN" })).is_err());
         assert!(settings(json!({ "region": "c.n" })).is_err());
         assert_eq!(
-            settings(json!({ "resolver_address": "10.150.255.254" }))
+            settings(json!({ "enabled": true, "resolver_address": "10.150.255.254" }))
                 .unwrap()
                 .resolver_address,
             Some(ip("10.150.255.254"))
@@ -881,11 +891,14 @@ mod tests {
             "8.8.8.8",
         ] {
             assert!(
-                settings(json!({ "resolver_address": bad })).is_err(),
+                settings(json!({ "enabled": true, "resolver_address": bad })).is_err(),
                 "{bad}"
             );
         }
-        assert!(settings(json!({ "resolver_address": "fd00:150::53" })).is_ok());
+        assert!(settings(json!({ "enabled": true, "resolver_address": "fd00:150::53" })).is_ok());
+        // Off: the resolver address is ignored, even a bad one.
+        let off = settings(json!({ "resolver_address": "8.8.8.8" })).unwrap();
+        assert_eq!(off.resolver_address, None);
         let too_many: Vec<Value> = (0..=MAX_NAMES)
             .map(|i| json!({ "name": format!("n{i}.cn"), "address": "10.150.0.1" }))
             .collect();
