@@ -88,6 +88,7 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
                 config.mesh_state_dir.as_deref(),
                 config.mesh_external_bridge,
                 config.mesh_backbone,
+                config.mesh_paths,
             )
         });
         if let Some(bundle) = &config.tls_fingerprints {
@@ -159,18 +160,20 @@ const MESH_STATE_DIR: &str = "/var/lib/anixcore/mesh";
 /// Installs the managed mesh networks of `PUT /v1/mesh` (Linux). Without
 /// its state directory the node runs without them: `GET /v1/status` does
 /// not list `mesh` and `/v1/mesh` answers 404. The inter-region backbone
-/// stays off unless the config sets `mesh_backbone`.
+/// stays off unless the config sets `mesh_backbone`, custom paths unless
+/// it sets `mesh_paths`.
 #[cfg(target_os = "linux")]
 fn with_mesh(
     node: Node,
     dir: Option<&std::path::Path>,
     external_bridge: bool,
     backbone: bool,
+    paths: bool,
 ) -> Node {
     let dir = dir.unwrap_or(std::path::Path::new(MESH_STATE_DIR));
     match mesh_node::managed::ManagedMesh::open_with_options(dir, external_bridge) {
         Ok(mesh) => {
-            let mesh = mesh.with_backbone(backbone);
+            let mesh = mesh.with_backbone(backbone).with_paths(paths);
             println!("mesh: instance {}", mesh.instance_id());
             node.with_mesh(Arc::new(mesh))
         }
@@ -190,6 +193,7 @@ fn with_mesh(
     _dir: Option<&std::path::Path>,
     _external_bridge: bool,
     _backbone: bool,
+    _paths: bool,
 ) -> Node {
     node
 }

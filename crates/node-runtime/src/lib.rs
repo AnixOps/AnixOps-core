@@ -482,7 +482,7 @@ impl Node {
         let mut features = FEATURES.to_vec();
         if let Some(mesh) = &self.mesh {
             for feature in mesh.features() {
-                if !features.contains(feature) {
+                if !features.contains(&feature) {
                     features.push(feature);
                 }
             }
