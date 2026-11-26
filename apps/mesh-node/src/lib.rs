@@ -14,7 +14,7 @@
 //! configuration is written, comes from a profile file maintained in the
 //! deployment layer (see [`profile`] and `docs/deploy/mesh-node.md`).
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod border;
 pub mod cmdline;
 pub mod convert;
