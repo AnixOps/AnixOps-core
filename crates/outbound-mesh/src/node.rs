@@ -1110,7 +1110,7 @@ impl Node {
             }
         };
         let from = inbound.header.from;
-        if from != session_peer && header.has(flags::ENCRYPTED) {
+        if inbound.relay_session {
             // Opened by a relay session with `from`: its handshake took
             // effect, which clears an earlier refusal (spec §8.3.1 rule 5).
             self.admitted_peer(from);
