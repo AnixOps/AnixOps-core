@@ -25,6 +25,7 @@
 //! | `PUT /v1/qos` | `QosConfig` | `QosStatus` |
 //! | `GET /v1/mesh` | | `ManagedStatus` |
 //! | `PUT /v1/mesh` | `{"networks": [MeshConfig + "tag"]}` | `ManagedStatus` |
+//! | `PUT /v1/mesh/subnet_route` | `{"tag", "cidr", "route": "local" \| "mesh"}` | `ManagedStatus` |
 //!
 //! `PUT /v1/mesh` replaces the managed mesh networks as a whole (see
 //! [`crate::mesh`]); `{"networks": []}` stops them all. An invalid network
@@ -266,6 +267,7 @@ enum Endpoint {
     PutTlsFingerprints,
     GetMesh,
     PutMesh,
+    PutMeshSubnetRoute,
 }
 
 impl Endpoint {
@@ -301,6 +303,7 @@ impl Endpoint {
             ("PUT", ["v1", "tls-fingerprints"]) => Self::PutTlsFingerprints,
             ("GET", ["v1", "mesh"]) => Self::GetMesh,
             ("PUT", ["v1", "mesh"]) => Self::PutMesh,
+            ("PUT", ["v1", "mesh", "subnet_route"]) => Self::PutMeshSubnetRoute,
             _ => return None,
         })
     }
@@ -315,7 +318,7 @@ impl Endpoint {
             | Self::PutQos
             | Self::PutTlsFingerprints
             | Self::PutMesh => LARGE_BODY_LIMIT,
-            Self::RemoveUsers(_) | Self::PutNetwork => SMALL_BODY_LIMIT,
+            Self::RemoveUsers(_) | Self::PutNetwork | Self::PutMeshSubnetRoute => SMALL_BODY_LIMIT,
             Self::Status
             | Self::ListInbounds
             | Self::RemoveInbound(_)
@@ -590,6 +593,10 @@ async fn route(node: &Node, endpoint: Endpoint, query: &str, body: &[u8]) -> Res
         Endpoint::GetMesh => node.mesh_state().map(|status| Response::ok(json!(status))),
         Endpoint::PutMesh => node
             .apply_mesh(body)
+            .await
+            .map(|status| Response::ok(json!(status))),
+        Endpoint::PutMeshSubnetRoute => node
+            .set_mesh_subnet_route(body)
             .await
             .map(|status| Response::ok(json!(status))),
         Endpoint::GetTlsFingerprints => Ok(Response::ok(json!(crate::tls_fingerprints()))),

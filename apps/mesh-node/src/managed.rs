@@ -12,6 +12,11 @@
 //!   `network.name`, readable by the owner only), unless the configuration
 //!   carries `node.private_key`. Keys stay when a network leaves the list,
 //!   so that taking it back keeps the key the panel already lists.
+//! - `overrides/<network>.json`: the subnets the user routes through the
+//!   mesh although they overlap a network of this machine
+//!   (`PUT /v1/mesh/subnet_route`, spec §15.4), `{"mesh": ["<cidr>", ...]}`,
+//!   named like the key. A local override: it outlives restarts and leaving
+//!   the list, and never changes the network's configuration.
 //!
 //! A border node's request also carries a `backbone` section; its backbone
 //! runs beside the networks and meets its region network through that
@@ -41,7 +46,7 @@ use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, ExternalBridgeStatus, FailureCode, ManagedBackbone,
     ManagedNetwork, ManagedNetworkStatus, ManagedPeer, ManagedStatus, MeshControl, NetworkFailure,
-    NetworkStaticKey,
+    NetworkStaticKey, OverrideError, SubnetRoute, MAX_ROUTE_OVERRIDES,
 };
 use outbound_mesh::{IpNet, MeshSettings};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -234,6 +239,8 @@ struct Running {
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
     host_groups: watch::Sender<Vec<HostGroup>>,
+    /// The subnet route overrides, handed to the running driver.
+    route_overrides: watch::Sender<Vec<IpNet>>,
     snapshot: watch::Receiver<Snapshot>,
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
@@ -254,6 +261,7 @@ impl ManagedMesh {
         let dir = dir.into();
         create_private_dir(&dir)?;
         create_private_dir(&dir.join("keys"))?;
+        create_private_dir(&dir.join("overrides"))?;
         let instance_id = instance_id(&dir.join("instance_id"))?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -291,11 +299,131 @@ impl ManagedMesh {
     }
 }
 
+/// A file name for `network`: a digest of its name.
+fn file_stem(network: &str) -> String {
+    let digest = Sha256::digest(network.as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The overrides file: the subnets routed through the mesh.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct OverridesFile {
+    mesh: Vec<String>,
+}
+
 impl Inner {
     fn key_path(&self, network: &str) -> PathBuf {
-        let digest = Sha256::digest(network.as_bytes());
-        let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-        self.dir.join("keys").join(format!("{name}.key"))
+        self.dir
+            .join("keys")
+            .join(format!("{}.key", file_stem(network)))
+    }
+
+    fn overrides_path(&self, network: &str) -> PathBuf {
+        self.dir
+            .join("overrides")
+            .join(format!("{}.json", file_stem(network)))
+    }
+
+    /// The subnets `network` routes through the mesh against the overlap
+    /// rule; none when there is no file. An unreadable file counts as none,
+    /// which is the safe default (spec §15.4), and is reported.
+    fn route_overrides(&self, network: &str) -> Vec<IpNet> {
+        let path = self.overrides_path(network);
+        let text = match std::fs::read(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => {
+                eprintln!("mesh: subnet route overrides of a network not read: {error}");
+                return Vec::new();
+            }
+        };
+        match serde_json::from_slice::<OverridesFile>(&text) {
+            Ok(file) => file
+                .mesh
+                .iter()
+                .filter_map(|text| IpNet::parse(text))
+                .map(|net| net.trunc())
+                .take(MAX_ROUTE_OVERRIDES)
+                .collect(),
+            Err(_) => {
+                eprintln!("mesh: subnet route overrides of a network not understood");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Writes `network`'s overrides whole: a temporary file renamed over
+    /// the old one, readable by the owner only.
+    fn save_route_overrides(&self, network: &str, subnets: &[IpNet]) -> io::Result<()> {
+        use std::io::Write;
+        let path = self.overrides_path(network);
+        let file = OverridesFile {
+            mesh: subnets.iter().map(ToString::to_string).collect(),
+        };
+        let body = serde_json::to_vec(&file).map_err(io::Error::other)?;
+        let mut temporary = path.clone().into_os_string();
+        temporary.push(format!(".{}.tmp", std::process::id()));
+        let temporary = PathBuf::from(temporary);
+        let written = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // On Windows the file takes the access list of the state
+            // directory.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut out = options.open(&temporary)?;
+            // A file left by an earlier attempt keeps its mode on open.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            out.write_all(&body)?;
+            out.sync_all()?;
+            std::fs::rename(&temporary, &path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        written
+    }
+
+    /// Saves one override for the network `tag` and hands the list to its
+    /// driver when it runs.
+    fn set_subnet_route(
+        &self,
+        tag: &str,
+        subnet: IpNet,
+        route: SubnetRoute,
+    ) -> Result<(), OverrideError> {
+        let networks = lock(&self.networks);
+        let instance = networks
+            .iter()
+            .find(|instance| instance.tag == tag)
+            .ok_or(OverrideError::UnknownNetwork)?;
+        let name = &instance.settings.network_name;
+        let mut subnets = self.route_overrides(name);
+        let subnet = subnet.trunc();
+        match route {
+            SubnetRoute::Mesh if subnets.contains(&subnet) => return Ok(()),
+            SubnetRoute::Mesh if subnets.len() >= MAX_ROUTE_OVERRIDES => {
+                return Err(OverrideError::Invalid(format!(
+                    "at most {MAX_ROUTE_OVERRIDES} subnets per network may be routed through the mesh"
+                )))
+            }
+            SubnetRoute::Mesh => subnets.push(subnet),
+            SubnetRoute::Local if !subnets.contains(&subnet) => return Ok(()),
+            SubnetRoute::Local => subnets.retain(|net| *net != subnet),
+        }
+        self.save_route_overrides(name, &subnets)
+            .map_err(|error| OverrideError::Failed(format!("saving the override: {error}")))?;
+        if let State::Running(running) = &instance.state {
+            running.route_overrides.send_replace(subnets);
+        }
+        Ok(())
     }
 
     fn static_key(&self, settings: &MeshSettings) -> Result<KeyPair, Failure> {
@@ -511,8 +639,9 @@ impl Inner {
         if let Some((code, detail)) = clash(&settings, occupied) {
             return instance(settings, State::Refused(code, detail));
         }
+        let overrides = self.route_overrides(&settings.network_name);
         let hub = lock(&self.hubs).get(&tag).cloned();
-        match launch(&settings, key, taken, &self.routes, &tag, hub).await {
+        match launch(&settings, key, taken, &self.routes, &tag, hub, overrides).await {
             Ok(mut running) => {
                 if let Some(section) = &settings.external_bridge {
                     if let Err(detail) = self.bridge_up(&mut running, section, &settings) {
@@ -624,6 +753,20 @@ impl MeshControl for ManagedMesh {
             (false, true) => FEATURES_WITH_BACKBONE,
             (false, false) => FEATURES,
         }
+    }
+
+    /// Waits for a replacement in progress, so that the network is found
+    /// under its tag.
+    fn set_subnet_route(
+        &self,
+        tag: String,
+        subnet: IpNet,
+        route: SubnetRoute,
+    ) -> BoxFuture<'_, Result<(), OverrideError>> {
+        Box::pin(async move {
+            let _turn = self.inner.applying.lock().await;
+            self.inner.set_subnet_route(&tag, subnet, route)
+        })
     }
 
     /// While networks are being replaced: the status from before.
@@ -831,6 +974,7 @@ async fn launch(
     routes: &HostRoutes,
     tag: &str,
     hub: Option<Arc<Hub>>,
+    overrides: Vec<IpNet>,
 ) -> Result<Running, (FailureCode, String)> {
     let (address, address_v6) = tun::addresses(
         settings.address.address(),
@@ -864,6 +1008,7 @@ async fn launch(
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
     let (host_groups, groups) = watch::channel(settings.host_groups.clone());
+    let (route_overrides, overrides) = watch::channel(overrides);
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
     let exit = Arc::new(Mutex::new(None));
     let exit_of_task = Arc::clone(&exit);
@@ -885,6 +1030,7 @@ async fn launch(
             serve::Updates {
                 native_keys: keys,
                 host_groups: groups,
+                route_overrides: overrides,
             },
             border,
             Some(host),
@@ -912,6 +1058,7 @@ async fn launch(
         stop: Some(stop),
         native_keys,
         host_groups,
+        route_overrides,
         snapshot,
         exit,
         task,
@@ -1361,6 +1508,89 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mesh-managed-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[tokio::test]
+    async fn a_subnet_route_override_is_saved_and_withdrawn() {
+        let dir = temp_dir("overrides");
+        let mesh = open(&dir).expect("open");
+        let net = |text: &str| IpNet::parse(text).unwrap();
+        // No network under the tag.
+        assert_eq!(
+            mesh.set_subnet_route("mesh-cn".into(), net("192.168.10.0/24"), SubnetRoute::Mesh)
+                .await,
+            Err(OverrideError::UnknownNetwork)
+        );
+        lock(&mesh.inner.networks).push(Instance {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+            public: None,
+            state: State::Waiting("empty"),
+        });
+        // Saved as a network address, once; read back after a restart.
+        for _ in 0..2 {
+            mesh.set_subnet_route("mesh-cn".into(), net("192.168.10.7/24"), SubnetRoute::Mesh)
+                .await
+                .unwrap();
+        }
+        let again = open(&dir).expect("open again");
+        assert_eq!(
+            again.inner.route_overrides("office"),
+            [net("192.168.10.0/24")]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(mesh.inner.overrides_path("office"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Withdrawn: the overlap rule applies again.
+        mesh.set_subnet_route("mesh-cn".into(), net("192.168.10.0/24"), SubnetRoute::Local)
+            .await
+            .unwrap();
+        assert!(mesh.inner.route_overrides("office").is_empty());
+        // A file that cannot be understood counts as none.
+        std::fs::write(mesh.inner.overrides_path("office"), b"{").unwrap();
+        assert!(mesh.inner.route_overrides("office").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_running_network_gets_its_overrides_at_once() {
+        let dir = temp_dir("overrides-running");
+        let mesh = open(&dir).expect("open");
+        let net = |text: &str| IpNet::parse(text).unwrap();
+        let (stop, _stopped) = oneshot::channel();
+        let (native_keys, _keys) = watch::channel(None);
+        let (host_groups, _groups) = watch::channel(Vec::new());
+        let (route_overrides, mut overrides) = watch::channel(Vec::new());
+        let (_snapshots, snapshot) = watch::channel(Snapshot::default());
+        lock(&mesh.inner.networks).push(Instance {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+            public: None,
+            state: State::Running(Box::new(Running {
+                interface: "anixmesh-0".into(),
+                stop: Some(stop),
+                native_keys,
+                host_groups,
+                route_overrides,
+                snapshot,
+                exit: Arc::new(Mutex::new(None)),
+                task: tokio::spawn(async {}),
+                bridge: None,
+                started: Instant::now(),
+            })),
+        });
+        mesh.set_subnet_route("mesh-cn".into(), net("192.168.10.0/24"), SubnetRoute::Mesh)
+            .await
+            .unwrap();
+        assert!(overrides.has_changed().unwrap());
+        assert_eq!(*overrides.borrow_and_update(), [net("192.168.10.0/24")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

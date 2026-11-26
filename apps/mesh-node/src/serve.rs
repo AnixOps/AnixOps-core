@@ -634,6 +634,9 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
         let (_keep_groups, host_groups) = watch::channel(Vec::new());
+        // Subnet route overrides belong to the managed networks
+        // (`PUT /v1/mesh/subnet_route`); a standalone node has none.
+        let (_keep_overrides, route_overrides) = watch::channel(Vec::new());
         let result = serve_with(
             settings,
             static_key,
@@ -643,6 +646,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             Updates {
                 native_keys,
                 host_groups,
+                route_overrides,
             },
             None,
             None,
@@ -1151,13 +1155,15 @@ pub(crate) struct Updates {
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
     /// New host groups (spec §15.7).
     pub host_groups: watch::Receiver<Vec<HostGroup>>,
+    /// New subnet route overrides (spec §15.4, `PUT /v1/mesh/subnet_route`).
+    pub route_overrides: watch::Receiver<Vec<IpNet>>,
 }
 
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `updates` carries new native keys and host groups into the running
-/// driver; `border` connects a border node's network to its backbone.
+/// `updates` carries new native keys, host groups and subnet route
+/// overrides into the running driver; `border` connects a border node's network to its backbone.
 /// With `host`, the network installs only routes no other network of the
 /// process holds, under the given owner name.
 #[allow(clippy::too_many_arguments)]
@@ -1175,6 +1181,7 @@ pub(crate) async fn serve_with(
     let Updates {
         native_keys,
         host_groups,
+        route_overrides,
     } = updates;
     let mtu = usize::from(settings.mtu);
     let (to_node, from_interface) = mpsc::channel::<Vec<u8>>(QUEUE);
@@ -1251,9 +1258,6 @@ pub(crate) async fn serve_with(
             }
         }
     }));
-    // No entry point sets subnet route overrides here yet; the sender is
-    // kept so that the driver sees an open, empty list.
-    let (_route_overrides, route_overrides) = watch::channel(Vec::new());
     let mut installed: Vec<IpNet> = Vec::new();
     let mut stopping = false;
     let mut wanted: Vec<IpNet> = Vec::new();
