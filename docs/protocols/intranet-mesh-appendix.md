@@ -514,7 +514,7 @@ D.9.1 的 `region` 对象另有可选字段 `responder`，只下发给边界节�
 
 #### D.9.5 能力与命令
 
-- 能力 `mesh_region_probe`（内核 0.4）：接受 D.9.1 的 `region`（含 D.9.3 的 `responder`），给出 D.9.2、`regionProbe`、`self.regionBasis`、`self.regionSuggestion`。内核未列出时 Agent 与面板不下发 `region`。
+- 能力 `mesh_region_probe`（内核 0.4）：接受 D.9.1 的 `region`（含 D.9.3 的 `responder`），给出 D.9.2、`regionProbe`、`self.regionBasis`、`self.regionSuggestion`。内核未列出时 Agent 与面板不下发 `region`。`anixcore` 只在运维开关 `mesh_regions` 开启（默认关闭）时列出，未列出时带 `region` 的请求体返回 400（`regions_disabled`）。
 - 迁区申请状态与撤回属于能力 `mesh_region_request_state`（mesh-status.md），与本能力独立。
 
 ### D.10 入网凭据只用一次（节点侧）
