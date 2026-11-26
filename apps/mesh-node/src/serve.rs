@@ -801,7 +801,7 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
 
     if let Err(error) = mesh_host::recover_mesh_host() {
         let detail = if error.kind() == io::ErrorKind::ResourceBusy {
-            "another administrator process (the client or another node) holds the host changes; what an earlier run left was not cleaned".to_owned()
+            "another process (normally the client or another node) holds the host lock; what an earlier run left was not cleaned".to_owned()
         } else {
             format!("what an earlier run left could not be put back: {error}")
         };
@@ -886,19 +886,54 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
     }
 }
 
-/// Linux: the host side is not in place yet, so the node advertises no
-/// subnets rather than draw traffic it does not carry.
+/// Linux: the node does not change host forwarding yet; the host may have
+/// switched it on itself (`net.ipv4.ip_forward`,
+/// `net.ipv6.conf.all.forwarding`). The advertised subnets of a family the
+/// host forwards count as carried; the others are withdrawn rather than
+/// draw traffic that is dropped.
 #[cfg(target_os = "linux")]
 fn start_host(settings: &MeshSettings, _interface: &str, _listen_ports: &[u16]) -> HostSide {
-    if forwards(settings) {
+    if !forwards(settings) {
+        forwarding_line("not_needed", None);
+        return HostSide::none();
+    }
+    let v4 = linux_forwarding("/proc/sys/net/ipv4/ip_forward");
+    let v6 = linux_forwarding("/proc/sys/net/ipv6/conf/all/forwarding");
+    let carried = host_forwarded(&settings.advertise_subnets, v4, v6);
+    if carried.is_empty() {
         forwarding_line(
             "off",
-            Some("host forwarding is not implemented on this system yet"),
+            Some(
+                "this node does not change host forwarding on this system yet, and the host \
+                 does not forward the advertised subnets' address family",
+            ),
         );
     } else {
-        forwarding_line("not_needed", None);
+        forwarding_line(
+            "on",
+            Some("forwarding is switched on by the host, not by this node"),
+        );
     }
-    HostSide::none()
+    HostSide {
+        forwarder: None,
+        carried,
+    }
+}
+
+/// Whether the forwarding switch at `path` reads `1`.
+#[cfg(target_os = "linux")]
+fn linux_forwarding(path: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|value| value.trim() == "1")
+}
+
+/// The advertised subnets of the families the host forwards.
+#[cfg(any(test, target_os = "linux"))]
+fn host_forwarded(advertised: &[IpNet], v4: bool, v6: bool) -> Vec<IpNet> {
+    advertised
+        .iter()
+        .copied()
+        .filter(|subnet| if subnet.is_ipv4() { v4 } else { v6 })
+        .collect()
 }
 
 /// Puts back what a node that died left on the host (`anixops-mesh
@@ -1182,6 +1217,17 @@ mod tests {
             "peers": [{ "server": "peer.example", "port": 40000 }],
         })
         .to_string()
+    }
+
+    #[test]
+    fn subnets_of_a_family_the_host_forwards_are_carried() {
+        let v4 = IpNet::parse("192.168.10.0/24").unwrap();
+        let v6 = IpNet::parse("fd10::/64").unwrap();
+        let advertised = [v4, v6];
+        assert_eq!(host_forwarded(&advertised, true, false), vec![v4]);
+        assert_eq!(host_forwarded(&advertised, false, true), vec![v6]);
+        assert_eq!(host_forwarded(&advertised, true, true), vec![v4, v6]);
+        assert!(host_forwarded(&advertised, false, false).is_empty());
     }
 
     #[test]
