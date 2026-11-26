@@ -490,6 +490,12 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             peer: String::new(),
             detail: String::new(),
         })
+        .chain(snapshot.foreign_overlaps.iter().map(|subnet| Alert {
+            code: AlertCode::ForeignRouteOverlap,
+            address: None,
+            peer: String::new(),
+            detail: subnet.to_string(),
+        }))
         .collect();
     for peer in &snapshot.refused_key_changes {
         status.alerts.push(Alert {
@@ -733,6 +739,7 @@ mod tests {
             not_native: Some(44),
             rejected_advertisements: 2,
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
+            foreign_overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
             system_routes_truncated: 3,
             sync_oversize: Some(SyncOversize::Received {
@@ -755,12 +762,14 @@ mod tests {
         assert_eq!(status.failure.as_ref().unwrap().detail, "44");
         assert_eq!(status.rejected_advertisements, 2);
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
-        assert_eq!(status.alerts[1].code, AlertCode::SystemRoutesTruncated);
-        assert_eq!(status.alerts[1].detail, "3");
-        assert_eq!(status.alerts[2].code, AlertCode::SyncOversize);
-        assert!(status.alerts[2].detail.contains("8400000"));
-        assert!(status.alerts[2].detail.starts_with("received:"));
-        assert!(status.alerts[2].detail.contains("node 9"));
+        assert_eq!(status.alerts[1].code, AlertCode::ForeignRouteOverlap);
+        assert_eq!(status.alerts[1].detail, "192.168.1.0/24");
+        assert_eq!(status.alerts[2].code, AlertCode::SystemRoutesTruncated);
+        assert_eq!(status.alerts[2].detail, "3");
+        assert_eq!(status.alerts[3].code, AlertCode::SyncOversize);
+        assert!(status.alerts[3].detail.contains("8400000"));
+        assert!(status.alerts[3].detail.starts_with("received:"));
+        assert!(status.alerts[3].detail.contains("node 9"));
 
         let undelivered = Snapshot {
             sync_oversize: Some(SyncOversize::Undelivered { peer: 4 }),

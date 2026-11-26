@@ -26,6 +26,8 @@
 //!   around a [`node::Node`].
 //! - [`node`]: one node of one network without I/O: connections,
 //!   keep-alive, RPC, route synchronisation, forwarding and traffic checks.
+//! - [`paths`]: custom paths at run time: capability queries, path states,
+//!   probes and the rate limits of a waypoint.
 //! - [`waypoint`]: custom paths: path matching, the path state and the
 //!   waypoint packet that carries traffic through every waypoint.
 //! - [`status`]: what a node agent reads and writes through the kernel's
@@ -40,6 +42,7 @@ pub mod link;
 pub mod net;
 pub mod node;
 pub mod packet;
+pub mod paths;
 pub mod route;
 pub mod routes;
 pub mod rpc;
