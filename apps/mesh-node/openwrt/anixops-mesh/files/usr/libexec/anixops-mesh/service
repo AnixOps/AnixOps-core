@@ -45,6 +45,14 @@ while :; do
 	if kill -0 "${child}" 2>/dev/null; then
 		continue
 	fi
+	# The program may have exited while the trap ran: the shell keeps its
+	# status until it is waited for, so ask once more. A program already
+	# waited for is unknown to wait (127), and the code above stands.
+	wait "${child}"
+	again=$?
+	if [ "${again}" -ne 127 ]; then
+		code="${again}"
+	fi
 	break
 done
 if [ -n "${killer}" ]; then

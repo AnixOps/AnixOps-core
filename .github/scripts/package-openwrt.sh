@@ -87,7 +87,13 @@ default_prerm $0 $@
 EOF
   if [ "$1" = 1 ]; then
     echo 'ret=$?'
+    # opkg also runs the old package's prerm on upgrade ("upgrade VERSION"):
+    # the device identity must stay then.
+    cat <<'EOF'
+if [ "$1" = remove ]; then
+EOF
     removal_cleanup
+    echo 'fi'
     cat <<'EOF'
 exit ${ret}
 EOF
@@ -127,8 +133,9 @@ exit ${ret}
 EOF
   fi
 }
-# Removal of the mesh device package (opkg runs prerm only on removal,
-# including a forced reinstall; apk runs pre-deinstall only on removal).
+# Removal of the mesh device package (opkg runs prerm with "remove" only on
+# removal, including a forced reinstall, and with "upgrade" on upgrade; apk
+# runs pre-deinstall only on removal).
 # The service is already stopped. Its firewall rules and zone go, and so
 # does the device state: the device token, device key and network keys must
 # not stay on the flash of a router that may change hands. The panel still
