@@ -462,7 +462,7 @@ tag    = HMAC-SHA256(K, 应答[0..28])[0..16]
 | `directory` | D.2.2 的目录对象，或 `null`；可省略，视为 `null` |
 | `responder` | 边界节点的探测应答器（D.9.3），或 `null`；可省略，视为 `null` |
 
-未知字段或违反约束时整个请求体返回 400，与 `networks` 相同。设备从 `GET /api/v5/mesh/device/config` 应答的顶层 `region`（同一形态，面板约定第 4 节第 3 项新增的顶层字段）取得同样内容，转成这一节。
+未知字段或违反约束时整个请求体返回 400，与 `networks` 相同。设备从 `GET /api/v5/mesh/device/config` 应答 `data` 中与 `networks` 同级的 `region`（同一形态；入网应答在 `data.config` 中与 `networks` 同级）取得同样内容，转成这一节。设备只接受固定字段（面板约定第 4 节第 3 项），所以面板只在设备上报的 `features` 列出 `mesh_region_probe` 时才下发 `region`，只在列出 `mesh_region_request_state` 时才在网络中下发 `region_request`；Agent 节点按其内核的 `features` 同样处理。
 
 边界节点也带 `region`（`current` 为其本区域）；边界节点不计算迁区建议。
 
