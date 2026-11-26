@@ -474,9 +474,10 @@ impl Names {
             by_name,
             by_address,
             scope,
-            // Host group and summary ranges follow the virtual subnets once
-            // the network carries them (spec §15.9.2 item 1).
-            reverse: ReverseZones::of(view.virtual_subnets.iter().copied()),
+            // Virtual subnets first, then host group ranges (spec §15.9.2
+            // item 1); the 256-zone limit cuts from the end. Summary ranges
+            // follow once the backbone hands them to the network.
+            reverse: ReverseZones::of(view.virtual_subnets.iter().chain(view.host_groups).copied()),
             entries,
             refused: settings.refused.clone(),
             resolver_address: configured.filter(|_| !resolver_conflict),
@@ -1192,6 +1193,35 @@ mod tests {
         assert!(!reply.tc);
         let first: Vec<IpAddr> = (1..=32).map(|i| ip(&format!("10.150.1.{i}"))).collect();
         assert_eq!(addresses(&reply), first);
+    }
+
+    #[test]
+    fn host_group_ranges_follow_the_virtual_subnets_as_reverse_zones() {
+        let settings = settings(region_dns()).unwrap();
+        let subnets = subnets();
+        let local = [ip("10.150.0.5")];
+        let names = Names::build(
+            &settings,
+            &NetworkView {
+                virtual_subnets: &subnets,
+                host_groups: &[IpNet::parse("10.151.0.0/24").unwrap()],
+                local_addresses: &local,
+                own_hostname: Some("Self-Box"),
+                members: &[],
+            },
+        );
+        assert_eq!(
+            names.reverse_zones(),
+            [
+                "150.10.in-addr.arpa",
+                "0.0.0.0.0.0.0.0.0.5.1.0.0.0.d.f.ip6.arpa",
+                "0.151.10.in-addr.arpa",
+            ]
+        );
+        let ptr = ask(&names, "7.0.151.10.in-addr.arpa", TYPE_PTR).unwrap();
+        assert_eq!((ptr.rcode, ptr.records.len()), (0, 1));
+        // The rest of 10.151.0.0/16 is outside every zone.
+        assert_eq!(ask(&names, "7.1.151.10.in-addr.arpa", TYPE_PTR), None);
     }
 
     #[test]
