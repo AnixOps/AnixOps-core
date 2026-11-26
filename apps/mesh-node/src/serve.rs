@@ -305,6 +305,9 @@ pub(crate) async fn serve_with(
     let (snapshots, mut status) = watch::channel(Snapshot::default());
     let (stop, shutdown) = watch::channel(false);
     let (networks, local_networks) = watch::channel(read_local_networks(device.name()));
+    // No entry point sets subnet route overrides here yet; the sender is
+    // kept so that the driver sees an open, empty list.
+    let (_route_overrides, route_overrides) = watch::channel(Vec::new());
     let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
     let mut installed: Vec<IpNet> = Vec::new();
     tokio::pin!(until);
@@ -319,6 +322,7 @@ pub(crate) async fn serve_with(
             snapshots,
             local_networks,
             native_keys,
+            route_overrides,
             shutdown,
         },
     ));

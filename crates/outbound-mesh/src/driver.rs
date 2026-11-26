@@ -226,6 +226,10 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// Advertised subnets the user routes through the mesh although they
+    /// overlap a network of this machine (`mesh_set_subnet_route`,
+    /// spec §15.4); the value at start applies too.
+    pub route_overrides: watch::Receiver<Vec<IpNet>>,
     /// Stops the node when it turns true.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -243,6 +247,7 @@ pub async fn run(
         snapshots,
         mut local_networks,
         mut native_keys,
+        mut route_overrides,
         mut shutdown,
     } = channels;
     native_keys.mark_unchanged();
@@ -251,6 +256,7 @@ pub async fn run(
     let peers = settings.peers.clone();
     let mut node = Node::new(settings, static_key, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
+    node.set_route_overrides(&route_overrides.borrow_and_update());
     node.set_local_networks(&local_networks.borrow_and_update());
     if node.waits_for_native_keys() {
         // No listening, dialling or packets until the list holds this
@@ -305,6 +311,9 @@ pub async fn run(
             }
             Ok(()) = local_networks.changed() => {
                 node.set_local_networks(&local_networks.borrow_and_update());
+            }
+            Ok(()) = route_overrides.changed() => {
+                node.set_route_overrides(&route_overrides.borrow_and_update());
             }
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
@@ -899,6 +908,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_, local_networks) = watch::channel(Vec::new());
         let (_, native_keys) = watch::channel(None);
+        let (_, route_overrides) = watch::channel(Vec::new());
         tokio::spawn(run(
             settings,
             static_key,
@@ -909,6 +919,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                route_overrides,
                 shutdown,
             },
         ));
