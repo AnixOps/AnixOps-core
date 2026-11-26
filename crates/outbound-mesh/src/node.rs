@@ -45,12 +45,12 @@ use crate::route::center::{self, CentreServer, GlobalPeerMap, PeerMap, ReportPee
 use crate::route::messages::{
     FeatureFlags, RoutePeerInfo, SyncRouteRequest, SyncRouteResponse, Uuid,
 };
-use crate::route::sync::{Notice, RouteSync};
+use crate::route::sync::{Failure, Notice, RouteSync};
 use crate::route::topology::{Metric, Route};
 use crate::routes::{self, Denied, PeerId, RouteTable};
 use crate::rpc::packet::{
-    split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
-    ROUTE_SYNC_TIMEOUT_MS,
+    reassembly_timeout_ms, route_sync_timeout_ms, split, Descriptor, RpcError, RpcPacket,
+    RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
 };
 use crate::rpc::reassembly::{Dropped as RpcDropped, Reassembler};
 use crate::secure::handshake::{
@@ -159,7 +159,8 @@ pub struct Counters {
     pub refused_graphs: u64,
     /// Connection rows refused past the stored edge limit (§12.4).
     pub refused_rows: u64,
-    /// Connection graphs sent cut short to fit one request (§12.4).
+    /// Connection graphs sent cut short: past the limits of §12.4, or
+    /// halved for delivery (§12.2).
     pub cut_graphs: u64,
     /// Node information off the native key list (spec §8.3.1 rule 4).
     pub refused_not_native: u64,
@@ -173,18 +174,28 @@ pub struct Counters {
     /// Nodes refused or reachable nodes evicted because the node table is
     /// full (spec §12.3, §12.4).
     pub refused_at_capacity: u64,
+    /// Route sync batches a neighbour answered with an error, or whose call
+    /// failed: closed sessions may come from the link or the neighbour.
+    pub sync_errors: u64,
 }
 
-/// The last oversized synchronisation, for the alert of spec §11.2 and
-/// §12.2: an RPC call received over 8 MiB, or a connection graph that a
-/// neighbour did not take in time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SyncOversize {
-    /// A call from `peer` was dropped at `bytes`, over the 8 MiB limit.
-    Received { peer: u32, bytes: usize },
-    /// The session with the neighbour `peer` was closed: the connection
-    /// graph, even cut by half, was not answered within twice 60 seconds.
-    Undelivered { peer: u32 },
+/// Oversized synchronisations, for the alert of spec §11.2 and §12.2; each
+/// kind keeps its last occurrence while the node runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncOversize {
+    /// A route sync call from the direct neighbour `.0`, over that
+    /// connection, was dropped at `.1` bytes, over the 8 MiB limit.
+    pub received: Option<(u32, usize)>,
+    /// The neighbours whose sessions were closed at the last check that
+    /// closed any: the connection graph, even cut by half, was not
+    /// answered within twice 60 seconds.
+    pub undelivered: Vec<u32>,
+}
+
+impl SyncOversize {
+    pub fn is_empty(&self) -> bool {
+        self.received.is_none() && self.undelivered.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -216,6 +227,8 @@ struct Outgoing {
     peer: u32,
     kind: CallKind,
     deadline: Instant,
+    /// The route sync batch the call carries (0 for other calls).
+    batch: u64,
 }
 
 /// The node's identity in its network: node ID, instance ID and route ID,
@@ -276,7 +289,7 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
-    sync_oversize: Option<SyncOversize>,
+    sync_oversize: SyncOversize,
     /// The last peer refused for a static key off the native key list
     /// (spec §8.3.1 rule 5), and when.
     not_native: Option<(u32, Instant)>,
@@ -561,7 +574,7 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
-            sync_oversize: None,
+            sync_oversize: SyncOversize::default(),
             not_native: None,
             renewed_at: None,
             relays: BTreeMap::new(),
@@ -589,6 +602,7 @@ impl Node {
             refused_not_native: refused.not_native,
             graph_timeouts: refused.graph_timeouts,
             refused_at_capacity: refused.at_capacity,
+            sync_errors: refused.error_answers,
             ..self.counters
         }
     }
@@ -768,8 +782,8 @@ impl Node {
 
     /// The last oversized synchronisation; kept while the node runs, so an
     /// operator sizing a network sees it (spec §11.2, §12.2).
-    pub fn sync_oversize(&self) -> Option<SyncOversize> {
-        self.sync_oversize
+    pub fn sync_oversize(&self) -> &SyncOversize {
+        &self.sync_oversize
     }
 
     /// The last peer refused because its static key is off the native key
@@ -1266,6 +1280,20 @@ impl Node {
         self.settings.role == Role::Full && self.settings.relay
     }
 
+    /// Whether this node serves as a waypoint (spec §17.2.4): it relays
+    /// and `node.waypoint_relay` is on.
+    fn relays_waypoints(&self) -> bool {
+        self.relays_for_others() && self.settings.waypoint_relay
+    }
+
+    /// Whether custom paths are on for this network (spec §17.2.4): this
+    /// node has paths of its own or serves as a waypoint. Otherwise it
+    /// answers `MeshPathRpc` like an implementation without the service
+    /// (Error 3) and drops every type-40 packet, counted.
+    fn paths_on(&self) -> bool {
+        self.settings.waypoint_relay || !self.paths.paths().is_empty()
+    }
+
     /// Whether this network's packets are encrypted. Without encryption no
     /// inner packet can be (spec §17.2.5 rule 3), so there is no
     /// encapsulation at all (spec §17.2.1 rule 6).
@@ -1276,7 +1304,7 @@ impl Node {
     /// This node's `MeshPathRpc.Capabilities` answer (spec §17.2.4):
     /// version 0 in a network without encryption, `relay` as configured.
     fn capabilities(&self) -> Capabilities {
-        let mut caps = Capabilities::local(self.relays_for_others());
+        let mut caps = Capabilities::local(self.relays_waypoints());
         if !self.encrypted() {
             caps.version = 0;
             caps.max_waypoints = 0;
@@ -1430,6 +1458,10 @@ impl Node {
         rng: &dyn SecureRandom,
         now: Instant,
     ) {
+        if !self.paths_on() {
+            self.paths.count_dropped();
+            return;
+        }
         let Some(decoded) = waypoint::decode(payload) else {
             self.paths.count_dropped();
             return;
@@ -1437,7 +1469,7 @@ impl Node {
         let from = header.from;
         match decoded {
             Payload::Transit(transit) => {
-                let relays = self.relays_for_others();
+                let relays = self.relays_waypoints();
                 let outer = Outer {
                     from,
                     forward_counter: header.forward_counter,
@@ -1637,9 +1669,15 @@ impl Node {
         }
     }
 
-    fn call(&mut self, to: u32, kind: CallKind, request: Vec<u8>, now: Instant) {
+    /// Sends a call; returns its transaction.
+    fn call(&mut self, to: u32, kind: CallKind, request: Vec<u8>, now: Instant) -> i64 {
         let (service, method, timeout_ms) = match kind {
-            CallKind::SyncRoute => (ROUTE_SERVICE, METHOD_SYNC_ROUTE_INFO, ROUTE_SYNC_TIMEOUT_MS),
+            // 3 s plus 2 s per MiB of the request, at most 15 s (spec §11).
+            CallKind::SyncRoute => (
+                ROUTE_SERVICE,
+                METHOD_SYNC_ROUTE_INFO,
+                route_sync_timeout_ms(request.len()),
+            ),
             CallKind::ReportPeers => (
                 center::SERVICE,
                 center::METHOD_REPORT_PEERS,
@@ -1669,9 +1707,11 @@ impl Node {
                 peer: to,
                 kind,
                 deadline: now + Duration::from_millis(u64::from(timeout_ms)),
+                batch: 0,
             },
         );
         self.send_rpc(to, transaction, &descriptor, true, &body, now);
+        transaction
     }
 
     /// One RPC piece from `from` (the packet header) that arrived over a
@@ -1688,14 +1728,32 @@ impl Node {
             self.counters.dropped += 1;
             return;
         };
-        let timeout = Duration::from_millis(u64::from(DEFAULT_TIMEOUT_MS));
+        // A request's own timeout is read only once it is whole, so its
+        // reassembly is bounded by what a route sync of its size may take,
+        // at least the default and at most 15 s (spec §11).
+        let timeout_ms = if piece.is_request {
+            reassembly_timeout_ms(piece.total_pieces)
+        } else {
+            DEFAULT_TIMEOUT_MS
+        };
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        // The alert counts only route synchronisation from the neighbour
+        // the connection authenticated, so that no member can raise it, or
+        // skew a size measurement, under another node's ID.
+        let route_sync = from == neighbour
+            && piece.descriptor.as_ref().is_some_and(|descriptor| {
+                descriptor.service == ROUTE_SERVICE
+                    && descriptor.method_index == METHOD_SYNC_ROUTE_INFO
+            });
         let call = match self.reassembler.push(from, piece, timeout, now) {
             Ok(Some(call)) => call,
             Ok(None) => return,
             Err(RpcDropped::CallTooLarge(bytes)) => {
                 self.counters.dropped += 1;
                 self.counters.oversize_calls += 1;
-                self.sync_oversize = Some(SyncOversize::Received { peer: from, bytes });
+                if route_sync {
+                    self.sync_oversize.received = Some((from, bytes));
+                }
                 return;
             }
             Err(_) => {
@@ -1763,6 +1821,7 @@ impl Node {
                 Ok(self.centre.get(digest).encode())
             }
             (center::SERVICE, _) => Err(RpcError::InvalidMethod),
+            (waypoint::RPC_SERVICE, _) if !self.paths_on() => Err(RpcError::InvalidService),
             (waypoint::RPC_SERVICE, waypoint::RPC_CAPABILITIES) => Ok(self.capabilities().encode()),
             (waypoint::RPC_SERVICE, _) => Err(RpcError::InvalidMethod),
             _ => Err(RpcError::InvalidService),
@@ -1797,9 +1856,12 @@ impl Node {
         let result = RpcResponse::decode(body).ok().and_then(|r| r.result.ok());
         match outgoing.kind {
             CallKind::SyncRoute => {
-                let response = result.and_then(|bytes| SyncRouteResponse::decode(&bytes).ok());
+                let response = result
+                    .and_then(|bytes| SyncRouteResponse::decode(&bytes).ok())
+                    .ok_or(Failure::Error);
                 if let Ok(Some(Notice::DuplicatePeerId)) =
-                    self.sync.on_response(from, response, rng, now)
+                    self.sync
+                        .on_response(from, outgoing.batch, response, rng, now)
                 {
                     self.id_conflict(rng, now);
                 }
@@ -1871,11 +1933,16 @@ impl Node {
         self.keep_alive(now);
         self.expire_calls(rng, now);
 
-        for (peer, request) in self.sync.poll(now, unix_now) {
-            self.call(peer, CallKind::SyncRoute, request.encode(), now);
+        for batch in self.sync.poll(now, unix_now) {
+            let transaction =
+                self.call(batch.peer, CallKind::SyncRoute, batch.request.encode(), now);
+            if let Some(call) = self.calls.get_mut(&transaction) {
+                call.batch = batch.id;
+            }
         }
-        if let Some(peer) = self.sync.take_graph_timeout() {
-            self.sync_oversize = Some(SyncOversize::Undelivered { peer });
+        let closed = self.sync.take_graph_timeouts();
+        if !closed.is_empty() {
+            self.sync_oversize.undelivered = closed;
         }
         // Rule 1 of spec §12.3, or this node's version ran out.
         if self.sync.take_conflict() {
@@ -2172,7 +2239,13 @@ impl Node {
             if let Some(call) = self.calls.remove(&transaction) {
                 match call.kind {
                     CallKind::SyncRoute => {
-                        let _ = self.sync.on_response(call.peer, None, rng, now);
+                        let _ = self.sync.on_response(
+                            call.peer,
+                            call.batch,
+                            Err(Failure::Timeout),
+                            rng,
+                            now,
+                        );
                     }
                     CallKind::PathCaps => self.paths.answered(call.peer, Answer::Failed, now),
                     CallKind::ReportPeers | CallKind::GetPeerMap => {}
@@ -2302,7 +2375,7 @@ mod tests {
         let config = serde_json::json!({
             "config_version": 1,
             "network": network,
-            "node": {"address": address, "role": "full"},
+            "node": {"address": address, "role": "full", "waypoint_relay": true},
             "peers": [{"server": "peer.example", "port": 40000}],
         });
         let config: MeshConfig = serde_json::from_value(config).expect("config parses");
@@ -2568,6 +2641,84 @@ mod tests {
     #[test]
     fn a_custom_path_carries_data_in_the_secure_mode() {
         custom_path_carries_data(true);
+    }
+
+    /// A node with no paths of its own and `waypoint_relay` off: the
+    /// default until custom paths are released (spec §17.2.4).
+    fn square_with_node_3_off(secure: bool) -> Net {
+        let addresses = [
+            "10.144.0.1/24",
+            "10.144.0.2/24",
+            "10.144.0.3/24",
+            "10.144.0.4/24",
+        ];
+        let mut all: Vec<MeshSettings> = addresses
+            .iter()
+            .map(|address| settings(address, secure))
+            .collect();
+        all[3].waypoint_relay = false;
+        let mut net = Net::with(all);
+        net.link(0, 1);
+        net.link(1, 2);
+        net.link(0, 3);
+        net.link(3, 2);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net
+    }
+
+    fn paths_off_by_default(secure: bool) {
+        let mut net = square_with_node_3_off(secure);
+        path_through_node_3(&mut net);
+        // Node 3 answers like an implementation without the service.
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[0].paths.capability(103),
+            crate::waypoint::Capability::Unsupported
+        );
+        for _ in 0..12 {
+            net.tick(Duration::from_secs(1));
+        }
+        // Never encapsulated: at most the first-hop policy (spec §17.2.3).
+        assert_ne!(net.nodes[0].path_status(net.now)[0].state, "active");
+
+        // A type-40 packet for node 3 is dropped and counted, not relayed.
+        let dropped = net.nodes[3].path_counters().dropped;
+        let relayed = net.nodes[3].counters().relayed;
+        let transit = waypoint::encode_transit(
+            100,
+            102,
+            &[],
+            waypoint::Body::Data(&ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3])),
+        );
+        let now = net.now;
+        assert!(net.nodes[0].originate(103, packet_type::WAYPOINT, &transit, now));
+        net.delivered.clear();
+        net.settle();
+        assert_eq!(net.nodes[3].path_counters().dropped, dropped + 1);
+        assert_eq!(net.nodes[3].counters().relayed, relayed);
+        assert!(net.delivered.is_empty());
+        // Dropped before it is read: a waypoint would have asked about the
+        // packet's origin (spec §17.2.5 rule 6) and learnt its answer.
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[3].paths.capability(100),
+            crate::waypoint::Capability::Pending
+        );
+        assert_eq!(net.nodes[3].path_counters().dropped_queries, 0);
+    }
+
+    #[test]
+    fn a_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(false);
+    }
+
+    #[test]
+    fn a_secure_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(true);
     }
 
     #[test]
