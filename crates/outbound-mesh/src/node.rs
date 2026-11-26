@@ -80,6 +80,10 @@ struct Relay {
     queue: VecDeque<(u8, Vec<u8>)>,
 }
 
+/// A refusal for a key off the native key list is reported for this long
+/// unless another follows (docs/architecture/mesh-status.md).
+pub const NOT_NATIVE_HOLD: Duration = Duration::from_secs(10 * 60);
+
 /// Most subnets installed as system routes for one network: as many as
 /// [`routes::MAX_SUBNETS_PER_PEER`] for sixteen advertising members; any
 /// further subnets are not installed.
@@ -224,8 +228,8 @@ pub struct Node {
     counters: Counters,
     duplicate_id: bool,
     /// The last peer refused for a static key off the native key list
-    /// (spec §8.3.1 rule 5).
-    not_native: Option<u32>,
+    /// (spec §8.3.1 rule 5), and when.
+    not_native: Option<(u32, Instant)>,
     /// When this node last took a new identity after a conflict.
     renewed_at: Option<Instant>,
     /// Relay sessions being set up, by destination (secure mode only).
@@ -415,6 +419,27 @@ impl Node {
             self.sessions.invalidate(&key);
             self.relays.remove(&key.peer_id);
         }
+        // Answers not yet confirmed by a packet, and handshakes this node
+        // started under the old list, go too.
+        let settings = &self.settings;
+        self.sessions
+            .drop_pending_refused(|key| settings.admits(key));
+        let stale: Vec<u32> = self
+            .relays
+            .iter()
+            .filter(|(_, relay)| {
+                relay
+                    .initiator
+                    .as_ref()
+                    .is_some_and(|initiator| !settings.admits(&initiator.peer_static()))
+            })
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in stale {
+            self.drop_relay(peer);
+        }
+        // A new list is a new start for refusals (spec §8.3.1 rule 5).
+        self.not_native = None;
         self.refresh_routes();
     }
 
@@ -451,8 +476,21 @@ impl Node {
 
     /// The last peer refused because its static key is off the native key
     /// list (spec §8.3.1 rule 5), for the status reason `peer_not_native`.
+    /// It clears when that peer completes a handshake, when the list
+    /// changes, or [`NOT_NATIVE_HOLD`] after the last refusal.
     pub fn last_not_native(&self) -> Option<u32> {
-        self.not_native
+        self.not_native.map(|(peer, _)| peer)
+    }
+
+    fn refused_not_native(&mut self, peer: u32, now: Instant) {
+        self.not_native = Some((peer, now));
+    }
+
+    /// `peer` completed a handshake: a refusal of it is over.
+    fn admitted_peer(&mut self, peer: u32) {
+        if self.not_native.is_some_and(|(refused, _)| refused == peer) {
+            self.not_native = None;
+        }
     }
 
     /// This node's static public key in the network.
@@ -689,7 +727,7 @@ impl Node {
                 }
                 self.close(conn, reason, now);
                 if let CloseReason::NotNative(peer) = reason {
-                    self.not_native = Some(peer);
+                    self.refused_not_native(peer, now);
                 }
                 // Only after the server proved the network secret (§5.3).
                 if reason == CloseReason::IdConflict {
@@ -704,6 +742,7 @@ impl Node {
             return;
         };
         state.peer = Some(up.peer_id);
+        self.admitted_peer(up.peer_id);
         state.ping = Ping {
             interval: PING_START,
             next_at: Some(now + PING_START),
@@ -1163,6 +1202,12 @@ impl Node {
         self.centre_round(now);
         self.reassembler.expire(now);
         self.sessions.reclaim(now);
+        if self
+            .not_native
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) >= NOT_NATIVE_HOLD)
+        {
+            self.not_native = None;
+        }
         self.wake(rng, now);
     }
 
@@ -1221,7 +1266,7 @@ impl Node {
         let Some(peer_static) = self.expected_key(peer) else {
             if self.peer_static(peer).is_some() {
                 // Announced, but off the native key list (spec §8.3.1).
-                self.not_native = Some(peer);
+                self.refused_not_native(peer, now);
             }
             self.drop_relay(peer);
             return;
@@ -1303,12 +1348,13 @@ impl Node {
         );
         let (msg2, joined) = match answer {
             Ok(RelayAnswer::Reply(msg2, established)) => {
+                self.admitted_peer(from);
                 (msg2, established.action != SessionAction::Create)
             }
             Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
             Err(error) => {
                 if error == HandshakeError::NotNative {
-                    self.not_native = Some(from);
+                    self.refused_not_native(from, now);
                 }
                 self.counters.dropped += 1;
                 return;
@@ -1342,7 +1388,17 @@ impl Node {
             return;
         };
         match initiator.finish(&self.local, msg2, &mut self.sessions, now) {
-            Ok(_) => self.flush_relay(from, now),
+            Ok(_) => {
+                self.admitted_peer(from);
+                self.flush_relay(from, now);
+            }
+            // Dropped from the native key list since msg1 (spec §8.3.1
+            // rule 6): nothing waits for this session any more.
+            Err(HandshakeError::NotNative) => {
+                self.refused_not_native(from, now);
+                self.counters.dropped += 1;
+                self.drop_relay(from);
+            }
             // The retry is a new handshake.
             Err(_) => self.counters.dropped += 1,
         }
@@ -1692,6 +1748,62 @@ mod tests {
         net.settle();
         assert_eq!(net.nodes[0].neighbours(), vec![101]);
         assert_eq!(net.nodes[0].last_not_native(), None);
+    }
+
+    #[test]
+    fn a_refusal_is_reported_until_a_handshake_a_new_list_or_ten_minutes() {
+        let refused = || {
+            let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+            let full = net.nodes[0].settings.native_keys.clone();
+            unlist(&mut net, 0, 1);
+            net.link(0, 1);
+            net.settle();
+            assert_eq!(net.nodes[0].last_not_native(), Some(101));
+            (net, full)
+        };
+
+        // Still reported just before ten minutes, gone at ten.
+        let (mut net, _) = refused();
+        net.tick(NOT_NATIVE_HOLD - Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), Some(101));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // A new list clears it.
+        let (mut net, full) = refused();
+        let now = net.now;
+        net.nodes[0].set_native_keys(full, now);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // So does a handshake with the refused peer.
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.nodes[0].not_native = Some((101, net.now));
+        net.link(0, 1);
+        net.settle();
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+    }
+
+    #[test]
+    fn a_relay_handshake_started_before_the_list_changed_is_dropped() {
+        let mut net = three_in_a_row(true);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        let _ = net.nodes[0].send_ip(&packet, net.now);
+        assert!(net.nodes[0]
+            .relays
+            .get(&102)
+            .is_some_and(|relay| relay.initiator.is_some()));
+        // Node 2 is dropped while its msg2 is on the way.
+        unlist(&mut net, 0, 2);
+        assert!(!net.nodes[0].relays.contains_key(&102));
+        net.settle();
+        let key = SessionKey {
+            namespace: Namespace::Relay,
+            network: net.nodes[0].local.network_name.clone(),
+            peer_id: 102,
+        };
+        assert!(net.nodes[0].sessions.get(&key).is_none());
+        assert!(net.delivered.is_empty());
     }
 
     #[test]

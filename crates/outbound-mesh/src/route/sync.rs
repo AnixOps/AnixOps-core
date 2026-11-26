@@ -926,6 +926,35 @@ mod tests {
     }
 
     #[test]
+    fn information_off_the_native_key_list_is_refused_and_counted() {
+        let now = Instant::now();
+        let mut nodes = [node(1, now), node(2, now)];
+        let (a, b) = nodes.split_at_mut(1);
+        connect(&mut a[0], &mut b[0], now);
+        let a = &mut nodes[0];
+        a.set_admitted(Some(vec![[2; 32], [3; 32]]));
+        let keyed = |id: u32, key: [u8; 32]| RoutePeerInfo {
+            noise_pubkey: key.to_vec(),
+            ..info(id, u64::from(id) * 1000)
+        };
+        let request = SyncRouteRequest {
+            my_peer_id: 2,
+            my_session_id: 1,
+            peer_infos: vec![keyed(2, [2; 32]), keyed(3, [3; 32]), keyed(4, [4; 32])],
+            ..SyncRouteRequest::default()
+        };
+        a.on_request(2, request, now);
+        assert!(a.info(2).is_some());
+        assert!(a.info(3).is_some());
+        assert!(a.info(4).is_none());
+        assert_eq!(a.refused().not_native, 1);
+        // Taking a key off the list removes what was stored under it.
+        a.set_admitted(Some(vec![[2; 32]]));
+        assert!(a.info(3).is_none());
+        assert!(a.info(2).is_some());
+    }
+
+    #[test]
     fn simultaneous_initiators_settle_on_the_smaller_id() {
         let now = Instant::now();
         let mut nodes = [node(1, now), node(2, now)];
