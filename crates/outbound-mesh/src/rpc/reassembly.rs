@@ -46,9 +46,13 @@ pub enum Dropped {
     /// The piece claims to come from another peer than the one it arrived
     /// from.
     WrongSource,
-    /// The call would exceed [`MAX_CALL_BYTES`], the peer
-    /// [`MAX_PEER_BYTES`] or the node [`MAX_TOTAL_BYTES`].
+    /// The peer would exceed [`MAX_PEER_BYTES`] or the node
+    /// [`MAX_TOTAL_BYTES`].
     TooLarge,
+    /// The call would exceed [`MAX_CALL_BYTES`] (spec §11.2): dropped, and
+    /// the node raises the alert for an oversized synchronisation. Carries
+    /// the bytes the call had reached.
+    CallTooLarge(usize),
     /// No descriptor in the first piece.
     NoDescriptor,
 }
@@ -118,8 +122,11 @@ impl Reassembler {
             None => (0, true),
         };
         if new_piece {
-            let fits = call_bytes + len <= MAX_CALL_BYTES
-                && peer_bytes + len <= MAX_PEER_BYTES
+            if call_bytes + len > MAX_CALL_BYTES {
+                self.remove(&key);
+                return Err(Dropped::CallTooLarge(call_bytes + len));
+            }
+            let fits = peer_bytes + len <= MAX_PEER_BYTES
                 && (self.bytes + len <= MAX_TOTAL_BYTES || self.make_room(source, peer_bytes, len));
             if !fits {
                 self.remove(&key);
@@ -418,6 +425,30 @@ mod tests {
             .find_map(|piece| reassembler.push(1, piece, TIMEOUT, now).err());
         assert_eq!(refused, Some(Dropped::TooLarge));
         assert!(reassembler.bytes() <= MAX_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn a_call_over_the_limit_is_reported_apart_from_budgets() {
+        let now = Instant::now();
+        let mut reassembler = Reassembler::new();
+        let body = vec![0u8; MAX_CALL_BYTES + 1];
+        let refused = split(4, 1, 1, &descriptor(), true, &body)
+            .into_iter()
+            .find_map(|piece| reassembler.push(4, piece, TIMEOUT, now).err());
+        match refused {
+            Some(Dropped::CallTooLarge(bytes)) => assert!(bytes > MAX_CALL_BYTES),
+            other => panic!("{other:?}"),
+        }
+        // Nothing of it is kept, and a call at the limit still completes.
+        assert_eq!(reassembler.bytes(), 0);
+        let body = vec![1u8; MAX_CALL_BYTES];
+        let mut done = None;
+        for piece in split(4, 1, 2, &descriptor(), true, &body) {
+            if let Some(call) = reassembler.push(4, piece, TIMEOUT, now).unwrap() {
+                done = Some(call);
+            }
+        }
+        assert_eq!(done.unwrap().body.len(), MAX_CALL_BYTES);
     }
 
     #[test]
