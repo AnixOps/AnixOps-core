@@ -303,7 +303,6 @@ impl Inner {
     /// the old one, readable by the owner only.
     fn save_route_overrides(&self, network: &str, subnets: &[IpNet]) -> io::Result<()> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let path = self.overrides_path(network);
         let file = OverridesFile {
             mesh: subnets.iter().map(ToString::to_string).collect(),
@@ -313,12 +312,22 @@ impl Inner {
         temporary.push(format!(".{}.tmp", std::process::id()));
         let temporary = PathBuf::from(temporary);
         let written = (|| {
-            let mut out = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temporary)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // On Windows the file takes the access list of the state
+            // directory.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut out = options.open(&temporary)?;
+            // A file left by an earlier attempt keeps its mode on open.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                out.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             out.write_all(&body)?;
             out.sync_all()?;
             std::fs::rename(&temporary, &path)
