@@ -197,6 +197,9 @@ pub struct ManagedNetworkStatus {
     /// while empty.
     #[serde(rename = "refusedNames", skip_serializing_if = "Vec::is_empty")]
     pub refused_names: Vec<RefusedName>,
+    /// The custom paths and their states, in configuration order (spec
+    /// §17.2.7). Members are named by their virtual address, as in `peers`.
+    pub paths: Vec<ManagedPath>,
     /// `externalBridge` (spec §15.12 item 8, three states): absent while
     /// unknown, `null` when the network surely has no bridge, otherwise
     /// the bridge in force.
@@ -232,6 +235,7 @@ impl ManagedNetworkStatus {
             alerts: Vec::new(),
             names: Vec::new(),
             refused_names: Vec::new(),
+            paths: Vec::new(),
             external_bridge: None,
         }
     }
@@ -254,6 +258,36 @@ pub struct ManagedPeer {
     pub latency_ms: Option<u32>,
     /// Whether the session with this member has forward secrecy.
     pub forward_secrecy: bool,
+    /// `auto`, `custom`, `first_hop_only` or `fallback`: the state of the
+    /// custom path to this member (`mesh-status.md`, `members[].pathState`).
+    pub path_state: &'static str,
+    /// The node that path names as unreachable; `null` when none.
+    pub unreachable: Option<IpAddr>,
+}
+
+/// One custom path of a managed network (`mesh-status.md`, `paths[]`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ManagedPath {
+    /// `peer:<address>` or `subnet:<network>`; stays when the list changes.
+    pub id: String,
+    pub target: ManagedPathTarget,
+    /// The waypoints' virtual addresses, in configuration order.
+    pub via: Vec<IpAddr>,
+    /// `pending`, `active`, `first_hop_only` or `fallback`.
+    pub state: &'static str,
+    /// The node `reason` is about; `null` when none.
+    pub unreachable: Option<IpAddr>,
+    /// Why the path fell back or is only partly kept; `null` otherwise.
+    pub reason: Option<&'static str>,
+}
+
+/// The target of a [`ManagedPath`]: `{"peer": address}` or
+/// `{"subnet": network}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedPathTarget {
+    Peer(IpAddr),
+    Subnet(String),
 }
 
 /// Something the network's operator should act on.
@@ -484,6 +518,8 @@ mod tests {
                     hops: 2,
                     latency_ms: None,
                     forward_secrecy: true,
+                    path_state: "custom",
+                    unreachable: None,
                 }],
                 rejected_advertisements: 1,
                 overlaps: vec![IpNet::parse("192.168.10.7/24").unwrap()],
@@ -503,6 +539,24 @@ mod tests {
                 ],
                 names: Vec::new(),
                 refused_names: Vec::new(),
+                paths: vec![
+                    ManagedPath {
+                        id: "peer:10.150.0.1".into(),
+                        target: ManagedPathTarget::Peer("10.150.0.1".parse().unwrap()),
+                        via: vec!["10.150.0.2".parse().unwrap()],
+                        state: "active",
+                        unreachable: None,
+                        reason: None,
+                    },
+                    ManagedPath {
+                        id: "subnet:192.168.10.0/24".into(),
+                        target: ManagedPathTarget::Subnet("192.168.10.0/24".into()),
+                        via: vec!["10.150.0.2".parse().unwrap()],
+                        state: "fallback",
+                        unreachable: Some("10.150.0.2".parse().unwrap()),
+                        reason: Some("no_echo"),
+                    },
+                ],
                 external_bridge: None,
             }],
             static_keys: vec![NetworkStaticKey {
@@ -529,13 +583,23 @@ mod tests {
                         "via": ["10.150.0.2"],
                         "hops": 2,
                         "latency_ms": null,
-                        "forward_secrecy": true
+                        "forward_secrecy": true,
+                        "path_state": "custom",
+                        "unreachable": null
                     }],
                     "rejected_advertisements": 1,
                     "overlaps": ["192.168.10.0/24"],
                     "alerts": [
                         {"code": "address_conflict", "address": "10.150.0.9", "peer": "", "detail": ""},
                         {"code": "start_refused", "address": "", "peer": "", "detail": "tcp port 11010 in use"}
+                    ],
+                    "paths": [
+                        {"id": "peer:10.150.0.1", "target": {"peer": "10.150.0.1"},
+                         "via": ["10.150.0.2"], "state": "active",
+                         "unreachable": null, "reason": null},
+                        {"id": "subnet:192.168.10.0/24", "target": {"subnet": "192.168.10.0/24"},
+                         "via": ["10.150.0.2"], "state": "fallback",
+                         "unreachable": "10.150.0.2", "reason": "no_echo"}
                     ]
                 }],
                 "static_keys": [{"network": "office", "static_key": "a2V5"}],

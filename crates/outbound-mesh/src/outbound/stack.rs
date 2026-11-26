@@ -609,6 +609,8 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     // while it runs; the senders only keep the receivers open.
     let (dns_tx, dns) = watch::channel(settings.dns.clone());
     let (host_groups_tx, host_groups) = watch::channel(settings.host_groups.clone());
+    // Custom paths likewise come with the settings.
+    let (paths_tx, paths) = watch::channel(Vec::new());
     let channels = {
         let mut core = instance.lock();
         if core.run != run || !core.running {
@@ -623,6 +625,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
             local_networks: core.local_networks.subscribe(),
             native_keys: core.native_keys.subscribe(),
             dns,
+            paths,
             host_groups,
             route_overrides: core.route_overrides.subscribe(),
             foreign_routes,
@@ -636,7 +639,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     drop(instance);
     tokio::spawn(pump(weak.clone(), wake, run, from_driver));
     let result = driver::run(settings, key, listeners, channels).await;
-    drop((foreign_routes_tx, dns_tx, host_groups_tx));
+    drop((foreign_routes_tx, dns_tx, host_groups_tx, paths_tx));
     // The driver only ends on its own after an error: a shutdown comes from
     // dropping the instance, and then nobody is left to tell.
     let _ = result;

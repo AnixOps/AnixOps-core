@@ -102,12 +102,15 @@ fn network_status(network: &ManagedNetwork) -> ManagedNetworkStatus {
             hops: 1,
             latency_ms: Some(12),
             forward_secrecy: true,
+            path_state: "auto",
+            unreachable: None,
         }],
         rejected_advertisements: 0,
         overlaps: Vec::new(),
         alerts: Vec::new(),
         names: Vec::new(),
         refused_names: Vec::new(),
+        paths: Vec::new(),
         external_bridge: None,
     }
 }
@@ -216,8 +219,9 @@ async fn the_agent_replaces_and_reads_its_networks() {
     assert_eq!(cn["forward_secrecy"], json!(true));
     assert_eq!(
         cn["peers"],
-        json!([{"address": "10.150.0.1", "subnets": ["192.168.10.0/24"], "via": [], "hops": 1, "latency_ms": 12, "forward_secrecy": true}])
+        json!([{"address": "10.150.0.1", "subnets": ["192.168.10.0/24"], "via": [], "hops": 1, "latency_ms": 12, "forward_secrecy": true, "path_state": "auto", "unreachable": null}])
     );
+    assert_eq!(cn["paths"], json!([]));
     assert_eq!(cn["rejected_advertisements"], json!(0));
     assert_eq!(cn["overlaps"], json!([]));
     let eu = &body["networks"][1];

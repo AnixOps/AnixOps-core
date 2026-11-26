@@ -44,15 +44,17 @@ use mesh_bridge::{
     ApplyError as BridgeApplyError, Bridge, Forwarding, Host as BridgeHost, HostLock, SystemHost,
 };
 use outbound_mesh::bridge::ExternalBridge;
-use outbound_mesh::config::{encode_key, HostGroup};
+use outbound_mesh::config::{encode_key, CustomPath, HostGroup, PathTarget};
 use outbound_mesh::dns::DnsSettings;
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, ExternalBridgeStatus, FailureCode, ManagedBackbone,
-    ManagedNetwork, ManagedNetworkStatus, ManagedPeer, ManagedStatus, MeshControl, NetworkFailure,
-    NetworkStaticKey, OverrideError, SubnetRoute, MAX_ROUTE_OVERRIDES,
+    ManagedNetwork, ManagedNetworkStatus, ManagedPath, ManagedPathTarget, ManagedPeer,
+    ManagedStatus, MeshControl, NetworkFailure, NetworkStaticKey, OverrideError, SubnetRoute,
+    MAX_ROUTE_OVERRIDES,
 };
+use outbound_mesh::waypoint::Reason;
 use outbound_mesh::{IpNet, MeshSettings};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
@@ -70,6 +72,10 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
+/// `mesh_paths` is listed because `routing.paths` is applied as spec §17.2
+/// asks: waypoint encapsulation, capability queries, fallback and the
+/// `paths` status; a changed path list reaches a running network without a
+/// restart (`mesh_set_paths`).
 /// `mesh_host_groups`: the `host_groups` section (spec §15.7).
 pub const FEATURES: &[&str] = &[
     "mesh",
@@ -77,6 +83,7 @@ pub const FEATURES: &[&str] = &[
     "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
+    "mesh_paths",
 ];
 
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
@@ -87,6 +94,7 @@ pub const FEATURES_WITH_BRIDGE: &[&str] = &[
     "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
+    "mesh_paths",
     mesh_bridge::FEATURE,
 ];
 
@@ -103,6 +111,7 @@ pub const FEATURES_WITH_BACKBONE: &[&str] = &[
     "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
+    "mesh_paths",
     BACKBONE_FEATURE,
 ];
 
@@ -113,6 +122,7 @@ pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
     "mesh_resolver_address",
     "mesh_native_keys",
     "mesh_host_groups",
+    "mesh_paths",
     mesh_bridge::FEATURE,
     BACKBONE_FEATURE,
 ];
@@ -328,6 +338,7 @@ struct Running {
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
     dns: watch::Sender<DnsSettings>,
+    paths: watch::Sender<Vec<CustomPath>>,
     host_groups: watch::Sender<Vec<HostGroup>>,
     /// The subnet route overrides, handed to the running driver.
     route_overrides: watch::Sender<Vec<IpNet>>,
@@ -932,10 +943,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Whether `instance` can go on under `settings` without a restart: the
 /// same settings, or, while it runs, the same but for the native key
-/// list, the `dns` section and the host groups, which are handed to the
-/// running driver. A
-/// network that failed to start is tried again. `false` means the
-/// instance is to be stopped.
+/// list, the `dns` section, the custom paths and the host groups, which
+/// are handed to the running driver. A network that failed to start is
+/// tried again. `false` means the instance is to be stopped.
 fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
     let same = instance.settings == *settings;
     let mut next = settings.clone();
@@ -956,6 +966,9 @@ fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
                 }
                 if instance.settings.dns != settings.dns {
                     let _ = running.dns.send(settings.dns.clone());
+                }
+                if instance.settings.paths != settings.paths {
+                    let _ = running.paths.send(settings.paths.clone());
                 }
                 if instance.settings.host_groups != settings.host_groups {
                     let _ = running.host_groups.send(settings.host_groups.clone());
@@ -1014,12 +1027,13 @@ fn running_ok(running: &Running) -> bool {
 }
 
 /// Whether `new` differs from `old` only in what a running network takes
-/// without a restart: the native key list, the `dns` section and the host
-/// groups.
+/// without a restart: the native key list, the `dns` section, the custom
+/// paths and the host groups.
 fn same_but_hot(old: &MeshSettings, new: &MeshSettings) -> bool {
     let mut old = old.clone();
     old.native_keys.clone_from(&new.native_keys);
     old.dns.clone_from(&new.dns);
+    old.paths.clone_from(&new.paths);
     old.host_groups.clone_from(&new.host_groups);
     old == *new
 }
@@ -1128,6 +1142,7 @@ async fn launch(
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
     let (dns, dns_settings) = watch::channel(settings.dns.clone());
+    let (paths, path_list) = watch::channel(settings.paths.clone());
     let (host_groups, groups) = watch::channel(settings.host_groups.clone());
     let (route_overrides, overrides) = watch::channel(overrides);
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
@@ -1151,6 +1166,7 @@ async fn launch(
             serve::Updates {
                 native_keys: keys,
                 dns: dns_settings,
+                paths: path_list,
                 host_groups: groups,
                 route_overrides: overrides,
             },
@@ -1180,6 +1196,7 @@ async fn launch(
         stop: Some(stop),
         native_keys,
         dns,
+        paths,
         host_groups,
         route_overrides,
         snapshot,
@@ -1326,7 +1343,24 @@ fn fill_running(
                 hops: member.hops,
                 latency_ms: member.latency_ms,
                 forward_secrecy: status.forward_secrecy,
+                path_state: member.path_state,
+                unreachable: member.unreachable,
             })
+        })
+        .collect();
+    status.paths = snapshot
+        .paths
+        .iter()
+        .map(|path| ManagedPath {
+            id: path.id.clone(),
+            target: match path.target {
+                PathTarget::Peer(address) => ManagedPathTarget::Peer(address),
+                PathTarget::Subnet(net) => ManagedPathTarget::Subnet(net.to_string()),
+            },
+            via: path.via.clone(),
+            state: path.state,
+            unreachable: path.unreachable,
+            reason: path.reason.map(Reason::as_str),
         })
         .collect();
     // One reason, the more pressing first: no configured peer reached,
@@ -1545,6 +1579,7 @@ mod tests {
     use super::*;
     use outbound_mesh::driver::Member;
     use outbound_mesh::node::SyncOversize;
+    use outbound_mesh::paths::PathStatus;
     use outbound_mesh::{IpNet, MeshConfig};
     use serde_json::json;
 
@@ -1807,6 +1842,7 @@ mod tests {
         assert_eq!(mesh.features(), FEATURES);
         assert!(!FEATURES.contains(&mesh_bridge::FEATURE));
         assert!(FEATURES_WITH_BRIDGE.contains(&mesh_bridge::FEATURE));
+        assert!(FEATURES_WITH_BRIDGE.contains(&"mesh_paths"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1872,6 +1908,7 @@ mod tests {
         let (stop, _stopped) = oneshot::channel();
         let (native_keys, _keys) = watch::channel(None);
         let (dns, _dns) = watch::channel(DnsSettings::default());
+        let (paths, _paths) = watch::channel(Vec::new());
         let (host_groups, _groups) = watch::channel(Vec::new());
         let (route_overrides, mut overrides) = watch::channel(Vec::new());
         let (_snapshots, snapshot) = watch::channel(Snapshot::default());
@@ -1884,6 +1921,7 @@ mod tests {
                 stop: Some(stop),
                 native_keys,
                 dns,
+                paths,
                 host_groups,
                 route_overrides,
                 snapshot,
@@ -2088,6 +2126,7 @@ mod tests {
         assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&BACKBONE_FEATURE));
         assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&mesh_bridge::FEATURE));
         assert!(!FEATURES_WITH_BACKBONE.contains(&mesh_bridge::FEATURE));
+        assert!(FEATURES.contains(&"mesh_paths"));
     }
 
     #[test]
@@ -2107,6 +2146,12 @@ mod tests {
             backup_gateway: Some("gw-b".into()),
         }];
         assert!(same_but_hot(&base, &grouped));
+        let mut routed = listed.clone();
+        routed.paths = vec![CustomPath {
+            target: PathTarget::Peer("10.150.0.7".parse().unwrap()),
+            via: vec!["10.150.0.3".parse().unwrap()],
+        }];
+        assert!(same_but_hot(&base, &routed));
         let mut moved = listed.clone();
         moved.mtu -= 10;
         assert!(!same_but_hot(&base, &moved));
@@ -2175,12 +2220,18 @@ mod tests {
             via,
             hops,
             latency_ms: (hops == 1).then_some(7),
+            path_state: "auto",
+            unreachable: None,
             ..Member::default()
         };
         let snapshot = Snapshot {
             members: vec![
                 member(3, "10.150.0.3", Vec::new(), 1),
-                member(9, "10.150.0.9", vec![3], 2),
+                Member {
+                    path_state: "fallback",
+                    unreachable: Some("10.150.0.3".parse().unwrap()),
+                    ..member(9, "10.150.0.9", vec![3], 2)
+                },
                 Member {
                     addresses: Vec::new(),
                     ..member(12, "10.150.0.12", Vec::new(), 1)
@@ -2191,6 +2242,24 @@ mod tests {
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             foreign_overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
+            paths: vec![
+                PathStatus {
+                    id: "peer:10.150.0.9".into(),
+                    target: PathTarget::Peer("10.150.0.9".parse().unwrap()),
+                    via: vec!["10.150.0.3".parse().unwrap()],
+                    state: "fallback",
+                    reason: Some(Reason::NoEcho),
+                    unreachable: Some("10.150.0.3".parse().unwrap()),
+                },
+                PathStatus {
+                    id: "subnet:192.168.20.0/24".into(),
+                    target: PathTarget::Subnet(IpNet::parse("192.168.20.0/24").unwrap()),
+                    via: vec!["10.150.0.3".parse().unwrap()],
+                    state: "active",
+                    reason: None,
+                    unreachable: None,
+                },
+            ],
             system_routes_truncated: 3,
             sync_oversize: SyncOversize {
                 received: Some((9, 8_400_000)),
@@ -2212,6 +2281,25 @@ mod tests {
         assert_eq!(status.failure.as_ref().unwrap().detail, "44");
         assert_eq!(status.rejected_advertisements, 2);
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
+        assert_eq!(status.peers[0].path_state, "auto");
+        assert_eq!(status.peers[1].path_state, "fallback");
+        assert_eq!(
+            status.peers[1].unreachable,
+            Some("10.150.0.3".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(status.paths.len(), 2);
+        assert_eq!(status.paths[0].id, "peer:10.150.0.9");
+        assert_eq!(
+            status.paths[0].target,
+            ManagedPathTarget::Peer("10.150.0.9".parse().unwrap())
+        );
+        assert_eq!(status.paths[0].reason, Some("no_echo"));
+        assert_eq!(
+            status.paths[1].target,
+            ManagedPathTarget::Subnet("192.168.20.0/24".into())
+        );
+        assert_eq!(status.paths[1].state, "active");
+        assert_eq!(status.paths[1].reason, None);
         assert_eq!(status.alerts[1].code, AlertCode::ForeignRouteOverlap);
         assert_eq!(status.alerts[1].detail, "192.168.1.0/24");
         assert_eq!(status.alerts[2].code, AlertCode::SystemRoutesTruncated);

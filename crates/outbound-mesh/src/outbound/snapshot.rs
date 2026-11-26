@@ -374,6 +374,8 @@ mod tests {
             fewest_hops: via.len() as u32 + 1,
             latency_ms: via.is_empty().then_some(12),
             via,
+            path_state: "auto",
+            unreachable: None,
         }
     }
 
