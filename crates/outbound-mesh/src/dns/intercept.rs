@@ -623,6 +623,7 @@ mod tests {
             &settings,
             &NetworkView {
                 virtual_subnets: &subnets,
+                host_groups: &[],
                 local_addresses: &local,
                 own_hostname: None,
                 members: &[],
@@ -786,6 +787,7 @@ mod tests {
             &config.validate(&subnets).unwrap(),
             &NetworkView {
                 virtual_subnets: &subnets,
+                host_groups: &[],
                 local_addresses: &[ip(CLIENT_V4)],
                 own_hostname: None,
                 members: &[],

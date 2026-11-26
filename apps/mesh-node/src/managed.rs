@@ -35,7 +35,7 @@ use mesh_bridge::{
     ApplyError as BridgeApplyError, Bridge, Forwarding, Host as BridgeHost, HostLock, SystemHost,
 };
 use outbound_mesh::bridge::ExternalBridge;
-use outbound_mesh::config::encode_key;
+use outbound_mesh::config::{encode_key, HostGroup};
 use outbound_mesh::dns::DnsSettings;
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
@@ -61,11 +61,13 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
+/// `mesh_host_groups`: the `host_groups` section (spec §15.7).
 pub const FEATURES: &[&str] = &[
     "mesh",
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
+    "mesh_host_groups",
 ];
 
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
@@ -75,6 +77,7 @@ pub const FEATURES_WITH_BRIDGE: &[&str] = &[
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
+    "mesh_host_groups",
     mesh_bridge::FEATURE,
 ];
 
@@ -90,6 +93,7 @@ pub const FEATURES_WITH_BACKBONE: &[&str] = &[
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
+    "mesh_host_groups",
     BACKBONE_FEATURE,
 ];
 
@@ -99,6 +103,7 @@ pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
     "mesh_dns",
     "mesh_resolver_address",
     "mesh_native_keys",
+    "mesh_host_groups",
     mesh_bridge::FEATURE,
     BACKBONE_FEATURE,
 ];
@@ -111,8 +116,10 @@ pub const BACKBONE_DISABLED: &str = "backbone_disabled";
 /// gave is the one kept.
 const INTERFACE_PREFIX: &str = "anixmesh-";
 
-/// How long a stopped network may take to close before it is cut off.
+/// How long a stopped network may take to close before it is cut off: more
+/// than the wait after withdrawing its advertisements (spec §15.7 rule 6).
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const _: () = assert!(STOP_TIMEOUT.as_secs() > outbound_mesh::node::WITHDRAW_WAIT.as_secs());
 
 /// A running network that has reached none of its configured peers for
 /// this long reports `unreachable_peers`.
@@ -243,6 +250,7 @@ struct Running {
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
     dns: watch::Sender<DnsSettings>,
+    host_groups: watch::Sender<Vec<HostGroup>>,
     snapshot: watch::Receiver<Snapshot>,
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
@@ -418,7 +426,9 @@ impl Inner {
         let mut next: Vec<Option<Instance>> = Vec::with_capacity(wanted.len());
         let mut starts = Vec::new();
         let mut stopping = Vec::new();
-        for (index, network) in wanted.into_iter().enumerate() {
+        for (index, mut network) in wanted.into_iter().enumerate() {
+            // Tells the node which host groups it is a gateway of.
+            network.settings.instance_id = Some(self.instance_id.clone());
             let previous = current
                 .iter()
                 .position(|instance| instance.tag == network.tag)
@@ -442,12 +452,20 @@ impl Inner {
         }
         // Whatever leaves or restarts stops first, so that its ports and
         // interface name are free for the networks that start.
+        // In parallel: each may wait after withdrawing its advertisements
+        // (spec §15.7 rule 6).
         stopping.append(&mut current);
-        for instance in stopping {
+        for instance in &stopping {
             if let Some(hub) = lock(&self.hubs).get(&instance.tag) {
                 hub.publish_region(RegionView::default());
             }
-            stop(instance).await;
+        }
+        let stops: Vec<_> = stopping
+            .into_iter()
+            .map(|instance| tokio::spawn(stop(instance)))
+            .collect();
+        for handle in stops {
+            let _ = handle.await;
         }
         let mut taken: Vec<String> = next
             .iter()
@@ -674,8 +692,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Whether `instance` can go on under `settings` without a restart: the
-/// same settings, or, while it runs, the same but for the native key list
-/// and the `dns` section, which are handed to the running driver. A
+/// same settings, or, while it runs, the same but for the native key
+/// list, the `dns` section and the host groups, which are handed to the
+/// running driver. A
 /// network that failed to start is tried again. `false` means the
 /// instance is to be stopped.
 fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
@@ -698,6 +717,9 @@ fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
                 }
                 if instance.settings.dns != settings.dns {
                     let _ = running.dns.send(settings.dns.clone());
+                }
+                if instance.settings.host_groups != settings.host_groups {
+                    let _ = running.host_groups.send(settings.host_groups.clone());
                 }
                 true
             } else if same_but_bridge_allow(&instance.settings, settings) {
@@ -752,12 +774,14 @@ fn running_ok(running: &Running) -> bool {
     !running.task.is_finished()
 }
 
-/// The same settings but for what a running node takes without a restart:
-/// the native key list and the `dns` section.
+/// Whether `new` differs from `old` only in what a running network takes
+/// without a restart: the native key list, the `dns` section and the host
+/// groups.
 fn same_but_hot(old: &MeshSettings, new: &MeshSettings) -> bool {
     let mut old = old.clone();
     old.native_keys.clone_from(&new.native_keys);
     old.dns.clone_from(&new.dns);
+    old.host_groups.clone_from(&new.host_groups);
     old == *new
 }
 
@@ -864,6 +888,7 @@ async fn launch(
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
     let (dns, dns_settings) = watch::channel(settings.dns.clone());
+    let (host_groups, groups) = watch::channel(settings.host_groups.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
     let exit = Arc::new(Mutex::new(None));
     let exit_of_task = Arc::clone(&exit);
@@ -882,8 +907,11 @@ async fn launch(
             listeners,
             device,
             until,
-            keys,
-            dns_settings,
+            serve::Updates {
+                native_keys: keys,
+                dns: dns_settings,
+                host_groups: groups,
+            },
             border,
             Some(host),
             move |next, _| {
@@ -910,6 +938,7 @@ async fn launch(
         stop: Some(stop),
         native_keys,
         dns,
+        host_groups,
         snapshot,
         exit,
         task,
@@ -1565,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn only_native_key_and_dns_changes_keep_a_network_running() {
+    fn only_native_key_dns_and_host_group_changes_keep_a_network_running() {
         let base = settings();
         let mut listed = base.clone();
         listed.native_keys = Some(vec![[1; 32], [2; 32]]);
@@ -1574,9 +1603,19 @@ mod tests {
         named.dns.enabled = true;
         named.dns.resolver_address = Some("10.150.255.254".parse().unwrap());
         assert!(same_but_hot(&base, &named));
-        let mut moved = named.clone();
+        let mut grouped = listed.clone();
+        grouped.host_groups = vec![HostGroup {
+            cidr: outbound_mesh::IpNet::parse("10.127.1.0/24").unwrap(),
+            gateway: "gw-a".into(),
+            backup_gateway: Some("gw-b".into()),
+        }];
+        assert!(same_but_hot(&base, &grouped));
+        let mut moved = listed.clone();
         moved.mtu -= 10;
         assert!(!same_but_hot(&base, &moved));
+        let mut renamed = grouped.clone();
+        renamed.instance_id = Some("other".into());
+        assert!(!same_but_hot(&grouped, &renamed));
         assert_eq!(waiting_detail(&base), "empty");
         assert_eq!(waiting_detail(&listed), "self_missing");
     }

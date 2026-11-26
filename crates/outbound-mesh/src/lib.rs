@@ -2,8 +2,9 @@
 //! reaches the peers' virtual addresses and the subnets they advertise.
 //!
 //! The wire protocol is written only from `docs/protocols/intranet-mesh.md`
-//! (cited as "spec §n"). The crate registers no outbound yet. See
-//! `docs/architecture/mesh-module.md` for the design and its boundaries.
+//! (cited as "spec §n"). With the feature `outbound` the embedded engine
+//! uses it as an outbound. See `docs/architecture/mesh-module.md` for the
+//! design and its boundaries.
 //!
 //! - [`config`]: the `"type": "mesh"` settings and their validation.
 //! - [`backbone`]: the inter-region backbone of border nodes (spec §17.3),
@@ -26,6 +27,8 @@
 //!   then the receive checks and the encryption of packets.
 //! - [`driver`] (feature `runtime`): sockets, dialing, listening and timers
 //!   around a [`node::Node`].
+//! - [`outbound`] (feature `outbound`): `"type": "mesh"` as an outbound of
+//!   the embedded engine, on a private TCP/IP stack per network.
 //! - [`node`]: one node of one network without I/O: connections,
 //!   keep-alive, RPC, route synchronisation, forwarding and traffic checks.
 //! - [`dns`]: intranet names (requirement R28): the `dns` section, the name
@@ -49,6 +52,8 @@ pub mod legacy;
 pub mod link;
 pub mod net;
 pub mod node;
+#[cfg(feature = "outbound")]
+pub mod outbound;
 pub mod packet;
 pub mod paths;
 pub mod route;

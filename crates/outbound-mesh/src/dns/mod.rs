@@ -284,6 +284,9 @@ pub struct MemberNames {
 /// The network around the name list.
 pub struct NetworkView<'a> {
     pub virtual_subnets: &'a [IpNet],
+    /// The ranges of the network's host groups (spec §15.7): names in
+    /// them are answered like names in the virtual subnets.
+    pub host_groups: &'a [IpNet],
     /// This node's virtual addresses.
     pub local_addresses: &'a [IpAddr],
     /// This node's host name, when the config or the system gives one.
@@ -344,6 +347,9 @@ impl Names {
     /// The list for `settings` in the network `view` describes.
     pub fn build(settings: &DnsSettings, view: &NetworkView<'_>) -> Self {
         let mut scope: Vec<IpNet> = view.virtual_subnets.to_vec();
+        for range in view.host_groups {
+            push_unique(&mut scope, *range);
+        }
         for member in view.members {
             for subnet in &member.subnets {
                 push_unique(&mut scope, *subnet);
@@ -790,6 +796,7 @@ mod tests {
             &settings,
             &NetworkView {
                 virtual_subnets: &subnets,
+                host_groups: &[],
                 local_addresses: &local,
                 own_hostname: Some("Self-Box"),
                 members,
@@ -968,6 +975,23 @@ mod tests {
         );
         let unreachable = ask(&alone, "web.eu.mesh.internal", TYPE_A).unwrap();
         assert_eq!(unreachable.rcode, Rcode::NxDomain as u8);
+        // A host group range is answered like a virtual subnet (spec §15.7),
+        // ahead of any member's advertisement.
+        let settings = settings(region_dns()).unwrap();
+        let subnets = subnets();
+        let local = [ip("10.150.0.5")];
+        let grouped = Names::build(
+            &settings,
+            &NetworkView {
+                virtual_subnets: &subnets,
+                host_groups: &[IpNet::parse("10.151.0.0/24").unwrap()],
+                local_addresses: &local,
+                own_hostname: Some("Self-Box"),
+                members: &[],
+            },
+        );
+        let in_group = ask(&grouped, "web.eu.mesh.internal", TYPE_A).unwrap();
+        assert_eq!(addresses(&in_group), [ip("10.151.0.7")]);
         let members = [
             member("gw", &["10.150.0.1"], &["192.168.10.0/24"]),
             member("eu-border", &["10.150.0.2"], &["10.151.0.0/16"]),

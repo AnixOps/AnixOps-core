@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use outbound_mesh::config::encode_key;
+use outbound_mesh::config::{encode_key, HostGroup};
 use outbound_mesh::dns::DnsSettings;
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
-use outbound_mesh::{IpNet, MeshConfig, MeshSettings, Role};
+use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
 use ring::rand::SystemRandom;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -539,14 +539,18 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
         let (_keep_dns, dns) = watch::channel(settings.dns.clone());
+        let (_keep_groups, host_groups) = watch::channel(Vec::new());
         let result = serve_with(
             settings,
             static_key,
             listeners,
             device,
             stop,
-            native_keys,
-            dns,
+            Updates {
+                native_keys,
+                dns,
+                host_groups,
+            },
             None,
             None,
             |snapshot, name| {
@@ -612,7 +616,7 @@ impl HostSide {
 /// Whether this node carries traffic to its advertised subnets: a full
 /// node with subnets to advertise (requirement R10).
 fn forwards(settings: &MeshSettings) -> bool {
-    settings.role == Role::Full && !settings.advertise_subnets.is_empty()
+    settings.role == outbound_mesh::Role::Full && !settings.carried_subnets().is_empty()
 }
 
 /// Keeps only the advertised subnets the machine carries. A subnet it does
@@ -716,7 +720,7 @@ fn start_host(settings: &MeshSettings, interface: &str, _listen_ports: &[u16]) -
         return HostSide::none();
     }
     let (v4, v6): (Vec<IpNet>, Vec<IpNet>) = settings
-        .advertise_subnets
+        .carried_subnets()
         .iter()
         .partition(|subnet| subnet.is_ipv4());
     if !v6.is_empty() {
@@ -820,7 +824,7 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
         return HostSide::none();
     }
     let mut host = crate::forward_windows::HostChanges::default();
-    if settings.role == Role::Full && !listen_ports.is_empty() {
+    if settings.role == outbound_mesh::Role::Full && !listen_ports.is_empty() {
         if let Err(error) = host.allow_inbound(&settings.network_name, listen_ports, interface) {
             warn("firewall", &error.to_string());
         }
@@ -834,7 +838,7 @@ fn start_host(settings: &MeshSettings, interface: &str, listen_ports: &[u16]) ->
     }
     let ipv6 = settings.address_v6.is_some();
     let wanted: Vec<IpNet> = settings
-        .advertise_subnets
+        .carried_subnets()
         .iter()
         .copied()
         .filter(|subnet| ipv6 || subnet.is_ipv4())
@@ -1048,13 +1052,23 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
     Ok(())
 }
 
+/// What a running network takes without a restart.
+pub(crate) struct Updates {
+    /// A new native key list (spec §8.3.1).
+    pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// A new `dns` section (R28, spec §15.9.2).
+    pub dns: watch::Receiver<DnsSettings>,
+    /// New host groups (spec §15.7).
+    pub host_groups: watch::Receiver<Vec<HostGroup>>,
+}
+
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `native_keys` carries a new native key list into the running driver,
-/// `dns` a new `dns` section; `border` connects a border node's network
-/// to its backbone. With `host`, the network installs only routes no
-/// other network of the process holds, under the given owner name.
+/// `updates` carries new native keys, a new `dns` section and new host
+/// groups into the running driver; `border` connects a border node's
+/// network to its backbone. With `host`, the network installs only routes
+/// no other network of the process holds, under the given owner name.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_with(
     settings: MeshSettings,
@@ -1062,12 +1076,16 @@ pub(crate) async fn serve_with(
     listeners: Listeners,
     device: Tun,
     until: impl std::future::Future<Output = ()>,
-    native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
-    dns: watch::Receiver<DnsSettings>,
+    updates: Updates,
     border: Option<driver::Border>,
     host: Option<(HostRoutes, String)>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
+    let Updates {
+        native_keys,
+        dns,
+        host_groups,
+    } = updates;
     let mtu = usize::from(settings.mtu);
     let (to_node, from_interface) = mpsc::channel::<Vec<u8>>(QUEUE);
     let (to_interface, mut from_node) = mpsc::channel::<Vec<u8>>(QUEUE);
@@ -1136,6 +1154,7 @@ pub(crate) async fn serve_with(
     // kept so that the driver sees an open, empty list.
     let (_route_overrides, route_overrides) = watch::channel(Vec::new());
     let mut installed: Vec<IpNet> = Vec::new();
+    let mut stopping = false;
     let mut wanted: Vec<IpNet> = Vec::new();
     tokio::pin!(until);
 
@@ -1150,6 +1169,7 @@ pub(crate) async fn serve_with(
             local_networks,
             native_keys,
             dns,
+            host_groups,
             route_overrides,
             foreign_routes,
             shutdown,
@@ -1220,9 +1240,16 @@ pub(crate) async fn serve_with(
                 // ours now (the scanner updates this machine's networks).
                 reconcile(&mut installed, &wanted);
             }
-            () = &mut until => break,
+            // The node may keep running for a moment after withdrawing its
+            // advertisements (spec §15.7 rule 6); the interface keeps
+            // carrying its traffic until it ends.
+            () = &mut until, if !stopping => {
+                stopping = true;
+                let _ = stop.send(true);
+            }
             result = &mut node => {
                 return match result {
+                    Ok(Ok(())) if stopping => Ok(()),
                     Ok(Ok(())) => Err(Failure::Other("the node stopped".into())),
                     Ok(Err(error)) => Err(Failure::Other(error.to_string())),
                     Err(error) => Err(Failure::Other(error.to_string())),
