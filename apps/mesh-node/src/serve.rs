@@ -11,7 +11,7 @@ use std::path::Path;
 
 use std::time::Duration;
 
-use outbound_mesh::config::encode_key;
+use outbound_mesh::config::{encode_key, HostGroup};
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings, Role};
@@ -254,6 +254,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
+        let (_keep_groups, host_groups) = watch::channel(Vec::new());
         serve_with(
             settings,
             static_key,
@@ -261,6 +262,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             device,
             stop,
             native_keys,
+            host_groups,
             |snapshot, name| {
                 if let Some(forwarding) = forwarding.as_mut() {
                     let mut sources = virtual_subnets.clone();
@@ -296,7 +298,7 @@ impl HostForwarder for crate::forward_macos::HostForwarding {
 /// Whether this node carries traffic to its advertised subnets: a full
 /// node with subnets to advertise (requirement R10).
 fn forwards(settings: &MeshSettings) -> bool {
-    settings.role == Role::Full && !settings.advertise_subnets.is_empty()
+    !settings.carried_subnets().is_empty()
 }
 
 /// One line saying whether the host forwards for the advertised subnets
@@ -334,7 +336,7 @@ fn start_forwarding(
         &settings.network_name,
         interface,
         &interfaces,
-        &settings.advertise_subnets,
+        &settings.carried_subnets(),
         &settings.virtual_subnets(),
         settings.address_v6.is_some(),
     ) {
@@ -417,7 +419,7 @@ fn start_forwarding(
                 &settings.network_name,
                 interface,
                 &interfaces,
-                &settings.advertise_subnets,
+                &settings.carried_subnets(),
                 crate::forward_windows::ipv4(&settings.address),
                 settings.address_v6.is_some(),
             )
@@ -509,6 +511,7 @@ pub(crate) async fn serve_with(
     device: Tun,
     until: impl std::future::Future<Output = ()>,
     native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    host_groups: watch::Receiver<Vec<HostGroup>>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
     let mtu = usize::from(settings.mtu);
@@ -519,6 +522,7 @@ pub(crate) async fn serve_with(
     let (networks, local_networks) = watch::channel(read_local_networks(device.name()));
     let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
     let mut installed: Vec<IpNet> = Vec::new();
+    let mut stopping = false;
     tokio::pin!(until);
 
     let mut node = tokio::spawn(driver::run(
@@ -531,6 +535,7 @@ pub(crate) async fn serve_with(
             snapshots,
             local_networks,
             native_keys,
+            host_groups,
             shutdown,
         },
     ));
@@ -583,9 +588,16 @@ pub(crate) async fn serve_with(
                     changed
                 });
             }
-            () = &mut until => break,
+            // The node may keep running for a moment after withdrawing its
+            // advertisements (spec §15.7 rule 6); the interface keeps
+            // carrying its traffic until it ends.
+            () = &mut until, if !stopping => {
+                stopping = true;
+                let _ = stop.send(true);
+            }
             result = &mut node => {
                 return match result {
+                    Ok(Ok(())) if stopping => Ok(()),
                     Ok(Ok(())) => Err(Failure::Other("the node stopped".into())),
                     Ok(Err(error)) => Err(Failure::Other(error.to_string())),
                     Err(error) => Err(Failure::Other(error.to_string())),

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use outbound_mesh::config::encode_key;
+use outbound_mesh::config::{encode_key, HostGroup};
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::node::SyncOversize;
 use outbound_mesh::secure::noise::KeyPair;
@@ -40,13 +40,16 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
+/// `mesh_host_groups`: the `host_groups` section (spec §15.7).
+pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_host_groups"];
 
 /// Interface names: `anixmesh-<n>`, the lowest number free.
 const INTERFACE_PREFIX: &str = "anixmesh-";
 
-/// How long a stopped network may take to close before it is cut off.
+/// How long a stopped network may take to close before it is cut off: more
+/// than the wait after withdrawing its advertisements (spec §15.7 rule 6).
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const _: () = assert!(STOP_TIMEOUT.as_secs() > outbound_mesh::node::WITHDRAW_WAIT.as_secs());
 
 /// The managed mesh of one node program.
 pub struct ManagedMesh {
@@ -82,6 +85,7 @@ struct Running {
     /// Dropping or sending stops the network.
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    host_groups: watch::Sender<Vec<HostGroup>>,
     snapshot: watch::Receiver<Snapshot>,
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
@@ -130,7 +134,9 @@ impl Inner {
         let mut next: Vec<Option<Instance>> = Vec::with_capacity(wanted.len());
         let mut starts = Vec::new();
         let mut stopping = Vec::new();
-        for (index, network) in wanted.into_iter().enumerate() {
+        for (index, mut network) in wanted.into_iter().enumerate() {
+            // Tells the node which host groups it is a gateway of.
+            network.settings.instance_id = Some(self.instance_id.clone());
             let previous = current
                 .iter()
                 .position(|instance| instance.tag == network.tag)
@@ -154,9 +160,15 @@ impl Inner {
         }
         // Whatever leaves or restarts stops first, so that its ports and
         // interface name are free for the networks that start.
+        // In parallel: each may wait after withdrawing its advertisements
+        // (spec §15.7 rule 6).
         stopping.append(&mut current);
-        for instance in stopping {
-            stop(instance).await;
+        let stops: Vec<_> = stopping
+            .into_iter()
+            .map(|instance| tokio::spawn(stop(instance)))
+            .collect();
+        for handle in stops {
+            let _ = handle.await;
         }
         let mut taken: Vec<String> = next
             .iter()
@@ -270,12 +282,17 @@ fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
         State::Running(running) => {
             if same {
                 true
-            } else if same_but_native_keys(&instance.settings, settings)
+            } else if same_but_hot(&instance.settings, settings)
                 && instance
                     .public
                     .is_some_and(|public| !settings.waits_for_native_keys(&public))
             {
-                let _ = running.native_keys.send(settings.native_keys.clone());
+                if instance.settings.native_keys != settings.native_keys {
+                    let _ = running.native_keys.send(settings.native_keys.clone());
+                }
+                if instance.settings.host_groups != settings.host_groups {
+                    let _ = running.host_groups.send(settings.host_groups.clone());
+                }
                 true
             } else {
                 false
@@ -292,9 +309,12 @@ fn running_ok(running: &Running) -> bool {
     !running.task.is_finished()
 }
 
-fn same_but_native_keys(old: &MeshSettings, new: &MeshSettings) -> bool {
+/// Whether `new` differs from `old` only in what a running network takes
+/// without a restart: the native key list and the host groups.
+fn same_but_hot(old: &MeshSettings, new: &MeshSettings) -> bool {
     let mut old = old.clone();
     old.native_keys.clone_from(&new.native_keys);
+    old.host_groups.clone_from(&new.host_groups);
     old == *new
 }
 
@@ -355,6 +375,7 @@ async fn launch(
 
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
+    let (host_groups, groups) = watch::channel(settings.host_groups.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
     let exit = Arc::new(Mutex::new(None));
     let exit_of_task = Arc::clone(&exit);
@@ -370,6 +391,7 @@ async fn launch(
             device,
             until,
             keys,
+            groups,
             move |next, _| {
                 snapshots.send_replace(next.clone());
             },
@@ -383,6 +405,7 @@ async fn launch(
         interface,
         stop: Some(stop),
         native_keys,
+        host_groups,
         snapshot,
         exit,
         task,
@@ -674,14 +697,24 @@ mod tests {
     }
 
     #[test]
-    fn only_a_native_key_change_keeps_a_network_running() {
+    fn only_native_key_and_host_group_changes_keep_a_network_running() {
         let base = settings();
         let mut listed = base.clone();
         listed.native_keys = Some(vec![[1; 32], [2; 32]]);
-        assert!(same_but_native_keys(&base, &listed));
+        assert!(same_but_hot(&base, &listed));
+        let mut grouped = listed.clone();
+        grouped.host_groups = vec![HostGroup {
+            cidr: outbound_mesh::IpNet::parse("10.127.1.0/24").unwrap(),
+            gateway: "gw-a".into(),
+            backup_gateway: Some("gw-b".into()),
+        }];
+        assert!(same_but_hot(&base, &grouped));
         let mut moved = listed.clone();
         moved.mtu -= 10;
-        assert!(!same_but_native_keys(&base, &moved));
+        assert!(!same_but_hot(&base, &moved));
+        let mut renamed = grouped.clone();
+        renamed.instance_id = Some("other".into());
+        assert!(!same_but_hot(&grouped, &renamed));
         assert_eq!(waiting_detail(&base), "empty");
         assert_eq!(waiting_detail(&listed), "self_missing");
     }

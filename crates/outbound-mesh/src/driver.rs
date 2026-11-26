@@ -21,10 +21,10 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
-use crate::config::{MeshSettings, PeerEndpoint, Role, SecurityMode, Transport};
+use crate::config::{HostGroup, MeshSettings, PeerEndpoint, Role, SecurityMode, Transport};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
-use crate::node::{Action, ConnId, Counters, Node, SyncOversize};
+use crate::node::{Action, ConnId, Counters, Node, SyncOversize, WITHDRAW_WAIT};
 use crate::routes::PeerId;
 use crate::secure::noise::KeyPair;
 use crate::wire::tcp::{encode_frame, FrameDecoder};
@@ -129,6 +129,15 @@ pub struct Snapshot {
     pub overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
+    /// What this node advertises now (field 5), host group ranges
+    /// included (spec §15.7).
+    pub advertising: Vec<IpNet>,
+    /// Host group ranges this node advertises as the standby gateway
+    /// because the gateway is not online (spec §15.7 rule 5).
+    pub standing_in: Vec<IpNet>,
+    /// The node is stopping: it withdrew its advertisements and closes its
+    /// connections [`WITHDRAW_WAIT`] later (spec §15.7 rule 6).
+    pub withdrawing: bool,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
@@ -228,7 +237,12 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
-    /// Stops the node when it turns true.
+    /// New `host_groups`, applied without a restart (spec §15.7); the value
+    /// at start is ignored, the settings carry it.
+    pub host_groups: watch::Receiver<Vec<HostGroup>>,
+    /// Stops the node when it turns true. A node that advertises subnets
+    /// first withdraws them and keeps running for [`WITHDRAW_WAIT`] (spec
+    /// §15.7 rule 6); the caller should allow for that.
     pub shutdown: watch::Receiver<bool>,
 }
 
@@ -245,9 +259,11 @@ pub async fn run(
         snapshots,
         mut local_networks,
         mut native_keys,
+        mut host_groups,
         mut shutdown,
     } = channels;
     native_keys.mark_unchanged();
+    host_groups.mark_unchanged();
     let rng = SystemRandom::new();
     let started = Instant::now();
     let peers = settings.peers.clone();
@@ -291,6 +307,9 @@ pub async fn run(
     let mut waiting: Vec<(ConnId, Instant, u32)> = Vec::new();
     let mut ticks = interval(Duration::from_secs(1));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Set once the node withdrew its advertisements to stop: it closes
+    // then (spec §15.7 rule 6).
+    let mut closing_at: Option<Instant> = None;
 
     loop {
         // Relay handshakes due before the next tick (spec §9 retries).
@@ -300,10 +319,21 @@ pub async fn run(
             .chain(waiting.iter().map(|(_, at, _)| *at))
             .min();
         tokio::select! {
-            changed = shutdown.changed() => {
+            changed = shutdown.changed(), if closing_at.is_none() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    break;
+                    let now = Instant::now();
+                    if !node.withdraw(now, unix_now()) {
+                        break;
+                    }
+                    closing_at = Some(now + WITHDRAW_WAIT);
+                    publish(&snapshots, snapshot(&node));
                 }
+            }
+            _ = until(closing_at) => break,
+            Ok(()) = host_groups.changed() => {
+                let groups = host_groups.borrow_and_update().clone();
+                node.set_host_groups(groups, Instant::now());
+                publish(&snapshots, snapshot(&node));
             }
             Ok(()) = local_networks.changed() => {
                 node.set_local_networks(&local_networks.borrow_and_update());
@@ -460,6 +490,9 @@ fn snapshot(node: &Node) -> Snapshot {
             .into_iter()
             .map(|(peer, address)| (peer.0, address))
             .collect(),
+        advertising: node.advertising().to_vec(),
+        standing_in: node.standing_in().to_vec(),
+        withdrawing: node.is_withdrawn(),
     }
 }
 
@@ -494,12 +527,22 @@ fn members(node: &Node) -> Vec<Member> {
         .collect()
 }
 
+/// Accepted subnets overlapping this node's networks. The range of a host
+/// group this node is a gateway of is not one: the other gateway
+/// advertising it is expected (spec §15.7 rule 5).
 fn overlaps(node: &Node) -> Vec<IpNet> {
+    let groups: Vec<IpNet> = node
+        .settings()
+        .gateway_groups()
+        .into_iter()
+        .map(|(group, _)| group.cidr)
+        .collect();
     let mut nets: Vec<IpNet> = node
         .route_table()
         .local_conflicts()
         .into_iter()
         .map(|(_, net)| net)
+        .filter(|net| !groups.contains(net))
         .collect();
     nets.sort_by_key(ToString::to_string);
     nets.dedup();
@@ -902,6 +945,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_, local_networks) = watch::channel(Vec::new());
         let (_, native_keys) = watch::channel(None);
+        let (_, host_groups) = watch::channel(Vec::new());
         tokio::spawn(run(
             settings,
             static_key,
@@ -912,6 +956,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                host_groups,
                 shutdown,
             },
         ));
@@ -1050,5 +1095,72 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         assert!(event_rx.try_recv().is_err(), "one session only");
         server.abort();
+    }
+
+    /// Runs a listening hub until shutdown and says how long it took to
+    /// stop after the signal.
+    async fn stop_time(advertise: &[&str]) -> Duration {
+        let mut hub = settings("10.144.0.1/24", "full");
+        hub.peers.clear();
+        hub.listen = vec![ListenConfig {
+            transport: Transport::Tcp,
+            port: 0,
+            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        }];
+        hub.advertise_subnets = advertise.iter().map(|text| IpNet::parse(text).unwrap()).collect();
+        let listeners = Listeners::bind(&hub).await.unwrap();
+        let rng = SystemRandom::new();
+        let (_to_mesh, from_interface) = mpsc::channel(16);
+        let (to_interface, _from_mesh) = mpsc::channel(16);
+        let (snapshot_tx, mut snapshots) = watch::channel(Snapshot::default());
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let (_keep_networks, local_networks) = watch::channel(Vec::new());
+        let (_keep_keys, native_keys) = watch::channel(None);
+        let (_keep_groups, host_groups) = watch::channel(Vec::new());
+        let task = tokio::spawn(run(
+            hub,
+            KeyPair::generate(&rng).unwrap(),
+            listeners,
+            Channels {
+                from_interface,
+                to_interface,
+                snapshots: snapshot_tx,
+                local_networks,
+                native_keys,
+                host_groups,
+                shutdown,
+            },
+        ));
+        timeout(Duration::from_secs(5), async {
+            while snapshots.borrow().peer_id == 0 {
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let signalled = Instant::now();
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the node stops")
+            .unwrap()
+            .unwrap();
+        let took = signalled.elapsed();
+        if !advertise.is_empty() {
+            assert!(snapshots.borrow().withdrawing);
+            assert!(snapshots.borrow().advertising.is_empty());
+        }
+        took
+    }
+
+    #[tokio::test]
+    async fn a_node_that_advertises_waits_after_withdrawing_before_it_stops() {
+        // Spec §15.7 rule 6: withdraw, then close WITHDRAW_WAIT later.
+        let took = stop_time(&["192.168.50.0/24"]).await;
+        assert!(took >= WITHDRAW_WAIT, "{took:?}");
+        assert!(took < WITHDRAW_WAIT + Duration::from_secs(2), "{took:?}");
+        // Nothing to withdraw: it stops at once.
+        let took = stop_time(&[]).await;
+        assert!(took < Duration::from_secs(1), "{took:?}");
     }
 }

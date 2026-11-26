@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use ring::error::Unspecified;
 use ring::rand::SecureRandom;
 
-use crate::config::{MeshSettings, NetworkKind, Role, RoutePolicy, SecurityMode};
+use crate::config::{
+    GatewayRole, HostGroup, MeshSettings, NetworkKind, Role, RoutePolicy, SecurityMode,
+};
 use crate::legacy::keys::digest;
 use crate::legacy::LegacyCipher;
 use crate::link::{self, CloseReason, Crypto, Dropped, Handshaking, Link, Step, Up};
@@ -101,6 +103,15 @@ pub const PING_MISSES: u32 = 5;
 /// that it only warns, so that a member forging information cannot make
 /// it change again and again (spec §12.3).
 pub const ID_RENEW_INTERVAL: Duration = Duration::from_secs(600);
+/// How long a node that stops keeps its connections after withdrawing its
+/// subnet advertisements, so that the network moves to another advertiser
+/// first (spec §15.7 rule 6).
+pub const WITHDRAW_WAIT: Duration = Duration::from_secs(3);
+/// How long a standby gateway must have had a direct neighbour before it
+/// may advertise a host group range: time for the first route
+/// synchronisation to show whether the gateway is online (spec §15.7
+/// rule 5).
+pub const STANDBY_SETTLE: Duration = Duration::from_secs(3);
 /// Version string announced in route information (spec §12.3).
 pub const VERSION_STRING: &str = "2.6.4-compat";
 
@@ -251,9 +262,44 @@ pub struct Node {
     renewed_at: Option<Instant>,
     /// Relay sessions being set up, by destination (secure mode only).
     relays: BTreeMap<u32, Relay>,
+    /// What this node advertises now in field 5 (spec §15.2, §15.7).
+    advertising: Vec<IpNet>,
+    /// Host group ranges this node advertises as the standby gateway
+    /// because no other reachable member does (spec §15.7 rule 5).
+    standing_in: Vec<IpNet>,
+    /// Since when this node has had a direct neighbour without a break.
+    neighbours_since: Option<Instant>,
+    /// The node withdrew its advertisements to stop (spec §15.7 rule 6).
+    withdrawn: bool,
 }
 
-fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) -> RoutePeerInfo {
+/// What a node advertises (field 5): nothing on access nodes and after
+/// [`Node::withdraw`]; otherwise `subnets.advertise` without host group
+/// ranges, the ranges of the groups it is the gateway of, and the ranges it
+/// stands in for as the standby gateway.
+fn advertising(settings: &MeshSettings, standing_in: &[IpNet], withdrawn: bool) -> Vec<IpNet> {
+    if withdrawn || settings.role != Role::Full {
+        return Vec::new();
+    }
+    let mut out = settings.plain_advertised();
+    for (group, role) in settings.gateway_groups() {
+        let advertised = match role {
+            GatewayRole::Gateway => true,
+            GatewayRole::Backup => standing_in.contains(&group.cidr),
+        };
+        if advertised && !out.contains(&group.cidr) {
+            out.push(group.cidr);
+        }
+    }
+    out
+}
+
+fn own_info(
+    settings: &MeshSettings,
+    identity: &Identity,
+    static_key: &KeyPair,
+    advertise: &[IpNet],
+) -> RoutePeerInfo {
     let ipv4 = match settings.address.address() {
         IpAddr::V4(v4) => Some(v4),
         IpAddr::V6(_) => None,
@@ -263,15 +309,7 @@ fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) 
         IpAddr::V4(_) => None,
     });
     let relays = settings.role == Role::Full && settings.relay;
-    let advertise = if settings.role == Role::Full {
-        settings
-            .advertise_subnets
-            .iter()
-            .map(|net| net.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let advertise = advertise.iter().map(|net| net.to_string()).collect();
     RoutePeerInfo {
         peer_id: identity.peer_id,
         inst_id: identity.inst_id,
@@ -339,7 +377,8 @@ impl Node {
             }
             SecurityMode::ForwardSecrecy => None,
         };
-        let info = own_info(&settings, &identity, &static_key);
+        let advertise = advertising(&settings, &[], false);
+        let info = own_info(&settings, &identity, &static_key, &advertise);
         let local = Local {
             id: identity.peer_id,
             static_key,
@@ -380,6 +419,10 @@ impl Node {
             not_native: None,
             renewed_at: None,
             relays: BTreeMap::new(),
+            advertising: advertise,
+            standing_in: Vec::new(),
+            neighbours_since: None,
+            withdrawn: false,
             settings,
         })
     }
@@ -440,6 +483,116 @@ impl Node {
             self.relays.remove(&key.peer_id);
         }
         self.refresh_routes();
+    }
+
+    /// Replaces the host groups while the node runs (spec §15.7): the
+    /// panel adds, changes or removes a group, or moves it with its gateway
+    /// to another region. What this node carries and advertises follows at
+    /// once; the custom paths were checked against the new groups with the
+    /// rest of the config.
+    pub fn set_host_groups(&mut self, groups: Vec<HostGroup>, now: Instant) {
+        self.settings.host_groups = groups;
+        self.routes.set_advertised(self.settings.carried_subnets());
+        let backups: Vec<IpNet> = self.backup_ranges();
+        self.standing_in.retain(|cidr| backups.contains(cidr));
+        self.update_advertising(now);
+        self.refresh_routes_now();
+    }
+
+    /// What this node advertises now (field 5).
+    pub fn advertising(&self) -> &[IpNet] {
+        &self.advertising
+    }
+
+    /// Host group ranges this node advertises as the standby gateway.
+    pub fn standing_in(&self) -> &[IpNet] {
+        &self.standing_in
+    }
+
+    /// Whether the node withdrew its advertisements to stop.
+    pub fn is_withdrawn(&self) -> bool {
+        self.withdrawn
+    }
+
+    /// Starts a graceful stop (spec §15.7 rule 6, §15.8 rule 6): removes
+    /// every subnet from field 5, raises the version and pushes the change
+    /// to every neighbour at once. The node keeps forwarding; the caller
+    /// closes the connections [`WITHDRAW_WAIT`] later. Returns whether
+    /// anything was advertised, that is whether there is anything to wait
+    /// for.
+    pub fn withdraw(&mut self, now: Instant, unix_now: (i64, i32)) -> bool {
+        let had = !self.advertising.is_empty();
+        self.withdrawn = true;
+        self.standing_in.clear();
+        self.update_advertising(now);
+        if had {
+            for (peer, request) in self.sync.poll(now, unix_now) {
+                self.call(peer, CallKind::SyncRoute, request.encode(), now);
+            }
+        }
+        had
+    }
+
+    fn backup_ranges(&self) -> Vec<IpNet> {
+        self.settings
+            .gateway_groups()
+            .into_iter()
+            .filter(|(_, role)| *role == GatewayRole::Backup)
+            .map(|(group, _)| group.cidr)
+            .collect()
+    }
+
+    /// Decides which host group ranges the standby gateway advertises
+    /// (spec §15.7 rule 5): a range no other reachable member advertises,
+    /// once this node has had a neighbour for [`STANDBY_SETTLE`], so that a
+    /// standby that has just started learns of an online gateway first.
+    /// It stops as soon as another member advertises the range again.
+    fn standby_round(&mut self, now: Instant) {
+        if self.neighbours().is_empty() {
+            self.neighbours_since = None;
+        } else if self.neighbours_since.is_none() {
+            self.neighbours_since = Some(now);
+        }
+        let backups = self.backup_ranges();
+        if backups.is_empty() || self.withdrawn {
+            self.standing_in.clear();
+            return;
+        }
+        let settled = self
+            .neighbours_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= STANDBY_SETTLE);
+        let reachable = self.compute_routes(Metric::Hops);
+        let own = self.id();
+        let mut next = Vec::new();
+        for cidr in backups {
+            let advertised_elsewhere = self.sync.infos().any(|info| {
+                info.peer_id != own
+                    && reachable.contains_key(&info.peer_id)
+                    && info
+                        .proxy_cidrs
+                        .iter()
+                        .filter_map(|text| IpNet::parse(text))
+                        .any(|subnet| subnet.trunc() == cidr)
+            });
+            let standing = self.standing_in.contains(&cidr);
+            if !advertised_elsewhere && (settled || standing) {
+                next.push(cidr);
+            }
+        }
+        self.standing_in = next;
+    }
+
+    /// Puts what this node should advertise into its information; the
+    /// version goes up when that changes (spec §12.3).
+    fn update_advertising(&mut self, now: Instant) {
+        let next = advertising(&self.settings, &self.standing_in, self.withdrawn);
+        if next == self.advertising {
+            return;
+        }
+        self.advertising = next;
+        let mut info = self.sync.own().clone();
+        info.proxy_cidrs = self.advertising.iter().map(|net| net.to_string()).collect();
+        self.sync.set_own(info, now);
     }
 
     /// The networks of this machine's other interfaces (spec §15.4).
@@ -523,7 +676,12 @@ impl Node {
             self.local.node_name = format!("node-{}", identity.peer_id);
         }
         self.sync = RouteSync::new(
-            own_info(&self.settings, &identity, &self.local.static_key),
+            own_info(
+                &self.settings,
+                &identity,
+                &self.local.static_key,
+                &self.advertising,
+            ),
             now,
         );
         self.sync.set_admitted(admitted_keys(&self.settings));
@@ -1150,6 +1308,10 @@ impl Node {
         if !self.sync.take_changed() {
             return;
         }
+        self.refresh_routes_now();
+    }
+
+    fn refresh_routes_now(&mut self) {
         let reachable = self.compute_routes(Metric::Hops);
         let mut known = Vec::new();
         for info in self.sync.infos() {
@@ -1187,6 +1349,8 @@ impl Node {
         self.keep_alive(now);
         self.expire_calls(rng, now);
 
+        self.standby_round(now);
+        self.update_advertising(now);
         for (peer, request) in self.sync.poll(now, unix_now) {
             self.call(peer, CallKind::SyncRoute, request.encode(), now);
         }
@@ -1636,6 +1800,214 @@ mod tests {
             }
             self.settle();
         }
+    }
+
+    /// Cuts the wire between `a` and `b`, as a crash of one of them would.
+    fn unlink(net: &mut Net, a: usize, b: usize) {
+        let cut: Vec<((usize, ConnId), (usize, ConnId))> = net
+            .wires
+            .iter()
+            .filter(|((i, _), (j, _))| (*i == a && *j == b) || (*i == b && *j == a))
+            .map(|(&from, &to)| (from, to))
+            .collect();
+        for (from, _) in &cut {
+            net.wires.remove(from);
+            let now = net.now;
+            net.nodes[from.0].disconnected(from.1, now);
+        }
+        net.settle();
+    }
+
+    const GROUP: &str = "10.127.1.0/24";
+
+    /// A full node of a secure network with one host group whose gateway
+    /// is `gw-a` and standby `gw-b`; `instance` is this device's ID.
+    fn group_settings(address: &str, instance: Option<&str>, advertise: &[&str]) -> MeshSettings {
+        let config = serde_json::json!({
+            "config_version": 1,
+            "network": {"name": "office", "secret": "s3cr3t"},
+            "node": {"address": address, "role": "full"},
+            "peers": [{"server": "peer.example", "port": 40000}],
+            "subnets": {"advertise": advertise},
+            "host_groups": [{"cidr": GROUP, "gateway": "gw-a", "backup_gateway": "gw-b"}],
+        });
+        let config: MeshConfig = serde_json::from_value(config).expect("config parses");
+        let mut settings = config.validate().expect("config is valid");
+        settings.instance_id = instance.map(str::to_owned);
+        settings
+    }
+
+    fn group() -> IpNet {
+        IpNet::parse(GROUP).unwrap()
+    }
+
+    fn in_group() -> IpAddr {
+        "10.127.1.20".parse().unwrap()
+    }
+
+    fn advertised_by(net: &Net, observer: usize, peer: u32) -> Vec<String> {
+        net.nodes[observer]
+            .route_sync()
+            .info(peer)
+            .map(|info| info.proxy_cidrs.clone())
+            .unwrap_or_default()
+    }
+
+    /// Node 0 is a plain member, node 1 the gateway, node 2 the standby
+    /// gateway; both gateways connect to node 0 and to each other.
+    fn gateway_pair() -> Net {
+        let mut net = Net::with(vec![
+            group_settings("10.144.0.1/24", Some("member"), &[GROUP]),
+            group_settings("10.144.0.2/24", Some("gw-a"), &[]),
+            group_settings("10.144.0.3/24", Some("gw-b"), &[]),
+        ]);
+        net.link(0, 1);
+        net.link(0, 2);
+        net.link(1, 2);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net
+    }
+
+    #[test]
+    fn the_gateway_advertises_the_group_range_and_others_do_not() {
+        let net = gateway_pair();
+        // Node 0 lists the range in subnets.advertise but is no gateway:
+        // a group's range comes from its gateways only.
+        assert!(net.nodes[0].advertising().is_empty());
+        assert_eq!(net.nodes[1].advertising(), &[group()]);
+        // The standby stays quiet while the gateway is reachable.
+        assert!(net.nodes[2].advertising().is_empty());
+        assert!(net.nodes[2].standing_in().is_empty());
+        assert_eq!(advertised_by(&net, 0, 101), vec![GROUP.to_owned()]);
+        assert!(advertised_by(&net, 0, 102).is_empty());
+        assert_eq!(net.nodes[0].route_table().lookup(in_group()), Ok(PeerId(101)));
+        // Both gateways carry the range: packets from it are taken.
+        assert!(net.nodes[1].settings().carried_subnets().contains(&group()));
+        assert!(net.nodes[2].settings().carried_subnets().contains(&group()));
+        assert!(net.nodes[0].settings().carried_subnets().is_empty());
+    }
+
+    #[test]
+    fn a_gateway_that_stops_withdraws_and_the_standby_takes_over_in_time() {
+        let mut net = gateway_pair();
+        let version = net.nodes[1].route_sync().own().version;
+        let now = net.now;
+        assert!(net.nodes[1].withdraw(now, (0, 0)));
+        assert!(net.nodes[1].is_withdrawn());
+        assert!(net.nodes[1].advertising().is_empty());
+        assert!(net.nodes[1].route_sync().own().version > version);
+        // Pushed at once, without waiting for a tick.
+        net.settle();
+        assert!(advertised_by(&net, 0, 101).is_empty());
+        assert!(net.nodes[0].route_table().lookup(in_group()).is_err());
+        // The standby advertises the range before the gateway closes its
+        // connections (WITHDRAW_WAIT later).
+        let mut waited = Duration::ZERO;
+        while net.nodes[0].route_table().lookup(in_group()) != Ok(PeerId(102)) {
+            assert!(waited < WITHDRAW_WAIT, "the standby did not take over in time");
+            net.tick(Duration::from_secs(1));
+            waited += Duration::from_secs(1);
+        }
+        assert_eq!(net.nodes[2].standing_in(), &[group()]);
+        assert_eq!(advertised_by(&net, 0, 102), vec![GROUP.to_owned()]);
+        // Ticks keep the withdrawn gateway quiet.
+        net.tick(Duration::from_secs(1));
+        assert!(net.nodes[1].advertising().is_empty());
+        // Withdrawing again has nothing left to wait for.
+        let now = net.now;
+        assert!(!net.nodes[1].withdraw(now, (0, 0)));
+    }
+
+    #[test]
+    fn the_standby_steps_back_when_the_gateway_returns() {
+        let mut net = gateway_pair();
+        let now = net.now;
+        net.nodes[1].withdraw(now, (0, 0));
+        net.settle();
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(net.nodes[2].standing_in(), &[group()]);
+        // The gateway advertises again (as after a restart).
+        net.nodes[1].withdrawn = false;
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert!(net.nodes[2].standing_in().is_empty());
+        assert!(advertised_by(&net, 0, 102).is_empty());
+        assert_eq!(net.nodes[0].route_table().lookup(in_group()), Ok(PeerId(101)));
+    }
+
+    #[test]
+    fn the_standby_takes_over_when_the_gateway_fails() {
+        let mut net = gateway_pair();
+        unlink(&mut net, 0, 1);
+        unlink(&mut net, 1, 2);
+        for _ in 0..5 {
+            net.tick(Duration::from_secs(1));
+        }
+        assert_eq!(net.nodes[2].standing_in(), &[group()]);
+        assert_eq!(net.nodes[0].route_table().lookup(in_group()), Ok(PeerId(102)));
+        // Both gone: the range is unreachable.
+        unlink(&mut net, 0, 2);
+        net.tick(Duration::from_secs(1));
+        assert!(net.nodes[0].route_table().lookup(in_group()).is_err());
+    }
+
+    #[test]
+    fn a_standby_that_just_started_waits_before_advertising() {
+        let mut net = Net::with(vec![
+            group_settings("10.144.0.1/24", Some("member"), &[]),
+            group_settings("10.144.0.3/24", Some("gw-b"), &[]),
+        ]);
+        net.link(0, 1);
+        net.settle();
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert!(net.nodes[1].standing_in().is_empty());
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(net.nodes[1].standing_in(), &[group()]);
+        // Nothing to stand in for without the group.
+        let now = net.now;
+        net.nodes[1].set_host_groups(Vec::new(), now);
+        assert!(net.nodes[1].standing_in().is_empty());
+        assert!(net.nodes[1].advertising().is_empty());
+        assert!(!net.nodes[1].settings().carried_subnets().contains(&group()));
+    }
+
+    #[test]
+    fn host_groups_change_while_running() {
+        let mut net = gateway_pair();
+        // The group moves away (its gateway changed region): node 1 stops
+        // advertising the range at once.
+        let now = net.now;
+        net.nodes[1].set_host_groups(Vec::new(), now);
+        assert!(net.nodes[1].advertising().is_empty());
+        net.tick(Duration::from_secs(1));
+        assert!(advertised_by(&net, 0, 101).is_empty());
+        // And comes back.
+        let now = net.now;
+        let groups = net.nodes[0].settings().host_groups.clone();
+        net.nodes[1].set_host_groups(groups, now);
+        assert_eq!(net.nodes[1].advertising(), &[group()]);
+        net.tick(Duration::from_secs(1));
+        assert_eq!(advertised_by(&net, 0, 101), vec![GROUP.to_owned()]);
+    }
+
+    #[test]
+    fn an_access_node_named_as_gateway_advertises_nothing() {
+        let mut settings = group_settings("10.144.0.2/24", Some("gw-a"), &[]);
+        settings.role = Role::Access;
+        assert!(settings.gateway_groups().is_empty());
+        assert!(settings.carried_subnets().is_empty());
+        assert!(advertising(&settings, &[], false).is_empty());
+        let mut unnamed = group_settings("10.144.0.2/24", None, &[]);
+        assert!(advertising(&unnamed, &[], false).is_empty());
+        unnamed.instance_id = Some("gw-a".into());
+        assert_eq!(advertising(&unnamed, &[], false), vec![group()]);
+        assert!(advertising(&unnamed, &[], true).is_empty());
     }
 
     fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {

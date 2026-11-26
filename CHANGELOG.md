@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+### Mesh
+
+- 宿主组网关（规范 §15.7，需求 R21、R25、R26，内核 0.4，能力 `mesh_host_groups`）：网络配置新增 `host_groups`（最多 256 组；组地址段须在内网范围、主机位为零、不与虚拟网段、本机 `subnets.advertise` 中的汇总网段及其他组重叠；网关与备用网关为设备实例 ID）。网关自动通告组地址段；备用网关只在没有其他可达成员通告该段、且自身有邻居满 3 秒时通告，网关回来即撤回；两台网关都承载该段的转发。`routing.paths` 的 `to_subnet` 落在组地址段内且前缀更长时整份配置被拒（审计 F-01），`check_paths_against_host_groups` 供路径热更新共用。`host_groups` 变化不重启网络。
+- 正常停机先撤回通告（规范 §15.7 第 6 条、§15.8 第 6 条）：通告了子网的网络停止时先从字段 5 删除全部子网、version 加 1 并立即同步，继续转发 3 秒再断开；`PUT /v1/mesh` 中要停止的网络并行撤回；`anixcore` 退出前停止全部受管网络。
+
 ### Release process
 
 - 发布策略加入版本节奏、候选版（RC）流程、维护分支 `release/X.Y` 与补丁维护规则（`docs/release-strategy.md`），新增兼容性承诺清单（`docs/compatibility-surface.md`）。
