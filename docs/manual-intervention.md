@@ -495,6 +495,7 @@ checksum/manifest、attestation、release notes、rollback 和 publish eligibili
 - 主机上另有防火墙在 forward 方向默认丢弃时（例如某些容器运行时把 forward 默认策略设为丢弃，或主机防火墙未放行转发），需要管理员在该防火墙中放行「组网网卡 → 外部网卡」及其回程，否则桥接流量被它丢弃。内核不替其他防火墙改配置。
 - 内核只在需要时打开 IPv4 转发，并在最后一个桥接拆除后恢复原值；IPv6 转发从不修改（打开后 Linux 会在默认设置的网卡上忽略路由通告）。桥接带 IPv6 外部地址时，状态中出现告警 `external_bridge_ipv6_forwarding_off`，需要管理员确认主机 IPv6 地址来自静态配置或已设置 `accept_ra = 2` 后，手工打开 `net.ipv6.conf.all.forwarding`。
 - 外部网络桥接默认关闭（内核 0.3 未审计），运维需在 `anixcore` 配置中写 `"mesh_external_bridge": true` 才开启；面板只有在节点声明 `mesh_external_bridge` 后才能下发 `external_bridge`。
+- 把 `mesh_external_bridge` 从开改回关后，内核在下次启动时按标记清除桥接表，但不再声明能力，Agent 观察不到这次清理，该网络在 Agent 一侧会一直带着 `external_bridge_downgrade_residue`，面板也不释放地址保留（#395 审计 M1）。确认 `nft list tables` 中已没有 `anixops_bridge_` 开头的 `inet` 表后，由运维删除 Agent 的 `bridged.json` 中对应的记录。另外，旧版内核的配置拒绝未知字段，遇到 `mesh_external_bridge` 会拒绝整份配置；写入该字段前先确认内核版本，Agent 重写 `anixcore` 配置时也要保留该字段（#395 审计 I2）。
 - 节点程序崩溃后，下次启动会清除残留的桥接规则（规范 §15.12 第 9 条；依据主机级标记 `/run/anixops-mesh-bridge-active`，任何节点程序启动时持锁清理，与开关无关），但不改 IPv4 转发：它无法判断主机原先是否打开。若主机原本不转发，且该节点不再承担桥接，由管理员把 `net.ipv4.ip_forward` 改回 0。内核降级到不声明 `mesh_external_bridge` 的版本前，应先停掉旧内核（退出时清除规则），否则由运维删除名称以 `anixops_bridge_` 开头的 `inet` 表；删表前先用 `nft list table inet <表名>` 记下其中的 `allow`、`routes` 名单，删表后按来源和目的删除经桥接的连接跟踪条目（如对每对网段执行 `conntrack -D -s <来源> -d <目的>`），否则已建立的连接会继续通信直到超时（规范 §15.12，#357 复核 Y3）。
 - 桥接节点需要安装 nftables（`nft` 位于 `/usr/sbin`、`/sbin` 或 `/usr/bin`），内核版本需支持 `inet` 表的源地址转换（Linux 5.2 及以上）。缺少时应用失败，告警 `external_bridge_apply_failed`。
 

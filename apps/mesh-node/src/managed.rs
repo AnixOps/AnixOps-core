@@ -231,6 +231,38 @@ impl Drop for Inner {
     }
 }
 
+struct Instance {
+    tag: String,
+    settings: MeshSettings,
+    /// The network's static public key; `None` when it could not be read.
+    /// Listed in `static_keys` in the secure mode only.
+    public: Option<[u8; 32]>,
+    state: State,
+}
+
+enum State {
+    /// A managed network whose native key list lacks this node; the
+    /// detail is `empty` or `self_missing`.
+    Waiting(&'static str),
+    /// The network could not start.
+    Refused(FailureCode, String),
+    Running(Box<Running>),
+}
+
+struct Running {
+    interface: String,
+    /// Dropping or sending stops the network.
+    stop: Option<oneshot::Sender<()>>,
+    native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    snapshot: watch::Receiver<Snapshot>,
+    /// Why the network stopped on its own, once it has.
+    exit: Arc<Mutex<Option<String>>>,
+    task: JoinHandle<()>,
+    /// The network's external bridge, when it has one.
+    bridge: Option<Bridge>,
+    started: Instant,
+}
+
 impl ManagedMesh {
     /// Opens the state directory `dir`, creating it and the instance ID
     /// when they are missing. External bridges stay off.
