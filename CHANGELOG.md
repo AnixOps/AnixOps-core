@@ -52,6 +52,7 @@
 
 ### Added
 
+- anixops-mesh 无 Agent 设备（R31、R32、R35，仅 Linux 与 OpenWrt 构建；`capabilities` 在这些构建中列出下列命令）：`enroll` 以一次性凭据接入并保存设备令牌与首份配置；`device` 常驻服务在同一进程运行受管组网，每 60 秒（加 0–5 秒随机偏移）读取配置、每 60 秒以及状态变化时（至多每 10 秒）上报，401 时停止网络并删除令牌后以退出码 8 结束，面板不可达时退避至 10 分钟，429 按 `Retry-After`；`subnet-request` 申请通告局域网网段；`device-status` 经本机状态套接字（`status.sock`，0660，属组 `anixops-mesh`，读写超时 3 秒）读取快照。传输只用 HTTPS，证书按内置公共根证书或 `--ca-file` 校验，连接 10 秒、整个请求 30 秒超时，不跟随重定向，应答体上限 1 MiB。`device_key` 在发出接入请求前写入 `device.json`，应答丢失后重试沿用同一值。
 - anixops-mesh 无 Agent 设备与面板交换的数据层（mesh-node `device`，R31）：接入与读取配置的应答按固定字段白名单整份校验（多余字段、非 `managed` 网络、名称不是 `mesh-<地区>` 一律拒绝，拒绝原因只含字段名与规则）；面板网络转为与 Agent 相同的 `PUT /v1/mesh` 分层配置（按本机能力决定 `dns` 与 `resolver_address`）；上报体由受管组网状态生成（`tag` 换回地区代码、按网络名附静态公钥、顶层 `features`、不报入区申请）；`--control` 只接受 `https://主机[:端口]`；凭据、令牌、时延参数校验；失败退避 60 秒起至 10 分钟与 `Retry-After`；通告网段申请体（至多 16 个内网网段，主机位非零拒绝，不做规范化）与已批准网段（各网络 `subnets.advertise` 的并集）。传输与常驻服务随后接入。
 - anixops-mesh Windows 发布随附 `wintun.dll`（amd64、arm64，Wintun 0.14.1 原样，固定 SHA-256，附许可证；CI 核对 PE 架构），`install-windows.ps1` 新增 `-WintunUrl`/`-WintunSha256` 并装到程序旁边，服务设 `sc.exe failureflag` 使失败重启对服务专用错误生效；macOS 文档注明网卡为 `utunN`（配合 #344）。
 - 文档 `docs/deploy/mesh-device.md`：无 Agent 组网设备（R31、R32、R35）的程序侧约定，即 `enroll`、`device`、`device-status` 子命令、状态目录、配置读取与上报、字段白名单校验、令牌失效与退避、本机状态套接字、OpenWrt 软件包与 LuCI 插件。

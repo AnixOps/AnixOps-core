@@ -319,10 +319,12 @@ call() { # METHOD [JSON]
 	cat /tmp/reply.json
 }
 
-# The installed build: device subcommands not provided yet.
+# The installed build: device subcommands provided, the service not
+# started (no status socket).
 call status
-[ "$(json /tmp/reply.json '@.supported.device_status')" = false ] || fail "real build: device_status"
-[ "$(json /tmp/reply.json '@.service.result')" = unsupported ] || fail "real build: service result"
+[ "$(json /tmp/reply.json '@.supported.device_status')" = true ] || fail "real build: device_status"
+[ "$(json /tmp/reply.json '@.supported.enroll')" = true ] || fail "real build: enroll"
+[ "$(json /tmp/reply.json '@.service.result')" = not_running ] || fail "real build: service result"
 [ "$(json /tmp/reply.json '@.enrolled')" = true ] || fail "token file means enrolled"
 call lan_networks
 json /tmp/reply.json '@.networks' > /dev/null || fail "lan_networks must return a list"
@@ -339,8 +341,11 @@ call enroll '{"control":"https://panel.example.com","token":"abc"}'
 [ "$(json /tmp/reply.json '@.result')" = invalid_token ] || fail "credential without prefix must be refused"
 call enroll '{"control":"https://panel.example.com","token":"mse_a b"}'
 [ "$(json /tmp/reply.json '@.result')" = invalid_token ] || fail "credential with space must be refused"
-call enroll '{"control":"https://panel.example.com","token":"mse_abc"}'
-[ "$(json /tmp/reply.json '@.result')" = unsupported ] || fail "real build: enroll unsupported"
+# A panel that refuses the connection: the real build exits 9.
+call enroll '{"control":"https://127.0.0.1:1","token":"mse_abc"}'
+[ "$(json /tmp/reply.json '@.result')" = unreachable ] || fail "real build: closed port is unreachable"
+[ -f /etc/anixops-mesh/device.json ] || fail "real build: device.json kept for a retry"
+rm -f /etc/anixops-mesh/device.json
 
 stub_install
 call status
