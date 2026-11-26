@@ -428,6 +428,9 @@ impl EmbeddedRuntime {
     /// (moving to a new UDP socket) and `set_network`, and rejects every
     /// other request.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        if let Some(answer) = feature_control(request) {
+            return answer;
+        }
         #[cfg(feature = "mesh")]
         if let Some(answer) = self.mesh.control(request) {
             return answer;
@@ -595,5 +598,72 @@ pub(crate) fn build_interceptor(
 impl Drop for EmbeddedRuntime {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// `{"cmd": "capabilities"}`: what this build of the engine runs,
+/// `{"capabilities": {"mesh": bool}}` (`mesh-status.md`). Without the
+/// `mesh` feature every `mesh_*` command answers `unsupported` here.
+/// `None` for any other request.
+fn feature_control(request: &[u8]) -> Option<Result<Vec<u8>, RuntimeError>> {
+    /// The command name; every other field is skipped unread.
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(default)]
+        cmd: Option<String>,
+    }
+    let named = |needle: &[u8]| request.windows(needle.len()).any(|window| window == needle);
+    if !named(b"capabilities") && (cfg!(feature = "mesh") || !named(b"mesh_")) {
+        return None;
+    }
+    // An object only: the derived reader would also take an array.
+    if request.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    let name = serde_json::from_slice::<Head>(request).ok()?.cmd?;
+    let answer = if name == "capabilities" {
+        serde_json::json!({"capabilities": {"mesh": cfg!(feature = "mesh")}})
+    } else if !cfg!(feature = "mesh") && name.starts_with("mesh_") {
+        serde_json::json!({
+            "ok": false,
+            "error": {"code": "unsupported", "detail": "this engine is built without mesh networks"},
+        })
+    } else {
+        return None;
+    };
+    Some(serde_json::to_vec(&answer).map_err(|_| {
+        RuntimeError::new(
+            RuntimeErrorCode::InternalError,
+            "capabilities answer could not be encoded",
+        )
+    }))
+}
+
+#[cfg(test)]
+mod feature_control_tests {
+    use super::feature_control;
+    use serde_json::{json, Value};
+
+    fn ask(request: &str) -> Option<Value> {
+        feature_control(request.as_bytes())
+            .map(|answer| serde_json::from_slice(&answer.unwrap()).unwrap())
+    }
+
+    #[test]
+    fn the_capabilities_say_whether_mesh_networks_are_built_in() {
+        assert_eq!(
+            ask(r#"{"cmd":"capabilities"}"#),
+            Some(json!({"capabilities": {"mesh": cfg!(feature = "mesh")}}))
+        );
+        assert_eq!(ask(r#"{"cmd":"traffic","note":"capabilities"}"#), None);
+        assert_eq!(ask(r#"["capabilities"]"#), None);
+        assert_eq!(ask(r#"{"cmd":"traffic"}"#), None);
+        let mesh = ask(r#"{"cmd":"mesh_status"}"#);
+        if cfg!(feature = "mesh") {
+            // The mesh binding answers it.
+            assert_eq!(mesh, None);
+        } else {
+            assert_eq!(mesh.unwrap()["error"]["code"], "unsupported");
+        }
     }
 }

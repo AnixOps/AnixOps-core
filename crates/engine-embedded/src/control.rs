@@ -33,6 +33,7 @@
 //! | `run_script` | `tag` | `{"scheduled": bool}` |
 //! | `outbound_health` | | `{"outbounds": [{"node", "protocol", "health"}]}`, only outbounds that report health |
 //! | `resume_outbound` | `node` | `{"resumed": bool}` |
+//! | `capabilities` | | `{"capabilities": {"mesh": bool}}`: whether this build runs mesh networks (`mesh_*` commands, `docs/architecture/mesh-status.md`); without them every `mesh_*` command answers `{"ok": false, "error": {"code": "unsupported"}}`. Answered by [`crate::EmbeddedRuntime::control_json`] for every tunnel, WireGuard included |
 //! | `metrics` | `anonymous` (optional bool) | `{"content_type", "text"}`: [`crate::metrics`] in the Prometheus text format |
 //! | `reload_rules` | `rules`, optional `dry_run` | `{"reloaded": bool, "rules", "generation"}` or `{"reloaded": false, "error": {"line", "code"}}` |
 //! | `outbound_reuse` | | `{"outbounds": [{"node", "protocol", "reuse"}]}`: connection pool (`mux`) and TLS resumption counters, only outbounds that keep them |
