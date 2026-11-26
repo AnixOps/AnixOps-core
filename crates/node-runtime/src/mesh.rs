@@ -12,7 +12,10 @@
 //! node's body also carries a top-level `backbone` section
 //! (`docs/protocols/intranet-mesh-appendix.md` B) whose `region` names one
 //! of the networks by its tag `mesh-<region>`; without it the backbone
-//! stops. One invalid item refuses the whole body with 400 and nothing
+//! stops. A top-level `region` object (appendix D.9.1: current region,
+//! directory, probe responder) is taken only when the mesh lists
+//! `mesh_region_probe`; its `current` must name one of the networks. One
+//! invalid item refuses the whole body with 400 and nothing
 //! changes. Neither the network secret nor a backbone link parameter ever
 //! appears in an answer: refusals name the item or field and the rule, not
 //! the values.
@@ -21,6 +24,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use outbound_mesh::backbone::BackboneConfig;
+use outbound_mesh::region::directory::RegionSection;
 use outbound_mesh::status::{
     valid_tag, ApplyError, ManagedBackbone, ManagedNetwork, ManagedStatus, MeshControl,
     OverrideError, SubnetRoute, MAX_MANAGED_NETWORKS, TAG_PREFIX,
@@ -87,17 +91,31 @@ impl Mesh {
                 "{BACKBONE_DISABLED}: backbone: this node does not run a backbone ({BACKBONE_FEATURE} is not listed)"
             )));
         }
+        let region = match request.region {
+            Some(_) if !self.features().contains(&REGION_FEATURE) => {
+                return Err(NodeError::Mesh(format!(
+                    "region: not supported (the mesh does not list {REGION_FEATURE})"
+                )))
+            }
+            region => region,
+        };
         let stopped = self.apply.lock().await;
         if *stopped {
             return Err(NodeError::MeshFailed("the node is shutting down".into()));
         }
-        self.control
+        let status = self
+            .control
             .apply(request.networks, request.backbone)
             .await
             .map_err(|error| match error {
                 ApplyError::Invalid(message) => NodeError::Mesh(message),
                 ApplyError::Failed(message) => NodeError::MeshFailed(message),
-            })
+            })?;
+        if !self.features().contains(&REGION_FEATURE) {
+            return Ok(status);
+        }
+        self.control.set_region(region.flatten()).await;
+        Ok(self.control.status())
     }
 
     /// Stops every network for good, as the node program shuts down: each
@@ -107,8 +125,15 @@ impl Mesh {
         let mut stopped = self.apply.lock().await;
         *stopped = true;
         let _ = self.control.apply(Vec::new(), None).await;
+        // The measurement task and the border responder end with the node.
+        if self.features().contains(&REGION_FEATURE) {
+            self.control.set_region(None).await;
+        }
     }
 }
+
+/// The feature that makes the top-level `region` object acceptable.
+pub const REGION_FEATURE: &str = "mesh_region_probe";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +164,13 @@ struct PutBody {
     networks: Vec<Map<String, Value>>,
     #[serde(default)]
     backbone: Option<Value>,
+    /// `Some(Value::Null)` for `"region": null`, unlike a missing key.
+    #[serde(default, deserialize_with = "present")]
+    region: Option<Value>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// A validated `PUT /v1/mesh` body.
@@ -146,6 +178,9 @@ pub struct MeshRequest {
     pub networks: Vec<ManagedNetwork>,
     /// The border node's backbone; `None` when the body has none.
     pub backbone: Option<ManagedBackbone>,
+    /// The `region` object: `None` when the body has no such key,
+    /// `Some(None)` for `null`.
+    pub region: Option<Option<RegionSection>>,
 }
 
 /// Validates a `PUT /v1/mesh` body: every item, unique tags and unique
@@ -190,7 +225,18 @@ pub fn parse(body: &[u8]) -> Result<MeshRequest, String> {
         None | Some(Value::Null) => None,
         Some(value) => Some(parse_backbone(value, &tags)?),
     };
-    Ok(MeshRequest { networks, backbone })
+    let region = match body.region {
+        None => None,
+        Some(value) => {
+            let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+            Some(RegionSection::from_value(&value, &tags).map_err(|error| error.to_string())?)
+        }
+    };
+    Ok(MeshRequest {
+        networks,
+        backbone,
+        region,
+    })
 }
 
 /// The `backbone` section: its own rules (appendix B) and a network tagged
@@ -274,6 +320,42 @@ mod tests {
             "node": {"address": "10.150.0.5/16", "role": "full", "listen": [{"transport": "tcp", "port": 11010}]},
             "peers": [{"server": "203.0.113.10", "port": 11010, "transport": "tcp"}]
         })
+    }
+
+    fn put_region(networks: Vec<Value>, region: Value) -> Result<MeshRequest, String> {
+        parse(&serde_json::to_vec(&json!({ "networks": networks, "region": region })).unwrap())
+    }
+
+    #[test]
+    fn takes_a_region_object_with_its_current_network() {
+        let directory = json!({ "version": 1, "preferred": null, "regions": [] });
+        let request = put_region(
+            vec![network("mesh-eu", "eu")],
+            json!({ "current": "eu", "basis": "latency", "directory": directory }),
+        )
+        .unwrap();
+        let region = request.region.expect("present").expect("not null");
+        assert_eq!(region.current.as_deref(), Some("eu"));
+        assert!(region.directory.is_some());
+        let request = put_region(vec![], Value::Null).unwrap();
+        assert_eq!(request.region, Some(None));
+        assert!(parse(br#"{"networks": []}"#).unwrap().region.is_none());
+        let error = match put_region(
+            vec![network("mesh-ap", "ap")],
+            json!({ "current": "eu", "basis": "admin" }),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted"),
+        };
+        assert!(error.starts_with("region.current"), "{error}");
+        let error = match put_region(
+            vec![],
+            json!({ "current": null, "basis": null, "secret": SECRET }),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("accepted"),
+        };
+        assert!(!error.contains(SECRET), "{error}");
     }
 
     fn put(networks: Vec<Value>) -> Result<Vec<ManagedNetwork>, String> {

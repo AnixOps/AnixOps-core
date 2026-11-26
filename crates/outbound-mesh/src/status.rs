@@ -116,6 +116,76 @@ pub struct ManagedStatus {
     /// item 9).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<Alert>,
+    /// Region measurement, suggestion and probe responder (appendix
+    /// D.9.2); `null` without a directory and without a responder.
+    pub region_probe: Option<RegionProbeStatus>,
+}
+
+/// `region_probe` of the answer (appendix D.9.2, D.9.3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RegionProbeStatus {
+    /// RFC 3339 UTC time of the latest finished round, `null` before one.
+    pub measured_at: Option<String>,
+    /// RFC 3339 UTC time of the next planned round, `null` without a
+    /// directory.
+    pub next_at: Option<String>,
+    /// Regions reachable in the latest round, by code.
+    pub regions: Vec<RegionRtt>,
+    /// Regions unreachable in the latest round, by code.
+    pub unreachable: Vec<String>,
+    /// Border entries of the directory dropped as malformed.
+    pub rejected: usize,
+    pub suggestion: Option<RegionSuggestion>,
+    /// The probe responder of a border node, `null` on other nodes.
+    pub responder: Option<ResponderStatus>,
+}
+
+/// One region's RTT in [`RegionProbeStatus::regions`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RegionRtt {
+    pub region: String,
+    /// Milliseconds, 0.1 ms.
+    pub rtt_ms: f64,
+}
+
+/// A region change suggestion (appendix D.6, mesh-status.md
+/// `self.regionSuggestion`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RegionSuggestion {
+    pub region: String,
+    pub current_median_ms: u64,
+    pub suggested_median_ms: u64,
+    /// RFC 3339 UTC.
+    pub since: String,
+}
+
+/// The probe responder (appendix D.9.3). No private key here.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ResponderStatus {
+    /// Standard base64 of the X25519 public key; empty when the key could
+    /// not be read or made (then `failure` says so).
+    pub public_key: String,
+    pub listening: Vec<String>,
+    pub failure: Option<ResponderFailure>,
+    pub counters: ResponderCounters,
+}
+
+/// Why (part of) the responder does not run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResponderFailure {
+    /// `region_probe_bind_failed` or `region_probe_key_failed`.
+    pub code: &'static str,
+    /// The address or the file, and the system's reason; never a key.
+    pub detail: String,
+}
+
+/// Counters of the responder (appendix D.9.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ResponderCounters {
+    pub answered: u64,
+    pub malformed: u64,
+    pub rate_limited: u64,
+    pub low_order: u64,
 }
 
 /// One entry of [`ManagedStatus::static_keys`].
@@ -407,6 +477,19 @@ pub trait MeshControl: Send + Sync {
         backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>>;
 
+    /// Hands over the top-level `region` object of the last `PUT`
+    /// (appendix D.9.1; `None` when it had none or `null`), after
+    /// [`MeshControl::apply`] of the same request. Only called when
+    /// [`MeshControl::features`] lists `mesh_region_probe`; the management
+    /// API refuses the object otherwise.
+    fn set_region(
+        &self,
+        region: Option<crate::region::directory::RegionSection>,
+    ) -> BoxFuture<'_, ()> {
+        let _ = region;
+        Box::pin(async {})
+    }
+
     /// Saves a local override for the network `tag` (spec §15.4): with
     /// [`SubnetRoute::Mesh`] the accepted subnet equal to `subnet` is routed
     /// and installed although it overlaps a network of this machine;
@@ -543,6 +626,7 @@ mod tests {
             }],
             backbone: None,
             alerts: Vec::new(),
+            region_probe: None,
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -581,7 +665,8 @@ mod tests {
                     ]
                 }],
                 "static_keys": [{"network": "office", "static_key": "a2V5"}],
-                "backbone": null
+                "backbone": null,
+                "region_probe": null
             })
         );
     }
