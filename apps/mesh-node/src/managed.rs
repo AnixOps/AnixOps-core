@@ -635,6 +635,30 @@ fn fill_running(
             detail: subnet.to_string(),
         }))
         .collect();
+    for peer in &snapshot.refused_key_changes {
+        status.alerts.push(Alert {
+            code: AlertCode::PeerKeyChanged,
+            address: address_of(*peer),
+            peer: String::new(),
+            detail: peer.to_string(),
+        });
+    }
+    if snapshot.counters.oversize_rpc > 0 {
+        status.alerts.push(Alert {
+            code: AlertCode::RpcOversize,
+            address: None,
+            peer: String::new(),
+            detail: snapshot.counters.oversize_rpc.to_string(),
+        });
+    }
+    if snapshot.system_routes_truncated > 0 {
+        status.alerts.push(Alert {
+            code: AlertCode::SystemRoutesTruncated,
+            address: None,
+            peer: String::new(),
+            detail: snapshot.system_routes_truncated.to_string(),
+        });
+    }
     if let Some(oversize) = snapshot.sync_oversize {
         let counters = &snapshot.counters;
         let detail = match oversize {
@@ -855,6 +879,7 @@ mod tests {
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             foreign_overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
+            system_routes_truncated: 3,
             sync_oversize: Some(SyncOversize::Received {
                 peer: 9,
                 bytes: 8_400_000,
@@ -877,10 +902,12 @@ mod tests {
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
         assert_eq!(status.alerts[1].code, AlertCode::ForeignRouteOverlap);
         assert_eq!(status.alerts[1].detail, "192.168.1.0/24");
-        assert_eq!(status.alerts[2].code, AlertCode::SyncOversize);
-        assert!(status.alerts[2].detail.contains("8400000"));
-        assert!(status.alerts[2].detail.starts_with("received:"));
-        assert!(status.alerts[2].detail.contains("node 9"));
+        assert_eq!(status.alerts[2].code, AlertCode::SystemRoutesTruncated);
+        assert_eq!(status.alerts[2].detail, "3");
+        assert_eq!(status.alerts[3].code, AlertCode::SyncOversize);
+        assert!(status.alerts[3].detail.contains("8400000"));
+        assert!(status.alerts[3].detail.starts_with("received:"));
+        assert!(status.alerts[3].detail.contains("node 9"));
 
         let undelivered = Snapshot {
             sync_oversize: Some(SyncOversize::Undelivered { peer: 4 }),
