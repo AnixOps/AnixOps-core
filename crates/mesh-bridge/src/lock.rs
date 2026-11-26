@@ -17,6 +17,15 @@ use std::io;
 /// Where the lock lives.
 pub const LOCK_PATH: &str = "/run/anixops-mesh-host.lock";
 
+/// Says bridge tables may be installed on this host: written before a
+/// node program installs its first bridge, removed once a cleanup removed
+/// every table carrying our mark. Host-wide and under `/run` like the
+/// tables themselves, so both go at reboot, and any node program that sees
+/// it (bridges on or off, whatever its state directory) cleans up under the
+/// lock before it brings up a mesh interface whose name a left table might
+/// still match.
+pub const ACTIVE_MARK_PATH: &str = "/run/anixops-mesh-bridge-active";
+
 /// Raised when another process holds the lock.
 pub const LOCK_HELD_ALERT: &str = "external_bridge_lock_held";
 

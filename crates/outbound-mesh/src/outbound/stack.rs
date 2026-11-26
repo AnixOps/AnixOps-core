@@ -622,9 +622,6 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
             native_keys: core.native_keys.subscribe(),
             host_groups,
             route_overrides: core.route_overrides.subscribe(),
-            // The engine takes host groups only from its settings: no
-            // later change arrives (the sender is dropped at once).
-            host_groups: watch::channel(Vec::new()).1,
             foreign_routes,
             shutdown,
             border: None,

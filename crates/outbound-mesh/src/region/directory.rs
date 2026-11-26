@@ -199,7 +199,9 @@ impl Directory {
                 return Err(Invalid::new(format!("{at}.code"), "duplicate"));
             }
             let subnet = IpNet::parse(&region.subnet)
-                .filter(|net| net.is_ipv4() && region.subnet.contains('/') && *net == net.trunc())
+                .filter(|net| {
+                    net.is_ipv4() && region.subnet.contains('/') && net.address() == net.network()
+                })
                 .ok_or_else(|| {
                     Invalid::new(
                         format!("{at}.subnet"),
