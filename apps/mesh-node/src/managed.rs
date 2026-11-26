@@ -160,7 +160,7 @@ enum State {
     Waiting(&'static str),
     /// The network could not start.
     Refused(FailureCode, String),
-    Running(Running),
+    Running(Box<Running>),
 }
 
 struct Running {
@@ -305,7 +305,7 @@ impl Inner {
                     }
                 }
                 taken.push(running.interface.clone());
-                instance(settings, State::Running(running))
+                instance(settings, State::Running(Box::new(running)))
             }
             Err((code, detail)) => instance(settings, State::Refused(code, detail)),
         }
@@ -518,7 +518,7 @@ fn waiting_detail(settings: &MeshSettings) -> &'static str {
 
 async fn stop(instance: Instance) {
     if let State::Running(running) = instance.state {
-        stop_running(running).await;
+        stop_running(*running).await;
     }
 }
 
