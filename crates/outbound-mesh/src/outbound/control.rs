@@ -235,7 +235,7 @@ enum Checked {
     Join(String),
     Leave(String),
     Remove(String),
-    Save(MeshSettings),
+    Save(Box<MeshSettings>),
     SetSubnetRoute(String, IpNet, Route),
 }
 
@@ -246,7 +246,7 @@ fn check(command: Command) -> Result<Checked, Value> {
         Command::Leave { network } => Checked::Leave(network),
         Command::Remove { network } => Checked::Remove(network),
         Command::Save { config } => match (*config).validate() {
-            Ok(settings) => Checked::Save(settings),
+            Ok(settings) => Checked::Save(Box::new(settings)),
             Err(detail) => return Err(error("invalid_argument", detail)),
         },
         Command::SetSubnetRoute {
@@ -282,7 +282,7 @@ fn execute(command: Checked, starts: bool, registry: Option<&Registry>) -> Value
         Checked::Join(network) => registry.join(&network),
         Checked::Leave(network) => registry.leave(&network),
         Checked::Remove(network) => registry.remove(&network),
-        Checked::Save(settings) => registry.save(settings),
+        Checked::Save(settings) => registry.save(*settings),
         Checked::SetSubnetRoute(network, cidr, route) => {
             registry.set_route_override(&network, cidr, route == Route::Mesh)
         }
