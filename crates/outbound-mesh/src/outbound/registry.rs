@@ -490,17 +490,26 @@ impl Registry {
     }
 }
 
-/// Whether another network running now carries another device ID than
-/// `settings`. A network that is left, or stopped for its ID, does not
-/// count: it runs under no identity.
+/// Whether another network that has an instance now carries another
+/// device ID than `settings`. A network that is left, or stopped for its
+/// ID, does not count: it runs under no identity. A network without an ID
+/// (`legacy`, the node then has a random one per network) conflicts with
+/// none.
 fn conflicting_instance_id(inner: &Inner, settings: &MeshSettings) -> bool {
+    let Some(id) = settings.instance_id.as_deref() else {
+        return false;
+    };
     inner.networks.iter().any(|(name, network)| {
         *name != settings.network_name
             && network
                 .instance
                 .as_ref()
                 .is_some_and(|instance| !instance.is_retired())
-            && network.settings.instance_id != settings.instance_id
+            && network
+                .settings
+                .instance_id
+                .as_deref()
+                .is_some_and(|other| other != id)
     })
 }
 
@@ -626,6 +635,31 @@ mod tests {
         assert!(!running.is_retired());
         registry.commit(Vec::new());
         assert!(!running.is_retired());
+    }
+
+    #[test]
+    fn a_network_without_a_device_id_conflicts_with_none() {
+        let (_runtime, registry) = registry();
+        let lab = with_id("lab", "10.147.0.2/24", "device-1");
+        registry.save(lab.clone()).unwrap();
+        let office = settings("office", "10.146.0.2/24", "legacy");
+        registry.commit(vec![office.clone()]);
+        found(&registry, &lab);
+        found(&registry, &office);
+        // Both run: commands on either, and a new network of either kind,
+        // are not refused for the ID.
+        registry.join("lab").unwrap();
+        registry.join("office").unwrap();
+        registry
+            .save(settings("home", "10.147.1.2/24", "legacy"))
+            .unwrap();
+        registry
+            .save(with_id("garage", "10.147.2.2/24", "device-1"))
+            .unwrap();
+        assert_eq!(
+            registry.save(with_id("shed", "10.147.3.2/24", "device-2")),
+            Err(RegistryError::InstanceIdMismatch)
+        );
     }
 
     #[test]
