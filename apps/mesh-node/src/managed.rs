@@ -1270,6 +1270,19 @@ fn fill_running(
             detail: String::new(),
         });
     }
+    if let Some(left_out) = snapshot
+        .names
+        .as_ref()
+        .map(|names| names.reverse_zones_truncated())
+        .filter(|&left_out| left_out > 0)
+    {
+        status.alerts.push(Alert {
+            code: AlertCode::ReverseZonesTruncated,
+            address: None,
+            peer: String::new(),
+            detail: left_out.to_string(),
+        });
+    }
     for peer in &snapshot.refused_key_changes {
         status.alerts.push(Alert {
             code: AlertCode::PeerKeyChanged,

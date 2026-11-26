@@ -277,6 +277,10 @@ pub enum AlertCode {
     /// address, so it is not intercepted (spec §15.9.2 item 8); `address`
     /// gives it.
     ResolverAddressConflict,
+    /// The network's reverse zones are more than 256; the rest are not
+    /// worked out or answered (spec §15.9.2 item 1). `detail` is how many
+    /// were left out; `address` and `peer` are empty.
+    ReverseZonesTruncated,
     /// More subnets are routable than the system routes take; `detail` is
     /// how many were left out.
     SystemRoutesTruncated,

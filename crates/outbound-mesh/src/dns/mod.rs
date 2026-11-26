@@ -10,10 +10,12 @@
 //! - [`normalize`]: the name rule and its Unicode 15.1.0 table.
 //! - [`message`]: reading a query and writing the answer.
 //! - [`intercept`]: the resolver address on the virtual interface.
+//! - [`reverse`]: the reverse zones worked out from the network's ranges.
 
 pub mod intercept;
 pub mod message;
 pub mod normalize;
+pub mod reverse;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -24,6 +26,7 @@ use crate::net::IpNet;
 use crate::scope::is_intranet_address;
 use message::{Query, Rcode, Record, Transport};
 pub use normalize::{is_normalized, normalize_label};
+use reverse::ReverseZones;
 
 /// Default suffix (spec §15.9.2 item 1).
 pub const DEFAULT_SUFFIX: &str = "mesh.internal";
@@ -322,8 +325,10 @@ pub struct Names {
     by_name: BTreeMap<Key, Vec<IpAddr>>,
     /// Full names (without the suffix) by answerable address, for PTR.
     by_address: BTreeMap<IpAddr, Vec<String>>,
-    /// Ranges answers and reverse queries may concern.
+    /// Ranges answers may concern (spec §15.9.2 item 9).
     scope: Vec<IpNet>,
+    /// The only reverse names answered (spec §15.9.2 items 1 and 7).
+    reverse: ReverseZones,
     entries: Vec<NameStatus>,
     refused: Vec<RefusedName>,
     resolver_address: Option<IpAddr>,
@@ -469,6 +474,9 @@ impl Names {
             by_name,
             by_address,
             scope,
+            // Host group and summary ranges follow the virtual subnets once
+            // the network carries them (spec §15.9.2 item 1).
+            reverse: ReverseZones::of(view.virtual_subnets.iter().copied()),
             entries,
             refused: settings.refused.clone(),
             resolver_address: configured.filter(|_| !resolver_conflict),
@@ -513,6 +521,29 @@ fn text(label: &[u8]) -> Option<String> {
     label
         .is_ascii()
         .then(|| String::from_utf8_lossy(label).into_owned())
+}
+
+/// Whether every address label of a partial reverse name is one an
+/// address name can hold: a decimal octet without a leading zero, or one
+/// hex digit.
+fn well_formed_reverse(labels: &[Vec<u8>]) -> bool {
+    let v4 = labels.len() >= 2 && labels[labels.len() - 2] == b"in-addr";
+    labels[..labels.len().saturating_sub(2)]
+        .iter()
+        .all(|label| {
+            if v4 {
+                !label.is_empty()
+                    && label.len() <= 3
+                    && label.iter().all(u8::is_ascii_digit)
+                    && (label.len() == 1 || label[0] != b'0')
+                    && std::str::from_utf8(label)
+                        .ok()
+                        .and_then(|text| text.parse::<u8>().ok())
+                        .is_some()
+            } else {
+                matches!(label.as_slice(), [digit] if digit.is_ascii_hexdigit())
+            }
+        })
 }
 
 /// The address of a complete reverse name: `d.c.b.a.in-addr.arpa` or the
@@ -623,6 +654,29 @@ impl Names {
         self.resolver_conflict
     }
 
+    /// The domains this list answers for the split DNS
+    /// (`tunnel.dns.matchDomains`): the suffix and the reverse zones,
+    /// without the final dot; none while names are off.
+    pub fn match_domains(&self) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut domains = vec![self.suffix.clone()];
+        domains.extend(self.reverse.names());
+        domains
+    }
+
+    /// The reverse zones worked out for the network.
+    pub fn reverse_zones(&self) -> Vec<String> {
+        self.reverse.names()
+    }
+
+    /// Reverse zones left out over the limit of 256; the status warns
+    /// `reverse_zones_truncated` when it is not zero.
+    pub fn reverse_zones_truncated(&self) -> usize {
+        self.reverse.truncated()
+    }
+
     /// Answers `message` when it asks for an intranet name: under the
     /// suffix, a reverse name in the network's ranges, or a single label
     /// of this region. Anything else is [`Outcome::NotOurs`], so the
@@ -671,11 +725,26 @@ impl Names {
         if labels.len() >= n && labels[labels.len() - n..] == self.suffix_labels[..] {
             return Some(self.under_suffix(&labels[..labels.len() - n], query.qtype));
         }
-        if let Some(address) = reverse_address(labels) {
-            if !self.scope.iter().any(|net| net.contains(address)) {
-                return None;
-            }
-            return Some(self.reverse(address, query.qtype));
+        if self.reverse.zone_of(labels).is_some() {
+            // In a reverse zone: answered here, never passed on. A full
+            // address name looks the address up; a shorter name may have
+            // names below it, so it is there without data; anything else
+            // does not exist.
+            let full = if labels.last().is_some_and(|l| l == b"arpa")
+                && labels.len() >= 2
+                && labels[labels.len() - 2] == b"in-addr"
+            {
+                6
+            } else {
+                34
+            };
+            return Some(match reverse_address(labels) {
+                Some(address) => self.reverse(address, query.qtype),
+                None if labels.len() < full && well_formed_reverse(labels) => {
+                    Resolution::empty(Rcode::NoError)
+                }
+                None => Resolution::empty(Rcode::NxDomain),
+            });
         }
         if let [label] = labels.as_slice() {
             // A bare host name: this region only, else the next resolver.
@@ -1158,19 +1227,43 @@ mod tests {
         assert_eq!(target(&gw), ["gw.cn.mesh.internal"]);
         let nibbles = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.5.1.0.0.0.d.f.ip6.arpa";
         assert_eq!(target(&ptr(nibbles).unwrap()), ["gw.cn.mesh.internal"]);
-        let nas = ptr("20.10.168.192.in-addr.arpa").unwrap();
-        assert_eq!(target(&nas), ["nas.cn.mesh.internal"]);
+        // Behind an advertised subnet: no reverse zone there (spec
+        // §15.9.2 item 1), so the next resolver takes it.
+        assert_eq!(ptr("20.10.168.192.in-addr.arpa"), None);
         // In the network but unnamed: NXDOMAIN, never forwarded.
         let unnamed = ptr("99.0.150.10.in-addr.arpa").unwrap();
         assert_eq!(unnamed.rcode, Rcode::NxDomain as u8);
         // Named, other type: no data.
         let a = ask(&names, "7.0.150.10.in-addr.arpa", TYPE_A).unwrap();
         assert_eq!((a.rcode, a.records.len()), (0, 0));
-        // Outside the network's ranges, or incomplete: not ours.
+        // The zone and names on the way to an address exist without data;
+        // a label no address has does not exist.
+        for name in ["150.10.in-addr.arpa", "0.150.10.in-addr.arpa"] {
+            let empty = ptr(name).unwrap();
+            assert_eq!((empty.rcode, empty.records.len()), (0, 0), "{name}");
+        }
+        for name in [
+            "07.0.150.10.in-addr.arpa",
+            "256.150.10.in-addr.arpa",
+            "x.0.150.10.in-addr.arpa",
+            "1.7.0.150.10.in-addr.arpa",
+        ] {
+            assert_eq!(ptr(name).unwrap().rcode, Rcode::NxDomain as u8, "{name}");
+        }
+        // Outside the reverse zones: not ours.
         assert_eq!(ptr("1.99.168.192.in-addr.arpa"), None);
         assert_eq!(ptr("8.8.8.8.in-addr.arpa"), None);
-        assert_eq!(ptr("150.10.in-addr.arpa"), None);
-        assert_eq!(ptr("07.0.150.10.in-addr.arpa"), None);
+        assert_eq!(ptr("10.in-addr.arpa"), None);
+        assert_eq!(ptr("in-addr.arpa"), None);
+        assert_eq!(
+            names.match_domains(),
+            [
+                "mesh.internal",
+                "150.10.in-addr.arpa",
+                "0.0.0.0.0.0.0.0.0.5.1.0.0.0.d.f.ip6.arpa"
+            ]
+        );
+        assert_eq!(names.reverse_zones_truncated(), 0);
     }
 
     #[test]
@@ -1198,6 +1291,7 @@ mod tests {
         );
         assert_eq!(ask(&off, "web.cn.mesh.internal", TYPE_A), None);
         assert_eq!(off.resolver_address(), None);
+        assert!(off.match_domains().is_empty());
         let refused = off
             .answer_at_resolver(
                 &query(1, "web.cn.mesh.internal", TYPE_A, None),
