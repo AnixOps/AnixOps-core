@@ -20,6 +20,11 @@ zeroize = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The managed border node's backbone links: the kernel's registry of link
+# kinds (`engine_outbound::backbone`); the open kernel registers none.
+engine-outbound = { path = "../../crates/engine-outbound" }
+
 [target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 # `run`: system randomness for the node identity (already used by the mesh
 # module), and the TUN interface, signals and the driver's runtime.
@@ -44,6 +49,8 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_NetworkManagement_Ndis",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
   "Win32_System_Diagnostics_Debug",
   "Win32_Networking_WinSock",
   "Win32_System_Diagnostics_ToolHelp",

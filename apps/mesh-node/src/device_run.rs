@@ -31,8 +31,28 @@ use crate::local_status;
 use crate::managed::{ManagedMesh, FEATURES};
 
 /// The default state directory, apart from anixcore's so the two never
-/// share an instance ID.
-pub const DEFAULT_STATE_DIR: &str = "/var/lib/anixops-mesh/device";
+/// share an instance ID: `/var/lib/anixops-mesh/device` on Linux,
+/// `/Library/Application Support/AnixOps/mesh/device` on macOS and
+/// `%ProgramData%\AnixOps\Mesh\device` on Windows.
+pub fn default_state_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/AnixOps/mesh/device")
+    }
+    #[cfg(windows)]
+    {
+        let program_data =
+            std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
+        PathBuf::from(program_data)
+            .join("AnixOps")
+            .join("Mesh")
+            .join("device")
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        PathBuf::from("/var/lib/anixops-mesh/device")
+    }
+}
 
 /// Exit codes (`docs/deploy/mesh-device.md`, "子命令").
 pub const EXIT_OTHER: u8 = 1;
@@ -48,6 +68,8 @@ const SUBNET_REQUEST: &str = "/api/v5/mesh/device/subnet-request";
 
 /// Reports on a change come at most this often.
 const CHANGE_INTERVAL: Duration = Duration::from_secs(10);
+/// Wait before binding the status endpoint again.
+const STATUS_RETRY: Duration = Duration::from_secs(10);
 /// Longest credential file read.
 const MAX_CREDENTIAL_FILE: u64 = 4096;
 
@@ -117,9 +139,17 @@ impl State {
         self.dir.join("device.lock")
     }
 
-    /// Creates the directory (0700) when it is missing.
+    /// Creates the directory when it is missing: mode 0700, or on Windows
+    /// open to SYSTEM and the administrators only.
     fn prepare(&self, host: &dyn Host) -> Result<(), Exit> {
-        host.create_dir_all(&self.dir, 0o700).map_err(|error| {
+        #[cfg(windows)]
+        let created = {
+            let _ = host;
+            crate::win_security::create_state_dir(&self.dir)
+        };
+        #[cfg(not(windows))]
+        let created = host.create_dir_all(&self.dir, 0o700);
+        created.map_err(|error| {
             Exit::new(
                 EXIT_USAGE,
                 "state",
@@ -317,7 +347,7 @@ pub fn managed_networks(body: &Value) -> Result<Vec<ManagedNetwork>, String> {
 async fn apply(mesh: &ManagedMesh, networks: &[Network]) -> Result<(), String> {
     let body = device::kernel_body(networks, Sections::default());
     let managed = managed_networks(&body)?;
-    mesh.apply(managed)
+    mesh.apply(managed, None)
         .await
         .map(|_| ())
         .map_err(|error| match error {
@@ -570,8 +600,6 @@ async fn serve(
     mut networks: Vec<Network>,
     client: Client,
 ) -> Result<(), Exit> {
-    use tokio::signal::unix::{signal, SignalKind};
-
     let mesh = Arc::new(
         ManagedMesh::open(&state.dir)
             .map_err(|error| Exit::new(EXIT_OTHER, "mesh", error.to_string()))?,
@@ -588,22 +616,40 @@ async fn serve(
             json!({ "source": "config.json", "detail": detail }),
         );
     }
-    match local_status::bind(&state.socket()) {
-        Ok(listener) => {
-            let mesh = Arc::clone(&mesh);
-            let shared = Arc::clone(&shared);
-            let device_id = file.device_id;
-            let control = file.control.clone();
-            tokio::spawn(local_status::serve(listener, move || {
-                snapshot(&mesh, &shared, device_id, &control)
-            }));
-        }
-        Err(error) => log("status_socket", json!({ "detail": error.to_string() })),
+    // The status endpoint is bound again every 10 seconds while it cannot
+    // be (on Windows another program may hold the pipe name while the
+    // service was stopped); the networks run either way.
+    {
+        let mesh = Arc::clone(&mesh);
+        let shared = Arc::clone(&shared);
+        let device_id = file.device_id;
+        let control = file.control.clone();
+        let answer = move || snapshot(&mesh, &shared, device_id, &control);
+        let socket = state.socket();
+        tokio::spawn(async move {
+            let mut logged = false;
+            loop {
+                match local_status::bind(&socket) {
+                    Ok(listener) => {
+                        if logged {
+                            log("status_socket_bound", json!({}));
+                        }
+                        local_status::serve(listener, answer.clone()).await;
+                        return;
+                    }
+                    Err(error) => {
+                        if !logged {
+                            log("status_socket", json!({ "detail": error.to_string() }));
+                            logged = true;
+                        }
+                        tokio::time::sleep(STATUS_RETRY).await;
+                    }
+                }
+            }
+        });
     }
-    let mut terminate = signal(SignalKind::terminate())
-        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
-    let mut interrupt = signal(SignalKind::interrupt())
-        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
+    let stop_requested = stop_signal()?;
+    tokio::pin!(stop_requested);
     let mut config_backoff = Backoff::default();
     let mut report_backoff = Backoff::default();
     let mut next_config = Instant::now();
@@ -685,10 +731,36 @@ async fn serve(
                     next_report = next_report.min(Instant::now());
                 }
             }
-            _ = terminate.recv() => return stop(state, &mesh).await,
-            _ = interrupt.recv() => return stop(state, &mesh).await,
+            () = &mut stop_requested => return stop(state, &mesh).await,
         }
     }
+}
+
+/// Resolves on SIGTERM or SIGINT (launchd and systemd stop with SIGTERM).
+#[cfg(unix)]
+fn stop_signal() -> Result<impl std::future::Future<Output = ()>, Exit> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate())
+        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
+    let mut interrupt = signal(SignalKind::interrupt())
+        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+/// Resolves on Ctrl+C, or when the service manager stops the service.
+#[cfg(windows)]
+fn stop_signal() -> Result<impl std::future::Future<Output = ()>, Exit> {
+    Ok(async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = crate::service_windows::stop_requested() => {}
+        }
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -720,7 +792,7 @@ fn snapshot(
 }
 
 async fn stop(state: &State, mesh: &ManagedMesh) -> Result<(), Exit> {
-    let _ = mesh.apply(Vec::new()).await;
+    let _ = mesh.apply(Vec::new(), None).await;
     let _ = std::fs::remove_file(state.socket());
     log("stopped", json!({}));
     Ok(())
@@ -730,7 +802,7 @@ async fn stop(state: &State, mesh: &ManagedMesh) -> Result<(), Exit> {
 /// service ends with [`EXIT_TOKEN`] until an administrator issues a new
 /// credential.
 async fn token_refused(host: &dyn Host, state: &State, mesh: &ManagedMesh) -> Result<(), Exit> {
-    let _ = mesh.apply(Vec::new()).await;
+    let _ = mesh.apply(Vec::new(), None).await;
     let _ = host.remove_file(&state.token());
     let _ = std::fs::remove_file(state.socket());
     Err(Exit::new(

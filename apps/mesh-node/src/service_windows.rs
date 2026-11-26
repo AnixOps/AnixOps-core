@@ -34,6 +34,8 @@ type Body = Box<dyn FnOnce() -> u8 + Send>;
 
 static BODY: Mutex<Option<Body>> = Mutex::new(None);
 static EXIT_CODE: AtomicU8 = AtomicU8::new(0);
+/// Exit codes reported to the service manager as a clean stop.
+static CLEAN_CODES: Mutex<&'static [u8]> = Mutex::new(&[]);
 static STATUS_HANDLE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn stop_channel() -> &'static watch::Sender<bool> {
@@ -74,6 +76,15 @@ fn status(state: SERVICE_STATUS_CURRENT_STATE, exit_code: u8) -> SERVICE_STATUS 
         } else {
             0
         },
+    }
+}
+
+/// The exit code the service manager is told: 0 for a code in `clean`.
+fn reported_code(code: u8, clean: &[u8]) -> u8 {
+    if clean.contains(&code) {
+        0
+    } else {
+        code
     }
 }
 
@@ -126,13 +137,27 @@ unsafe extern "system" fn service_main(_argc: u32, argv: *mut windows_sys::core:
     let body = BODY.lock().unwrap_or_else(PoisonError::into_inner).take();
     let code = body.map_or(1, |body| body());
     EXIT_CODE.store(code, Ordering::Release);
-    report(SERVICE_STOPPED, code);
+    let clean = *CLEAN_CODES.lock().unwrap_or_else(PoisonError::into_inner);
+    report(SERVICE_STOPPED, reported_code(code, clean));
 }
 
 /// Runs `body` as the service when the service manager started this
 /// process, and returns its exit code; `None` for a console process, which
 /// runs the node itself.
 pub fn dispatch(body: impl FnOnce() -> u8 + Send + 'static) -> Option<u8> {
+    dispatch_with(body, &[])
+}
+
+/// [`dispatch`], reporting the exit codes in `clean` to the service
+/// manager as a clean stop: the recovery actions (`sc failureflag 1`) then
+/// do not start the service again. The device service uses it for exit
+/// code 8, a token Control refused, which only a new enrolment mends.
+/// The returned code is the body's own.
+pub fn dispatch_with(
+    body: impl FnOnce() -> u8 + Send + 'static,
+    clean: &'static [u8],
+) -> Option<u8> {
+    *CLEAN_CODES.lock().unwrap_or_else(PoisonError::into_inner) = clean;
     *BODY.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(body));
     // An own-process service may give an empty name.
     let mut name = [0u16; 1];
@@ -188,6 +213,15 @@ mod tests {
         let clean = status(SERVICE_STOPPED, 0);
         assert_eq!(clean.dwWin32ExitCode, NO_ERROR);
         assert_eq!(clean.dwServiceSpecificExitCode, 0);
+    }
+
+    #[test]
+    fn clean_codes_stop_the_service_without_a_failure() {
+        assert_eq!(reported_code(8, &[8]), 0);
+        assert_eq!(reported_code(1, &[8]), 1);
+        assert_eq!(reported_code(8, &[]), 8);
+        let stopped = status(SERVICE_STOPPED, reported_code(8, &[8]));
+        assert_eq!(stopped.dwWin32ExitCode, NO_ERROR);
     }
 
     #[test]

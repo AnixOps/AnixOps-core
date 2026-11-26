@@ -141,6 +141,9 @@ pub enum Action {
     Send { conn: ConnId, packet: Vec<u8> },
     /// Write an IP packet to the virtual interface.
     Deliver(Vec<u8>),
+    /// Hand an IP packet for another region to the backbone (border nodes,
+    /// [`Node::set_border`]).
+    ToBackbone(Vec<u8>),
     /// Close a connection.
     Close { conn: ConnId, reason: CloseReason },
 }
@@ -742,7 +745,7 @@ impl Node {
     /// anything was advertised, that is whether there is anything to wait
     /// for.
     pub fn withdraw(&mut self, now: Instant, unix_now: (i64, i32)) -> bool {
-        let had = !self.advertising.is_empty();
+        let had = !self.announced().is_empty();
         self.withdrawn = true;
         self.standing_in.clear();
         self.update_advertising(now);
@@ -815,14 +818,70 @@ impl Node {
     /// Puts what this node should advertise into its information; the
     /// version goes up when that changes (spec §12.3).
     fn update_advertising(&mut self, now: Instant) {
-        let next = advertising(&self.settings, &self.standing_in, self.withdrawn);
-        if next == self.advertising {
+        self.advertising = advertising(&self.settings, &self.standing_in, self.withdrawn);
+        self.announce(now);
+    }
+
+    /// Field 5 of this node's route information: what it advertises from
+    /// its settings and, on a border node, the other regions' summary
+    /// prefixes it carries; nothing once it withdrew to stop.
+    fn announced(&self) -> Vec<IpNet> {
+        if self.withdrawn {
+            return Vec::new();
+        }
+        let mut out = self.advertising.clone();
+        for net in self.routes.border() {
+            if !out.contains(net) {
+                out.push(*net);
+            }
+        }
+        out
+    }
+
+    /// Puts [`announced`](Self::announced) into this node's information;
+    /// the version goes up only when it changes (spec §12.3).
+    fn announce(&mut self, now: Instant) {
+        let next: Vec<String> = self.announced().iter().map(IpNet::to_string).collect();
+        if self.sync.own().proxy_cidrs == next {
             return;
         }
-        self.advertising = next;
         let mut info = self.sync.own().clone();
-        info.proxy_cidrs = self.advertising.iter().map(|net| net.to_string()).collect();
+        info.proxy_cidrs = next;
         self.sync.set_own(info, now);
+    }
+
+    /// The other regions' summary prefixes this border node carries (spec
+    /// §15.6 item 3; empty withdraws them): advertised to the members in
+    /// this node's route information, packets to them come out as
+    /// [`Action::ToBackbone`]. A full node only; on an access node nothing
+    /// is carried. Returns how many prefixes did not fit
+    /// ([`RouteTable::set_border`]).
+    pub fn set_border(&mut self, prefixes: &[IpNet], now: Instant) -> usize {
+        let prefixes: &[IpNet] = if self.settings.role == Role::Full {
+            prefixes
+        } else {
+            &[]
+        };
+        let left_out = self.routes.set_border(prefixes);
+        self.announce(now);
+        left_out
+    }
+
+    /// An IP packet the backbone delivered for this network
+    /// ([`RouteTable::classify_from_backbone`]).
+    pub fn send_from_backbone(&mut self, packet: &[u8], now: Instant) -> Result<(), Denied> {
+        let peer = match self.routes.classify_from_backbone(packet) {
+            Ok(peer) => peer,
+            Err(denied) => {
+                self.counters.refused_outgoing += 1;
+                return Err(denied);
+            }
+        };
+        if self.send_data(peer.0, packet, now) {
+            Ok(())
+        } else {
+            Err(Denied::NoRoute)
+        }
     }
 
     /// The networks of this machine's other interfaces (spec §15.4).
@@ -1009,7 +1068,7 @@ impl Node {
                 &self.settings,
                 &identity,
                 &self.local.static_key,
-                &self.advertising,
+                &self.announced(),
             ),
             now,
         );
@@ -1289,7 +1348,11 @@ impl Node {
             packet_type::DATA => match self.routes.check_incoming(PeerId(from), &inbound.payload) {
                 Ok(()) => {
                     let delivered = self.clamp_inbound(from, inbound.payload);
-                    self.actions.push_back(Action::Deliver(delivered));
+                    if self.routes.for_backbone(&delivered) {
+                        self.actions.push_back(Action::ToBackbone(delivered));
+                    } else {
+                        self.actions.push_back(Action::Deliver(delivered));
+                    }
                 }
                 Err(_) => self.counters.refused_incoming += 1,
             },
@@ -2554,6 +2617,7 @@ mod tests {
         /// (node index, conn) -> (node index, conn)
         wires: BTreeMap<(usize, ConnId), (usize, ConnId)>,
         delivered: Vec<(usize, Vec<u8>)>,
+        to_backbone: Vec<(usize, Vec<u8>)>,
         now: Instant,
         /// A node that silently drops type-40 packets addressed to it, as
         /// an implementation without custom paths does.
@@ -2596,6 +2660,7 @@ mod tests {
                 nodes,
                 wires: BTreeMap::new(),
                 delivered: Vec::new(),
+                to_backbone: Vec::new(),
                 now,
                 drops_type_40: None,
             }
@@ -2632,6 +2697,7 @@ mod tests {
                                 }
                             }
                             Action::Deliver(packet) => self.delivered.push((i, packet)),
+                            Action::ToBackbone(packet) => self.to_backbone.push((i, packet)),
                             Action::Close { .. } => {}
                         }
                     }
@@ -3163,6 +3229,52 @@ mod tests {
         assert_eq!(status[0].state, "fallback");
         assert_eq!(status[0].reason, Some(crate::waypoint::Reason::NotRelay));
         assert_eq!(status[0].unreachable, Some(IpAddr::from([10, 144, 0, 4])));
+    }
+
+    #[test]
+    fn a_border_node_carries_other_regions_both_ways() {
+        let mut net = three_in_a_row(false);
+        let version = net.nodes[2].sync.own().version;
+        let left_out = net.nodes[2].set_border(&[IpNet::parse("10.20.0.0/16").unwrap()], net.now);
+        assert_eq!(left_out, 0);
+        assert!(net.nodes[2].sync.own().version > version);
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        // The members learn the summary and route it to the border node.
+        assert_eq!(
+            net.nodes[0]
+                .route_table()
+                .lookup("10.20.1.1".parse().unwrap()),
+            Ok(PeerId(102))
+        );
+        let out = ipv4_packet([10, 144, 0, 1], [10, 20, 1, 1]);
+        net.nodes[0].send_ip(&out, net.now).unwrap();
+        net.settle();
+        assert_eq!(net.to_backbone, vec![(2, out)]);
+        assert!(net.delivered.is_empty());
+
+        // The reply from the backbone reaches the member.
+        let back = ipv4_packet([10, 20, 1, 1], [10, 144, 0, 1]);
+        net.nodes[2].send_from_backbone(&back, net.now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, vec![(0, back)]);
+        // Only sources the border node carries.
+        let spoofed = ipv4_packet([10, 30, 1, 1], [10, 144, 0, 1]);
+        assert_eq!(
+            net.nodes[2].send_from_backbone(&spoofed, net.now),
+            Err(Denied::ForeignSource)
+        );
+
+        // Withdrawn: the members forget the route.
+        net.nodes[2].set_border(&[], net.now);
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        assert!(net.nodes[0]
+            .route_table()
+            .lookup("10.20.1.1".parse().unwrap())
+            .is_err());
     }
 
     #[test]

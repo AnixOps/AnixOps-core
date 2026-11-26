@@ -8,6 +8,10 @@
 //! with [`RouteTable::check_incoming`], which drops spoofed sources and
 //! anything not addressed to this node's stack (the node is never an exit;
 //! relaying for other peers happens on mesh frames in the session layer).
+//! The one exception is a border node (spec §15.6, §17.3): it advertises
+//! the other regions' summary prefixes ([`RouteTable::set_border`]), takes
+//! packets addressed to them for the backbone, and sends packets from them
+//! that the backbone delivered ([`RouteTable::classify_from_backbone`]).
 //!
 //! A [`PeerId`] here is the peer that owns an address, not the next hop: when
 //! a packet travels through relay peers, the session layer resolves the path
@@ -138,6 +142,9 @@ pub struct RouteTable {
     /// Advertised subnets the user chose to reach through the mesh even
     /// though they overlap an interface network.
     mesh_overrides: Vec<IpNet>,
+    /// Other regions' summary prefixes this border node carries to the
+    /// backbone; advertised like `advertised` and never accepted from a peer.
+    border: Vec<IpNet>,
     peers: BTreeMap<PeerId, PeerRoutes>,
 }
 
@@ -150,6 +157,7 @@ impl RouteTable {
             advertised: settings.carried_subnets(),
             interfaces: Vec::new(),
             mesh_overrides: Vec::new(),
+            border: Vec::new(),
             peers: BTreeMap::new(),
         }
     }
@@ -160,6 +168,48 @@ impl RouteTable {
     /// update of the peer.
     pub fn set_advertised(&mut self, advertised: Vec<IpNet>) {
         self.advertised = advertised;
+    }
+
+    /// Sets the other regions' summary prefixes this border node carries
+    /// (empty: none, the backbone is down or this is no border node). Only
+    /// intranet prefixes outside this network's virtual subnets are kept,
+    /// and no more than the members accept from one peer together with the
+    /// subnets this node advertises itself ([`MAX_SUBNETS_PER_PEER`]).
+    /// Returns how many usable prefixes were left out by that limit.
+    pub fn set_border(&mut self, prefixes: &[IpNet]) -> usize {
+        let mut border: Vec<IpNet> = prefixes
+            .iter()
+            .map(IpNet::trunc)
+            .filter(|net| {
+                is_intranet_network(net)
+                    && !self.virtual_subnets.iter().any(|own| own.overlaps(net))
+            })
+            .collect();
+        border.sort();
+        border.dedup();
+        let room = MAX_SUBNETS_PER_PEER.saturating_sub(self.advertised.len());
+        let left_out = border.len().saturating_sub(room);
+        border.truncate(room);
+        self.border = border;
+        left_out
+    }
+
+    /// The prefixes [`set_border`](Self::set_border) kept.
+    pub fn border(&self) -> &[IpNet] {
+        &self.border
+    }
+
+    fn in_border(&self, address: IpAddr) -> bool {
+        let address = unmap(address);
+        self.border.iter().any(|net| net.contains(address))
+    }
+
+    /// Whether a packet [`check_incoming`](Self::check_incoming) accepted
+    /// goes to the backbone rather than to this node's interface.
+    pub fn for_backbone(&self, packet: &[u8]) -> bool {
+        packet::addresses(packet).is_ok_and(|addresses| {
+            !self.is_ours(unmap(addresses.destination)) && self.in_border(addresses.destination)
+        })
     }
 
     /// Sets the networks of this node's interfaces and the subnets the user
@@ -226,7 +276,12 @@ impl RouteTable {
     }
 
     fn overlaps_local(&self, subnet: &IpNet) -> bool {
-        if self.advertised.iter().any(|own| own.overlaps(subnet)) {
+        if self
+            .advertised
+            .iter()
+            .chain(&self.border)
+            .any(|own| own.overlaps(subnet))
+        {
             return true;
         }
         self.interfaces.iter().any(|own| own.overlaps(subnet))
@@ -475,6 +530,21 @@ impl RouteTable {
         self.lookup(addresses.destination)
     }
 
+    /// Where a packet the backbone delivered goes (spec §17.3.6): its source
+    /// lies in another region's summary prefix this node carries, and its
+    /// destination is a routed address of this network, never a flood and
+    /// never back into the border prefixes.
+    pub fn classify_from_backbone(&self, packet: &[u8]) -> Result<PeerId, Denied> {
+        let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
+        if !self.in_border(addresses.source) {
+            return Err(Denied::ForeignSource);
+        }
+        if self.in_border(addresses.destination) || self.is_flood(addresses.destination) {
+            return Err(Denied::NoRoute);
+        }
+        self.lookup(addresses.destination)
+    }
+
     /// Whether `address` is this node's: one of its virtual addresses, or
     /// inside a subnet it advertises (a full node proxying its LAN: the
     /// interface forwards those packets on, and replies from the LAN leave
@@ -498,7 +568,10 @@ impl RouteTable {
     /// narrower subnet another peer advertises.
     pub fn check_incoming(&self, peer: PeerId, packet: &[u8]) -> Result<(), Denied> {
         let addresses = packet::addresses(packet).map_err(Denied::Malformed)?;
-        if !self.is_ours(unmap(addresses.destination)) && !self.is_flood(addresses.destination) {
+        if !self.is_ours(unmap(addresses.destination))
+            && !self.is_flood(addresses.destination)
+            && !self.in_border(addresses.destination)
+        {
             return Err(Denied::NotForUs);
         }
         let routes = self.peers.get(&peer).ok_or(Denied::Spoofed)?;
@@ -1036,5 +1109,83 @@ mod tests {
             table.check_incoming(A, &ipv4([10, 144, 144, 6], [1, 1, 1, 1], 0)),
             Err(Denied::NotForUs)
         );
+    }
+
+    #[test]
+    fn a_border_node_carries_the_other_regions_prefixes() {
+        let mut table = RouteTable::new(&settings(json!({})));
+        table.set_peer(A, &[ip("10.144.144.6")], &[net("192.168.10.0/24")]);
+        // Another border node of this region advertises the same summary.
+        table.set_peer(B, &[ip("10.144.144.7")], &[net("10.20.0.0/16")]);
+        assert_eq!(table.lookup(ip("10.20.1.1")), Ok(B));
+        // Public, this network's own and duplicate prefixes are left out.
+        let left_out = table.set_border(&[
+            net("10.20.0.0/16"),
+            net("10.20.0.0/16"),
+            net("8.8.0.0/16"),
+            net("10.144.0.0/16"),
+        ]);
+        assert_eq!(left_out, 0);
+        assert_eq!(table.border(), &[net("10.20.0.0/16")]);
+        // What this node carries is not routed to the other advertiser.
+        assert_eq!(table.lookup(ip("10.20.1.1")), Err(Denied::NoRoute));
+
+        let to_region = ipv4([10, 144, 144, 6], [10, 20, 1, 1], 0);
+        assert_eq!(table.check_incoming(A, &to_region), Ok(()));
+        assert!(table.for_backbone(&to_region));
+        assert!(!table.for_backbone(&ipv4([10, 144, 144, 6], [10, 144, 144, 5], 0)));
+        // The source check still applies to packets for the backbone.
+        assert_eq!(
+            table.check_incoming(A, &ipv4([10, 144, 144, 7], [10, 20, 1, 1], 0)),
+            Err(Denied::Spoofed)
+        );
+        // Other transit is still refused.
+        assert_eq!(
+            table.check_incoming(A, &ipv4([10, 144, 144, 6], [10, 30, 1, 1], 0)),
+            Err(Denied::NotForUs)
+        );
+
+        // From the backbone: a source in a carried prefix, to this network.
+        assert_eq!(
+            table.classify_from_backbone(&ipv4([10, 20, 1, 1], [10, 144, 144, 6], 0)),
+            Ok(A)
+        );
+        assert_eq!(
+            table.classify_from_backbone(&ipv4([10, 20, 1, 1], [192, 168, 10, 3], 0)),
+            Ok(A)
+        );
+        assert_eq!(
+            table.classify_from_backbone(&ipv4([10, 30, 1, 1], [10, 144, 144, 6], 0)),
+            Err(Denied::ForeignSource)
+        );
+        assert_eq!(
+            table.classify_from_backbone(&ipv4([10, 20, 1, 1], [10, 20, 2, 2], 0)),
+            Err(Denied::NoRoute)
+        );
+        assert_eq!(
+            table.classify_from_backbone(&ipv4([10, 20, 1, 1], [10, 144, 144, 255], 0)),
+            Err(Denied::NoRoute)
+        );
+        assert_eq!(
+            table.classify_from_backbone(&ipv4([10, 20, 1, 1], [10, 144, 144, 5], 0)),
+            Err(Denied::Local)
+        );
+        // The interface path still refuses foreign sources.
+        assert_eq!(
+            table.check_outgoing(&ipv4([10, 20, 1, 1], [10, 144, 144, 6], 0)),
+            Err(Denied::ForeignSource)
+        );
+
+        // At most what one peer may advertise.
+        let many: Vec<IpNet> = (0..=MAX_SUBNETS_PER_PEER as u32)
+            .map(|i| net(&format!("10.{}.{}.0/24", 30 + i / 256, i % 256)))
+            .collect();
+        assert_eq!(table.set_border(&many), 1);
+        assert_eq!(table.border().len(), MAX_SUBNETS_PER_PEER);
+
+        // Withdrawn: the other advertiser is used again, nothing is taken.
+        assert_eq!(table.set_border(&[]), 0);
+        assert_eq!(table.lookup(ip("10.20.1.1")), Ok(B));
+        assert_eq!(table.check_incoming(A, &to_region), Err(Denied::NotForUs));
     }
 }
