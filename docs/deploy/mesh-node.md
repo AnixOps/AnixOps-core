@@ -22,7 +22,7 @@
 | 来源 | 方法 |
 | --- | --- |
 | systemd 服务 | 单元目录中名称在 `detect.services` 里、或 `ExecStart` 运行 `detect.executables` 的单元；模板单元按 `*.wants/` 中已启用的实例展开。用 `systemctl show` 取单元文件、drop-in、`UnitFileState`、`ActiveState` |
-| OpenRC / SysV / procd 脚本 | `/etc/init.d/` 下名称匹配或内容引用程序名的脚本；OpenRC 读 `command`、`command_args` 和 `/etc/conf.d/<名称>`，运行级别取自 `rc-update show -v` |
+| OpenRC / SysV / procd 脚本 | `/etc/init.d/` 下名称匹配或内容引用程序名的脚本；OpenRC 读 `command`、`command_args` 和 `/etc/conf.d/<名称>`，运行级别取自 `rc-update show -v`；procd 脚本（OpenWrt，首行含 `/etc/rc.common` 且含 `USE_PROCD=1`）的运行状态与进程号取自 `ubus call service list`，开机自启取自 `/etc/rc.d/S<数字><名称>`，所属软件包取自 opkg 或 apk 的文件清单，详见 [OpenWrt](openwrt.md) |
 | 自启行 | `/etc/rc.local`、`/etc/crontab`、`/etc/cron.d/*`、`/var/spool/cron/**` 中启动该程序的行 |
 | 手动进程 | `/proc/*/exe` 与命令行匹配、且不属于以上任何一项的进程。进程所在的 systemd 单元不是程序自己的服务（名称不在 `detect.services` 里，`ExecStart` 也不运行该程序，例如 `cron.service`、`rc-local.service`）时，只记为宿主单元，接管时只结束该进程，绝不停用或停止宿主单元 |
 | 容器 | cgroup 属于容器的进程，以及镜像名匹配 `detect.images` 的容器。只报告，不接管 |
