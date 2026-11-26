@@ -542,6 +542,7 @@ impl PartialEq for MeshSettings {
             paths,
             native_keys,
             private_key,
+            dns,
             external_bridge,
             host_groups,
             instance_id,
@@ -568,6 +569,7 @@ impl PartialEq for MeshSettings {
             && *paths == other.paths
             && *native_keys == other.native_keys
             && *private_key == other.private_key
+            && *dns == other.dns
             && *external_bridge == other.external_bridge
             && *host_groups == other.host_groups
             && *instance_id == other.instance_id
