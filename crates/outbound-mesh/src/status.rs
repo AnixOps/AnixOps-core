@@ -116,6 +116,76 @@ pub struct ManagedStatus {
     /// item 9).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<Alert>,
+    /// Region measurement, suggestion and probe responder (appendix
+    /// D.9.2); `null` without a directory and without a responder.
+    pub region_probe: Option<RegionProbeStatus>,
+}
+
+/// `region_probe` of the answer (appendix D.9.2, D.9.3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RegionProbeStatus {
+    /// RFC 3339 UTC time of the latest finished round, `null` before one.
+    pub measured_at: Option<String>,
+    /// RFC 3339 UTC time of the next planned round, `null` without a
+    /// directory.
+    pub next_at: Option<String>,
+    /// Regions reachable in the latest round, by code.
+    pub regions: Vec<RegionRtt>,
+    /// Regions unreachable in the latest round, by code.
+    pub unreachable: Vec<String>,
+    /// Border entries of the directory dropped as malformed.
+    pub rejected: usize,
+    pub suggestion: Option<RegionSuggestion>,
+    /// The probe responder of a border node, `null` on other nodes.
+    pub responder: Option<ResponderStatus>,
+}
+
+/// One region's RTT in [`RegionProbeStatus::regions`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RegionRtt {
+    pub region: String,
+    /// Milliseconds, 0.1 ms.
+    pub rtt_ms: f64,
+}
+
+/// A region change suggestion (appendix D.6, mesh-status.md
+/// `self.regionSuggestion`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RegionSuggestion {
+    pub region: String,
+    pub current_median_ms: u64,
+    pub suggested_median_ms: u64,
+    /// RFC 3339 UTC.
+    pub since: String,
+}
+
+/// The probe responder (appendix D.9.3). No private key here.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ResponderStatus {
+    /// Standard base64 of the X25519 public key; empty when the key could
+    /// not be read or made (then `failure` says so).
+    pub public_key: String,
+    pub listening: Vec<String>,
+    pub failure: Option<ResponderFailure>,
+    pub counters: ResponderCounters,
+}
+
+/// Why (part of) the responder does not run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResponderFailure {
+    /// `region_probe_bind_failed` or `region_probe_key_failed`.
+    pub code: &'static str,
+    /// The address or the file, and the system's reason; never a key.
+    pub detail: String,
+}
+
+/// Counters of the responder (appendix D.9.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ResponderCounters {
+    pub answered: u64,
+    pub malformed: u64,
+    pub rate_limited: u64,
+    pub low_order: u64,
 }
 
 /// One entry of [`ManagedStatus::static_keys`].
@@ -188,6 +258,9 @@ pub struct ManagedNetworkStatus {
     #[serde(serialize_with = "display_all")]
     pub overlaps: Vec<IpNet>,
     pub alerts: Vec<Alert>,
+    /// The custom paths and their states, in configuration order (spec
+    /// §17.2.7). Members are named by their virtual address, as in `peers`.
+    pub paths: Vec<ManagedPath>,
     /// `externalBridge` (spec §15.12 item 8, three states): absent while
     /// unknown, `null` when the network surely has no bridge, otherwise
     /// the bridge in force.
@@ -221,6 +294,7 @@ impl ManagedNetworkStatus {
             rejected_advertisements: 0,
             overlaps: Vec::new(),
             alerts: Vec::new(),
+            paths: Vec::new(),
             external_bridge: None,
         }
     }
@@ -243,6 +317,36 @@ pub struct ManagedPeer {
     pub latency_ms: Option<u32>,
     /// Whether the session with this member has forward secrecy.
     pub forward_secrecy: bool,
+    /// `auto`, `custom`, `first_hop_only` or `fallback`: the state of the
+    /// custom path to this member (`mesh-status.md`, `members[].pathState`).
+    pub path_state: &'static str,
+    /// The node that path names as unreachable; `null` when none.
+    pub unreachable: Option<IpAddr>,
+}
+
+/// One custom path of a managed network (`mesh-status.md`, `paths[]`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ManagedPath {
+    /// `peer:<address>` or `subnet:<network>`; stays when the list changes.
+    pub id: String,
+    pub target: ManagedPathTarget,
+    /// The waypoints' virtual addresses, in configuration order.
+    pub via: Vec<IpAddr>,
+    /// `pending`, `active`, `first_hop_only` or `fallback`.
+    pub state: &'static str,
+    /// The node `reason` is about; `null` when none.
+    pub unreachable: Option<IpAddr>,
+    /// Why the path fell back or is only partly kept; `null` otherwise.
+    pub reason: Option<&'static str>,
+}
+
+/// The target of a [`ManagedPath`]: `{"peer": address}` or
+/// `{"subnet": network}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedPathTarget {
+    Peer(IpAddr),
+    Subnet(String),
 }
 
 /// Something the network's operator should act on.
@@ -373,6 +477,19 @@ pub trait MeshControl: Send + Sync {
         backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>>;
 
+    /// Hands over the top-level `region` object of the last `PUT`
+    /// (appendix D.9.1; `None` when it had none or `null`), after
+    /// [`MeshControl::apply`] of the same request. Only called when
+    /// [`MeshControl::features`] lists `mesh_region_probe`; the management
+    /// API refuses the object otherwise.
+    fn set_region(
+        &self,
+        region: Option<crate::region::directory::RegionSection>,
+    ) -> BoxFuture<'_, ()> {
+        let _ = region;
+        Box::pin(async {})
+    }
+
     /// Saves a local override for the network `tag` (spec §15.4): with
     /// [`SubnetRoute::Mesh`] the accepted subnet equal to `subnet` is routed
     /// and installed although it overlaps a network of this machine;
@@ -464,6 +581,8 @@ mod tests {
                     hops: 2,
                     latency_ms: None,
                     forward_secrecy: true,
+                    path_state: "custom",
+                    unreachable: None,
                 }],
                 rejected_advertisements: 1,
                 overlaps: vec![IpNet::parse("192.168.10.7/24").unwrap()],
@@ -481,6 +600,24 @@ mod tests {
                         detail: "tcp port 11010 in use".into(),
                     },
                 ],
+                paths: vec![
+                    ManagedPath {
+                        id: "peer:10.150.0.1".into(),
+                        target: ManagedPathTarget::Peer("10.150.0.1".parse().unwrap()),
+                        via: vec!["10.150.0.2".parse().unwrap()],
+                        state: "active",
+                        unreachable: None,
+                        reason: None,
+                    },
+                    ManagedPath {
+                        id: "subnet:192.168.10.0/24".into(),
+                        target: ManagedPathTarget::Subnet("192.168.10.0/24".into()),
+                        via: vec!["10.150.0.2".parse().unwrap()],
+                        state: "fallback",
+                        unreachable: Some("10.150.0.2".parse().unwrap()),
+                        reason: Some("no_echo"),
+                    },
+                ],
                 external_bridge: None,
             }],
             static_keys: vec![NetworkStaticKey {
@@ -489,6 +626,7 @@ mod tests {
             }],
             backbone: None,
             alerts: Vec::new(),
+            region_probe: None,
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -507,17 +645,28 @@ mod tests {
                         "via": ["10.150.0.2"],
                         "hops": 2,
                         "latency_ms": null,
-                        "forward_secrecy": true
+                        "forward_secrecy": true,
+                        "path_state": "custom",
+                        "unreachable": null
                     }],
                     "rejected_advertisements": 1,
                     "overlaps": ["192.168.10.0/24"],
                     "alerts": [
                         {"code": "address_conflict", "address": "10.150.0.9", "peer": "", "detail": ""},
                         {"code": "start_refused", "address": "", "peer": "", "detail": "tcp port 11010 in use"}
+                    ],
+                    "paths": [
+                        {"id": "peer:10.150.0.1", "target": {"peer": "10.150.0.1"},
+                         "via": ["10.150.0.2"], "state": "active",
+                         "unreachable": null, "reason": null},
+                        {"id": "subnet:192.168.10.0/24", "target": {"subnet": "192.168.10.0/24"},
+                         "via": ["10.150.0.2"], "state": "fallback",
+                         "unreachable": "10.150.0.2", "reason": "no_echo"}
                     ]
                 }],
                 "static_keys": [{"network": "office", "static_key": "a2V5"}],
-                "backbone": null
+                "backbone": null,
+                "region_probe": null
             })
         );
     }

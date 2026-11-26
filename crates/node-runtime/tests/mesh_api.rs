@@ -70,6 +70,7 @@ impl MeshControl for FakeMesh {
                 static_keys: Vec::new(),
                 backbone: None,
                 alerts: Vec::new(),
+                region_probe: None,
             };
             *self.running.lock().unwrap() = status.clone();
             Ok(status)
@@ -102,10 +103,13 @@ fn network_status(network: &ManagedNetwork) -> ManagedNetworkStatus {
             hops: 1,
             latency_ms: Some(12),
             forward_secrecy: true,
+            path_state: "auto",
+            unreachable: None,
         }],
         rejected_advertisements: 0,
         overlaps: Vec::new(),
         alerts: Vec::new(),
+        paths: Vec::new(),
         external_bridge: None,
     }
 }
@@ -214,8 +218,9 @@ async fn the_agent_replaces_and_reads_its_networks() {
     assert_eq!(cn["forward_secrecy"], json!(true));
     assert_eq!(
         cn["peers"],
-        json!([{"address": "10.150.0.1", "subnets": ["192.168.10.0/24"], "via": [], "hops": 1, "latency_ms": 12, "forward_secrecy": true}])
+        json!([{"address": "10.150.0.1", "subnets": ["192.168.10.0/24"], "via": [], "hops": 1, "latency_ms": 12, "forward_secrecy": true, "path_state": "auto", "unreachable": null}])
     );
+    assert_eq!(cn["paths"], json!([]));
     assert_eq!(cn["rejected_advertisements"], json!(0));
     assert_eq!(cn["overlaps"], json!([]));
     let eu = &body["networks"][1];
@@ -336,6 +341,21 @@ async fn a_border_node_takes_its_backbone_with_the_region_network() {
     let (status, _, _) = call(api, "PUT", "/v1/mesh", Some(body)).await;
     assert_eq!(status, 200);
     assert_eq!(*mesh.backbones.lock().unwrap(), [Some(11), None]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_object_needs_the_region_probe_feature() {
+    let mesh = Arc::new(FakeMesh::default());
+    let api = start_api(Some(mesh.clone())).await;
+    let body = json!({
+        "networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")],
+        "region": { "current": "cn", "basis": "admin", "directory": null }
+    });
+    let (status, raw, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer["error"].as_str().unwrap().starts_with("region"));
+    assert!(!raw.contains(SECRET), "{raw}");
+    assert!(mesh.applied.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
