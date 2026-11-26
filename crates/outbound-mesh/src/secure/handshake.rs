@@ -603,7 +603,14 @@ impl RelayInitiator {
         self.peer_id
     }
 
-    /// Reads relay msg2 and installs the session.
+    /// The static key this handshake expects from the peer.
+    pub fn peer_static(&self) -> [u8; LEN] {
+        self.peer_static
+    }
+
+    /// Reads relay msg2 and installs the session. The peer is admitted
+    /// again: the native key list may have changed since [`Self::start`]
+    /// (spec §8.3.1 rule 6).
     pub fn finish(
         mut self,
         local: &Local,
@@ -611,6 +618,7 @@ impl RelayInitiator {
         sessions: &mut Sessions,
         now: Instant,
     ) -> Result<Established, HandshakeError> {
+        admit(local, &self.peer_static)?;
         let plain = Zeroizing::new(self.noise.read_message(msg2)?);
         let msg2 = RelayMsg2::decode(&plain)?;
         if msg2.peer_conn_id_echo != self.conn_id {
@@ -683,7 +691,11 @@ pub fn relay_respond(
     let seen = seen_digest(ephemeral);
     match sessions.relay_lookup(&key, &seen, now) {
         RelayLookup::New => {}
-        RelayLookup::Repeat(msg2) => return Ok(RelayAnswer::Repeat(msg2)),
+        RelayLookup::Repeat(msg2, peer_static) => {
+            // The list may have dropped the peer since the answer.
+            admit(local, &peer_static)?;
+            return Ok(RelayAnswer::Repeat(msg2));
+        }
         RelayLookup::Replayed => return Err(HandshakeError::Replayed),
     }
     let mut noise = HandshakeState::new(
@@ -1198,6 +1210,86 @@ mod tests {
 
         assert!(keeps_initiating(1, 9));
         assert!(!keeps_initiating(9, 1));
+    }
+
+    #[test]
+    fn a_relay_responder_refuses_an_initiator_off_the_native_list() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let (a, mut b, at_a, mut at_b) = relay_pair();
+        let b_key = session_key(Namespace::Relay, &b, a.id);
+        b.native_keys = Some(vec![b.static_key.public()]);
+        let (_, msg1) =
+            RelayInitiator::start(&a, b.id, b.static_key.public(), &at_a, &rng).unwrap();
+        let answer = relay_respond(
+            &b,
+            a.id,
+            Some(a.static_key.public()),
+            &msg1,
+            &mut at_b,
+            &rng,
+            now,
+        );
+        assert_eq!(answer, Err(HandshakeError::NotNative));
+        // Neither remembered as seen nor pending: once listed, the same
+        // msg1 is answered.
+        assert_eq!(at_b.pending_len(&b_key), 0);
+        b.native_keys = Some(vec![b.static_key.public(), a.static_key.public()]);
+        let answer = relay_respond(
+            &b,
+            a.id,
+            Some(a.static_key.public()),
+            &msg1,
+            &mut at_b,
+            &rng,
+            now,
+        );
+        assert!(matches!(answer, Ok(RelayAnswer::Reply(..))));
+    }
+
+    #[test]
+    fn a_relay_initiator_refuses_a_peer_dropped_from_the_list_before_msg2() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let (mut a, b, mut at_a, mut at_b) = relay_pair();
+        let a_key = session_key(Namespace::Relay, &a, b.id);
+        a.native_keys = Some(vec![a.static_key.public(), b.static_key.public()]);
+        let (initiator, msg1) =
+            RelayInitiator::start(&a, b.id, b.static_key.public(), &at_a, &rng).unwrap();
+        let (msg2, _) = reply(
+            relay_respond(
+                &b,
+                a.id,
+                Some(a.static_key.public()),
+                &msg1,
+                &mut at_b,
+                &rng,
+                now,
+            )
+            .unwrap(),
+        );
+        a.native_keys = Some(vec![a.static_key.public()]);
+        assert_eq!(
+            initiator.finish(&a, &msg2, &mut at_a, now).err(),
+            Some(HandshakeError::NotNative)
+        );
+        assert!(at_a.get(&a_key).is_none());
+    }
+
+    #[test]
+    fn a_repeated_relay_msg1_is_refused_once_the_initiator_is_dropped() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let (a, mut b, at_a, mut at_b) = relay_pair();
+        b.native_keys = Some(vec![b.static_key.public(), a.static_key.public()]);
+        let (_, msg1) =
+            RelayInitiator::start(&a, b.id, b.static_key.public(), &at_a, &rng).unwrap();
+        let respond = |b: &Local, at_b: &mut Sessions| {
+            relay_respond(b, a.id, Some(a.static_key.public()), &msg1, at_b, &rng, now)
+        };
+        reply(respond(&b, &mut at_b).unwrap());
+        b.native_keys = Some(vec![b.static_key.public()]);
+        assert_eq!(respond(&b, &mut at_b), Err(HandshakeError::NotNative));
     }
 
     #[test]

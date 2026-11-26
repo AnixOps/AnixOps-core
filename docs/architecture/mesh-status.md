@@ -152,7 +152,7 @@
 - 内核不持久化这些网络：重启后 Agent 重新发送最后一次 `PUT`。内核只在状态目录（`anixcore` 配置的 `mesh_state_dir`，缺省 `/var/lib/anixcore/mesh`，权限 0700）保存本设备的 `instance_id` 与各网络的静态密钥（`keys/` 下按 `network.name` 的摘要命名，0600；配置带 `node.private_key` 时用它）。网络移出列表时密钥保留，再次加入仍用同一密钥，面板已列入的 `native_keys` 不失效。状态目录不可用时内核不列 `mesh`。
 - 实现（Linux，`apps/mesh-node` 的 `managed`）：每个运行中的网络各有一组监听、一块虚拟网卡（`anixmesh-<n>`，取最小未用编号）和一个驱动。`PUT` 中与上次相同的网络不中断；只有 `native_keys` 变化的运行中网络把新清单交给驱动，不重启：清单外对端的直连与中继会话断开、路由信息删除，其余照常；新清单不再含本机公钥时该网络停下并转为暂缓。启动失败的网络在下一次 `PUT` 时重试。端口占用、网卡占用、无权限分别给出 `failure.code` `port_in_use`、`tun_in_use`、`permission_denied`，其余为 `start_refused`，都带 `start_refused` 告警。
 - 自定义路径（0.5，`mesh_paths`）：`routing.paths` 随 `PUT /v1/mesh` 下发，`mesh_set_paths` 即用新列表重发 `PUT`。与上次相比只有 `native_keys` 与 `routing.paths` 变化的运行中网络不重启，新路径列表交给驱动立即生效（规范 §17.2.8）；校验失败按 `PUT` 整体返回 400，旧列表保留。应答中每个网络多一个 `paths[{ "id", "target", "via", "state", "unreachable", "reason" }]`（字段取值同快照的 `paths[]`；`target` 为 `{"peer": 虚拟地址}` 或 `{"subnet": 网段}`，`via`、`unreachable` 也用虚拟地址，Agent 按成员地址换成成员 `id`），`peers[]` 每项多 `path_state`（`auto`、`custom`、`first_hop_only`、`fallback`，规则同 `members[].pathState`）与 `unreachable`（虚拟地址或 `null`）。
-- `peers[]` 每项取该成员的第一个虚拟地址；`latency_ms` 只给直连成员（经中继的成员为 `null`）；`alerts` 中的 `address_conflict` 为声称本机虚拟地址的成员（`peer` 暂为空串）。`address_unmanaged` 待地址分配（0.4）实现。
+- `peers[]` 每项取该成员的第一个虚拟地址；`latency_ms` 只给直连成员（经中继的成员为 `null`）；`alerts` 中的 `address_conflict` 为声称本机虚拟地址的成员（`peer` 暂为空串）。`foreign_route_overlap` 为与本机上其他组网程序的路由重叠、因而保持 `route = local` 的通告子网（`detail` 为该子网；与本机网卡网段重叠的不报此告警，规范 §15.4）。`address_unmanaged` 待地址分配（0.4）实现。
 - `secret` 不出现在任何应答、错误信息和日志中：错误信息只指出第几项、哪条规则或哪个字段名，不回显取值。
 - 内核未编入组网驱动时 `features` 不列 `mesh`，`GET`、`PUT /v1/mesh` 都返回 404。
 

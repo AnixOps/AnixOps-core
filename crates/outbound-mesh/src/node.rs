@@ -89,6 +89,10 @@ struct Relay {
     queue: VecDeque<(u8, Vec<u8>)>,
 }
 
+/// A refusal for a key off the native key list is reported for this long
+/// unless another follows (docs/architecture/mesh-status.md).
+pub const NOT_NATIVE_HOLD: Duration = Duration::from_secs(10 * 60);
+
 /// Most subnets installed as system routes for one network: as many as
 /// [`routes::MAX_SUBNETS_PER_PEER`] for sixteen advertising members; any
 /// further subnets are not installed.
@@ -243,6 +247,12 @@ pub struct Node {
     sessions: Sessions,
     sync: RouteSync,
     routes: RouteTable,
+    /// Networks of this machine's other interfaces, as last reported.
+    local_networks: Vec<IpNet>,
+    /// Routes other mesh programs carry on this machine (spec §15.4).
+    foreign_routes: Vec<IpNet>,
+    /// Overlapping subnets the user routes through the mesh anyway.
+    route_overrides: Vec<IpNet>,
     conns: BTreeMap<ConnId, Conn>,
     reassembler: Reassembler,
     calls: BTreeMap<i64, Outgoing>,
@@ -258,8 +268,8 @@ pub struct Node {
     duplicate_id: bool,
     sync_oversize: Option<SyncOversize>,
     /// The last peer refused for a static key off the native key list
-    /// (spec §8.3.1 rule 5).
-    not_native: Option<u32>,
+    /// (spec §8.3.1 rule 5), and when.
+    not_native: Option<(u32, Instant)>,
     /// When this node last took a new identity after a conflict.
     renewed_at: Option<Instant>,
     /// Relay sessions being set up, by destination (secure mode only).
@@ -525,6 +535,9 @@ impl Node {
                 sync
             },
             routes,
+            local_networks: Vec::new(),
+            foreign_routes: Vec::new(),
+            route_overrides: Vec::new(),
             conns: BTreeMap::new(),
             reassembler: Reassembler::new(),
             calls: BTreeMap::new(),
@@ -600,12 +613,91 @@ impl Node {
             self.sessions.invalidate(&key);
             self.relays.remove(&key.peer_id);
         }
+        // Answers not yet confirmed by a packet, and handshakes this node
+        // started under the old list, go too.
+        let settings = &self.settings;
+        self.sessions
+            .drop_pending_refused(|key| settings.admits(key));
+        let stale: Vec<u32> = self
+            .relays
+            .iter()
+            .filter(|(_, relay)| {
+                relay
+                    .initiator
+                    .as_ref()
+                    .is_some_and(|initiator| !settings.admits(&initiator.peer_static()))
+            })
+            .map(|(&peer, _)| peer)
+            .collect();
+        for peer in stale {
+            self.drop_relay(peer);
+        }
+        // A new list is a new start for refusals (spec §8.3.1 rule 5).
+        self.not_native = None;
         self.refresh_routes();
     }
 
     /// The networks of this machine's other interfaces (spec §15.4).
     pub fn set_local_networks(&mut self, interfaces: &[IpNet]) {
-        self.routes.set_local_networks(interfaces, &[]);
+        self.local_networks = interfaces.to_vec();
+        self.apply_local_networks();
+    }
+
+    /// Routes that other mesh programs' virtual interfaces carry here, as
+    /// the system actually selects them (spec §15.4): treated like the
+    /// interface networks, and reported apart ([`Self::foreign_overlaps`]).
+    pub fn set_foreign_routes(&mut self, routes: &[IpNet]) {
+        self.foreign_routes = routes.iter().map(IpNet::trunc).collect();
+        self.apply_local_networks();
+    }
+
+    /// Accepted subnets kept local because they overlap a route of another
+    /// mesh program (and no interface network of this machine).
+    pub fn foreign_overlaps(&self) -> Vec<IpNet> {
+        let mut found: Vec<IpNet> = self
+            .routes
+            .local_conflicts()
+            .into_iter()
+            .map(|(_, subnet)| subnet)
+            .filter(|subnet| {
+                self.foreign_routes
+                    .iter()
+                    .any(|route| route.overlaps(subnet))
+                    && !self
+                        .local_networks
+                        .iter()
+                        .any(|network| network.overlaps(subnet))
+            })
+            .collect();
+        found.sort_by_key(ToString::to_string);
+        found.dedup();
+        found
+    }
+
+    fn apply_local_networks(&mut self) {
+        let networks: Vec<IpNet> = self
+            .local_networks
+            .iter()
+            .chain(&self.foreign_routes)
+            .copied()
+            .collect();
+        self.routes
+            .set_local_networks(&networks, &self.route_overrides);
+    }
+
+    /// Subnets the user routes through the mesh although they overlap a
+    /// network of this machine (`mesh_set_subnet_route` with
+    /// `route = mesh`, spec §15.4): an accepted subnet equal to one of them
+    /// is routed and installed again. Replaces the earlier list; a local
+    /// override, never sent to other members.
+    pub fn set_route_overrides(&mut self, overrides: &[IpNet]) {
+        self.route_overrides.clear();
+        for subnet in overrides.iter().map(IpNet::trunc) {
+            if !self.route_overrides.contains(&subnet) {
+                self.route_overrides.push(subnet);
+            }
+        }
+        self.apply_local_networks();
     }
 
     /// Subnets to route into the virtual interface: accepted and routed,
@@ -642,8 +734,21 @@ impl Node {
 
     /// The last peer refused because its static key is off the native key
     /// list (spec §8.3.1 rule 5), for the status reason `peer_not_native`.
+    /// It clears when that peer completes a handshake, when the list
+    /// changes, or [`NOT_NATIVE_HOLD`] after the last refusal.
     pub fn last_not_native(&self) -> Option<u32> {
-        self.not_native
+        self.not_native.map(|(peer, _)| peer)
+    }
+
+    fn refused_not_native(&mut self, peer: u32, now: Instant) {
+        self.not_native = Some((peer, now));
+    }
+
+    /// `peer` completed a handshake: a refusal of it is over.
+    fn admitted_peer(&mut self, peer: u32) {
+        if self.not_native.is_some_and(|(refused, _)| refused == peer) {
+            self.not_native = None;
+        }
     }
 
     /// This node's static public key in the network.
@@ -875,7 +980,7 @@ impl Node {
                 }
                 self.close(conn, reason, now);
                 if let CloseReason::NotNative(peer) = reason {
-                    self.not_native = Some(peer);
+                    self.refused_not_native(peer, now);
                 }
                 // Only after the server proved the network secret (§5.3).
                 if reason == CloseReason::IdConflict {
@@ -895,6 +1000,7 @@ impl Node {
             next_at: Some(now + PING_START),
             ..Ping::default()
         };
+        self.admitted_peer(up.peer_id);
         if self.sync.neighbour_up(up.peer_id, rng, now).is_err() {
             self.close(conn, CloseReason::Unexpected, now);
             return;
@@ -1735,6 +1841,12 @@ impl Node {
         self.centre_round(now);
         self.reassembler.expire(now);
         self.sessions.reclaim(now);
+        if self
+            .not_native
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) >= NOT_NATIVE_HOLD)
+        {
+            self.not_native = None;
+        }
         self.wake(rng, now);
     }
 
@@ -1793,7 +1905,7 @@ impl Node {
         let Some(peer_static) = self.expected_key(peer) else {
             if self.peer_static(peer).is_some() {
                 // Announced, but off the native key list (spec §8.3.1).
-                self.not_native = Some(peer);
+                self.refused_not_native(peer, now);
             }
             self.drop_relay(peer);
             return;
@@ -1875,12 +1987,13 @@ impl Node {
         );
         let (msg2, joined) = match answer {
             Ok(RelayAnswer::Reply(msg2, established)) => {
+                self.admitted_peer(from);
                 (msg2, established.action != SessionAction::Create)
             }
             Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
             Err(error) => {
                 if error == HandshakeError::NotNative {
-                    self.not_native = Some(from);
+                    self.refused_not_native(from, now);
                 }
                 self.counters.dropped += 1;
                 return;
@@ -1914,7 +2027,17 @@ impl Node {
             return;
         };
         match initiator.finish(&self.local, msg2, &mut self.sessions, now) {
-            Ok(_) => self.flush_relay(from, now),
+            Ok(_) => {
+                self.admitted_peer(from);
+                self.flush_relay(from, now);
+            }
+            // Dropped from the native key list since msg1 (spec §8.3.1
+            // rule 6): nothing waits for this session any more.
+            Err(HandshakeError::NotNative) => {
+                self.refused_not_native(from, now);
+                self.counters.dropped += 1;
+                self.drop_relay(from);
+            }
             // The retry is a new handshake.
             Err(_) => self.counters.dropped += 1,
         }
@@ -2474,6 +2597,69 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_is_reported_until_a_handshake_a_new_list_or_ten_minutes() {
+        let refused = || {
+            let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+            let full = net.nodes[0].settings.native_keys.clone();
+            unlist(&mut net, 0, 1);
+            net.link(0, 1);
+            net.settle();
+            assert_eq!(net.nodes[0].last_not_native(), Some(101));
+            (net, full)
+        };
+
+        // Still reported just before ten minutes, gone at ten.
+        let (mut net, _) = refused();
+        net.tick(NOT_NATIVE_HOLD - Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), Some(101));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // A new list clears it.
+        let (mut net, full) = refused();
+        let now = net.now;
+        net.nodes[0].set_native_keys(full, now);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+
+        // So does a handshake with the refused peer.
+        let mut net = Net::new(&["10.144.0.1/24", "10.144.0.2/24"], true);
+        net.nodes[0].not_native = Some((101, net.now));
+        net.link(0, 1);
+        net.settle();
+        assert_eq!(net.nodes[0].neighbours(), vec![101]);
+        assert_eq!(net.nodes[0].last_not_native(), None);
+    }
+
+    #[test]
+    fn a_relay_handshake_started_before_the_list_changed_is_dropped() {
+        let mut net = three_in_a_row(true);
+        let key = SessionKey {
+            namespace: Namespace::Relay,
+            network: net.nodes[0].local.network_name.clone(),
+            peer_id: 102,
+        };
+        // The latency centre's calls may already have set up a relay
+        // session with node 2; start from none, so that the packet waits
+        // for a new handshake.
+        net.nodes[0].sessions.invalidate(&key);
+        net.nodes[0].relays.remove(&102);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        net.nodes[0].send_ip(&packet, net.now).unwrap();
+        // msg1 goes out; the answer is not delivered yet.
+        net.nodes[0].wake(&SystemRandom::new(), net.now);
+        assert!(net.nodes[0]
+            .relays
+            .get(&102)
+            .is_some_and(|relay| relay.initiator.is_some()));
+        // Node 2 is dropped while its msg2 is on the way.
+        unlist(&mut net, 0, 2);
+        assert!(!net.nodes[0].relays.contains_key(&102));
+        net.settle();
+        assert!(net.nodes[0].sessions.get(&key).is_none());
+        assert!(net.delivered.is_empty());
+    }
+
+    #[test]
     fn a_node_off_the_list_is_not_routed_to_or_relayed_to() {
         let mut net = three_in_a_row(true);
         assert!(net.nodes[0].paths().contains_key(&102));
@@ -2710,6 +2896,32 @@ mod tests {
         // This machine sits on 192.168.10.0/24 itself.
         net.nodes[0].set_local_networks(&[IpNet::parse("192.168.10.7/24").unwrap()]);
         assert!(routes(&net).is_empty());
+        // The user routes it through the mesh anyway; the override outlives
+        // a rescan of the interfaces and ends when it is withdrawn.
+        net.nodes[0].set_route_overrides(&[IpNet::parse("192.168.10.0/24").unwrap()]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        net.nodes[0].set_local_networks(&[IpNet::parse("192.168.10.7/24").unwrap()]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        // Only the very subnet: a wider override does not cover it.
+        net.nodes[0].set_route_overrides(&[IpNet::parse("192.168.0.0/16").unwrap()]);
+        assert!(routes(&net).is_empty());
+        net.nodes[0].set_route_overrides(&[]);
+        assert!(routes(&net).is_empty());
+        // A local network is not another mesh program's route.
+        assert!(net.nodes[0].foreign_overlaps().is_empty());
+        net.nodes[0].set_local_networks(&[]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        // Another mesh program carries 192.168.0.0/16: kept local and
+        // reported apart.
+        net.nodes[0].set_foreign_routes(&[IpNet::parse("192.168.0.0/16").unwrap()]);
+        assert!(routes(&net).is_empty());
+        assert_eq!(
+            net.nodes[0].foreign_overlaps(),
+            [IpNet::parse("192.168.10.0/24").unwrap()]
+        );
+        net.nodes[0].set_foreign_routes(&[]);
+        assert_eq!(routes(&net), ["192.168.10.0/24"]);
+        assert!(net.nodes[0].foreign_overlaps().is_empty());
     }
 
     #[test]

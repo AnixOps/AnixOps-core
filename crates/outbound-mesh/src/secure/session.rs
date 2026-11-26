@@ -273,8 +273,9 @@ struct Pending {
 pub enum RelayLookup {
     /// Not seen before: handle it.
     New,
-    /// The msg1 of a session still pending: send this msg2 again.
-    Repeat(Vec<u8>),
+    /// The msg1 of a session still pending: send this msg2 again, after
+    /// admitting the peer's static key once more.
+    Repeat(Vec<u8>, [u8; LEN]),
     /// Seen before and no longer pending: drop it without an answer.
     Replayed,
 }
@@ -345,6 +346,21 @@ impl Sessions {
             .filter(|(_, session)| !keep(&session.peer_static()))
             .map(|(key, _)| key.clone())
             .collect()
+    }
+
+    /// Drops the pending relay sessions whose peer's static key fails
+    /// `keep`, so that none of them is promoted by a later packet (spec
+    /// §8.3.1 rule 6). Returns how many went.
+    pub fn drop_pending_refused(&mut self, keep: impl Fn(&[u8; LEN]) -> bool) -> usize {
+        let mut dropped = 0;
+        for pending in self.pending.values_mut() {
+            let before = pending.len();
+            pending.retain(|p| keep(&p.session.peer_static()));
+            dropped += before - pending.len();
+        }
+        self.pending.retain(|_, pending| !pending.is_empty());
+        self.pending_count -= dropped;
+        dropped
     }
 
     pub fn get_mut(&mut self, key: &SessionKey) -> Option<&mut Session> {
@@ -790,7 +806,7 @@ impl Sessions {
             .get(key)
             .and_then(|pending| pending.iter().find(|p| p.seen == *seen && now < p.until));
         if let Some(pending) = pending {
-            return RelayLookup::Repeat(pending.msg2.clone());
+            return RelayLookup::Repeat(pending.msg2.clone(), pending.session.peer_static());
         }
         if self
             .seen
@@ -1502,6 +1518,46 @@ mod tests {
     }
 
     #[test]
+    fn pending_relay_sessions_of_a_refused_key_are_dropped() {
+        let rng = SystemRandom::new();
+        let now = Instant::now();
+        let mut sessions = Sessions::new();
+        let key = key(Namespace::Relay);
+        let seen = seen_digest(b"ephemeral");
+        let choice = sessions
+            .server_choice(&key, None, c(AES, AES), &rng)
+            .unwrap();
+        sessions.remember_seen(&key, seen);
+        sessions
+            .add_pending(
+                &key,
+                seen,
+                &choice,
+                LOCAL_ID,
+                c(AES, AES),
+                PEER,
+                b"msg2".to_vec(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(sessions.drop_pending_refused(|_| true), 0);
+        assert_eq!(sessions.pending_len(&key), 1);
+        assert_eq!(sessions.drop_pending_refused(|key| *key != PEER), 1);
+        assert_eq!(sessions.pending_len(&key), 0);
+        // A repeated msg1 is now a replay, not an answer.
+        assert_eq!(
+            sessions.relay_lookup(&key, &seen, now),
+            RelayLookup::Replayed
+        );
+        // The first packet under the dropped session is not promoted.
+        let mut sender = Sender::new(AES, choice.root_key, 7, LOCAL_ID, 0, now).unwrap();
+        let mut packet = b"new".to_vec();
+        sender.seal(&mut packet, now).unwrap();
+        assert!(sessions.open(&key, &mut packet, now).is_err());
+        assert!(sessions.get(&key).is_none());
+    }
+
+    #[test]
     fn a_relay_create_waits_for_its_first_packet() {
         let rng = SystemRandom::new();
         let now = Instant::now();
@@ -1538,7 +1594,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions.relay_lookup(&key, &seen, now),
-            RelayLookup::Repeat(b"msg2".to_vec())
+            RelayLookup::Repeat(b"msg2".to_vec(), PEER)
         );
         // The old session still works and nothing moved.
         assert_eq!(sessions.generation(&key), Some(2));
