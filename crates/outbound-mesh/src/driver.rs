@@ -110,14 +110,20 @@ pub struct Snapshot {
     /// Node ID, next hop and hop count of every reachable node.
     pub routes: Vec<(u32, u32, u32)>,
     pub counters: Counters,
-    /// The last oversized synchronisation (spec §11.2, §12.2).
-    pub sync_oversize: Option<SyncOversize>,
+    /// Oversized synchronisations, the last of each kind (spec §11.2,
+    /// §12.2).
+    pub sync_oversize: SyncOversize,
     /// This node's ID is taken and it changed ID less than ten minutes
     /// ago, so it only warns (spec §12.3).
     pub duplicate_id: bool,
     /// Subnets to route into the interface: accepted, not overlapping this
-    /// machine's networks, within `routing.system_routes`.
+    /// machine's networks, within `routing.system_routes`. Empty until
+    /// those networks were read once ([`Snapshot::local_networks_read`]).
     pub system_routes: Vec<IpNet>,
+    /// The networks of this machine's other interfaces were read at least
+    /// once. Until then no subnet is installed, so that a local network
+    /// is never taken into the mesh (spec §15.4).
+    pub local_networks_read: bool,
     /// This node's static public key in the network; `None` in the
     /// default mode, which has none.
     pub static_key: Option<[u8; 32]>,
@@ -141,6 +147,12 @@ pub struct Snapshot {
     /// The intranet name list (R28): the names the status shows, and the
     /// answers for the engine's split DNS ([`Names::answer`]).
     pub names: Option<Arc<Names>>,
+    /// Routable subnets not installed because [`Snapshot::system_routes`]
+    /// is full.
+    pub system_routes_truncated: usize,
+    /// Members announcing another static key than the one bound to their
+    /// node ID (spec §12.3).
+    pub refused_key_changes: Vec<u32>,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
@@ -239,7 +251,9 @@ pub struct Channels {
     pub snapshots: watch::Sender<Snapshot>,
     /// The networks of this machine's other interfaces: advertised subnets
     /// that overlap them are neither routed nor installed (spec §15.4).
-    pub local_networks: watch::Receiver<Vec<IpNet>>,
+    /// `None` while they could not be read yet: then no subnet is installed
+    /// ([`Snapshot::system_routes`] stays empty).
+    pub local_networks: watch::Receiver<Option<Vec<IpNet>>>,
     /// A new `network.native_keys` for a managed network, applied without
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
@@ -286,12 +300,16 @@ pub async fn run(
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
     node.set_route_overrides(&route_overrides.borrow_and_update());
     node.set_foreign_routes(&foreign_routes.borrow_and_update());
-    node.set_local_networks(&local_networks.borrow_and_update());
+    let mut local_read = false;
+    if let Some(networks) = &*local_networks.borrow_and_update() {
+        node.set_local_networks(networks);
+        local_read = true;
+    }
     if node.waits_for_native_keys() {
         // No listening, dialling or packets until the list holds this
         // node; the caller should not have bound listeners either.
         drop(listeners);
-        publish(&snapshots, snapshot(&node));
+        publish(&snapshots, snapshot(&node, local_read));
         while !*shutdown.borrow_and_update() {
             if shutdown.changed().await.is_err() {
                 break;
@@ -344,7 +362,11 @@ pub async fn run(
                 }
             }
             Ok(()) = local_networks.changed() => {
-                node.set_local_networks(&local_networks.borrow_and_update());
+                // Once read, a later `None` keeps the networks known.
+                if let Some(networks) = &*local_networks.borrow_and_update() {
+                    node.set_local_networks(networks);
+                    local_read = true;
+                }
             }
             Ok(()) = foreign_routes.changed() => {
                 node.set_foreign_routes(&foreign_routes.borrow_and_update());
@@ -355,7 +377,7 @@ pub async fn run(
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
                 node.set_native_keys(keys, Instant::now());
-                publish(&snapshots, snapshot(&node));
+                publish(&snapshots, snapshot(&node, local_read));
             }
             Ok(()) = dns.changed() => {
                 let settings = dns.borrow_and_update().clone();
@@ -460,7 +482,7 @@ pub async fn run(
             }
             _ = ticks.tick() => {
                 node.tick(&rng, Instant::now(), unix_now());
-                publish(&snapshots, snapshot(&node));
+                publish(&snapshots, snapshot(&node, local_read));
             }
         }
         carry_out(&mut node, &mut conns, &mut budget, &to_interface);
@@ -483,7 +505,7 @@ async fn until(at: Option<Instant>) {
     }
 }
 
-fn snapshot(node: &Node) -> Snapshot {
+fn snapshot(node: &Node, local_read: bool) -> Snapshot {
     Snapshot {
         peer_id: node.id(),
         neighbours: node.neighbours(),
@@ -493,9 +515,20 @@ fn snapshot(node: &Node) -> Snapshot {
             .map(|(peer, route)| (peer, route.next_hop, route.hops))
             .collect(),
         counters: node.counters(),
-        sync_oversize: node.sync_oversize(),
+        sync_oversize: node.sync_oversize().clone(),
         duplicate_id: node.duplicate_id(),
-        system_routes: node.system_routes(),
+        system_routes: if local_read {
+            node.system_routes()
+        } else {
+            Vec::new()
+        },
+        system_routes_truncated: if local_read {
+            node.system_routes_truncated()
+        } else {
+            0
+        },
+        local_networks_read: local_read,
+        refused_key_changes: node.refused_key_changes(),
         static_key: (node.settings().security == SecurityMode::ForwardSecrecy)
             .then(|| node.static_public()),
         waiting_for_native_keys: node.waits_for_native_keys(),
@@ -1005,17 +1038,26 @@ mod tests {
         to_mesh: mpsc::Sender<Vec<u8>>,
         from_mesh: mpsc::Receiver<Vec<u8>>,
         snapshots: watch::Receiver<Snapshot>,
+        local_networks: watch::Sender<Option<Vec<IpNet>>>,
         _shutdown: watch::Sender<bool>,
     }
 
     async fn start(settings: MeshSettings, listeners: Listeners) -> Running {
+        start_with(settings, listeners, Some(Vec::new())).await
+    }
+
+    async fn start_with(
+        settings: MeshSettings,
+        listeners: Listeners,
+        local: Option<Vec<IpNet>>,
+    ) -> Running {
         let rng = SystemRandom::new();
         let static_key = KeyPair::generate(&rng).unwrap();
         let (to_mesh, from_interface) = mpsc::channel(16);
         let (to_interface, from_mesh) = mpsc::channel(16);
         let (snapshot_tx, snapshots) = watch::channel(Snapshot::default());
         let (shutdown_tx, shutdown) = watch::channel(false);
-        let (_, local_networks) = watch::channel(Vec::new());
+        let (local_tx, local_networks) = watch::channel(local);
         let (_, native_keys) = watch::channel(None);
         let (_, dns) = watch::channel(DnsSettings::default());
         let (_, route_overrides) = watch::channel(Vec::new());
@@ -1040,6 +1082,7 @@ mod tests {
             to_mesh,
             from_mesh,
             snapshots,
+            local_networks: local_tx,
             _shutdown: shutdown_tx,
         }
     }
@@ -1127,6 +1170,74 @@ mod tests {
         assert_eq!(member.addresses, [IpAddr::V4(Ipv4Addr::new(10, 144, 0, 1))]);
         assert_eq!((member.hops, member.via.is_empty()), (1, true));
         assert_eq!(b.snapshots.borrow().rejected_advertisements, 0);
+    }
+
+    /// Waits until `running`'s snapshot passes `check`.
+    async fn wait_for(running: &Running, check: impl Fn(&Snapshot) -> bool) {
+        let mut snapshots = running.snapshots.clone();
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if check(&snapshots.borrow()) {
+                    break;
+                }
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the snapshot comes in time");
+    }
+
+    #[tokio::test]
+    async fn no_subnet_is_installed_before_the_local_networks_are_read() {
+        let config = serde_json::json!({
+            "config_version": 1,
+            "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+            "node": {"address": "10.144.0.1/24", "role": "full"},
+            "peers": [{"server": "peer.example", "port": 40000}],
+            "subnets": {"advertise": ["192.168.10.0/24"]},
+        });
+        let mut server: MeshSettings = serde_json::from_value::<MeshConfig>(config)
+            .unwrap()
+            .validate()
+            .unwrap();
+        server.peers.clear();
+        // Port 0 is refused in a configuration; a test binds any free one.
+        server.listen = vec![ListenConfig {
+            transport: Transport::Tcp,
+            port: 0,
+            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        }];
+        let listeners = Listeners::bind(&server).await.unwrap();
+        let port = listeners.local_addrs().unwrap()[0].1.port();
+        let mut client = settings("10.144.0.2/24", "full");
+        client.peers = vec![PeerEndpoint {
+            server: "127.0.0.1".into(),
+            port,
+            transport: Transport::Tcp,
+        }];
+        client.listen.clear();
+        let client_listeners = Listeners::bind(&client).await.unwrap();
+        let _a = start(server, listeners).await;
+        let b = start_with(client, client_listeners, None).await;
+        let subnet = IpNet::parse("192.168.10.0/24").unwrap();
+
+        // The subnet is accepted, but the networks of this machine are not
+        // known yet: nothing is installed.
+        wait_for(&b, |snapshot| !snapshot.members.is_empty()).await;
+        sleep(Duration::from_secs(2)).await;
+        assert!(b.snapshots.borrow().system_routes.is_empty());
+        assert!(!b.snapshots.borrow().local_networks_read);
+
+        // Read: the subnet is not one of them, so it is installed.
+        b.local_networks.send(Some(Vec::new())).unwrap();
+        wait_for(&b, |snapshot| snapshot.system_routes == [subnet]).await;
+        assert!(b.snapshots.borrow().local_networks_read);
+
+        // A later failed read keeps what is known.
+        b.local_networks.send(None).unwrap();
+        sleep(Duration::from_secs(2)).await;
+        assert_eq!(b.snapshots.borrow().system_routes, [subnet]);
+        assert!(b.snapshots.borrow().local_networks_read);
     }
 
     #[tokio::test]
