@@ -1025,6 +1025,13 @@ impl ProbeState {
             return self.verdict();
         };
         let answered = self.rounds.remove(at).answered;
+        // A probe answered in full supersedes the ones sent before it that
+        // are still open: they no longer count as misses (spec §17.2.6
+        // rule 3), so an early warm-up probe that went unanswered does not
+        // count once warm-up is over.
+        if answered.iter().all(Option::is_some) {
+            self.rounds.drain(..at);
+        }
         self.latest = Some(answered.clone());
         // Waypoints after one that echoed status 1 are not missing: that
         // one is still waiting for its query, for at most 3 rounds in a
@@ -2202,6 +2209,33 @@ mod tests {
         assert_eq!(probe.verdict(), Verdict::Ready);
         // An echo for a round already closed is not taken.
         assert!(!probe.echo(&echo_from(3, 0, Forwarded), 3));
+    }
+
+    #[test]
+    fn a_clean_round_supersedes_older_open_rounds() {
+        use EchoStatus::Forwarded;
+        let mut probe = ProbeState::new(vec![3]);
+        // The first warm-up probe goes unanswered; the second is answered.
+        assert_eq!(probe.start(1), None);
+        assert_eq!(probe.start(2), None);
+        assert!(probe.echo(&echo_from(3, 2, Forwarded), 3));
+        assert_eq!(probe.finish(2), Verdict::Ready);
+        assert_eq!(probe.open_rounds(), 0);
+        // Closing the superseded round later changes nothing.
+        assert_eq!(probe.finish(1), Verdict::Ready);
+        // Two misses, then a clean round: the count starts again.
+        let mut probe = warmed(vec![3]);
+        for token in [10, 11] {
+            assert_eq!(probe.start(token), None);
+            assert_eq!(probe.finish(token), Verdict::Ready);
+        }
+        assert_eq!(round(&mut probe, 12, &[(3, Forwarded)]), Verdict::Ready);
+        for token in [13, 14] {
+            assert_eq!(probe.start(token), None);
+            assert_eq!(probe.finish(token), Verdict::Ready);
+        }
+        assert_eq!(probe.start(15), None);
+        assert!(matches!(probe.finish(15), Verdict::Held { .. }));
     }
 
     #[test]
