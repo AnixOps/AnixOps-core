@@ -980,6 +980,18 @@ impl Sessions {
         payload: &mut Vec<u8>,
         now: Instant,
     ) -> Result<(), SessionError> {
+        self.open_counting(key, payload, now, true)
+    }
+
+    /// [`open`](Self::open); with `count` false a failure is not counted
+    /// against the session, for a packet that may belong to another one.
+    pub fn open_counting(
+        &mut self,
+        key: &SessionKey,
+        payload: &mut Vec<u8>,
+        now: Instant,
+        count: bool,
+    ) -> Result<(), SessionError> {
         self.drop_expired_pending(key, now);
         let original = (self.pending_len(key) > 0).then(|| payload.clone());
         let current = self.map.get_mut(key).map(|session| {
@@ -1035,7 +1047,7 @@ impl Sessions {
             return Err(SessionError::NoSession);
         };
         let session = self.map.get_mut(key).expect("opened above");
-        let error = if counts && !grace {
+        let error = if count && counts && !grace {
             session.receiver.count_failure(error)
         } else {
             error
