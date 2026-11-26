@@ -586,8 +586,9 @@ jobs:
       - policy-fast
       - detect-projects
     # Same condition as the other Rust jobs. Builds the release form of
-    # anixops-mesh (static musl, x86_64 and aarch64) with the script the
-    # release workflow uses, so a tag never meets an untested build path.
+    # anixops-mesh (static musl: x86_64, aarch64 and the 32-bit ARM builds of
+    # the OpenWrt packages) with the script the release workflow uses, so a
+    # tag never meets an untested build path.
     if: >-
       ${{
         needs.detect-projects.outputs.rust == 'true' &&
@@ -643,7 +644,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+            armv7-unknown-linux-musleabihf armv7-unknown-linux-musleabi \
+            arm-unknown-linux-musleabihf arm-unknown-linux-musleabi; do
             echo "::group::${target}"
             .github/scripts/build-mesh-node.sh "${target}" ci dist/mesh-node
             echo "::endgroup::"

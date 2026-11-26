@@ -31,8 +31,14 @@ msgstr "设备身份已在其他位置在线"
 msgid "Direct"
 msgstr "直连"
 
+msgid "Disabled"
+msgstr "已停用"
+
 msgid "Enable service"
 msgstr "启用服务"
+
+msgid "Enabled, not running"
+msgstr "已启用，未运行"
 
 msgid "Enroll"
 msgstr "接入"
@@ -63,6 +69,12 @@ msgstr "请填写不超过 16 个私有 IPv4 网段，使用网络地址形式�
 
 msgid "Enter the panel address and the one-time enrollment credential issued by the administrator."
 msgstr "请填写面板地址及管理员签发的一次性入网凭据。"
+
+msgid "External network bridge lock held by another process"
+msgstr "外部网络桥接锁被其他进程持有"
+
+msgid "External network bridge rules may remain from an earlier version"
+msgstr "可能残留早期版本的外部网络桥接规则"
 
 msgid "Forward secrecy"
 msgstr "前向保密"
@@ -126,9 +138,6 @@ msgstr "未接入"
 
 msgid "Not measured"
 msgstr "未测得"
-
-msgid "Not running"
-msgstr "未运行"
 
 msgid "Not supported by the installed program version"
 msgstr "当前安装的程序版本不支持"
@@ -246,6 +255,12 @@ msgstr "设备接入后服务方可启动。"
 
 msgid "This device is not enrolled."
 msgstr "本设备尚未接入。"
+
+msgid "Unknown alert: %s"
+msgstr "未知告警：%s"
+
+msgid "Unknown failure: %s"
+msgstr "未知故障：%s"
 
 msgid "Unreachable"
 msgstr "无法连接"

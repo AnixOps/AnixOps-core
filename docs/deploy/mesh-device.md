@@ -124,19 +124,12 @@ CI（`mesh-node-desktop` 作业）在 macos-26 与 windows-latest 上以模拟�
 
 ## OpenWrt（R35，内核 0.5）
 
-- 软件包 `anixops-mesh`（ipk 与 apk 各一份），只含本程序、procd 脚本与默认 UCI 配置；musl 静态构建，目标 `aarch64`、`arm`（armv7）、`mips`/`mipsel`、`x86_64`，安装后占用不超过 4 MiB 闪存。
-- UCI `/etc/config/anixops-mesh`：
+软件包、UCI、procd 服务、防火墙与网页插件的细节以 [`openwrt.md`](openwrt.md) 为准，这里只列与本程序相关的约定：
 
-  ```
-  config device 'main'
-  	option enabled '1'
-  	option control 'https://panel.example.com'
-  	option state_dir '/etc/anixops-mesh'
-  ```
-
-  OpenWrt 的 `/var` 在内存中，状态目录放在 `/etc/anixops-mesh`，并列入 `/lib/upgrade/keep.d/anixops-mesh`，系统升级后保留设备身份。
-- procd 服务运行 `anixops-mesh device --state-dir …`，`respawn` 遇到退出码 8 时不再拉起（init 脚本检查退出码，记录日志后停止）。
-- LuCI 插件 `luci-app-anixops-mesh`：页面经 rpcd 调用 `anixops-mesh device-status` 读取成员、子网、路径与时延，以查看为主；填入凭据时调用 `enroll`（凭据经 rpcd 写入 0600 临时文件）。插件不新增监听端口。通告哪些局域网网段由管理员在面板确认（`PUT /api/v4/kernel/mesh/devices/{id}/subnets`），设备经 `subnet-request`（面板 `POST /api/v5/mesh/device/subnet-request`）提交申请，批准前 LuCI 显示为「待管理员确认」；设备不能自行通告。
+- 软件包 `anixops-mesh`（ipk 与 apk）含本程序、procd 脚本、防火墙规则维护与默认 UCI 配置；musl 静态构建，已提供与暂缓的架构见 `openwrt.md`。闪存占用的上限在各架构的实际大小出来后设定。
+- 状态目录固定为 `/etc/anixops-mesh`（OpenWrt 的 `/var` 在内存中），不是 UCI 选项；列入 `/lib/upgrade/keep.d/anixops-mesh`，系统升级后保留设备身份。UCI `/etc/config/anixops-mesh` 只有 `enabled`、`control` 与 LuCI 记录的 `advertise`。
+- procd 服务经包装脚本运行 `anixops-mesh device --state-dir /etc/anixops-mesh`：退出码 8 时包装脚本记录日志并停止服务，不再拉起；其他退出码由 procd 每 5 秒重启。
+- LuCI 插件 `luci-app-anixops-mesh`：页面经 rpcd 调用 `anixops-mesh device-status` 读取成员、子网、路径与时延，以查看为主；填入凭据时调用 `enroll`（凭据经 rpcd 写入 0600 临时文件）。插件不新增监听端口。通告哪些局域网网段由管理员在面板确认（`PUT /api/v4/kernel/mesh/devices/{id}/subnets`），设备经 `subnet-request`（面板 `POST /api/v5/mesh/device/subnet-request`）提交申请，批准前 LuCI 显示为「待管理员批准」；设备不能自行通告。
 - 接管原程序的三种装法（软件包、自写启动脚本、手动运行）沿用 `takeover`；OpenWrt 的 procd 与 `/etc/init.d` 检测随 0.5 加入。
 
 ## 卸载

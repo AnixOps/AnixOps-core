@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use outbound_mesh::IpNet;
 
-use super::{HostLink, HostRoute};
+use super::{HostLink, HostRoute, RouteKind};
 
 /// Length of `struct rt_msghdr`, after which the socket addresses follow.
 const RT_MSGHDR: usize = std::mem::size_of::<libc::rt_msghdr>();
@@ -115,6 +115,7 @@ fn parse_route(message: &[u8]) -> Option<HostRoute> {
     };
     Some(HostRoute {
         destination: IpNet::new(address, prefix)?.trunc(),
+        kind: RouteKind::Unicast,
         interfaces: vec![u32::from(header.rtm_index)],
     })
 }
