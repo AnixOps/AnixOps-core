@@ -16,6 +16,7 @@
 pub mod cmdline;
 pub mod convert;
 pub mod detect;
+pub mod device;
 pub mod host;
 pub mod import;
 pub mod launchd;
