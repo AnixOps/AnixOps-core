@@ -1166,6 +1166,11 @@ impl Node {
             }
         };
         let from = inbound.header.from;
+        if inbound.relay_session {
+            // Opened by a relay session with `from`: its handshake took
+            // effect, which clears an earlier refusal (spec §8.3.1 rule 5).
+            self.admitted_peer(from);
+        }
         match inbound.header.packet_type {
             packet_type::PING => {
                 // Same header, type changed (spec §10).
@@ -2183,8 +2188,13 @@ impl Node {
         );
         let (msg2, joined) = match answer {
             Ok(RelayAnswer::Reply(msg2, established)) => {
-                self.admitted_peer(from);
-                (msg2, established.action != SessionAction::Create)
+                let joined = established.action != SessionAction::Create;
+                // A pending session counts once a packet promotes it
+                // (`receive_up`).
+                if joined {
+                    self.admitted_peer(from);
+                }
+                (msg2, joined)
             }
             Ok(RelayAnswer::Repeat(msg2)) => (msg2, false),
             Err(error) => {
@@ -3246,6 +3256,53 @@ mod tests {
         send(&mut net, 0, &packet);
         assert_eq!(net.delivered, vec![(2, packet)]);
         assert_eq!(net.nodes[2].counters().dropped, dropped);
+    }
+
+    #[test]
+    fn an_established_relay_session_ends_when_its_peer_leaves_the_list() {
+        let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet.clone())]);
+        let key = SessionKey {
+            namespace: Namespace::Relay,
+            network: net.nodes[0].settings.network_name.clone(),
+            peer_id: net.nodes[2].id(),
+        };
+        assert!(net.nodes[0].sessions.get(&key).is_some());
+        unlist(&mut net, 0, 2);
+        assert!(net.nodes[0].sessions.get(&key).is_none());
+        assert!(!net.nodes[0].relays.contains_key(&key.peer_id));
+        // Nothing reaches it any more, through a new handshake or not.
+        net.tick(Duration::from_secs(1));
+        assert!(net.nodes[0].send_ip(&packet, net.now).is_err());
+        net.settle();
+        assert_eq!(net.delivered.len(), 1);
+    }
+
+    #[test]
+    fn a_relay_answer_clears_a_refusal_only_once_its_session_takes_effect() {
+        let mut net = three_in_a_row(true);
+        without_relay_session(&mut net);
+        let refused = net.nodes[0].id();
+        net.nodes[2].not_native = Some((refused, net.now));
+        // The relay loses everything towards node 0: node 2 answers msg1,
+        // but its session stays pending, so the refusal stays.
+        let wires = net.wires.clone();
+        net.wires
+            .retain(|&(from, _), &mut (to, _)| !(from == 1 && to == 0));
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert!(net.delivered.is_empty());
+        assert_eq!(net.nodes[2].last_not_native(), Some(refused));
+        // With the answer through, the first packet makes it current.
+        net.wires = wires;
+        let answering = net.nodes[2].id();
+        net.nodes[0].relays.remove(&answering);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[2].last_not_native(), None);
     }
 
     #[test]
