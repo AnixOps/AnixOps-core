@@ -104,7 +104,8 @@ impl HostChanges {
     /// Undoes everything now, in the order the fields drop, waiting for the
     /// removals so that none is left running when the service reports that
     /// it stopped (a removal still running could delete the rules of the
-    /// next start). Returns problems as warnings.
+    /// next start), including removals of guards dropped before. Returns
+    /// problems as warnings.
     pub fn shutdown(mut self) -> Vec<String> {
         let mut warnings = Vec::new();
         if let Some(nat) = self.nat.take() {
@@ -118,6 +119,9 @@ impl HostChanges {
                 warnings.push(error.to_string());
             }
         }
+        // Guards dropped earlier (a start that failed half way) remove on
+        // threads of their own: wait for those too.
+        mesh_host::finish_mesh_firewall_removals();
         warnings
     }
 }
