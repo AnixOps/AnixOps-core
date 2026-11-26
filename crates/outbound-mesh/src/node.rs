@@ -1687,7 +1687,7 @@ mod tests {
     fn a_border_node_carries_other_regions_both_ways() {
         let mut net = three_in_a_row(false);
         let version = net.nodes[2].sync.own().version;
-        let left_out = net.nodes[2].set_border(&["10.20.0.0/16".parse().unwrap()], net.now);
+        let left_out = net.nodes[2].set_border(&[IpNet::parse("10.20.0.0/16").unwrap()], net.now);
         assert_eq!(left_out, 0);
         assert!(net.nodes[2].sync.own().version > version);
         for _ in 0..6 {
