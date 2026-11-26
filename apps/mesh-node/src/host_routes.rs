@@ -126,6 +126,19 @@ pub enum Lookup {
     Refused,
     /// No route, or nothing known.
     Unknown,
+    /// The lookup itself failed: the candidate stays unchecked unless
+    /// another of its addresses was selected.
+    Failed,
+}
+
+/// What [`select_foreign`] found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Foreign {
+    /// The routes the system selects, sorted.
+    pub routes: Vec<IpNet>,
+    /// Candidates left unchecked: past [`MAX_LOOKUPS`], or every lookup of
+    /// theirs failed. They do not count (a warning tells of them).
+    pub unchecked: usize,
 }
 
 fn wide_enough(net: &IpNet) -> bool {
@@ -136,45 +149,87 @@ fn wide_enough(net: &IpNet) -> bool {
     net.prefix() >= widest
 }
 
+/// The addresses a candidate is looked up at: its first, middle and last
+/// address, so that a range a more specific route takes at its start is
+/// still seen elsewhere. A single address once.
+fn samples(net: &IpNet) -> Vec<IpAddr> {
+    let mut found = match net.network() {
+        IpAddr::V4(first) => {
+            let first = u32::from(first);
+            let size = u32::MAX.checked_shr(u32::from(net.prefix())).unwrap_or(0);
+            [first, first + size / 2 + u32::from(size > 0), first + size]
+                .map(|address| IpAddr::V4(address.into()))
+                .to_vec()
+        }
+        IpAddr::V6(first) => {
+            let first = u128::from(first);
+            let size = u128::MAX.checked_shr(u32::from(net.prefix())).unwrap_or(0);
+            [first, first + size / 2 + u128::from(size > 0), first + size]
+                .map(|address| IpAddr::V6(address.into()))
+                .to_vec()
+        }
+    };
+    found.dedup();
+    found
+}
+
 /// The routes, at least /8 (IPv4) or /7 (IPv6), that another program's
 /// virtual interface carries or that refuse traffic, kept only when
-/// `lookup` of their destination shows the system selects them. `own` tells
-/// our mesh interfaces by index.
+/// `lookup` of one of their [`samples`] shows the system selects them (the
+/// route, or another one of the same sort). `own` tells our mesh interfaces
+/// by index. The most specific candidates are checked first; past
+/// [`MAX_LOOKUPS`] lookups the rest are counted as unchecked.
 pub fn select_foreign(
     routes: &[HostRoute],
     links: &HashMap<u32, HostLink>,
     own: &dyn Fn(u32) -> bool,
     lookup: &mut dyn FnMut(IpAddr) -> Lookup,
-) -> Vec<IpNet> {
+) -> Foreign {
     let foreign =
         |index: &u32| !own(*index) && links.get(index).is_some_and(|link| link.is_virtual);
-    let mut found: Vec<IpNet> = Vec::new();
-    let mut lookups = 0;
-    for route in routes
+    let mut candidates: Vec<&HostRoute> = routes
         .iter()
         .filter(|route| wide_enough(&route.destination))
-    {
-        let candidate = match route.kind {
+        .filter(|route| match route.kind {
             RouteKind::Unicast => route.interfaces.iter().any(foreign),
             RouteKind::Refusing => true,
-        };
-        if !candidate || found.contains(&route.destination) {
+        })
+        .collect();
+    // Stable: the table order stays within a prefix length.
+    candidates.sort_by_key(|route| std::cmp::Reverse(route.destination.prefix()));
+    let mut found = Foreign::default();
+    let mut lookups = 0;
+    for route in candidates {
+        if found.routes.contains(&route.destination) {
             continue;
         }
-        if lookups == MAX_LOOKUPS {
-            break;
+        let addresses = samples(&route.destination);
+        if lookups + addresses.len() > MAX_LOOKUPS {
+            found.unchecked += 1;
+            continue;
         }
-        lookups += 1;
-        let selected = match (lookup(route.destination.network()), route.kind) {
-            (Lookup::Route(interfaces), RouteKind::Unicast) => interfaces.iter().any(foreign),
-            (Lookup::Refused, RouteKind::Refusing) => true,
-            _ => false,
-        };
+        lookups += addresses.len();
+        let mut selected = false;
+        let mut answered = false;
+        for address in addresses {
+            let answer = lookup(address);
+            answered |= answer != Lookup::Failed;
+            selected = match (answer, route.kind) {
+                (Lookup::Route(interfaces), RouteKind::Unicast) => interfaces.iter().any(foreign),
+                (Lookup::Refused, RouteKind::Refusing) => true,
+                _ => false,
+            };
+            if selected {
+                break;
+            }
+        }
         if selected {
-            found.push(route.destination);
+            found.routes.push(route.destination);
+        } else if !answered {
+            found.unchecked += 1;
         }
     }
-    found.sort_by_key(|net| net.to_string());
+    found.routes.sort_by_key(|net| net.to_string());
     found
 }
 
@@ -196,7 +251,7 @@ pub fn most_specific(routes: &[HostRoute], address: IpAddr) -> Lookup {
 /// routes that the system selects (see the module documentation). `own`
 /// names the interface being served, in addition to those recorded.
 #[cfg(not(target_os = "linux"))]
-pub fn foreign_routes(own: &str) -> io::Result<Vec<IpNet>> {
+pub fn foreign_routes(own: &str) -> io::Result<Foreign> {
     let links = host_links()?;
     let routes = host_routes()?;
     let is_own = |index: u32| {
@@ -304,6 +359,7 @@ mod tests {
         select_foreign(routes, &links(), own, &mut |address| {
             most_specific(routes, address)
         })
+        .routes
     }
 
     #[test]
@@ -343,7 +399,8 @@ mod tests {
         let found = select_foreign(&routes, &links(), &ours(&[]), &mut |_| {
             Lookup::Route(vec![3])
         });
-        assert_eq!(found, vec![net("10.0.0.0/8"), net("fc00::/7")]);
+        assert_eq!(found.routes, vec![net("10.0.0.0/8"), net("fc00::/7")]);
+        assert_eq!(found.unchecked, 0);
     }
 
     #[test]
@@ -367,23 +424,91 @@ mod tests {
         // The policy rules send 10.40.0.0/16 out through eth0 (a table of
         // another program is not consulted), and 10.51.0.0/16 is reached
         // through another, preferred table.
-        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |address| match address
-            .to_string()
-            .as_str()
-        {
-            "10.40.0.0" | "10.51.0.0" => Lookup::Route(vec![2]),
-            "100.64.0.0" => Lookup::Route(vec![3]),
-            _ => Lookup::Refused,
+        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |address| {
+            if net("10.40.0.0/16").contains(address) || net("10.51.0.0/16").contains(address) {
+                Lookup::Route(vec![2])
+            } else if net("100.64.0.0/10").contains(address) {
+                Lookup::Route(vec![3])
+            } else {
+                Lookup::Refused
+            }
         });
-        assert_eq!(found, vec![net("10.50.0.0/16"), net("100.64.0.0/10")]);
+        assert_eq!(
+            found.routes,
+            vec![net("10.50.0.0/16"), net("100.64.0.0/10")]
+        );
         // A route that leaves through our own interface in the end is ours.
         let found = select_foreign(&routes[..1], &links(), &ours(&[]), &mut |_| {
             Lookup::Route(vec![4])
         });
-        assert!(found.is_empty());
+        assert!(found.routes.is_empty());
         // Nothing known: nothing counts.
         let found = select_foreign(&routes, &links(), &ours(&[]), &mut |_| Lookup::Unknown);
-        assert!(found.is_empty());
+        assert_eq!(found, Foreign::default());
+    }
+
+    #[test]
+    fn a_candidate_is_looked_up_at_its_start_middle_and_end() {
+        assert_eq!(
+            samples(&net("10.40.0.0/16")),
+            ["10.40.0.0", "10.40.128.0", "10.40.255.255"]
+                .map(|text| text.parse::<IpAddr>().unwrap())
+                .to_vec()
+        );
+        assert_eq!(
+            samples(&net("10.40.0.6/31")),
+            ["10.40.0.6", "10.40.0.7"]
+                .map(|text| text.parse::<IpAddr>().unwrap())
+                .to_vec()
+        );
+        assert_eq!(samples(&net("10.40.0.9/32")).len(), 1);
+        assert_eq!(
+            samples(&net("fd00:1::/64")),
+            [
+                "fd00:1::",
+                "fd00:1::8000:0:0:0",
+                "fd00:1::ffff:ffff:ffff:ffff"
+            ]
+            .map(|text| text.parse::<IpAddr>().unwrap())
+            .to_vec()
+        );
+        // A more specific route through eth0 takes the start of the range;
+        // the rest still leaves through the other program's interface.
+        let routes = [route("10.40.0.0/16", &[3]), route("10.40.0.0/24", &[2])];
+        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |address| {
+            most_specific(&routes, address)
+        });
+        assert_eq!(found.routes, vec![net("10.40.0.0/16")]);
+    }
+
+    #[test]
+    fn a_failed_lookup_leaves_only_its_candidate_unchecked() {
+        let routes = [route("10.70.0.0/16", &[3]), route("10.71.0.0/16", &[3])];
+        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |address| {
+            if net("10.70.0.0/16").contains(address) {
+                Lookup::Failed
+            } else {
+                Lookup::Route(vec![3])
+            }
+        });
+        assert_eq!(found.routes, vec![net("10.71.0.0/16")]);
+        assert_eq!(found.unchecked, 1);
+    }
+
+    #[test]
+    fn past_the_lookup_limit_the_widest_candidates_are_counted_unchecked() {
+        // Every /24 takes three lookups; the /16 comes last, being widest.
+        let mut routes: Vec<HostRoute> = vec![route("10.80.0.0/16", &[3])];
+        let count = MAX_LOOKUPS / 3;
+        routes.extend(
+            (0..count).map(|n| route(&format!("10.{}.{}.0/24", 90 + n / 256, n % 256), &[3])),
+        );
+        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |_| {
+            Lookup::Route(vec![3])
+        });
+        assert_eq!(found.routes.len(), count);
+        assert!(!found.routes.contains(&net("10.80.0.0/16")));
+        assert_eq!(found.unchecked, 1);
     }
 
     #[test]
