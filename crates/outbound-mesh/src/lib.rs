@@ -37,6 +37,7 @@
 //!   through.
 
 pub mod backbone;
+pub mod bridge;
 pub mod config;
 #[cfg(feature = "runtime")]
 pub mod driver;

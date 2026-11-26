@@ -20,6 +20,8 @@ pub mod cmdline;
 pub mod convert;
 pub mod detect;
 pub mod device;
+#[cfg(target_os = "linux")]
+pub mod device_run;
 #[cfg(target_os = "macos")]
 pub mod forward_macos;
 #[cfg(windows)]
@@ -27,8 +29,12 @@ pub mod forward_windows;
 pub mod host;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod host_routes;
+#[cfg(target_os = "linux")]
+pub mod https;
 pub mod import;
 pub mod launchd;
+#[cfg(target_os = "linux")]
+pub mod local_status;
 #[cfg(target_os = "linux")]
 pub mod managed;
 pub mod net;
@@ -60,11 +66,30 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// replace it. `run` exists on Linux but is not listed until the
 /// interoperability tests against third-party nodes pass in CI, so that no
 /// installer replaces a working network with an incomplete node.
+///
+/// `enroll`, `device`, `device-status` and `subnet-request` (the device
+/// without the Agent, `docs/deploy/mesh-device.md`) run the managed mesh,
+/// which is built on Linux only, so they are listed there only.
+#[cfg(not(target_os = "linux"))]
 pub const COMMANDS: &[&str] = &[
     "capabilities",
     "detect",
     "import",
     "rollback",
+    "takeover",
+    "version",
+];
+
+#[cfg(target_os = "linux")]
+pub const COMMANDS: &[&str] = &[
+    "capabilities",
+    "detect",
+    "device",
+    "device-status",
+    "enroll",
+    "import",
+    "rollback",
+    "subnet-request",
     "takeover",
     "version",
 ];
