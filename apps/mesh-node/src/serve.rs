@@ -379,7 +379,10 @@ fn carried(lan: &[(String, IpNet)]) -> Vec<IpNet> {
 struct HostInterfaces {
     /// LAN interfaces as (name, address network) pairs.
     lan: Vec<(String, IpNet)>,
-    /// Names of other programs' virtual interfaces.
+    /// Names of other programs' virtual interfaces. Only macOS reads it:
+    /// forwarding there is system-wide. Windows forwards per interface and
+    /// reports the interfaces that actually forward instead.
+    #[cfg_attr(windows, allow(dead_code))]
     others: Vec<String>,
 }
 
