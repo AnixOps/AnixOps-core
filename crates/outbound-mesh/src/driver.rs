@@ -993,6 +993,12 @@ mod tests {
     async fn two_nodes(transport: Transport) {
         let mut server = settings("10.144.0.1/24", "full");
         server.peers.clear();
+        // Port 0 is refused in a configuration; a test binds any free one.
+        server.listen = vec![ListenConfig {
+            transport: Transport::Tcp,
+            port: 0,
+            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        }];
         server.listen = vec![ListenConfig {
             transport,
             port: 0,
@@ -1084,11 +1090,7 @@ mod tests {
         let config = serde_json::json!({
             "config_version": 1,
             "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
-            "node": {
-                "address": "10.144.0.1/24",
-                "role": "full",
-                "listen": [{"transport": "tcp", "port": 0, "address": "127.0.0.1"}],
-            },
+            "node": {"address": "10.144.0.1/24", "role": "full"},
             "peers": [{"server": "peer.example", "port": 40000}],
             "subnets": {"advertise": ["192.168.10.0/24"]},
         });
