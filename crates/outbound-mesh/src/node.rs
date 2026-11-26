@@ -2646,6 +2646,15 @@ mod tests {
         assert_eq!(net.nodes[3].path_counters().dropped, dropped + 1);
         assert_eq!(net.nodes[3].counters().relayed, relayed);
         assert!(net.delivered.is_empty());
+        // Dropped before it is read: a waypoint would have asked about the
+        // packet's origin (spec §17.2.5 rule 6) and learnt its answer.
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[3].paths.capability(100),
+            crate::waypoint::Capability::Pending
+        );
+        assert_eq!(net.nodes[3].path_counters().dropped_queries, 0);
     }
 
     #[test]
