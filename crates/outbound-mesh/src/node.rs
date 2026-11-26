@@ -2049,6 +2049,9 @@ mod tests {
         wires: BTreeMap<(usize, ConnId), (usize, ConnId)>,
         delivered: Vec<(usize, Vec<u8>)>,
         now: Instant,
+        /// A node that silently drops type-40 packets addressed to it, as
+        /// an implementation without custom paths does.
+        drops_type_40: Option<usize>,
     }
 
     impl Net {
@@ -2088,6 +2091,7 @@ mod tests {
                 wires: BTreeMap::new(),
                 delivered: Vec::new(),
                 now,
+                drops_type_40: None,
             }
         }
 
@@ -2111,7 +2115,14 @@ mod tests {
                         match action {
                             Action::Send { conn, packet } => {
                                 if let Some(&(j, peer_conn)) = self.wires.get(&(i, conn)) {
-                                    self.nodes[j].receive(peer_conn, &packet, &rng, self.now);
+                                    let dropped = self.drops_type_40 == Some(j)
+                                        && NodeHeader::decode(&packet).is_some_and(|header| {
+                                            header.packet_type == packet_type::WAYPOINT
+                                                && header.to == self.nodes[j].local.id
+                                        });
+                                    if !dropped {
+                                        self.nodes[j].receive(peer_conn, &packet, &rng, self.now);
+                                    }
                                 }
                             }
                             Action::Deliver(packet) => self.delivered.push((i, packet)),
@@ -2299,9 +2310,9 @@ mod tests {
         path_through_node_3(&mut net);
         warm_up(&mut net);
         assert_eq!(net.nodes[0].path_status(net.now)[0].state, "active");
-        // Node 3 keeps answering that it relays but drops type 40: only
-        // probes can tell (spec §17.2.6).
-        net.nodes[3].paths = PathRuntime::new(Vec::new(), false, net.now);
+        // Node 3 keeps answering that it relays but drops type 40 without
+        // a word: only probes can tell (spec §17.2.6).
+        net.drops_type_40 = Some(3);
         let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
         let mut fell_back = None;
         for second in 0..60 {
