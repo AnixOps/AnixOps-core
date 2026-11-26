@@ -186,14 +186,18 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
 /// The device without the Agent: `enroll`, `device`, `device-status`,
 /// `subnet-request`. Errors are one JSON line on standard error with the
 /// exit code of `docs/deploy/mesh-device.md`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn run_device(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
     use mesh_node::device_run::{self, EnrollOptions, Exit};
 
     let state_dir = options
         .state_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from(device_run::DEFAULT_STATE_DIR));
+        .unwrap_or_else(device_run::default_state_dir);
+    #[cfg(windows)]
+    if command == "device" {
+        return device_service_windows(state_dir);
+    }
     let result: Result<Option<serde_json::Value>, Exit> = match command {
         "enroll" => {
             let (Some(control), Some(token_file)) = (&options.control, &options.token_file) else {
@@ -243,12 +247,50 @@ fn node_exit_code(config: &Path, interface: Option<&str>) -> u8 {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn run_device(_command: &str, _options: &Options) -> Result<ExitCode, ExitCode> {
     Err(fail(
         "platform",
-        "the device without the Agent runs on Linux only",
+        "the device without the Agent runs on Linux, macOS and Windows only",
     ))
+}
+
+/// `device` on Windows: runs as the service when the service manager
+/// started it, in the console otherwise. Started as a service, what it
+/// writes to standard error goes to `device.log` in the state directory
+/// (see `mesh_node::device_log`), and a refused or missing token (exit
+/// code 8) is reported to the service manager as a clean stop, so that the
+/// recovery actions do not start it again until it is enrolled again.
+#[cfg(windows)]
+fn device_service_windows(state_dir: PathBuf) -> Result<ExitCode, ExitCode> {
+    use mesh_node::device_run::{self, EXIT_TOKEN};
+
+    fn body(state_dir: &Path) -> u8 {
+        match device_run::device_service(state_dir) {
+            Ok(()) => 0,
+            Err(exit) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({ "error": exit.kind, "detail": exit.detail })
+                );
+                exit.code
+            }
+        }
+    }
+    let service_dir = state_dir.clone();
+    let code = mesh_node::service_windows::dispatch_with(
+        move || {
+            mesh_node::device_log::redirect_stderr(&service_dir);
+            body(&service_dir)
+        },
+        &[EXIT_TOKEN],
+    )
+    .unwrap_or_else(|| body(&state_dir));
+    if code == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(ExitCode::from(code))
+    }
 }
 
 /// On Windows the node runs as a service when the service manager started

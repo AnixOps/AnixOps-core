@@ -619,16 +619,24 @@ jobs:
         run: |
           set -euo pipefail
           # The installers are POSIX sh (BusyBox, dash and macOS sh included).
-          for script in install-linux.sh install-macos.sh; do
+          for script in install-linux.sh install-macos.sh install-device-macos.sh; do
             sh -n "apps/mesh-node/install/${script}"
             shellcheck --shell=sh "apps/mesh-node/install/${script}"
           done
-          shellcheck --shell=bash .github/scripts/build-mesh-node.sh
-          # The Windows installer must at least parse.
+          for script in build-mesh-node.sh mesh-device-certs.sh mesh-device-smoke-macos.sh; do
+            shellcheck --shell=bash ".github/scripts/${script}"
+          done
+          python3 -m py_compile .github/scripts/mesh-device-mock-control.py
+          # The Windows installers and the smoke test must at least parse;
+          # they run in the desktop build job.
           pwsh -NoProfile -NonInteractive -Command '
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile("apps/mesh-node/install/install-windows.ps1", [ref]$null, [ref]$errors) | Out-Null
-            if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_ }; exit 1 }
+            $failed = $false
+            foreach ($file in @("apps/mesh-node/install/install-windows.ps1", "apps/mesh-node/install/install-device-windows.ps1", ".github/scripts/mesh-device-smoke-windows.ps1")) {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$errors) | Out-Null
+              if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host "${file}: $_" }; $failed = $true }
+            }
+            if ($failed) { exit 1 }
           '
 
       - name: Build static anixops-mesh
@@ -712,6 +720,38 @@ jobs:
           $ErrorActionPreference = "Stop"
           $arch = if ($env:TARGET -like "aarch64-*") { "arm64" } else { "amd64" }
           & .github/scripts/fetch-wintun.ps1 -Destination (Join-Path $env:RUNNER_TEMP "wintun") -Arch $arch
+
+      # The device without the Agent on the runner's own architecture:
+      # install as a launchd daemon or Windows service, enroll against a
+      # stand-in for Control (private CA), report, revoke the token,
+      # uninstall (docs/deploy/mesh-device.md).
+      - name: Device service smoke test (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          .github/scripts/mesh-device-smoke-macos.sh "${PWD}/dist/mesh-node/anixops-mesh-ci-${TARGET}" "${RUNNER_TEMP}/mesh-device"
+
+      - name: Device service smoke certificates (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/scripts/mesh-device-certs.sh "${RUNNER_TEMP}/mesh-device/certs"
+
+      - name: Device service smoke test (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .github/scripts/mesh-device-smoke-windows.ps1 `
+            -Binary (Join-Path $PWD "dist/mesh-node/anixops-mesh-ci-$env:TARGET.exe") `
+            -Wintun (Join-Path $env:RUNNER_TEMP "wintun\wintun.dll") `
+            -Work (Join-Path $env:RUNNER_TEMP "mesh-device")
 
   script-runtime-jsc:
     name: JavaScriptCore script conformance

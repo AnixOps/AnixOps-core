@@ -31,8 +31,28 @@ use crate::local_status;
 use crate::managed::{ManagedMesh, FEATURES};
 
 /// The default state directory, apart from anixcore's so the two never
-/// share an instance ID.
-pub const DEFAULT_STATE_DIR: &str = "/var/lib/anixops-mesh/device";
+/// share an instance ID: `/var/lib/anixops-mesh/device` on Linux,
+/// `/Library/Application Support/AnixOps/mesh/device` on macOS and
+/// `%ProgramData%\AnixOps\Mesh\device` on Windows.
+pub fn default_state_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/Library/Application Support/AnixOps/mesh/device")
+    }
+    #[cfg(windows)]
+    {
+        let program_data =
+            std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
+        PathBuf::from(program_data)
+            .join("AnixOps")
+            .join("Mesh")
+            .join("device")
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        PathBuf::from("/var/lib/anixops-mesh/device")
+    }
+}
 
 /// Exit codes (`docs/deploy/mesh-device.md`, "子命令").
 pub const EXIT_OTHER: u8 = 1;
@@ -117,9 +137,17 @@ impl State {
         self.dir.join("device.lock")
     }
 
-    /// Creates the directory (0700) when it is missing.
+    /// Creates the directory when it is missing: mode 0700, or on Windows
+    /// open to SYSTEM and the administrators only.
     fn prepare(&self, host: &dyn Host) -> Result<(), Exit> {
-        host.create_dir_all(&self.dir, 0o700).map_err(|error| {
+        #[cfg(windows)]
+        let created = {
+            let _ = host;
+            crate::win_security::create_state_dir(&self.dir)
+        };
+        #[cfg(not(windows))]
+        let created = host.create_dir_all(&self.dir, 0o700);
+        created.map_err(|error| {
             Exit::new(
                 EXIT_USAGE,
                 "state",
@@ -570,8 +598,6 @@ async fn serve(
     mut networks: Vec<Network>,
     client: Client,
 ) -> Result<(), Exit> {
-    use tokio::signal::unix::{signal, SignalKind};
-
     let mesh = Arc::new(
         ManagedMesh::open(&state.dir)
             .map_err(|error| Exit::new(EXIT_OTHER, "mesh", error.to_string()))?,
@@ -600,10 +626,8 @@ async fn serve(
         }
         Err(error) => log("status_socket", json!({ "detail": error.to_string() })),
     }
-    let mut terminate = signal(SignalKind::terminate())
-        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
-    let mut interrupt = signal(SignalKind::interrupt())
-        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
+    let stop_requested = stop_signal()?;
+    tokio::pin!(stop_requested);
     let mut config_backoff = Backoff::default();
     let mut report_backoff = Backoff::default();
     let mut next_config = Instant::now();
@@ -685,10 +709,36 @@ async fn serve(
                     next_report = next_report.min(Instant::now());
                 }
             }
-            _ = terminate.recv() => return stop(state, &mesh).await,
-            _ = interrupt.recv() => return stop(state, &mesh).await,
+            () = &mut stop_requested => return stop(state, &mesh).await,
         }
     }
+}
+
+/// Resolves on SIGTERM or SIGINT (launchd and systemd stop with SIGTERM).
+#[cfg(unix)]
+fn stop_signal() -> Result<impl std::future::Future<Output = ()>, Exit> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate())
+        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
+    let mut interrupt = signal(SignalKind::interrupt())
+        .map_err(|error| Exit::new(EXIT_OTHER, "signal", error.to_string()))?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+/// Resolves on Ctrl+C, or when the service manager stops the service.
+#[cfg(windows)]
+fn stop_signal() -> Result<impl std::future::Future<Output = ()>, Exit> {
+    Ok(async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = crate::service_windows::stop_requested() => {}
+        }
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

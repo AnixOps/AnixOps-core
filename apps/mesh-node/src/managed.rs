@@ -42,7 +42,9 @@ use crate::tun::{self, Tun};
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
 pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
 
-/// Interface names: `anixmesh-<n>`, the lowest number free.
+/// Interface names: `anixmesh-<n>`, the lowest number free (the adapter's
+/// name on Windows). macOS names a `utun` interface itself; the name it
+/// gave is the one kept.
 const INTERFACE_PREFIX: &str = "anixmesh-";
 
 /// How long a stopped network may take to close before it is cut off.
@@ -353,6 +355,7 @@ async fn launch(
         )
     })?;
 
+    let name = device.name().to_owned();
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
@@ -380,7 +383,7 @@ async fn launch(
         }
     });
     Ok(Running {
-        interface,
+        interface: name,
         stop: Some(stop),
         native_keys,
         snapshot,
@@ -394,7 +397,9 @@ fn refusal(what: &str, error: &io::Error, busy: FailureCode) -> (FailureCode, St
     let code = match error.kind() {
         io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => busy,
         io::ErrorKind::PermissionDenied => FailureCode::PermissionDenied,
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EBUSY) => busy,
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EPERM) => FailureCode::PermissionDenied,
         _ => FailureCode::StartRefused,
     };
@@ -528,9 +533,17 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
     }
 }
 
+/// Creates `dir` readable by the owner only. On Windows it takes the access
+/// list of the state directory, which is open to SYSTEM and the
+/// administrators only (`docs/deploy/mesh-device.md`).
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
         _ => Ok(()),
     }
