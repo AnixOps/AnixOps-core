@@ -17,6 +17,20 @@
 
 用法错误、数据文件错误和状态目录错误的退出码为 2，标准错误最后一行是一行 JSON：`{"error":"<类别>","detail":"…"}`。`detail` 只给人看。
 
+## `run` 的输出
+
+`run` 的标准输出是逐行的 JSON 对象，每行一个，标准错误同样每行一个 JSON 对象。消费方（Agent、安装器、OpenWrt 软件包、服务日志采集）按对象中出现的键区分种类，**必须忽略不认识的对象和不认识的字段**；新版本只新增对象种类与字段，不删除、不改义已有的（`docs/compatibility-surface.md` §4）。
+
+标准输出：
+
+| 对象 | 何时输出 | 字段 |
+| --- | --- | --- |
+| 转发状态 | 启动时一次，在第一条状态行之前 | `ip_forwarding`：`on`（已为通告子网打开本机转发）、`off`（需要转发但没有打开，原因见 `detail`）、`not_needed`（本节点不通告子网，或不是完整节点）；`detail`：字符串或 `null`，只给人看。Linux 的 `run` 目前不改本机转发，通告子网时为 `off`，`detail` 为 `host forwarding is not implemented on this system yet` |
+| 状态行 | 状态变化时，内容不变不重复输出 | `interface`、`peer_id`、`neighbours`、`reachable`、`duplicate_id`、`static_key`、`not_native`、`system_routes`、`local_networks_read`、`foreign_overlaps`（含义见 `docs/architecture/mesh-status.md`） |
+| 等待公钥 | `managed` 网络的 `native_keys` 不含本机时，代替状态行输出一次 | `state`：`not_joined`；`reason`：`native_keys_pending`；`static_key`：本机静态公钥 |
+
+标准错误：运行中的告警为 `{"warning":"<种类>","detail":"…"}`（例如 `forwarding`、`firewall`、`host_changes`），不影响退出码；退出前的错误按上一节，最后一行为 `{"error":"<类别>","detail":"…"}`。`detail` 一律只给人看，不作解析依据。
+
 ## 检测（Linux）
 
 | 来源 | 方法 |
