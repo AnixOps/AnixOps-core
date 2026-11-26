@@ -466,8 +466,9 @@ impl MeshSettings {
 }
 
 /// Validated settings. Has no `Debug`: it holds the secret. Equality
-/// tells the management API whether a network's settings changed.
-#[derive(Clone, PartialEq, Eq)]
+/// tells the management API whether a network's settings changed; see the
+/// `PartialEq` impl for how the node's own addresses are compared.
+#[derive(Clone)]
 pub struct MeshSettings {
     pub network_name: String,
     pub network_secret: Zeroizing<String>,
@@ -512,6 +513,68 @@ pub struct MeshSettings {
     /// `advertise_subnets`.
     pub external_bridge: Option<ExternalBridge>,
 }
+
+/// Field by field, except that the node's own addresses compare as written:
+/// [`IpNet`] equality compares masked networks, and a new address inside
+/// the same subnet is a changed setting. Every field is named, so a new one
+/// cannot be left out of the comparison.
+impl PartialEq for MeshSettings {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            network_name,
+            network_secret,
+            kind,
+            security,
+            cipher,
+            address,
+            address_v6,
+            role,
+            hostname,
+            mtu,
+            relay,
+            waypoint_relay,
+            listen,
+            peers,
+            accept_subnets,
+            advertise_subnets,
+            route_policy,
+            system_routes,
+            paths,
+            native_keys,
+            private_key,
+            external_bridge,
+            host_groups,
+            instance_id,
+        } = self;
+        let exact = |net: &IpNet| (net.address(), net.prefix());
+        *network_name == other.network_name
+            && *network_secret == other.network_secret
+            && *kind == other.kind
+            && *security == other.security
+            && *cipher == other.cipher
+            && exact(address) == exact(&other.address)
+            && address_v6.as_ref().map(exact) == other.address_v6.as_ref().map(exact)
+            && *role == other.role
+            && *hostname == other.hostname
+            && *mtu == other.mtu
+            && *relay == other.relay
+            && *waypoint_relay == other.waypoint_relay
+            && *listen == other.listen
+            && *peers == other.peers
+            && *accept_subnets == other.accept_subnets
+            && *advertise_subnets == other.advertise_subnets
+            && *route_policy == other.route_policy
+            && *system_routes == other.system_routes
+            && *paths == other.paths
+            && *native_keys == other.native_keys
+            && *private_key == other.private_key
+            && *external_bridge == other.external_bridge
+            && *host_groups == other.host_groups
+            && *instance_id == other.instance_id
+    }
+}
+
+impl Eq for MeshSettings {}
 
 impl MeshSettings {
     /// A managed network waits, without links, interface or routes, while
@@ -1591,6 +1654,20 @@ mod tests {
         let legacy = validate(base()).unwrap();
         assert!(!legacy.waits_for_native_keys(&own));
         assert!(legacy.admits(&own));
+    }
+
+    #[test]
+    fn a_new_address_in_the_same_subnet_is_a_changed_setting() {
+        let first = validate(base()).unwrap();
+        assert!(first == validate(base()).unwrap());
+        let moved = validate(with("node.address", json!("10.144.144.6/24"))).unwrap();
+        assert_eq!(first.virtual_subnets(), moved.virtual_subnets());
+        assert!(first != moved);
+
+        let v6 = |address: &str| validate(with("node.address_v6", json!(address))).unwrap();
+        assert!(v6("fd00:aa::5/64") == v6("fd00:aa::5/64"));
+        assert!(v6("fd00:aa::5/64") != v6("fd00:aa::6/64"));
+        assert!(v6("fd00:aa::5/64") != first);
     }
 
     fn group(cidr: &str) -> Value {

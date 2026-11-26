@@ -14,7 +14,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::backbone::config::{BackboneSettings, LinkConfig};
 use crate::backbone::engine::{RouteEvent, Status as BackboneEngineStatus};
@@ -324,6 +324,32 @@ impl fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
+/// How this node routes an accepted subnet that overlaps one of its own
+/// networks (`mesh_set_subnet_route`, spec §15.4): `local` (the default)
+/// keeps it out of the mesh, `mesh` routes and installs it all the same.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubnetRoute {
+    Local,
+    Mesh,
+}
+
+/// Why a subnet route override was not taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideError {
+    /// No network has the tag (answers 404).
+    UnknownNetwork,
+    /// The override is refused, for example past [`MAX_ROUTE_OVERRIDES`]
+    /// (answers 400).
+    Invalid(String),
+    /// It could not be saved (answers 500); nothing changed.
+    Failed(String),
+}
+
+/// Subnets one network may route through the mesh against the overlap
+/// rule.
+pub const MAX_ROUTE_OVERRIDES: usize = 256;
+
 /// A boxed future, so [`MeshControl`] stays object safe.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -351,6 +377,25 @@ pub trait MeshControl: Send + Sync {
         networks: Vec<ManagedNetwork>,
         backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>>;
+
+    /// Saves a local override for the network `tag` (spec §15.4): with
+    /// [`SubnetRoute::Mesh`] the accepted subnet equal to `subnet` is routed
+    /// and installed although it overlaps a network of this machine;
+    /// [`SubnetRoute::Local`] withdraws that. It outlives restarts and the
+    /// network's configuration, which it does not change.
+    fn set_subnet_route(
+        &self,
+        tag: String,
+        subnet: IpNet,
+        route: SubnetRoute,
+    ) -> BoxFuture<'_, Result<(), OverrideError>> {
+        let _ = (tag, subnet, route);
+        Box::pin(async {
+            Err(OverrideError::Invalid(
+                "subnet route overrides are not supported".to_owned(),
+            ))
+        })
+    }
 }
 
 fn interface_address<S: Serializer>(address: &Option<IpNet>, s: S) -> Result<S::Ok, S::Error> {

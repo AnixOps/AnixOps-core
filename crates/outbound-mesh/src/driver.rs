@@ -378,15 +378,21 @@ pub async fn run(
         events,
         next_conn: Arc::new(AtomicU64::new(1)),
     };
-    let mut tasks = Vec::new();
+    // Aborted however `run` ends, even when its own task is aborted, so
+    // that the listening sockets are freed.
+    let mut tasks = AbortAll(Vec::new());
     for listener in listeners.tcp {
-        tasks.push(tokio::spawn(accept_tcp(listener, shared.clone())));
+        tasks
+            .0
+            .push(tokio::spawn(accept_tcp(listener, shared.clone())));
     }
     for socket in listeners.udp {
-        tasks.push(tokio::spawn(serve_udp(socket, shared.clone())));
+        tasks
+            .0
+            .push(tokio::spawn(serve_udp(socket, shared.clone())));
     }
     for (index, peer) in peers.into_iter().enumerate() {
-        tasks.push(tokio::spawn(dial(
+        tasks.0.push(tokio::spawn(dial(
             peer,
             index,
             shared.clone(),
@@ -578,9 +584,7 @@ pub async fn run(
     for open in conns.values() {
         open.closer.notify_one();
     }
-    for task in tasks {
-        task.abort();
-    }
+    drop(tasks);
     Ok(())
 }
 
@@ -838,6 +842,17 @@ async fn run_tcp(
     write.abort();
     let _ = shared.events.send(Event::Closed { conn }).await;
     opened.elapsed()
+}
+
+/// Aborts its tasks when dropped.
+struct AbortAll(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortAll {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// How long a dial task waits before dialing its peer again.
@@ -1405,6 +1420,66 @@ mod tests {
         sleep(Duration::from_secs(2)).await;
         assert_eq!(b.snapshots.borrow().system_routes, [subnet]);
         assert!(b.snapshots.borrow().local_networks_read);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_driver_frees_its_listening_port() {
+        let mut server = settings("10.144.0.1/24", "full");
+        server.peers.clear();
+        server.listen = vec![ListenConfig {
+            transport: Transport::Tcp,
+            port: 0,
+            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        }];
+        let listeners = Listeners::bind(&server).await.unwrap();
+        let address = listeners.local_addrs().unwrap()[0].1;
+        let rng = SystemRandom::new();
+        let (_to_mesh, from_interface) = mpsc::channel(16);
+        let (to_interface, _from_mesh) = mpsc::channel(16);
+        let (snapshot_tx, mut snapshots) = watch::channel(Snapshot::default());
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_local, local_networks) = watch::channel(Some(Vec::new()));
+        let (_keys, native_keys) = watch::channel(None);
+        let (_dns, dns) = watch::channel(DnsSettings::default());
+        let (_groups, host_groups) = watch::channel(Vec::new());
+        let (_overrides, route_overrides) = watch::channel(Vec::new());
+        let (_foreign, foreign_routes) = watch::channel(Vec::new());
+        let task = tokio::spawn(run(
+            server,
+            KeyPair::generate(&rng).unwrap(),
+            listeners,
+            Channels {
+                from_interface,
+                to_interface,
+                snapshots: snapshot_tx,
+                local_networks,
+                native_keys,
+                dns,
+                host_groups,
+                route_overrides,
+                foreign_routes,
+                shutdown,
+                border: None,
+            },
+        ));
+        // Running: the first snapshot is out.
+        timeout(Duration::from_secs(5), snapshots.changed())
+            .await
+            .expect("started")
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        // The accept loop went with it: the port can be bound again.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if TcpListener::bind(address).await.is_ok() {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the port is free again");
     }
 
     #[tokio::test]

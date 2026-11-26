@@ -636,9 +636,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     drop(instance);
     tokio::spawn(pump(weak.clone(), wake, run, from_driver));
     let result = driver::run(settings, key, listeners, channels).await;
-    drop(foreign_routes_tx);
-    drop(dns_tx);
-    drop(host_groups_tx);
+    drop((foreign_routes_tx, dns_tx, host_groups_tx));
     // The driver only ends on its own after an error: a shutdown comes from
     // dropping the instance, and then nobody is left to tell.
     let _ = result;
