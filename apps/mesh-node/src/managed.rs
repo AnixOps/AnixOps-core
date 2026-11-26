@@ -12,7 +12,12 @@
 //!   `network.name`, readable by the owner only), unless the configuration
 //!   carries `node.private_key`. Keys stay when a network leaves the list,
 //!   so that taking it back keeps the key the panel already lists.
+//!
+//! A border node's request also carries a `backbone` section; its backbone
+//! runs beside the networks and meets its region network through that
+//! network's hub ([`crate::border`]).
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -23,8 +28,9 @@ use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
-    Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedNetwork, ManagedNetworkStatus,
-    ManagedPeer, ManagedStatus, MeshControl, NetworkFailure, NetworkStaticKey,
+    Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedBackbone, ManagedNetwork,
+    ManagedNetworkStatus, ManagedPeer, ManagedStatus, MeshControl, NetworkFailure,
+    NetworkStaticKey,
 };
 use outbound_mesh::MeshSettings;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -32,6 +38,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::border::{BorderInstance, Hub, RegionView};
 use crate::serve::{self, Failure};
 use crate::tun::{self, Tun};
 
@@ -39,7 +46,9 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
+/// `mesh_backbone`: `PUT /v1/mesh` takes the top-level `backbone` section
+/// and `GET /v1/mesh` gives its status (spec §17.3, appendix B and C).
+pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_backbone"];
 
 /// Interface names: `anixmesh-<n>`, the lowest number free.
 const INTERFACE_PREFIX: &str = "anixmesh-";
@@ -56,6 +65,9 @@ struct Inner {
     dir: PathBuf,
     instance_id: String,
     networks: Mutex<Vec<Instance>>,
+    /// One per network of the last request, by tag.
+    hubs: Mutex<BTreeMap<String, Arc<Hub>>>,
+    backbone: Mutex<Option<BorderInstance>>,
 }
 
 struct Instance {
@@ -100,6 +112,8 @@ impl ManagedMesh {
                 dir,
                 instance_id,
                 networks: Mutex::new(Vec::new()),
+                hubs: Mutex::new(BTreeMap::new()),
+                backbone: Mutex::new(None),
             }),
         })
     }
@@ -124,7 +138,66 @@ impl Inner {
         }
     }
 
-    async fn replace(&self, wanted: Vec<ManagedNetwork>) -> ManagedStatus {
+    async fn replace(
+        &self,
+        wanted: Vec<ManagedNetwork>,
+        backbone: Option<ManagedBackbone>,
+    ) -> ManagedStatus {
+        // The backbone first: one that stays keeps running through the
+        // network changes, the others stop before their network does.
+        let current_backbone = lock(&self.backbone).take();
+        let kept_backbone = match current_backbone {
+            Some(mut running) => {
+                if backbone.as_ref().is_some_and(|next| running.keep(next)) {
+                    Some(running)
+                } else {
+                    let hub = lock(&self.hubs).get(&running.tag).cloned();
+                    running.stop(hub.as_deref()).await;
+                    None
+                }
+            }
+            None => None,
+        };
+        let backbone = if kept_backbone.is_some() {
+            None
+        } else {
+            backbone
+        };
+        let tags: Vec<String> = wanted.iter().map(|network| network.tag.clone()).collect();
+        {
+            let mut hubs = lock(&self.hubs);
+            for tag in &tags {
+                hubs.entry(tag.clone()).or_insert_with(Hub::new);
+            }
+        }
+        let mut status = self.replace_networks(wanted).await;
+        {
+            let mut hubs = lock(&self.hubs);
+            hubs.retain(|tag, hub| {
+                let stays = tags.contains(tag);
+                if !stays {
+                    hub.withdraw();
+                }
+                stays
+            });
+        }
+        let started = backbone.map(|backbone| {
+            let tag = format!(
+                "{}{}",
+                outbound_mesh::status::TAG_PREFIX,
+                backbone.settings.region
+            );
+            // The management API checked that the region network is in the
+            // request, so its hub exists.
+            let hub = lock(&self.hubs).get(&tag).cloned().unwrap_or_else(Hub::new);
+            BorderInstance::start(backbone, &hub)
+        });
+        *lock(&self.backbone) = kept_backbone.or(started);
+        status.backbone = lock(&self.backbone).as_ref().map(BorderInstance::status);
+        status
+    }
+
+    async fn replace_networks(&self, wanted: Vec<ManagedNetwork>) -> ManagedStatus {
         let mut current: Vec<Instance> = std::mem::take(&mut *lock(&self.networks));
         let mut next: Vec<Option<Instance>> = Vec::with_capacity(wanted.len());
         let mut starts = Vec::new();
@@ -155,6 +228,9 @@ impl Inner {
         // interface name are free for the networks that start.
         stopping.append(&mut current);
         for instance in stopping {
+            if let Some(hub) = lock(&self.hubs).get(&instance.tag) {
+                hub.publish_region(RegionView::default());
+            }
             stop(instance).await;
         }
         let mut taken: Vec<String> = next
@@ -199,7 +275,8 @@ impl Inner {
             let detail = waiting_detail(&settings);
             return instance(settings, State::Waiting(detail));
         }
-        match launch(&settings, key, taken).await {
+        let hub = lock(&self.hubs).get(&tag).cloned().unwrap_or_else(Hub::new);
+        match launch(&settings, key, taken, hub).await {
             Ok(running) => {
                 taken.push(running.interface.clone());
                 instance(settings, State::Running(running))
@@ -222,6 +299,7 @@ impl Inner {
                     })
                 })
                 .collect(),
+            backbone: lock(&self.backbone).as_ref().map(BorderInstance::status),
         }
     }
 }
@@ -240,10 +318,11 @@ impl MeshControl for ManagedMesh {
     fn apply(
         &self,
         networks: Vec<ManagedNetwork>,
+        backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
-            tokio::spawn(async move { inner.replace(networks).await })
+            tokio::spawn(async move { inner.replace(networks, backbone).await })
                 .await
                 .map_err(|error| ApplyError::Failed(format!("mesh apply: {error}")))
         })
@@ -323,6 +402,7 @@ async fn launch(
     settings: &MeshSettings,
     key: KeyPair,
     taken: &[String],
+    hub: Arc<Hub>,
 ) -> Result<Running, (FailureCode, String)> {
     let (address, address_v6) = tun::addresses(
         settings.address.address(),
@@ -362,6 +442,8 @@ async fn launch(
         let until = async {
             let _ = stopped.await;
         };
+        let border = hub.driver_side();
+        let observed = settings.clone();
         let result = serve::serve_with(
             settings,
             key,
@@ -369,7 +451,9 @@ async fn launch(
             device,
             until,
             keys,
+            Some(border),
             move |next, _| {
+                hub.publish_region(RegionView::of(&observed, next));
                 snapshots.send_replace(next.clone());
             },
         )
@@ -612,10 +696,13 @@ mod tests {
         let mesh = ManagedMesh::open(&dir).expect("open");
         let waiting = settings();
         let status = mesh
-            .apply(vec![ManagedNetwork {
-                tag: "mesh-cn".into(),
-                settings: waiting,
-            }])
+            .apply(
+                vec![ManagedNetwork {
+                    tag: "mesh-cn".into(),
+                    settings: waiting,
+                }],
+                None,
+            )
             .await
             .unwrap();
         let network = &status.networks[0];
@@ -632,8 +719,60 @@ mod tests {
         assert_eq!(status.instance_id, mesh.instance_id());
         assert_eq!(mesh.status(), status);
 
-        let stopped = mesh.apply(Vec::new()).await.unwrap();
+        assert_eq!(status.backbone, None);
+
+        let stopped = mesh.apply(Vec::new(), None).await.unwrap();
         assert!(stopped.networks.is_empty() && stopped.static_keys.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn backbone(kind: &str) -> ManagedBackbone {
+        let config = json!({
+            "id": 11,
+            "region": "cn",
+            "members": [
+                { "id": 11, "region": "cn", "link": { "kind": kind } },
+                { "id": 21, "region": "ap", "link": { "kind": kind, "params": { "key": "SECRET-VALUE" } } }
+            ]
+        });
+        let config: outbound_mesh::backbone::BackboneConfig =
+            serde_json::from_value(config).unwrap();
+        ManagedBackbone {
+            settings: config.validate().unwrap(),
+            links: config.links(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backbone_without_its_link_kind_reports_why_and_the_network_stays() {
+        let dir = temp_dir("backbone");
+        let mesh = ManagedMesh::open(&dir).expect("open");
+        let network = || ManagedNetwork {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+        };
+        let status = mesh
+            .apply(vec![network()], Some(backbone("not-registered")))
+            .await
+            .unwrap();
+        assert_eq!(status.networks.len(), 1);
+        let backbone_status = status.backbone.clone().expect("backbone status");
+        assert!(!backbone_status.running);
+        assert_eq!(backbone_status.status.id, 11);
+        assert_eq!(backbone_status.status.region, "cn");
+        let failure = backbone_status.failure.expect("failure");
+        assert_eq!(failure.code, "backbone_kind_unavailable");
+        assert_eq!(failure.detail, "backbone.members[0].link.kind");
+        let text = serde_json::to_string(&status).unwrap();
+        assert!(!text.contains("SECRET-VALUE"), "{text}");
+        assert_eq!(mesh.status(), status);
+        assert!(FEATURES.contains(&"mesh_backbone"));
+
+        // Without the section the backbone goes; the network stays.
+        let status = mesh.apply(vec![network()], None).await.unwrap();
+        assert_eq!(status.backbone, None);
+        assert_eq!(status.networks.len(), 1);
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

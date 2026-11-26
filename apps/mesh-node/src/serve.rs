@@ -230,6 +230,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             device,
             stop,
             native_keys,
+            None,
             |snapshot, name| {
                 let line = status_line(snapshot, name);
                 if line != last {
@@ -276,7 +277,9 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `native_keys` carries a new native key list into the running driver.
+/// `native_keys` carries a new native key list into the running driver;
+/// `border` connects a border node's network to its backbone.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_with(
     settings: MeshSettings,
     static_key: KeyPair,
@@ -284,6 +287,7 @@ pub(crate) async fn serve_with(
     device: Tun,
     until: impl std::future::Future<Output = ()>,
     native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    border: Option<driver::Border>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
     let mtu = usize::from(settings.mtu);
@@ -307,6 +311,7 @@ pub(crate) async fn serve_with(
             local_networks,
             native_keys,
             shutdown,
+            border,
         },
     ));
     // Room for one packet larger than the MTU, so that an oversized one is

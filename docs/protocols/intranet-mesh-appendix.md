@@ -178,9 +178,9 @@ LinkCost：
 | `id` | u32 | 本节点骨干 ID，非 0，必须出现在 `members` 中 |
 | `region` | string | 区域 ID 规则；必须等于 `members` 中本节点一项的区域；同一请求体的 `networks` 中必须有 `tag` 为 `mesh-<region>` 的网络，它就是本区域网络 |
 | `members` | array | 2–256 项；`id` 不重复；每个区域至少一项。区域少于 2 个边界节点时只告警（规格 §15.6 要求每区域至少 2 个，属部署要求） |
-| `members[].link` | object | `kind` 为已注册的骨干链路实现名，`params` 原样交给实现；本节点一项的 `link` 是本端监听参数 |
+| `members[].link` | object | `kind` 为已注册的骨干链路实现名，1–32 位小写字母、数字或连字符；`params` 原样交给实现，缺省为 `null`。到每个其他成员的链路用该成员一项的 `link` 打开（拨号还是接收由 `params` 决定），链路 ID 为 `backbone-<较小 ID>-<较大 ID>`，两端相同；本节点一项的 `link` 只检查 `kind`，不单独打开 |
 
-`kind` 未注册（开源构建没有任何实现）时，`backbone` 不运行，状态给出 `failure.code = backbone_kind_unavailable`，本区域网络照常运行；这不算请求无效。字段缺失、未知字段或违反上表约束时，整个请求体返回 400，不应用（与 `networks` 相同）。
+`kind` 未注册（开源构建没有任何实现）时，`backbone` 不运行，状态给出 `failure.code = backbone_kind_unavailable`，本区域网络照常运行；这不算请求无效。链路实现拒绝某项 `params` 时同样不运行，`failure.code = backbone_link_refused`，`detail` 为字段路径加实现给出的固定原因。字段缺失、未知字段或违反上表约束时，整个请求体返回 400，不应用（与 `networks` 相同）。
 
 **链路参数的保密**：`members[].link.params` 由链路实现解释，可能含密钥、证书或私钥。
 
@@ -220,19 +220,20 @@ LinkCost：
 | 字段 | 内容 |
 | --- | --- |
 | `id`、`region` | 本节点骨干 ID 与区域 |
-| `running`、`failure` | 骨干是否在运行；`failure` 为 `null` 或 `{ "code", "detail" }`，`code` 如 `backbone_kind_unavailable` |
+| `running`、`failure` | 骨干是否在运行；`failure` 为 `null` 或 `{ "code", "detail" }`，`code` 为 `backbone_kind_unavailable`、`backbone_link_refused` 或 `backbone_stopped`（运行中意外退出），`detail` 只含字段路径与固定原因 |
 | `links[]` | 每个成员一项：`peer`、`region`、`up`、`forward_secrecy`、`transport`、`rtt_ms`、`loss_ppm`、`jitter_ms`、`cost`（无穷大时为 `null`）、`usable`（满足 A.6 第 1 条且已稳定 10 秒） |
 | `regions[]` | 每个已知区域一项：`region`、`prefixes`、`borders[]`（`id`、`reachable`、`expires_in_s`） |
-| `routes[]` | 每个其他区域的汇总网段一项：`prefix`、`region`、`egress`、`via`（经中转时为中转节点 ID，直达为 null）、`cost`、`since`（本路径选定的时间） |
+| `routes[]` | 每个其他区域的汇总网段一项：`prefix`、`region`、`egress`、`via`（经中转时为中转节点 ID，直达为 null）、`cost`、`since_s`（本路径选定至今的秒数） |
 | `withdrawn` | bool：本节点当前是否因与骨干全部失联而撤回了汇总网段（规格 §15.6 第 6 条） |
-| `counters` | 丢弃计数：`no_route`、`access`、`relay_unreachable`、`inconsistent`、`not_for_us`、`bad_message`、`unknown_type`、`link_send` |
+| `counters` | 丢弃计数：`no_route`、`access`、`relay_unreachable`、`inconsistent`、`not_for_us`、`bad_message`、`unknown_type`、`link_send`，以及超出每秒 50 条而未列入 `events[]` 的事件数 `events_dropped` |
+| `events[]` | 最近至多 64 条切换事件（C.2），旧的在前，每条另带 `seq`：从骨干启动时刻的 Unix 毫秒数起逐条加一，重启后仍递增，agent 按 `seq` 只上报新的 |
 | `alerts[]` | 当前未撤销的告警 `{ "code", "peer", "detail" }`，`code` 见 C.2；不适用时 `peer` 为 0、`detail` 为空串 |
 
 状态中不出现链路参数（`params`）、密钥或证书。Agent 把 `backbone` 原样随节点状态上报面板。
 
 ### C.2 切换事件
 
-每次路径切换（规格 §17.3.5）产生一条事件，经组网状态的事件队列上报 agent：
+每次路径切换（规格 §17.3.5）产生一条事件，经 C.1 的 `events[]` 交给 agent：
 
 | 字段 | 内容 |
 | --- | --- |

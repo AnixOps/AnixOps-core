@@ -123,10 +123,30 @@ pub struct Status {
     pub alerts: Vec<Alert>,
 }
 
+impl Status {
+    /// The status of a backbone that does not run: nothing known, the
+    /// summaries withdrawn.
+    pub fn idle(id: BackboneId, region: &RegionId) -> Self {
+        Self {
+            id,
+            region: region.to_string(),
+            links: Vec::new(),
+            regions: Vec::new(),
+            routes: Vec::new(),
+            withdrawn: true,
+            counters: Counters::default(),
+            alerts: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LinkStatus {
     pub peer: BackboneId,
     pub region: String,
+    /// The link's transport name, filled in by the runtime from the link's
+    /// own report; empty until then.
+    pub transport: String,
     pub up: bool,
     pub forward_secrecy: bool,
     pub rtt_ms: Option<f64>,
@@ -768,6 +788,7 @@ impl Backbone {
                         .region_of(*id)
                         .map(ToString::to_string)
                         .unwrap_or_default(),
+                    transport: String::new(),
                     up: t.report().up,
                     forward_secrecy: t.report().forward_secrecy,
                     rtt_ms: metrics.map(|m| m.rtt_ms),

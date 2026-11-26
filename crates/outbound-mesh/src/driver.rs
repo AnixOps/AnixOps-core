@@ -127,6 +127,9 @@ pub struct Snapshot {
     pub overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
+    /// The other regions' summary prefixes this border node carries
+    /// ([`Border`]); empty on other nodes.
+    pub border: Vec<IpNet>,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
@@ -228,6 +231,21 @@ pub struct Channels {
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
     /// Stops the node when it turns true.
     pub shutdown: watch::Receiver<bool>,
+    /// A border node's side of the backbone; `None` on other nodes.
+    pub border: Option<Border>,
+}
+
+/// What a border node exchanges with the backbone (spec §15.6, §17.3).
+pub struct Border {
+    /// The other regions' summary prefixes to carry: advertised to the
+    /// members, packets to them go to `to_backbone`. Empty withdraws them.
+    pub prefixes: watch::Receiver<Vec<IpNet>>,
+    /// IP packets from this network for another region.
+    pub to_backbone: mpsc::Sender<Vec<u8>>,
+    /// IP packets the backbone delivered for this network; their sources
+    /// must lie in `prefixes`. Shared, so that the channel outlives a
+    /// restart of either side: the running driver holds the lock.
+    pub from_backbone: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
 }
 
 /// Runs one network until `shutdown` turns true.
@@ -244,7 +262,25 @@ pub async fn run(
         mut local_networks,
         mut native_keys,
         mut shutdown,
+        border,
     } = channels;
+    // Without a border the branches below never fire; the senders are kept
+    // so that the receivers stay open.
+    let (mut border_prefixes, to_backbone, from_backbone, _no_border) = match border {
+        Some(border) => (
+            border.prefixes,
+            Some(border.to_backbone),
+            border.from_backbone,
+            None,
+        ),
+        None => {
+            let (prefixes_tx, prefixes) = watch::channel(Vec::new());
+            let (packets_tx, packets) = mpsc::channel(1);
+            let packets = Arc::new(tokio::sync::Mutex::new(packets));
+            (prefixes, None, packets, Some((prefixes_tx, packets_tx)))
+        }
+    };
+    let mut from_backbone = from_backbone.lock_owned().await;
     native_keys.mark_unchanged();
     let rng = SystemRandom::new();
     let started = Instant::now();
@@ -252,6 +288,10 @@ pub async fn run(
     let mut node = Node::new(settings, static_key, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
     node.set_local_networks(&local_networks.borrow_and_update());
+    let initial = border_prefixes.borrow_and_update().clone();
+    if !initial.is_empty() {
+        node.set_border(&initial, started);
+    }
     if node.waits_for_native_keys() {
         // No listening, dialling or packets until the list holds this
         // node; the caller should not have bound listeners either.
@@ -305,6 +345,17 @@ pub async fn run(
             }
             Ok(()) = local_networks.changed() => {
                 node.set_local_networks(&local_networks.borrow_and_update());
+            }
+            Ok(()) = border_prefixes.changed() => {
+                let prefixes = border_prefixes.borrow_and_update().clone();
+                node.set_border(&prefixes, Instant::now());
+                publish(&snapshots, snapshot(&node));
+            }
+            Some(packet) = from_backbone.recv() => {
+                // Refusals are counted by the node.
+                let now = Instant::now();
+                let _ = node.send_from_backbone(&packet, now);
+                node.wake(&rng, now);
             }
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
@@ -412,7 +463,13 @@ pub async fn run(
                 publish(&snapshots, snapshot(&node));
             }
         }
-        carry_out(&mut node, &mut conns, &mut budget, &to_interface);
+        carry_out(
+            &mut node,
+            &mut conns,
+            &mut budget,
+            &to_interface,
+            to_backbone.as_ref(),
+        );
     }
 
     for open in conns.values() {
@@ -457,6 +514,7 @@ fn snapshot(node: &Node) -> Snapshot {
             .into_iter()
             .map(|(peer, address)| (peer.0, address))
             .collect(),
+        border: node.route_table().border().to_vec(),
     }
 }
 
@@ -536,6 +594,7 @@ fn carry_out(
     conns: &mut HashMap<ConnId, Open>,
     budget: &mut HandshakeBudget,
     to_interface: &mpsc::Sender<Vec<u8>>,
+    to_backbone: Option<&mpsc::Sender<Vec<u8>>>,
 ) {
     while let Some(action) = node.poll_action() {
         match action {
@@ -547,6 +606,12 @@ fn carry_out(
             }
             Action::Deliver(packet) => {
                 let _ = to_interface.try_send(packet);
+            }
+            Action::ToBackbone(packet) => {
+                // A full queue drops the packet, like a full link.
+                if let Some(to_backbone) = to_backbone {
+                    let _ = to_backbone.try_send(packet);
+                }
             }
             Action::Close { conn, .. } => {
                 if let Some(open) = conns.remove(&conn) {
@@ -910,6 +975,7 @@ mod tests {
                 local_networks,
                 native_keys,
                 shutdown,
+                border: None,
             },
         ));
         Running {

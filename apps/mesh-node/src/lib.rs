@@ -7,12 +7,15 @@
 //! node itself (`run`, Linux only) drives the mesh module's socket driver
 //! over a TUN interface ([`serve`], [`tun`]). The kernel's management API
 //! runs the networks a node agent sends through [`managed`] the same way,
-//! one interface each.
+//! one interface each, and on a border node the backbone between regions
+//! (`border`).
 //!
 //! Nothing here names another program. What identifies one, and how its
 //! configuration is written, comes from a profile file maintained in the
 //! deployment layer (see [`profile`] and `docs/deploy/mesh-node.md`).
 
+#[cfg(target_os = "linux")]
+mod border;
 pub mod cmdline;
 pub mod convert;
 pub mod detect;

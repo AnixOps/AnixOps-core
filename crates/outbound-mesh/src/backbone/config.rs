@@ -1,14 +1,15 @@
 //! The border node's `backbone` section (appendix B) and its validation.
 //!
-//! `members[].link` is read by the caller: its `params` are opaque to the
-//! mesh module and may hold secrets, so this module never stores, prints or
-//! echoes them. Errors name a field path and a rule, never a value.
+//! `members[].link` is handed to the caller ([`BackboneConfig::links`]):
+//! its `params` are opaque to the mesh module and may hold secrets, so
+//! [`LinkConfig`] has no `Debug` and nothing here prints or echoes them.
+//! Errors name a field path and a rule, never a value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::region::{parse_summary_prefix, RegionId};
 use super::BackboneId;
@@ -19,6 +20,8 @@ use crate::scope;
 pub const MAX_MEMBERS: usize = 256;
 /// Most extra prefixes (appendix B.2).
 pub const MAX_EXTRA_PREFIXES: usize = 256;
+/// Longest `members[].link.kind`.
+pub const MAX_KIND_LEN: usize = 32;
 /// Most `deny_link` pairs (appendix B.3).
 pub const MAX_DENY_LINK: usize = 256;
 /// Most access rules, and most prefixes on either side of one (B.4).
@@ -47,8 +50,18 @@ pub struct BackboneConfig {
 pub struct MemberConfig {
     pub id: BackboneId,
     pub region: String,
-    /// Read by the caller (link kind and opaque params); skipped here.
-    pub link: IgnoredAny,
+    /// Read by the caller ([`BackboneConfig::links`]).
+    pub link: LinkConfig,
+}
+
+/// `members[].link`: a registered link kind and its opaque parameters. No
+/// `Debug`: `params` may hold keys.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkConfig {
+    pub kind: String,
+    #[serde(default)]
+    pub params: Value,
 }
 
 #[derive(Default, Deserialize)]
@@ -145,7 +158,16 @@ fn access_prefix(text: &str, path: String) -> Result<IpNet, ConfigError> {
 }
 
 impl BackboneConfig {
-    pub fn validate(self) -> Result<BackboneSettings, ConfigError> {
+    /// Every member's link in the order of `members`, this node's own
+    /// entry included, so that errors can name `members[i]`.
+    pub fn links(&self) -> Vec<(BackboneId, LinkConfig)> {
+        self.members
+            .iter()
+            .map(|member| (member.id, member.link.clone()))
+            .collect()
+    }
+
+    pub fn validate(&self) -> Result<BackboneSettings, ConfigError> {
         if self.id == 0 {
             return Err(err("backbone.id", "must not be 0"));
         }
@@ -159,6 +181,18 @@ impl BackboneConfig {
                 return Err(err(format!("backbone.members[{i}].id"), "must not be 0"));
             }
             let member_region = region_at(&member.region, format!("backbone.members[{i}].region"))?;
+            let kind = &member.link.kind;
+            if kind.is_empty()
+                || kind.len() > MAX_KIND_LEN
+                || !kind
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                return Err(err(
+                    format!("backbone.members[{i}].link.kind"),
+                    "must be 1 to 32 lowercase letters, digits or '-'",
+                ));
+            }
             if members.insert(member.id, member_region).is_some() {
                 return Err(err(format!("backbone.members[{i}].id"), "is duplicated"));
             }
@@ -412,7 +446,35 @@ mod tests {
     #[test]
     fn member_count_bounds() {
         let mut v = base();
-        v["members"] = json!([{ "id": 11, "region": "eu", "link": {} }]);
+        v["members"] = json!([{ "id": 11, "region": "eu", "link": { "kind": "k" } }]);
         assert_eq!(parse(v).unwrap_err().path, "backbone.members");
+    }
+
+    #[test]
+    fn links_keep_kind_and_params() {
+        let config: BackboneConfig = serde_json::from_value(base()).unwrap();
+        config.validate().unwrap();
+        let links = config.links();
+        let ids: Vec<BackboneId> = links.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [11, 12, 21, 31]);
+        assert_eq!(links[0].1.kind, "k");
+        assert_eq!(links[0].1.params["key"], "SECRET-VALUE");
+        assert!(links[1].1.params.is_null());
+    }
+
+    #[test]
+    fn link_kind_is_checked_without_echo() {
+        for kind in [json!(""), json!("Bad Kind"), json!("x".repeat(33))] {
+            let mut v = base();
+            v["members"][1]["link"]["kind"] = kind;
+            let error = parse(v).unwrap_err();
+            assert_eq!(error.path, "backbone.members[1].link.kind");
+        }
+        let mut v = base();
+        v["members"][1]["link"] = json!({ "params": {} });
+        assert!(serde_json::from_value::<BackboneConfig>(v).is_err());
+        let mut v = base();
+        v["members"][1]["link"]["extra"] = json!(1);
+        assert!(serde_json::from_value::<BackboneConfig>(v).is_err());
     }
 }
