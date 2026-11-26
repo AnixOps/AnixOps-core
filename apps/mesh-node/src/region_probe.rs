@@ -173,10 +173,19 @@ impl RegionRuntime {
                         });
                     }
                     _ => {
+                        // The first wait is fixed here so `next_at` is in the
+                        // status as soon as the `PUT` returns.
+                        let wait = {
+                            let mut m = lock(&self.measured);
+                            let wait =
+                                first_delay(&m.history, input.current.as_deref(), unix_now());
+                            m.next_at = Some(unix_now() + wait);
+                            wait
+                        };
                         let (sender, receiver) = watch::channel(input);
                         let measured = Arc::clone(&self.measured);
                         let dir = self.dir.clone();
-                        self.task = Some(tokio::spawn(measure_loop(dir, measured, receiver)));
+                        self.task = Some(tokio::spawn(measure_loop(dir, measured, receiver, wait)));
                         self.input = Some(sender);
                     }
                 }
@@ -320,12 +329,10 @@ async fn measure_loop(
     dir: PathBuf,
     measured: Arc<Mutex<Measured>>,
     mut input: watch::Receiver<Input>,
+    first_wait: u64,
 ) {
     let mut current = input.borrow().current.clone();
-    let mut wait = {
-        let m = lock(&measured);
-        first_delay(&m.history, current.as_deref(), unix_now())
-    };
+    let mut wait = first_wait;
     loop {
         lock(&measured).next_at = Some(unix_now() + wait);
         // A node without a region waits for a region: when one arrives the
