@@ -53,6 +53,8 @@ struct Inner {
     /// The engine stopped; nothing starts any more.
     closed: bool,
     local_networks: Option<Vec<IpNet>>,
+    /// The `tunnel.routes` last reported and their `routesVersion`.
+    routes: (Vec<IpNet>, u64),
 }
 
 /// What [`Registry::network`] reports about one network.
@@ -60,8 +62,12 @@ struct Inner {
 pub struct NetworkState {
     pub settings: MeshSettings,
     pub joined: bool,
+    /// Kept by `mesh_save_network`.
+    pub saved: bool,
     pub instance: Option<Arc<Instance>>,
     pub failure: Option<Failure>,
+    /// `mesh_set_subnet_route` overrides.
+    pub route_overrides: Vec<IpNet>,
 }
 
 /// Why a command could not change the registry.
@@ -74,6 +80,28 @@ pub enum RegistryError {
     /// `mesh_save_network` of a `managed` network without
     /// `node.private_key` (`mesh-module.md`): refused, not stored.
     PrivateKeyRequired,
+    /// `node.instance_id` differs from that of another network: one device
+    /// has one instance ID (`mesh-module.md`).
+    InstanceIdMismatch,
+}
+
+impl RegistryError {
+    /// The `error.code` and `error.detail` of a refused command
+    /// (`mesh-status.md`, 命令).
+    pub fn answer(self) -> (&'static str, &'static str) {
+        match self {
+            Self::NotFound => ("not_found", "no saved mesh network of that name"),
+            Self::Closed => ("start_refused", "the mesh engine stopped"),
+            Self::PrivateKeyRequired => (
+                "invalid_argument",
+                "private_key_required: a managed network needs node.private_key",
+            ),
+            Self::InstanceIdMismatch => (
+                "invalid_argument",
+                "node.instance_id differs from that of another mesh network",
+            ),
+        }
+    }
 }
 
 pub struct Registry {
@@ -144,8 +172,29 @@ impl Registry {
         if settings.kind == NetworkKind::Managed && settings.private_key.is_none() {
             return Err(RegistryError::PrivateKeyRequired);
         }
+        if conflicting_instance_id(&inner, &settings) {
+            return Err(RegistryError::InstanceIdMismatch);
+        }
         self.put(&mut inner, settings, true);
         Ok(())
+    }
+
+    /// Whether `settings` names another `node.instance_id` than a network
+    /// of another name already adopted: a profile with it is refused.
+    pub fn conflicts(&self, settings: &MeshSettings) -> bool {
+        conflicting_instance_id(&self.lock(), settings)
+    }
+
+    /// The `routesVersion` of `routes` (snapshot `tunnel`): 1 for the
+    /// first routes reported, one more at each change.
+    pub fn routes_version(&self, routes: &[IpNet]) -> u64 {
+        let mut inner = self.lock();
+        let (last, version) = &mut inner.routes;
+        if *version == 0 || last.as_slice() != routes {
+            *last = routes.to_vec();
+            *version += 1;
+        }
+        *version
     }
 
     /// `mesh_join`: starts a network the user left, or one that could not
@@ -212,6 +261,9 @@ impl Registry {
         overrides: Vec<IpNet>,
     ) -> Result<(), RegistryError> {
         let mut inner = self.lock();
+        if inner.closed {
+            return Err(RegistryError::Closed);
+        }
         let network = inner
             .networks
             .get_mut(name)
@@ -278,8 +330,10 @@ impl Registry {
                     ..network.settings.clone()
                 },
                 joined: network.joined,
+                saved: network.saved,
                 instance: network.instance.clone(),
                 failure: network.failure,
+                route_overrides: network.route_overrides.clone(),
             })
             .collect()
     }
@@ -376,6 +430,12 @@ impl Registry {
         network.failure = None;
         network.instance = Some(instance);
     }
+}
+
+fn conflicting_instance_id(inner: &Inner, settings: &MeshSettings) -> bool {
+    inner.networks.iter().any(|(name, network)| {
+        *name != settings.network_name && network.settings.instance_id != settings.instance_id
+    })
 }
 
 fn remove(inner: &mut Inner, name: &str) {

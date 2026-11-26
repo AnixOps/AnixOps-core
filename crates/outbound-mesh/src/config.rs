@@ -247,6 +247,12 @@ pub struct NodeConfig {
     /// secret and never written out. Absent: the caller keeps one.
     #[serde(default, deserialize_with = "optional_secret_text")]
     pub private_key: Option<Zeroizing<String>>,
+    /// This device's instance ID (spec §1), for the embedded engine, which
+    /// has no state directory: the client makes it once and gives the same
+    /// value in every network's config (`mesh-module.md`). Node programs
+    /// with a state directory replace it with their own.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 /// Secret text, wiped from memory when dropped.
@@ -854,6 +860,11 @@ impl MeshConfig {
                 Some(keys)
             }
         };
+        if let Some(id) = &node.instance_id {
+            if !valid_instance_id(id) {
+                return Err("mesh node instance_id is not an instance ID");
+            }
+        }
         let private_key = match &node.private_key {
             None => None,
             Some(text) => {
@@ -896,7 +907,7 @@ impl MeshConfig {
             private_key,
             dns,
             host_groups: Vec::new(),
-            instance_id: None,
+            instance_id: node.instance_id,
             external_bridge,
         };
         if let Some(bridge) = &settings.external_bridge {
@@ -1678,6 +1689,21 @@ mod tests {
             validate_paths(parse(Value::Array(many)), &settings).err(),
             Some("mesh routing lists too many paths")
         );
+    }
+
+    #[test]
+    fn the_device_instance_id_follows_the_contract() {
+        assert_eq!(validate(base()).unwrap().instance_id, None);
+        let settings = validate(with("node.instance_id", json!("device-1"))).unwrap();
+        assert_eq!(settings.instance_id.as_deref(), Some("device-1"));
+        let long = "a".repeat(65);
+        for bad in ["", "-device", "device 1", long.as_str()] {
+            assert_eq!(
+                validate(with("node.instance_id", json!(bad))).err(),
+                Some("mesh node instance_id is not an instance ID"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

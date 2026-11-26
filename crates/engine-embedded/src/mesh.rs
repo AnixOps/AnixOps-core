@@ -9,15 +9,21 @@
 //! Delay tests and checkups build their outbounds from the default registry,
 //! whose mesh factory is detached: their mesh outbounds answer
 //! `unsupported` and never start or replace a network.
+//!
+//! The `mesh_*` commands of `mesh-status.md` reach the engine through any
+//! runtime's control channel ([`outbound_mesh::outbound::control`]).
+//! `mesh_save_network` and `mesh_join` start the engine when none runs; the
+//! runtime that answered them then holds it until it stops, so that a
+//! network saved while only the proxy runs keeps running.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine_outbound::registry::OutboundRegistry;
+use outbound_mesh::outbound::control;
 use outbound_mesh::outbound::engine::{EngineHold, EngineSlot, GRACE};
 use outbound_mesh::outbound::MeshFactory;
 use outbound_mesh::{MeshSettings, TYPE_NAME};
-use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -37,13 +43,6 @@ pub(crate) struct MeshBinding {
     built: Arc<Mutex<Vec<MeshSettings>>>,
     /// Held from the tunnel's start to its stop.
     hold: Mutex<Option<EngineHold>>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "cmd")]
-enum MeshControl {
-    #[serde(rename = "mesh_engine_stop")]
-    EngineStop,
 }
 
 impl MeshBinding {
@@ -86,23 +85,57 @@ impl MeshBinding {
         lock(&self.hold).take();
     }
 
+    /// Answers a `mesh_*` request; `None` for any other request.
+    ///
     /// `{"cmd": "mesh_engine_stop"}`: the user closed the VPN; lets go of
-    /// the engine and stops it at once unless another runtime holds it.
+    /// the engine and stops it at once unless another runtime holds it
+    /// (`stopped` says whether it stopped).
     pub(crate) fn control(&self, request: &[u8]) -> Option<Result<Vec<u8>, RuntimeError>> {
-        if request.len() > 256 {
+        // Cheap test before parsing: every mesh command names itself.
+        if !contains(request, b"mesh_") {
             return None;
         }
-        let MeshControl::EngineStop = serde_json::from_slice(request).ok()?;
-        if let Some(hold) = lock(&self.hold).take() {
-            hold.close();
+        let value: Value = serde_json::from_slice(request).ok()?;
+        if value.get("cmd").and_then(Value::as_str) == Some("mesh_engine_stop") {
+            if let Some(hold) = lock(&self.hold).take() {
+                hold.close();
+            }
+            let stopped = SLOT.current().is_none();
+            return Some(encode(&json!({"ok": true, "stopped": stopped})));
         }
-        Some(serde_json::to_vec(&json!({"ok": true})).map_err(|_| {
-            RuntimeError::new(
-                RuntimeErrorCode::InternalError,
-                "mesh answer could not be encoded",
-            )
-        }))
+        let request = control::parse(&value)?;
+        let engine = match &request {
+            control::Request::Command(command) if command.starts_engine() => self.engine(),
+            _ => SLOT.current(),
+        };
+        let answer = control::answer(request, engine.as_deref().map(|engine| engine.registry()));
+        Some(encode(&answer))
     }
+
+    /// The running engine, started and held by this runtime when none runs
+    /// or this runtime does not hold it yet; `None` when it cannot start.
+    fn engine(&self) -> Option<Arc<outbound_mesh::outbound::engine::MeshEngine>> {
+        let mut hold = lock(&self.hold);
+        if hold.is_none() {
+            *hold = SLOT.acquire().ok();
+        }
+        hold.as_ref().map(|hold| hold.engine().clone())
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn encode(answer: &Value) -> Result<Vec<u8>, RuntimeError> {
+    serde_json::to_vec(answer).map_err(|_| {
+        RuntimeError::new(
+            RuntimeErrorCode::InternalError,
+            "mesh answer could not be encoded",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -177,11 +210,76 @@ mod tests {
 
         // A request for another command is not the mesh's.
         assert!(second.control(br#"{"cmd":"traffic"}"#).is_none());
+
+        // The mesh commands reach the engine through any runtime.
+        let ask = |binding: &MeshBinding, request: Value| -> Value {
+            let answer = binding
+                .control(request.to_string().as_bytes())
+                .expect("a mesh command")
+                .unwrap();
+            serde_json::from_slice(&answer).unwrap()
+        };
+        let status = ask(&first, json!({"cmd": "mesh_status"}));
+        assert_eq!(status["network"]["id"], "embedded-office");
+        let left = ask(
+            &first,
+            json!({"cmd": "mesh_leave", "network": "embedded-office"}),
+        );
+        assert_eq!(left, json!({"ok": true}));
+        assert!(instance.is_retired());
+        // A later profile does not join it again.
+        second.commit();
+        let status = ask(&second, json!({"cmd": "mesh_status"}));
+        assert_eq!(status["network"]["state"], "not_joined");
+        let joined = ask(
+            &second,
+            json!({"cmd": "mesh_join", "network": "embedded-office"}),
+        );
+        assert_eq!(joined, json!({"ok": true}));
+        let instance = engine.registry().networks()[0]
+            .instance
+            .clone()
+            .expect("the network runs again");
+        let unsupported = ask(&second, json!({"cmd": "mesh_set_paths", "network": "x"}));
+        assert_eq!(unsupported["error"]["code"], "unsupported");
+
+        // A profile naming another device ID than the running network is
+        // refused when built.
+        let mut other = outbound_settings("10.161.0.2/24");
+        other.insert(
+            "network".into(),
+            json!({"name": "lab", "secret": "s3cr3t", "kind": "legacy"}),
+        );
+        other.insert(
+            "node".into(),
+            json!({"address": "10.161.0.2/24", "role": "access", "instance_id": "device-2"}),
+        );
+        let third = MeshBinding::default();
+        assert!(third
+            .bind(&detached)
+            .build(TYPE_NAME, &other, Arc::new(TcpDialer))
+            .is_err());
         // The user closes the VPN: the engine stops at once.
         let answer = second.control(br#"{"cmd":"mesh_engine_stop"}"#).unwrap();
-        assert_eq!(answer.unwrap(), br#"{"ok":true}"#);
+        let answer: Value = serde_json::from_slice(&answer.unwrap()).unwrap();
+        assert_eq!(answer, json!({"ok": true, "stopped": true}));
         assert!(engine.is_stopped());
         assert!(instance.is_retired());
         assert!(SLOT.current().is_none());
+
+        // Saving a network starts the engine; the runtime that answered
+        // holds it until it lets go.
+        let status = ask(&third, json!({"cmd": "mesh_status"}));
+        assert_eq!(status["networks"], json!([]));
+        assert!(SLOT.current().is_none());
+        let saved = ask(
+            &third,
+            json!({"cmd": "mesh_save_network", "config": Value::Object(outbound_settings("10.160.0.2/24"))}),
+        );
+        assert_eq!(saved, json!({"ok": true}));
+        let engine = SLOT.current().expect("saving started the engine");
+        let answer = ask(&third, json!({"cmd": "mesh_engine_stop"}));
+        assert_eq!(answer, json!({"ok": true, "stopped": true}));
+        assert!(engine.is_stopped());
     }
 }
