@@ -136,7 +136,10 @@ impl Default for DnsSettings {
 /// zones are worked out from the virtual subnets, never configured. The
 /// same rule applies to the local override (`mesh_set_dns`).
 pub fn normalize_suffix(suffix: &str) -> Option<String> {
-    let suffix = suffix.strip_suffix('.').unwrap_or(suffix).to_ascii_lowercase();
+    let suffix = suffix
+        .strip_suffix('.')
+        .unwrap_or(suffix)
+        .to_ascii_lowercase();
     let labels: Vec<&str> = suffix.split('.').collect();
     let labels_ok = labels.iter().all(|label| {
         (1..=63).contains(&label.len())
@@ -840,7 +843,11 @@ mod tests {
             ("mesh.internal.", "mesh.internal"),
             ("a-b.internal", "a-b.internal"),
         ] {
-            assert_eq!(settings(json!({ "suffix": given })).unwrap().suffix, kept, "{given}");
+            assert_eq!(
+                settings(json!({ "suffix": given })).unwrap().suffix,
+                kept,
+                "{given}"
+            );
         }
         // Spec §15.9.2 item 1 (client audit H1): only names under
         // `internal` with at least two labels.
@@ -955,7 +962,10 @@ mod tests {
         // The other region is reachable here through a member's accepted
         // advertisement (a summary range does the same once the backbone
         // carries them); without it its names are not answered.
-        let alone = names(region_dns(), &[member("gw", &["10.150.0.1"], &["192.168.10.0/24"])]);
+        let alone = names(
+            region_dns(),
+            &[member("gw", &["10.150.0.1"], &["192.168.10.0/24"])],
+        );
         let unreachable = ask(&alone, "web.eu.mesh.internal", TYPE_A).unwrap();
         assert_eq!(unreachable.rcode, Rcode::NxDomain as u8);
         let members = [
