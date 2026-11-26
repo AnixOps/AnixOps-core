@@ -81,9 +81,7 @@ pub fn snapshot(
             .collect::<Vec<_>>(),
         "network": network(view),
         "self": own(view, current),
-        "members": current
-            .members
-            .iter()
+        "members": known(current)
             .map(|member| member_value(member, current))
             .collect::<Vec<_>>(),
         "subnets": subnets(current),
@@ -184,7 +182,9 @@ fn joining(view: &NetworkView<'_>) -> Value {
 fn own(view: &NetworkView<'_>, current: &Snapshot) -> Value {
     let settings = view.settings;
     let mut own = Map::new();
-    own.insert("id".into(), json!(current.instance));
+    // The device's instance ID (`node.instance_id`), the same in every
+    // network; the instance ID on the wire changes at every start.
+    own.insert("id".into(), json!(settings.instance_id));
     own.insert("name".into(), json!(settings.hostname));
     own.insert(
         "role".into(),
@@ -217,8 +217,18 @@ fn own(view: &NetworkView<'_>, current: &Snapshot) -> Value {
     Value::Object(own)
 }
 
-/// A member's `id`: its instance ID, or its node ID until its route
-/// information arrived.
+/// The members whose route information arrived: only they have an `id`
+/// that stays the same for the rest of their run, so the others are left
+/// out until it arrives.
+fn known(current: &Snapshot) -> impl Iterator<Item = &Member> {
+    current
+        .members
+        .iter()
+        .filter(|member| !member.instance.is_empty())
+}
+
+/// A member's `id`: its instance ID on the wire, the same for one run of
+/// that member. A relay not (yet) known by it is named by its node ID.
 fn member_id(member: &Member) -> String {
     if member.instance.is_empty() {
         format!("node-{}", member.peer_id)
@@ -252,12 +262,14 @@ fn member_value(member: &Member, current: &Snapshot) -> Value {
     })
 }
 
-/// Every subnet a member advertises, with its advertisers; the one in use
-/// is the nearest (fewest hops, then lowest node ID).
+/// Every subnet a member advertises, with its advertisers. The one in use
+/// is the one the driver sends to (spec §15.2, `RouteTable::lookup_by`):
+/// among the peers advertising the same subnet, the fewest hops away, then
+/// the smallest node ID. `route` is `mesh` only for a subnet the driver
+/// routes into the mesh now, the ones `tunnel.routes` lists; every other
+/// subnet stays on this machine's own networks.
 fn subnets(current: &Snapshot) -> Vec<Value> {
-    let mut cidrs: Vec<IpNet> = current
-        .members
-        .iter()
+    let mut cidrs: Vec<IpNet> = known(current)
         .flat_map(|member| member.subnets.iter().copied())
         .collect();
     cidrs.sort();
@@ -265,13 +277,11 @@ fn subnets(current: &Snapshot) -> Vec<Value> {
     cidrs
         .into_iter()
         .map(|cidr| {
-            let mut advertisers: Vec<&Member> = current
-                .members
-                .iter()
+            let mut advertisers: Vec<&Member> = known(current)
                 .filter(|member| member.subnets.contains(&cidr))
                 .collect();
             advertisers.sort_by_key(|member| (member.hops, member.peer_id));
-            let routed = current.system_routes.contains(&cidr);
+            let routed = current.local_networks_read && current.system_routes.contains(&cidr);
             let overlaps = current.overlaps.contains(&cidr);
             json!({
                 "cidr": cidr.to_string(),
@@ -302,7 +312,7 @@ fn subnets(current: &Snapshot) -> Vec<Value> {
                 "state": "ok",
                 "overlaps": overlaps,
                 "localOverlap": overlaps && !current.foreign_overlaps.contains(&cidr),
-                "route": if routed || !overlaps { "mesh" } else { "local" },
+                "route": if routed { "mesh" } else { "local" },
             })
         })
         .collect()
@@ -391,24 +401,36 @@ mod tests {
         assert_eq!(value["self"]["role"], "client");
         assert_eq!(value["self"]["address"], "10.144.0.2");
         assert_eq!(value["self"]["staticKey"], Value::Null);
+        assert_eq!(value["self"]["id"], Value::Null);
         assert_eq!(value["members"], json!([]));
         assert_eq!(value["tunnel"]["dns"], Value::Null);
     }
 
     #[test]
     fn a_joined_network_lists_members_paths_and_subnets() {
-        let settings = settings("legacy", true);
+        let mut settings = settings("legacy", true);
+        settings.instance_id = Some("device-1".into());
+        let unknown = Member {
+            instance: String::new(),
+            ..member(12, "10.144.0.12", &["172.16.0.0/16"], Vec::new())
+        };
         let current = Snapshot {
             neighbours: vec![3],
             instance: "11111111-2222-3333-4444-555555555555".into(),
             members: vec![
-                member(3, "10.144.0.3", &["192.168.10.0/24"], Vec::new()),
+                member(
+                    3,
+                    "10.144.0.3",
+                    &["192.168.10.0/24", "10.30.0.0/16"],
+                    Vec::new(),
+                ),
                 member(
                     9,
                     "10.144.0.9",
                     &["192.168.10.0/24", "192.168.1.0/24"],
                     vec![3],
                 ),
+                unknown,
             ],
             system_routes: vec![net("192.168.10.0/24")],
             local_networks_read: true,
@@ -437,7 +459,9 @@ mod tests {
         assert_eq!(value["network"]["security"], "forward_secrecy");
         assert_eq!(value["network"]["limitations"], json!(["reference_peers"]));
         assert_eq!(value["network"]["joining"], Value::Null);
-        assert_eq!(value["self"]["id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(value["self"]["id"], "device-1");
+        // A member whose route information has not arrived is left out.
+        assert_eq!(value["members"].as_array().unwrap().len(), 2);
         assert_eq!(value["self"]["name"], "laptop");
         assert_eq!(
             value["self"]["staticKey"],
@@ -474,6 +498,15 @@ mod tests {
             .unwrap();
         assert_eq!(home["route"], "local");
         assert_eq!(home["localOverlap"], true);
+        // Not overlapping, but not routed either (for instance beyond
+        // `routing.system_routes`): it is not in the tunnel, so not `mesh`.
+        let beyond = subnets
+            .iter()
+            .find(|s| s["cidr"] == "10.30.0.0/16")
+            .unwrap();
+        assert_eq!(beyond["route"], "local");
+        assert_eq!(beyond["localOverlap"], false);
+        assert!(!subnets.iter().any(|s| s["cidr"] == "172.16.0.0/16"));
         assert_eq!(value["refusedAdvertisements"], 2);
         assert_eq!(
             value["tunnel"]["routes"],
@@ -527,5 +560,23 @@ mod tests {
         );
         assert_eq!(state(&view(Some(Failure::Stopped), false)), "failed");
         assert_eq!(state(&view(None, false)), "joining");
+    }
+
+    #[test]
+    fn no_secret_is_in_the_snapshot() {
+        let mut settings = settings("managed", true);
+        settings.private_key = Some(zeroize::Zeroizing::new([7; 32]));
+        let view = NetworkView {
+            settings: &settings,
+            joined: None,
+            static_key: Some([2; 32]),
+        };
+        let tunnel = Tunnel {
+            routes: &[],
+            routes_version: 1,
+        };
+        let text = snapshot(&view, std::slice::from_ref(&view), &tunnel).to_string();
+        assert!(!text.contains("s3cr3t"));
+        assert!(!text.contains(&encode_key(&[7; 32])));
     }
 }
