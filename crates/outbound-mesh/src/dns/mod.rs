@@ -126,21 +126,25 @@ impl Default for DnsSettings {
     }
 }
 
-/// Whether `suffix` may carry the intranet names: `internal`, `home.arpa`
-/// or a name under one of them, at most [`MAX_SUFFIX_BYTES`] bytes, each
-/// label 1 to 63 bytes of lower-case letters, digits and hyphens. The same
-/// rule applies to the local override (`mesh_set_dns`).
-pub fn valid_suffix(suffix: &str) -> bool {
-    let labels_ok = suffix.split('.').all(|label| {
+/// The suffix the intranet names are under (spec §15.9.2 item 1), or
+/// `None` when `suffix` may not carry them. Compared without a final dot
+/// and in lower case: it must lie under `internal` with at least two
+/// labels (so the root, any single label, `arpa`, `home.arpa`, the reverse
+/// zones and `local` are all refused), at most [`MAX_SUFFIX_BYTES`] bytes,
+/// each label 1 to 63 bytes of letters, digits and hyphens. The reverse
+/// zones are worked out from the virtual subnets, never configured. The
+/// same rule applies to the local override (`mesh_set_dns`).
+pub fn normalize_suffix(suffix: &str) -> Option<String> {
+    let suffix = suffix.strip_suffix('.').unwrap_or(suffix).to_ascii_lowercase();
+    let labels: Vec<&str> = suffix.split('.').collect();
+    let labels_ok = labels.iter().all(|label| {
         (1..=63).contains(&label.len())
             && label
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     });
-    let reserved = ["internal", "home.arpa"]
-        .iter()
-        .any(|top| suffix == *top || suffix.ends_with(&format!(".{top}")));
-    suffix.len() <= MAX_SUFFIX_BYTES && labels_ok && reserved
+    let under_internal = labels.len() >= 2 && labels.last() == Some(&"internal");
+    (suffix.len() <= MAX_SUFFIX_BYTES && labels_ok && under_internal).then_some(suffix)
 }
 
 /// Cuts `text` to at most `max` bytes on a character boundary.
@@ -158,10 +162,10 @@ impl DnsConfig {
     /// many names, refuses the whole config; a bad entry is skipped and
     /// listed.
     pub fn validate(self, virtual_subnets: &[IpNet]) -> Result<DnsSettings, &'static str> {
-        let suffix = self.suffix.unwrap_or_else(|| DEFAULT_SUFFIX.into());
-        if !valid_suffix(&suffix) {
-            return Err("mesh dns suffix must be internal, home.arpa or a name under them");
-        }
+        let suffix = self.suffix.as_deref().unwrap_or(DEFAULT_SUFFIX);
+        let Some(suffix) = normalize_suffix(suffix) else {
+            return Err("mesh dns suffix must be a name under internal");
+        };
         if let Some(region) = &self.region {
             if !is_normalized(region) {
                 return Err("mesh dns region is not a normalized label");
@@ -823,12 +827,31 @@ mod tests {
         let defaults = settings(json!({})).unwrap();
         assert_eq!(defaults, DnsSettings::default());
         assert_eq!(defaults.suffix, "mesh.internal");
-        for good in ["internal", "home.arpa", "corp.internal", "a-b.home.arpa"] {
-            assert!(settings(json!({ "suffix": good })).is_ok(), "{good}");
+        for (given, kept) in [
+            ("mesh.internal", "mesh.internal"),
+            ("a.b.internal", "a.b.internal"),
+            ("Mesh.Internal", "mesh.internal"),
+            ("mesh.internal.", "mesh.internal"),
+            ("a-b.internal", "a-b.internal"),
+        ] {
+            assert_eq!(settings(json!({ "suffix": given })).unwrap().suffix, kept, "{given}");
         }
+        // Spec §15.9.2 item 1 (client audit H1): only names under
+        // `internal` with at least two labels.
         for bad in [
-            "Mesh.internal",
-            "mesh.internal.",
+            "com",
+            "internal",
+            "internal.",
+            "home.arpa",
+            "a.home.arpa",
+            "arpa",
+            "in-addr.arpa",
+            "10.in-addr.arpa",
+            "ip6.arpa",
+            "local",
+            "mesh.local",
+            ".",
+            "mesh.internal..",
             "example.com",
             "internal.com",
             "xinternal",
