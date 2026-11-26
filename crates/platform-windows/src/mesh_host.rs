@@ -1335,9 +1335,16 @@ mod tests {
         );
         assert!(nat_name("a,b", "1a2b3c4d").starts_with("AnixOpsMesh-a_b-"));
         assert!(nat_name("a,b", "1a2b3c4d").ends_with("-1a2b3c4d"));
-        // Another network's objects never share the stem.
-        assert!(!nat_name("office-1", "1a2b3c4d").starts_with(&nat_stem("office")));
-        assert!(nat_name("office", "1a2b3c4d").starts_with(&nat_stem("office")));
+        // The add script removes leftovers matching the stem followed by
+        // exactly an 8-hex-digit instance; another network's objects never
+        // match, even when its name extends this one's.
+        let matches = |name: &str, network: &str| {
+            name.strip_prefix(&nat_stem(network))
+                .is_some_and(|rest| rest.len() == 8 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+        };
+        assert!(!matches(&nat_name("office-1", "1a2b3c4d"), "office"));
+        assert!(!matches(&nat_name("office", "1a2b3c4d"), "office-1"));
+        assert!(matches(&nat_name("office", "1a2b3c4d"), "office"));
         assert_eq!(
             nat_prefix(Ipv4Addr::new(10, 144, 3, 7), 24).unwrap(),
             "10.144.3.0/24"
