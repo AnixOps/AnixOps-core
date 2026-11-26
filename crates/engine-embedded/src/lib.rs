@@ -72,6 +72,8 @@ pub mod lan_guard;
 pub mod lan_share;
 #[cfg(feature = "local-proxy")]
 pub mod local_proxy;
+#[cfg(feature = "mesh")]
+pub(crate) mod mesh;
 pub mod metrics;
 #[cfg(feature = "mitm")]
 pub mod mitm;
@@ -210,6 +212,9 @@ pub struct EmbeddedRuntime {
     replay_proxy: replay_proxy::ReplayProxySlot,
     #[cfg(feature = "local-proxy")]
     system_proxy: system_proxy::SystemProxySlot,
+    /// The mesh outbounds' link to the process's mesh engine.
+    #[cfg(feature = "mesh")]
+    mesh: mesh::MeshBinding,
 }
 
 impl EmbeddedRuntime {
@@ -229,6 +234,14 @@ impl EmbeddedRuntime {
         dialer: Arc<dyn Dialer>,
     ) -> Result<Self, RuntimeError> {
         let config = RuntimeConfig::from_json(bytes)?;
+        // Mesh outbounds of this profile find their network in the mesh
+        // engine, which the runtime commits them to once its tunnel runs.
+        #[cfg(feature = "mesh")]
+        let mesh = mesh::MeshBinding::default();
+        #[cfg(feature = "mesh")]
+        let bound = mesh.bind(registry);
+        #[cfg(feature = "mesh")]
+        let registry = &bound;
         config.install_tls_fingerprints();
         let interceptor = build_interceptor(&config)?;
         let plugin_rules = interceptor
@@ -263,6 +276,10 @@ impl EmbeddedRuntime {
         let mut runtime = Self::with_engine(config, engine);
         runtime.interceptor = interceptor;
         runtime.routed = routed;
+        #[cfg(feature = "mesh")]
+        {
+            runtime.mesh = mesh;
+        }
         Ok(runtime)
     }
 
@@ -289,6 +306,8 @@ impl EmbeddedRuntime {
             replay_proxy: replay_proxy::ReplayProxySlot::default(),
             #[cfg(feature = "local-proxy")]
             system_proxy: system_proxy::SystemProxySlot::default(),
+            #[cfg(feature = "mesh")]
+            mesh: mesh::MeshBinding::default(),
         }
     }
 
@@ -320,6 +339,10 @@ impl EmbeddedRuntime {
             Ok(tunnel) => {
                 self.tunnel = Some(tunnel);
                 self.state = RuntimeState::Running;
+                // The profile is adopted now: its mesh networks are
+                // committed only after the tunnel runs.
+                #[cfg(feature = "mesh")]
+                self.mesh.commit();
                 Ok(())
             }
             Err(_) => Err(self.fail(RuntimeError::new(
@@ -357,8 +380,12 @@ impl EmbeddedRuntime {
         }
     }
 
-    /// Idempotent.
+    /// Idempotent. The mesh engine keeps running for the grace period, for
+    /// the next profile to take over; `mesh_engine_stop` before the stop
+    /// ends it at once.
     pub fn stop(&mut self) {
+        #[cfg(feature = "mesh")]
+        self.mesh.release();
         #[cfg(feature = "local-proxy")]
         {
             self.system_proxy.stop();
@@ -401,6 +428,10 @@ impl EmbeddedRuntime {
     /// (moving to a new UDP socket) and `set_network`, and rejects every
     /// other request.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        #[cfg(feature = "mesh")]
+        if let Some(answer) = self.mesh.control(request) {
+            return answer;
+        }
         match &self.engine {
             Engine::Stack(dispatcher) => {
                 if let Some(answer) = self.lan_share_control(dispatcher, request) {
