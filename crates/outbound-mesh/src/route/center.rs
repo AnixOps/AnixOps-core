@@ -190,10 +190,7 @@ impl CentreServer {
         }
         let peers = report.peers.into_iter().take(MAX_REPORTED_PEERS).collect();
         self.entries.insert(report.my_peer_id, (peers, now));
-        *self
-            .cached_digest
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.cached_digest.lock().unwrap_or_else(|e| e.into_inner()) = None;
         true
     }
 
@@ -203,20 +200,13 @@ impl CentreServer {
         self.entries
             .retain(|_, (_, at)| now.saturating_duration_since(*at) < ENTRY_TTL);
         if self.entries.len() != before {
-            *self
-                .cached_digest
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self.cached_digest.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 
     /// Our own digest of the map; callers treat it as opaque.
     pub fn digest(&self) -> u64 {
-        if let Some(d) = *self
-            .cached_digest
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-        {
+        if let Some(d) = *self.cached_digest.lock().unwrap_or_else(|e| e.into_inner()) {
             return d;
         }
         let mut bytes = Vec::new();
@@ -227,10 +217,7 @@ impl CentreServer {
         }
         // Zero means "nothing yet" to callers, so never hand it out.
         let d = siphash13(&bytes).max(1);
-        *self
-            .cached_digest
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(d);
+        *self.cached_digest.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
         d
     }
 

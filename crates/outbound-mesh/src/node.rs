@@ -1263,9 +1263,8 @@ impl Node {
             Metric::Hops => &mut cache.hops,
             Metric::Latency => &mut cache.latency,
         };
-        let routes = slot.get_or_insert_with(|| {
-            routes_from(&self.sync, &self.peer_map, self.local.id, metric)
-        });
+        let routes = slot
+            .get_or_insert_with(|| routes_from(&self.sync, &self.peer_map, self.local.id, metric));
         routes.get(&to).map(|r| r.next_hop)
     }
 
