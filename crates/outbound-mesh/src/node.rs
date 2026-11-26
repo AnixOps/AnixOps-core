@@ -1788,7 +1788,9 @@ mod tests {
     fn a_relay_handshake_started_before_the_list_changed_is_dropped() {
         let mut net = three_in_a_row(true);
         let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
-        let _ = net.nodes[0].send_ip(&packet, net.now);
+        net.nodes[0].send_ip(&packet, net.now).unwrap();
+        // msg1 goes out; the answer is not delivered yet.
+        net.nodes[0].wake(&SystemRandom::new(), net.now);
         assert!(net.nodes[0]
             .relays
             .get(&102)
