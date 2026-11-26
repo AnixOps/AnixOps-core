@@ -16,13 +16,15 @@
 //! runtime that answered them then holds it until it stops, so that a
 //! network saved while only the proxy runs keeps running.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine_outbound::registry::OutboundRegistry;
 use outbound_mesh::outbound::control;
-use outbound_mesh::outbound::engine::{EngineHold, EngineSlot, GRACE};
+use outbound_mesh::outbound::engine::{EngineHold, EngineSlot, MeshEngine, GRACE};
 use outbound_mesh::outbound::MeshFactory;
 use outbound_mesh::{MeshSettings, TYPE_NAME};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{RuntimeError, RuntimeErrorCode};
@@ -43,6 +45,17 @@ pub(crate) struct MeshBinding {
     built: Arc<Mutex<Vec<MeshSettings>>>,
     /// Held from the tunnel's start to its stop.
     hold: Mutex<Option<EngineHold>>,
+    /// Set once the runtime stopped: no command makes it hold the engine
+    /// again, so that a host that stopped the tunnel but keeps the runtime
+    /// cannot keep the mesh running with the VPN closed.
+    stopped: AtomicBool,
+}
+
+/// The command name of a request; every other field is skipped unread.
+#[derive(Deserialize)]
+struct Head {
+    #[serde(default)]
+    cmd: Option<String>,
 }
 
 impl MeshBinding {
@@ -82,6 +95,7 @@ impl MeshBinding {
     /// Lets go of the engine when the tunnel stops: it stops after the
     /// grace period unless another profile takes it over.
     pub(crate) fn release(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         lock(&self.hold).take();
     }
 
@@ -95,26 +109,49 @@ impl MeshBinding {
         if !contains(request, b"mesh_") {
             return None;
         }
-        let value: Value = serde_json::from_slice(request).ok()?;
-        if value.get("cmd").and_then(Value::as_str) == Some("mesh_engine_stop") {
+        // An object only: the derived reader would also take an array.
+        if request.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+            return None;
+        }
+        let head: Head = serde_json::from_slice(request).ok()?;
+        if head.cmd.as_deref() == Some("mesh_engine_stop") {
             if let Some(hold) = lock(&self.hold).take() {
                 hold.close();
             }
             let stopped = SLOT.current().is_none();
             return Some(encode(&json!({"ok": true, "stopped": stopped})));
         }
-        let request = control::parse(&value)?;
-        let engine = match &request {
-            control::Request::Command(command) if command.starts_engine() => self.engine(),
-            _ => SLOT.current(),
+        let request = control::parse(request)?;
+        let starts = matches!(
+            &request,
+            control::Request::Command(command) if command.starts_engine()
+        );
+        if !starts {
+            let engine = SLOT.current();
+            let answer = control::answer(request, engine.as_deref().map(MeshEngine::registry));
+            return Some(encode(&answer));
+        }
+        let engine = self.engine();
+        // The engine this runtime held stopped meanwhile (the user closed
+        // the VPN through another runtime): start a new one, once.
+        let engine = match engine {
+            Some(engine) if engine.is_stopped() => {
+                lock(&self.hold).take();
+                self.engine()
+            }
+            engine => engine,
         };
-        let answer = control::answer(request, engine.as_deref().map(|engine| engine.registry()));
+        let answer = control::answer(request, engine.as_deref().map(MeshEngine::registry));
         Some(encode(&answer))
     }
 
     /// The running engine, started and held by this runtime when none runs
-    /// or this runtime does not hold it yet; `None` when it cannot start.
-    fn engine(&self) -> Option<Arc<outbound_mesh::outbound::engine::MeshEngine>> {
+    /// or this runtime does not hold it yet; `None` when it cannot start or
+    /// the runtime stopped.
+    fn engine(&self) -> Option<Arc<MeshEngine>> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return None;
+        }
         let mut hold = lock(&self.hold);
         if hold.is_none() {
             *hold = SLOT.acquire().ok();
@@ -202,6 +239,21 @@ mod tests {
             .unwrap();
         first.release();
         second.commit();
+        // A stopped runtime does not hold the engine again.
+        let refused: Value = serde_json::from_slice(
+            &first
+                .control(
+                    json!({"cmd": "mesh_join", "network": "embedded-office"})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .expect("a mesh command")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refused["error"]["code"], "engine_unavailable");
+        assert!(lock(&first.hold).is_none());
+        assert!(first.control(br#"["mesh_engine_stop"]"#).is_none());
         assert!(!instance.is_retired());
         assert!(Arc::ptr_eq(
             &instance,
@@ -243,8 +295,8 @@ mod tests {
         let unsupported = ask(&second, json!({"cmd": "mesh_set_paths", "network": "x"}));
         assert_eq!(unsupported["error"]["code"], "unsupported");
 
-        // A profile naming another device ID than the running network is
-        // refused when built.
+        // A profile whose networks name different device IDs is refused
+        // when built; building does not look at the running networks.
         let mut other = outbound_settings("10.161.0.2/24");
         other.insert(
             "network".into(),
@@ -255,10 +307,18 @@ mod tests {
             json!({"address": "10.161.0.2/24", "role": "access", "instance_id": "device-2"}),
         );
         let third = MeshBinding::default();
-        assert!(third
-            .bind(&detached)
+        let registry = third.bind(&detached);
+        assert!(registry
             .build(TYPE_NAME, &other, Arc::new(TcpDialer))
+            .is_ok());
+        assert!(registry
+            .build(
+                TYPE_NAME,
+                &outbound_settings("10.160.0.2/24"),
+                Arc::new(TcpDialer)
+            )
             .is_err());
+        lock(&third.built).clear();
         // The user closes the VPN: the engine stops at once.
         let answer = second.control(br#"{"cmd":"mesh_engine_stop"}"#).unwrap();
         let answer: Value = serde_json::from_slice(&answer.unwrap()).unwrap();
