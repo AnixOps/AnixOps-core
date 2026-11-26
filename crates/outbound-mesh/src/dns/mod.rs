@@ -1224,6 +1224,35 @@ mod tests {
         assert_eq!(ask(&names, "7.1.151.10.in-addr.arpa", TYPE_PTR), None);
     }
 
+    /// Without host groups (a node with `mesh_host_groups` off takes none)
+    /// no group range is a reverse zone or answered as a name's address.
+    #[test]
+    fn without_host_groups_no_group_range_is_answered() {
+        let settings = settings(region_dns()).unwrap();
+        let subnets = subnets();
+        let local = [ip("10.150.0.5")];
+        let names = Names::build(
+            &settings,
+            &NetworkView {
+                virtual_subnets: &subnets,
+                host_groups: &[],
+                local_addresses: &local,
+                own_hostname: Some("Self-Box"),
+                members: &[],
+            },
+        );
+        assert_eq!(
+            names.reverse_zones(),
+            [
+                "150.10.in-addr.arpa",
+                "0.0.0.0.0.0.0.0.0.5.1.0.0.0.d.f.ip6.arpa",
+            ]
+        );
+        assert_eq!(ask(&names, "7.0.151.10.in-addr.arpa", TYPE_PTR), None);
+        let in_group = ask(&names, "web.eu.mesh.internal", TYPE_A).unwrap();
+        assert_eq!(in_group.rcode, Rcode::NxDomain as u8);
+    }
+
     #[test]
     fn answers_reverse_queries_in_the_network() {
         let members = [member(

@@ -507,6 +507,10 @@ checksum/manifest、attestation、release notes、rollback 和 publish eligibili
 
 - 自定义路径（`routing.paths`，规范 §17.2）在审计通过前默认关闭。节点需由运维在 `anixcore` 配置中写 `"mesh_paths": true` 才开启；未开启时节点不声明 `mesh_paths`，带 `routing.paths` 或 `node.waypoint_relay: true` 的 `PUT /v1/mesh` 整份返回 400（`paths_disabled`），运行中的网络不变。独立运行的 `anixops-mesh run` 不受该开关约束。面板与 Agent 只在节点声明 `mesh_paths` 后下发路径。旧版内核的配置拒绝未知字段，写入该字段前先确认内核版本，Agent 重写 `anixcore` 配置时也要保留该字段。
 
+## 组网宿主组默认关闭（运维）
+
+- 宿主组（`host_groups`，规范 §15.7，内核 0.4）在审计通过前默认关闭。节点需由运维在 `anixcore` 配置中写 `"mesh_host_groups": true` 才开启；未开启时节点不声明 `mesh_host_groups`，任一网络带非空 `host_groups` 的 `PUT /v1/mesh` 整份返回 400（`host_groups_disabled`），运行中的网络不变，组地址段不通告、不进入 DNS 应答与反向区。设备模式不声明该能力。面板与 Agent 只在节点声明 `mesh_host_groups` 后下发 `host_groups`。旧版内核的配置拒绝未知字段，写入该字段前先确认内核版本，Agent 重写 `anixcore` 配置时也要保留该字段。
+
 ## 组网区域测量默认关闭（运维）
 
 - 区域归属与迁区测量（实现附录 D.9，内核 0.4）在审计通过前默认关闭。节点需由运维在 `anixcore` 配置中写 `"mesh_regions": true` 才开启；未开启时节点不声明 `mesh_region_probe`，带顶层 `region`（含 `null`）的 `PUT /v1/mesh` 整份返回 400（`regions_disabled`），运行中的网络不变，不启动区域测量与边界探测应答器，`region_probe` 恒为 `null`。设备模式不声明该能力。面板与 Agent 只在节点声明 `mesh_region_probe` 后下发 `region`。旧版内核的配置拒绝未知字段，写入该字段前先确认内核版本，Agent 重写 `anixcore` 配置时也要保留该字段。

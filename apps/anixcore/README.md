@@ -68,6 +68,12 @@ border node's probe responder) stay off unless the config sets
 is refused as a whole with 400 (`regions_disabled`), leaving the running
 networks as they are, and `region_probe` is always `null`.
 
+Host groups (a network's `host_groups`) stay off unless the config sets
+`"mesh_host_groups": true`. Off, `GET /v1/status` does not list
+`mesh_host_groups` and a `PUT /v1/mesh` body any of whose networks carries
+a non-empty `host_groups` is refused as a whole with 400
+(`host_groups_disabled`), leaving the running networks as they are.
+
 Users may carry `"speed_limit"` (Mbit/s for each direction, shared by all
 of the user's connections) and `"device_limit"` (most client IPs online at
 once); both default to 0, no limit.

@@ -90,6 +90,7 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
                 config.mesh_backbone,
                 config.mesh_paths,
                 config.mesh_regions,
+                config.mesh_host_groups,
             )
         });
         if let Some(bundle) = &config.tls_fingerprints {
@@ -162,7 +163,8 @@ const MESH_STATE_DIR: &str = "/var/lib/anixcore/mesh";
 /// its state directory the node runs without them: `GET /v1/status` does
 /// not list `mesh` and `/v1/mesh` answers 404. The inter-region backbone
 /// stays off unless the config sets `mesh_backbone`, custom paths unless
-/// it sets `mesh_paths`, regions unless it sets `mesh_regions`.
+/// it sets `mesh_paths`, regions unless it sets `mesh_regions`, host groups
+/// unless it sets `mesh_host_groups`.
 #[cfg(target_os = "linux")]
 fn with_mesh(
     node: Node,
@@ -171,6 +173,7 @@ fn with_mesh(
     backbone: bool,
     paths: bool,
     regions: bool,
+    host_groups: bool,
 ) -> Node {
     let dir = dir.unwrap_or(std::path::Path::new(MESH_STATE_DIR));
     match mesh_node::managed::ManagedMesh::open_with_options(dir, external_bridge) {
@@ -178,7 +181,8 @@ fn with_mesh(
             let mesh = mesh
                 .with_backbone(backbone)
                 .with_paths(paths)
-                .with_regions(regions);
+                .with_regions(regions)
+                .with_host_groups(host_groups);
             println!("mesh: instance {}", mesh.instance_id());
             node.with_mesh(Arc::new(mesh))
         }
@@ -200,6 +204,7 @@ fn with_mesh(
     _backbone: bool,
     _paths: bool,
     _regions: bool,
+    _host_groups: bool,
 ) -> Node {
     node
 }
@@ -233,7 +238,6 @@ mod tests {
         "mesh_dns",
         "mesh_resolver_address",
         "mesh_native_keys",
-        "mesh_host_groups",
     ];
 
     #[test]
@@ -248,6 +252,7 @@ mod tests {
             config.mesh_backbone,
             config.mesh_paths,
             config.mesh_regions,
+            config.mesh_host_groups,
         );
         let mut expected = node_runtime::FEATURES.to_vec();
         expected.extend_from_slice(MESH_FEATURES_0_3);

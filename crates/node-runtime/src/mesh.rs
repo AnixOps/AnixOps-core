@@ -54,6 +54,14 @@ pub fn waypoint_field(settings: &outbound_mesh::MeshSettings) -> Option<&'static
     }
 }
 
+/// Listed only when the operator turned host groups on (`mesh_host_groups`
+/// in the node configuration, off by default).
+pub const HOST_GROUPS_FEATURE: &str = "mesh_host_groups";
+
+/// The refusal of a body whose networks carry `host_groups` while host
+/// groups are off.
+pub const HOST_GROUPS_DISABLED: &str = "host_groups_disabled";
+
 /// Listed only when the operator turned custom paths on (`mesh_paths` in
 /// the node configuration, off by default).
 pub const PATHS_FEATURE: &str = "mesh_paths";
@@ -132,6 +140,20 @@ impl Mesh {
             {
                 return Err(NodeError::Mesh(format!(
                     "{PATHS_DISABLED}: {field}: this node does not apply custom paths ({PATHS_FEATURE} is not listed)"
+                )));
+            }
+        }
+        // And for host groups: a node that does not list them takes no
+        // network with a non-empty `host_groups`, so no group range is
+        // advertised, routed or answered in DNS.
+        if !features.contains(&HOST_GROUPS_FEATURE) {
+            if let Some(index) = request
+                .networks
+                .iter()
+                .position(|network| !network.settings.host_groups.is_empty())
+            {
+                return Err(NodeError::Mesh(format!(
+                    "{HOST_GROUPS_DISABLED}: networks[{index}].host_groups: this node does not apply host groups ({HOST_GROUPS_FEATURE} is not listed)"
                 )));
             }
         }

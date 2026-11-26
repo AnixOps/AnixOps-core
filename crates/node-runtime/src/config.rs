@@ -125,6 +125,12 @@ pub struct NodeConfig {
     /// (`regions_disabled`) and gives no `region_probe`.
     #[serde(default)]
     pub mesh_regions: bool,
+    /// Turns on host groups of managed networks (`host_groups`, spec
+    /// §15.7). Off by default: the node then does not list
+    /// `mesh_host_groups` and refuses a `PUT /v1/mesh` body whose networks
+    /// carry a non-empty `host_groups` (`host_groups_disabled`).
+    #[serde(default)]
+    pub mesh_host_groups: bool,
 }
 
 /// Has no `Debug`: `token` is a credential.
@@ -382,6 +388,14 @@ mod tests {
         assert!(!config.mesh_backbone);
         assert!(!config.mesh_paths);
         assert!(!config.mesh_regions);
+        assert!(!config.mesh_host_groups);
+    }
+
+    #[test]
+    fn host_groups_are_off_unless_the_config_turns_them_on() {
+        let config: NodeConfig =
+            serde_json::from_value(serde_json::json!({"mesh_host_groups": true})).unwrap();
+        assert!(config.mesh_host_groups);
     }
 
     #[test]
