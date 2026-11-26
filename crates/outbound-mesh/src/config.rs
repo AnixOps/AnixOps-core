@@ -79,6 +79,85 @@ pub struct MeshConfig {
     /// The external network bridge (spec §15.12): Linux full nodes only.
     #[serde(default)]
     pub external_bridge: Option<ExternalBridgeConfig>,
+    /// Host groups of the network (spec §15.7, requirements R21, R25, R26).
+    #[serde(default)]
+    pub host_groups: Vec<HostGroupConfig>,
+}
+
+/// Most host groups one network may list.
+pub const MAX_HOST_GROUPS: usize = 256;
+/// Longest instance ID (`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`, spec §1).
+pub const MAX_INSTANCE_ID_BYTES: usize = 64;
+
+/// One host group as the config lists it: virtual machines on one host
+/// behind a gateway node, using a group address range outside every
+/// virtual subnet (spec §15.7).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostGroupConfig {
+    /// The group address range.
+    pub cidr: String,
+    /// Instance ID of the gateway: the device's `instance_id`.
+    pub gateway: String,
+    /// Instance ID of the standby gateway, which advertises the range only
+    /// while no other reachable member does.
+    #[serde(default)]
+    pub backup_gateway: Option<String>,
+}
+
+/// A validated host group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostGroup {
+    /// The group address range, host bits zero.
+    pub cidr: IpNet,
+    pub gateway: String,
+    pub backup_gateway: Option<String>,
+}
+
+/// What this node is for a host group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayRole {
+    /// The gateway: advertises the range whenever it runs.
+    Gateway,
+    /// The standby gateway: advertises the range only while no other
+    /// reachable member does (spec §15.7 rule 5).
+    Backup,
+}
+
+/// Whether `id` is an instance ID as the management API gives it:
+/// `^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`.
+pub fn valid_instance_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_INSTANCE_ID_BYTES
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+}
+
+/// Refuses a `to_subnet` path inside a host group range with a longer
+/// prefix: the members of a group follow the gateway's path and a path can
+/// only name the whole range or a wider network (spec §15.7 rule 7,
+/// §17.2.2, requirement R25). Used for the config and for every
+/// replacement of the path list.
+pub fn check_paths_against_host_groups(
+    paths: &[CustomPath],
+    groups: &[HostGroup],
+) -> Result<(), &'static str> {
+    for path in paths {
+        if let PathTarget::Subnet(subnet) = path.target {
+            if groups
+                .iter()
+                .any(|group| group.cidr.covers(&subnet) && subnet.prefix() > group.cidr.prefix())
+            {
+                return Err(
+                    "mesh path to_subnet is inside a host group range; members of a host group follow the gateway's path",
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The virtual network; every node of it must agree on all of these.
@@ -417,6 +496,12 @@ pub struct MeshSettings {
     pub native_keys: Option<Vec<[u8; 32]>>,
     /// Decoded `node.private_key`, wiped when dropped.
     pub private_key: Option<Zeroizing<[u8; 32]>>,
+    /// Host groups of the network (spec §15.7).
+    pub host_groups: Vec<HostGroup>,
+    /// This device's instance ID, set by the node program that runs the
+    /// network (not part of the config); it tells which host groups this
+    /// node is a gateway of. `None`: none.
+    pub instance_id: Option<String>,
     /// The checked `external_bridge` section; its routes are also in
     /// `advertise_subnets`.
     pub external_bridge: Option<ExternalBridge>,
@@ -457,6 +542,53 @@ impl MeshSettings {
         let mut addresses = vec![self.address.address()];
         addresses.extend(self.address_v6.map(|address| address.address()));
         addresses
+    }
+
+    /// The host groups this node is the gateway or the standby gateway
+    /// of, with its role. Empty for access nodes, which never advertise.
+    pub fn gateway_groups(&self) -> Vec<(&HostGroup, GatewayRole)> {
+        let Some(id) = self.instance_id.as_deref() else {
+            return Vec::new();
+        };
+        if self.role != Role::Full {
+            return Vec::new();
+        }
+        self.host_groups
+            .iter()
+            .filter_map(|group| {
+                if group.gateway == id {
+                    Some((group, GatewayRole::Gateway))
+                } else if group.backup_gateway.as_deref() == Some(id) {
+                    Some((group, GatewayRole::Backup))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// `subnets.advertise` without the host group ranges: a range is
+    /// advertised by its gateways only, whatever a node's own list says.
+    pub fn plain_advertised(&self) -> Vec<IpNet> {
+        self.advertise_subnets
+            .iter()
+            .filter(|subnet| !self.host_groups.iter().any(|group| group.cidr == **subnet))
+            .copied()
+            .collect()
+    }
+
+    /// The subnets this node carries traffic for: its own advertised
+    /// subnets and the ranges of the host groups it is a gateway or standby
+    /// gateway of, whether or not it advertises them at the moment. The
+    /// host forwards for these and the node accepts packets from them.
+    pub fn carried_subnets(&self) -> Vec<IpNet> {
+        let mut carried = self.plain_advertised();
+        for (group, _) in self.gateway_groups() {
+            if !carried.contains(&group.cidr) {
+                carried.push(group.cidr);
+            }
+        }
+        carried
     }
 
     fn in_virtual_subnet(&self, address: IpAddr) -> bool {
@@ -684,6 +816,8 @@ impl MeshConfig {
             paths: Vec::new(),
             native_keys,
             private_key,
+            host_groups: Vec::new(),
+            instance_id: None,
             external_bridge,
         };
         if let Some(bridge) = &settings.external_bridge {
@@ -696,6 +830,7 @@ impl MeshConfig {
         if advertise_subnets_overlap_virtual(&settings) {
             return Err("mesh subnets.advertise overlaps the virtual subnet");
         }
+        settings.host_groups = host_groups(&self.host_groups, &settings)?;
 
         settings.paths = validate_paths(self.routing.paths, &settings)?;
         Ok(settings)
@@ -763,7 +898,66 @@ pub fn validate_paths(
             via: path.via,
         });
     }
+    check_paths_against_host_groups(&custom, &settings.host_groups)?;
     Ok(custom)
+}
+
+/// Validates `host_groups` (spec §15.7 rule 1): at most
+/// [`MAX_HOST_GROUPS`]; each range an intranet network with its host bits
+/// zero, outside this network's virtual subnets and every summary range
+/// this node knows (its own `subnets.advertise`, which a border node fills
+/// with the other regions' subnets; an entry equal to the range is allowed
+/// and only the gateways advertise it), and not overlapping another group;
+/// gateways are instance IDs and the standby differs from the gateway.
+fn host_groups(
+    groups: &[HostGroupConfig],
+    settings: &MeshSettings,
+) -> Result<Vec<HostGroup>, &'static str> {
+    if groups.len() > MAX_HOST_GROUPS {
+        return Err("mesh host_groups lists too many groups");
+    }
+    let virtual_subnets = settings.virtual_subnets();
+    let mut out: Vec<HostGroup> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let cidr = IpNet::parse(&group.cidr).ok_or("mesh host_groups cidr is not a network")?;
+        if cidr.trunc().address() != cidr.address() {
+            return Err("mesh host_groups cidr has host bits set");
+        }
+        let cidr = cidr.trunc();
+        if cidr.prefix() == 0 || !is_intranet_network(&cidr) {
+            return Err("mesh host_groups cidr is outside the intranet ranges");
+        }
+        if virtual_subnets.iter().any(|own| own.overlaps(&cidr)) {
+            return Err("mesh host_groups cidr overlaps the virtual subnet");
+        }
+        if settings
+            .advertise_subnets
+            .iter()
+            .any(|subnet| subnet.overlaps(&cidr) && *subnet != cidr)
+        {
+            return Err("mesh host_groups cidr overlaps a subnet in subnets.advertise");
+        }
+        if out.iter().any(|other| other.cidr.overlaps(&cidr)) {
+            return Err("mesh host_groups ranges overlap");
+        }
+        if !valid_instance_id(&group.gateway) {
+            return Err("mesh host_groups gateway is not an instance ID");
+        }
+        if let Some(backup) = &group.backup_gateway {
+            if !valid_instance_id(backup) {
+                return Err("mesh host_groups backup_gateway is not an instance ID");
+            }
+            if *backup == group.gateway {
+                return Err("mesh host_groups backup_gateway is the gateway");
+            }
+        }
+        out.push(HostGroup {
+            cidr,
+            gateway: group.gateway.clone(),
+            backup_gateway: group.backup_gateway.clone(),
+        });
+    }
+    Ok(out)
 }
 
 impl std::hash::Hash for PathTarget {
@@ -1457,5 +1651,194 @@ mod tests {
         let legacy = validate(base()).unwrap();
         assert!(!legacy.waits_for_native_keys(&own));
         assert!(legacy.admits(&own));
+    }
+
+    fn group(cidr: &str) -> Value {
+        json!({"cidr": cidr, "gateway": "gw-a", "backup_gateway": "gw-b"})
+    }
+
+    /// A full node with `host_groups` and optional extra sections.
+    fn grouped(groups: Value) -> Value {
+        let mut config = with("host_groups", groups);
+        config["node"]["role"] = json!("full");
+        config
+    }
+
+    #[test]
+    fn host_groups_are_validated() {
+        let settings = validate(grouped(json!([group("10.127.1.0/24")]))).unwrap();
+        assert_eq!(
+            settings.host_groups,
+            vec![HostGroup {
+                cidr: IpNet::parse("10.127.1.0/24").unwrap(),
+                gateway: "gw-a".into(),
+                backup_gateway: Some("gw-b".into()),
+            }]
+        );
+        // The standby gateway may be left out.
+        let single = json!([{"cidr": "10.127.2.0/24", "gateway": "gw-a"}]);
+        assert_eq!(
+            validate(grouped(single)).unwrap().host_groups[0].backup_gateway,
+            None
+        );
+        // Absent and empty both mean none.
+        assert!(validate(base()).unwrap().host_groups.is_empty());
+        assert!(validate(grouped(json!([]))).unwrap().host_groups.is_empty());
+
+        let refused = |groups: Value| validate(grouped(groups)).err().unwrap();
+        assert_eq!(
+            refused(json!([group("10.127.1.5/24")])),
+            "mesh host_groups cidr has host bits set"
+        );
+        assert_eq!(
+            refused(json!([group("8.8.8.0/24")])),
+            "mesh host_groups cidr is outside the intranet ranges"
+        );
+        assert_eq!(
+            refused(json!([group("0.0.0.0/0")])),
+            "mesh host_groups cidr is outside the intranet ranges"
+        );
+        assert_eq!(
+            refused(json!([group("not a network")])),
+            "mesh host_groups cidr is not a network"
+        );
+        // Inside, or around, the virtual subnet 10.144.144.0/24.
+        assert_eq!(
+            refused(json!([group("10.144.144.128/25")])),
+            "mesh host_groups cidr overlaps the virtual subnet"
+        );
+        assert_eq!(
+            refused(json!([group("10.144.0.0/16")])),
+            "mesh host_groups cidr overlaps the virtual subnet"
+        );
+        assert_eq!(
+            refused(json!([group("10.127.1.0/24"), group("10.127.0.0/16")])),
+            "mesh host_groups ranges overlap"
+        );
+        assert_eq!(
+            refused(json!([group("10.127.1.0/24"), group("10.127.1.0/24")])),
+            "mesh host_groups ranges overlap"
+        );
+        assert_eq!(
+            refused(json!([{"cidr": "10.127.1.0/24", "gateway": "-bad"}])),
+            "mesh host_groups gateway is not an instance ID"
+        );
+        assert_eq!(
+            refused(json!([{"cidr": "10.127.1.0/24", "gateway": "a".repeat(65)}])),
+            "mesh host_groups gateway is not an instance ID"
+        );
+        assert_eq!(
+            refused(json!([{"cidr": "10.127.1.0/24", "gateway": "gw-a", "backup_gateway": "x y"}])),
+            "mesh host_groups backup_gateway is not an instance ID"
+        );
+        assert_eq!(
+            refused(
+                json!([{"cidr": "10.127.1.0/24", "gateway": "gw-a", "backup_gateway": "gw-a"}])
+            ),
+            "mesh host_groups backup_gateway is the gateway"
+        );
+        let too_many: Vec<Value> = (0..=MAX_HOST_GROUPS)
+            .map(|n| group(&format!("10.{}.{}.0/24", 100 + n / 256, n % 256)))
+            .collect();
+        assert_eq!(
+            refused(json!(too_many)),
+            "mesh host_groups lists too many groups"
+        );
+        let most: Vec<Value> = (0..MAX_HOST_GROUPS)
+            .map(|n| group(&format!("10.127.{n}.0/24")))
+            .collect();
+        assert_eq!(
+            validate(grouped(json!(most))).unwrap().host_groups.len(),
+            MAX_HOST_GROUPS
+        );
+        // Unknown fields are refused like everywhere else.
+        assert!(parse(grouped(
+            json!([{"cidr": "10.127.1.0/24", "gateway": "gw-a", "vms": []}])
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn host_groups_stay_clear_of_known_summary_ranges() {
+        // A border node advertises the other regions' subnets; a group
+        // range inside one of them is refused.
+        let mut config = grouped(json!([group("10.127.1.0/24")]));
+        config["subnets"] = json!({"advertise": ["10.127.0.0/16"]});
+        assert_eq!(
+            validate(config).err().unwrap(),
+            "mesh host_groups cidr overlaps a subnet in subnets.advertise"
+        );
+        // The range itself in subnets.advertise is allowed, and only the
+        // group's gateways advertise it.
+        let mut config = grouped(json!([group("10.127.1.0/24")]));
+        config["subnets"] = json!({"advertise": ["10.127.1.0/24", "192.168.10.0/24"]});
+        let mut settings = validate(config).unwrap();
+        let lan = IpNet::parse("192.168.10.0/24").unwrap();
+        let range = IpNet::parse("10.127.1.0/24").unwrap();
+        assert_eq!(settings.plain_advertised(), vec![lan]);
+        assert_eq!(settings.carried_subnets(), vec![lan]);
+        settings.instance_id = Some("gw-b".into());
+        assert_eq!(settings.gateway_groups()[0].1, GatewayRole::Backup);
+        assert_eq!(settings.carried_subnets(), vec![lan, range]);
+        settings.instance_id = Some("gw-a".into());
+        assert_eq!(settings.gateway_groups()[0].1, GatewayRole::Gateway);
+    }
+
+    #[test]
+    fn a_path_cannot_single_out_a_member_of_a_host_group() {
+        // Audit F-01, requirement R25, spec §15.7 rule 7.
+        let path = |to: &str| json!([{"to_subnet": to, "via": ["10.144.144.9"]}]);
+        let mut config = grouped(json!([group("10.127.1.0/24")]));
+        for inside in [
+            "10.127.1.20/32",
+            "10.127.1.20",
+            "10.127.1.0/25",
+            "10.127.1.128/26",
+        ] {
+            config["routing"] = json!({"paths": path(inside)});
+            assert_eq!(
+                validate(config.clone()).err().unwrap(),
+                "mesh path to_subnet is inside a host group range; members of a host group follow the gateway's path",
+                "{inside}"
+            );
+        }
+        // The whole range, a wider network and other networks are fine.
+        for allowed in [
+            "10.127.1.0/24",
+            "10.127.0.0/16",
+            "10.0.0.0/8",
+            "192.168.1.0/24",
+        ] {
+            config["routing"] = json!({"paths": path(allowed)});
+            assert!(validate(config.clone()).is_ok(), "{allowed}");
+        }
+        // A path to a member of the network is not affected.
+        config["routing"] =
+            json!({"paths": [{"to_peer": "10.144.144.7", "via": ["10.144.144.9"]}]});
+        assert!(validate(config).is_ok());
+
+        // The shared check, as every replacement of the path list uses it.
+        let groups = vec![HostGroup {
+            cidr: IpNet::parse("10.127.1.0/24").unwrap(),
+            gateway: "gw-a".into(),
+            backup_gateway: None,
+        }];
+        let to = |text: &str| CustomPath {
+            target: PathTarget::Subnet(IpNet::parse(text).unwrap()),
+            via: vec!["10.144.144.9".parse().unwrap()],
+        };
+        assert!(check_paths_against_host_groups(&[to("10.127.1.7/32")], &groups).is_err());
+        assert!(check_paths_against_host_groups(&[to("10.127.1.0/24")], &groups).is_ok());
+        assert!(check_paths_against_host_groups(&[to("10.127.1.0/24")], &[]).is_ok());
+    }
+
+    #[test]
+    fn instance_ids_follow_the_contract() {
+        for id in ["a", "0", "gw-a", "A-b-9", &"x".repeat(64)] {
+            assert!(valid_instance_id(id), "{id}");
+        }
+        for id in ["", "-a", "a b", "a_b", "é", &"x".repeat(65)] {
+            assert!(!valid_instance_id(id), "{id}");
+        }
     }
 }

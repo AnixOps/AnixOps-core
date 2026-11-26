@@ -31,11 +31,17 @@ struct FakeMesh {
     applied: Mutex<Vec<Vec<(String, String)>>>,
     /// The backbone ID of every applied request, `None` without one.
     backbones: Mutex<Vec<Option<u32>>>,
+    /// Does not list `mesh_backbone`, as a node with the backbone off.
+    no_backbone: bool,
 }
 
 impl MeshControl for FakeMesh {
     fn features(&self) -> &'static [&'static str] {
-        &["mesh", "mesh_dns"]
+        if self.no_backbone {
+            &["mesh", "mesh_dns"]
+        } else {
+            &["mesh", "mesh_dns", "mesh_backbone"]
+        }
     }
 
     fn status(&self) -> ManagedStatus {
@@ -334,4 +340,42 @@ async fn a_border_node_takes_its_backbone_with_the_region_network() {
     let (status, _, _) = call(api, "PUT", "/v1/mesh", Some(body)).await;
     assert_eq!(status, 200);
     assert_eq!(*mesh.backbones.lock().unwrap(), [Some(11), None]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_with_the_backbone_off_refuses_the_section_and_keeps_its_networks() {
+    let mesh = Arc::new(FakeMesh {
+        no_backbone: true,
+        ..FakeMesh::default()
+    });
+    let api = start_api(Some(mesh.clone())).await;
+    let (_, _, status) = call(api, "GET", "/v1/status", None).await;
+    assert!(features(&status).contains(&"mesh".to_owned()));
+    assert!(!features(&status).contains(&"mesh_backbone".to_owned()));
+
+    let body = json!({"networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")]});
+    let (status, _, before) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 200, "{before}");
+
+    // A valid body with a backbone: refused as a whole with its own code,
+    // nothing reaches the mesh, the running network stays.
+    let body = json!({
+        "networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")],
+        "backbone": backbone("cn")
+    });
+    let (status, raw, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("backbone_disabled"),
+        "{answer}"
+    );
+    assert!(!raw.contains(SECRET), "{raw}");
+    assert_eq!(*mesh.backbones.lock().unwrap(), [None]);
+    assert_eq!(mesh.applied.lock().unwrap().len(), 1);
+    let (status, _, after) = call(api, "GET", "/v1/mesh", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(after, before);
 }
