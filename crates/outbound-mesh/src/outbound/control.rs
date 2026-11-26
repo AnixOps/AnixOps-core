@@ -402,13 +402,20 @@ mod tests {
         assert!(parsed(json!({"cmd": 7, "mesh_status": true})).is_none());
         assert!(parse(b"mesh_status").is_none());
         assert!(parse(b"[\"mesh_status\"]").is_none());
-        // Nesting deeper than the parser takes is refused, not followed.
+        // Deep nesting is refused, never taken as a command: the command
+        // name is read past it without recursing, the arguments are not.
         let deep = format!(
             "{{\"cmd\":\"mesh_status\",\"x\":{}{}}}",
             "[".repeat(10_000),
             "]".repeat(10_000)
         );
-        assert!(parse(deep.as_bytes()).is_none());
+        assert!(matches!(parse(deep.as_bytes()), Some(Request::Invalid(_))));
+        let deep = format!(
+            "{{\"cmd\":\"mesh_status\",\"network\":{}\"a\"{}}}",
+            "[".repeat(10_000),
+            "]".repeat(10_000)
+        );
+        assert!(matches!(parse(deep.as_bytes()), Some(Request::Invalid(_))));
         // A large request of another command is left alone.
         let large = format!(
             "{{\"cmd\":\"traffic\",\"pad\":\"{}\"}}",
