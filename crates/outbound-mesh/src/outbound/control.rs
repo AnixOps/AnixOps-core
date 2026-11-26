@@ -381,9 +381,19 @@ fn status(registry: &Registry, network: Option<&str>) -> Value {
         Some(name) => views
             .iter()
             .position(|view| view.settings.network_name == name),
+        // A running network first, then a joined one that is not stopped
+        // for its device ID (it would show the old identity), else the
+        // first saved one.
         None => views
             .iter()
-            .position(|view| view.joined.is_some())
+            .position(|view| view.joined.as_ref().is_some_and(|joined| joined.running))
+            .or_else(|| {
+                views.iter().position(|view| {
+                    view.joined.as_ref().is_some_and(|joined| {
+                        joined.failure != Some(crate::outbound::Failure::InstanceIdChanged)
+                    })
+                })
+            })
             .or(Some(0)),
     };
     let Some(chosen) = chosen else {
@@ -639,6 +649,29 @@ mod tests {
         );
         assert_eq!(saved, json!({"ok": true}));
         assert!(looked.get());
+    }
+
+    #[test]
+    fn the_status_does_not_default_to_a_network_stopped_for_its_device_id() {
+        let (_runtime, registry) = registry();
+        let saved = run(
+            Some(&registry),
+            json!({"cmd": "mesh_save_network", "config": config("a-old", "10.144.0.2/24", "legacy")}),
+        );
+        assert_eq!(saved, json!({"ok": true}));
+        let mut current: MeshConfig =
+            serde_json::from_value(config("b-new", "10.145.0.2/24", "legacy")).unwrap();
+        current.node.instance_id = Some("device-2".into());
+        registry.commit(vec![current.validate().unwrap()]);
+        let status = run(Some(&registry), json!({"cmd": "mesh_status"}));
+        assert_eq!(status["network"]["id"], "b-new");
+        assert_eq!(status["self"]["id"], "device-2");
+        let old = run(
+            Some(&registry),
+            json!({"cmd": "mesh_status", "network": "a-old"}),
+        );
+        assert_eq!(old["network"]["state"], "not_joined");
+        assert_eq!(old["network"]["failure"]["code"], "instance_id_changed");
     }
 
     #[test]
