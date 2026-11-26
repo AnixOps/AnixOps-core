@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+### Mesh
+
+- 新增组网端到端实验床（`docs/mesh-e2e.md`、`.github/scripts/mesh-e2e/`、工作流 `mesh-e2e.yml`）：每台机器一个网络命名空间，运行本仓库构建的 `anixops-mesh run`，场景按需求编号登记；12 个场景启用，0.4、0.5 的 11 个场景待对应功能合并后启用。内核 0.4 起 RC 必须该工作流全绿。
+- `anixops-mesh run` 失败时 stderr 最后一行改为符合设计文档的退出约定：启动冲突为 `{"error":"conflict","conflict":"port_in_use"|"tun_in_use","detail"}`（此前为 `{"error":"busy"}`、无冲突代码），其他运行错误为 `"error":"runtime"`（此前为 `"run"`）。退出码不变（2、3、1）。端到端场景 E10 发现。
+
 ### Release process
 
 - 发布策略加入版本节奏、候选版（RC）流程、维护分支 `release/X.Y` 与补丁维护规则（`docs/release-strategy.md`），新增兼容性承诺清单（`docs/compatibility-surface.md`）。

@@ -174,10 +174,7 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     match mesh_node::serve::run(config, options.interface.as_deref()) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(failure) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({ "error": failure.kind(), "detail": failure.detail() })
-            );
+            eprintln!("{}", failure.json());
             Err(ExitCode::from(failure.exit_code()))
         }
     }
@@ -234,10 +231,7 @@ fn node_exit_code(config: &Path, interface: Option<&str>) -> u8 {
     match mesh_node::serve::run(config, interface) {
         Ok(()) => 0,
         Err(failure) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({ "error": failure.kind(), "detail": failure.detail() })
-            );
+            eprintln!("{}", failure.json());
             failure.exit_code()
         }
     }
