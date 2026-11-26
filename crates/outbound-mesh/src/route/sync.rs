@@ -1625,7 +1625,6 @@ mod tests {
     #[test]
     fn rows_cut_from_a_delivered_graph_are_sent_again() {
         let now = Instant::now();
-        let rng = SystemRandom::new();
         // A chain 1 - 2 - 3 learned by node 1, then a new neighbour 9.
         let mut nodes = [node(1, now), node(2, now), node(3, now)];
         {
