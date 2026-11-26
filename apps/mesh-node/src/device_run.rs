@@ -317,7 +317,7 @@ pub fn managed_networks(body: &Value) -> Result<Vec<ManagedNetwork>, String> {
 async fn apply(mesh: &ManagedMesh, networks: &[Network]) -> Result<(), String> {
     let body = device::kernel_body(networks, Sections::default());
     let managed = managed_networks(&body)?;
-    mesh.apply(managed)
+    mesh.apply(managed, None)
         .await
         .map(|_| ())
         .map_err(|error| match error {
@@ -720,7 +720,7 @@ fn snapshot(
 }
 
 async fn stop(state: &State, mesh: &ManagedMesh) -> Result<(), Exit> {
-    let _ = mesh.apply(Vec::new()).await;
+    let _ = mesh.apply(Vec::new(), None).await;
     let _ = std::fs::remove_file(state.socket());
     log("stopped", json!({}));
     Ok(())
@@ -730,7 +730,7 @@ async fn stop(state: &State, mesh: &ManagedMesh) -> Result<(), Exit> {
 /// service ends with [`EXIT_TOKEN`] until an administrator issues a new
 /// credential.
 async fn token_refused(host: &dyn Host, state: &State, mesh: &ManagedMesh) -> Result<(), Exit> {
-    let _ = mesh.apply(Vec::new()).await;
+    let _ = mesh.apply(Vec::new(), None).await;
     let _ = host.remove_file(&state.token());
     let _ = std::fs::remove_file(state.socket());
     Err(Exit::new(
