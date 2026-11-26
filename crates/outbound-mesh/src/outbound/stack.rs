@@ -45,8 +45,25 @@ const STACK_QUEUE: usize = 1024;
 const CHANNEL_PACKETS: usize = 1024;
 const UDP_PACKETS: usize = 32;
 pub(crate) const UDP_BUFFER: usize = 16 * 1024;
+/// Receive buffer of each TCP connection; it bounds the window one
+/// connection advertises. Same trade-off as the WireGuard outbound: iOS
+/// keeps 64 KiB for the Network Extension's memory budget, Android takes
+/// 256 KiB, desktops 512 KiB.
+#[cfg(target_os = "ios")]
+const TCP_RECEIVE_BUFFER: usize = 64 * 1024;
+#[cfg(target_os = "android")]
 const TCP_RECEIVE_BUFFER: usize = 256 * 1024;
-const TCP_SEND_BUFFER: usize = 256 * 1024;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const TCP_RECEIVE_BUFFER: usize = 512 * 1024;
+/// Send buffer of each TCP connection: the stack runs no congestion
+/// control, so a larger one would only send larger bursts.
+const TCP_SEND_BUFFER: usize = 64 * 1024;
+/// Most sockets (connections, flows, closing connections) one network's
+/// stack holds; iOS is bounded by the Network Extension's memory.
+#[cfg(target_os = "ios")]
+pub(crate) const MAX_SOCKETS: usize = 128;
+#[cfg(not(target_os = "ios"))]
+pub(crate) const MAX_SOCKETS: usize = 1024;
 const FIRST_LOCAL_PORT: u16 = 49152;
 
 /// Packet queues between the stack and the driver.
@@ -192,6 +209,9 @@ pub enum Failure {
     PortInUse,
     /// The driver stopped on an error.
     Stopped,
+    /// The engine built the network again with other settings; this
+    /// instance stopped for good and the new one runs instead.
+    Replaced,
 }
 
 impl Failure {
@@ -200,7 +220,7 @@ impl Failure {
         match self {
             Self::NativeKeysPending => "native_keys_pending",
             Self::PortInUse => "port_in_use",
-            Self::Stopped => "start_refused",
+            Self::Stopped | Self::Replaced => "start_refused",
         }
     }
 
@@ -215,6 +235,10 @@ impl Failure {
                 "mesh network listening port is in use",
             ),
             Self::Stopped => io::Error::new(io::ErrorKind::NotConnected, "mesh network stopped"),
+            Self::Replaced => io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "mesh network settings changed",
+            ),
         }
     }
 }
@@ -235,6 +259,8 @@ struct Core {
     route_overrides: watch::Sender<Vec<IpNet>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
     next_port: u16,
+    /// Stopped for good: newer settings replaced the network.
+    retired: bool,
 }
 
 /// One network: its settings, static key, stack and driver.
@@ -279,6 +305,7 @@ impl Instance {
                 route_overrides,
                 native_keys,
                 next_port,
+                retired: false,
             }),
             wake: Arc::new(Notify::new()),
             snapshot,
@@ -345,6 +372,9 @@ impl Instance {
     /// Starts a driver unless one runs. Fails at once for a network that
     /// waits for its key list.
     pub(crate) fn ensure_running(self: &Arc<Self>) -> io::Result<()> {
+        if self.lock().retired {
+            return Err(Failure::Replaced.error());
+        }
         if self
             .settings
             .waits_for_native_keys(&self.static_key.public())
@@ -399,6 +429,23 @@ impl Instance {
         f(core.stack.sockets.get_mut::<T>(handle))
     }
 
+    /// Stops the network for good, after the engine built it again with
+    /// other settings: the driver stops at once (it would keep the old
+    /// `native_keys` and dial with the same identity as the new one) and
+    /// every connection ends, however long it would have lived.
+    pub(crate) fn retire(&self) {
+        let mut core = self.lock();
+        core.retired = true;
+        core.running = false;
+        core.failure = Some(Failure::Replaced);
+        // A new run number ends the pump and makes the old driver's report
+        // a no-op.
+        core.run += 1;
+        core.shutdown = None;
+        core.to_driver = None;
+        core.stack.abort_all();
+    }
+
     /// Starts a TCP connection to `remote`.
     pub(crate) fn open_tcp(&self, remote: SocketAddr) -> io::Result<SocketHandle> {
         let mut guard = self.lock();
@@ -407,6 +454,7 @@ impl Instance {
             return Err(self.not_running());
         }
         let core = &mut *guard;
+        check_capacity(&core.stack.sockets)?;
         let port = allocate_port(&mut core.next_port, &core.stack.sockets)?;
         let mut socket = new_tcp_socket();
         socket
@@ -419,6 +467,7 @@ impl Instance {
     /// traffic between two nodes.
     pub(crate) fn listen_tcp(&self, port: u16) -> io::Result<SocketHandle> {
         let mut core = self.lock();
+        check_capacity(&core.stack.sockets)?;
         let mut socket = new_tcp_socket();
         socket
             .listen(port)
@@ -430,6 +479,7 @@ impl Instance {
     pub(crate) fn open_udp(&self, port: Option<u16>) -> io::Result<SocketHandle> {
         let mut guard = self.lock();
         let core = &mut *guard;
+        check_capacity(&core.stack.sockets)?;
         let port = match port {
             Some(port) if udp_port_bound(&core.stack.sockets, port) => {
                 return Err(udp_port_unavailable())
@@ -630,6 +680,17 @@ fn new_tcp_socket() -> tcp::Socket<'static> {
     socket
 }
 
+/// Refuses a new socket when the stack holds [`MAX_SOCKETS`] already.
+fn check_capacity(sockets: &SocketSet<'static>) -> io::Result<()> {
+    if sockets.iter().count() >= MAX_SOCKETS {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "mesh network has too many open connections",
+        ));
+    }
+    Ok(())
+}
+
 /// The port after `port` in the local range, wrapping from 65535 to
 /// [`FIRST_LOCAL_PORT`].
 fn following_port(port: u16) -> u16 {
@@ -756,18 +817,27 @@ impl UdpHandle {
         Ok(())
     }
 
-    pub(crate) async fn recv(&self) -> io::Result<Vec<u8>> {
+    /// The next datagram; with `from`, only one whose source is `from`
+    /// (others are dropped), so that a member cannot answer for another.
+    pub(crate) async fn recv(&self, from: Option<SocketAddr>) -> io::Result<Vec<u8>> {
+        let from = from.map(endpoint);
         std::future::poll_fn(|cx| {
             self.instance
                 .with_socket::<udp::Socket, _>(self.handle, |socket| {
                     if !socket.is_open() {
                         return TaskPoll::Ready(Err(closed()));
                     }
-                    match socket.recv() {
-                        Ok((payload, _)) => TaskPoll::Ready(Ok(payload.to_vec())),
-                        Err(_) => {
-                            socket.register_recv_waker(cx.waker());
-                            TaskPoll::Pending
+                    loop {
+                        match socket.recv() {
+                            Ok((payload, meta)) => {
+                                if from.is_none_or(|from| meta.endpoint == from) {
+                                    return TaskPoll::Ready(Ok(payload.to_vec()));
+                                }
+                            }
+                            Err(_) => {
+                                socket.register_recv_waker(cx.waker());
+                                return TaskPoll::Pending;
+                            }
                         }
                     }
                 })

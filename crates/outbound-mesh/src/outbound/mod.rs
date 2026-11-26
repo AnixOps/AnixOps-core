@@ -7,8 +7,9 @@
 //! The engine finds a network by its `network.name`, not by the outbound's
 //! key: building the same settings again (a new profile that keeps the
 //! network) returns the running network, so its sessions and member links
-//! stay ([`MeshFactory`]). Changed settings make a new network once the old
-//! one is no longer used.
+//! stay ([`MeshFactory`]). Changed settings stop the old network at once,
+//! connections included, and start a new one: the old one would keep the
+//! previous `native_keys` (spec §8.3.1) and dial with the same identity.
 
 mod stack;
 
@@ -55,6 +56,7 @@ fn instance_for(settings: MeshSettings) -> io::Result<Arc<Instance>> {
         if *instance.settings() == settings {
             return Ok(instance);
         }
+        instance.retire();
     }
     let name = settings.network_name.clone();
     let instance = Instance::new(settings)?;
@@ -116,9 +118,20 @@ impl MeshOutbound {
         &self.instance
     }
 
+    /// An outbound for `settings` on a network of its own, which the engine
+    /// does not find by name; for tests that run several nodes of one
+    /// network in a process.
+    #[doc(hidden)]
+    pub fn unshared(settings: MeshSettings) -> io::Result<Self> {
+        Ok(Self {
+            instance: Instance::new(settings)?,
+        })
+    }
+
     /// Accepts one TCP connection to `port` of this node's virtual
     /// address. A client only dials out in normal use; this serves tests
     /// that pass traffic between two nodes.
+    #[doc(hidden)]
     pub async fn accept_tcp(&self, port: u16) -> io::Result<BoxStream> {
         self.instance.ensure_running()?;
         let handle = self.instance.listen_tcp(port)?;
@@ -132,6 +145,7 @@ impl MeshOutbound {
     }
 
     /// Like [`TcpOutbound::open_udp`] with a fixed local port; for tests.
+    #[doc(hidden)]
     pub async fn open_udp_on(&self, port: u16, target: &TargetAddr) -> io::Result<UdpFlow> {
         self.udp_flow(Some(port), target).await
     }
@@ -202,7 +216,7 @@ impl MeshOutbound {
                 socket: socket.clone(),
                 remote,
             }),
-            Box::new(MeshUdpRecv { socket }),
+            Box::new(MeshUdpRecv { socket, remote }),
         ))
     }
 }
@@ -352,13 +366,15 @@ impl DatagramSend for MeshUdpSend {
     }
 }
 
-/// Replies are attributed to the flow's destination whatever their source.
+/// Only datagrams from the flow's destination: another member cannot
+/// answer for it.
 struct MeshUdpRecv {
     socket: Arc<UdpHandle>,
+    remote: SocketAddr,
 }
 
 impl DatagramRecv for MeshUdpRecv {
     fn recv(&mut self) -> BoxFuture<'_, io::Result<Vec<u8>>> {
-        Box::pin(self.socket.recv())
+        Box::pin(self.socket.recv(Some(self.remote)))
     }
 }

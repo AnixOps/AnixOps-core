@@ -53,9 +53,10 @@ fn two_nodes() -> (MeshOutbound, MeshOutbound) {
         json!({"address": "10.144.0.2/24", "role": "full"}),
         json!([{"server": "127.0.0.1", "port": port, "transport": "tcp"}]),
     );
+    // One network twice in a process: neither may replace the other.
     (
-        MeshOutbound::new(server).unwrap(),
-        MeshOutbound::new(client).unwrap(),
+        MeshOutbound::unshared(server).unwrap(),
+        MeshOutbound::unshared(client).unwrap(),
     )
 }
 
@@ -194,4 +195,26 @@ fn the_same_settings_share_one_network() {
     assert!(std::sync::Arc::ptr_eq(first.instance(), &found));
     drop((first, again, found));
     assert!(outbound_mesh::outbound::instance("outbound-shared").is_none());
+}
+
+#[test]
+fn changed_settings_stop_the_old_network() {
+    let config = |address: &str| {
+        let config: MeshConfig = serde_json::from_value(json!({
+            "config_version": 1,
+            "network": {"name": "outbound-replaced", "secret": "s3cr3t", "kind": "legacy"},
+            "node": {"address": address, "role": "access"},
+            "peers": [{"server": "127.0.0.1", "port": 1}],
+        }))
+        .unwrap();
+        config.validate().unwrap()
+    };
+    let old = MeshOutbound::new(config("10.147.0.2/24")).unwrap();
+    let new = MeshOutbound::new(config("10.147.0.3/24")).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(old.instance(), new.instance()));
+    // The old one stays stopped although an outbound still holds it.
+    assert_eq!(old.instance().state(), (false, Some(Failure::Replaced)));
+    assert_eq!(new.instance().state(), (false, None));
+    let found = outbound_mesh::outbound::instance("outbound-replaced").unwrap();
+    assert!(std::sync::Arc::ptr_eq(new.instance(), &found));
 }
