@@ -613,19 +613,19 @@ mod native {
         if created.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let mut boundary = Boundary(created as *mut core::ffi::c_void);
+        let mut boundary = Boundary(created);
         let mut administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
         let mut handle = boundary.0 as _;
         let added =
             unsafe { AddSIDToBoundaryDescriptor(&mut handle, administrators.as_mut_ptr() as PSID) };
-        boundary.0 = handle as *mut core::ffi::c_void;
+        boundary.0 = handle;
         if added == 0 {
             return Err(io::Error::last_os_error());
         }
         let namespace =
             unsafe { CreatePrivateNamespaceW(attributes, boundary.0 as _, name.as_ptr()) };
         if !namespace.is_null() {
-            return Ok(Namespace(namespace as *mut core::ffi::c_void));
+            return Ok(Namespace(namespace));
         }
         let error = unsafe { GetLastError() };
         if error != ERROR_ALREADY_EXISTS {
@@ -635,7 +635,7 @@ mod native {
         if namespace.is_null() {
             return Err(namespace_error(unsafe { GetLastError() }));
         }
-        Ok(Namespace(namespace as *mut core::ffi::c_void))
+        Ok(Namespace(namespace))
     }
 
     /// A token without the Administrators SID enabled is refused the
