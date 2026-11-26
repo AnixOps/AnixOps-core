@@ -4,21 +4,26 @@
 //! opens inside the network's private stack ([`stack`]); nothing is sent for
 //! any other destination.
 //!
-//! The engine finds a network by its `network.name`, not by the outbound's
-//! key: building the same settings again (a new profile that keeps the
-//! network) returns the running network, so its sessions and member links
-//! stay ([`MeshFactory`]). Changed settings stop the old network at once,
-//! connections included, and start a new one: the old one would keep the
-//! previous `native_keys` (spec §8.3.1) and dial with the same identity.
+//! The networks run in the [`engine::MeshEngine`], not in the outbounds: an
+//! outbound only names its network (`network.name`, not the outbound's
+//! key) and the settings it was built with, and takes the running instance
+//! from the engine's [`registry::Registry`] at each connection. Building an
+//! outbound starts and stops nothing; the engine commits a profile's
+//! networks once it adopted the profile. A network whose settings did not
+//! change keeps running across profiles, its sessions and member links
+//! included; changed settings stop the old network at once, connections
+//! included, and start a new one: the old one would keep the previous
+//! `native_keys` (spec §8.3.1) and dial with the same identity.
 
+pub mod engine;
+pub mod registry;
 pub mod snapshot;
 mod stack;
 
-use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -32,6 +37,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{MeshConfig, MeshSettings, TYPE_NAME};
 
+use engine::EngineSlot;
 use stack::{closed, unreachable_address, UdpHandle};
 pub use stack::{Failure, Instance};
 
@@ -40,32 +46,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a domain target may take to resolve.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The networks built so far, by `network.name`; an entry lives as long as
-/// an outbound uses it.
-static INSTANCES: Mutex<BTreeMap<String, Weak<Instance>>> = Mutex::new(BTreeMap::new());
-
-/// The running network for `settings`, or a new one.
-fn instance_for(settings: MeshSettings) -> io::Result<Arc<Instance>> {
-    let mut instances = INSTANCES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    instances.retain(|_, instance| instance.strong_count() > 0);
-    if let Some(instance) = instances
-        .get(&settings.network_name)
-        .and_then(Weak::upgrade)
-        .filter(|instance| !instance.is_retired())
-    {
-        if same_settings(instance.settings(), &settings) {
-            return Ok(instance);
-        }
-        instance.retire();
-    }
-    let name = settings.network_name.clone();
-    let instance = Instance::new(settings)?;
-    instances.insert(name, Arc::downgrade(&instance));
-    Ok(instance)
-}
-
 /// Whether a running network can serve `settings` as it is. [`IpNet`]
 /// equality compares networks only, so the node's own addresses are
 /// compared apart: a new address inside the same subnet is a new network.
@@ -73,18 +53,33 @@ fn same_settings(running: &MeshSettings, wanted: &MeshSettings) -> bool {
     running == wanted && running.local_addresses() == wanted.local_addresses()
 }
 
-/// The running network named `name` (`network.name`), while an outbound
-/// uses it.
-pub fn instance(name: &str) -> Option<Arc<Instance>> {
-    INSTANCES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(name)
-        .and_then(Weak::upgrade)
-        .filter(|instance| !instance.is_retired())
+/// Builds `"type": "mesh"` outbounds.
+pub struct MeshFactory {
+    binding: Option<Binding>,
 }
 
-pub struct MeshFactory;
+struct Binding {
+    slot: &'static EngineSlot,
+    built: Arc<Mutex<Vec<MeshSettings>>>,
+}
+
+impl MeshFactory {
+    /// Outbounds that refuse every connection as unsupported: for delay
+    /// tests and checkups, which must neither start a network nor take one
+    /// over from the running profile.
+    pub fn detached() -> Self {
+        Self { binding: None }
+    }
+
+    /// Outbounds that find their network in the engine of `slot` at each
+    /// connection. `built` collects the settings of every outbound built,
+    /// for the engine to commit once it adopted the profile.
+    pub fn bound(slot: &'static EngineSlot, built: Arc<Mutex<Vec<MeshSettings>>>) -> Self {
+        Self {
+            binding: Some(Binding { slot, built }),
+        }
+    }
+}
 
 impl OutboundFactory for MeshFactory {
     fn type_name(&self) -> &'static str {
@@ -104,26 +99,92 @@ impl OutboundFactory for MeshFactory {
     ) -> Result<Arc<dyn TcpOutbound>, BuildError> {
         let config: MeshConfig = parse_settings(settings, "mesh settings are missing or invalid")?;
         let settings = config.validate()?;
-        let instance = instance_for(settings).map_err(|_| "mesh static key could not be made")?;
-        Ok(Arc::new(MeshOutbound { instance }))
+        let Some(binding) = &self.binding else {
+            return Ok(Arc::new(DetachedOutbound));
+        };
+        binding
+            .built
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(settings.clone());
+        Ok(Arc::new(RegistryOutbound {
+            slot: binding.slot,
+            settings,
+        }))
     }
 }
 
-/// One mesh network as an outbound. Clones share the network.
+/// A mesh outbound outside the engine's adopted profile.
+struct DetachedOutbound;
+
+fn unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "mesh networks are only reached through the running engine",
+    )
+}
+
+impl TcpOutbound for DetachedOutbound {
+    fn protocol(&self) -> &'static str {
+        TYPE_NAME
+    }
+
+    fn connect<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async { Err(unsupported()) })
+    }
+
+    fn open_udp<'a>(&'a self, _target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
+        Box::pin(async { Err(unsupported()) })
+    }
+}
+
+/// A mesh outbound of a profile: the network named in `settings`, taken
+/// from the engine at each connection.
+struct RegistryOutbound {
+    slot: &'static EngineSlot,
+    settings: MeshSettings,
+}
+
+impl RegistryOutbound {
+    fn resolve(&self) -> io::Result<MeshOutbound> {
+        let engine = self.slot.current().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "mesh engine is not running")
+        })?;
+        let instance = engine
+            .registry()
+            .instance(&self.settings.network_name, &self.settings)?;
+        Ok(MeshOutbound { instance })
+    }
+}
+
+impl TcpOutbound for RegistryOutbound {
+    fn protocol(&self) -> &'static str {
+        TYPE_NAME
+    }
+
+    fn connect<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<BoxStream>> {
+        Box::pin(async move { self.resolve()?.tcp(target).await })
+    }
+
+    fn open_udp<'a>(&'a self, target: &'a TargetAddr) -> BoxFuture<'a, io::Result<UdpFlow>> {
+        Box::pin(async move { self.resolve()?.udp_flow(None, target).await })
+    }
+
+    fn health(&self) -> Option<serde_json::Value> {
+        match self.resolve() {
+            Ok(outbound) => outbound.health(),
+            Err(_) => Some(serde_json::json!({"running": false, "members": 0})),
+        }
+    }
+}
+
+/// One mesh network instance as an outbound. Clones share the network.
 #[derive(Clone)]
 pub struct MeshOutbound {
     instance: Arc<Instance>,
 }
 
 impl MeshOutbound {
-    /// An outbound for `settings`, sharing a running network with the same
-    /// settings.
-    pub fn new(settings: MeshSettings) -> io::Result<Self> {
-        Ok(Self {
-            instance: instance_for(settings)?,
-        })
-    }
-
     pub fn instance(&self) -> &Arc<Instance> {
         &self.instance
     }

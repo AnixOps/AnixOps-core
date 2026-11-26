@@ -24,6 +24,7 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use crate::config::{
     CustomPath, HostGroup, MeshSettings, PathTarget, PeerEndpoint, Role, SecurityMode, Transport,
 };
+use crate::dns::{DnsSettings, Names};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
 use crate::node::{Action, ConnId, Counters, Node, SyncOversize, WITHDRAW_WAIT};
@@ -146,6 +147,9 @@ pub struct Snapshot {
     pub foreign_overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
+    /// The intranet name list (R28): the names the status shows, and the
+    /// answers for the engine's split DNS ([`Names::answer`]).
+    pub names: Option<Arc<Names>>,
     /// The custom paths and their states, in configuration order (spec
     /// §17.2.7).
     pub paths: Vec<PathStatus>,
@@ -289,6 +293,9 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// A new `dns` section, applied without a restart (R28); the value at
+    /// start is ignored, the settings carry it.
+    pub dns: watch::Receiver<DnsSettings>,
     /// A new list of custom paths, already validated, which replaces the
     /// current one at once (spec §17.2.8); the value at start is ignored,
     /// the settings carry it.
@@ -338,6 +345,7 @@ pub async fn run(
         snapshots,
         mut local_networks,
         mut native_keys,
+        mut dns,
         mut paths,
         mut host_groups,
         mut route_overrides,
@@ -363,6 +371,7 @@ pub async fn run(
     };
     let mut from_backbone = from_backbone.lock_owned().await;
     native_keys.mark_unchanged();
+    dns.mark_unchanged();
     paths.mark_unchanged();
     host_groups.mark_unchanged();
     let rng = SystemRandom::new();
@@ -484,6 +493,11 @@ pub async fn run(
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
                 node.set_native_keys(keys, Instant::now());
+                publish(&snapshots, snapshot(&node, local_read));
+            }
+            Ok(()) = dns.changed() => {
+                let settings = dns.borrow_and_update().clone();
+                node.set_dns(settings);
                 publish(&snapshots, snapshot(&node, local_read));
             }
             Ok(()) = paths.changed() => {
@@ -655,6 +669,7 @@ fn snapshot(node: &Node, local_read: bool) -> Snapshot {
             .into_iter()
             .map(|(peer, address)| (peer.0, address))
             .collect(),
+        names: Some(Arc::clone(node.names())),
         paths,
         advertising: node.advertising().to_vec(),
         standing_in: node.standing_in().to_vec(),
@@ -1294,6 +1309,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (local_tx, local_networks) = watch::channel(local);
         let (_, native_keys) = watch::channel(None);
+        let (_, dns) = watch::channel(DnsSettings::default());
         let (_, paths) = watch::channel(Vec::new());
         let (_, host_groups) = watch::channel(Vec::new());
         let (_, route_overrides) = watch::channel(Vec::new());
@@ -1308,6 +1324,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                dns,
                 paths,
                 host_groups,
                 route_overrides,
@@ -1535,6 +1552,7 @@ mod tests {
         let (_shutdown_tx, shutdown) = watch::channel(false);
         let (_local, local_networks) = watch::channel(Some(Vec::new()));
         let (_keys, native_keys) = watch::channel(None);
+        let (_dns, dns) = watch::channel(DnsSettings::default());
         let (_groups, host_groups) = watch::channel(Vec::new());
         let (_paths, paths) = watch::channel(Vec::new());
         let (_overrides, route_overrides) = watch::channel(Vec::new());
@@ -1549,6 +1567,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                dns,
                 paths,
                 host_groups,
                 route_overrides,
@@ -1664,6 +1683,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_keep_networks, local_networks) = watch::channel(Some(Vec::new()));
         let (_keep_keys, native_keys) = watch::channel(None);
+        let (_keep_dns, dns) = watch::channel(DnsSettings::default());
         let (_keep_groups, host_groups) = watch::channel(Vec::new());
         let (_keep_paths, paths) = watch::channel(Vec::new());
         let (_keep_overrides, route_overrides) = watch::channel(Vec::new());
@@ -1678,6 +1698,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                dns,
                 paths,
                 host_groups,
                 route_overrides,

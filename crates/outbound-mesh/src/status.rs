@@ -20,6 +20,7 @@ use crate::backbone::config::{BackboneSettings, LinkConfig};
 use crate::backbone::engine::{RouteEvent, Status as BackboneEngineStatus};
 use crate::backbone::BackboneId;
 use crate::config::MeshSettings;
+use crate::dns::{NameStatus, RefusedName};
 use crate::net::IpNet;
 
 /// Most networks one `PUT /v1/mesh` may carry. A border node joins one
@@ -116,6 +117,76 @@ pub struct ManagedStatus {
     /// item 9).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<Alert>,
+    /// Region measurement, suggestion and probe responder (appendix
+    /// D.9.2); `null` without a directory and without a responder.
+    pub region_probe: Option<RegionProbeStatus>,
+}
+
+/// `region_probe` of the answer (appendix D.9.2, D.9.3).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RegionProbeStatus {
+    /// RFC 3339 UTC time of the latest finished round, `null` before one.
+    pub measured_at: Option<String>,
+    /// RFC 3339 UTC time of the next planned round, `null` without a
+    /// directory.
+    pub next_at: Option<String>,
+    /// Regions reachable in the latest round, by code.
+    pub regions: Vec<RegionRtt>,
+    /// Regions unreachable in the latest round, by code.
+    pub unreachable: Vec<String>,
+    /// Border entries of the directory dropped as malformed.
+    pub rejected: usize,
+    pub suggestion: Option<RegionSuggestion>,
+    /// The probe responder of a border node, `null` on other nodes.
+    pub responder: Option<ResponderStatus>,
+}
+
+/// One region's RTT in [`RegionProbeStatus::regions`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RegionRtt {
+    pub region: String,
+    /// Milliseconds, 0.1 ms.
+    pub rtt_ms: f64,
+}
+
+/// A region change suggestion (appendix D.6, mesh-status.md
+/// `self.regionSuggestion`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RegionSuggestion {
+    pub region: String,
+    pub current_median_ms: u64,
+    pub suggested_median_ms: u64,
+    /// RFC 3339 UTC.
+    pub since: String,
+}
+
+/// The probe responder (appendix D.9.3). No private key here.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ResponderStatus {
+    /// Standard base64 of the X25519 public key; empty when the key could
+    /// not be read or made (then `failure` says so).
+    pub public_key: String,
+    pub listening: Vec<String>,
+    pub failure: Option<ResponderFailure>,
+    pub counters: ResponderCounters,
+}
+
+/// Why (part of) the responder does not run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResponderFailure {
+    /// `region_probe_bind_failed` or `region_probe_key_failed`.
+    pub code: &'static str,
+    /// The address or the file, and the system's reason; never a key.
+    pub detail: String,
+}
+
+/// Counters of the responder (appendix D.9.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ResponderCounters {
+    pub answered: u64,
+    pub malformed: u64,
+    pub rate_limited: u64,
+    pub low_order: u64,
 }
 
 /// One entry of [`ManagedStatus::static_keys`].
@@ -188,6 +259,14 @@ pub struct ManagedNetworkStatus {
     #[serde(serialize_with = "display_all")]
     pub overlaps: Vec<IpNet>,
     pub alerts: Vec<Alert>,
+    /// The intranet name list (requirement R28, `names[]` of
+    /// `docs/architecture/mesh-status.md`); left out while empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<NameStatus>,
+    /// `dns.names` entries skipped at load (`refusedNames[]`); left out
+    /// while empty.
+    #[serde(rename = "refusedNames", skip_serializing_if = "Vec::is_empty")]
+    pub refused_names: Vec<RefusedName>,
     /// The custom paths and their states, in configuration order (spec
     /// §17.2.7). Members are named by their virtual address, as in `peers`.
     pub paths: Vec<ManagedPath>,
@@ -224,6 +303,8 @@ impl ManagedNetworkStatus {
             rejected_advertisements: 0,
             overlaps: Vec::new(),
             alerts: Vec::new(),
+            names: Vec::new(),
+            refused_names: Vec::new(),
             paths: Vec::new(),
             external_bridge: None,
         }
@@ -307,6 +388,14 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
+    /// The network's `dns.resolver_address` is this node's own virtual
+    /// address, so it is not intercepted (spec §15.9.2 item 8); `address`
+    /// gives it.
+    ResolverAddressConflict,
+    /// The network's reverse zones are more than 256; the rest are not
+    /// worked out or answered (spec §15.9.2 item 1). `detail` is how many
+    /// were left out; `address` and `peer` are empty.
+    ReverseZonesTruncated,
     /// More subnets are routable than the system routes take; `detail` is
     /// how many were left out.
     SystemRoutesTruncated,
@@ -388,7 +477,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// features and `/v1/mesh` answers 404.
 pub trait MeshControl: Send + Sync {
     /// Feature names this implementation adds to `GET /v1/status`:
-    /// at least `mesh`; `mesh_dns` once the network config takes `dns`.
+    /// at least `mesh`; `mesh_dns` when the network config takes `dns`,
+    /// `mesh_resolver_address` when it also takes `dns.resolver_address`.
     /// Operator switches (`mesh_paths`, `mesh_backbone`, the external
     /// bridge) decide some of them, so the list is made at each call.
     fn features(&self) -> Vec<&'static str>;
@@ -408,6 +498,19 @@ pub trait MeshControl: Send + Sync {
         networks: Vec<ManagedNetwork>,
         backbone: Option<ManagedBackbone>,
     ) -> BoxFuture<'_, Result<ManagedStatus, ApplyError>>;
+
+    /// Hands over the top-level `region` object of the last `PUT`
+    /// (appendix D.9.1; `None` when it had none or `null`), after
+    /// [`MeshControl::apply`] of the same request. Only called when
+    /// [`MeshControl::features`] lists `mesh_region_probe`; the management
+    /// API refuses the object otherwise.
+    fn set_region(
+        &self,
+        region: Option<crate::region::directory::RegionSection>,
+    ) -> BoxFuture<'_, ()> {
+        let _ = region;
+        Box::pin(async {})
+    }
 
     /// Saves a local override for the network `tag` (spec §15.4): with
     /// [`SubnetRoute::Mesh`] the accepted subnet equal to `subnet` is routed
@@ -519,6 +622,8 @@ mod tests {
                         detail: "tcp port 11010 in use".into(),
                     },
                 ],
+                names: Vec::new(),
+                refused_names: Vec::new(),
                 paths: vec![
                     ManagedPath {
                         id: "peer:10.150.0.1".into(),
@@ -545,6 +650,7 @@ mod tests {
             }],
             backbone: None,
             alerts: Vec::new(),
+            region_probe: None,
         };
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
@@ -583,7 +689,8 @@ mod tests {
                     ]
                 }],
                 "static_keys": [{"network": "office", "static_key": "a2V5"}],
-                "backbone": null
+                "backbone": null,
+                "region_probe": null
             })
         );
     }

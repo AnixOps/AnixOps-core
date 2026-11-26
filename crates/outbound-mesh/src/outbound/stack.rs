@@ -212,6 +212,10 @@ pub enum Failure {
     /// The engine built the network again with other settings; this
     /// instance stopped for good and the new one runs instead.
     Replaced,
+    /// A `managed` network without `node.private_key`: its key must stay
+    /// the one `native_keys` lists, so the engine does not make one
+    /// (spec §8.1, §8.3.1).
+    PrivateKeyRequired,
 }
 
 impl Failure {
@@ -220,11 +224,12 @@ impl Failure {
         match self {
             Self::NativeKeysPending => "native_keys_pending",
             Self::PortInUse => "port_in_use",
+            Self::PrivateKeyRequired => "private_key_required",
             Self::Stopped | Self::Replaced => "start_refused",
         }
     }
 
-    fn error(self) -> io::Error {
+    pub(crate) fn error(self) -> io::Error {
         match self {
             Self::NativeKeysPending => io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -238,6 +243,10 @@ impl Failure {
             Self::Replaced => io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "mesh network settings changed",
+            ),
+            Self::PrivateKeyRequired => io::Error::new(
+                io::ErrorKind::NotConnected,
+                "mesh network needs its private key",
             ),
         }
     }
@@ -272,6 +281,8 @@ pub struct Instance {
     wake: Arc<Notify>,
     snapshot: watch::Sender<Snapshot>,
     epoch: Instant,
+    /// The runtime drivers run on; `None` runs them on the caller's.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Instance {
@@ -284,6 +295,16 @@ impl Instance {
             None => KeyPair::generate(&SystemRandom::new())
                 .map_err(|_| io::Error::other("mesh static key could not be made"))?,
         };
+        Ok(Self::with_key(settings, static_key, None))
+    }
+
+    /// A stopped network with the static key `static_key`, whose drivers
+    /// run on `runtime` (or on the caller's runtime for `None`).
+    pub(crate) fn with_key(
+        settings: MeshSettings,
+        static_key: KeyPair,
+        runtime: Option<tokio::runtime::Handle>,
+    ) -> Arc<Self> {
         let epoch = Instant::now();
         let stack = Stack::new(&settings, SmolInstant::from_micros(0), random());
         let next_port = FIRST_LOCAL_PORT + (random() % 16384) as u16;
@@ -291,7 +312,7 @@ impl Instance {
         let (route_overrides, _) = watch::channel(Vec::new());
         let (native_keys, _) = watch::channel(settings.native_keys.clone());
         let (snapshot, _) = watch::channel(Snapshot::default());
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             settings,
             static_key,
             core: Mutex::new(Core {
@@ -310,7 +331,8 @@ impl Instance {
             wake: Arc::new(Notify::new()),
             snapshot,
             epoch,
-        }))
+            runtime,
+        })
     }
 
     pub fn settings(&self) -> &MeshSettings {
@@ -369,7 +391,8 @@ impl Instance {
         self.lock().route_overrides.send_replace(overrides);
     }
 
-    /// Starts the network if it does not run; needs a Tokio runtime.
+    /// Starts the network if it does not run; needs a Tokio runtime unless
+    /// the instance has its own.
     pub fn start(self: &Arc<Self>) {
         let _ = self.ensure_running();
     }
@@ -406,7 +429,11 @@ impl Instance {
             instance: Arc::downgrade(self),
             run,
         };
-        tokio::spawn(start_driver(self.clone(), run, guard));
+        let task = start_driver(self.clone(), run, guard);
+        match &self.runtime {
+            Some(runtime) => drop(runtime.spawn(task)),
+            None => drop(tokio::spawn(task)),
+        }
         Ok(())
     }
 
@@ -604,9 +631,11 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     // The engine does not read other programs' routes: its stack is not the
     // system's, so they never compete with the mesh routes.
     let (foreign_routes_tx, foreign_routes) = watch::channel(Vec::new());
-    // Host groups come with the settings; changed settings make a new
-    // network, so nothing updates them while this one runs.
-    let (host_groups_tx, host_groups) = watch::channel(Vec::new());
+    // The engine restarts the instance for a new configuration, so the
+    // `dns` section and the host groups the settings carry never change
+    // while it runs; the senders only keep the receivers open.
+    let (dns_tx, dns) = watch::channel(settings.dns.clone());
+    let (host_groups_tx, host_groups) = watch::channel(settings.host_groups.clone());
     // Custom paths likewise come with the settings.
     let (paths_tx, paths) = watch::channel(Vec::new());
     let channels = {
@@ -622,6 +651,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
             snapshots: instance.snapshot.clone(),
             local_networks: core.local_networks.subscribe(),
             native_keys: core.native_keys.subscribe(),
+            dns,
             paths,
             host_groups,
             route_overrides: core.route_overrides.subscribe(),
@@ -636,7 +666,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     drop(instance);
     tokio::spawn(pump(weak.clone(), wake, run, from_driver));
     let result = driver::run(settings, key, listeners, channels).await;
-    drop((foreign_routes_tx, host_groups_tx, paths_tx));
+    drop((foreign_routes_tx, dns_tx, host_groups_tx, paths_tx));
     // The driver only ends on its own after an error: a shutdown comes from
     // dropping the instance, and then nobody is left to tell.
     let _ = result;
