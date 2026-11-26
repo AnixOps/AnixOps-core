@@ -13,13 +13,22 @@
 | `subnet-request --state-dir DIR [--cidr CIDR]...` | 申请通告局域网网段（仅完整节点；至多 16 个内网网段；不带 `--cidr` 为撤回），由管理员在面板批准后经配置下发；面板不提供申请状态查询，LuCI 对比下发的 `subnets.advertise` 自行判断；LuCI 经 rpcd 调用 | 0 已提交（202）；2 用法或状态目录错误（含主机位非零的网段，不做规范化）；8 令牌失效（401）；9 面板不可达或应答无效；10 面板拒绝（400 `invalid_request`，或接入端申请时 409 `mesh_conflict`），标准错误末行 JSON 的 `detail` 带面板返回的 `code` |
 | `device-status --state-dir DIR` | 经本机状态套接字读取快照（JSON），供 LuCI 与排障 | 0；1 服务未运行 |
 
-`capabilities` 的命令列表包含 `enroll`、`device`、`device-status` 时，安装器才走无 Agent 路径。受管组网目前只在 Linux 编译，所以这四个命令（含 `subnet-request`）只在 Linux 与 OpenWrt 的构建中列出；macOS、Windows 的无 Agent 运行在受管组网移植后再列出。`--state-dir` 省略时为默认状态目录。实现见 `apps/mesh-node/src/device_run.rs`（传输 `https.rs`，状态套接字 `local_status.rs`）。
+`capabilities` 的命令列表包含 `enroll`、`device`、`device-status` 时，安装器才走无 Agent 路径。受管组网在 Linux（含 OpenWrt）、macOS、Windows 上编译，这四个命令（含 `subnet-request`）在这三个平台的构建中都列出，行为与退出码在三个平台上相同；平台之间只有状态目录、本机状态接口与服务管理不同（见下文）。`--state-dir` 省略时为默认状态目录。实现见 `apps/mesh-node/src/device_run.rs`（传输 `https.rs`，本机状态接口 `local_status.rs`，Windows 访问控制 `win_security.rs`）。
 
 凭据从文件读取（安装器写入 0600 临时文件，用后删除），不从命令行参数读取，避免出现在进程列表与 shell 历史中。
 
 ## 状态目录
 
-默认 `/var/lib/anixops-mesh/device`，与同机 anixcore 的 `/var/lib/anixcore/mesh` 分开，避免共用实例 ID。目录要求与接管状态目录相同（本用户所有、各级上级目录不可被其他用户写、不是符号链接），每次读写都以不跟随符号链接的方式逐级打开。
+| 平台 | 默认状态目录 | 权限 |
+|---|---|---|
+| Linux | `/var/lib/anixops-mesh/device`（OpenWrt 见下文） | 0700，root 所有 |
+| macOS | `/Library/Application Support/AnixOps/mesh/device` | 安装器建为 0710，root 所有，属组 `admin`（管理员只能穿过目录访问状态套接字，不能列出目录；其中文件均为 0600，读不到内容）；程序自行创建时为 0700，此时只有 root 能用状态套接字 |
+| Windows | `%ProgramData%\AnixOps\Mesh\device` | 只有 SYSTEM 与 Administrators 有访问权，不继承上级目录的权限 |
+
+Linux 的默认目录与同机 anixcore 的 `/var/lib/anixcore/mesh` 分开，避免共用实例 ID。目录要求与接管状态目录相同：
+
+- Linux、macOS：本用户所有、各级上级目录不可被其他用户写、不是符号链接，每次读写都以不跟随符号链接的方式逐级打开。macOS 的 `/etc`、`/var`、`/tmp` 是符号链接，所以状态目录放在 `/Library` 下。
+- Windows：目录及各级上级目录不是链接或联接点，属于 SYSTEM、Administrators 或 TrustedInstaller；目录本身只有这些账户可以修改，上级目录不允许其他账户替换其中内容。`enroll` 在目录不存在时一次性创建它并带上上述访问列表（`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`），之间没有对其他账户开放的时刻；已存在的目录不改动，由上述检查决定能否使用（安装器在接入前把访问列表改成同样的内容）。目录中的文件继承这份访问列表，表中的 0600 在 Windows 上即指此。
 
 | 文件 | 权限 | 内容 |
 |---|---|---|
@@ -27,7 +36,8 @@
 | `token` | 0600 | 设备令牌 `msd_…` |
 | `config.json` | 0600 | 最近一份通过校验的 `networks`（含网络密钥） |
 | `instance_id`、`keys/` | 0600 | 受管组网的实例 ID 与各网络静态密钥（布局同 anixcore） |
-| `status.sock` | 0660，属组 `anixops-mesh` | 本机状态套接字（见下文） |
+| `status.sock` | 0660，属组 `anixops-mesh`（macOS 为 `admin`） | 本机状态套接字（见下文；Windows 上不是文件，改用命名管道） |
+| `device.log`、`device.log.1` | 继承目录 | 仅 Windows：服务方式运行时的标准错误输出（见「服务管理」） |
 | `device.lock` | 0600 | `device` 运行期间持有的排他锁，防止同一状态目录上同时运行两个服务（由系统在进程退出时释放） |
 
 `device_key`：首次接入时由系统随机数生成 32 字节，标准 base64 编码（44 个字符），此后一直沿用；重新接入同一设备必须使用同一值（面板以之核对）。删除状态目录即放弃该设备身份，需要管理员为新设备签发凭据。
@@ -69,15 +79,48 @@
 - 连接超时 10 秒，整个请求 30 秒。`User-Agent` 为 `anixops-mesh/<版本>`。
 - 令牌、凭据、网络密钥不出现在日志、错误信息与 `device-status` 输出中。
 
-## 本机状态套接字
+## 本机状态接口
 
-`device` 在 `status.sock`（Unix 域套接字，0660，属组 `anixops-mesh`）上回答一行 JSON 请求 `{"cmd":"mesh_status"}`，应答为受管组网状态加上设备字段：
+`device` 在本机状态接口上回答一行 JSON 请求 `{"cmd":"mesh_status"}`：
+
+- Linux、macOS：状态目录中的 `status.sock`（Unix 域套接字，0660，属组 Linux 为 `anixops-mesh`、macOS 为 `admin`）。上次运行留下的套接字会被替换，同名的其他文件则拒绝绑定。
+- Windows：命名管道 `\\.\pipe\anixops-mesh-device-<16 位十六进制>`，十六进制为 `<状态目录>\status.sock` 的绝对路径转小写后 SHA-256 的前 8 字节（管道名是全机共用的命名空间，按状态目录区分）。访问列表 `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12008b;;;BU)`：SYSTEM 与 Administrators 完全控制；本机 Users 只能连接、读取和写入请求（`FILE_GENERIC_READ | FILE_WRITE_DATA`），不能创建管道实例、修改访问列表或取得所有权。拒绝远程客户端。服务以「首个实例」方式创建管道；管道已存在（已有服务在运行，或服务停止期间被其他程序抢先创建）时记录一次 `status_socket`，此后每 10 秒重试，网络照常运行（其他平台绑定失败时同样重试）。客户端只请求 `FILE_GENERIC_READ | FILE_WRITE_DATA` 打开管道，不请求通用写权限（其中的追加权限对管道即创建实例）。`device-status` 只接受所有者为 SYSTEM、Administrators 或调用者本人的管道，并以 `SECURITY_IDENTIFICATION` 连接，服务端只能识别、不能冒充调用者。
+
+应答为受管组网状态加上设备字段：
 
 ```json
 {"ok":true,"device":{"device_id":5,"control":"https://…","last_config":"2026-11-25T21:00:00Z","last_report":"2026-11-25T21:00:03Z","control_state":"ok","advertise":["192.168.1.0/24"]},"mesh":{"instance_id":"…","networks":[…]}}
 ```
 
-`control_state`：`ok`、`unreachable`（最近一次读取或上报失败）、`rejected`（最近一份配置未通过校验）。`advertise`：`config.json` 各网络 `subnets.advertise` 的并集，即面板已批准并下发的通告网段（按网段排序去重；未接入或没有配置时为空数组），LuCI 据此区分「已批准」与「待管理员批准」。`device-status` 连接套接字时读写超时各 3 秒，服务未运行或无应答时以退出码 1 结束，不会挂住调用方（rpcd 同步调用）。只接受这一条命令，其他请求回 `{"ok":false,"error":{"code":"unsupported"}}`；不监听 TCP 或 UDP 端口（R11）。实现放在 `apps/mesh-node/src/local_status.rs`，`run` 路径以同一文件经 `serve_with` 的观察回调提供 `mesh-status.md` 的快照。
+`control_state`：`ok`、`unreachable`（最近一次读取或上报失败）、`rejected`（最近一份配置未通过校验）。`advertise`：`config.json` 各网络 `subnets.advertise` 的并集，即面板已批准并下发的通告网段（按网段排序去重；未接入或没有配置时为空数组），LuCI 据此区分「已批准」与「待管理员批准」。`device-status` 连接时读写超时各 3 秒，服务未运行或无应答时以退出码 1 结束，不会挂住调用方（rpcd 同步调用）。只接受这一条命令，其他请求回 `{"ok":false,"error":{"code":"unsupported"}}`；不监听 TCP 或 UDP 端口（R11）。实现放在 `apps/mesh-node/src/local_status.rs`，`run` 路径以同一文件经 `serve_with` 的观察回调提供 `mesh-status.md` 的快照。
+
+## 服务管理
+
+`device` 收到停止请求（SIGTERM、SIGINT、Ctrl+C，或 Windows 服务管理器的停止与关机通知）时停止全部网络、删除状态套接字并以 0 退出。令牌失效（退出码 8）不应被自动重启：
+
+| 平台 | 服务 | 退出码 8 |
+|---|---|---|
+| Linux | systemd：`Restart=on-failure`，`RestartPreventExitStatus=8` | 不重启 |
+| OpenWrt | procd（见下文） | init 脚本判断后不再拉起 |
+| macOS | launchd 系统守护进程 `com.anixops.mesh.device`（`/Library/LaunchDaemons/com.anixops.mesh.device.plist`），`RunAtLoad`，`KeepAlive` 为 `PathState`：`<状态目录>/token` 存在时保持运行，`ThrottleInterval` 30 秒；`Umask` 077；标准错误写入 `/Library/Logs/anixops-mesh-device.log`（安装器建为 root:admin 0640，`--purge` 删除；日志只在出错与退避时写入，不轮转） | 程序已删除 `token`，launchd 不再拉起；重新接入写回 `token` 后由 launchd 自动启动。`token` 存在但内容无效时同样以 8 退出，launchd 每 30 秒重试一次，直至重新接入 |
+| Windows | 服务 `AnixOpsMeshDevice`（LocalSystem，自动启动），恢复操作为失败后 5 秒重启，`sc failureflag 1` | 程序向服务管理器报告为正常停止（`WIN32_EXIT_CODE` 0），恢复操作不生效；从控制台运行时退出码仍为 8 |
+
+Windows 服务没有控制台：由服务管理器启动时，`device` 把标准错误改写到状态目录的 `device.log`（追加；每次启动时超过 1 MiB 的旧日志改名为 `device.log.1`，覆盖更早的一份）。日志内容与其他平台的标准错误相同，不含令牌、凭据与网络密钥。
+
+受管组网在 macOS、Windows 上与 Linux 一样只建立虚拟网卡与路由，不改动主机转发、源地址转换或防火墙；作为完整节点通告局域网网段、或在 Windows 上接受入站连接，需要的主机改动与完整节点 `run` 的做法（`forward_macos.rs`、`forward_windows.rs`）在受管组网中尚未接入，见后续事项。
+
+## 安装（macOS、Windows）
+
+安装器把程序放到独立位置，接入后注册并启动服务；已接入（状态目录中有 `token` 与 `device.json`）时不再接入，只替换程序并重启服务。凭据只从文件读取或在终端隐藏输入，不出现在命令行中；安装器用后即删除临时凭据文件。面板使用私有 CA 时，CA 文件复制到状态目录旁（macOS `/Library/Application Support/AnixOps/mesh/control-ca.pem`，Windows `%ProgramData%\AnixOps\Mesh\device-control-ca.pem`）再传给 `--ca-file`。
+
+- macOS（root 运行）：`install-device-macos.sh (--binary-url URL | --binary-file FILE) --binary-sha256 HEX --control URL [--token-file FILE] [--latency CODE=MS]... [--ca-file FILE]`。程序在 `/Library/Application Support/AnixOps/mesh/bin/anixops-mesh`。
+- Windows（管理员运行）：`install-device-windows.ps1 (-BinaryUrl URL | -BinaryFile FILE) -BinarySha256 HEX (-WintunUrl URL | -WintunFile FILE) -WintunSha256 HEX -Control URL [-TokenFile FILE] [-Latency CODE=MS,...] [-CaFile FILE]`。程序与 `wintun.dll`（核对架构）在 `%ProgramFiles%\AnixOps\Mesh\device`，程序只从自身目录加载 `wintun.dll`。
+
+下载只接受 https，并核对 SHA-256；程序的 `capabilities` 必须列出 `enroll`、`device`、`device-status`。接入退出码 8 时提示向管理员索取新凭据，9 时提示在 10 分钟内用同一凭据重试。服务启动后以 `device-status` 确认在 10 秒内应答，否则停止并删除服务（接入结果保留，可重新运行安装器）。
+
+卸载：`install-device-macos.sh --uninstall [--purge]`、`install-device-windows.ps1 -Uninstall [-Purge]`：停止并删除服务与程序；状态目录（设备身份）默认保留，`--purge`/`-Purge` 一并删除。卸载不通知面板，管理员需在面板吊销该设备。
+
+CI（`mesh-node-desktop` 作业）在 macos-26 与 windows-latest 上以模拟面板（私有 CA）走完安装、接入、上报、重复安装、令牌吊销与卸载，并检查状态目录权限与状态接口（`.github/scripts/mesh-device-smoke-macos.sh`、`mesh-device-smoke-windows.ps1`）。
 
 ## OpenWrt（R35，内核 0.5）
 

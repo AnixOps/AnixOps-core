@@ -64,7 +64,9 @@ pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_backbone"];
 /// lock, nftables took the probe and the start-up cleanup ran.
 pub const FEATURES_WITH_BRIDGE: &[&str] = &["mesh", "mesh_native_keys", mesh_bridge::FEATURE];
 
-/// Interface names: `anixmesh-<n>`, the lowest number free.
+/// Interface names: `anixmesh-<n>`, the lowest number free (the adapter's
+/// name on Windows). macOS names a `utun` interface itself; the name it
+/// gave is the one kept.
 const INTERFACE_PREFIX: &str = "anixmesh-";
 
 /// How long a stopped network may take to close before it is cut off.
@@ -130,7 +132,10 @@ impl Bridging {
             Ok(lock) => lock,
             Err(error) => {
                 bridging.lock_held = error.kind() == io::ErrorKind::WouldBlock;
-                eprintln!("mesh: external bridge unavailable: {error}");
+                // macOS and Windows have no external bridge; nothing to say.
+                if error.kind() != io::ErrorKind::Unsupported {
+                    eprintln!("mesh: external bridge unavailable: {error}");
+                }
                 return bridging;
             }
         };
@@ -770,6 +775,7 @@ async fn launch(
         )
     })?;
 
+    let name = device.name().to_owned();
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
@@ -811,7 +817,7 @@ async fn launch(
         }
     });
     Ok(Running {
-        interface,
+        interface: name,
         stop: Some(stop),
         native_keys,
         snapshot,
@@ -827,7 +833,9 @@ fn refusal(what: &str, error: &io::Error, busy: FailureCode) -> (FailureCode, St
     let code = match error.kind() {
         io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => busy,
         io::ErrorKind::PermissionDenied => FailureCode::PermissionDenied,
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EBUSY) => busy,
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EPERM) => FailureCode::PermissionDenied,
         _ => FailureCode::StartRefused,
     };
@@ -1054,9 +1062,20 @@ fn fill_running(
     }
 }
 
+/// Creates `dir` readable by the owner only. On Windows it takes the access
+/// list of the state directory, which is open to SYSTEM and the
+/// administrators only (`docs/deploy/mesh-device.md`).
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    match builder.create(dir) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
         _ => Ok(()),
     }
@@ -1097,7 +1116,27 @@ fn instance_id(path: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::other("no system randomness"))?;
     let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, format!("{id}\n"))?;
+    // Readable by the owner only, whatever the umask (on Windows the file
+    // takes the access list of the state directory).
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        // A file left by an earlier attempt keeps its mode on open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(format!("{id}\n").as_bytes())?;
+        file.sync_all()?;
+    }
     std::fs::rename(&temporary, path)?;
     Ok(id)
 }
@@ -1129,6 +1168,8 @@ mod tests {
         ManagedMesh::open_with(dir, Bridging::off())
     }
 
+    // A bridge passes the config checks on Linux only.
+    #[cfg(target_os = "linux")]
     fn bridged(allow: &[&str]) -> MeshSettings {
         let config = json!({
             "config_version": 1,
@@ -1147,6 +1188,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn only_an_allow_list_change_keeps_a_bridge_running() {
         let before = bridged(&["10.150.0.2/32"]);
@@ -1237,6 +1279,15 @@ mod tests {
         assert_eq!(first.instance_id().len(), 32);
         let again = open(&dir).expect("open again");
         assert_eq!(first.instance_id(), again.instance_id());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("instance_id"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::write(dir.join("instance_id"), "-bad").unwrap();
         assert!(open(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
