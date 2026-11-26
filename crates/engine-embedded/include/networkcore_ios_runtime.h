@@ -62,6 +62,7 @@ typedef void (*NetworkCorePacketBatchWriter)(void *context, const NetworkCorePac
 
 uint32_t networkcore_ios_abi_version(void);
 uint32_t networkcore_ios_schema_version(void);
+/* 7: mesh networks (`"type": "mesh"` outbounds, `mesh_*` and `capabilities` control commands). */
 uint32_t networkcore_ios_feature_set_version(void);
 
 int32_t networkcore_ios_runtime_init(const uint8_t *config, size_t config_len, NetworkCoreRuntime **out_handle);

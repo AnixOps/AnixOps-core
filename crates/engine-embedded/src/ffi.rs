@@ -22,8 +22,10 @@ pub const NETWORKCORE_IOS_SCHEMA_VERSION: u32 = crate::config::CONFIG_SCHEMA_VER
 /// `networkcore_ios_mitm_inspect_plugin`, 4 added
 /// `networkcore_ios_runtime_start_tunnel_batched` and
 /// `networkcore_ios_runtime_input_packets`, 5 added `networkcore_ios_checkup`,
-/// 6 added `networkcore_ios_capture_viewer`.
-pub const NETWORKCORE_IOS_FEATURE_SET_VERSION: u32 = 6;
+/// 6 added `networkcore_ios_capture_viewer`, 7 added mesh networks
+/// (`"type": "mesh"` outbounds, the `mesh_*` and `capabilities` control
+/// commands, `docs/architecture/mesh-status.md`).
+pub const NETWORKCORE_IOS_FEATURE_SET_VERSION: u32 = 7;
 
 pub const NETWORKCORE_IOS_OK: i32 = 0;
 pub const NETWORKCORE_IOS_ERR_ARTIFACT_MISSING: i32 = 1;

@@ -6,6 +6,7 @@
 
 ### Mesh
 
+- 嵌入式组网进入默认构建（第二步 2f）：`engine-embedded` 默认 feature 加入 `mesh`，`networkcore_ios_feature_set_version` 升为 7（组网出站、`mesh_*` 与 `capabilities` 控制命令、`tunnel.routes` 自动分流）。客户端以 `feature_set_version() >= 7` 判断可用；组网界面仍按客户端发布门槛控制。
 - 组网私钥放到堆上（#417 审计 Q5）：`MeshSettings.private_key` 改为 `Box<Zeroizing<[u8; 32]>>`，解码直接写入堆上，设置在装箱、拆箱、登记表赋值时只移动指针，不再在栈上留下未清零的私钥副本；新增 `KeyPair::from_private_ref` 按引用取私钥（按值传参的临时副本与运算库内部副本仍不保证清零，见 mesh-module.md），`mesh_status` 等状态查询复制设置时先移开私钥，不再复制私钥；修复 `apps/mesh-node` 随之的编译。文档收尾（#418 审计 R1–R3）：去掉把「无 ID」等同于 `legacy` 的说法，写明 `self.id` 属于所选网络，`mesh-module.md` 的 `node.instance_id` 一行同步比较口径。
 - 嵌入式组网控制命令审计修复（第二步 2c-5，#417 审计）：提交带 `node.instance_id` 的 profile 不再停下没有 ID 的已保存网络（Q1）；mesh-status.md 与代码注释写明 `mesh_status` 默认网络的三档选择顺序，客户端以 `networks[]` 与显式 `network` 为准（Q2）；写明「无 ID 不冲突」只用于保存、加入与提交（Q3）。补测：失败网络排在运行中网络之前时仍选运行中的网络、无 ID 的已保存网络在任何 profile 下继续运行。
 - 嵌入式组网控制命令审计修复（第二步 2c-4，#416 审计）：不带 `network` 的 `mesh_status` 优先选运行中的网络，其次不是因 `instance_id_changed` 停下的已加入网络（P1）；没有 `node.instance_id` 的网络与任何网络都不冲突（P2）。mesh-status.md 补充密钥含 `"`、`\`、控制字符时的残留副本（P3）、辅助运行时可能以 `instance_id_changed` 停网（P4）、`failure` 优先级列入 `instance_id_changed`（P5），并注明 ID 比较按有无实例判断。

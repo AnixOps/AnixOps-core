@@ -45,7 +45,7 @@
 | --- | --- | --- |
 | `crates/engine-embedded/include/networkcore_ios_runtime.h` | `networkcore_ios_abi_version()` | ABI 1 |
 | 同上 | `networkcore_ios_schema_version()` | 配置 schema 1 |
-| 同上 | `networkcore_ios_feature_set_version()` | 能力集 6 |
+| 同上 | `networkcore_ios_feature_set_version()` | 能力集 7（7 起含组网） |
 | `crates/node-import/include/networkcore_import.h` | `networkcore_import_abi_version()` | ABI 1 |
 
 规则：
