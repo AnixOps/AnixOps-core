@@ -165,12 +165,19 @@ pub struct Snapshot {
     /// Members announcing another static key than the one bound to their
     /// node ID (spec §12.3).
     pub refused_key_changes: Vec<u32>,
+    /// This node's instance ID in the network, as a UUID text.
+    pub instance: String,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Member {
     pub peer_id: u32,
+    /// Its instance ID, as a UUID text; empty before its route information
+    /// arrived.
+    pub instance: String,
+    /// The host name it advertises, if any.
+    pub hostname: Option<String>,
     /// Its virtual addresses, as accepted.
     pub addresses: Vec<IpAddr>,
     /// The subnets it advertises, as accepted.
@@ -180,6 +187,10 @@ pub struct Member {
     pub via: Vec<u32>,
     /// 1 for a direct connection.
     pub hops: u32,
+    /// The fewest hops to it, whatever the path policy; the driver picks
+    /// among the advertisers of a subnet by this count (spec §15.2), while
+    /// `hops` and `via` follow the policy's path.
+    pub fewest_hops: u32,
     /// Round-trip time to a direct neighbour, in milliseconds; `None`
     /// before the first keep-alive answer and for members reached through
     /// relays.
@@ -639,11 +650,13 @@ fn snapshot(node: &Node, local_read: bool) -> Snapshot {
         standing_in: node.standing_in().to_vec(),
         withdrawing: node.is_withdrawn(),
         border: node.route_table().border().to_vec(),
+        instance: node.own_info().inst_id.to_string(),
     }
 }
 
 fn members(node: &Node) -> Vec<Member> {
     let table = node.route_table();
+    let fewest = node.fewest_hops();
     node.paths()
         .into_iter()
         .map(|(peer, route)| {
@@ -661,12 +674,18 @@ fn members(node: &Node) -> Vec<Member> {
                 None
             };
             let latency_ms = rtt.map(|rtt| u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
+            let info = node.peer_info(peer);
             Member {
                 peer_id: peer,
+                instance: info
+                    .map(|info| info.inst_id.to_string())
+                    .unwrap_or_default(),
+                hostname: info.and_then(|info| info.hostname.clone()),
                 addresses,
                 subnets,
                 via,
                 hops: route.hops,
+                fewest_hops: fewest.get(&peer).copied().unwrap_or(route.hops),
                 latency_ms,
             }
         })

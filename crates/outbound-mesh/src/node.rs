@@ -661,6 +661,16 @@ impl Node {
         self.local.id
     }
 
+    /// This node's own route information, as it advertises it.
+    pub fn own_info(&self) -> &RoutePeerInfo {
+        self.sync.own()
+    }
+
+    /// The route information a reachable member last advertised.
+    pub fn peer_info(&self, id: u32) -> Option<&RoutePeerInfo> {
+        self.sync.info(id)
+    }
+
     pub fn settings(&self) -> &MeshSettings {
         &self.settings
     }
@@ -1208,6 +1218,16 @@ impl Node {
         }
     }
 
+    /// The fewest hops to each reachable member, whatever the path
+    /// policy: what [`send_ip`](Self::send_ip) chooses a subnet's
+    /// advertiser by.
+    pub fn fewest_hops(&self) -> BTreeMap<u32, u32> {
+        self.compute_routes(Metric::Hops)
+            .into_iter()
+            .map(|(peer, route)| (peer, route.hops))
+            .collect()
+    }
+
     fn compute_routes(&self, metric: Metric) -> BTreeMap<u32, Route> {
         routes_from(&self.sync, &self.peer_map, self.local.id, metric)
     }
@@ -1567,7 +1587,21 @@ impl Node {
                 .extend(replies.into_iter().map(Action::Deliver));
             return Ok(());
         }
-        let outgoing = match self.routes.classify_outgoing(packet) {
+        // Among several advertisers of a subnet the one with the fewest hops
+        // is used (spec §15.2, requirement R7); unreachable ones are
+        // skipped. The count is fixed to hops, whatever the path policy,
+        // so that changing latencies do not move the gateway from packet
+        // to packet; the next hop towards it still follows the policy.
+        // The paths are only worked out when a subnet destination needs
+        // them.
+        let paths = std::cell::OnceCell::new();
+        let hops = |peer: PeerId| {
+            paths
+                .get_or_init(|| self.compute_routes(Metric::Hops))
+                .get(&peer.0)
+                .map(|route: &Route| route.hops)
+        };
+        let outgoing = match self.routes.classify_outgoing_by(packet, hops) {
             Ok(outgoing) => outgoing,
             Err(denied) => {
                 self.counters.refused_outgoing += 1;
@@ -3872,6 +3906,53 @@ mod tests {
         assert_eq!(chosen, [net(1), net(2)]);
         assert_eq!(truncated, 0);
         assert_eq!(fair_share(&[], 10), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_subnet_packet_goes_to_the_nearest_advertiser() {
+        let member = |address: &str, advertise: &[&str]| {
+            let config = serde_json::json!({
+                "config_version": 1,
+                "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+                "node": {"address": address, "role": "full"},
+                "peers": [{"server": "peer.example", "port": 40000}],
+                "subnets": {"advertise": advertise},
+            });
+            serde_json::from_value::<MeshConfig>(config)
+                .unwrap()
+                .validate()
+                .unwrap()
+        };
+        // 0–1–2 and 0–3: nodes 2 and 3 both advertise 192.168.40.0/24.
+        // Node 3 is the nearer one but has the larger ID.
+        let mut net = Net::with(vec![
+            member("10.144.0.1/24", &[]),
+            member("10.144.0.2/24", &[]),
+            member("10.144.0.3/24", &["192.168.40.0/24"]),
+            member("10.144.0.4/24", &["192.168.40.0/24"]),
+        ]);
+        net.link(0, 1);
+        net.link(1, 2);
+        net.link(0, 3);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        let packet = ipv4_packet([10, 144, 0, 1], [192, 168, 40, 9]);
+        let now = net.now;
+        net.nodes[0].send_ip(&packet, now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, [(3, packet.clone())]);
+        // With node 3 gone, node 2 takes over.
+        unlink(&mut net, 0, 3);
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net.delivered.clear();
+        let now = net.now;
+        net.nodes[0].send_ip(&packet, now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, [(2, packet)]);
     }
 
     #[test]

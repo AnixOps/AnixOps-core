@@ -96,6 +96,14 @@ pub struct NodeConfig {
     /// uses `/var/lib/anixcore/mesh` when it is absent.
     #[serde(default)]
     pub mesh_state_dir: Option<std::path::PathBuf>,
+    /// Turns on the external network bridges of managed networks (spec
+    /// §15.12, `docs/architecture/mesh-bridge.md`). Off by default: the
+    /// node then neither lists `mesh_external_bridge` nor touches
+    /// nftables or conntrack, unless `/run/anixops-mesh-bridge-active` says
+    /// a bridge was installed on this host, whose tables it then removes
+    /// once under the host lock.
+    #[serde(default)]
+    pub mesh_external_bridge: bool,
     /// Turns on the inter-region backbone of managed networks (spec
     /// §17.3, `docs/protocols/intranet-mesh-appendix.md` B). Off by
     /// default: the node then does not list `mesh_backbone` and refuses a

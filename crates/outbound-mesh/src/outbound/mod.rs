@@ -11,6 +11,7 @@
 //! connections included, and start a new one: the old one would keep the
 //! previous `native_keys` (spec §8.3.1) and dial with the same identity.
 
+pub mod snapshot;
 mod stack;
 
 use std::collections::BTreeMap;

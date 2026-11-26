@@ -627,6 +627,7 @@ mod tests {
             via: Vec::new(),
             hops: 1,
             latency_ms: None,
+            ..Member::default()
         }
     }
 
