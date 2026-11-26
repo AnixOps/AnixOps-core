@@ -434,6 +434,9 @@ pub struct Inbound {
     pub payload: Vec<u8>,
     /// Whether it arrived encrypted.
     pub was_encrypted: bool,
+    /// Whether a secure-mode relay session with its sender opened it
+    /// (spec §9), rather than a direct session or the network key.
+    pub relay_session: bool,
 }
 
 /// Types that carry user data or control state and so are sealed whenever
@@ -526,6 +529,8 @@ fn open_counted(
     }
     let mut payload = packet[HEADER_LEN..].to_vec();
     let encrypted = header.has(flags::ENCRYPTED);
+    let relay_session =
+        encrypted && matches!(crypto, Crypto::Secure { .. }) && header.from != neighbour;
     let unencrypted_network = matches!(crypto, Crypto::Default(None));
     if !encrypted && needs_encryption(header.packet_type) && !unencrypted_network {
         return Err(Dropped::Unencrypted);
@@ -561,6 +566,7 @@ fn open_counted(
         header,
         payload,
         was_encrypted: encrypted,
+        relay_session,
     })
 }
 
