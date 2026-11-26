@@ -604,6 +604,9 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     // The engine does not read other programs' routes: its stack is not the
     // system's, so they never compete with the mesh routes.
     let (foreign_routes_tx, foreign_routes) = watch::channel(Vec::new());
+    // Host groups come with the settings; changed settings make a new
+    // network, so nothing updates them while this one runs.
+    let (host_groups_tx, host_groups) = watch::channel(Vec::new());
     let channels = {
         let mut core = instance.lock();
         if core.run != run || !core.running {
@@ -617,6 +620,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
             snapshots: instance.snapshot.clone(),
             local_networks: core.local_networks.subscribe(),
             native_keys: core.native_keys.subscribe(),
+            host_groups,
             route_overrides: core.route_overrides.subscribe(),
             // The engine takes host groups only from its settings: no
             // later change arrives (the sender is dropped at once).
@@ -632,7 +636,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     drop(instance);
     tokio::spawn(pump(weak.clone(), wake, run, from_driver));
     let result = driver::run(settings, key, listeners, channels).await;
-    drop(foreign_routes_tx);
+    drop((foreign_routes_tx, host_groups_tx));
     // The driver only ends on its own after an error: a shutdown comes from
     // dropping the instance, and then nobody is left to tell.
     let _ = result;
