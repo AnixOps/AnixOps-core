@@ -1629,6 +1629,7 @@ mod tests {
         let net = |text: &str| IpNet::parse(text).unwrap();
         let (stop, _stopped) = oneshot::channel();
         let (native_keys, _keys) = watch::channel(None);
+        let (dns, _dns) = watch::channel(DnsSettings::default());
         let (host_groups, _groups) = watch::channel(Vec::new());
         let (route_overrides, mut overrides) = watch::channel(Vec::new());
         let (_snapshots, snapshot) = watch::channel(Snapshot::default());
@@ -1640,6 +1641,7 @@ mod tests {
                 interface: "anixmesh-0".into(),
                 stop: Some(stop),
                 native_keys,
+                dns,
                 host_groups,
                 route_overrides,
                 snapshot,
