@@ -24,8 +24,10 @@
 
 - 组网区域间骨干（`mesh_backbone`）、外部网络桥接（`mesh_external_bridge`）、自定义路径与途经点中继（`mesh_paths`、`node.waypoint_relay`）、区域测量（`mesh_regions`）、宿主组（`mesh_host_groups`）：`anixcore` 运维开关默认 `false`，关闭时不声明能力，带对应配置的 `PUT /v1/mesh` 整份返回 400。
 - 嵌入式引擎的 `"type": "mesh"` 出站（`engine-embedded` feature `mesh`）不在默认 feature 中。
+- 上述开关只约束 `anixcore` 受管组网。独立运行的 `anixops-mesh run` 按本地配置原样应用，不受这些开关约束；只有在本地配置里写了对应字段才会启用。
 - macOS 与 Windows 版 `anixops-mesh` 为实验性，未审计。
 - 内网域名的解析地址依赖面板为它保留（审计 L-5），需要与支持保留的面板版本一起使用。
+- 本轮审计的低危遗留项在 0.3.x 补丁中处理，不阻断本候选版。
 
 ### Mesh
 
