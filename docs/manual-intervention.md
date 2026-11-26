@@ -506,3 +506,7 @@ checksum/manifest、attestation、release notes、rollback 和 publish eligibili
 ## Windows 组网主机锁跨会话互斥（维护者实机确认）
 
 组网主机锁（`platform-windows` 的 `create_host_wide_object`）放在私有命名空间 `AnixOps` 中，边界只含 Administrators SID、不含会话号。按微软「Object Namespaces」文档，私有命名空间只由名称与边界确定，所以会话 0 的服务与用户会话中以管理员身份运行的客户端应打开同一个对象、相互排斥。CI 只能在单个会话内验证，需在一台 Windows 实机上确认一次：先启动组网服务（会话 0），再在交互会话中以管理员身份启动客户端的组网，客户端应因主机锁已被持有而拒绝接管（反之亦然）；非提升的进程无法进入该命名空间（Administrators SID 在其令牌中为仅拒绝），应同样被拒。结果记录在本节下方。
+
+## 独立运行的路由器无法覆盖子网路由（机主）
+
+组网规范 §15.4：子网与本机已有路由重叠时，该子网判为本地、不经组网转发；管理员可用 `PUT /v1/mesh/subnet_route` 把它改为经组网转发。覆盖只保存在 Agent 管理模式的状态目录中，独立 `run`（OpenWrt 上只装网页插件、不装 Agent 的方式）不提供覆盖。OpenWrt 默认为私有前缀下发 `unreachable` 路由，这类路由器上的成员子网可能因此一直判为本地，目前无法补救。处理方式：需要这些子网经组网转发的路由器改用 Agent 管理模式；或由机主手工删除对应的 `unreachable` 路由（重启或网络重载后会恢复）。独立模式是否支持覆盖在 0.3.1 再定。

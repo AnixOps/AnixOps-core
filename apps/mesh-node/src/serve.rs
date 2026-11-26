@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use outbound_mesh::config::{encode_key, HostGroup};
+use outbound_mesh::config::{encode_key, HostGroup, NetworkKind};
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
@@ -191,17 +191,39 @@ fn route_changes(installed: &[IpNet], wanted: &[IpNet]) -> (Vec<IpNet>, Vec<IpNe
     (add, remove)
 }
 
-/// The system routes the networks of one process installed, by network,
-/// shared so that no two networks install overlapping subnets: the first
-/// to claim a subnet keeps it, and the others treat it as one of this
-/// machine's networks (spec §15.4), which refuses it as an overlap.
+/// What one network of this process holds on the host.
+#[derive(Debug, Default)]
+struct Holder {
+    /// A `managed` network: its claims take precedence over `legacy`
+    /// networks' (spec §15.4).
+    managed: bool,
+    /// Its virtual address ranges, on its interface.
+    interface: Vec<IpNet>,
+    /// The subnets it installed as system routes, sorted.
+    routes: Vec<IpNet>,
+}
+
+/// Sorted and without repeats, so that claims compare as sets.
+fn sorted(mut nets: Vec<IpNet>) -> Vec<IpNet> {
+    nets.sort_by_key(|net| (net.network(), net.prefix()));
+    nets.dedup();
+    nets
+}
+
+/// The system routes the networks of one process installed, and their
+/// virtual address ranges, by network: shared so that no two networks
+/// install overlapping subnets. Each network treats what the others hold
+/// as one of this machine's networks (spec §15.4), which refuses it as an
+/// overlap. A subnet goes to the first network to claim it, except that a
+/// `managed` network takes it from a `legacy` one; a virtual address range
+/// is never taken.
 #[derive(Clone)]
 pub(crate) struct HostRoutes {
     inner: Arc<HostRoutesInner>,
 }
 
 struct HostRoutesInner {
-    claimed: Mutex<BTreeMap<String, Vec<IpNet>>>,
+    holders: Mutex<BTreeMap<String, Holder>>,
     /// Counts changes, so that the other networks look again.
     changed: watch::Sender<u64>,
 }
@@ -210,7 +232,7 @@ impl Default for HostRoutes {
     fn default() -> Self {
         Self {
             inner: Arc::new(HostRoutesInner {
-                claimed: Mutex::new(BTreeMap::new()),
+                holders: Mutex::new(BTreeMap::new()),
                 changed: watch::channel(0).0,
             }),
         }
@@ -218,48 +240,122 @@ impl Default for HostRoutes {
 }
 
 impl HostRoutes {
-    fn claimed(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<IpNet>>> {
+    fn holders(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Holder>> {
         self.inner
-            .claimed
+            .holders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Claims for `owner` the subnets of `wanted` that overlap none the
-    /// other networks hold, gives up the rest of what it held, and returns
-    /// what it now holds.
+    fn notify(&self) {
+        self.inner.changed.send_modify(|count| *count += 1);
+    }
+
+    /// Records `owner`, of the given kind and with its virtual address
+    /// ranges, before it claims anything: the other networks see the
+    /// ranges at once.
+    pub(crate) fn join(&self, owner: &str, managed: bool, interface: &[IpNet]) {
+        let mut holders = self.holders();
+        let holder = holders.entry(owner.to_owned()).or_default();
+        holder.managed = managed;
+        holder.interface = sorted(interface.iter().map(IpNet::trunc).collect());
+        drop(holders);
+        self.notify();
+    }
+
+    /// Claims for `owner` the subnets of `wanted` that overlap neither
+    /// another network's virtual range nor a subnet another network holds
+    /// with the same or a higher precedence; a `managed` owner takes
+    /// overlapping subnets from `legacy` networks. Gives up the rest of
+    /// what it held and returns what it now holds, sorted. Others are told
+    /// only when something changed.
     pub(crate) fn claim(&self, owner: &str, wanted: &[IpNet]) -> Vec<IpNet> {
-        let mut claimed = self.claimed();
-        let held: Vec<IpNet> = wanted
-            .iter()
-            .filter(|net| {
-                !claimed
-                    .iter()
-                    .filter(|(other, _)| other.as_str() != owner)
-                    .any(|(_, theirs)| theirs.iter().any(|their| their.overlaps(net)))
-            })
-            .copied()
-            .collect();
-        let before = claimed.insert(owner.to_owned(), held.clone());
-        if before.as_ref() != Some(&held) {
-            self.inner.changed.send_modify(|count| *count += 1);
+        let mut holders = self.holders();
+        let managed = holders.get(owner).is_some_and(|holder| holder.managed);
+        let held = sorted(
+            wanted
+                .iter()
+                .filter(|net| {
+                    !holders
+                        .iter()
+                        .filter(|(other, _)| other.as_str() != owner)
+                        .any(|(_, holder)| {
+                            holder.interface.iter().any(|range| range.overlaps(net))
+                                || ((holder.managed || !managed)
+                                    && holder.routes.iter().any(|route| route.overlaps(net)))
+                        })
+                })
+                .copied()
+                .collect(),
+        );
+        let mut changed = false;
+        if managed {
+            for (other, holder) in holders.iter_mut() {
+                if other.as_str() == owner || holder.managed {
+                    continue;
+                }
+                let before = holder.routes.len();
+                holder
+                    .routes
+                    .retain(|route| !held.iter().any(|net| net.overlaps(route)));
+                changed |= holder.routes.len() != before;
+            }
+        }
+        let holder = holders.entry(owner.to_owned()).or_default();
+        if holder.routes != held {
+            holder.routes = held.clone();
+            changed = true;
+        }
+        drop(holders);
+        if changed {
+            self.notify();
         }
         held
     }
 
-    /// What the networks other than `owner` hold.
+    /// Keeps of `owner`'s claim only what it installed.
+    pub(crate) fn narrow(&self, owner: &str, installed: &[IpNet]) {
+        let mut holders = self.holders();
+        let Some(holder) = holders.get_mut(owner) else {
+            return;
+        };
+        let before = holder.routes.len();
+        holder.routes.retain(|route| installed.contains(route));
+        let changed = holder.routes.len() != before;
+        drop(holders);
+        if changed {
+            self.notify();
+        }
+    }
+
+    /// What the networks other than `owner` hold: virtual ranges and
+    /// subnets, sorted.
     pub(crate) fn others(&self, owner: &str) -> Vec<IpNet> {
-        self.claimed()
-            .iter()
-            .filter(|(other, _)| other.as_str() != owner)
-            .flat_map(|(_, theirs)| theirs.iter().copied())
-            .collect()
+        sorted(
+            self.holders()
+                .iter()
+                .filter(|(other, _)| other.as_str() != owner)
+                .flat_map(|(_, holder)| holder.interface.iter().chain(&holder.routes).copied())
+                .collect(),
+        )
+    }
+
+    /// What `owner` sees of the shared state: the others' holdings and its
+    /// own claim. A change notice that leaves it the same, such as one
+    /// `owner` caused itself, needs no new look.
+    pub(crate) fn view(&self, owner: &str) -> (Vec<IpNet>, Vec<IpNet>) {
+        let own = self
+            .holders()
+            .get(owner)
+            .map(|holder| holder.routes.clone())
+            .unwrap_or_default();
+        (self.others(owner), own)
     }
 
     /// `owner` stopped: what it held is free.
     pub(crate) fn release(&self, owner: &str) {
-        if self.claimed().remove(owner).is_some() {
-            self.inner.changed.send_modify(|count| *count += 1);
+        if self.holders().remove(owner).is_some() {
+            self.notify();
         }
     }
 
@@ -538,6 +634,9 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
         let (_keep_groups, host_groups) = watch::channel(Vec::new());
+        // Subnet route overrides belong to the managed networks
+        // (`PUT /v1/mesh/subnet_route`); a standalone node has none.
+        let (_keep_overrides, route_overrides) = watch::channel(Vec::new());
         let result = serve_with(
             settings,
             static_key,
@@ -547,6 +646,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             Updates {
                 native_keys,
                 host_groups,
+                route_overrides,
             },
             None,
             None,
@@ -1055,13 +1155,15 @@ pub(crate) struct Updates {
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
     /// New host groups (spec §15.7).
     pub host_groups: watch::Receiver<Vec<HostGroup>>,
+    /// New subnet route overrides (spec §15.4, `PUT /v1/mesh/subnet_route`).
+    pub route_overrides: watch::Receiver<Vec<IpNet>>,
 }
 
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `updates` carries new native keys and host groups into the running
-/// driver; `border` connects a border node's network to its backbone.
+/// `updates` carries new native keys, host groups and subnet route
+/// overrides into the running driver; `border` connects a border node's network to its backbone.
 /// With `host`, the network installs only routes no other network of the
 /// process holds, under the given owner name.
 #[allow(clippy::too_many_arguments)]
@@ -1079,14 +1181,26 @@ pub(crate) async fn serve_with(
     let Updates {
         native_keys,
         host_groups,
+        route_overrides,
     } = updates;
     let mtu = usize::from(settings.mtu);
     let (to_node, from_interface) = mpsc::channel::<Vec<u8>>(QUEUE);
     let (to_interface, mut from_node) = mpsc::channel::<Vec<u8>>(QUEUE);
     let (snapshots, mut status) = watch::channel(Snapshot::default());
     let (stop, shutdown) = watch::channel(false);
-    let claim = host.map(|(routes, owner)| Claim { routes, owner });
+    let claim = host.map(|(routes, owner)| {
+        let mut ranges = vec![settings.address.trunc()];
+        ranges.extend(settings.address_v6.map(|net| net.trunc()));
+        routes.join(&owner, settings.kind == NetworkKind::Managed, &ranges);
+        Claim { routes, owner }
+    });
     let mut others_changed = claim.as_ref().map(|claim| claim.routes.subscribe());
+    // What this network last acted on, so that a notice it caused itself
+    // does not wake it again.
+    let mut seen = claim
+        .as_ref()
+        .map(|claim| claim.routes.view(&claim.owner))
+        .unwrap_or_default();
     // Recorded as ours, so that no other network of this process takes
     // its routes for another program's.
     let _own = host_routes::claim_own_interface(device.name());
@@ -1144,9 +1258,6 @@ pub(crate) async fn serve_with(
             }
         }
     }));
-    // No entry point sets subnet route overrides here yet; the sender is
-    // kept so that the driver sees an open, empty list.
-    let (_route_overrides, route_overrides) = watch::channel(Vec::new());
     let mut installed: Vec<IpNet> = Vec::new();
     let mut stopping = false;
     let mut wanted: Vec<IpNet> = Vec::new();
@@ -1194,7 +1305,7 @@ pub(crate) async fn serve_with(
         }
         if let Some(claim) = &claim {
             // Only what is installed stays claimed.
-            claim.routes.claim(&claim.owner, installed);
+            claim.routes.narrow(&claim.owner, installed);
         }
     };
     // Room for one packet larger than the MTU, so that an oversized one is
@@ -1221,6 +1332,9 @@ pub(crate) async fn serve_with(
                 let snapshot = status.borrow_and_update().clone();
                 wanted.clone_from(&snapshot.system_routes);
                 reconcile(&mut installed, &wanted);
+                if let Some(claim) = &claim {
+                    seen = claim.routes.view(&claim.owner);
+                }
                 observe(&snapshot, device.name());
             }
             Some(Ok(())) = async {
@@ -1230,8 +1344,15 @@ pub(crate) async fn serve_with(
                 }
             } => {
                 // Another network took or freed routes: freed ones may be
-                // ours now (the scanner updates this machine's networks).
-                reconcile(&mut installed, &wanted);
+                // ours now (the scanner updates this machine's networks),
+                // and a managed network may have taken ours.
+                if let Some(claim) = &claim {
+                    let now = claim.routes.view(&claim.owner);
+                    if now != seen {
+                        reconcile(&mut installed, &wanted);
+                        seen = claim.routes.view(&claim.owner);
+                    }
+                }
             }
             // The node may keep running for a moment after withdrawing its
             // advertisements (spec §15.7 rule 6); the interface keeps
@@ -1410,6 +1531,82 @@ mod tests {
         assert_eq!(remove, [net("172.16.0.0/16")]);
         let (add, remove) = route_changes(&wanted, &wanted);
         assert!(add.is_empty() && remove.is_empty());
+    }
+
+    #[test]
+    fn claims_compare_as_sets_and_settle() {
+        let net = |text: &str| IpNet::parse(text).expect("network");
+        let routes = HostRoutes::default();
+        routes.join("mesh-a", true, &[net("10.150.0.0/16")]);
+        let mut changes = routes.subscribe();
+        assert_eq!(
+            routes.claim("mesh-a", &[net("192.168.2.0/24")]),
+            [net("192.168.2.0/24")]
+        );
+        changes.mark_unchanged();
+        // A subnet that sorts first arrives; installed in another order.
+        let held = routes.claim("mesh-a", &[net("10.20.0.0/16"), net("192.168.2.0/24")]);
+        assert_eq!(held, [net("10.20.0.0/16"), net("192.168.2.0/24")]);
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+        routes.narrow("mesh-a", &[net("192.168.2.0/24"), net("10.20.0.0/16")]);
+        routes.claim("mesh-a", &[net("192.168.2.0/24"), net("10.20.0.0/16")]);
+        assert!(!changes.has_changed().unwrap());
+        // What failed to install is given up, once.
+        routes.narrow("mesh-a", &[net("192.168.2.0/24")]);
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(routes.view("mesh-a").1, [net("192.168.2.0/24")]);
+        // The network's own claims leave what it sees of the others alone.
+        assert_eq!(routes.view("mesh-a").0, Vec::<IpNet>::new());
+    }
+
+    #[test]
+    fn a_managed_network_takes_a_subnet_from_a_legacy_one() {
+        let net = |text: &str| IpNet::parse(text).expect("network");
+        let routes = HostRoutes::default();
+        routes.join("legacy", false, &[net("10.144.0.0/24")]);
+        routes.join("managed", true, &[net("10.150.0.0/16")]);
+        // The managed network restarted: the legacy one took the subnet.
+        assert_eq!(
+            routes.claim("legacy", &[net("192.168.50.0/24")]),
+            [net("192.168.50.0/24")]
+        );
+        let (_, before) = routes.view("legacy");
+        assert_eq!(
+            routes.claim("managed", &[net("192.168.50.0/24")]),
+            [net("192.168.50.0/24")]
+        );
+        // The legacy network lost it and cannot take it back.
+        let (others, own) = routes.view("legacy");
+        assert_ne!(own, before);
+        assert!(own.is_empty());
+        assert!(others.contains(&net("192.168.50.0/24")));
+        assert!(routes.claim("legacy", &[net("192.168.50.0/24")]).is_empty());
+        // Between networks of one kind the first keeps it.
+        routes.join("managed-2", true, &[]);
+        assert!(routes
+            .claim("managed-2", &[net("192.168.50.0/24")])
+            .is_empty());
+    }
+
+    #[test]
+    fn a_virtual_range_is_never_claimed_by_another_network() {
+        let net = |text: &str| IpNet::parse(text).expect("network");
+        let routes = HostRoutes::default();
+        routes.join("legacy", false, &[]);
+        assert_eq!(
+            routes.claim("legacy", &[net("10.150.0.0/16")]),
+            [net("10.150.0.0/16")]
+        );
+        // A network on that range starts: the others see it at once.
+        routes.join("managed", true, &[net("10.150.0.5/16")]);
+        assert!(routes.others("legacy").contains(&net("10.150.0.0/16")));
+        assert!(routes.claim("legacy", &[net("10.150.0.0/16")]).is_empty());
+        // Nor by a managed network.
+        routes.join("managed-2", true, &[]);
+        assert!(routes
+            .claim("managed-2", &[net("10.150.1.0/24")])
+            .is_empty());
     }
 
     #[test]

@@ -509,6 +509,17 @@ impl Node {
         }
     }
 
+    /// Saves a subnet route override (`PUT /v1/mesh/subnet_route`).
+    pub async fn set_mesh_subnet_route(
+        &self,
+        body: &[u8],
+    ) -> Result<outbound_mesh::status::ManagedStatus, NodeError> {
+        match &self.mesh {
+            Some(mesh) => mesh.set_subnet_route(body).await,
+            None => Err(NodeError::MeshUnavailable),
+        }
+    }
+
     pub fn with_serve_settings(mut self, settings: ServeSettings) -> Self {
         self.serve_settings = settings;
         self
