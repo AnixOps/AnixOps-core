@@ -1,8 +1,8 @@
 # Release CI Success Source Contract
 
 本文定义 `package-linux` 或其他平台 artifact job 在 release workflow 中运行前，release workflow
-如何证明当前 release commit 已经在 `main` 上通过 CI。当前 `release-ci-gate` 已通过
-GitHub Actions API 自动读取同 repository、同 commit、`main` 分支成功 CI run，并作为
+如何证明当前 release commit 已经在 `main`（或该版本的维护分支 `release/X.Y`）上通过 CI。当前 `release-ci-gate` 已通过
+GitHub Actions API 自动读取同 repository、同 commit、`main` 或 `release/X.Y` 分支成功 CI run，并作为
 Linux CLI artifact 的 `package-linux`、attestation、publish eligibility 和 GitHub Release
 asset 上传前置门禁。
 
@@ -31,7 +31,7 @@ CI run。允许来源：
 - workflow 文件：`.github/workflows/ci.yml`
 - workflow 名称：`CI`
 - repository：当前 release run 所在仓库
-- branch：`main`
+- branch：`main`，或与发布版本同一 `MAJOR.MINOR` 的维护分支 `release/MAJOR.MINOR`（2026-11-26 起，见 [Release Strategy](../release-strategy.md#维护分支)）
 - commit：当前 release run 的 `${{ github.sha }}`
 - conclusion：`success`
 - status：`completed`
@@ -53,7 +53,7 @@ CI run。允许来源：
 | `ci_run_status` | 必须为 `completed` |
 | `ci_run_conclusion` | 必须为 `success` |
 | `ci_head_sha` | 必须等于 release run 的 commit SHA |
-| `ci_head_branch` | 必须为 `main` |
+| `ci_head_branch` | 必须为 `main` 或 `release/MAJOR.MINOR`（与发布版本一致） |
 | `ci_event` | `push` 或受控 `workflow_dispatch` |
 | `ci_repository` | 必须等于 release run repository |
 | `ci_checked_at` | release workflow 完成检查的 UTC 时间 |
@@ -65,7 +65,8 @@ CI URL 或 run id 后绕过校验。
 
 真实 gate 必须拒绝以下情况：
 
-- 找不到同 repository、同 commit、`main` 分支上的成功 CI run。
+- 找不到同 repository、同 commit、`main` 或 `release/MAJOR.MINOR` 分支上的成功 CI run；
+  `release/` 下版本号与发布版本不一致的分支同样拒绝。
 - CI run 仍在 `queued`、`in_progress` 或 `waiting`。
 - CI run conclusion 不是 `success`。
 - CI run 来自 pull request ref、fork、不同 commit、不同 branch 或不同 workflow。

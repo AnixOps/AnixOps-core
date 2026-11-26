@@ -85,8 +85,12 @@ jobs:
 
           case "${RELEASE_EVENT}" in
             workflow_dispatch)
-              if [ "${RELEASE_REF_TYPE}" != "branch" ] || [ "${RELEASE_REF_NAME}" != "main" ]; then
-                echo "::error::workflow_dispatch release validation must run from main."
+              # main, or the maintenance branch release/MAJOR.MINOR of this version
+              # (docs/release-strategy.md「维护分支」).
+              [[ "${RELEASE_VERSION}" =~ ^v([0-9]+)\.([0-9]+)\. ]]
+              maintenance_branch="release/${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+              if [ "${RELEASE_REF_TYPE}" != "branch" ] || { [ "${RELEASE_REF_NAME}" != "main" ] && [ "${RELEASE_REF_NAME}" != "${maintenance_branch}" ]; }; then
+                echo "::error::workflow_dispatch release validation must run from main or ${maintenance_branch}."
                 exit 1
               fi
               echo "is_tag_release=false" >> "${GITHUB_OUTPUT}"
@@ -122,6 +126,14 @@ jobs:
             echo "| Release kind | ${release_kind} |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
+      # The binaries print the version they are published under, and the release has a
+      # CHANGELOG section (docs/release-strategy.md「版本节奏与候选版」).
+      - name: Release version preconditions
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.policy.outputs.version }}
+        run: bash .github/scripts/release-version-check.sh "${RELEASE_VERSION}"
+
   release-ci-gate:
     name: Release CI gate
     runs-on: ubuntu-latest
@@ -155,16 +167,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ github.sha }}
           RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.release-policy.outputs.version }}
         run: |
           set -euo pipefail
           test -f docs/architecture/release-ci-success-source-contract.md
           test -f docs/architecture/release-ci-gate-execution-validation-contract.md
 
+          # The CI run may come from main or from this version's maintenance branch
+          # release/MAJOR.MINOR (docs/release-strategy.md「维护分支」); no other branch counts.
+          [[ "${RELEASE_VERSION}" =~ ^v([0-9]+)\.([0-9]+)\. ]]
+          maintenance_branch="release/${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+
           runs_json="$(gh api --method GET "repos/${RELEASE_REPOSITORY}/actions/workflows/ci.yml/runs" \
-            -f branch=main \
             -f status=completed \
             -f head_sha="${RELEASE_SHA}" \
-            -f per_page=20)"
+            -f per_page=50)"
           run_total="$(jq -r '.total_count // 0' <<< "${runs_json}")"
           run_count="$(jq -r '.workflow_runs | length' <<< "${runs_json}")"
           if [ "${run_total}" -gt "${run_count}" ]; then
@@ -172,12 +189,12 @@ jobs:
             exit 1
           fi
 
-          ci_run_json="$(jq -c --arg sha "${RELEASE_SHA}" --arg repo "${RELEASE_REPOSITORY}" '
+          ci_run_json="$(jq -c --arg sha "${RELEASE_SHA}" --arg repo "${RELEASE_REPOSITORY}" --arg maintenance "${maintenance_branch}" '
             [
               .workflow_runs[]
               | select(.name == "CI")
               | select(.path == ".github/workflows/ci.yml")
-              | select(.head_branch == "main")
+              | select(.head_branch == "main" or .head_branch == $maintenance)
               | select(.head_sha == $sha)
               | select(.status == "completed")
               | select(.conclusion == "success")
@@ -188,7 +205,7 @@ jobs:
             | last // empty
           ' <<< "${runs_json}")"
           if [ -z "${ci_run_json}" ]; then
-            echo "::error::No successful completed CI run on main was found for ${RELEASE_REPOSITORY}@${RELEASE_SHA}."
+            echo "::error::No successful completed CI run on main or ${maintenance_branch} was found for ${RELEASE_REPOSITORY}@${RELEASE_SHA}."
             exit 1
           fi
 
