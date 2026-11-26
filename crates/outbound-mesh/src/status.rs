@@ -202,6 +202,11 @@ pub enum AlertCode {
     PeerKeyChanged,
     /// RPC bodies over 4 MiB were not sent; `detail` is how many.
     RpcOversize,
+    /// The network is larger than route synchronisation carries: a call
+    /// over 8 MiB was dropped (spec §11.2), or a neighbour did not take the
+    /// connection graph in time and the session was closed (§12.2). `peer`
+    /// is empty; `detail` says which, with the node ID.
+    SyncOversize,
 }
 
 /// Why a `PUT /v1/mesh` was not applied.
