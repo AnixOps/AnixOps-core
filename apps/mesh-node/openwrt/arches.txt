@@ -4,9 +4,25 @@
 # lists (opkg print-architecture, /etc/apk/arch). The program is static, so
 # one build serves every OpenWrt architecture of the same instruction set;
 # .github/scripts/package-openwrt.sh writes one package per line below for
-# which the build exists. 32-bit ARM and MIPS follow with their builds.
+# which the build exists.
+#
+# 32-bit ARM: architectures with a floating-point unit (the _vfp*/_neon
+# suffixes) use the hard-float builds, the others the soft-float builds,
+# which need no floating-point unit. ARMv5 (arm_arm926ej-s, arm_xscale) and
+# MIPS follow with their builds; ARMv4 (arm_fa526) has no Rust target.
 x86_64 x86_64-unknown-linux-musl
 aarch64_generic aarch64-unknown-linux-musl
 aarch64_cortex-a53 aarch64-unknown-linux-musl
 aarch64_cortex-a72 aarch64-unknown-linux-musl
 aarch64_cortex-a76 aarch64-unknown-linux-musl
+arm_cortex-a5_vfpv4 armv7-unknown-linux-musleabihf
+arm_cortex-a7_neon-vfpv4 armv7-unknown-linux-musleabihf
+arm_cortex-a7_vfpv4 armv7-unknown-linux-musleabihf
+arm_cortex-a8_vfpv3 armv7-unknown-linux-musleabihf
+arm_cortex-a9_neon armv7-unknown-linux-musleabihf
+arm_cortex-a9_vfpv3-d16 armv7-unknown-linux-musleabihf
+arm_cortex-a15_neon-vfpv4 armv7-unknown-linux-musleabihf
+arm_cortex-a7 armv7-unknown-linux-musleabi
+arm_cortex-a9 armv7-unknown-linux-musleabi
+arm_arm1176jzf-s_vfp arm-unknown-linux-musleabihf
+arm_mpcore arm-unknown-linux-musleabi

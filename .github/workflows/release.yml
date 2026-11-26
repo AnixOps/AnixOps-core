@@ -24,6 +24,9 @@ env:
   LINUX_BINARY: networkcore-linux
   LINUX_RUST_TOOLCHAIN: stable
   LINUX_RUST_PROFILE: minimal
+  # apk-tools 3 (3.0.9) for the OpenWrt apk packages; same image as the
+  # OpenWrt workflow (.github/workflows/openwrt.yml).
+  APK_MKPKG_IMAGE: alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2 # 3.23.8
 
 jobs:
   release-policy:
@@ -784,6 +787,15 @@ jobs:
             installer: install-linux.sh
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+          # 32-bit ARM, for the OpenWrt packages.
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabi
+          - os: ubuntu-latest
+            target: arm-unknown-linux-musleabihf
+          - os: ubuntu-latest
+            target: arm-unknown-linux-musleabi
           - os: macos-26
             target: aarch64-apple-darwin
             installer: install-macos.sh
@@ -862,6 +874,77 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # OpenWrt packages of the Linux builds above (docs/deploy/openwrt.md),
+  # same script as the OpenWrt workflow. Uploaded as a mesh-node-* artifact
+  # so they are attested and published with the programs.
+  package-openwrt:
+    name: Package OpenWrt
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - release-policy
+      - package-mesh-node
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download Linux mesh node builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mesh-node-*-linux-musl*
+          merge-multiple: true
+          path: dist/bin
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.release-policy.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+          APK_IMAGE: ${{ env.APK_MKPKG_IMAGE }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          (cd dist/bin && sha256sum -c ./*.sha256)
+          mkdir -p dist/openwrt
+          # The packages only work with a program that enrolls and runs the
+          # device (docs/deploy/mesh-device.md). Until the release's program
+          # has these subcommands, the release carries no OpenWrt packages
+          # rather than packages that cannot enroll.
+          program="dist/bin/anixops-mesh-${VERSION}-x86_64-unknown-linux-musl"
+          chmod 0755 "${program}"
+          missing=""
+          for command in enroll device device-status subnet-request; do
+            "${program}" capabilities | jq -e --arg c "${command}" '.commands | index($c)' > /dev/null \
+              || missing="${missing} ${command}"
+          done
+          if [ -n "${missing}" ]; then
+            echo "::warning::anixops-mesh ${VERSION} lacks${missing}: no OpenWrt packages in this release"
+            echo "OpenWrt packages left out: the program lacks${missing}" > dist/openwrt/NOT-PACKAGED
+            exit 0
+          fi
+          .github/scripts/package-openwrt.sh "${VERSION}" dist/bin dist/openwrt
+          # Every line of arches.txt has its package in both formats.
+          file_version="${VERSION#v}-r1"
+          while read -r arch _; do
+            case "${arch}" in "" | \#*) continue ;; esac
+            test -s "dist/openwrt/anixops-mesh_${file_version}_${arch}.ipk"
+            test -s "dist/openwrt/anixops-mesh_${file_version}_${arch}.apk"
+          done < apps/mesh-node/openwrt/arches.txt
+          test -s "dist/openwrt/luci-app-anixops-mesh_${file_version}_all.ipk"
+          test -s "dist/openwrt/luci-app-anixops-mesh_${file_version}_all.apk"
+          (cd dist/openwrt && sha256sum -c SHA256SUMS)
+          mv dist/openwrt/SHA256SUMS "dist/openwrt/anixops-mesh-${VERSION}-openwrt-SHA256SUMS"
+
+      - name: Upload OpenWrt packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mesh-node-openwrt
+          path: dist/openwrt/
+          retention-days: 14
+          if-no-files-found: error
+
   attest-mesh-node:
     name: Attest mesh node
     runs-on: ubuntu-latest
@@ -869,6 +952,7 @@ jobs:
     needs:
       - release-policy
       - package-mesh-node
+      - package-openwrt
     permissions:
       contents: read
       id-token: write
@@ -894,6 +978,10 @@ jobs:
           for name in \
             "anixops-mesh-${VERSION}-x86_64-unknown-linux-musl" \
             "anixops-mesh-${VERSION}-aarch64-unknown-linux-musl" \
+            "anixops-mesh-${VERSION}-armv7-unknown-linux-musleabihf" \
+            "anixops-mesh-${VERSION}-armv7-unknown-linux-musleabi" \
+            "anixops-mesh-${VERSION}-arm-unknown-linux-musleabihf" \
+            "anixops-mesh-${VERSION}-arm-unknown-linux-musleabi" \
             "anixops-mesh-${VERSION}-aarch64-apple-darwin" \
             "anixops-mesh-${VERSION}-x86_64-apple-darwin" \
             "anixops-mesh-${VERSION}-x86_64-pc-windows-msvc.exe" \
@@ -909,6 +997,8 @@ jobs:
             sha256sum -c "${name}.sha256"
           done
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+            armv7-unknown-linux-musleabihf armv7-unknown-linux-musleabi \
+            arm-unknown-linux-musleabihf arm-unknown-linux-musleabi \
             aarch64-apple-darwin x86_64-apple-darwin \
             x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
             name="anixops-mesh-${VERSION}-${target}"
@@ -924,7 +1014,28 @@ jobs:
                and (.rustc | startswith("rustc ")) and (.cargo | startswith("cargo "))' \
               "${name}.buildinfo.json" >/dev/null
           done
-          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "30"
+          # OpenWrt packages, all listed in their checksum file (package-openwrt
+          # checked one per line of arches.txt), or a note that the program
+          # cannot run them yet.
+          ipks="$(find . -maxdepth 1 -type f -name '*.ipk' | wc -l | tr -d ' ')"
+          apks="$(find . -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')"
+          if [ -f NOT-PACKAGED ]; then
+            cat NOT-PACKAGED
+            test "${ipks}" = 0
+            test "${apks}" = 0
+            rm NOT-PACKAGED
+            extra=0
+          else
+            sha256sum -c "anixops-mesh-${VERSION}-openwrt-SHA256SUMS"
+            test "${ipks}" -ge 2
+            test "${ipks}" = "${apks}"
+            test "$(wc -l < "anixops-mesh-${VERSION}-openwrt-SHA256SUMS" | tr -d ' ')" = "$((ipks + apks))"
+            extra=$((ipks + apks + 1))
+          fi
+          # 42 program files (10 builds with their .sha256 and .buildinfo.json
+          # files, 3 installers and Wintun with theirs) plus the packages and
+          # their checksum file.
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "$((42 + extra))"
 
       - name: Generate mesh node attestation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -1102,9 +1213,14 @@ jobs:
             sha256sum -c "${MANIFEST_NAME}.sha256"
           )
           mesh_assets=()
+          openwrt_note=""
           for name in \
             "anixops-mesh-${VERSION}-x86_64-unknown-linux-musl" \
             "anixops-mesh-${VERSION}-aarch64-unknown-linux-musl" \
+            "anixops-mesh-${VERSION}-armv7-unknown-linux-musleabihf" \
+            "anixops-mesh-${VERSION}-armv7-unknown-linux-musleabi" \
+            "anixops-mesh-${VERSION}-arm-unknown-linux-musleabihf" \
+            "anixops-mesh-${VERSION}-arm-unknown-linux-musleabi" \
             "anixops-mesh-${VERSION}-aarch64-apple-darwin" \
             "anixops-mesh-${VERSION}-x86_64-apple-darwin" \
             "anixops-mesh-${VERSION}-x86_64-pc-windows-msvc.exe" \
@@ -1119,10 +1235,21 @@ jobs:
             mesh_assets+=("dist/mesh-node/${name}" "dist/mesh-node/${name}.sha256")
           done
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+            armv7-unknown-linux-musleabihf armv7-unknown-linux-musleabi \
+            arm-unknown-linux-musleabihf arm-unknown-linux-musleabi \
             aarch64-apple-darwin x86_64-apple-darwin \
             x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
             mesh_assets+=("dist/mesh-node/anixops-mesh-${VERSION}-${target}.buildinfo.json")
           done
+          if [ -f "dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS" ]; then
+            (cd dist/mesh-node && sha256sum -c "anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
+            mesh_assets+=("dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
+            while read -r file; do
+              mesh_assets+=("dist/mesh-node/${file}")
+            done < <(awk '{ print $2 }' "dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
+          else
+            openwrt_note="(not in this release: the program cannot enroll a device yet)"
+          fi
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             echo "::error::Release ${VERSION} already exists. Asset overwrite is forbidden."
             exit 1
@@ -1145,7 +1272,8 @@ jobs:
 
           ## Mesh node
 
-          - anixops-mesh-${VERSION}-x86_64-unknown-linux-musl and -aarch64-unknown-linux-musl: static programs for intranet mesh nodes, each with a .sha256 file
+          - anixops-mesh-${VERSION}-x86_64-unknown-linux-musl, -aarch64-unknown-linux-musl, -armv7-unknown-linux-musleabihf, -armv7-unknown-linux-musleabi, -arm-unknown-linux-musleabihf and -arm-unknown-linux-musleabi: static programs for intranet mesh nodes, each with a .sha256 file
+          - anixops-mesh_*.ipk and .apk (OpenWrt 23.05 and 24.10, 25.12 and later), one per OpenWrt architecture, and luci-app-anixops-mesh_*_all.ipk and .apk: the OpenWrt packages and web interface, listed in anixops-mesh-${VERSION}-openwrt-SHA256SUMS; see docs/deploy/openwrt.md ${openwrt_note}
           - anixops-mesh-${VERSION}-aarch64-apple-darwin and -x86_64-apple-darwin: macOS programs, each with a .sha256 file
           - anixops-mesh-${VERSION}-x86_64-pc-windows-msvc.exe and -aarch64-pc-windows-msvc.exe: Windows programs with the C runtime linked in, each with a .sha256 file
           - anixops-mesh-${VERSION}-x86_64-pc-windows-msvc-wintun.dll and -aarch64-pc-windows-msvc-wintun.dll: the unmodified Wintun 0.14.1 driver library each Windows program loads from its own folder, with its license anixops-mesh-${VERSION}-wintun-LICENSE.txt

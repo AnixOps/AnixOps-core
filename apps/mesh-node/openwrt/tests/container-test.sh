@@ -2,13 +2,15 @@
 # Installs the OpenWrt packages in an OpenWrt root file system container
 # and checks the installed result (.github/workflows/openwrt.yml):
 # package scripts, procd service definition, the procd wrapper's exit-code
-# handling, the rpcd backend through a real ubusd and rpcd, translations
-# through the web interface's own catalog loader, reinstall and removal.
+# handling, the firewall rules through fw4, the rpcd backend through a real
+# ubusd and rpcd, translations through the web interface's own catalog
+# loader, reinstall, upgrade and removal.
 #
 #   container-test.sh PKG_DIR FORMAT ARCH
 #
-# FORMAT is ipk (opkg) or apk. PKG_DIR holds the packages and i18n-check.uc
-# (generated from the catalog by the workflow).
+# FORMAT is ipk (opkg) or apk. PKG_DIR holds the packages, i18n-check.uc
+# (generated from the catalog by the workflow) and upgrade/ (the same
+# packages with a later version).
 
 set -eu
 
@@ -38,21 +40,25 @@ case "${format}" in
 	ipk)
 		main_pkg="$(ls "${pkg_dir}"/anixops-mesh_*_"${arch}".ipk)"
 		luci_pkg="$(ls "${pkg_dir}"/luci-app-anixops-mesh_*_all.ipk)"
+		next_pkgs="$(ls "${pkg_dir}"/upgrade/anixops-mesh_*_"${arch}".ipk "${pkg_dir}"/upgrade/luci-app-anixops-mesh_*_all.ipk)"
 		pm_update() { opkg update; }
 		pm_install() { opkg install "$@"; }
 		pm_reinstall() { opkg install --force-reinstall "${main_pkg}"; }
 		pm_remove() { opkg remove "$@"; }
 		pm_installed() { opkg status "$1" | grep -q '^Status: .* installed'; }
+		pm_version() { opkg status "$1" | sed -n 's/^Version: //p'; }
 		;;
 	apk)
 		main_pkg="$(ls "${pkg_dir}"/anixops-mesh_*_"${arch}".apk)"
 		luci_pkg="$(ls "${pkg_dir}"/luci-app-anixops-mesh_*_all.apk)"
+		next_pkgs="$(ls "${pkg_dir}"/upgrade/anixops-mesh_*_"${arch}".apk "${pkg_dir}"/upgrade/luci-app-anixops-mesh_*_all.apk)"
 		pm_update() { apk update; }
 		# Local packages are not signed by the OpenWrt build key.
 		pm_install() { apk add --allow-untrusted "$@"; }
 		pm_reinstall() { apk fix --reinstall anixops-mesh; }
 		pm_remove() { apk del "$@"; }
 		pm_installed() { apk info -e "$1" > /dev/null; }
+		pm_version() { apk list -I "$1" | sed -n "s/^$1-\([^ ]*\) .*/\1/p"; }
 		;;
 	*)
 		fail "unknown format ${format}"
@@ -77,8 +83,8 @@ step "Install dependencies from the release feeds"
 pm_update
 # kmod-tun's own scripts load the module, which a container cannot do; the
 # dependencies only have to be present so that our packages install.
-pm_install kmod-tun luci-base rpcd-mod-ucode || true
-for dep in kmod-tun luci-base rpcd-mod-ucode; do
+pm_install kmod-tun luci-base rpcd-mod-ucode firewall4 ucode ucode-mod-fs ucode-mod-uci || true
+for dep in kmod-tun luci-base rpcd-mod-ucode firewall4 ucode ucode-mod-fs ucode-mod-uci; do
 	pm_installed "${dep}" || fail "dependency ${dep} not installed"
 done
 end
@@ -90,7 +96,8 @@ pm_installed luci-app-anixops-mesh || fail "luci-app-anixops-mesh not installed"
 end
 
 step "Installed files"
-for file in /usr/bin/anixops-mesh /etc/init.d/anixops-mesh /usr/libexec/anixops-mesh/service; do
+for file in /usr/bin/anixops-mesh /etc/init.d/anixops-mesh /usr/libexec/anixops-mesh/service \
+	/usr/libexec/anixops-mesh/firewall; do
 	[ -x "${file}" ] || fail "${file} missing or not executable"
 	[ "$(owner "${file}")" = 0:0 ] || fail "${file} not owned by root"
 done
@@ -100,7 +107,15 @@ grep -qx '/etc/anixops-mesh/' /lib/upgrade/keep.d/anixops-mesh || fail "state di
 [ ! -e /etc/uci-defaults/90-anixops-mesh ] || fail "uci-defaults script was not run"
 [ "$(uci -q get anixops-mesh.main)" = device ] || fail "default configuration missing"
 [ "$(uci -q get anixops-mesh.main.enabled)" = 0 ] || fail "service must be off by default"
-[ "$(uci -q get anixops-mesh.main.state_dir)" = /etc/anixops-mesh ] || fail "state_dir default"
+[ -z "$(uci -q get anixops-mesh.main.state_dir)" ] || fail "the state directory is fixed, not a setting"
+[ "$(owner /usr/share/anixops-mesh/firewall.uc)" = 0:0 ] || fail "firewall rules script missing"
+# Modes come from the package, not the build machine's umask.
+for dir in /etc/init.d /usr/libexec/anixops-mesh /usr/share/anixops-mesh; do
+	case "$(ls -ld "${dir}")" in
+		drwxr-xr-x*) ;;
+		*) fail "${dir} mode" ;;
+	esac
+done
 grep -q '^anixops-mesh:' /etc/group || fail "group anixops-mesh not created"
 ls /etc/rc.d/S95anixops-mesh > /dev/null 2>&1 || fail "init script not enabled"
 for file in \
@@ -129,6 +144,11 @@ case "$1" in
 		;;
 	device)
 		echo "$$" > /tmp/stub/pid
+		if [ "${mode}" = stubborn ]; then
+			# Ignores SIGTERM: the wrapper must kill it.
+			trap 'echo term > /tmp/stub/term' TERM
+			while :; do sleep 1; done
+		fi
 		trap 'echo term > /tmp/stub/term; exit 0' TERM
 		if [ "${mode}" = sleep ]; then
 			sleep 60 &
@@ -211,7 +231,17 @@ rm -f /tmp/fakebin/calls
 PATH="/tmp/fakebin:${PATH}" /etc/init.d/anixops-mesh start
 calls
 calls | grep -q '"command": \[ "/usr/libexec/anixops-mesh/service", "/etc/anixops-mesh" \]' || fail "instance command"
-calls | grep -q '"respawn": \[ "3600", "5", "5" \]' || fail "respawn limits"
+calls | grep -q '"command": \[ "/usr/libexec/anixops-mesh/firewall", "watch" \]' || fail "firewall instance command"
+calls | grep -q '"respawn": \[ "3600", "5", "0" \]' || fail "respawn without a limit"
+calls | grep -q '"term_timeout": 30' || fail "term timeout"
+# A UCI setting cannot move the state directory (for example under /www).
+uci set anixops-mesh.main.state_dir=/www/m
+uci commit anixops-mesh
+rm -f /tmp/fakebin/calls
+PATH="/tmp/fakebin:${PATH}" /etc/init.d/anixops-mesh start
+calls | grep -q '"command": \[ "/usr/libexec/anixops-mesh/service", "/etc/anixops-mesh" \]' || fail "state directory must stay fixed"
+uci delete anixops-mesh.main.state_dir
+uci commit anixops-mesh
 end
 
 step "procd wrapper exit codes"
@@ -244,6 +274,29 @@ code=0
 wait "${wrapper}" || code=$?
 [ -f /tmp/stub/term ] || fail "SIGTERM was not passed on to the program"
 [ "${code}" = 0 ] || fail "wrapper must return the program's exit code after SIGTERM (got ${code})"
+# A program that does not stop is killed by the wrapper itself, before procd
+# would kill only the wrapper (term_timeout 30 s) and leave it running.
+echo stubborn > /tmp/stub/mode
+rm -f /tmp/stub/pid /tmp/stub/term
+PATH="/tmp/fakebin:${PATH}" /usr/libexec/anixops-mesh/service /etc/anixops-mesh &
+wrapper=$!
+tries=0
+while [ ! -s /tmp/stub/pid ]; do
+	tries=$((tries + 1))
+	[ "${tries}" -lt 20 ] || fail "program did not start"
+	sleep 1
+done
+program="$(cat /tmp/stub/pid)"
+started="$(date +%s)"
+kill -TERM "${wrapper}"
+wait "${wrapper}" || true
+elapsed=$(($(date +%s) - started))
+[ -f /tmp/stub/term ] || fail "SIGTERM was not passed on to the stubborn program"
+if kill -0 "${program}" 2> /dev/null; then
+	fail "program still running after the wrapper ended"
+fi
+[ "${elapsed}" -lt 30 ] || fail "wrapper took ${elapsed} s, longer than procd's term timeout"
+echo ok > /tmp/stub/mode
 stub_remove
 end
 
@@ -280,6 +333,8 @@ call enroll '{"control":"http://panel.example.com","token":"mse_abc"}'
 [ "$(json /tmp/reply.json '@.result')" = invalid_control ] || fail "http panel address must be refused"
 call enroll '{"control":"https://panel.example.com/x?y","token":"mse_abc"}'
 [ "$(json /tmp/reply.json '@.result')" = invalid_control ] || fail "query in panel address must be refused"
+call enroll '{"control":"https://panel.example.com/base","token":"mse_abc"}'
+[ "$(json /tmp/reply.json '@.result')" = invalid_control ] || fail "path in panel address must be refused (the program takes none)"
 call enroll "{\"control\":\"https://panel.example.com'\",\"token\":\"mse_abc\"}"
 [ "$(json /tmp/reply.json '@.result')" = invalid_control ] || fail "quote in panel address must be refused"
 call enroll '{"control":"https://panel.example.com","token":"abc"}'
@@ -305,7 +360,7 @@ echo ok > /tmp/stub/mode
 uci set anixops-mesh.main.enabled=0
 uci set anixops-mesh.main.control=''
 uci commit anixops-mesh
-call enroll '{"control":"https://panel.example.com:8443/base","token":"  mse_secret-1  "}'
+call enroll '{"control":"https://panel.example.com:8443","token":"  mse_secret-1  "}'
 [ "$(json /tmp/reply.json '@.result')" = ok ] || fail "enroll"
 [ "$(cat /tmp/stub/token-copy)" = mse_secret-1 ] || fail "credential written to the file, trimmed"
 [ "$(cat /tmp/stub/token-mode)" = -rw------- ] || fail "credential file must be 0600"
@@ -317,9 +372,9 @@ esac
 if grep -q 'mse_secret' /tmp/stub/calls; then
 	fail "credential must not appear on a command line"
 fi
-grep -q -- "--control https://panel.example.com:8443/base --token-file /tmp/anixops-mesh-enroll\.[A-Za-z0-9]* --state-dir /etc/anixops-mesh" /tmp/stub/calls ||
+grep -q -- "--control https://panel.example.com:8443 --token-file /tmp/anixops-mesh-enroll\.[A-Za-z0-9]* --state-dir /etc/anixops-mesh" /tmp/stub/calls ||
 	fail "enroll arguments"
-[ "$(uci -q get anixops-mesh.main.control)" = https://panel.example.com:8443/base ] || fail "panel address saved"
+[ "$(uci -q get anixops-mesh.main.control)" = https://panel.example.com:8443 ] || fail "panel address saved"
 [ "$(uci -q get anixops-mesh.main.enabled)" = 1 ] || fail "service enabled after enrollment"
 echo rejected > /tmp/stub/mode
 call enroll '{"control":"https://panel.example.com","token":"mse_abc"}'
@@ -353,7 +408,82 @@ call request_subnets '{"cidrs":[]}'
 rm /etc/anixops-mesh/token
 call request_subnets '{"cidrs":["192.168.1.0/24"]}'
 [ "$(json /tmp/reply.json '@.result')" = not_enrolled ] || fail "request without token"
+# UCI changed outside the backend: values are checked again before the
+# page gets them.
+uci set anixops-mesh.main.control='<img src=x onerror=alert(1)>'
+uci set anixops-mesh.main.advertise='192.168.7.0/24'
+uci add_list anixops-mesh.main.advertise='<b>x</b>'
+uci commit anixops-mesh
+call status
+[ -z "$(json /tmp/reply.json '@.control')" ] || fail "invalid panel address must not reach the page"
+[ "$(json /tmp/reply.json '@.requested[0]')" = 192.168.7.0/24 ] || fail "valid subnet passed on"
+[ -z "$(json /tmp/reply.json '@.requested[1]')" ] || fail "invalid subnets must not reach the page"
+uci delete anixops-mesh.main.advertise
+uci set anixops-mesh.main.control=''
+uci commit anixops-mesh
 stub_remove
+end
+
+step "Firewall rules"
+mkdir -p /etc/anixops-mesh
+# The panel's answer as the program saves it (docs/deploy/mesh-device.md):
+# a full node with the default listening ports and one approved subnet, and
+# an access network that must add nothing. Invalid values are ignored.
+cat > /etc/anixops-mesh/config.json <<'EOF'
+{"data":{"networks":[
+ {"id":"eu","name":"mesh-eu","role":"full","listen":[{"transport":"tcp","port":11010},{"transport":"udp"},{"transport":"sctp","port":1},{"transport":"tcp","port":70000}],
+  "subnets":{"accept":[],"advertise":["192.168.1.0/24","192.168.2.0/24; drop","300.1.1.0/24"]}},
+ {"id":"us","name":"mesh-us","role":"access","listen":[{"transport":"tcp","port":12000}],"subnets":{"accept":[],"advertise":["10.9.0.0/16"]}}
+]}}
+EOF
+/usr/libexec/anixops-mesh/firewall sync || fail "firewall sync"
+uci show firewall | grep anixmesh
+[ "$(uci -q get firewall.anixmesh)" = zone ] || fail "mesh zone"
+[ "$(uci -q get firewall.anixmesh.device)" = anixmesh-+ ] || fail "mesh zone covers every mesh interface"
+[ "$(uci -q get firewall.anixmesh.input)" = REJECT ] || fail "mesh members must not reach the router"
+[ "$(uci -q get firewall.anixmesh.forward)" = REJECT ] || fail "mesh zone forward"
+[ "$(uci -q get firewall.anixmesh.output)" = ACCEPT ] || fail "mesh zone output"
+for rule in anixmesh_wan_tcp_11010 anixmesh_wan_udp_11010 anixmesh_in_192_168_1_0_24 anixmesh_out_192_168_1_0_24; do
+	[ "$(uci -q get "firewall.${rule}")" = rule ] || fail "rule ${rule} missing"
+done
+[ "$(uci show firewall | grep -c '^firewall\.anixmesh_[a-z0-9_]*=rule$')" = 4 ] || fail "only the full node's rules, valid values only"
+[ "$(uci -q get firewall.anixmesh_wan_tcp_11010.src)" = wan ] || fail "listening port open from wan only"
+[ "$(uci -q get firewall.anixmesh_in_192_168_1_0_24.dest)" = lan ] || fail "mesh to lan only"
+[ "$(uci -q get firewall.anixmesh_in_192_168_1_0_24.dest_ip)" = 192.168.1.0/24 ] || fail "mesh to the approved subnet only"
+[ "$(uci -q get firewall.anixmesh_out_192_168_1_0_24.src_ip)" = 192.168.1.0/24 ] || fail "lan to mesh from the approved subnet only"
+fw4 print > /tmp/fw4.nft 2> /tmp/fw4.err || { cat /tmp/fw4.err; fail "fw4 cannot render the rules"; }
+grep -n 'anixmesh\|AnixOps-Mesh' /tmp/fw4.nft
+grep -q 'iifname "anixmesh-\*"' /tmp/fw4.nft || fail "fw4: mesh interfaces not in the zone"
+grep 'AnixOps-Mesh-tcp-11010' /tmp/fw4.nft | grep -q 'tcp dport 11010' || fail "fw4: listening port rule"
+grep 'AnixOps-Mesh-to-192.168.1.0/24' /tmp/fw4.nft | grep -q 'ip daddr 192.168.1.0/24' || fail "fw4: forward to the approved subnet"
+sed -n '/chain input_anixmesh/,/}/p' /tmp/fw4.nft | grep -q 'jump reject_from_anixmesh' || fail "fw4: mesh input not rejected"
+# No change, no rewrite.
+/usr/libexec/anixops-mesh/firewall sync > /tmp/fw-sync.out || fail "second sync"
+if grep -q updated /tmp/fw-sync.out; then
+	fail "unchanged rules must not be rewritten"
+fi
+# The node becomes an access node: the rules go, the zone stays.
+sed -i 's/"role":"full"/"role":"access"/' /etc/anixops-mesh/config.json
+/usr/libexec/anixops-mesh/firewall sync || fail "firewall sync"
+[ "$(uci show firewall | grep -c '^firewall\.anixmesh_')" = 0 ] || fail "access node keeps no rules"
+[ "$(uci -q get firewall.anixmesh)" = zone ] || fail "zone kept"
+sed -i 's/"role":"access"/"role":"full"/' /etc/anixops-mesh/config.json
+/usr/libexec/anixops-mesh/firewall sync || fail "firewall sync"
+/usr/libexec/anixops-mesh/firewall clear || fail "firewall clear"
+[ "$(uci show firewall | grep -c '^firewall\.anixmesh_')" = 0 ] || fail "clear removes the rules"
+# The watcher syncs, and clears when procd stops it.
+/usr/libexec/anixops-mesh/firewall watch &
+watcher=$!
+tries=0
+until [ "$(uci -q get firewall.anixmesh_wan_tcp_11010)" = rule ]; do
+	tries=$((tries + 1))
+	[ "${tries}" -lt 20 ] || fail "watcher did not sync"
+	sleep 1
+done
+kill -TERM "${watcher}"
+wait "${watcher}" || true
+[ "$(uci show firewall | grep -c '^firewall\.anixmesh_')" = 0 ] || fail "stopping the watcher removes the rules"
+/usr/libexec/anixops-mesh/firewall sync || fail "firewall sync"
 end
 
 step "Translations through the web interface's catalog loader"
@@ -367,8 +497,27 @@ pm_reinstall || fail "reinstall failed"
 [ "$(uci -q get anixops-mesh.main.control)" = https://kept.example.com ] || fail "configuration replaced on reinstall"
 end
 
+step "Upgrade keeps the device"
+mkdir -p /etc/anixops-mesh
+echo msd_test > /etc/anixops-mesh/token
+echo '{}' > /etc/anixops-mesh/device.json
+/usr/libexec/anixops-mesh/firewall sync || fail "firewall sync"
+# shellcheck disable=SC2086 # two file names
+pm_install ${next_pkgs} || fail "upgrade failed"
+[ "$(pm_version anixops-mesh)" = 99.0.0-r1 ] || fail "upgraded version (got $(pm_version anixops-mesh))"
+[ "$(pm_version luci-app-anixops-mesh)" = 99.0.0-r1 ] || fail "upgraded web interface"
+[ "$(cat /etc/anixops-mesh/token)" = msd_test ] || fail "device token lost on upgrade"
+[ -f /etc/anixops-mesh/device.json ] || fail "device key lost on upgrade"
+[ "$(uci -q get anixops-mesh.main.control)" = https://kept.example.com ] || fail "configuration replaced on upgrade"
+[ "$(uci -q get firewall.anixmesh)" = zone ] || fail "firewall zone lost on upgrade"
+ls /etc/rc.d/S95anixops-mesh > /dev/null 2>&1 || fail "init script not enabled after upgrade"
+end
+
 step "Removal"
 pm_remove luci-app-anixops-mesh anixops-mesh || fail "removal failed"
+[ ! -e /etc/anixops-mesh ] || fail "device token and keys must not stay on the flash"
+[ -z "$(uci -q get firewall.anixmesh)" ] || fail "firewall zone left behind"
+[ "$(uci show firewall | grep -c '^firewall\.anixmesh_')" = 0 ] || fail "firewall rules left behind"
 [ ! -e /usr/bin/anixops-mesh ] || fail "program left behind"
 [ ! -e /etc/init.d/anixops-mesh ] || fail "init script left behind"
 if ls /etc/rc.d/*anixops-mesh > /dev/null 2>&1; then
