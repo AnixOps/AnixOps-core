@@ -194,6 +194,14 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
+    /// More subnets are routable than the system routes take; `detail` is
+    /// how many were left out.
+    SystemRoutesTruncated,
+    /// A member announces another static key than the one bound to its
+    /// node ID; the announcement is not used. `detail` is its node ID.
+    PeerKeyChanged,
+    /// RPC bodies over 4 MiB were not sent; `detail` is how many.
+    RpcOversize,
 }
 
 /// Why a `PUT /v1/mesh` was not applied.

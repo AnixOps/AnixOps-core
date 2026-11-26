@@ -127,6 +127,12 @@ pub struct Snapshot {
     pub overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
+    /// Routable subnets not installed because [`Snapshot::system_routes`]
+    /// is full.
+    pub system_routes_truncated: usize,
+    /// Members announcing another static key than the one bound to their
+    /// node ID (spec §12.3).
+    pub refused_key_changes: Vec<u32>,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
@@ -444,6 +450,8 @@ fn snapshot(node: &Node) -> Snapshot {
         counters: node.counters(),
         duplicate_id: node.duplicate_id(),
         system_routes: node.system_routes(),
+        system_routes_truncated: node.system_routes_truncated(),
+        refused_key_changes: node.refused_key_changes(),
         static_key: (node.settings().security == SecurityMode::ForwardSecrecy)
             .then(|| node.static_public()),
         waiting_for_native_keys: node.waits_for_native_keys(),

@@ -490,6 +490,30 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             detail: String::new(),
         })
         .collect();
+    for peer in &snapshot.refused_key_changes {
+        status.alerts.push(Alert {
+            code: AlertCode::PeerKeyChanged,
+            address: address_of(*peer),
+            peer: String::new(),
+            detail: peer.to_string(),
+        });
+    }
+    if snapshot.counters.oversize_rpc > 0 {
+        status.alerts.push(Alert {
+            code: AlertCode::RpcOversize,
+            address: None,
+            peer: String::new(),
+            detail: snapshot.counters.oversize_rpc.to_string(),
+        });
+    }
+    if snapshot.system_routes_truncated > 0 {
+        status.alerts.push(Alert {
+            code: AlertCode::SystemRoutesTruncated,
+            address: None,
+            peer: String::new(),
+            detail: snapshot.system_routes_truncated.to_string(),
+        });
+    }
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -674,6 +698,7 @@ mod tests {
             rejected_advertisements: 2,
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
+            system_routes_truncated: 3,
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
@@ -690,5 +715,7 @@ mod tests {
         assert_eq!(status.failure.as_ref().unwrap().detail, "44");
         assert_eq!(status.rejected_advertisements, 2);
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
+        assert_eq!(status.alerts[1].code, AlertCode::SystemRoutesTruncated);
+        assert_eq!(status.alerts[1].detail, "3");
     }
 }
