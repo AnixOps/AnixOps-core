@@ -80,7 +80,7 @@ pub fn snapshot(
             }))
             .collect::<Vec<_>>(),
         "network": network(view),
-        "self": own(view, current),
+        "self": own(view),
         "members": known(current)
             .map(|member| member_value(member, current))
             .collect::<Vec<_>>(),
@@ -179,7 +179,7 @@ fn joining(view: &NetworkView<'_>) -> Value {
     }
 }
 
-fn own(view: &NetworkView<'_>, current: &Snapshot) -> Value {
+fn own(view: &NetworkView<'_>) -> Value {
     let settings = view.settings;
     let mut own = Map::new();
     // The device's instance ID (`node.instance_id`), the same in every
@@ -264,7 +264,8 @@ fn member_value(member: &Member, current: &Snapshot) -> Value {
 
 /// Every subnet a member advertises, with its advertisers. The one in use
 /// is the one the driver sends to (spec §15.2, `RouteTable::lookup_by`):
-/// among the peers advertising the same subnet, the fewest hops away, then
+/// among the peers advertising the same subnet, the fewest hops away
+/// whatever the path policy (`Member::fewest_hops`), then
 /// the smallest node ID. `route` is `mesh` only for a subnet the driver
 /// routes into the mesh now, the ones `tunnel.routes` lists; every other
 /// subnet stays on this machine's own networks.
@@ -280,7 +281,7 @@ fn subnets(current: &Snapshot) -> Vec<Value> {
             let mut advertisers: Vec<&Member> = known(current)
                 .filter(|member| member.subnets.contains(&cidr))
                 .collect();
-            advertisers.sort_by_key(|member| (member.hops, member.peer_id));
+            advertisers.sort_by_key(|member| (member.fewest_hops, member.peer_id));
             let routed = current.local_networks_read && current.system_routes.contains(&cidr);
             let overlaps = current.overlaps.contains(&cidr);
             json!({
@@ -370,6 +371,7 @@ mod tests {
             addresses: vec![address.parse().unwrap()],
             subnets: subnets.iter().map(|s| net(s)).collect(),
             hops: via.len() as u32 + 1,
+            fewest_hops: via.len() as u32 + 1,
             latency_ms: via.is_empty().then_some(12),
             via,
         }
@@ -404,6 +406,44 @@ mod tests {
         assert_eq!(value["self"]["id"], Value::Null);
         assert_eq!(value["members"], json!([]));
         assert_eq!(value["tunnel"]["dns"], Value::Null);
+    }
+
+    #[test]
+    fn the_advertiser_in_use_is_the_fewest_hops_away_whatever_the_policy() {
+        let settings = settings("legacy", false);
+        // By the latency policy node 9 is reached in three hops, but it is
+        // one hop away at the fewest; node 3 is two hops away either way.
+        let current = Snapshot {
+            members: vec![
+                member(3, "10.144.0.3", &["192.168.10.0/24"], vec![5]),
+                Member {
+                    fewest_hops: 1,
+                    ..member(9, "10.144.0.9", &["192.168.10.0/24"], vec![3, 5])
+                },
+            ],
+            ..Snapshot::default()
+        };
+        let view = NetworkView {
+            settings: &settings,
+            joined: Some(Joined {
+                running: true,
+                failure: None,
+                snapshot: &current,
+            }),
+            static_key: None,
+        };
+        let tunnel = Tunnel {
+            routes: &[],
+            routes_version: 1,
+        };
+        let value = snapshot(&view, std::slice::from_ref(&view), &tunnel);
+        let advertisers = &value["subnets"][0]["advertisers"];
+        assert_eq!(
+            advertisers[0]["member"],
+            "00000000-0000-0000-0000-000000000009"
+        );
+        assert_eq!(advertisers[0]["inUse"], true);
+        assert_eq!(advertisers[1]["inUse"], false);
     }
 
     #[test]

@@ -1140,6 +1140,16 @@ impl Node {
         }
     }
 
+    /// The fewest hops to each reachable member, whatever the path
+    /// policy: what [`send_ip`](Self::send_ip) chooses a subnet's
+    /// advertiser by.
+    pub fn fewest_hops(&self) -> BTreeMap<u32, u32> {
+        self.compute_routes(Metric::Hops)
+            .into_iter()
+            .map(|(peer, route)| (peer, route.hops))
+            .collect()
+    }
+
     fn compute_routes(&self, metric: Metric) -> BTreeMap<u32, Route> {
         routes_from(&self.sync, &self.peer_map, self.local.id, metric)
     }

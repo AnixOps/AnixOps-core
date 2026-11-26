@@ -183,6 +183,10 @@ pub struct Member {
     pub via: Vec<u32>,
     /// 1 for a direct connection.
     pub hops: u32,
+    /// The fewest hops to it, whatever the path policy; the driver picks
+    /// among the advertisers of a subnet by this count (spec §15.2), while
+    /// `hops` and `via` follow the policy's path.
+    pub fewest_hops: u32,
     /// Round-trip time to a direct neighbour, in milliseconds; `None`
     /// before the first keep-alive answer and for members reached through
     /// relays.
@@ -637,6 +641,7 @@ fn snapshot(node: &Node, local_read: bool) -> Snapshot {
 
 fn members(node: &Node) -> Vec<Member> {
     let table = node.route_table();
+    let fewest = node.fewest_hops();
     node.paths()
         .into_iter()
         .map(|(peer, route)| {
@@ -665,6 +670,7 @@ fn members(node: &Node) -> Vec<Member> {
                 subnets,
                 via,
                 hops: route.hops,
+                fewest_hops: fewest.get(&peer).copied().unwrap_or(route.hops),
                 latency_ms,
             }
         })
