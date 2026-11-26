@@ -345,7 +345,9 @@ impl Inner {
             backbone
         };
         let tags: Vec<String> = wanted.iter().map(|network| network.tag.clone()).collect();
-        {
+        // With the backbone off no network gets a hub, so no driver is
+        // handed a border side at all (#401 audit L1).
+        if self.backbone_enabled.load(Ordering::SeqCst) {
             let mut hubs = lock(&self.hubs);
             for tag in &tags {
                 hubs.entry(tag.clone()).or_insert_with(Hub::new);
@@ -484,7 +486,7 @@ impl Inner {
         if let Some((code, detail)) = clash(&settings, occupied) {
             return instance(settings, State::Refused(code, detail));
         }
-        let hub = lock(&self.hubs).get(&tag).cloned().unwrap_or_else(Hub::new);
+        let hub = lock(&self.hubs).get(&tag).cloned();
         match launch(&settings, key, taken, &self.routes, &tag, hub).await {
             Ok(mut running) => {
                 if let Some(section) = &settings.external_bridge {
@@ -795,7 +797,7 @@ async fn launch(
     taken: &[String],
     routes: &HostRoutes,
     tag: &str,
-    hub: Arc<Hub>,
+    hub: Option<Arc<Hub>>,
 ) -> Result<Running, (FailureCode, String)> {
     let (address, address_v6) = tun::addresses(
         settings.address.address(),
@@ -837,7 +839,7 @@ async fn launch(
         let until = async {
             let _ = stopped.await;
         };
-        let border = hub.driver_side();
+        let border = hub.as_ref().map(|hub| hub.driver_side());
         let observed = settings.clone();
         // On a task of its own, so that a panic is seen and reported.
         let serving = tokio::spawn(serve::serve_with(
@@ -847,10 +849,12 @@ async fn launch(
             device,
             until,
             keys,
-            Some(border),
+            border,
             Some(host),
             move |next, _| {
-                hub.publish_region(RegionView::of(&observed, next));
+                if let Some(hub) = &hub {
+                    hub.publish_region(RegionView::of(&observed, next));
+                }
                 snapshots.send_replace(next.clone());
             },
         ));
@@ -1484,9 +1488,8 @@ mod tests {
         }
         assert_eq!(mesh.status(), before);
         assert!(lock(&mesh.inner.backbone).is_none());
-        assert!(lock(&mesh.inner.hubs)
-            .values()
-            .all(|hub| hub.carried().is_empty()));
+        // No hub at all: no driver was handed a border side.
+        assert!(lock(&mesh.inner.hubs).is_empty());
         let _ = mesh.apply(Vec::new(), None).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

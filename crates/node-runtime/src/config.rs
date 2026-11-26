@@ -343,6 +343,15 @@ mod tests {
     }
 
     #[test]
+    fn the_mesh_backbone_is_off_unless_the_config_turns_it_on() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.mesh_backbone);
+        let config: NodeConfig =
+            serde_json::from_value(serde_json::json!({"mesh_backbone": true})).unwrap();
+        assert!(config.mesh_backbone);
+    }
+
+    #[test]
     fn management_non_loopback_needs_the_explicit_switch() {
         let warning = management("0.0.0.0:10085", true).check().unwrap();
         assert!(warning.unwrap().contains("plaintext"));
