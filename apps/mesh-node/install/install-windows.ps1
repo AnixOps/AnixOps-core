@@ -96,6 +96,19 @@ function Stop-Ours {
     }
 }
 
+# Puts back the forwarding, firewall rules and address translation a node
+# that died left. The stopped service may hold the host lock for a moment
+# while its process exits, so a refusal is retried.
+function Restore-Host {
+    if (-not (Test-Path $Bin)) { return }
+    for ($try = 0; $try -lt 5; $try++) {
+        & $Bin restore-host | Out-Null
+        if ($LASTEXITCODE -eq 0) { return }
+        Start-Sleep -Seconds 2
+    }
+    Say "warning: host changes could not be restored; run '$Bin restore-host' as administrator"
+}
+
 function Invoke-Rollback {
     if ((Test-Path $Bin) -and (Test-Path (Join-Path $State "takeover\takeover.json"))) {
         Say "restoring the programs that were taken over"
@@ -106,6 +119,7 @@ function Invoke-Rollback {
 
 if ($Uninstall) {
     Stop-Ours
+    Restore-Host
     Invoke-Rollback
     Say "removed the service; configuration kept in $DataDir"
     exit 0

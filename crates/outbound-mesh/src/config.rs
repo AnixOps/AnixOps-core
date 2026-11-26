@@ -158,6 +158,11 @@ pub struct NodeConfig {
     /// that does not relay is still reachable as a destination.
     #[serde(default)]
     pub relay: Option<bool>,
+    /// Whether this node serves as a waypoint of other nodes' custom paths
+    /// (spec §17.2.4). Absent: `false`. Needs `relay`, so `true` is refused
+    /// on access nodes and with `relay: false`.
+    #[serde(default)]
+    pub waypoint_relay: Option<bool>,
     /// This node's secure-mode static private key for the network, standard
     /// Base64 of 32 bytes, injected from the system key store like the
     /// secret and never written out. Absent: the caller keeps one.
@@ -399,6 +404,9 @@ pub struct MeshSettings {
     pub mtu: u16,
     /// Whether this node relays for others; always `false` on access nodes.
     pub relay: bool,
+    /// Whether this node serves as a waypoint of custom paths (spec
+    /// §17.2.4); never without `relay`.
+    pub waypoint_relay: bool,
     pub listen: Vec<ListenConfig>,
     pub peers: Vec<PeerEndpoint>,
     /// Masked networks; empty means no extra limit.
@@ -553,6 +561,10 @@ impl MeshConfig {
             (Role::Access, _) => false,
             (Role::Full, relay) => relay.unwrap_or(true),
         };
+        let waypoint_relay = node.waypoint_relay.unwrap_or(false);
+        if waypoint_relay && !relay {
+            return Err("mesh node waypoint_relay needs relay");
+        }
         let mtu = node.mtu.unwrap_or(DEFAULT_MTU);
         if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
             return Err("mesh node mtu is out of range");
@@ -675,6 +687,7 @@ impl MeshConfig {
             hostname: node.hostname,
             mtu,
             relay,
+            waypoint_relay,
             listen: node.listen,
             peers,
             accept_subnets,
@@ -1166,6 +1179,29 @@ mod tests {
         let mut config = with("node.role", json!("full"));
         config["node"]["relay"] = json!(false);
         assert!(!validate(config).unwrap().relay);
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[test]
+    fn waypoint_relay_is_off_unless_asked_and_needs_relay() {
+        // Off by default (spec §17.2.4).
+        assert!(
+            !validate(with("node.role", json!("full")))
+                .unwrap()
+                .waypoint_relay
+        );
+        let mut config = with("node.role", json!("full"));
+        config["node"]["waypoint_relay"] = json!(true);
+        assert!(validate(config.clone()).unwrap().waypoint_relay);
+        config["node"]["relay"] = json!(false);
+        assert_eq!(
+            validate(config).err(),
+            Some("mesh node waypoint_relay needs relay")
+        );
+        assert_eq!(
+            validate(with("node.waypoint_relay", json!(true))).err(),
+            Some("mesh node waypoint_relay needs relay")
+        );
     }
 
     #[test]

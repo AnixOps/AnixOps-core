@@ -382,7 +382,7 @@ pub async fn run(
             Ok(()) = dns.changed() => {
                 let settings = dns.borrow_and_update().clone();
                 node.set_dns(settings);
-                publish(&snapshots, snapshot(&node));
+                publish(&snapshots, snapshot(&node, local_read));
             }
             event = event_rx.recv() => {
                 let Some(event) = event else { break };
