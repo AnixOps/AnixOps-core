@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +36,11 @@ pub const REDIAL_MIN: Duration = Duration::from_secs(1);
 pub const REDIAL_MAX: Duration = Duration::from_secs(30);
 /// A connection that lasted this long resets the dial delay.
 const STABLE: Duration = Duration::from_secs(30);
+/// First delay before dialing a peer this node refused for a static key
+/// off the native key list (spec §8.3.1 rule 5).
+pub const REFUSED_MIN: Duration = Duration::from_secs(5);
+/// Longest delay before dialing such a peer again.
+pub const REFUSED_MAX: Duration = Duration::from_secs(5 * 60);
 /// A client waits this long for Sack and never sends Syn again (spec §3.2).
 pub const SACK_TIMEOUT: Duration = Duration::from_secs(3);
 /// Connection attempts that wait for another connection's session try again
@@ -127,6 +132,9 @@ pub struct Snapshot {
     /// Accepted subnets that overlap this node's own networks: kept, but
     /// neither routed nor installed (R17, spec §15.4).
     pub overlaps: Vec<IpNet>,
+    /// Those of `overlaps` that overlap another mesh program's route
+    /// rather than a network of this machine (spec §15.4).
+    pub foreign_overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
 }
@@ -157,6 +165,9 @@ enum Event {
         closer: Arc<Notify>,
         /// The source of a connection a peer opened.
         inbound: Option<(SocketAddr, link::Transport)>,
+        /// For a connection a dial task opened: set when the node refuses
+        /// the peer as not native, so that the task backs off.
+        refused: Option<Arc<AtomicBool>>,
     },
     /// The address the dial task of `peer` (its place in the peer list)
     /// connects to: a known member address for the handshake budget.
@@ -177,6 +188,7 @@ struct Open {
     writer: mpsc::Sender<Vec<u8>>,
     closer: Arc<Notify>,
     ticket: Option<Ticket>,
+    refused: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -228,6 +240,14 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// Advertised subnets the user routes through the mesh although they
+    /// overlap a network of this machine (`mesh_set_subnet_route`,
+    /// spec §15.4); the value at start applies too.
+    pub route_overrides: watch::Receiver<Vec<IpNet>>,
+    /// Routes other mesh programs' virtual interfaces carry on this
+    /// machine, as the system selects them: handled like `local_networks`
+    /// and reported apart (spec §15.4).
+    pub foreign_routes: watch::Receiver<Vec<IpNet>>,
     /// Stops the node when it turns true.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -245,6 +265,8 @@ pub async fn run(
         snapshots,
         mut local_networks,
         mut native_keys,
+        mut route_overrides,
+        mut foreign_routes,
         mut shutdown,
     } = channels;
     native_keys.mark_unchanged();
@@ -253,6 +275,8 @@ pub async fn run(
     let peers = settings.peers.clone();
     let mut node = Node::new(settings, static_key, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
+    node.set_route_overrides(&route_overrides.borrow_and_update());
+    node.set_foreign_routes(&foreign_routes.borrow_and_update());
     node.set_local_networks(&local_networks.borrow_and_update());
     if node.waits_for_native_keys() {
         // No listening, dialling or packets until the list holds this
@@ -279,7 +303,12 @@ pub async fn run(
         tasks.push(tokio::spawn(serve_udp(socket, shared.clone())));
     }
     for (index, peer) in peers.into_iter().enumerate() {
-        tasks.push(tokio::spawn(dial(peer, index, shared.clone())));
+        tasks.push(tokio::spawn(dial(
+            peer,
+            index,
+            shared.clone(),
+            native_keys.clone(),
+        )));
     }
 
     let mut conns: HashMap<ConnId, Open> = HashMap::new();
@@ -308,6 +337,12 @@ pub async fn run(
             Ok(()) = local_networks.changed() => {
                 node.set_local_networks(&local_networks.borrow_and_update());
             }
+            Ok(()) = foreign_routes.changed() => {
+                node.set_foreign_routes(&foreign_routes.borrow_and_update());
+            }
+            Ok(()) = route_overrides.changed() => {
+                node.set_route_overrides(&route_overrides.borrow_and_update());
+            }
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
                 node.set_native_keys(keys, Instant::now());
@@ -317,8 +352,8 @@ pub async fn run(
                 let Some(event) = event else { break };
                 let now = Instant::now();
                 match event {
-                    Event::Opened { conn, writer, closer, inbound } => {
-                        let mut open = Open { writer, closer, ticket: None };
+                    Event::Opened { conn, writer, closer, inbound, refused } => {
+                        let mut open = Open { writer, closer, ticket: None, refused };
                         match inbound {
                             Some((address, transport)) => {
                                 let member = dialed.values().any(|known| *known == address.ip());
@@ -454,6 +489,7 @@ fn snapshot(node: &Node) -> Snapshot {
         members: members(node),
         rejected_advertisements: node.route_table().refused_subnet_count(),
         overlaps: overlaps(node),
+        foreign_overlaps: node.foreign_overlaps(),
         address_conflicts: node
             .route_table()
             .address_conflicts()
@@ -551,8 +587,11 @@ fn carry_out(
             Action::Deliver(packet) => {
                 let _ = to_interface.try_send(packet);
             }
-            Action::Close { conn, .. } => {
+            Action::Close { conn, reason } => {
                 if let Some(open) = conns.remove(&conn) {
+                    if let (CloseReason::NotNative(_), Some(refused)) = (reason, &open.refused) {
+                        refused.store(true, Ordering::Relaxed);
+                    }
                     open.closer.notify_one();
                     if let Some(ticket) = open.ticket {
                         budget.release(ticket);
@@ -571,7 +610,7 @@ async fn accept_tcp(listener: TcpListener, shared: Shared) {
         };
         let shared = shared.clone();
         tokio::spawn(async move {
-            run_tcp(stream, Some((address, link::Transport::Tcp)), shared).await;
+            run_tcp(stream, Some((address, link::Transport::Tcp)), None, shared).await;
         });
     }
 }
@@ -580,6 +619,7 @@ async fn accept_tcp(listener: TcpListener, shared: Shared) {
 async fn run_tcp(
     stream: TcpStream,
     inbound: Option<(SocketAddr, link::Transport)>,
+    refused: Option<Arc<AtomicBool>>,
     shared: Shared,
 ) -> Duration {
     let opened = Instant::now();
@@ -595,6 +635,7 @@ async fn run_tcp(
             writer: tx,
             closer: closer.clone(),
             inbound,
+            refused,
         })
         .await
         .is_err()
@@ -645,10 +686,61 @@ async fn run_tcp(
     opened.elapsed()
 }
 
-/// Keeps one configured peer connected (spec §3).
-async fn dial(peer: PeerEndpoint, index: usize, shared: Shared) {
+/// How long a dial task waits before dialing its peer again.
+#[derive(Debug, PartialEq, Eq)]
+struct DialDelay {
+    redial: Duration,
+    /// Zero until the node refuses the peer as not native.
+    refused: Duration,
+}
+
+impl DialDelay {
+    fn new() -> Self {
+        Self {
+            redial: REDIAL_MIN,
+            refused: Duration::ZERO,
+        }
+    }
+
+    /// The wait after a connection that lasted `lasted`. A peer refused
+    /// for a static key off the native key list waits from
+    /// [`REFUSED_MIN`], doubling up to [`REFUSED_MAX`], and the refusal
+    /// does not count as a failed connection (spec §8.3.1 rule 5).
+    fn after(&mut self, lasted: Duration, refused: bool) -> Duration {
+        if refused {
+            self.refused = if self.refused.is_zero() {
+                REFUSED_MIN
+            } else {
+                (self.refused * 2).min(REFUSED_MAX)
+            };
+            return self.refused;
+        }
+        self.refused = Duration::ZERO;
+        self.redial = if lasted >= STABLE {
+            REDIAL_MIN
+        } else {
+            (self.redial * 2).min(REDIAL_MAX)
+        };
+        self.redial
+    }
+
+    /// A new native key list: refusals start over (spec §8.3.1 rule 5).
+    fn new_list(&mut self) {
+        self.refused = Duration::ZERO;
+    }
+}
+
+/// Keeps one configured peer connected (spec §3). A new native key list
+/// ends the wait and dials at once.
+async fn dial(
+    peer: PeerEndpoint,
+    index: usize,
+    shared: Shared,
+    mut native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+) {
     let rng = SystemRandom::new();
-    let mut delay = REDIAL_MIN;
+    let mut delay = DialDelay::new();
+    let refused = Arc::new(AtomicBool::new(false));
     loop {
         let lasted = match tokio::net::lookup_host((peer.server.as_str(), peer.port)).await {
             Ok(mut addresses) => match addresses.next() {
@@ -665,12 +757,14 @@ async fn dial(peer: PeerEndpoint, index: usize, shared: Shared) {
                         return;
                     }
                     Transport::Tcp => match TcpStream::connect(address).await {
-                        Ok(stream) => run_tcp(stream, None, shared.clone()).await,
+                        Ok(stream) => {
+                            run_tcp(stream, None, Some(refused.clone()), shared.clone()).await
+                        }
                         Err(_) => Duration::ZERO,
                     },
                     Transport::Udp => {
                         let (conn_id, magic) = (random_u32(&rng), random_u64(&rng));
-                        dial_udp(address, conn_id, magic, shared.clone())
+                        dial_udp(address, conn_id, magic, refused.clone(), shared.clone())
                             .await
                             .unwrap_or(Duration::ZERO)
                     }
@@ -682,12 +776,15 @@ async fn dial(peer: PeerEndpoint, index: usize, shared: Shared) {
         if shared.events.is_closed() {
             return;
         }
-        delay = if lasted >= STABLE {
-            REDIAL_MIN
-        } else {
-            (delay * 2).min(REDIAL_MAX)
-        };
-        sleep(delay).await;
+        let wait = delay.after(lasted, refused.swap(false, Ordering::Relaxed));
+        tokio::select! {
+            _ = sleep(wait) => {}
+            changed = native_keys.changed() => match changed {
+                Ok(()) => delay.new_list(),
+                // Only fixed lists from here on.
+                Err(_) => sleep(wait).await,
+            },
+        }
     }
 }
 
@@ -697,6 +794,7 @@ async fn dial_udp(
     address: SocketAddr,
     conn_id: u32,
     magic: u64,
+    refused: Arc<AtomicBool>,
     shared: Shared,
 ) -> io::Result<Duration> {
     let local: SocketAddr = match address {
@@ -733,6 +831,7 @@ async fn dial_udp(
             writer: tx,
             closer: closer.clone(),
             inbound: None,
+            refused: Some(refused),
         })
         .await
         .is_err()
@@ -825,6 +924,7 @@ async fn serve_udp(socket: UdpSocket, shared: Shared) {
                         writer: tx,
                         closer: closer.clone(),
                         inbound: Some((from, link::Transport::Udp)),
+                        refused: None,
                     })
                     .await
                     .is_err()
@@ -902,6 +1002,8 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_, local_networks) = watch::channel(Vec::new());
         let (_, native_keys) = watch::channel(None);
+        let (_, route_overrides) = watch::channel(Vec::new());
+        let (_, foreign_routes) = watch::channel(Vec::new());
         tokio::spawn(run(
             settings,
             static_key,
@@ -912,6 +1014,8 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                route_overrides,
+                foreign_routes,
                 shutdown,
             },
         ));
@@ -1016,6 +1120,27 @@ mod tests {
     #[tokio::test]
     async fn two_nodes_over_udp() {
         two_nodes(Transport::Udp).await;
+    }
+
+    #[test]
+    fn a_refused_peer_backs_off_from_five_seconds_to_five_minutes() {
+        let mut delay = DialDelay::new();
+        // Ordinary failures double from the first delay.
+        assert_eq!(delay.after(Duration::ZERO, false), REDIAL_MIN * 2);
+        let redial = delay.redial;
+        let waits: Vec<u64> = (0..8)
+            .map(|_| delay.after(Duration::ZERO, true).as_secs())
+            .collect();
+        assert_eq!(waits, vec![5, 10, 20, 40, 80, 160, 300, 300]);
+        // Refusals are not failed connections.
+        assert_eq!(delay.redial, redial);
+        // A new list starts the refusals over.
+        delay.new_list();
+        assert_eq!(delay.after(Duration::ZERO, true), REFUSED_MIN);
+        // So does a connection the node did not refuse.
+        delay.after(STABLE, false);
+        assert_eq!(delay.after(Duration::ZERO, true), REFUSED_MIN);
+        assert_eq!(delay.after(STABLE, false), REDIAL_MIN);
     }
 
     #[tokio::test]

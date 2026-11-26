@@ -222,6 +222,10 @@ pub enum AlertCode {
     /// connection graph in time and the session was closed (§12.2). `peer`
     /// is empty; `detail` says which, with the node ID.
     SyncOversize,
+    /// An advertised subnet overlaps a route another mesh program carries
+    /// on this machine, so it is kept local (spec §15.4); `detail` is the
+    /// subnet.
+    ForeignRouteOverlap,
     /// The bridge's new rules or the deletion of tracked connections
     /// failed; the old rules and `externalBridge` stay (spec §15.12).
     ExternalBridgeApplyFailed,

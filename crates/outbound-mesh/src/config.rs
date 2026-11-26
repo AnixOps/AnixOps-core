@@ -1301,6 +1301,13 @@ mod tests {
         // Without padding is not the standard form.
         let unpadded = key.trim_end_matches('=').to_owned();
         assert!(validate(with("network.native_keys", json!([unpadded]))).is_err());
+        // Non-zero bits after the last byte are not the canonical form:
+        // one key has exactly one text.
+        let zero = encode_key(&[0; 32]);
+        assert!(zero.ends_with("A="));
+        assert!(validate(with("network.native_keys", json!([zero.clone()]))).is_ok());
+        let noncanonical = format!("{}B=", &zero[..42]);
+        assert!(validate(with("network.native_keys", json!([noncanonical]))).is_err());
     }
 
     #[test]
