@@ -995,7 +995,7 @@ impl Host for RealHost {
 /// working directory and environment read from the process's own
 /// parameters block, so a restart on rollback is exact.
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use super::{judge_state_dir, split_windows_command_line_of, AccessEntry, Environ, ProcInfo};
     use std::ffi::c_void;
     use std::io;
@@ -1359,7 +1359,7 @@ mod windows {
 
     /// The owner and access list of a file or directory; `None` for a
     /// missing access list.
-    fn security(path: &Path) -> io::Result<(String, Option<Vec<AccessEntry>>)> {
+    pub(crate) fn security(path: &Path) -> io::Result<(String, Option<Vec<AccessEntry>>)> {
         use std::os::windows::ffi::OsStrExt;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut owner: PSID = std::ptr::null_mut();
@@ -1433,7 +1433,7 @@ mod windows {
     /// by them only, and none above it letting anyone else replace what
     /// lies below. The counterpart of the Unix check from `/` down; once
     /// it passes, only those accounts could swap anything in.
-    pub(super) fn check_state_dir(dir: &Path) -> io::Result<()> {
+    pub(crate) fn check_state_dir(dir: &Path) -> io::Result<()> {
         use std::os::windows::fs::MetadataExt;
         // FILE_ATTRIBUTE_REPARSE_POINT: a link, junction or mount point.
         const REPARSE_POINT: u32 = 0x400;
