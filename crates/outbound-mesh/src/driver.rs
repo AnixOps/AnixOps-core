@@ -589,9 +589,7 @@ fn carry_out(
             }
             Action::Close { conn, reason } => {
                 if let Some(open) = conns.remove(&conn) {
-                    if let (CloseReason::NotNative(_), Some(refused)) = (reason, &open.refused) {
-                        refused.store(true, Ordering::Relaxed);
-                    }
+                    note_refusal(reason, open.refused.as_ref());
                     open.closer.notify_one();
                     if let Some(ticket) = open.ticket {
                         budget.release(ticket);
@@ -777,14 +775,33 @@ async fn dial(
             return;
         }
         let wait = delay.after(lasted, refused.swap(false, Ordering::Relaxed));
-        tokio::select! {
-            _ = sleep(wait) => {}
-            changed = native_keys.changed() => match changed {
-                Ok(()) => delay.new_list(),
-                // Only fixed lists from here on.
-                Err(_) => sleep(wait).await,
-            },
-        }
+        redial_wait(wait, &mut delay, &mut native_keys).await;
+    }
+}
+
+/// Tells a dial task that its connection closed because the node refused
+/// the peer's static key (spec §8.3.1 rule 5), so that it waits as a
+/// refused peer.
+fn note_refusal(reason: CloseReason, refused: Option<&Arc<AtomicBool>>) {
+    if let (CloseReason::NotNative(_), Some(refused)) = (reason, refused) {
+        refused.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Waits `wait` before the next dial. A new native key list ends the wait
+/// at once and starts refusals over (spec §8.3.1 rule 5).
+async fn redial_wait(
+    wait: Duration,
+    delay: &mut DialDelay,
+    native_keys: &mut watch::Receiver<Option<Vec<[u8; 32]>>>,
+) {
+    tokio::select! {
+        _ = sleep(wait) => {}
+        changed = native_keys.changed() => match changed {
+            Ok(()) => delay.new_list(),
+            // Only fixed lists from here on.
+            Err(_) => sleep(wait).await,
+        },
     }
 }
 
@@ -1110,6 +1127,45 @@ mod tests {
         assert_eq!(member.addresses, [IpAddr::V4(Ipv4Addr::new(10, 144, 0, 1))]);
         assert_eq!((member.hops, member.via.is_empty()), (1, true));
         assert_eq!(b.snapshots.borrow().rejected_advertisements, 0);
+    }
+
+    #[test]
+    fn only_a_refusal_marks_the_dial_task() {
+        let refused = Arc::new(AtomicBool::new(false));
+        note_refusal(CloseReason::Timeout, Some(&refused));
+        assert!(!refused.load(Ordering::Relaxed));
+        note_refusal(CloseReason::NotNative(7), None);
+        note_refusal(CloseReason::NotNative(7), Some(&refused));
+        assert!(refused.load(Ordering::Relaxed));
+        // The dial task reads it once, then waits as a refused peer.
+        let mut delay = DialDelay::new();
+        assert_eq!(
+            delay.after(Duration::ZERO, refused.swap(false, Ordering::Relaxed)),
+            REFUSED_MIN
+        );
+        assert!(!refused.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_new_list_ends_the_wait_of_a_refused_peer() {
+        let (keys_tx, mut keys) = watch::channel(None);
+        let mut delay = DialDelay::new();
+        let wait = delay.after(Duration::ZERO, true);
+        assert_eq!(wait, REFUSED_MIN);
+        let started = Instant::now();
+        let waiting = redial_wait(REFUSED_MAX, &mut delay, &mut keys);
+        let update = async {
+            sleep(Duration::from_millis(50)).await;
+            keys_tx.send(Some(vec![[1; 32]])).unwrap();
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            () = waiting => {}
+            () = update => unreachable!(),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Refusals start over: the next one waits the least again.
+        assert_eq!(delay.after(Duration::ZERO, true), REFUSED_MIN);
     }
 
     #[tokio::test]
