@@ -407,6 +407,24 @@ async fn a_node_with_custom_paths_off_refuses_them_and_keeps_its_networks() {
         "{answer}"
     );
     assert!(!raw.contains(SECRET), "{raw}");
+    // Relaying as a waypoint for others opens the same code: refused too.
+    let mut relaying = network("mesh-cn", "mesh-cn", "10.150.0.5/16");
+    relaying["node"]["waypoint_relay"] = json!(true);
+    let (status, _, answer) = call(
+        api,
+        "PUT",
+        "/v1/mesh",
+        Some(json!({"networks": [relaying]})),
+    )
+    .await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("paths_disabled: node.waypoint_relay"),
+        "{answer}"
+    );
     assert_eq!(mesh.applied.lock().unwrap().len(), 1);
     let (status, _, after) = call(api, "GET", "/v1/mesh", None).await;
     assert_eq!(status, 200);

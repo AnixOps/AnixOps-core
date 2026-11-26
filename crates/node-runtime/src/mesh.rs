@@ -38,6 +38,18 @@ pub const BACKBONE_FEATURE: &str = "mesh_backbone";
 /// [`BACKBONE_FEATURE`].
 pub const BACKBONE_DISABLED: &str = "backbone_disabled";
 
+/// The field that would open the waypoint code (spec §17.2): a custom path,
+/// or relaying as a waypoint for others.
+pub fn waypoint_field(settings: &outbound_mesh::MeshSettings) -> Option<&'static str> {
+    if !settings.paths.is_empty() {
+        Some("routing.paths")
+    } else if settings.waypoint_relay {
+        Some("node.waypoint_relay")
+    } else {
+        None
+    }
+}
+
 /// Listed only when the operator turned custom paths on (`mesh_paths` in
 /// the node configuration, off by default).
 pub const PATHS_FEATURE: &str = "mesh_paths";
@@ -96,17 +108,19 @@ impl Mesh {
             )));
         }
         // Likewise for custom paths: a node that does not list them takes
-        // no `routing.paths`, so the waypoint code stays closed to the
-        // network; the running networks stay as they are.
-        if !features.contains(&PATHS_FEATURE)
-            && request
+        // neither `routing.paths` nor `node.waypoint_relay`, so the waypoint
+        // code stays closed to the network; the running networks stay as
+        // they are.
+        if !features.contains(&PATHS_FEATURE) {
+            if let Some(field) = request
                 .networks
                 .iter()
-                .any(|network| !network.settings.paths.is_empty())
-        {
-            return Err(NodeError::Mesh(format!(
-                "{PATHS_DISABLED}: routing.paths: this node does not apply custom paths ({PATHS_FEATURE} is not listed)"
-            )));
+                .find_map(|network| waypoint_field(&network.settings))
+            {
+                return Err(NodeError::Mesh(format!(
+                    "{PATHS_DISABLED}: {field}: this node does not apply custom paths ({PATHS_FEATURE} is not listed)"
+                )));
+            }
         }
         let stopped = self.apply.lock().await;
         if *stopped {

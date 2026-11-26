@@ -505,7 +505,7 @@ checksum/manifest、attestation、release notes、rollback 和 publish eligibili
 
 ## 组网自定义路径默认关闭（运维）
 
-- 自定义路径（`routing.paths`，规范 §17.2）在审计通过前默认关闭。节点需由运维在 `anixcore` 配置中写 `"mesh_paths": true` 才开启；未开启时节点不声明 `mesh_paths`，带 `routing.paths` 的 `PUT /v1/mesh` 整份返回 400（`paths_disabled`），运行中的网络不变。面板与 Agent 只在节点声明 `mesh_paths` 后下发路径。旧版内核的配置拒绝未知字段，写入该字段前先确认内核版本，Agent 重写 `anixcore` 配置时也要保留该字段。
+- 自定义路径（`routing.paths`，规范 §17.2）在审计通过前默认关闭。节点需由运维在 `anixcore` 配置中写 `"mesh_paths": true` 才开启；未开启时节点不声明 `mesh_paths`，带 `routing.paths` 或 `node.waypoint_relay: true` 的 `PUT /v1/mesh` 整份返回 400（`paths_disabled`），运行中的网络不变。独立运行的 `anixops-mesh run` 不受该开关约束。面板与 Agent 只在节点声明 `mesh_paths` 后下发路径。旧版内核的配置拒绝未知字段，写入该字段前先确认内核版本，Agent 重写 `anixcore` 配置时也要保留该字段。
 
 ## Windows 组网主机锁跨会话互斥（维护者实机确认）
 

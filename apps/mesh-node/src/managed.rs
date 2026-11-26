@@ -920,12 +920,13 @@ impl MeshControl for ManagedMesh {
         if backbone.is_some() && !self.backbone_enabled() {
             return Box::pin(async { Err(backbone_disabled()) });
         }
-        if !self.paths_enabled()
-            && networks
+        if !self.paths_enabled() {
+            if let Some(field) = networks
                 .iter()
-                .any(|network| !network.settings.paths.is_empty())
-        {
-            return Box::pin(async { Err(paths_disabled()) });
+                .find_map(|network| waypoint_field(&network.settings))
+            {
+                return Box::pin(async move { Err(paths_disabled(field)) });
+            }
         }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
@@ -955,10 +956,22 @@ fn backbone_disabled() -> ApplyError {
 
 /// Nothing of the request is applied: the running networks stay as they
 /// are.
-fn paths_disabled() -> ApplyError {
+fn paths_disabled(field: &str) -> ApplyError {
     ApplyError::Invalid(format!(
-        "{PATHS_DISABLED}: routing.paths: this node does not apply custom paths (mesh_paths is off in the node configuration)"
+        "{PATHS_DISABLED}: {field}: this node does not apply custom paths (mesh_paths is off in the node configuration)"
     ))
+}
+
+/// The field that would open the waypoint code (spec §17.2): a custom path,
+/// or relaying as a waypoint for others.
+fn waypoint_field(settings: &MeshSettings) -> Option<&'static str> {
+    if !settings.paths.is_empty() {
+        Some("routing.paths")
+    } else if settings.waypoint_relay {
+        Some("node.waypoint_relay")
+    } else {
+        None
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -2120,6 +2133,22 @@ mod tests {
         assert!(lock(&mesh.inner.networks)
             .iter()
             .all(|instance| instance.settings.paths.is_empty()));
+        // Relaying as a waypoint opens the same code: refused too.
+        let mut relaying = plain();
+        relaying.settings.waypoint_relay = true;
+        match mesh.apply(vec![relaying], None).await.unwrap_err() {
+            ApplyError::Invalid(message) => {
+                assert!(
+                    message.starts_with(&format!("{PATHS_DISABLED}: node.waypoint_relay")),
+                    "{message}"
+                );
+            }
+            ApplyError::Failed(message) => panic!("not invalid: {message}"),
+        }
+        assert_eq!(mesh.status(), before);
+        assert!(lock(&mesh.inner.networks)
+            .iter()
+            .all(|instance| !instance.settings.waypoint_relay));
         let _ = mesh.apply(Vec::new(), None).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
 
