@@ -28,7 +28,13 @@ msgstr ""
 msgid "Direct"
 msgstr ""
 
+msgid "Disabled"
+msgstr ""
+
 msgid "Enable service"
+msgstr ""
+
+msgid "Enabled, not running"
 msgstr ""
 
 msgid "Enroll"
@@ -59,6 +65,12 @@ msgid "Enter at most 16 private IPv4 subnets in network address form, for exampl
 msgstr ""
 
 msgid "Enter the panel address and the one-time enrollment credential issued by the administrator."
+msgstr ""
+
+msgid "External network bridge lock held by another process"
+msgstr ""
+
+msgid "External network bridge rules may remain from an earlier version"
 msgstr ""
 
 msgid "Forward secrecy"
@@ -122,9 +134,6 @@ msgid "Not enrolled"
 msgstr ""
 
 msgid "Not measured"
-msgstr ""
-
-msgid "Not running"
 msgstr ""
 
 msgid "Not supported by the installed program version"
@@ -242,6 +251,12 @@ msgid "The service starts only after the device has been enrolled."
 msgstr ""
 
 msgid "This device is not enrolled."
+msgstr ""
+
+msgid "Unknown alert: %s"
+msgstr ""
+
+msgid "Unknown failure: %s"
 msgstr ""
 
 msgid "Unreachable"

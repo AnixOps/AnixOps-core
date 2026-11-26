@@ -48,6 +48,8 @@ env:
   IMAGE_AARCH64_2512: openwrt/rootfs@sha256:22f13387da208c0fb4150c41f3ec12e34cc5994a0717a49e50aa9f9ae6cb5e7b # armsr-armv8-25.12.6
   IMAGE_ARMV7_2410: openwrt/rootfs@sha256:00c6e1dc4d6d4f3e0761fdb8df667b942185d0f4ab0ec361c9e46fa384631ef5 # armsr-armv7-24.10.8 (manifest in index a69380f5…)
   IMAGE_ARMV7_2512: openwrt/rootfs@sha256:c32d38ebe9811c647a4171b745313cb221b968198be52cedea9a4632b26195f8 # armsr-armv7-25.12.6
+  # QEMU user-mode emulators (10.2.3), registered for the ARM jobs.
+  BINFMT_IMAGE: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 # qemu-v10.2.3
   # apk-tools 3 (3.0.9) for `apk mkpkg`; OpenWrt's device apk has no mkpkg.
   APK_MKPKG_IMAGE: alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2 # 3.23.8
   # luci-base's catalog hash, compared with the Python writer.
@@ -72,6 +74,7 @@ jobs:
           for script in \
             "${root}/anixops-mesh/files/etc/init.d/anixops-mesh" \
             "${root}/anixops-mesh/files/usr/libexec/anixops-mesh/service" \
+            "${root}/anixops-mesh/files/usr/libexec/anixops-mesh/firewall" \
             "${root}/anixops-mesh/files/etc/uci-defaults/90-anixops-mesh" \
             "${root}/tests/container-test.sh"; do
             sh -n "${script}"
@@ -98,6 +101,9 @@ jobs:
             node -e 'new Function(require("fs").readFileSync(process.argv[1], "utf8"))' "${view}"
             echo "parsed ${view}"
           done
+
+      - name: Views render outside values as text
+        run: node apps/mesh-node/openwrt/tests/render-test.js apps/mesh-node/openwrt/luci-app-anixops-mesh/htdocs/luci-static/resources/view/anixops-mesh
 
       - name: Permissions match the backend
         shell: python
@@ -184,12 +190,10 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # The build script runs the program for other architectures under
-      # user-mode emulation when it is there.
+      # user-mode emulation when it is registered.
       - name: User-mode emulation
         if: ${{ matrix.target != 'x86_64-unknown-linux-musl' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user
+        run: docker run --rm --privileged "${BINFMT_IMAGE}" --install arm64,arm
 
       - name: Build
         shell: bash
@@ -246,10 +250,10 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           .github/scripts/package-openwrt.sh "${version}" dist/bin dist/openwrt
           ls -l dist/openwrt
-          # Reproducible: a second run gives identical ipk files.
+          # Reproducible: a second run gives identical ipk and apk files.
           .github/scripts/package-openwrt.sh "${version}" dist/bin dist/openwrt-again
-          for ipk in dist/openwrt/*.ipk; do
-            cmp "${ipk}" "dist/openwrt-again/$(basename "${ipk}")"
+          for package in dist/openwrt/*.ipk dist/openwrt/*.apk; do
+            cmp "${package}" "dist/openwrt-again/$(basename "${package}")"
           done
           # A pre-release tag gives versions that sort before the release in
           # both package managers; apk mkpkg rejects a malformed one.
@@ -257,6 +261,8 @@ jobs:
           ipk="dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.ipk"
           tar -xzOf "${ipk}" ./control.tar.gz | tar -xzOf - ./control | grep -Fx "Version: ${version}~rc.1-r1"
           test -s "dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.apk"
+          # A later version, for the upgrade test of the install jobs.
+          .github/scripts/package-openwrt.sh 99.0.0 dist/bin dist/openwrt/upgrade
 
       - name: Package contents
         shell: bash
@@ -333,11 +339,9 @@ jobs:
         env:
           EMULATOR: ${{ matrix.emulate }}
         run: |
-          sudo apt-get update
-          # Static emulators registered with the F (fix binary) flag, so
-          # they work inside containers.
-          sudo apt-get install -y --no-install-recommends qemu-user-binfmt
-          sudo systemctl restart systemd-binfmt || true
+          # Emulators registered with the F (fix binary) flag, so that they
+          # work inside containers. Pinned by digest like the images.
+          docker run --rm --privileged "${BINFMT_IMAGE}" --install arm64,arm
           cat "/proc/sys/fs/binfmt_misc/${EMULATOR}"
           grep -q '^flags:.*F' "/proc/sys/fs/binfmt_misc/${EMULATOR}"
 

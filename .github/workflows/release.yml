@@ -890,6 +890,23 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
           (cd dist/bin && sha256sum -c ./*.sha256)
+          mkdir -p dist/openwrt
+          # The packages only work with a program that enrolls and runs the
+          # device (docs/deploy/mesh-device.md). Until the release's program
+          # has these subcommands, the release carries no OpenWrt packages
+          # rather than packages that cannot enroll.
+          program="dist/bin/anixops-mesh-${VERSION}-x86_64-unknown-linux-musl"
+          chmod 0755 "${program}"
+          missing=""
+          for command in enroll device device-status subnet-request; do
+            "${program}" capabilities | jq -e --arg c "${command}" '.commands | index($c)' > /dev/null \
+              || missing="${missing} ${command}"
+          done
+          if [ -n "${missing}" ]; then
+            echo "::warning::anixops-mesh ${VERSION} lacks${missing}: no OpenWrt packages in this release"
+            echo "OpenWrt packages left out: the program lacks${missing}" > dist/openwrt/NOT-PACKAGED
+            exit 0
+          fi
           .github/scripts/package-openwrt.sh "${VERSION}" dist/bin dist/openwrt
           # Every line of arches.txt has its package in both formats.
           file_version="${VERSION#v}-r1"
@@ -980,19 +997,28 @@ jobs:
                and (.rustc | startswith("rustc ")) and (.cargo | startswith("cargo "))' \
               "${name}.buildinfo.json" >/dev/null
           done
-          # OpenWrt packages, all listed in their checksum file
-          sha256sum -c "anixops-mesh-${VERSION}-openwrt-SHA256SUMS"
-          # (package-openwrt checked one per line of arches.txt).
+          # OpenWrt packages, all listed in their checksum file (package-openwrt
+          # checked one per line of arches.txt), or a note that the program
+          # cannot run them yet.
           ipks="$(find . -maxdepth 1 -type f -name '*.ipk' | wc -l | tr -d ' ')"
           apks="$(find . -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')"
-          test "${ipks}" -ge 2
-          test "${ipks}" = "${apks}"
-          packages=$((ipks + apks))
-          test "$(wc -l < "anixops-mesh-${VERSION}-openwrt-SHA256SUMS" | tr -d ' ')" = "${packages}"
+          if [ -f NOT-PACKAGED ]; then
+            cat NOT-PACKAGED
+            test "${ipks}" = 0
+            test "${apks}" = 0
+            rm NOT-PACKAGED
+            extra=0
+          else
+            sha256sum -c "anixops-mesh-${VERSION}-openwrt-SHA256SUMS"
+            test "${ipks}" -ge 2
+            test "${ipks}" = "${apks}"
+            test "$(wc -l < "anixops-mesh-${VERSION}-openwrt-SHA256SUMS" | tr -d ' ')" = "$((ipks + apks))"
+            extra=$((ipks + apks + 1))
+          fi
           # 42 program files (10 builds with their .sha256 and .buildinfo.json
           # files, 3 installers and Wintun with theirs) plus the packages and
           # their checksum file.
-          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "$((42 + packages + 1))"
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "$((42 + extra))"
 
       - name: Generate mesh node attestation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -1170,6 +1196,7 @@ jobs:
             sha256sum -c "${MANIFEST_NAME}.sha256"
           )
           mesh_assets=()
+          openwrt_note=""
           for name in \
             "anixops-mesh-${VERSION}-x86_64-unknown-linux-musl" \
             "anixops-mesh-${VERSION}-aarch64-unknown-linux-musl" \
@@ -1197,11 +1224,15 @@ jobs:
             x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
             mesh_assets+=("dist/mesh-node/anixops-mesh-${VERSION}-${target}.buildinfo.json")
           done
-          (cd dist/mesh-node && sha256sum -c "anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
-          mesh_assets+=("dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
-          while read -r file; do
-            mesh_assets+=("dist/mesh-node/${file}")
-          done < <(awk '{ print $2 }' "dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
+          if [ -f "dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS" ]; then
+            (cd dist/mesh-node && sha256sum -c "anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
+            mesh_assets+=("dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
+            while read -r file; do
+              mesh_assets+=("dist/mesh-node/${file}")
+            done < <(awk '{ print $2 }' "dist/mesh-node/anixops-mesh-${VERSION}-openwrt-SHA256SUMS")
+          else
+            openwrt_note="(not in this release: the program cannot enroll a device yet)"
+          fi
           if gh release view "${VERSION}" >/dev/null 2>&1; then
             echo "::error::Release ${VERSION} already exists. Asset overwrite is forbidden."
             exit 1
@@ -1225,7 +1256,7 @@ jobs:
           ## Mesh node
 
           - anixops-mesh-${VERSION}-x86_64-unknown-linux-musl, -aarch64-unknown-linux-musl, -armv7-unknown-linux-musleabihf, -armv7-unknown-linux-musleabi, -arm-unknown-linux-musleabihf and -arm-unknown-linux-musleabi: static programs for intranet mesh nodes, each with a .sha256 file
-          - anixops-mesh_*.ipk and .apk (OpenWrt 23.05 and 24.10, 25.12 and later), one per OpenWrt architecture, and luci-app-anixops-mesh_*_all.ipk and .apk: the OpenWrt packages and web interface, listed in anixops-mesh-${VERSION}-openwrt-SHA256SUMS; see docs/deploy/openwrt.md
+          - anixops-mesh_*.ipk and .apk (OpenWrt 23.05 and 24.10, 25.12 and later), one per OpenWrt architecture, and luci-app-anixops-mesh_*_all.ipk and .apk: the OpenWrt packages and web interface, listed in anixops-mesh-${VERSION}-openwrt-SHA256SUMS; see docs/deploy/openwrt.md ${openwrt_note}
           - anixops-mesh-${VERSION}-aarch64-apple-darwin and -x86_64-apple-darwin: macOS programs, each with a .sha256 file
           - anixops-mesh-${VERSION}-x86_64-pc-windows-msvc.exe and -aarch64-pc-windows-msvc.exe: Windows programs with the C runtime linked in, each with a .sha256 file
           - anixops-mesh-${VERSION}-x86_64-pc-windows-msvc-wintun.dll and -aarch64-pc-windows-msvc-wintun.dll: the unmodified Wintun 0.14.1 driver library each Windows program loads from its own folder, with its license anixops-mesh-${VERSION}-wintun-LICENSE.txt

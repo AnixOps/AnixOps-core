@@ -19,10 +19,16 @@ fi
 state_dir="$1"
 
 child=
+killer=
 # shellcheck disable=SC2329 # invoked by the trap below
 forward() {
-	if [ -n "${child}" ]; then
+	if [ -n "${child}" ] && [ -z "${killer}" ]; then
 		kill -TERM "${child}" 2>/dev/null
+		# procd kills this wrapper 30 s after SIGTERM (term_timeout), and
+		# only the wrapper: the program would be left running with its
+		# interface and ports. Kill it first if it has not stopped by then.
+		(sleep 25; kill -KILL "${child}" 2>/dev/null) &
+		killer=$!
 	fi
 }
 # procd stops the service with SIGTERM to this process: pass it on and wait
@@ -41,6 +47,9 @@ while :; do
 	fi
 	break
 done
+if [ -n "${killer}" ]; then
+	kill "${killer}" 2>/dev/null
+fi
 
 if [ "${code}" -eq 8 ]; then
 	logger -t anixops-mesh -p daemon.warn "device token revoked by the panel; service stopped until the device is enrolled again"

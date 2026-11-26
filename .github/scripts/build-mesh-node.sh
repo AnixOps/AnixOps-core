@@ -156,8 +156,8 @@ jq -n \
 
 # A build for the runner's own architecture must start and list its
 # subcommands, which the installers read before anything else. Linux builds
-# for other architectures run the same check under user-mode emulation when
-# the runner has it (the OpenWrt workflow installs it).
+# for other architectures run the same check when the runner has user-mode
+# emulation registered for them (the OpenWrt workflow registers it).
 host="$(rustc -vV | sed -n 's/^host: //p')"
 case "${target}" in
   x86_64-unknown-linux-musl | "${host}")
@@ -170,8 +170,8 @@ case "${target}" in
         aarch64-*) emulator=qemu-aarch64 ;;
         arm*) emulator=qemu-arm ;;
       esac
-      if [ -n "${emulator}" ] && command -v "${emulator}" > /dev/null; then
-        "${emulator}" "${out_dir}/${file}" capabilities | grep -q '"commands"'
+      if [ -n "${emulator}" ] && grep -qx enabled "/proc/sys/fs/binfmt_misc/${emulator}" 2> /dev/null; then
+        "${out_dir}/${file}" capabilities | grep -q '"commands"'
         echo "${target}: capabilities checked under ${emulator}"
       fi
     fi

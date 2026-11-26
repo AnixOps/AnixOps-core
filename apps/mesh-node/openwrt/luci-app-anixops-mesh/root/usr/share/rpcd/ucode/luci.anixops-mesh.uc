@@ -11,7 +11,9 @@ import { connect } from 'ubus';
 
 const PROGRAM = '/usr/bin/anixops-mesh';
 const INIT = '/etc/init.d/anixops-mesh';
-const DEFAULT_STATE_DIR = '/etc/anixops-mesh';
+// Fixed, as in the init script: it holds the device token and keys, so no
+// setting (which LuCI's UCI write access could change) may move it.
+const STATE_DIR = '/etc/anixops-mesh';
 // The panel takes at most 16 networks per request.
 const MAX_SUBNETS = 16;
 
@@ -49,39 +51,54 @@ function error_kind(output) {
 	return (type(kind) == 'string' && match(kind, /^[a-z0-9_]{1,64}$/)) ? kind : null;
 }
 
+// UCI can also be changed outside this backend (LuCI's generic UCI access,
+// the command line): values are checked again before they are returned.
 function settings() {
 	const uci = cursor();
 	uci.load('anixops-mesh');
-	const state_dir = uci.get('anixops-mesh', 'main', 'state_dir') || DEFAULT_STATE_DIR;
 	let advertise = uci.get('anixops-mesh', 'main', 'advertise') ?? [];
 	if (type(advertise) != 'array')
 		advertise = [ advertise ];
+	const control = uci.get('anixops-mesh', 'main', 'control') ?? '';
 	return {
 		enabled: uci.get('anixops-mesh', 'main', 'enabled') == '1',
-		control: uci.get('anixops-mesh', 'main', 'control') ?? '',
-		state_dir,
-		advertise
+		control: valid_control(control) ? control : '',
+		advertise: filter(advertise, valid_subnet)
 	};
 }
 
+// The program's subcommands, read once per installed program (rpcd keeps
+// this script loaded): the status page polls every 5 seconds.
+let capability_cache = null;
+
 function capabilities() {
+	const info = stat(PROGRAM);
+	const key = info ? `${info.inode}:${info.size}:${info.mtime}` : null;
+	if (key == null)
+		return [];
+	if (capability_cache?.key == key)
+		return capability_cache.commands;
 	const result = run(`${PROGRAM} capabilities`);
-	if (result.code != 0)
-		return [];
-	try {
-		const parsed = json(result.output);
-		return (type(parsed?.commands) == 'array') ? parsed.commands : [];
+	let commands = [];
+	if (result.code == 0) {
+		try {
+			const parsed = json(result.output);
+			if (type(parsed?.commands) == 'array')
+				commands = filter(parsed.commands, (c) => type(c) == 'string');
+		}
+		catch (e) {
+			commands = [];
+		}
 	}
-	catch (e) {
-		return [];
-	}
+	capability_cache = { key, commands };
+	return commands;
 }
 
-// Panel address: https only, host[:port][/path], no user part, query,
-// fragment or characters that need quoting.
+// Panel address as the program takes it (docs/deploy/mesh-device.md):
+// https://host[:port], no path, user part, query or fragment.
 function valid_control(value) {
 	return type(value) == 'string' && length(value) <= 256 &&
-		match(value, /^https:\/\/[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/) != null;
+		match(value, /^https:\/\/[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$/) != null;
 }
 
 // One-time enrollment credential (docs/deploy/mesh-device.md): `mse_`,
@@ -159,7 +176,7 @@ const methods = {
 			const result = {
 				enabled: conf.enabled,
 				control: conf.control,
-				enrolled: token_present(conf.state_dir),
+				enrolled: token_present(STATE_DIR),
 				requested: conf.advertise,
 				supported: {
 					device: index(commands, 'device') >= 0,
@@ -172,7 +189,7 @@ const methods = {
 				result.service = { result: 'unsupported' };
 				return result;
 			}
-			const out = run(`${PROGRAM} device-status --state-dir ${quote(conf.state_dir)}`);
+			const out = run(`${PROGRAM} device-status --state-dir ${quote(STATE_DIR)}`);
 			if (out.code == 1) {
 				result.service = { result: 'not_running' };
 				return result;
@@ -229,7 +246,6 @@ const methods = {
 			if (index(capabilities(), 'enroll') < 0)
 				return { result: 'unsupported' };
 
-			const conf = settings();
 			// The credential goes to a 0600 file in /tmp (memory, never the
 			// flash) and is removed right after; it never appears in a
 			// command line.
@@ -242,8 +258,8 @@ const methods = {
 				unlink(path);
 				return { result: 'error' };
 			}
-			run(`umask 077 && mkdir -p ${quote(conf.state_dir)}`);
-			out = run(`${PROGRAM} enroll --control ${quote(control)} --token-file ${quote(path)} --state-dir ${quote(conf.state_dir)}`);
+			run(`umask 077 && mkdir -p ${quote(STATE_DIR)}`);
+			out = run(`${PROGRAM} enroll --control ${quote(control)} --token-file ${quote(path)} --state-dir ${quote(STATE_DIR)}`);
 			unlink(path);
 
 			if (out.code == 8)
@@ -282,10 +298,9 @@ const methods = {
 			if (index(capabilities(), 'subnet-request') < 0)
 				return { result: 'unsupported' };
 
-			const conf = settings();
-			if (!token_present(conf.state_dir))
+			if (!token_present(STATE_DIR))
 				return { result: 'not_enrolled' };
-			let command = `${PROGRAM} subnet-request --state-dir ${quote(conf.state_dir)}`;
+			let command = `${PROGRAM} subnet-request --state-dir ${quote(STATE_DIR)}`;
 			for (let cidr in cidrs)
 				command += ` --cidr ${quote(cidr)}`;
 			const out = run(command);
