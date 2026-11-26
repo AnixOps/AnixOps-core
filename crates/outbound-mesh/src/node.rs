@@ -995,16 +995,17 @@ impl Node {
             self.forward(packet);
             return;
         }
-        // The session follows the header's sender (spec §8.7): a direct
-        // neighbour's packet may arrive over another connection, as the
-        // inner packet of a custom path does (spec §17.2.5).
-        let session_peer = if header.from != neighbour && self.is_neighbour(header.from) {
-            header.from
-        } else {
-            neighbour
-        };
+        // The session follows the arrival path (spec §8.7): the relay
+        // session for a packet relayed to us, the direct one for a packet
+        // from the neighbour itself. A direct neighbour's packet may still
+        // arrive relayed under the direct session, as the inner packet of a
+        // custom path does (spec §17.2.5), or while the direct connection
+        // comes up or goes: then the other session is tried too, without
+        // counting a failure unless both fail (review of #376, M2).
+        let direct =
+            (header.from != neighbour && self.is_neighbour(header.from)).then_some(header.from);
         let mut crypto = self.crypto();
-        let inbound = match link::open(&mut crypto, session_peer, packet, now) {
+        let inbound = match link::open_either(&mut crypto, neighbour, direct, packet, now) {
             Ok(inbound) => inbound,
             Err(Dropped::Unencrypted) => {
                 self.counters.unencrypted += 1;
@@ -2667,6 +2668,55 @@ mod tests {
         assert_eq!(net.nodes[2].next_wake(), None);
         // The relay only carried packets.
         assert!(net.delivered.iter().all(|(i, _)| *i != 1));
+    }
+
+    /// Packets relayed through node 1 keep using the relay session after
+    /// node 0 and node 2 connect directly (review of #376, M2): none fails
+    /// under the direct session, so neither session is discarded.
+    #[test]
+    fn relayed_packets_survive_a_direct_connection_coming_up() {
+        let mut net = three_in_a_row(true);
+        let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet.clone())]);
+        // Node 0 and node 2 connect directly; node 0 still has packets in
+        // flight through node 1, sealed under the relay session.
+        net.link(0, 2);
+        net.settle();
+        assert!(net.nodes[2].neighbours().contains(&100));
+        let (_, to_2) = net
+            .wires
+            .iter()
+            .find(|((i, _), (j, _))| *i == 1 && *j == 2)
+            .map(|(_, to)| *to)
+            .unwrap();
+        let rng = SystemRandom::new();
+        net.delivered.clear();
+        let dropped = net.nodes[2].counters().dropped;
+        for _ in 0..12 {
+            let sealed = {
+                let mut crypto = net.nodes[0].crypto();
+                link::seal(
+                    &mut crypto,
+                    100,
+                    102,
+                    101,
+                    packet_type::DATA,
+                    &packet,
+                    net.now,
+                )
+                .unwrap()
+            };
+            net.nodes[2].receive(to_2, &sealed, &rng, net.now);
+            net.settle();
+        }
+        assert_eq!(net.nodes[2].counters().dropped, dropped);
+        assert_eq!(net.delivered.len(), 12);
+        // The direct session is intact too.
+        net.delivered.clear();
+        send(&mut net, 0, &packet);
+        assert_eq!(net.delivered, vec![(2, packet)]);
+        assert_eq!(net.nodes[2].counters().dropped, dropped);
     }
 
     #[test]
