@@ -108,6 +108,7 @@ struct Bridging {
 
 impl Bridging {
     /// No bridges, and nothing touched on the host.
+    #[cfg(test)]
     fn off() -> Self {
         Self::with_host(Arc::new(SystemHost))
     }
