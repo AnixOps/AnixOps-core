@@ -505,8 +505,10 @@ pub struct MeshSettings {
     pub paths: Vec<CustomPath>,
     /// Decoded `network.native_keys`; `None` when absent.
     pub native_keys: Option<Vec<[u8; 32]>>,
-    /// Decoded `node.private_key`, wiped when dropped.
-    pub private_key: Option<Zeroizing<[u8; 32]>>,
+    /// Decoded `node.private_key`, wiped when dropped. On the heap, so
+    /// that moving the settings (into a box, a registry entry, a clone's
+    /// slot) moves a pointer and leaves no copy of the key behind.
+    pub private_key: Option<Box<Zeroizing<[u8; 32]>>>,
     /// The `dns` section; names are off without one.
     pub dns: DnsSettings,
     /// Host groups of the network (spec §15.7).
@@ -692,6 +694,20 @@ fn decode_key(text: &str) -> Option<Zeroizing<[u8; 32]>> {
     Some(key)
 }
 
+/// Decodes a private key straight into its heap slot: no copy of it is
+/// made on the way.
+fn decode_private_key(text: &str) -> Option<Box<Zeroizing<[u8; 32]>>> {
+    use base64::Engine as _;
+    let bytes = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .ok()?,
+    );
+    let mut key = Box::new(Zeroizing::new([0u8; 32]));
+    key.copy_from_slice(bytes.get(..32).filter(|_| bytes.len() == 32)?);
+    Some(key)
+}
+
 /// Encodes a static public key the way the status and `native_keys` do.
 pub fn encode_key(key: &[u8; 32]) -> String {
     use base64::Engine as _;
@@ -867,9 +883,10 @@ impl MeshConfig {
         }
         let private_key = match &node.private_key {
             None => None,
-            Some(text) => {
-                Some(decode_key(text).ok_or("mesh node private_key is not Base64 of 32 bytes")?)
-            }
+            Some(text) => Some(
+                decode_private_key(text)
+                    .ok_or("mesh node private_key is not Base64 of 32 bytes")?,
+            ),
         };
 
         let mut virtual_subnets = vec![address.trunc()];
@@ -1713,7 +1730,10 @@ mod tests {
         let settings = validate(with("network.native_keys", json!([key, key]))).unwrap();
         assert_eq!(settings.native_keys, Some(vec![[7; 32]]));
         let settings = validate(with("node.private_key", json!(encode_key(&[9; 32])))).unwrap();
-        assert_eq!(settings.private_key.as_deref(), Some(&[9; 32]));
+        assert_eq!(
+            settings.private_key.as_deref().map(|key| &**key),
+            Some(&[9; 32])
+        );
         for bad in [
             json!(["not base64!"]),
             json!([&encode_key(&[1; 32])[..40]]),

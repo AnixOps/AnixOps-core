@@ -93,6 +93,17 @@ impl KeyPair {
         Self { secret, public }
     }
 
+    /// From a private key kept elsewhere (the heap slot of
+    /// `MeshSettings`), which stays where it is. [`Self::from_private`]
+    /// wipes its own parameter once the secret is made, and the library's
+    /// secret is wiped when the key pair is dropped; the temporaries
+    /// passed by value (to `from_private` and to the library's
+    /// conversion) and the library's own copies while it derives the
+    /// public key are not guaranteed to be wiped.
+    pub fn from_private_ref(private: &[u8; LEN]) -> Self {
+        Self::from_private(*private)
+    }
+
     pub fn generate(rng: &dyn SecureRandom) -> Result<Self, NoiseError> {
         let mut private = Zeroizing::new([0u8; LEN]);
         rng.fill(&mut private[..]).map_err(|_| NoiseError::Random)?;

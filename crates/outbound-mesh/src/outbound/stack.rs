@@ -301,7 +301,7 @@ impl Instance {
     /// network lists it in `native_keys`) passes it in the configuration.
     pub fn new(settings: MeshSettings) -> io::Result<Arc<Self>> {
         let static_key = match &settings.private_key {
-            Some(private) => KeyPair::from_private(**private),
+            Some(private) => KeyPair::from_private_ref(private),
             None => KeyPair::generate(&SystemRandom::new())
                 .map_err(|_| io::Error::other("mesh static key could not be made"))?,
         };

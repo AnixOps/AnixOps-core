@@ -183,8 +183,10 @@ fn joining(view: &NetworkView<'_>) -> Value {
 fn own(view: &NetworkView<'_>) -> Value {
     let settings = view.settings;
     let mut own = Map::new();
-    // The device's instance ID (`node.instance_id`), the same in every
-    // network; the instance ID on the wire changes at every start.
+    // The device's instance ID (`node.instance_id`) of the chosen
+    // network, the same in every network that has one; `null` for a
+    // network configured without it. The instance ID on the wire changes
+    // at every start.
     own.insert("id".into(), json!(settings.instance_id));
     own.insert("name".into(), json!(settings.hostname));
     own.insert(
@@ -608,7 +610,7 @@ mod tests {
     #[test]
     fn no_secret_is_in_the_snapshot() {
         let mut settings = settings("managed", true);
-        settings.private_key = Some(zeroize::Zeroizing::new([7; 32]));
+        settings.private_key = Some(Box::new(zeroize::Zeroizing::new([7; 32])));
         let view = NetworkView {
             settings: &settings,
             joined: None,
