@@ -375,6 +375,20 @@ fn status_line(snapshot: &Snapshot, interface: &str) -> String {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
+        // Measures a network before a bridge is built to it (spec §11.2).
+        "sync_oversize": {
+            "received": snapshot
+                .sync_oversize
+                .received
+                .map(|(peer, bytes)| serde_json::json!({ "peer": peer, "bytes": bytes })),
+            "undelivered": snapshot.sync_oversize.undelivered,
+            "oversize_calls": snapshot.counters.oversize_calls,
+            "graph_timeouts": snapshot.counters.graph_timeouts,
+            "sync_errors": snapshot.counters.sync_errors,
+            "cut_graphs": snapshot.counters.cut_graphs,
+            "refused_at_capacity": snapshot.counters.refused_at_capacity,
+            "refused_over_budget": snapshot.counters.refused_over_budget,
+        },
     })
     .to_string()
 }
@@ -1002,6 +1016,16 @@ mod tests {
             serde_json::from_str(&status_line(&secure, "anixmesh0")).expect("json");
         assert_eq!(line["static_key"], encode_key(&[7; 32]));
         assert_eq!(line["not_native"], 12);
+        assert_eq!(line["sync_oversize"]["received"], serde_json::Value::Null);
+
+        let mut oversize = Snapshot::default();
+        oversize.sync_oversize.received = Some((9, 8_400_000));
+        oversize.counters.refused_at_capacity = 3;
+        let line: serde_json::Value =
+            serde_json::from_str(&status_line(&oversize, "anixmesh0")).expect("json");
+        assert_eq!(line["sync_oversize"]["received"]["peer"], 9);
+        assert_eq!(line["sync_oversize"]["received"]["bytes"], 8_400_000);
+        assert_eq!(line["sync_oversize"]["refused_at_capacity"], 3);
     }
 
     #[test]
