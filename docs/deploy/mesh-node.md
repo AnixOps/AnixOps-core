@@ -27,7 +27,7 @@
 | 对象 | 何时输出 | 字段 |
 | --- | --- | --- |
 | 转发状态 | 启动时一次，在第一条状态行之前 | `ip_forwarding`：`on`（已为通告子网打开本机转发）、`off`（需要转发但没有打开，原因见 `detail`）、`not_needed`（本节点不通告子网，或不是完整节点）；`detail`：字符串或 `null`，只给人看。Linux 的 `run` 目前不改本机转发，启动时读一次主机自己的 `net.ipv4.ip_forward` 与 `net.ipv6.conf.all.forwarding`：有局域网接口在通告网段上且该地址族已转发的网段照常通告，此时为 `on`（`detail` 说明用的是主机自己的设置）；其余网段撤销通告并告警 `advertise_withdrawn`，全部撤销时为 `off`。转发开关只在启动时读取一次：启动后才开转发，需要重启节点才会通告；启动后关掉转发，节点仍会通告，流量会被丢弃，也应重启节点 |
-| 状态行 | 状态变化时，内容不变不重复输出 | `interface`、`peer_id`、`neighbours`、`reachable`、`duplicate_id`、`static_key`、`not_native`、`system_routes`、`local_networks_read`、`foreign_overlaps`（含义见 `docs/architecture/mesh-status.md`） |
+| 状态行 | 状态变化时，内容不变不重复输出 | `interface`、`peer_id`、`neighbours`、`reachable`、`duplicate_id`、`static_key`、`not_native`、`system_routes`、`local_networks_read`、`foreign_overlaps`（含义见 `docs/architecture/mesh-status.md`）；`sync_oversize`：建桥前实测旧网规模用（规范 §11.2），`received`（`null` 或 `{"peer", "bytes"}`，收到的超限同步）、`undelivered`（120 秒内未取走连接图而关闭同步的邻居 ID 列表）以及累计计数 `oversize_calls`、`graph_timeouts`、`sync_errors`、`cut_graphs`、`refused_at_capacity`、`refused_over_budget` |
 | 等待公钥 | `managed` 网络的 `native_keys` 不含本机时，代替状态行输出一次 | `state`：`not_joined`；`reason`：`native_keys_pending`；`static_key`：本机静态公钥 |
 
 标准错误：运行中的告警为 `{"warning":"<种类>","detail":"…"}`（例如 `forwarding`、`firewall`、`host_changes`），不影响退出码；退出前的错误按上一节，最后一行为 `{"error":"<类别>","detail":"…"}`。`detail` 一律只给人看，不作解析依据。
