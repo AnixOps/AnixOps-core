@@ -100,7 +100,7 @@
 | `identity_online` | 同一节点身份已在别处在线 |
 | `permission_denied` | 没有创建虚拟网卡或修改路由的权限 |
 | `unreachable_peers` | 所有初始对端都连不上 |
-| `external_bridge_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级桥接锁 `/run/anixops-mesh-bridge.lock`（同一主机上另有持锁、声明该能力的进程），因此不声明 `mesh_external_bridge`、不清理桥接表（规范 §15.12 第 9 条）。出现在每个网络的 `alerts` 中，进程退出前不消除 |
+| `external_bridge_lock_held` | 告警，不是网络失败：Linux 节点程序取不到主机级桥接锁 `/run/anixops-mesh-bridge.lock`（同一主机上另有持锁、声明该能力的进程），因此不声明 `mesh_external_bridge`、不清理桥接表（规范 §15.12 第 9 条）。同时出现在 `GET /v1/mesh` 顶层 `alerts` 与每个网络的 `alerts` 中（没有运行任何网络时只在顶层），进程退出前不消除 |
 
 新增取值属于兼容变更，读取方遇到未知取值按失败处理。
 
@@ -126,13 +126,14 @@
 | `GET /v1/mesh` 顶层 `static_keys` | `[{ "network", "static_key" }]`：本机各网络的安全模式静态公钥，`network` 为该网络配置的 `network.name`，`static_key` 编码同快照的 `self.staticKey`；旧模式网络不列出。Agent 在每个网络实例的状态上报中原样带上 `static_key`，面板只采信 Agent 通道的值来生成 `native_keys`（规范 §8.3.1 第 7 条） | 0.3 |
 | `GET /v1/mesh` 的 `networks[].failure` | `{ "code", "detail" }` 或 `null`，与该网络快照的 `network.failure` 同值（例如 `native_keys_pending`、`peer_not_native`）；Agent 转为告警上报 | 0.3 |
 | `GET /v1/mesh` 顶层 `region_requests` | `[{ "id", "network", "region", "reason" }]`，`network` 为该网络配置的 `network.name`，即快照的 `network.id`；每个网络最多一条待处理申请，新申请替换旧的，保留到被删除为止 | 0.4 |
+| `GET /v1/mesh` 顶层 `alerts` | 可选，节点级告警：元素格式与 `networks[].alerts` 相同（`{ "code", "detail" }`），缺省或空数组表示没有。用于与具体网络无关、内核没有运行任何网络时也要让 Agent 看到的状态；目前只有 `external_bridge_lock_held`。内核在持锁失败期间把该告警同时放在顶层 `alerts` 与每个网络的 `alerts` 中；Agent 在任一处看到即按持锁处理（规范 §15.12 第 9 条） | 0.4 |
 | `DELETE /v1/mesh/region_requests/{id}` | 删除一条申请；`id` 由内核在记下申请时生成，为 1–64 位 ASCII 字母、数字或连字符，首字符必须是字母或数字（`^[0-9A-Za-z][0-9A-Za-z-]{0,63}$`），不存在时返回 404 | 0.4 |
 
 `PUT /v1/mesh` 与 `GET /v1/mesh` 的具体形态（networkcore issue #300，实现见 node-runtime `mesh`、outbound-mesh `status`）：
 
 - 请求体 `{"networks": [网络配置]}`：每项是上面的 `config_version: 1` 配置，另带同级的 `tag`，取值 `mesh-<地区代码>`（地区代码与面板一致：2–16 位小写字母、数字或连字符，字母开头，不以连字符结尾）。边界节点同时加入多个网络，所以是数组（需求 R18、R19），最多 64 项。
 - 整体替换：这组网络取代当前运行的全部网络，未变的网络不中断；`{"networks": []}` 停止全部。任一项无效（字段缺失或未知、配置校验不过、`tag` 不合规或重复、`network.name` 重复）时返回 400，整个请求体都不应用，与 `/v1/network`、`/v1/egress` 一致。网络启动不了（R12：端口占用、虚拟网卡或路由冲突、同一节点身份已在线）不算请求无效：应答 200，该网络 `running` 为 `false`，带 `start_refused` 告警。
-- 应答与 `GET` 相同：`{"instance_id", "networks": [...]}`，每项依请求顺序给出 `tag`、`running`、`error`（运行时为空串）、`address`（本机虚拟地址带前缀长度，如 `10.150.0.5/16`，没有时为空串）、`forward_secrecy`、`peers[{ "address", "subnets", "via", "hops", "latency_ms", "forward_secrecy" }]`（`via` 为途经的中继虚拟地址，直连为空；`latency_ms` 未测到为 `null`，需求 R16）、`failure`（同快照的 `network.failure`：`null` 或 `{ "code", "detail" }`，取值与优先级见上；暂缓的网络 `running` 为 `false`、`failure.code` 为 `native_keys_pending`，**不**发 `start_refused` 告警，Agent 只把 `failure` 转为同码告警上报面板）、`rejected_advertisements`（被拒的子网通告数）、`overlaps`（重叠网段，R16、R17）、`alerts[{ "code", "address", "peer", "detail" }]`。内核给出的 `code`：`address_conflict`、`address_unmanaged`（R29）、`start_refused`（`detail` 写原因）；`address`、`peer`（成员实例 ID）不适用时为空串。字段名与面板 `mesh.status` 一致，Agent 把 `tag` 换回地区代码后原样上报。
+- 应答与 `GET` 相同：`{"instance_id", "alerts", "networks": [...]}`（`alerts` 为可选的节点级告警，见上表），每项依请求顺序给出 `tag`、`running`、`error`（运行时为空串）、`address`（本机虚拟地址带前缀长度，如 `10.150.0.5/16`，没有时为空串）、`forward_secrecy`、`peers[{ "address", "subnets", "via", "hops", "latency_ms", "forward_secrecy" }]`（`via` 为途经的中继虚拟地址，直连为空；`latency_ms` 未测到为 `null`，需求 R16）、`failure`（同快照的 `network.failure`：`null` 或 `{ "code", "detail" }`，取值与优先级见上；暂缓的网络 `running` 为 `false`、`failure.code` 为 `native_keys_pending`，**不**发 `start_refused` 告警，Agent 只把 `failure` 转为同码告警上报面板）、`rejected_advertisements`（被拒的子网通告数）、`overlaps`（重叠网段，R16、R17）、`alerts[{ "code", "address", "peer", "detail" }]`。内核给出的 `code`：`address_conflict`、`address_unmanaged`（R29）、`start_refused`（`detail` 写原因）；`address`、`peer`（成员实例 ID）不适用时为空串。字段名与面板 `mesh.status` 一致，Agent 把 `tag` 换回地区代码后原样上报。
 - 内核不持久化这些网络：重启后 Agent 重新发送最后一次 `PUT`。内核只在状态目录（`anixcore` 配置的 `mesh_state_dir`，缺省 `/var/lib/anixcore/mesh`，权限 0700）保存本设备的 `instance_id` 与各网络的静态密钥（`keys/` 下按 `network.name` 的摘要命名，0600；配置带 `node.private_key` 时用它）。网络移出列表时密钥保留，再次加入仍用同一密钥，面板已列入的 `native_keys` 不失效。状态目录不可用时内核不列 `mesh`。
 - 实现（Linux，`apps/mesh-node` 的 `managed`）：每个运行中的网络各有一组监听、一块虚拟网卡（`anixmesh-<n>`，取最小未用编号）和一个驱动。`PUT` 中与上次相同的网络不中断；只有 `native_keys` 变化的运行中网络把新清单交给驱动，不重启：清单外对端的直连与中继会话断开、路由信息删除，其余照常；新清单不再含本机公钥时该网络停下并转为暂缓。启动失败的网络在下一次 `PUT` 时重试。端口占用、网卡占用、无权限分别给出 `failure.code` `port_in_use`、`tun_in_use`、`permission_denied`，其余为 `start_refused`，都带 `start_refused` 告警。
 - 自定义路径（0.5，`mesh_paths`）：`routing.paths` 随 `PUT /v1/mesh` 下发，`mesh_set_paths` 即用新列表重发 `PUT`。与上次相比只有 `native_keys` 与 `routing.paths` 变化的运行中网络不重启，新路径列表交给驱动立即生效（规范 §17.2.8）；校验失败按 `PUT` 整体返回 400，旧列表保留。应答中每个网络多一个 `paths[{ "id", "target", "via", "state", "unreachable", "reason" }]`（字段取值同快照的 `paths[]`；`target` 为 `{"peer": 虚拟地址}` 或 `{"subnet": 网段}`，`via`、`unreachable` 也用虚拟地址，Agent 按成员地址换成成员 `id`），`peers[]` 每项多 `path_state`（`auto`、`custom`、`first_hop_only`、`fallback`，规则同 `members[].pathState`）与 `unreachable`（虚拟地址或 `null`）。
@@ -158,7 +159,7 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `mesh_join` / `mesh_leave` | `network` | 0.3 |
 | `mesh_save_network` | `config`：`config_version: 1` 网络配置（见 `mesh-module.md`；密钥由钥匙串注入） | 0.3 |
 | `mesh_remove_network` | `network` | 0.3 |
-| `mesh_set_dns` | `enabled`、可省的 `suffix`；本机覆盖，优先于网络配置的 `dns`，`suffix` 须位于 `internal` 或 `home.arpa` 之下（见 `mesh-module.md`） | 0.3 |
+| `mesh_set_dns` | `enabled`、可省的 `suffix`；本机覆盖，优先于网络配置的 `dns`，`suffix` 须位于 `internal` 之下且至少两个标签（规范 §15.9.2 第 1 条，见 `mesh-module.md`），不合规时拒绝该次设置 | 0.3 |
 | `mesh_set_subnet_route` | `network`、`cidr`、`route`（`local` \| `mesh`）；作为本机覆盖保存，不改网络配置 | 0.3 |
 | `mesh_set_relay` / `mesh_set_host_mode` | `network`、`enabled`；仅完整节点 | 0.4 |
 | `mesh_advertise` / `mesh_withdraw` | `network`、`cidr`；仅完整节点，须在内网范围内 | 0.4 |

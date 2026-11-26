@@ -19,6 +19,7 @@ use ring::rand::SystemRandom;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, watch};
 
+use crate::host_routes;
 use crate::tun::{self, Tun};
 
 /// Interface name when the configuration names none.
@@ -30,20 +31,32 @@ const QUEUE: usize = 256;
 /// How often the networks of the other interfaces are read again.
 const LOCAL_NETWORKS_EVERY: Duration = Duration::from_secs(30);
 
-fn read_local_networks(skip: &str) -> Vec<IpNet> {
-    match tun::local_networks(skip) {
+/// What the host reaches without the mesh (spec §15.4): the networks of the
+/// other interfaces and the routes of other programs' virtual interfaces.
+/// Every interface named like ours, and `device`, is left out.
+fn read_local_networks(device: &str) -> Vec<IpNet> {
+    let own = |name: &str| host_routes::is_own_interface(name, &[device]);
+    let mut networks: Vec<IpNet> = match tun::local_networks(own) {
         Ok(networks) => networks
             .into_iter()
             .filter_map(|(address, prefix)| IpNet::new(address, prefix))
             .collect(),
         Err(error) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({ "warning": "interfaces", "detail": error.to_string() })
-            );
+            warn("interfaces", &error.to_string());
             Vec::new()
         }
+    };
+    match host_routes::host_links()
+        .and_then(|links| host_routes::host_routes().map(|routes| (links, routes)))
+    {
+        Ok((links, routes)) => networks.extend(host_routes::foreign_virtual_routes(
+            &routes,
+            &links,
+            &[device],
+        )),
+        Err(error) => warn("routes", &error.to_string()),
     }
+    networks
 }
 
 /// Routes to add and to remove to go from `installed` to `wanted`, in
@@ -360,7 +373,14 @@ pub(crate) async fn serve_with(
                 observe(&snapshot, device.name());
             }
             _ = rescan.tick() => {
-                let _ = networks.send(read_local_networks(device.name()));
+                let fresh = read_local_networks(device.name());
+                networks.send_if_modified(|current| {
+                    let changed = *current != fresh;
+                    if changed {
+                        *current = fresh;
+                    }
+                    changed
+                });
             }
             () = &mut until => break,
             result = &mut node => {
