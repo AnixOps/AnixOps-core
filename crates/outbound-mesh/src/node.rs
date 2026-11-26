@@ -1447,6 +1447,20 @@ impl Node {
         self.settings.role == Role::Full && self.settings.relay
     }
 
+    /// Whether this node serves as a waypoint (spec §17.2.4): it relays
+    /// and `node.waypoint_relay` is on.
+    fn relays_waypoints(&self) -> bool {
+        self.relays_for_others() && self.settings.waypoint_relay
+    }
+
+    /// Whether custom paths are on for this network (spec §17.2.4): this
+    /// node has paths of its own or serves as a waypoint. Otherwise it
+    /// answers `MeshPathRpc` like an implementation without the service
+    /// (Error 3) and drops every type-40 packet, counted.
+    fn paths_on(&self) -> bool {
+        self.settings.waypoint_relay || !self.paths.paths().is_empty()
+    }
+
     /// Whether this network's packets are encrypted. Without encryption no
     /// inner packet can be (spec §17.2.5 rule 3), so there is no
     /// encapsulation at all (spec §17.2.1 rule 6).
@@ -1457,7 +1471,7 @@ impl Node {
     /// This node's `MeshPathRpc.Capabilities` answer (spec §17.2.4):
     /// version 0 in a network without encryption, `relay` as configured.
     fn capabilities(&self) -> Capabilities {
-        let mut caps = Capabilities::local(self.relays_for_others());
+        let mut caps = Capabilities::local(self.relays_waypoints());
         if !self.encrypted() {
             caps.version = 0;
             caps.max_waypoints = 0;
@@ -1611,6 +1625,10 @@ impl Node {
         rng: &dyn SecureRandom,
         now: Instant,
     ) {
+        if !self.paths_on() {
+            self.paths.count_dropped();
+            return;
+        }
         let Some(decoded) = waypoint::decode(payload) else {
             self.paths.count_dropped();
             return;
@@ -1618,7 +1636,7 @@ impl Node {
         let from = header.from;
         match decoded {
             Payload::Transit(transit) => {
-                let relays = self.relays_for_others();
+                let relays = self.relays_waypoints();
                 let outer = Outer {
                     from,
                     forward_counter: header.forward_counter,
@@ -1970,6 +1988,7 @@ impl Node {
                 Ok(self.centre.get(digest).encode())
             }
             (center::SERVICE, _) => Err(RpcError::InvalidMethod),
+            (waypoint::RPC_SERVICE, _) if !self.paths_on() => Err(RpcError::InvalidService),
             (waypoint::RPC_SERVICE, waypoint::RPC_CAPABILITIES) => Ok(self.capabilities().encode()),
             (waypoint::RPC_SERVICE, _) => Err(RpcError::InvalidMethod),
             _ => Err(RpcError::InvalidService),
@@ -2523,7 +2542,7 @@ mod tests {
         let config = serde_json::json!({
             "config_version": 1,
             "network": network,
-            "node": {"address": address, "role": "full"},
+            "node": {"address": address, "role": "full", "waypoint_relay": true},
             "peers": [{"server": "peer.example", "port": 40000}],
         });
         let config: MeshConfig = serde_json::from_value(config).expect("config parses");
@@ -3009,6 +3028,84 @@ mod tests {
     #[test]
     fn a_custom_path_carries_data_in_the_secure_mode() {
         custom_path_carries_data(true);
+    }
+
+    /// A node with no paths of its own and `waypoint_relay` off: the
+    /// default until custom paths are released (spec §17.2.4).
+    fn square_with_node_3_off(secure: bool) -> Net {
+        let addresses = [
+            "10.144.0.1/24",
+            "10.144.0.2/24",
+            "10.144.0.3/24",
+            "10.144.0.4/24",
+        ];
+        let mut all: Vec<MeshSettings> = addresses
+            .iter()
+            .map(|address| settings(address, secure))
+            .collect();
+        all[3].waypoint_relay = false;
+        let mut net = Net::with(all);
+        net.link(0, 1);
+        net.link(1, 2);
+        net.link(0, 3);
+        net.link(3, 2);
+        net.settle();
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        net
+    }
+
+    fn paths_off_by_default(secure: bool) {
+        let mut net = square_with_node_3_off(secure);
+        path_through_node_3(&mut net);
+        // Node 3 answers like an implementation without the service.
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[0].paths.capability(103),
+            crate::waypoint::Capability::Unsupported
+        );
+        for _ in 0..12 {
+            net.tick(Duration::from_secs(1));
+        }
+        // Never encapsulated: at most the first-hop policy (spec §17.2.3).
+        assert_ne!(net.nodes[0].path_status(net.now)[0].state, "active");
+
+        // A type-40 packet for node 3 is dropped and counted, not relayed.
+        let dropped = net.nodes[3].path_counters().dropped;
+        let relayed = net.nodes[3].counters().relayed;
+        let transit = waypoint::encode_transit(
+            100,
+            102,
+            &[],
+            waypoint::Body::Data(&ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3])),
+        );
+        let now = net.now;
+        assert!(net.nodes[0].originate(103, packet_type::WAYPOINT, &transit, now));
+        net.delivered.clear();
+        net.settle();
+        assert_eq!(net.nodes[3].path_counters().dropped, dropped + 1);
+        assert_eq!(net.nodes[3].counters().relayed, relayed);
+        assert!(net.delivered.is_empty());
+        // Dropped before it is read: a waypoint would have asked about the
+        // packet's origin (spec §17.2.5 rule 6) and learnt its answer.
+        net.tick(Duration::from_secs(1));
+        net.tick(Duration::from_secs(1));
+        assert_eq!(
+            net.nodes[3].paths.capability(100),
+            crate::waypoint::Capability::Pending
+        );
+        assert_eq!(net.nodes[3].path_counters().dropped_queries, 0);
+    }
+
+    #[test]
+    fn a_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(false);
+    }
+
+    #[test]
+    fn a_secure_node_without_paths_or_waypoint_relay_refuses_the_extension() {
+        paths_off_by_default(true);
     }
 
     #[test]
