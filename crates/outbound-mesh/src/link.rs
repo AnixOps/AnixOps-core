@@ -467,6 +467,41 @@ pub fn open(
     packet: &[u8],
     now: Instant,
 ) -> Result<Inbound, Dropped> {
+    open_counted(crypto, neighbour, packet, now, true)
+}
+
+/// Like [`open`], for a packet that may be sealed under one of two
+/// sessions: the one of the path it arrived on (`neighbour`) or the direct
+/// session with its sender (`direct`, a direct neighbour that is not the
+/// one it came through, as for the inner packet of a custom path, spec
+/// §17.2.5). The arrival path is tried first and a failure on either is
+/// not counted against a session unless both fail; then it is counted on
+/// the arrival path's session, as [`open`] does (review of #376, M2).
+pub fn open_either(
+    crypto: &mut Crypto<'_>,
+    neighbour: u32,
+    direct: Option<u32>,
+    packet: &[u8],
+    now: Instant,
+) -> Result<Inbound, Dropped> {
+    if let (Some(direct), Crypto::Secure { .. }) = (direct, &*crypto) {
+        if let Ok(inbound) = open_counted(crypto, neighbour, packet, now, false) {
+            return Ok(inbound);
+        }
+        if let Ok(inbound) = open_counted(crypto, direct, packet, now, false) {
+            return Ok(inbound);
+        }
+    }
+    open_counted(crypto, neighbour, packet, now, true)
+}
+
+fn open_counted(
+    crypto: &mut Crypto<'_>,
+    neighbour: u32,
+    packet: &[u8],
+    now: Instant,
+    count: bool,
+) -> Result<Inbound, Dropped> {
     let mut header = NodeHeader::decode(packet).ok_or(Dropped::Truncated)?;
     if header.has(flags::EXIT_NODE) {
         return Err(Dropped::ExitNode);
@@ -495,6 +530,11 @@ pub fn open(
     if !encrypted && needs_encryption(header.packet_type) && !unencrypted_network {
         return Err(Dropped::Unencrypted);
     }
+    // A network without encryption carries no type 40 at all: it could
+    // only go in the clear (spec §17.2.1 rule 6; review of #376, M1).
+    if unencrypted_network && header.packet_type == packet_type::WAYPOINT {
+        return Err(Dropped::Unencrypted);
+    }
     if encrypted {
         match crypto {
             Crypto::Default(Some(cipher)) => {
@@ -504,7 +544,7 @@ pub fn open(
             Crypto::Secure { sessions, network } => {
                 let key = session_key(network, neighbour, header.from);
                 sessions
-                    .open(&key, &mut payload, now)
+                    .open_counting(&key, &mut payload, now, count)
                     .map_err(session_dropped)?;
             }
         }
@@ -568,6 +608,10 @@ pub fn seal(
     payload: &[u8],
     now: Instant,
 ) -> Result<Vec<u8>, Dropped> {
+    if kind == packet_type::WAYPOINT && matches!(crypto, Crypto::Default(None)) {
+        // Never in the clear (spec §17.2.1 rule 6).
+        return Err(Dropped::Unencrypted);
+    }
     let mut header = NodeHeader::new(from, to, kind, payload.len() as u32);
     let mut body = payload.to_vec();
     if needs_encryption(kind) {
@@ -1056,8 +1100,18 @@ mod tests {
         let plain = packet(1, 2, packet_type::WAYPOINT, b"probe");
         assert_eq!(open(&mut crypto, 1, &plain, now), Err(Dropped::Unencrypted));
 
-        // Only an explicitly unencrypted network takes plain Data.
+        // Only an explicitly unencrypted network takes plain Data, and
+        // never type 40 either way.
         let mut none = Crypto::Default(None);
+        let plain_waypoint = packet(1, 2, packet_type::WAYPOINT, b"probe");
+        assert_eq!(
+            open(&mut none, 1, &plain_waypoint, now),
+            Err(Dropped::Unencrypted)
+        );
+        assert_eq!(
+            seal(&mut none, 1, 2, 2, packet_type::WAYPOINT, b"probe", now),
+            Err(Dropped::Unencrypted)
+        );
         let plain = packet(1, 2, packet_type::DATA, b"ip");
         assert_eq!(open(&mut none, 1, &plain, now).unwrap().payload, b"ip");
         assert_eq!(

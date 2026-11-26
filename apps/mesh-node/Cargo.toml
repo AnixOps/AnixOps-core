@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -23,7 +24,13 @@ libc = "0.2"
 # `run`: system randomness for the node identity (already used by the mesh
 # module), and the TUN interface, signals and the driver's runtime.
 ring = "0.17"
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "signal", "io-util"] }
+# `enroll`, `device`, `subnet-request`: HTTPS to Control, verified against
+# the built-in public roots (a static binary has no system store) or the
+# operator's own CA file.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.8"
 
 [target.'cfg(windows)'.dependencies]
 # `run`: the Wintun adapter.
