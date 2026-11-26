@@ -141,7 +141,7 @@ fn platform_supported() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos", windows))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     let Some(config) = &options.config else {
         return Err(fail("usage", "--config is required"));
@@ -158,10 +158,49 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Runs the node and returns its exit code, after writing why it stopped.
+#[cfg(windows)]
+fn node_exit_code(config: &Path, interface: Option<&str>) -> u8 {
+    match mesh_node::serve::run(config, interface) {
+        Ok(()) => 0,
+        Err(failure) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "error": failure.kind(), "detail": failure.detail() })
+            );
+            failure.exit_code()
+        }
+    }
+}
+
+/// On Windows the node runs as a service when the service manager started
+/// it, and in the console otherwise.
+#[cfg(windows)]
+fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
+    let Some(config) = options.config.clone() else {
+        return Err(fail("usage", "--config is required"));
+    };
+    let interface = options.interface.clone();
+    let service_config = config.clone();
+    let service_interface = interface.clone();
+    let code = mesh_node::service_windows::dispatch(move || {
+        node_exit_code(&service_config, service_interface.as_deref())
+    })
+    .unwrap_or_else(|| node_exit_code(&config, interface.as_deref()));
+    if code == 0 {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(ExitCode::from(code))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     let _ = (&options.config, &options.interface);
-    Err(fail("platform", "the node runs on Linux only"))
+    Err(fail(
+        "platform",
+        "the node runs on Linux, macOS and Windows only",
+    ))
 }
 
 fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {

@@ -945,19 +945,23 @@ impl ProbeState {
     }
 
     /// Opens a round for a probe sent with this token. A token already
-    /// open is ignored.
-    pub fn start(&mut self, token: u64) {
+    /// open is ignored. When [`MAX_OPEN_ROUNDS`] are open, the oldest is
+    /// closed first and its verdict returned, to be acted on like one
+    /// from [`finish`](Self::finish).
+    #[must_use]
+    pub fn start(&mut self, token: u64) -> Option<Verdict> {
         if self.rounds.iter().any(|round| round.token == token) {
-            return;
+            return None;
         }
-        if self.rounds.len() >= MAX_OPEN_ROUNDS {
+        let closed = (self.rounds.len() >= MAX_OPEN_ROUNDS).then(|| {
             let oldest = self.rounds[0].token;
-            self.finish(oldest);
-        }
+            self.finish(oldest)
+        });
         self.rounds.push(Round {
             token,
             answered: vec![None; self.waypoints.len()],
         });
+        closed
     }
 
     /// Takes an echo that arrived with outer `from_peer_id` = `from`.
@@ -1161,8 +1165,9 @@ pub fn tcp_syn_addresses(ip: &[u8]) -> Option<(IpAddr, IpAddr)> {
 /// Lowers the MSS option of a TCP SYN or SYN-ACK in the IP packet `ip` to
 /// `max` and updates the TCP checksum incrementally (RFC 1624, eqn. 3; spec
 /// §17.2.5, size, rule 2), so a segment that arrived with a bad checksum
-/// stays bad instead of being repaired. Returns whether the packet changed. Packets that are not such a segment, carry
-/// no MSS option or a smaller one are left alone.
+/// stays bad instead of being repaired. The option may sit at any offset,
+/// odd ones included. Returns whether the packet changed. Packets that are
+/// not such a segment, carry no MSS option or a smaller one are left alone.
 pub fn clamp_mss(ip: &mut [u8], max: u16) -> bool {
     let Some((_, _, tcp_at)) = tcp_segment(ip) else {
         return false;
@@ -1202,8 +1207,17 @@ pub fn clamp_mss(ip: &mut [u8], max: u16) -> bool {
         return false;
     }
     ip[field..field + 2].copy_from_slice(&max.to_be_bytes());
+    // The checksum sums 16-bit words aligned to the TCP header (and so to
+    // the packet start). A field at an odd offset straddles two of them,
+    // and its bytes count swapped (RFC 1071 section 2, byte order
+    // independence).
+    let (old, new) = if (field - tcp_at) % 2 == 0 {
+        (current, max)
+    } else {
+        (current.swap_bytes(), max.swap_bytes())
+    };
     let stored = u16::from_be_bytes([ip[tcp_at + 16], ip[tcp_at + 17]]);
-    let checksum = checksum_update(stored, current, max);
+    let checksum = checksum_update(stored, old, new);
     ip[tcp_at + 16..tcp_at + 18].copy_from_slice(&checksum.to_be_bytes());
     true
 }
@@ -1909,7 +1923,7 @@ mod tests {
 
     /// One round in which `answers` echo with their status.
     fn round(probe: &mut ProbeState, token: u64, answers: &[(u32, EchoStatus)]) -> Verdict {
-        probe.start(token);
+        assert_eq!(probe.start(token), None);
         for (waypoint, status) in answers {
             assert!(probe.echo(&echo_from(*waypoint, token, *status), *waypoint));
         }
@@ -1932,7 +1946,7 @@ mod tests {
         use EchoStatus::Forwarded;
         let mut probe = warmed(vec![3, 4]);
         for token in 0..3u64 {
-            probe.start(token);
+            assert_eq!(probe.start(token), None);
             assert!(probe.echo(&echo_from(3, token, Forwarded), 3));
             // Wrong token, or a waypoint field that is not the sender.
             assert!(!probe.echo(&echo_from(4, token + 100, Forwarded), 4));
@@ -2105,7 +2119,7 @@ mod tests {
         // Half-second ticks.
         for tick in 0..2 * probes + 6 {
             if tick % 2 == 0 && tick / 2 < probes {
-                probe.start(tick / 2);
+                assert_eq!(probe.start(tick / 2), None);
             }
             if tick >= 5 && (tick - 5) % 2 == 0 && (tick - 5) / 2 < probes {
                 let token = (tick - 5) / 2;
@@ -2128,18 +2142,38 @@ mod tests {
 
     #[test]
     fn open_rounds_are_bounded() {
-        let mut probe = ProbeState::new(vec![3]);
-        for token in 0..=MAX_OPEN_ROUNDS as u64 {
-            probe.start(token);
+        let held = Verdict::Held {
+            waypoint: 0,
+            reason: Reason::NoEcho,
+        };
+        let mut probe = warmed(vec![3]);
+        for token in 0..MAX_OPEN_ROUNDS as u64 {
+            assert_eq!(probe.start(token), None);
         }
+        // Each start beyond the limit closes the oldest round (here as a
+        // miss) and hands back its verdict: the third miss holds the path
+        // at once instead of on a later finish (review of #360, Q2).
+        let tokens = MAX_OPEN_ROUNDS as u64..MAX_OPEN_ROUNDS as u64 + 3;
+        let closed: Vec<_> = tokens.map(|token| probe.start(token)).collect();
+        assert_eq!(
+            closed,
+            vec![Some(Verdict::Ready), Some(Verdict::Ready), Some(held)]
+        );
         assert_eq!(probe.open_rounds(), MAX_OPEN_ROUNDS);
-        // The oldest was closed (as a miss) to make room.
-        assert!(!probe.echo(&echo_from(3, 0, EchoStatus::Forwarded), 3));
-        assert!(probe.echo(&echo_from(3, 1, EchoStatus::Forwarded), 3));
+        assert_eq!(probe.verdict(), held);
+        assert!(!probe.echo(&echo_from(3, 2, EchoStatus::Forwarded), 3));
+        assert!(probe.echo(&echo_from(3, 3, EchoStatus::Forwarded), 3));
         // Starting an open token again changes nothing.
-        probe.start(1);
+        assert_eq!(probe.start(3), None);
         assert_eq!(probe.open_rounds(), MAX_OPEN_ROUNDS);
-        assert_eq!(probe.finish(1), Verdict::Ready);
+        // One clean round is not yet a recovery.
+        assert_eq!(probe.finish(3), held);
+        // A forced close during warm-up reports warming.
+        let mut warming = ProbeState::new(vec![3]);
+        for token in 0..MAX_OPEN_ROUNDS as u64 {
+            assert_eq!(warming.start(token), None);
+        }
+        assert_eq!(warming.start(99), Some(Verdict::Warming));
     }
 
     #[test]
@@ -2315,6 +2349,66 @@ mod tests {
         let mut broken = syn_v4();
         broken[45] ^= 1;
         assert!(!checksum_ok(&broken, 20));
+        assert!(clamp_mss(&mut broken, 1280));
+        assert!(!checksum_ok(&broken, 20));
+    }
+
+    /// `syn_v4` with its options replaced, checksum recomputed.
+    fn syn_v4_with(options: [u8; 8]) -> Vec<u8> {
+        let mut ip = syn_v4();
+        ip[40..48].copy_from_slice(&options);
+        ip[36..38].copy_from_slice(&[0, 0]);
+        let checksum = tcp_checksum(&ip, 20);
+        ip[36..38].copy_from_slice(&checksum.to_be_bytes());
+        ip
+    }
+
+    /// `syn_ack_v6` with its options replaced, checksum recomputed.
+    fn syn_ack_v6_with(options: [u8; 8]) -> Vec<u8> {
+        let mut ip = syn_ack_v6();
+        ip[60..68].copy_from_slice(&options);
+        ip[56..58].copy_from_slice(&[0, 0]);
+        let checksum = tcp_checksum(&ip, 40);
+        ip[56..58].copy_from_slice(&checksum.to_be_bytes());
+        ip
+    }
+
+    #[test]
+    fn clamps_mss_at_odd_offsets() {
+        // NOP, MSS 1460, NOP, NOP, NOP: the value sits at TCP offset 23
+        // and straddles two checksum words. Known values worked out
+        // independently (review of #360, Q1): 0x901e before, 0x441f after.
+        let mut ip = syn_v4_with([1, 2, 4, 0x05, 0xb4, 1, 1, 1]);
+        assert_eq!(&ip[36..38], &[0x90, 0x1e]);
+        assert!(clamp_mss(&mut ip, 1280));
+        assert_eq!(&ip[43..45], &1280u16.to_be_bytes());
+        assert_eq!(&ip[36..38], &[0x44, 0x1f]);
+        assert!(checksum_ok(&ip, 20));
+        // IPv6 SYN-ACK: NOP, NOP, NOP, MSS 1440, NOP (offset 25); 0xbf22
+        // before, 0x7723 after lowering to 1256.
+        let mut ip = syn_ack_v6_with([1, 1, 1, 2, 4, 0x05, 0xa0, 1]);
+        assert_eq!(&ip[56..58], &[0xbf, 0x22]);
+        assert!(clamp_mss(&mut ip, 1256));
+        assert_eq!(&ip[65..67], &1256u16.to_be_bytes());
+        assert_eq!(&ip[56..58], &[0x77, 0x23]);
+        assert!(checksum_ok(&ip, 40));
+        // Every NOP padding from 0 to 4 in both families, against a full
+        // recomputation, for several targets.
+        for pad in 0..=4usize {
+            let mut options = [1u8; 8];
+            options[pad..pad + 4].copy_from_slice(&[2, 4, 0x05, 0xb4]);
+            for max in [1200u16, 1264, 1284, 0x05b3, 0x00ff, 0x0100] {
+                let mut v4 = syn_v4_with(options);
+                assert!(clamp_mss(&mut v4, max));
+                assert!(checksum_ok(&v4, 20), "v4 pad {pad} max {max}");
+                let mut v6 = syn_ack_v6_with(options);
+                assert!(clamp_mss(&mut v6, max));
+                assert!(checksum_ok(&v6, 40), "v6 pad {pad} max {max}");
+            }
+        }
+        // A bad checksum stays bad at an odd offset too.
+        let mut broken = syn_v4_with([1, 2, 4, 0x05, 0xb4, 1, 1, 1]);
+        broken[45] ^= 1;
         assert!(clamp_mss(&mut broken, 1280));
         assert!(!checksum_ok(&broken, 20));
     }
