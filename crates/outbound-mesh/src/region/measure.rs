@@ -24,7 +24,7 @@ pub fn border_median(samples: &[f64]) -> Option<f64> {
     }
     valid.sort_by(f64::total_cmp);
     let mid = valid.len() / 2;
-    Some(if valid.len() % 2 == 0 {
+    Some(if valid.len().is_multiple_of(2) {
         (valid[mid - 1] + valid[mid]) / 2.0
     } else {
         valid[mid]

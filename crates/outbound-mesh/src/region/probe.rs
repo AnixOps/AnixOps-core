@@ -190,8 +190,14 @@ impl AnswerKey {
     pub fn verify(&self, answer: &Answer) -> bool {
         let head = header(&answer.nonce, answer.seq);
         let tag = hmac::sign(&self.0, &head);
-        ring::constant_time::verify_slices_are_equal(&tag.as_ref()[..TAG_LEN], &answer.tag).is_ok()
+        constant_time_eq(&tag.as_ref()[..TAG_LEN], &answer.tag)
     }
+}
+
+/// Whether `a` and `b` are equal, without branching on where they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && std::hint::black_box(a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y))) == 0
 }
 
 /// The node's side of one round towards one responder: a fresh ephemeral
@@ -275,9 +281,7 @@ impl Bucket {
 /// of an IPv6 address.
 pub fn source_key(ip: IpAddr) -> u128 {
     match ip {
-        IpAddr::V4(v4) => match v4.to_ipv6_mapped().octets() {
-            octets => u128::from_be_bytes(octets),
-        },
+        IpAddr::V4(v4) => u128::from_be_bytes(v4.to_ipv6_mapped().octets()),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => u128::from_be_bytes(v4.to_ipv6_mapped().octets()),
             None => u128::from_be_bytes(v6.octets()) & !((1u128 << 64) - 1),
