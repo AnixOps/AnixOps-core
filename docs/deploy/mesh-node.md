@@ -8,7 +8,7 @@
 
 | 子命令 | 作用 | 退出码 |
 | --- | --- | --- |
-| `run --config F [--interface N]` | 运行节点（Linux、macOS、Windows；macOS 网卡为系统分配的 `utunN`；Windows 网卡为 Wintun 适配器，`wintun.dll` 须与程序同目录，由服务管理器启动时以服务运行；监听的完整节点自动添加规则组 `AnixOps Mesh` 中的入站规则，通告子网时开接口级转发并以 WinNAT 转换 IPv4 虚拟网段，退出时撤销）：读取导入或面板写入的组网配置，绑定监听端口，创建 TUN 网卡（默认 `anixmesh0`），直到 SIGTERM/SIGINT。静态私钥取配置的 `node.private_key`，没有时用配置旁的 `<配置>.key`（首次运行生成，0600）。`managed` 网络的 `native_keys` 缺省、为空或不含本机公钥时暂缓（规范 §8.3.1）：不监听、不建网卡，输出一行 `{"state":"not_joined","reason":"native_keys_pending","static_key":…}` 后等待信号，退出码 0；Agent 上报公钥、面板下发含本机公钥的清单后重启服务即入网。状态行带 `static_key`（旧模式为 `null`）与最近一次被拒的非我方节点 `not_native`。与第三方节点的互通测试在 CI 中通过前，`run` 不列入 `capabilities`，安装器因此不会接管现有网络 | 0 收到信号正常停止；1 运行错误；2 用法或配置错误；3 端口或网卡被占用 |
+| `run --config F [--interface N]` | 运行节点（Linux、macOS、Windows；macOS 网卡为系统分配的 `utunN`；Windows 网卡为 Wintun 适配器，`wintun.dll` 须与程序同目录，由服务管理器启动时以服务运行；监听的完整节点自动添加规则组 `AnixOps Mesh` 中的入站规则，通告子网时开接口级转发并以 WinNAT 转换 IPv4 虚拟网段，退出时撤销）：读取导入或面板写入的组网配置，绑定监听端口，创建 TUN 网卡（默认 `anixmesh0`），直到 SIGTERM/SIGINT。静态私钥取配置的 `node.private_key`，没有时用配置旁的 `<配置>.key`（首次运行生成，0600）。`managed` 网络的 `native_keys` 缺省、为空或不含本机公钥时暂缓（规范 §8.3.1）：不监听、不建网卡，输出一行 `{"state":"not_joined","reason":"native_keys_pending","static_key":…}` 后等待信号，退出码 0；Agent 上报公钥、面板下发含本机公钥的清单后重启服务即入网。状态行带 `static_key`（旧模式为 `null`）、最近一次被拒的非我方节点 `not_native`、已安装的子网路由 `system_routes`、`local_networks_read`（本机网卡网段是否已成功读取过；为 `false` 时不安装子网路由，规范 §15.4）与 `foreign_overlaps`（因与其他组网软件的路由重叠而保留在本地的通告子网）。与第三方节点的互通测试在 CI 中通过前，`run` 不列入 `capabilities`，安装器因此不会接管现有网络 | 0 收到信号正常停止；1 运行错误；2 用法或配置错误；3 端口或网卡被占用 |
 | `capabilities` | 输出版本和本构建支持的子命令（JSON）。安装器只有在列表含 `run` 时才执行接管 | 0 |
 | `detect --profile F` | 列出本机的现有安装（服务、启动脚本、自启行、手动进程、容器）。只输出参数名，不输出任何取值 | 0；2 用法错误 |
 | `import --profile F [--out-dir D] [--report R] [--allow-unencrypted] [--address CIDR] [-- ARGS…]` | 按检测结果（或 `--` 后手动给出的命令行）生成我方配置和导入报告 | 0 全部可用；3 未发现；5 有需确认项；6 有无法自动迁移的实例 |
@@ -22,7 +22,7 @@
 | 来源 | 方法 |
 | --- | --- |
 | systemd 服务 | 单元目录中名称在 `detect.services` 里、或 `ExecStart` 运行 `detect.executables` 的单元；模板单元按 `*.wants/` 中已启用的实例展开。用 `systemctl show` 取单元文件、drop-in、`UnitFileState`、`ActiveState` |
-| OpenRC / SysV / procd 脚本 | `/etc/init.d/` 下名称匹配或内容引用程序名的脚本；OpenRC 读 `command`、`command_args` 和 `/etc/conf.d/<名称>`，运行级别取自 `rc-update show -v` |
+| OpenRC / SysV / procd 脚本 | `/etc/init.d/` 下名称匹配或内容引用程序名的脚本；OpenRC 读 `command`、`command_args` 和 `/etc/conf.d/<名称>`，运行级别取自 `rc-update show -v`；procd 脚本（OpenWrt，首行含 `/etc/rc.common` 且含 `USE_PROCD=1`）的运行状态与进程号取自 `ubus call service list`，开机自启取自 `/etc/rc.d/S<数字><名称>`，所属软件包取自 opkg 或 apk 的文件清单，详见 [OpenWrt](openwrt.md) |
 | 自启行 | `/etc/rc.local`、`/etc/crontab`、`/etc/cron.d/*`、`/var/spool/cron/**` 中启动该程序的行 |
 | 手动进程 | `/proc/*/exe` 与命令行匹配、且不属于以上任何一项的进程。进程所在的 systemd 单元不是程序自己的服务（名称不在 `detect.services` 里，`ExecStart` 也不运行该程序，例如 `cron.service`、`rc-local.service`）时，只记为宿主单元，接管时只结束该进程，绝不停用或停止宿主单元 |
 | 容器 | cgroup 属于容器的进程，以及镜像名匹配 `detect.images` 的容器。只报告，不接管 |

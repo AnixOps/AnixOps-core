@@ -22,6 +22,11 @@ const USAGE: &str = "usage:
   anixops-mesh takeover --profile FILE --state-dir DIR [--dry-run] [--report FILE]
   anixops-mesh rollback --state-dir DIR [--forget-process PID... --confirm] [--report FILE]
   anixops-mesh run      --config FILE [--interface NAME]
+  anixops-mesh enroll   --control URL --token-file FILE --state-dir DIR
+                        [--latency CODE=MS]... [--ca-file FILE]
+  anixops-mesh device   --state-dir DIR
+  anixops-mesh device-status --state-dir DIR
+  anixops-mesh subnet-request --state-dir DIR [--cidr CIDR]...
   anixops-mesh capabilities
   anixops-mesh version";
 
@@ -45,6 +50,14 @@ struct Options {
     confirm: bool,
     /// Arguments after `--`: import this command line instead of detecting.
     manual: Option<Vec<String>>,
+    /// `enroll`: Control's address, the credential file, region latencies
+    /// and a private CA.
+    control: Option<String>,
+    token_file: Option<PathBuf>,
+    latencies: Vec<String>,
+    ca_file: Option<PathBuf>,
+    /// `subnet-request`: the networks asked for.
+    cidrs: Vec<String>,
 }
 
 fn fail(kind: &str, detail: &str) -> ExitCode {
@@ -75,6 +88,11 @@ fn parse(args: &[String]) -> Result<Options, String> {
         forget: Vec::new(),
         confirm: false,
         manual: None,
+        control: None,
+        token_file: None,
+        latencies: Vec::new(),
+        ca_file: None,
+        cidrs: Vec::new(),
     };
     let mut index = 0;
     while index < args.len() {
@@ -101,6 +119,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--confirm" => options.confirm = true,
+            "--control" => options.control = Some(take(args, &mut index, arg)?),
+            "--token-file" => {
+                options.token_file = Some(PathBuf::from(take(args, &mut index, arg)?));
+            }
+            "--latency" => options.latencies.push(take(args, &mut index, arg)?),
+            "--ca-file" => options.ca_file = Some(PathBuf::from(take(args, &mut index, arg)?)),
+            "--cidr" => options.cidrs.push(take(args, &mut index, arg)?),
             "--" => {
                 options.manual = Some(args[index..].to_vec());
                 break;
@@ -158,6 +183,51 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     }
 }
 
+/// The device without the Agent: `enroll`, `device`, `device-status`,
+/// `subnet-request`. Errors are one JSON line on standard error with the
+/// exit code of `docs/deploy/mesh-device.md`.
+#[cfg(target_os = "linux")]
+fn run_device(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
+    use mesh_node::device_run::{self, EnrollOptions, Exit};
+
+    let state_dir = options
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(device_run::DEFAULT_STATE_DIR));
+    let result: Result<Option<serde_json::Value>, Exit> = match command {
+        "enroll" => {
+            let (Some(control), Some(token_file)) = (&options.control, &options.token_file) else {
+                return Err(fail("usage", "--control and --token-file are required"));
+            };
+            device_run::enroll(&EnrollOptions {
+                control,
+                token_file,
+                state_dir: &state_dir,
+                latencies: &options.latencies,
+                ca_file: options.ca_file.as_deref(),
+            })
+            .map(Some)
+        }
+        "device" => device_run::device_service(&state_dir).map(|()| None),
+        "device-status" => device_run::device_status(&state_dir).map(Some),
+        _ => device_run::subnet_request(&state_dir, &options.cidrs).map(Some),
+    };
+    match result {
+        Ok(Some(answer)) => {
+            println!("{answer}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(None) => Ok(ExitCode::SUCCESS),
+        Err(exit) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "error": exit.kind, "detail": exit.detail })
+            );
+            Err(ExitCode::from(exit.code))
+        }
+    }
+}
+
 /// Runs the node and returns its exit code, after writing why it stopped.
 #[cfg(windows)]
 fn node_exit_code(config: &Path, interface: Option<&str>) -> u8 {
@@ -171,6 +241,14 @@ fn node_exit_code(config: &Path, interface: Option<&str>) -> u8 {
             failure.exit_code()
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_device(_command: &str, _options: &Options) -> Result<ExitCode, ExitCode> {
+    Err(fail(
+        "platform",
+        "the device without the Agent runs on Linux only",
+    ))
 }
 
 /// On Windows the node runs as a service when the service manager started
@@ -222,6 +300,7 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         "run" => run_node(options),
+        "enroll" | "device" | "device-status" | "subnet-request" => run_device(command, options),
         "detect" => {
             if !platform_supported() {
                 return Err(fail(

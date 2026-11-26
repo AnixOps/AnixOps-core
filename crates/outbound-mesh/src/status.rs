@@ -97,6 +97,14 @@ pub enum FailureCode {
     PeerNotNative,
     PortInUse,
     TunInUse,
+    /// The virtual subnet overlaps one another network of this node runs
+    /// on; `detail` is the subnet.
+    RouteOverlap,
+    /// The virtual address is one another network of this node uses.
+    AddressInUse,
+    /// None of the configured peers has been reached since the network
+    /// started.
+    UnreachablePeers,
     PermissionDenied,
     /// Any other reason the network could not start.
     StartRefused,
@@ -194,6 +202,14 @@ pub enum AlertCode {
     /// virtual interface or route conflict, or the same node identity
     /// already online; `detail` says which.
     StartRefused,
+    /// More subnets are routable than the system routes take; `detail` is
+    /// how many were left out.
+    SystemRoutesTruncated,
+    /// A member announces another static key than the one bound to its
+    /// node ID; the announcement is not used. `detail` is its node ID.
+    PeerKeyChanged,
+    /// RPC bodies over 4 MiB were not sent; `detail` is how many.
+    RpcOversize,
     /// The network is larger than route synchronisation carries: a call
     /// over 8 MiB was dropped (spec §11.2), or a neighbour did not take the
     /// connection graph in time and the session was closed (§12.2). `peer`
