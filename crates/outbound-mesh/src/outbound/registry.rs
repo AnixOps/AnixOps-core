@@ -456,7 +456,10 @@ mod tests {
         registry.commit(vec![office.clone()]);
         let running = found(&registry, &office);
         let draft = settings("office", "10.148.0.9/24", "legacy");
-        let error = registry.instance("office", &draft).unwrap_err();
+        let error = registry
+            .instance("office", &draft)
+            .err()
+            .expect("a draft gets no instance");
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
         assert!(!running.is_retired());
         assert!(registry.instance("elsewhere", &draft).is_err());
