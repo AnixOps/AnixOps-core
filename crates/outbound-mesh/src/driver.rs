@@ -1065,7 +1065,7 @@ mod tests {
     }
 
     /// Waits until `running`'s snapshot passes `check`.
-    async fn until(running: &Running, check: impl Fn(&Snapshot) -> bool) {
+    async fn wait_for(running: &Running, check: impl Fn(&Snapshot) -> bool) {
         let mut snapshots = running.snapshots.clone();
         timeout(Duration::from_secs(20), async {
             loop {
@@ -1113,14 +1113,14 @@ mod tests {
 
         // The subnet is accepted, but the networks of this machine are not
         // known yet: nothing is installed.
-        until(&b, |snapshot| !snapshot.members.is_empty()).await;
+        wait_for(&b, |snapshot| !snapshot.members.is_empty()).await;
         sleep(Duration::from_secs(2)).await;
         assert!(b.snapshots.borrow().system_routes.is_empty());
         assert!(!b.snapshots.borrow().local_networks_read);
 
         // Read: the subnet is not one of them, so it is installed.
         b.local_networks.send(Some(Vec::new())).unwrap();
-        until(&b, |snapshot| snapshot.system_routes == [subnet]).await;
+        wait_for(&b, |snapshot| snapshot.system_routes == [subnet]).await;
         assert!(b.snapshots.borrow().local_networks_read);
 
         // A later failed read keeps what is known.
