@@ -48,8 +48,9 @@ pub fn state(view: &NetworkView<'_>) -> &'static str {
         return "not_joined";
     };
     match joined.failure {
-        // A managed network waiting for its key list is not joined yet.
-        Some(Failure::NativeKeysPending) => "not_joined",
+        // A managed network waiting for its key list is not joined yet;
+        // nor is a saved network of another device ID than the profile's.
+        Some(Failure::NativeKeysPending | Failure::InstanceIdChanged) => "not_joined",
         Some(_) => "failed",
         None if !joined.running => "joining",
         None if joined.snapshot.neighbours.is_empty() => "joining",

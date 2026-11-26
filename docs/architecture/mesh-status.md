@@ -106,6 +106,7 @@
 | `port_in_use` | 监听端口被占用，`detail` 为传输与端口 |
 | `tun_in_use` | 虚拟网卡名称已被占用 |
 | `native_keys_pending` | `managed` 网络暂缓：`network.native_keys` 缺省、为空或不含本机在该网络的静态公钥（规范 §8.3.1 第 1 条）。`detail` 为 `empty`（缺省或为空）或 `self_missing`（不含本机公钥）。此时 `network.state` 为 `not_joined`，不建链路、不启动虚拟网卡；`self.staticKey` 与 `static_keys` 照常给出，供 Agent 上报。只影响该网络，不使 `anixops-mesh run` 退出；面板下发含本机公钥的清单后自动启动 |
+| `instance_id_changed` | 嵌入式引擎：已保存网络的 `node.instance_id` 与之后提交的 profile 不同，停下不运行（`state` 为 `not_joined`），以当前值重新保存或 profile 恢复原值后自动恢复 |
 | `peer_not_native` | `managed` 网络中，对端经握手认证的静态公钥不在 `network.native_keys` 中，握手被拒（规范 §8.3.1）。只记录最近一次，`detail` 为对端节点 ID；不改变 `network.state`，不使 `anixops-mesh run` 退出。通常是原版节点或尚未列入清单的新节点，后者在清单下发后自动恢复 |
 | `route_overlap` | 虚拟网段或要装的路由与本机已有路由冲突，`detail` 为网段 |
 | `address_in_use` | 虚拟地址已被本机其他接口使用 |
@@ -202,8 +203,10 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 成功返回 `{"ok":true}`，`mesh_status` 返回快照。失败返回 `{"ok":false,"error":{"code","detail"}}`。`code` 为 `unsupported`、`invalid_argument`、`not_found`、`not_allowed`（例如接入节点通告子网）、`engine_unavailable`（嵌入式引擎：组网引擎未运行且无法由该运行时启动，见下），或上面的失败原因之一。
 
 嵌入式引擎的补充约定：
-- 任一运行时的控制通道都可发 `mesh_*` 命令。没有组网引擎在运行时，`mesh_save_network` 与 `mesh_join` 启动组网引擎，并由收到命令的运行时持有到它停止（只开代理时保存的网络因此继续运行）；已停止的运行时不再持有组网引擎，这两条命令返回 `engine_unavailable`（组网引擎线程无法启动时同样），宿主停止隧道后应释放该运行时的句柄，不再经它发 `mesh_*` 命令；其余命令返回 `not_found`，`mesh_status` 返回空快照 `{"statusVersion":1,"networks":[],"network":null,"self":null,"members":[],"subnets":[],"refusedAdvertisements":0,"tunnel":{"routes":[],"routesVersion":0,"dns":null}}`（带 `network` 参数时返回 `not_found`）。
-- `mesh_save_network` 的 `config` 不合规、`kind = managed` 缺 `node.private_key`（`detail` 以 `private_key_required` 开头）、`node.instance_id` 与其他网络不同，都返回 `invalid_argument`，不保存。profile 中组网出站的 `node.instance_id` 彼此不同时该 profile 构建失败（构建只看 profile 本身）；profile 提交后以它的 `node.instance_id` 为准，未列在其中、`node.instance_id` 不同的已保存网络退出（保留配置，`state` 为 `not_joined`），以当前值重新 `mesh_save_network` 后可再加入。
+- 任一运行时的控制通道都可发 `mesh_*` 命令。没有组网引擎在运行时，`mesh_save_network` 与 `mesh_join` 启动组网引擎，并由收到命令的运行时持有到它停止（只开代理时保存的网络因此继续运行）；已停止的运行时在隧道再次启动前不再持有组网引擎，这两条命令返回 `engine_unavailable`（组网引擎线程无法启动时同样），宿主停止隧道后不应再经它发 `mesh_*` 命令，同一运行时再次启动隧道后恢复；其余命令返回 `not_found`，`mesh_status` 返回空快照 `{"statusVersion":1,"networks":[],"network":null,"self":null,"members":[],"subnets":[],"refusedAdvertisements":0,"tunnel":{"routes":[],"routesVersion":0,"dns":null}}`（带 `network` 参数时返回 `not_found`）。
+- `mesh_save_network` 的 `config` 不合规、`kind = managed` 缺 `node.private_key`（`detail` 以 `private_key_required` 开头）、`node.instance_id` 与其他网络不同，都返回 `invalid_argument`，不保存。profile 中组网出站的 `node.instance_id` 彼此不同时该 profile 构建失败（构建只看 profile 本身）；设备的 `node.instance_id` 只与正在运行的网络比较：用户已退出、或因下述原因停下的网络不算，`mesh_join` 一个 `node.instance_id` 与运行中网络不同的网络同样返回 `invalid_argument`。profile 提交后以它的 `node.instance_id` 为准，未列在其中、`node.instance_id` 不同、用户未退出的已保存网络停下（保留配置，`state` 为 `not_joined`，`failure.code` 为 `instance_id_changed`，与用户退出区分），以当前值重新 `mesh_save_network`、或之后的 profile 再次使用它的 `node.instance_id` 时自动恢复；profile 中的组网出站都没有 `node.instance_id`（只有 `legacy` 网络）时不停任何已保存网络。参数不合规（配置校验不过、超出上限、`cidr` 主机位不为零）的命令先返回 `invalid_argument`，不启动组网引擎；已停止的运行时同样如此。
+- 宿主把配置编码成 JSON 时不得把 `/` 转义为 `\/`（iOS 用 `JSONSerialization` 的 `.withoutEscapingSlashes`）：带转义的字符串要先解到临时缓冲区，那份私钥、密钥的明文副本不会被清零。
+- 只有承载用户 profile 的运行时会在隧道启动后提交其组网网络；同一进程中为其他用途（如诊断）启动的运行时也会提交，会停掉未保存的网络，因此不得在同一进程中这样启动。
 - 私钥只由运行引擎的进程注入（#408）：引擎无法分辨 `mesh_save_network` 的配置来自哪个进程，网络扩展、VPN 服务收到 App 经进程间通道转来的、带 `node.private_key` 的配置时应拒绝，只用自己专用安全存储中的私钥填入。
 - `mesh_set_subnet_route` 的 `cidr` 须为主机位为零的网段。
 - `mesh_set_dns` 在内网域名接入嵌入式引擎之前返回 `unsupported`；上表 0.4、0.5 的命令与未知的 `mesh_*` 命令返回 `unsupported`。
