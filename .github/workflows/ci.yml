@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      # Maintenance branches for patch releases (docs/release-strategy.md「维护分支」).
+      - "release/[0-9]+.[0-9]+"
     tags:
       - "v*"
   pull_request:
@@ -89,6 +91,10 @@ jobs:
       # Every action is pinned to a full commit SHA with its release tag (audit 2026-11-25 REL-02).
       - name: Workflow action pinning
         run: python3 .github/scripts/workflow_policy.py --self-test .
+
+      # Release version preconditions used by release.yml (Cargo version and CHANGELOG section).
+      - name: Release version check self-test
+        run: bash .github/scripts/release-version-check.sh --self-test
 
       # Neutral terminology (AnixOps-design guidelines/terminology.md); the script and word list are
       # byte-identical copies of the AnixOps-design baseline.
@@ -580,8 +586,9 @@ jobs:
       - policy-fast
       - detect-projects
     # Same condition as the other Rust jobs. Builds the release form of
-    # anixops-mesh (static musl, x86_64 and aarch64) with the script the
-    # release workflow uses, so a tag never meets an untested build path.
+    # anixops-mesh (static musl: x86_64, aarch64 and the 32-bit ARM builds of
+    # the OpenWrt packages) with the script the release workflow uses, so a
+    # tag never meets an untested build path.
     if: >-
       ${{
         needs.detect-projects.outputs.rust == 'true' &&
@@ -629,7 +636,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+            armv7-unknown-linux-musleabihf armv7-unknown-linux-musleabi \
+            arm-unknown-linux-musleabihf arm-unknown-linux-musleabi; do
             echo "::group::${target}"
             .github/scripts/build-mesh-node.sh "${target}" ci dist/mesh-node
             echo "::endgroup::"

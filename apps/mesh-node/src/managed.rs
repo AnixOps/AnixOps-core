@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use outbound_mesh::config::{encode_key, CustomPath, PathTarget};
 use outbound_mesh::driver::{Listeners, Snapshot};
+use outbound_mesh::node::SyncOversize;
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedNetwork, ManagedNetworkStatus,
@@ -527,6 +528,41 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             detail: String::new(),
         })
         .collect();
+    if let Some(oversize) = snapshot.sync_oversize {
+        let counters = &snapshot.counters;
+        let detail = match oversize {
+            SyncOversize::Received { peer, bytes } => format!(
+                "received: rpc body of at least {bytes} bytes from node {peer} over the 8 MiB limit"
+            ),
+            SyncOversize::Undelivered { peer } => format!(
+                "undelivered: connection graph not taken by node {peer} within 120 s, sync session closed"
+            ),
+        };
+        status.alerts.push(Alert {
+            code: AlertCode::SyncOversize,
+            address: None,
+            peer: String::new(),
+            detail: format!(
+                "{detail} ({} received over the limit, {} sessions closed)",
+                counters.oversize_calls, counters.graph_timeouts
+            ),
+        });
+    }
+    let counters = &snapshot.counters;
+    if counters.refused_at_capacity > 0 || counters.refused_over_budget > 0 {
+        status.alerts.push(Alert {
+            code: AlertCode::SyncOversize,
+            address: None,
+            peer: String::new(),
+            detail: format!(
+                "capacity: node table full ({} entries) or information budget (16 MiB) reached; \
+                 {} refused or evicted at the table limit, {} refused over the budget",
+                outbound_mesh::route::sync::MAX_NODES,
+                counters.refused_at_capacity,
+                counters.refused_over_budget
+            ),
+        });
+    }
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -748,6 +784,10 @@ mod tests {
                     unreachable: None,
                 },
             ],
+            sync_oversize: Some(SyncOversize::Received {
+                peer: 9,
+                bytes: 8_400_000,
+            }),
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
@@ -783,5 +823,27 @@ mod tests {
         );
         assert_eq!(status.paths[1].state, "active");
         assert_eq!(status.paths[1].reason, None);
+        assert_eq!(status.alerts[1].code, AlertCode::SyncOversize);
+        assert!(status.alerts[1].detail.contains("8400000"));
+        assert!(status.alerts[1].detail.starts_with("received:"));
+        assert!(status.alerts[1].detail.contains("node 9"));
+
+        let undelivered = Snapshot {
+            sync_oversize: Some(SyncOversize::Undelivered { peer: 4 }),
+            ..Snapshot::default()
+        };
+        let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut status, &base, &undelivered);
+        assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
+        assert!(status.alerts[0].detail.starts_with("undelivered:"));
+
+        let mut full = Snapshot::default();
+        full.counters.refused_at_capacity = 3;
+        let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut status, &base, &full);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
+        assert!(status.alerts[0].detail.starts_with("capacity:"));
+        assert!(status.alerts[0].detail.contains("3 refused"));
     }
 }
