@@ -14,7 +14,7 @@ use std::time::Duration;
 use outbound_mesh::config::{encode_key, HostGroup};
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
-use outbound_mesh::{IpNet, MeshConfig, MeshSettings, Role};
+use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
 use ring::rand::SystemRandom;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -300,8 +300,10 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             listeners,
             device,
             stop,
-            native_keys,
-            host_groups,
+            Updates {
+                native_keys,
+                host_groups,
+            },
             |snapshot, name| {
                 if let Some(forwarding) = forwarding.as_mut() {
                     let mut sources = virtual_subnets.clone();
@@ -445,7 +447,7 @@ fn start_forwarding(
         return None;
     }
     let mut host = crate::forward_windows::HostChanges::default();
-    if settings.role == Role::Full && !listen_ports.is_empty() {
+    if settings.role == outbound_mesh::Role::Full && !listen_ports.is_empty() {
         if let Err(error) = host.allow_inbound(&settings.network_name, listen_ports, interface) {
             warn("firewall", &error.to_string());
         }
@@ -539,6 +541,14 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
     Ok(())
 }
 
+/// What a running network takes without a restart.
+pub(crate) struct Updates {
+    /// A new native key list (spec §8.3.1).
+    pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// New host groups (spec §15.7).
+    pub host_groups: watch::Receiver<Vec<HostGroup>>,
+}
+
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
@@ -549,10 +559,13 @@ pub(crate) async fn serve_with(
     listeners: Listeners,
     device: Tun,
     until: impl std::future::Future<Output = ()>,
-    native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
-    host_groups: watch::Receiver<Vec<HostGroup>>,
+    updates: Updates,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
+    let Updates {
+        native_keys,
+        host_groups,
+    } = updates;
     let mtu = usize::from(settings.mtu);
     let (to_node, from_interface) = mpsc::channel::<Vec<u8>>(QUEUE);
     let (to_interface, mut from_node) = mpsc::channel::<Vec<u8>>(QUEUE);

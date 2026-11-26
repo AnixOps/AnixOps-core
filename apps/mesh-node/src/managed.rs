@@ -390,8 +390,10 @@ async fn launch(
             listeners,
             device,
             until,
-            keys,
-            groups,
+            serve::Updates {
+                native_keys: keys,
+                host_groups: groups,
+            },
             move |next, _| {
                 snapshots.send_replace(next.clone());
             },
