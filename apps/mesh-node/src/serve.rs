@@ -296,8 +296,12 @@ impl Drop for AbortOnDrop {
 pub enum Failure {
     /// Exit code 2.
     Config(String),
-    /// Exit code 3.
-    Busy(String),
+    /// Exit code 3: a startup conflict (requirement R12). `conflict` is one
+    /// of the codes in `docs/architecture/mesh-module.md` (exit codes).
+    Busy {
+        conflict: &'static str,
+        detail: String,
+    },
     /// Exit code 1.
     Other(String),
 }
@@ -306,7 +310,7 @@ impl Failure {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) => 2,
-            Self::Busy(_) => 3,
+            Self::Busy { .. } => 3,
             Self::Other(_) => 1,
         }
     }
@@ -314,15 +318,33 @@ impl Failure {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
-            Self::Busy(_) => "busy",
-            Self::Other(_) => "run",
+            Self::Busy { .. } => "conflict",
+            Self::Other(_) => "runtime",
         }
     }
 
     pub fn detail(&self) -> &str {
         match self {
-            Self::Config(detail) | Self::Busy(detail) | Self::Other(detail) => detail,
+            Self::Config(detail) | Self::Busy { detail, .. } | Self::Other(detail) => detail,
         }
+    }
+
+    /// The conflict code of a startup conflict, `None` otherwise.
+    pub fn conflict(&self) -> Option<&'static str> {
+        match self {
+            Self::Busy { conflict, .. } => Some(conflict),
+            Self::Config(_) | Self::Other(_) => None,
+        }
+    }
+
+    /// The last line written to stderr when `run` fails (exit code
+    /// contract in `docs/architecture/mesh-module.md`).
+    pub fn json(&self) -> serde_json::Value {
+        let mut line = serde_json::json!({ "error": self.kind(), "detail": self.detail() });
+        if let Some(conflict) = self.conflict() {
+            line["conflict"] = serde_json::Value::from(conflict);
+        }
+        line
     }
 }
 
@@ -335,14 +357,16 @@ pub fn settings_from_json(text: &str) -> Result<MeshSettings, Failure> {
         .map_err(|error| Failure::Config(error.into()))
 }
 
-fn busy(what: &str, error: &io::Error) -> Failure {
+fn busy(conflict: &'static str, what: &str, error: &io::Error) -> Failure {
+    let conflict = || Failure::Busy {
+        conflict,
+        detail: format!("{what}: {error}"),
+    };
     match error.kind() {
-        io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => {
-            Failure::Busy(format!("{what}: {error}"))
-        }
+        io::ErrorKind::AddrInUse | io::ErrorKind::ResourceBusy => conflict(),
         // The kernel answers EBUSY for an interface another program holds.
         #[cfg(unix)]
-        _ if error.raw_os_error() == Some(libc::EBUSY) => Failure::Busy(format!("{what}: {error}")),
+        _ if error.raw_os_error() == Some(libc::EBUSY) => conflict(),
         _ => Failure::Other(format!("{what}: {error}")),
     }
 }
@@ -489,9 +513,9 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         }
         let listeners = Listeners::bind(&settings)
             .await
-            .map_err(|error| busy("listen", &error))?;
+            .map_err(|error| busy("port_in_use", "listen", &error))?;
         let device = Tun::create(&interface, address, address_v6, settings.mtu)
-            .map_err(|error| busy(&format!("interface {interface}"), &error))?;
+            .map_err(|error| busy("tun_in_use", &format!("interface {interface}"), &error))?;
         let stop = signals()?;
         let mut last = String::new();
         let mut listen_ports: Vec<u16> = listeners
@@ -957,6 +981,7 @@ mod tests {
         let failure = settings_from_json("{").err().expect("not json");
         assert_eq!(failure.exit_code(), 2);
         assert_eq!(failure.kind(), "config");
+        assert!(failure.json().get("conflict").is_none());
         let failure = settings_from_json("{\"config_version\": 999}")
             .err()
             .expect("missing fields");
@@ -966,14 +991,23 @@ mod tests {
     #[test]
     fn a_port_in_use_is_busy() {
         let error = io::Error::from(io::ErrorKind::AddrInUse);
-        assert_eq!(busy("listen", &error).exit_code(), 3);
+        let failure = busy("port_in_use", "listen", &error);
+        assert_eq!(failure.exit_code(), 3);
+        let line = failure.json();
+        assert_eq!(line["error"], "conflict");
+        assert_eq!(line["conflict"], "port_in_use");
         #[cfg(unix)]
         {
             let error = io::Error::from_raw_os_error(libc::EBUSY);
-            assert_eq!(busy("interface", &error).exit_code(), 3);
+            let failure = busy("tun_in_use", "interface", &error);
+            assert_eq!(failure.exit_code(), 3);
+            assert_eq!(failure.json()["conflict"], "tun_in_use");
         }
         let error = io::Error::from(io::ErrorKind::PermissionDenied);
-        assert_eq!(busy("interface", &error).exit_code(), 1);
+        let failure = busy("tun_in_use", "interface", &error);
+        assert_eq!(failure.exit_code(), 1);
+        assert_eq!(failure.json()["error"], "runtime");
+        assert!(failure.json().get("conflict").is_none());
     }
 
     #[test]
