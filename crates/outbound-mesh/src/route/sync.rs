@@ -64,6 +64,17 @@ pub const MAX_GRAPH_BYTES: usize = 2 * 1024 * 1024 + 100 * 1024;
 /// Encoded node information one request carries at most, without a graph.
 pub const REQUEST_INFO_BYTES: usize = MAX_REQUEST_BYTES - REQUEST_RESERVE;
 
+/// A connection graph sent must be answered within this long; past it the
+/// farthest half of its rows is cut, and past it again the session with
+/// that neighbour is closed (spec §12.2). Shorter than the receiver's
+/// [`UNREACHABLE_TTL`].
+pub const GRAPH_DEADLINE: Duration = Duration::from_secs(60);
+/// Wait before a session closed for an undelivered graph is rebuilt; it
+/// doubles with each further closure up to [`REBUILD_MAX`] and resets once a
+/// graph gets through (spec §12.2).
+pub const REBUILD_FIRST: Duration = Duration::from_secs(30);
+pub const REBUILD_MAX: Duration = Duration::from_secs(600);
+
 /// Encoded node information all stored entries may take together
 /// (spec §12.3). Past it, information of new nodes is refused; updates of
 /// stored ones are still taken.
@@ -93,6 +104,13 @@ pub struct Refused {
     /// Node information whose own static key is off the native key list
     /// (spec §8.3.1 rule 4).
     pub not_native: u64,
+    /// Node information or connection rows of new nodes refused, or reachable
+    /// nodes evicted, because [`MAX_NODES`] entries are stored: the network is
+    /// larger than one node keeps (spec §12.3, §12.4).
+    pub at_capacity: u64,
+    /// Sessions closed because a connection graph could not be delivered,
+    /// even cut by half, within two [`GRAPH_DEADLINE`]s (spec §12.2).
+    pub graph_timeouts: u64,
 }
 
 struct Stored {
@@ -111,6 +129,8 @@ struct Row {
 struct Sent {
     infos: BTreeMap<u32, u32>,
     rows: BTreeMap<u32, u32>,
+    /// The request carried a connection graph.
+    graph: bool,
 }
 
 struct Session {
@@ -125,6 +145,14 @@ struct Session {
     last_sent: Option<Instant>,
     retry: Duration,
     not_before: Option<Instant>,
+    /// When the connection graph now waiting for an answer was first sent.
+    graph_since: Option<Instant>,
+    /// Rows the graph is cut to after the first [`GRAPH_DEADLINE`].
+    graph_cut: Option<usize>,
+    /// Rows of the graph last sent.
+    graph_rows: usize,
+    /// Wait before the session is rebuilt after the last closure.
+    rebuild_wait: Duration,
 }
 
 impl Session {
@@ -139,6 +167,10 @@ impl Session {
             last_sent: None,
             retry: Duration::ZERO,
             not_before: None,
+            graph_since: None,
+            graph_cut: None,
+            graph_rows: 0,
+            rebuild_wait: Duration::ZERO,
         }
     }
 
@@ -194,6 +226,8 @@ pub struct RouteSync {
     refused: Refused,
     /// See [`RouteSync::set_admitted`].
     admitted: Option<Vec<[u8; 32]>>,
+    /// See [`RouteSync::take_graph_timeout`].
+    graph_timeout: Option<u32>,
 }
 
 impl RouteSync {
@@ -220,6 +254,7 @@ impl RouteSync {
             stored_bytes: 0,
             refused: Refused::default(),
             admitted: None,
+            graph_timeout: None,
         };
         sync.rebuild();
         sync
@@ -323,6 +358,13 @@ impl RouteSync {
         std::mem::take(&mut self.conflict)
     }
 
+    /// The neighbour whose session was last closed because a connection
+    /// graph could not be delivered (spec §12.2: the alert for an oversized
+    /// synchronisation); once.
+    pub fn take_graph_timeout(&mut self) -> Option<u32> {
+        self.graph_timeout.take()
+    }
+
     /// True once after the topology or the stored information changed.
     pub fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
@@ -379,6 +421,7 @@ impl RouteSync {
         now: Instant,
         unix_now: (i64, i32),
     ) -> Option<SyncRouteRequest> {
+        self.graph_deadline(peer, now);
         let initiator = self.initiates(peer, now);
         let session = self.sessions.get(&peer)?;
         if session.in_flight.is_some() || session.not_before.is_some_and(|at| now < at) {
@@ -397,8 +440,13 @@ impl RouteSync {
             .iter()
             .any(|(id, row)| session.sent.rows.get(id).is_none_or(|&v| v < row.version));
         let mut cut = false;
+        let mut kept_rows = 0;
         let conn_graph = rows_changed.then(|| {
-            let kept = graph_rows(&ordered, MAX_GRAPH_BYTES);
+            let mut kept = graph_rows(&ordered, MAX_GRAPH_BYTES);
+            if let Some(limit) = session.graph_cut {
+                kept = kept.min(limit);
+            }
+            kept_rows = kept;
             cut = kept < ordered.len();
             // Rows cut are taken as sent: they would not fit the next time
             // either, and must not make every round send the graph.
@@ -452,12 +500,54 @@ impl RouteSync {
             ..SyncRouteRequest::default()
         };
         let session = self.sessions.get_mut(&peer)?;
+        if request.conn_graph.is_some() {
+            pending.graph = true;
+            session.graph_since.get_or_insert(now);
+            session.graph_rows = kept_rows;
+        }
         session.in_flight = Some(pending);
         session.last_sent = Some(now);
         if cut {
             self.refused.cut_graphs += 1;
         }
         Some(request)
+    }
+
+    /// A connection graph unanswered for [`GRAPH_DEADLINE`] is cut to half
+    /// its rows, farthest first; unanswered again for as long, the session
+    /// with `peer` is closed and rebuilt after a wait, with everything sent
+    /// again (spec §12.2).
+    fn graph_deadline(&mut self, peer: u32, now: Instant) {
+        let Some(session) = self.sessions.get_mut(&peer) else {
+            return;
+        };
+        let Some(since) = session.graph_since else {
+            return;
+        };
+        if now.saturating_duration_since(since) < GRAPH_DEADLINE {
+            return;
+        }
+        if session.graph_cut.is_none() {
+            session.graph_cut = Some((session.graph_rows / 2).max(1));
+            session.graph_since = Some(now);
+            return;
+        }
+        // A new session number: the neighbour sees a new session and the
+        // next request is full.
+        session.mine = session.mine.wrapping_add(1);
+        session.theirs = None;
+        session.forget_sent();
+        session.graph_since = None;
+        session.graph_cut = None;
+        session.retry = Duration::ZERO;
+        session.rebuild_wait = if session.rebuild_wait.is_zero() {
+            REBUILD_FIRST
+        } else {
+            (session.rebuild_wait * 2).min(REBUILD_MAX)
+        };
+        session.not_before = Some(now + session.rebuild_wait);
+        self.refused.graph_timeouts += 1;
+        self.graph_timeout = Some(peer);
     }
 
     /// The outcome of the request last sent to `peer`: its response, or
@@ -498,6 +588,11 @@ impl RouteSync {
             _ => {
                 session.retry = Duration::ZERO;
                 session.not_before = None;
+                if pending.graph {
+                    session.graph_since = None;
+                    session.graph_cut = None;
+                    session.rebuild_wait = Duration::ZERO;
+                }
                 if session
                     .theirs
                     .is_some_and(|theirs| theirs != response.session_id)
@@ -620,12 +715,16 @@ impl RouteSync {
                 let victim = match unreachable {
                     Some(id) => id,
                     None if self.sessions.contains_key(&info.peer_id) => {
+                        self.refused.at_capacity += 1;
                         match self.farthest_non_neighbour() {
                             Some(id) => id,
                             None => return false,
                         }
                     }
-                    None => return false,
+                    None => {
+                        self.refused.at_capacity += 1;
+                        return false;
+                    }
                 };
                 self.remove_node(victim);
             }
@@ -705,6 +804,7 @@ impl RouteSync {
                 continue;
             }
             if known.is_none() && self.rows.len() >= MAX_NODES {
+                self.refused.at_capacity += 1;
                 continue;
             }
             let replaced = known.map_or(0, |known| known.neighbours.len());
@@ -1055,6 +1155,117 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert_ne!(again[0].1.my_session_id, session);
         assert!(again[0].1.peer_infos.iter().any(|i| i.peer_id == 1));
+    }
+
+    /// Rows (not placeholders) of the graph in the request to `peer`.
+    fn graph_rows_to(requests: &[(u32, SyncRouteRequest)], peer: u32) -> Option<usize> {
+        let (_, request) = requests.iter().find(|(to, _)| *to == peer)?;
+        let graph = request.conn_graph.as_ref()?;
+        Some(
+            graph
+                .peers
+                .iter()
+                .filter(|(_, version)| *version != 0)
+                .count(),
+        )
+    }
+
+    #[test]
+    fn an_undelivered_graph_is_cut_then_the_session_closed() {
+        let now = Instant::now();
+        let rng = SystemRandom::new();
+        // A chain 1 - 2 - 3, so that node 1 holds three rows.
+        let mut nodes = [node(1, now), node(2, now), node(3, now)];
+        {
+            let (left, right) = nodes.split_at_mut(1);
+            connect(&mut left[0], &mut right[0], now);
+            let (left, right) = nodes.split_at_mut(2);
+            connect(&mut left[1], &mut right[0], now);
+        }
+        for _ in 0..4 {
+            round(&mut nodes, now);
+        }
+        let mut a = std::mem::replace(&mut nodes[0], node(1, now));
+        a.neighbour_up(9, &rng, now).unwrap();
+        // Node 2 answers, so that only the session with node 9 times out.
+        let mut two = std::mem::replace(&mut nodes[1], node(2, now));
+        let mut poll = |a: &mut RouteSync, t: Instant| {
+            let requests = a.poll(t, (0, 0));
+            for (to, request) in &requests {
+                if *to == 2 {
+                    deliver(a, &mut two, request.clone(), t);
+                }
+            }
+            requests
+        };
+
+        // Node 9 never answers.
+        let first = poll(&mut a, now);
+        assert_eq!(graph_rows_to(&first, 9), Some(3));
+        let session = first
+            .iter()
+            .find(|(to, _)| *to == 9)
+            .unwrap()
+            .1
+            .my_session_id;
+        a.on_response(9, None, &rng, now).unwrap();
+
+        // Within the deadline the whole graph is retried.
+        let t = now + Duration::from_secs(30);
+        assert_eq!(graph_rows_to(&poll(&mut a, t), 9), Some(3));
+        a.on_response(9, None, &rng, t).unwrap();
+
+        // Past it, half the rows go, the farthest first.
+        let t = now + GRAPH_DEADLINE;
+        let cut = poll(&mut a, t);
+        assert_eq!(graph_rows_to(&cut, 9), Some(1));
+        let graph = cut
+            .iter()
+            .find(|(to, _)| *to == 9)
+            .unwrap()
+            .1
+            .conn_graph
+            .clone();
+        assert_eq!(graph.unwrap().peers[0].0, 1);
+        assert_eq!(a.take_graph_timeout(), None);
+        a.on_response(9, None, &rng, t).unwrap();
+
+        // Past it again, the session is closed and waits 30 seconds.
+        let t = now + GRAPH_DEADLINE * 2;
+        assert!(graph_rows_to(&poll(&mut a, t), 9).is_none());
+        assert_eq!(a.take_graph_timeout(), Some(9));
+        assert_eq!(a.take_graph_timeout(), None);
+        assert_eq!(a.refused().graph_timeouts, 1);
+        let early = t + REBUILD_FIRST - Duration::from_secs(1);
+        assert!(graph_rows_to(&poll(&mut a, early), 9).is_none());
+
+        // Then everything goes again under a new session, uncut.
+        let t = t + REBUILD_FIRST;
+        let rebuilt = poll(&mut a, t);
+        assert_eq!(graph_rows_to(&rebuilt, 9), Some(3));
+        let request = &rebuilt.iter().find(|(to, _)| *to == 9).unwrap().1;
+        assert_ne!(request.my_session_id, session);
+        assert!(request.peer_infos.iter().any(|info| info.peer_id == 1));
+
+        // A second closure waits twice as long.
+        a.on_response(9, None, &rng, t).unwrap();
+        let closed = t + GRAPH_DEADLINE * 2;
+        poll(&mut a, t + GRAPH_DEADLINE);
+        poll(&mut a, closed);
+        assert_eq!(a.take_graph_timeout(), Some(9));
+        assert!(graph_rows_to(&poll(&mut a, closed + REBUILD_FIRST), 9).is_none());
+        let t = closed + REBUILD_FIRST * 2;
+        let again = poll(&mut a, t);
+        assert_eq!(graph_rows_to(&again, 9), Some(3));
+
+        // A graph that gets through resets the wait.
+        let mut b = node(9, t);
+        b.neighbour_up(1, &rng, t).unwrap();
+        let request = again.into_iter().find(|(to, _)| *to == 9).unwrap().1;
+        deliver(&mut a, &mut b, request, t);
+        let session = a.sessions.get(&9).unwrap();
+        assert!(session.graph_since.is_none() && session.graph_cut.is_none());
+        assert!(session.rebuild_wait.is_zero());
     }
 
     #[test]
@@ -1517,6 +1728,7 @@ mod tests {
         };
         a.on_request(2, fill, now);
         assert_eq!(a.infos().count(), MAX_NODES);
+        assert_eq!(a.refused().at_capacity, 0);
         let late = SyncRouteRequest {
             my_peer_id: 2,
             my_session_id: 1,
@@ -1527,6 +1739,8 @@ mod tests {
         // for long yet: once marked, the longest unreachable makes room.
         a.on_request(2, late.clone(), now);
         assert!(a.info(99_999).is_none());
+        // The refusal is counted: the network is larger than the table.
+        assert_eq!(a.refused().at_capacity, 1);
         a.expire(now);
         // Only after the grace period.
         a.on_request(2, late.clone(), now);

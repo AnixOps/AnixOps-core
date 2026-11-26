@@ -8,6 +8,10 @@
 // switch, enrollment with a one-time credential, and requests to advertise
 // LAN subnets. Networks themselves are assigned by the panel; a subnet
 // request takes effect only after an administrator approves it there.
+//
+// Every value that does not come from this file is passed to E() inside an
+// array: LuCI turns array items into text nodes, while a lone string child
+// is assigned to innerHTML.
 
 const callStatus = rpc.declare({
 	object: 'luci.anixops-mesh',
@@ -88,17 +92,17 @@ return view.extend({
 			'class': 'cbi-input-password', 'type': 'password', 'autocomplete': 'off'
 		});
 		ui.showModal(_('Enroll device'), [
-			E('p', {}, _('Enter the panel address and the one-time enrollment credential issued by the administrator.')),
+			E('p', {}, [ _('Enter the panel address and the one-time enrollment credential issued by the administrator.') ]),
 			E('div', { 'class': 'cbi-value' }, [
-				E('label', { 'class': 'cbi-value-title' }, _('Panel address')),
-				E('div', { 'class': 'cbi-value-field' }, control)
+				E('label', { 'class': 'cbi-value-title' }, [ _('Panel address') ]),
+				E('div', { 'class': 'cbi-value-field' }, [ control ])
 			]),
 			E('div', { 'class': 'cbi-value' }, [
-				E('label', { 'class': 'cbi-value-title' }, _('Enrollment credential')),
-				E('div', { 'class': 'cbi-value-field' }, token)
+				E('label', { 'class': 'cbi-value-title' }, [ _('Enrollment credential') ]),
+				E('div', { 'class': 'cbi-value-field' }, [ token ])
 			]),
 			E('div', { 'class': 'right' }, [
-				E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
 				' ',
 				E('button', {
 					'class': 'btn cbi-button-action',
@@ -107,12 +111,12 @@ return view.extend({
 							const message = ENROLL_RESULTS[res.result] || ENROLL_RESULTS.error;
 							token.value = '';
 							ui.hideModal();
-							ui.addNotification(null, E('p', {}, message), res.result === 'ok' ? 'info' : 'danger');
+							ui.addNotification(null, E('p', {}, [ message ]), res.result === 'ok' ? 'info' : 'danger');
 							if (res.result === 'ok')
 								window.setTimeout(function() { location.reload(); }, 1500);
 						});
 					})
-				}, _('Enroll'))
+				}, [ _('Enroll') ])
 			])
 		]);
 	},
@@ -131,10 +135,10 @@ return view.extend({
 			box.checked = requested.indexOf(cidr) >= 0;
 			boxes.push(box);
 			return E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td', 'width': '1%' }, box),
-				E('td', { 'class': 'td' }, cidr),
-				E('td', { 'class': 'td' }, label || '—'),
-				E('td', { 'class': 'td' }, subnetState(cidr, requested, approved) || '—')
+				E('td', { 'class': 'td', 'width': '1%' }, [ box ]),
+				E('td', { 'class': 'td' }, [ cidr ]),
+				E('td', { 'class': 'td' }, [ label || '—' ]),
+				E('td', { 'class': 'td' }, [ subnetState(cidr, requested, approved) || '—' ])
 			]);
 		}
 
@@ -158,36 +162,36 @@ return view.extend({
 					let message = REQUEST_RESULTS[res.result] || REQUEST_RESULTS.error;
 					if (res.result === 'refused' && REFUSED_REASONS[res.reason])
 						message = REFUSED_REASONS[res.reason];
-					ui.addNotification(null, E('p', {}, message), res.result === 'ok' ? 'info' : 'danger');
+					ui.addNotification(null, E('p', {}, [ message ]), res.result === 'ok' ? 'info' : 'danger');
 					if (res.result === 'ok')
 						window.setTimeout(function() { location.reload(); }, 1500);
 				});
 			})
-		}, _('Submit request'));
+		}, [ _('Submit request') ]);
 
 		const disabled = !status.enrolled || !status.supported || !status.supported.subnet_request;
 		if (disabled)
 			submit.setAttribute('disabled', 'disabled');
 
 		return E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('Advertised LAN subnets')),
+			E('h3', {}, [ _('Advertised LAN subnets') ]),
 			E('div', { 'class': 'cbi-section-descr' },
-				_('Select the LAN subnets that other mesh members may reach through this router. The request is sent to the panel and takes effect after an administrator approves it. Submitting an empty selection withdraws a pending request.')),
+				[ _('Select the LAN subnets that other mesh members may reach through this router. The request is sent to the panel and takes effect after an administrator approves it. Submitting an empty selection withdraws a pending request.') ]),
 			E('table', { 'class': 'table' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
-					E('th', { 'class': 'th' }, ''),
-					E('th', { 'class': 'th' }, _('Subnet')),
-					E('th', { 'class': 'th' }, _('Interface')),
-					E('th', { 'class': 'th' }, _('State'))
+					E('th', { 'class': 'th' }, []),
+					E('th', { 'class': 'th' }, [ _('Subnet') ]),
+					E('th', { 'class': 'th' }, [ _('Interface') ]),
+					E('th', { 'class': 'th' }, [ _('State') ])
 				])
 			].concat(rows.length ? rows : [
-				E('tr', { 'class': 'tr placeholder' }, [ E('td', { 'class': 'td' }, E('em', {}, _('No private LAN subnet found'))) ])
+				E('tr', { 'class': 'tr placeholder' }, [ E('td', { 'class': 'td' }, [ E('em', {}, [ _('No private LAN subnet found') ]) ]) ])
 			])),
 			E('div', { 'class': 'cbi-value' }, [
-				E('label', { 'class': 'cbi-value-title' }, _('Other subnets')),
-				E('div', { 'class': 'cbi-value-field' }, other)
+				E('label', { 'class': 'cbi-value-title' }, [ _('Other subnets') ]),
+				E('div', { 'class': 'cbi-value-field' }, [ other ])
 			]),
-			E('div', { 'class': 'right' }, submit)
+			E('div', { 'class': 'right' }, [ submit ])
 		]);
 	},
 
@@ -204,21 +208,21 @@ return view.extend({
 			_('The service starts only after the device has been enrolled.'));
 
 		const enrollment = E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('Enrollment')),
+			E('h3', {}, [ _('Enrollment') ]),
 			E('table', { 'class': 'table' }, [
 				E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td left', 'width': '33%' }, _('State')),
-					E('td', { 'class': 'td left' }, status.enrolled ? _('Enrolled') : _('Not enrolled'))
+					E('td', { 'class': 'td left', 'width': '33%' }, [ _('State') ]),
+					E('td', { 'class': 'td left' }, [ status.enrolled ? _('Enrolled') : _('Not enrolled') ])
 				]),
 				E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td left', 'width': '33%' }, _('Panel address')),
-					E('td', { 'class': 'td left' }, status.control || '—')
+					E('td', { 'class': 'td left', 'width': '33%' }, [ _('Panel address') ]),
+					E('td', { 'class': 'td left' }, [ status.control || '—' ])
 				])
 			]),
-			E('div', { 'class': 'right' }, E('button', {
+			E('div', { 'class': 'right' }, [ E('button', {
 				'class': 'btn cbi-button-action',
 				'click': function() { self.enrollDialog(status); }
-			}, status.enrolled ? _('Enroll again') : _('Enroll')))
+			}, [ status.enrolled ? _('Enroll again') : _('Enroll') ]) ])
 		]);
 
 		return m.render().then(function(node) {

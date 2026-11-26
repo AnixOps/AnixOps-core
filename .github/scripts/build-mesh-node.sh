@@ -42,6 +42,10 @@ sha256() {
 suffix=""
 case "${target}" in
   x86_64-unknown-linux-musl | aarch64-unknown-linux-musl) kind=linux ;;
+  # 32-bit ARM for OpenWrt routers (apps/mesh-node/openwrt/arches.txt):
+  # ARMv7 and ARMv6, each with and without hardware floating point.
+  armv7-unknown-linux-musleabihf | armv7-unknown-linux-musleabi | \
+    arm-unknown-linux-musleabihf | arm-unknown-linux-musleabi) kind=linux ;;
   x86_64-apple-darwin | aarch64-apple-darwin) kind=macos ;;
   x86_64-pc-windows-msvc | aarch64-pc-windows-msvc)
     kind=windows
@@ -56,10 +60,11 @@ case "${target}" in
 esac
 
 if [ "${kind}" = linux ]; then
-  # No aarch64 musl C toolchain on the runner: musl targets ship their own C
-  # runtime objects, so the bundled lld links it.
-  if [ "${target}" = aarch64-unknown-linux-musl ]; then
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+  # No musl C toolchain for other architectures on the runner: musl targets
+  # ship their own C runtime objects, so the bundled lld links them.
+  if [ "${target}" != x86_64-unknown-linux-musl ]; then
+    target_upper="$(tr '[:lower:]-' '[:upper:]_' <<< "${target}")"
+    export "CARGO_TARGET_${target_upper}_LINKER=rust-lld"
   fi
   # The one C dependency is the crypto library's own code, which needs no C
   # library headers: clang compiles it for any target as freestanding code,
@@ -150,11 +155,26 @@ jq -n \
   > "${out_dir}/${name}.buildinfo.json"
 
 # A build for the runner's own architecture must start and list its
-# subcommands, which the installers read before anything else.
+# subcommands, which the installers read before anything else. Linux builds
+# for other architectures run the same check when the runner has user-mode
+# emulation registered for them (the OpenWrt workflow registers it).
 host="$(rustc -vV | sed -n 's/^host: //p')"
 case "${target}" in
   x86_64-unknown-linux-musl | "${host}")
     "${out_dir}/${file}" capabilities | grep -q '"commands"'
+    ;;
+  *)
+    if [ "${kind}" = linux ]; then
+      emulator=""
+      case "${target}" in
+        aarch64-*) emulator=qemu-aarch64 ;;
+        arm*) emulator=qemu-arm ;;
+      esac
+      if [ -n "${emulator}" ] && grep -qx enabled "/proc/sys/fs/binfmt_misc/${emulator}" 2> /dev/null; then
+        "${out_dir}/${file}" capabilities | grep -q '"commands"'
+        echo "${target}: capabilities checked under ${emulator}"
+      fi
+    fi
     ;;
 esac
 echo "built ${out_dir}/${file}"
