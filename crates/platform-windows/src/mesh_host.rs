@@ -1,29 +1,37 @@
 //! Host changes a Windows mesh node needs when it advertises subnets or relays:
-//! interface-level IP forwarding and inbound firewall rules.
+//! interface-level IP forwarding, inbound firewall rules and source address
+//! translation (WinNAT) of the virtual subnet towards the advertised subnets.
 //!
-//! Both are owned by guards. Dropping a guard puts the host back; what a guard
+//! All are owned by guards. Dropping a guard puts the host back; what a guard
 //! changed is also written to a state directory, so a process that died with a
 //! guard alive is cleaned up by [`recover_mesh_host`] on its next start.
 //!
-//! - One process per host holds these changes: the first call takes an
-//!   exclusive lock file in the state directory and keeps it until the process
-//!   exits, and a second process is refused instead of undoing the first one's
-//!   changes.
-//! - The state directory must lie under `%ProgramData%\AnixOps`; it is created
-//!   or repaired with the protected access list of [`crate::managed_files`]
-//!   (owner Administrators, SYSTEM and Administrators only, no reparse
-//!   points), and the state file is written through a random, exclusively
-//!   created temporary file. A standard user can therefore neither plant
-//!   records that a privileged recovery would act on nor redirect a write.
+//! - One process per host holds these changes: the first call creates the
+//!   host-wide named object [`MESH_HOST_MUTEX`] (open to SYSTEM and
+//!   Administrators only) and keeps it until the process exits; a second
+//!   process, whatever it was started with, is refused instead of undoing the
+//!   first one's changes. A standard user can neither create nor open that
+//!   name in the global namespace, so it cannot be held to block the module.
+//! - The state directory is fixed: [`mesh_host_state_dir`], under
+//!   `%ProgramData%\AnixOps`. It is created or repaired with the protected
+//!   access list of [`crate::managed_files`] (owner Administrators, SYSTEM and
+//!   Administrators only, no reparse points), the state file is written
+//!   through a random, exclusively created temporary file, and it is read only
+//!   when owned by SYSTEM or Administrators. A record owned by anyone else is
+//!   set aside, not applied.
 //! - Forwarding is switched per interface (`MIB_IPINTERFACE_ROW.ForwardingEnabled`)
 //!   on the mesh adapter and the chosen LAN interfaces only; the global
 //!   `IPEnableRouter` setting is never touched. IPv6 is switched only when
 //!   asked for. Windows forwards between every pair of interfaces that have
 //!   forwarding on, so other interfaces that already forward (virtual
-//!   switches, connection sharing) can reach the chosen LAN as well. Several
+//!   switches, connection sharing) can reach the chosen LAN as well;
+//!   [`ForwardingGuard::other_forwarding_interfaces`] lists them so the caller
+//!   can raise an alert. Several
 //!   guards may hold the same interface: the original value is restored when
 //!   the last one is dropped. Records name the interface by LUID and GUID, and
-//!   a record whose GUID no longer resolves to that LUID is not applied.
+//!   a record whose GUID no longer resolves to that LUID is not applied. When
+//!   an earlier restore of an interface failed, a new hold takes the original
+//!   value from that record instead of the current (still switched) one.
 //! - Firewall rules live in one rule group and are named from a fixed prefix
 //!   and the network name. They allow inbound TCP/UDP to this program's listen
 //!   ports (the underlay, from any address), and block inbound traffic to this
@@ -34,10 +42,22 @@
 //!   rules; that members only reach advertised subnets is enforced by the
 //!   mesh's receive check, which delivers only packets for this node's
 //!   addresses and its own advertised subnets.
+//! - Dropping a [`FirewallGuard`] removes its rules on a separate thread, so
+//!   that an async runtime is not blocked for the second the firewall cmdlets
+//!   take; the network can be added again once that has finished. A failure
+//!   is kept for [`last_firewall_error`]; [`FirewallGuard::remove`] removes
+//!   synchronously and returns the error instead.
+//! - Source address translation is one WinNAT object per network, named
+//!   [`nat_name`], whose internal prefix is the network's IPv4 virtual
+//!   subnet, so hosts on an advertised subnet answer this machine's own
+//!   address and need no route back into the mesh. A [`NatGuard`] is held
+//!   and removed the same way as a [`FirewallGuard`] (removal on a separate
+//!   thread, failures kept for [`last_firewall_error`]).
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -48,9 +68,12 @@ pub const MESH_FIREWALL_GROUP: &str = "AnixOps Mesh";
 pub const MESH_FIREWALL_RULE_PREFIX: &str = "AnixOpsMesh";
 /// File in the state directory that holds original forwarding values.
 pub const MESH_FORWARDING_STATE_FILE: &str = "mesh-forwarding.json";
-/// File in the state directory held open exclusively by the one process that
-/// makes host changes.
-pub const MESH_HOST_LOCK_FILE: &str = "mesh-host.lock";
+/// Folder under `%ProgramData%\AnixOps` that holds the state file.
+pub const MESH_HOST_STATE_DIR: &str = "mesh-host";
+/// Host-wide named object held by the one process that makes host changes.
+pub const MESH_HOST_MUTEX: &str = r"Global\AnixOpsMeshHost";
+/// Bytes of the firewall script's error output kept for diagnosis.
+const MAX_SCRIPT_ERROR: usize = 512;
 
 const MAX_NETWORK_LABEL: usize = 48;
 
@@ -91,6 +114,9 @@ pub struct RecoveryReport {
     pub state_set_aside: bool,
     /// Whether leftover rules of [`MESH_FIREWALL_GROUP`] were removed.
     pub firewall_cleared: bool,
+    /// Whether leftover WinNAT objects named from
+    /// [`MESH_FIREWALL_RULE_PREFIX`] and `-` were removed.
+    pub nat_cleared: bool,
 }
 
 /// The part of a network name used in rule names: ASCII letters, digits, `-`
@@ -134,6 +160,26 @@ pub fn firewall_rule_names(network: &str) -> [String; 3] {
     ]
 }
 
+/// Name of the WinNAT object created for `network`.
+pub fn nat_name(network: &str) -> String {
+    format!("{MESH_FIREWALL_RULE_PREFIX}-{}", network_label(network))
+}
+
+/// The internal prefix of a WinNAT object, `a.b.c.d/n`, for the IPv4 subnet
+/// holding `address`. Errors for a prefix length outside /1 to /30, which
+/// leaves no room for the host and a peer.
+pub fn nat_prefix(address: Ipv4Addr, prefix: u8) -> io::Result<String> {
+    if !(1..=30).contains(&prefix) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the translated subnet must be /1 to /30",
+        ));
+    }
+    let mask = u32::MAX << (32 - u32::from(prefix));
+    let network = Ipv4Addr::from(u32::from(address) & mask);
+    Ok(format!("{network}/{prefix}"))
+}
+
 /// Listen ports as a comma-separated list, sorted and without duplicates or
 /// zero. Errors when nothing is left.
 pub fn listen_port_list(ports: &[u16]) -> io::Result<String> {
@@ -172,16 +218,15 @@ fn check_alias(alias: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// The state directory must lie under `%ProgramData%\AnixOps`, where
-/// [`crate::managed_files`] keeps folders protected.
-fn check_state_dir(state_dir: &Path) -> io::Result<()> {
-    if !crate::managed_files::is_within_managed_root(state_dir) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the mesh host state directory must lie under %ProgramData%\\AnixOps",
-        ));
-    }
-    Ok(())
+/// The one state directory of every caller on the host.
+pub fn mesh_host_state_dir() -> PathBuf {
+    crate::managed_files::windows_managed_root_directory().join(MESH_HOST_STATE_DIR)
+}
+
+/// The first `MAX_SCRIPT_ERROR` bytes of a script's error output, as text.
+fn script_error(stderr: &[u8]) -> String {
+    let cut = &stderr[..stderr.len().min(MAX_SCRIPT_ERROR)];
+    String::from_utf8_lossy(cut).trim().to_owned()
 }
 
 fn state_path(state_dir: &Path) -> PathBuf {
@@ -211,7 +256,11 @@ impl Holdings {
     }
 
     /// Takes one hold on `(luid, family)`. `current` is read only for the first
-    /// hold. Returns whether forwarding must be switched on now.
+    /// hold, and not at all when a failed restore of the same interface is on
+    /// record: its value is still the switched one, so the recorded original
+    /// is taken over (and the record leaves `stuck`). A record for the same
+    /// LUID but another GUID names an interface that is gone and is dropped.
+    /// Returns whether forwarding must be switched on now.
     fn hold(
         &mut self,
         luid: u64,
@@ -223,7 +272,17 @@ impl Holdings {
             self.held[position].1 += 1;
             return false;
         }
-        let original = current();
+        let mut original = None;
+        self.stuck.retain(|entry| {
+            if entry.luid != luid || entry.family != family {
+                return true;
+            }
+            if entry.guid == guid {
+                original = Some(entry.original);
+            }
+            false
+        });
+        let original = original.unwrap_or_else(current);
         self.held.push((
             ForwardingEntry {
                 luid,
@@ -234,6 +293,13 @@ impl Holdings {
             1,
         ));
         !original
+    }
+
+    fn luids(&self) -> Vec<u64> {
+        let mut luids: Vec<u64> = self.held.iter().map(|(e, _)| e.luid).collect();
+        luids.sort_unstable();
+        luids.dedup();
+        luids
     }
 
     /// Drops one hold. Returns the entry to restore when it was the last one.
@@ -264,14 +330,14 @@ impl Holdings {
 
 #[cfg(windows)]
 pub use native::{
-    add_mesh_firewall_rules, enable_mesh_forwarding, recover_mesh_host, FirewallGuard,
-    ForwardingGuard,
+    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, last_firewall_error,
+    recover_mesh_host, FirewallGuard, ForwardingGuard, NatGuard,
 };
 
 #[cfg(not(windows))]
 pub use unsupported::{
-    add_mesh_firewall_rules, enable_mesh_forwarding, recover_mesh_host, FirewallGuard,
-    ForwardingGuard,
+    add_mesh_firewall_rules, add_mesh_nat, enable_mesh_forwarding, last_firewall_error,
+    recover_mesh_host, FirewallGuard, ForwardingGuard, NatGuard,
 };
 
 #[cfg(not(windows))]
@@ -289,122 +355,142 @@ mod unsupported {
     #[derive(Debug)]
     pub struct ForwardingGuard(());
 
+    impl ForwardingGuard {
+        /// Other interfaces that forward; Windows only.
+        pub fn other_forwarding_interfaces(&self) -> io::Result<Vec<String>> {
+            Err(unsupported())
+        }
+    }
+
     /// Holds the mesh firewall rules of one network; Windows only.
     #[derive(Debug)]
     pub struct FirewallGuard(());
 
+    impl FirewallGuard {
+        /// Removes the rules now; Windows only.
+        pub fn remove(self) -> io::Result<()> {
+            Err(unsupported())
+        }
+    }
+
     pub fn enable_mesh_forwarding(
-        state_dir: &Path,
         mesh_adapter: &str,
         lan_interfaces: &[String],
         ipv6: bool,
     ) -> io::Result<ForwardingGuard> {
-        let _ = (state_dir, mesh_adapter, lan_interfaces, ipv6);
+        let _ = (mesh_adapter, lan_interfaces, ipv6);
         Err(unsupported())
     }
 
     pub fn add_mesh_firewall_rules(
-        state_dir: &Path,
         network: &str,
         program_path: &Path,
         listen_ports: &[u16],
         mesh_adapter: &str,
     ) -> io::Result<FirewallGuard> {
-        let _ = (state_dir, network, program_path, listen_ports, mesh_adapter);
+        let _ = (network, program_path, listen_ports, mesh_adapter);
         Err(unsupported())
     }
 
-    pub fn recover_mesh_host(state_dir: &Path) -> io::Result<RecoveryReport> {
-        let _ = state_dir;
+    pub fn recover_mesh_host() -> io::Result<RecoveryReport> {
         Err(unsupported())
+    }
+
+    /// Holds the translation object of one network; Windows only.
+    #[derive(Debug)]
+    pub struct NatGuard(());
+
+    impl NatGuard {
+        /// Removes the object now; Windows only.
+        pub fn remove(self) -> io::Result<()> {
+            Err(unsupported())
+        }
+    }
+
+    pub fn add_mesh_nat(network: &str, address: Ipv4Addr, prefix: u8) -> io::Result<NatGuard> {
+        let _ = (network, address, prefix);
+        Err(unsupported())
+    }
+
+    /// The last failure of a firewall removal done on drop; none here.
+    pub fn last_firewall_error() -> Option<String> {
+        None
     }
 }
 
 #[cfg(windows)]
 mod native {
     use super::*;
-    use std::fs::{File, OpenOptions};
     use std::mem::zeroed;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::OwnedHandle;
     use std::process::Stdio;
     use std::sync::{Mutex, MutexGuard};
 
     use windows_sys::core::GUID;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ConvertInterfaceAliasToLuid, ConvertInterfaceGuidToLuid, ConvertInterfaceLuidToGuid,
-        GetIpInterfaceEntry, InitializeIpInterfaceEntry, SetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+        ConvertInterfaceAliasToLuid, ConvertInterfaceGuidToLuid, ConvertInterfaceLuidToAlias,
+        ConvertInterfaceLuidToGuid, FreeMibTable, GetIpInterfaceEntry, GetIpInterfaceTable,
+        InitializeIpInterfaceEntry, SetIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+        MIB_IPINTERFACE_TABLE,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
 
     use crate::managed_files::{
-        ensure_managed_directory, read_managed_file, write_managed_file_atomic,
+        create_host_wide_object, ensure_managed_directory, read_admin_owned_file,
+        write_managed_file_atomic,
     };
     use crate::trusted_command::native_windows_powershell_command;
-
-    /// `FILE_FLAG_OPEN_REPARSE_POINT`: open a link itself, never its target.
-    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    /// `ERROR_SHARING_VIOLATION`: another process holds the lock file.
-    const SHARING_VIOLATION: i32 = 32;
 
     /// Everything this process holds on the host.
     struct Host {
         dir: PathBuf,
-        /// Held open without sharing for the life of the process.
-        _lock: File,
+        /// The host-wide object, held for the life of the process.
+        _lock: OwnedHandle,
         holdings: Holdings,
-        /// Networks with a live [`FirewallGuard`].
+        /// Networks with a live [`FirewallGuard`], or whose rules are still
+        /// being removed.
         networks: Vec<String>,
+        /// Networks with a live [`NatGuard`], or whose object is still being
+        /// removed.
+        nats: Vec<String>,
     }
 
     static HOST: Mutex<Option<Host>> = Mutex::new(None);
+    static LAST_FIREWALL_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
-    /// The host state of this process, taking the lock file in `state_dir`
-    /// on first use. Refused when another process holds the lock, or when
-    /// this process already uses another state directory.
-    fn host(state_dir: &Path) -> io::Result<MutexGuard<'static, Option<Host>>> {
-        check_state_dir(state_dir)?;
+    /// The host state of this process, taking the host-wide object on first
+    /// use. Refused when another process holds it.
+    fn host() -> io::Result<MutexGuard<'static, Option<Host>>> {
         let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
-        match slot.as_ref() {
-            Some(host) if host.dir == state_dir => return Ok(slot),
-            Some(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "mesh host changes already use another state directory",
-                ))
-            }
-            None => {}
+        if slot.is_some() {
+            return Ok(slot);
         }
-        ensure_managed_directory(state_dir)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .share_mode(0)
-            .custom_flags(OPEN_REPARSE_POINT)
-            .open(state_dir.join(MESH_HOST_LOCK_FILE))
-            .map_err(|error| {
-                if error.raw_os_error() == Some(SHARING_VIOLATION) {
-                    io::Error::new(
-                        io::ErrorKind::ResourceBusy,
-                        "another process holds the mesh host changes",
-                    )
-                } else {
-                    error
-                }
-            })?;
+        let lock = create_host_wide_object(MESH_HOST_MUTEX).map_err(|error| {
+            if error.kind() == io::ErrorKind::ResourceBusy {
+                io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "another process holds the mesh host changes",
+                )
+            } else {
+                error
+            }
+        })?;
+        let dir = mesh_host_state_dir();
+        ensure_managed_directory(&dir)?;
         *slot = Some(Host {
-            dir: state_dir.to_path_buf(),
+            dir,
             _lock: lock,
             holdings: Holdings::default(),
             networks: Vec::new(),
+            nats: Vec::new(),
         });
         Ok(slot)
     }
 
     fn read_state(state_dir: &Path) -> io::Result<ForwardingState> {
-        match read_managed_file(&state_path(state_dir)) {
+        match read_admin_owned_file(&state_path(state_dir)) {
             Ok(bytes) => parse_state(&bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ForwardingState::default()),
             Err(e) => Err(e),
@@ -454,6 +540,20 @@ mod native {
             "the interface was not found",
         )?;
         Ok(unsafe { luid.Value })
+    }
+
+    /// The alias of `luid`; the LUID in hex when it has none.
+    fn luid_alias(luid: u64) -> String {
+        let mut net_luid: NET_LUID_LH = unsafe { zeroed() };
+        net_luid.Value = luid;
+        // IF_MAX_STRING_SIZE + 1.
+        let mut buffer = [0u16; 257];
+        if unsafe { ConvertInterfaceLuidToAlias(&net_luid, buffer.as_mut_ptr(), buffer.len()) } != 0
+        {
+            return format!("{luid:#x}");
+        }
+        let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..end])
     }
 
     fn format_guid(guid: &GUID) -> String {
@@ -525,6 +625,30 @@ mod native {
         (unsafe { GetIpInterfaceEntry(&mut row) } == 0).then_some(row)
     }
 
+    /// LUIDs of every interface that has forwarding on, in either family.
+    fn forwarding_luids() -> io::Result<Vec<u64>> {
+        let mut table: *mut MIB_IPINTERFACE_TABLE = std::ptr::null_mut();
+        win32(
+            unsafe { GetIpInterfaceTable(AF_UNSPEC, &mut table) },
+            "the interface table could not be read",
+        )?;
+        let mut luids = Vec::new();
+        if !table.is_null() {
+            let count = unsafe { (*table).NumEntries } as usize;
+            let rows = unsafe { std::ptr::addr_of!((*table).Table) as *const MIB_IPINTERFACE_ROW };
+            for index in 0..count {
+                let row = unsafe { &*rows.add(index) };
+                if row.ForwardingEnabled {
+                    luids.push(unsafe { row.InterfaceLuid.Value });
+                }
+            }
+            unsafe { FreeMibTable(table as *const _) };
+        }
+        luids.sort_unstable();
+        luids.dedup();
+        Ok(luids)
+    }
+
     fn set_forwarding(luid: u64, family: IpFamily, enabled: bool) -> io::Result<()> {
         let mut row = interface_row(luid, family).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "the interface settings are gone")
@@ -563,6 +687,27 @@ mod native {
         held: Vec<(u64, IpFamily)>,
     }
 
+    impl ForwardingGuard {
+        /// Aliases of the interfaces that forward but that no guard of this
+        /// process holds (virtual switches, connection sharing, other
+        /// software). Windows forwards between all of them and the
+        /// interfaces held here, so the caller should raise an alert when
+        /// the list is not empty.
+        pub fn other_forwarding_interfaces(&self) -> io::Result<Vec<String>> {
+            let held = {
+                let slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
+                slot.as_ref()
+                    .map(|host| host.holdings.luids())
+                    .unwrap_or_default()
+            };
+            Ok(forwarding_luids()?
+                .into_iter()
+                .filter(|luid| held.binary_search(luid).is_err())
+                .map(luid_alias)
+                .collect())
+        }
+    }
+
     impl Drop for ForwardingGuard {
         fn drop(&mut self) {
             // A guard emptied on an error path inside `enable_mesh_forwarding`
@@ -589,14 +734,12 @@ mod native {
     /// Switches forwarding on for the mesh adapter and `lan_interfaces` (by
     /// interface alias) for IPv4, and for IPv6 too when `ipv6` is set, on
     /// each interface that has the family. Original values are written to
-    /// `state_dir` before anything changes.
+    /// the state directory before anything changes.
     pub fn enable_mesh_forwarding(
-        state_dir: &Path,
         mesh_adapter: &str,
         lan_interfaces: &[String],
         ipv6: bool,
     ) -> io::Result<ForwardingGuard> {
-        check_state_dir(state_dir)?;
         let mut luids = vec![alias_luid(mesh_adapter)?];
         for alias in lan_interfaces {
             let luid = alias_luid(alias)?;
@@ -614,7 +757,7 @@ mod native {
             interfaces.push((luid, luid_guid(luid)?));
         }
 
-        let mut slot = host(state_dir)?;
+        let mut slot = host()?;
         let host = slot.as_mut().expect("host state was just taken");
         // The whole change happens under the lock, so a second caller never
         // sees a hold whose switch has not happened yet.
@@ -664,22 +807,78 @@ mod native {
         Ok(guard)
     }
 
-    /// Holds the firewall rules of one network. Dropping it deletes them.
+    /// Holds the firewall rules of one network. Dropping it deletes them on
+    /// a separate thread; [`FirewallGuard::remove`] deletes them now.
     #[derive(Debug)]
     pub struct FirewallGuard {
         network: String,
         names: [String; 3],
+        removed: bool,
+    }
+
+    /// Removes the rules `names` of `network`, then lets the network be added
+    /// again. A failure is also kept for [`last_firewall_error`].
+    fn remove_rules(network: &str, names: &[String; 3]) -> io::Result<()> {
+        let result = run_firewall_script(REMOVE_SCRIPT, &[("ANIX_MESH_NAMES", names.join(","))]);
+        if let Err(error) = &result {
+            *LAST_FIREWALL_ERROR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(format!("{network}: {error}"));
+        }
+        let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(host) = slot.as_mut() {
+            host.networks.retain(|held| held != network);
+        }
+        result
+    }
+
+    impl FirewallGuard {
+        /// Removes the rules now and returns what went wrong, with the start
+        /// of the firewall script's error output.
+        pub fn remove(mut self) -> io::Result<()> {
+            self.removed = true;
+            remove_rules(&self.network, &self.names)
+        }
     }
 
     impl Drop for FirewallGuard {
         fn drop(&mut self) {
-            let _ =
-                run_firewall_script(REMOVE_SCRIPT, &[("ANIX_MESH_NAMES", self.names.join(","))]);
-            let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(host) = slot.as_mut() {
-                host.networks.retain(|network| *network != self.network);
+            if self.removed {
+                return;
+            }
+            let network = std::mem::take(&mut self.network);
+            let names = self.names.clone();
+            let spawned = std::thread::Builder::new()
+                .name("mesh-firewall-remove".into())
+                .spawn({
+                    let network = network.clone();
+                    move || {
+                        let _ = remove_rules(&network, &names);
+                    }
+                });
+            if spawned.is_err() {
+                // No thread: leave the rules to the next recovery, but do not
+                // keep the network blocked for the rest of the process.
+                *LAST_FIREWALL_ERROR
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(format!(
+                    "{network}: the rules are left for the next recovery"
+                ));
+                let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(host) = slot.as_mut() {
+                    host.networks.retain(|held| *held != network);
+                }
             }
         }
+    }
+
+    /// The last failure of a firewall removal done when a guard was dropped,
+    /// with the start of the script's error output.
+    pub fn last_firewall_error() -> Option<String> {
+        LAST_FIREWALL_ERROR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     const ADD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
@@ -690,9 +889,9 @@ $group = $env:ANIX_MESH_GROUP
 $program = $env:ANIX_MESH_PROGRAM
 $adapter = [System.Management.Automation.WildcardPattern]::Escape($env:ANIX_MESH_ADAPTER)
 if (@(Get-NetAdapter -InterfaceAlias $adapter -IncludeHidden -ErrorAction Stop).Count -ne 1) { throw 'adapter' }
+New-NetFirewallRule -Name $names[2] -DisplayName $names[2] -Group $group -PolicyStore PersistentStore -Direction Inbound -Action Block -Program $program -InterfaceAlias $adapter -Profile Any | Out-Null
 New-NetFirewallRule -Name $names[0] -DisplayName $names[0] -Group $group -PolicyStore PersistentStore -Direction Inbound -Action Allow -Program $program -Protocol UDP -LocalPort $ports -Profile Any | Out-Null
 New-NetFirewallRule -Name $names[1] -DisplayName $names[1] -Group $group -PolicyStore PersistentStore -Direction Inbound -Action Allow -Program $program -Protocol TCP -LocalPort $ports -Profile Any | Out-Null
-New-NetFirewallRule -Name $names[2] -DisplayName $names[2] -Group $group -PolicyStore PersistentStore -Direction Inbound -Action Block -Program $program -InterfaceAlias $adapter -Profile Any | Out-Null
 "#;
 
     const REMOVE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
@@ -706,36 +905,48 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
 "#;
 
     /// Runs a fixed script; every variable value is passed through the
-    /// environment, never spliced into the script text.
+    /// environment, never spliced into the script text. A failure carries
+    /// the start of the script's error output.
     fn run_firewall_script(script: &str, values: &[(&str, String)]) -> io::Result<()> {
+        run_script(script, values, "the firewall rules could not be changed")
+    }
+
+    /// Runs a fixed script with `values` in the environment; a failure is
+    /// `failure` followed by the start of the script's error output.
+    fn run_script(script: &str, values: &[(&str, String)], failure: &str) -> io::Result<()> {
         let mut command = native_windows_powershell_command()?;
         command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("ANIX_MESH_GROUP", MESH_FIREWALL_GROUP)
             .env("ANIX_MESH_PREFIX", MESH_FIREWALL_RULE_PREFIX)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         for (name, value) in values {
             command.env(name, value);
         }
-        if !command.status()?.success() {
-            return Err(io::Error::other("the firewall rules could not be changed"));
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "{failure}: {}",
+                script_error(&output.stderr)
+            )));
         }
         Ok(())
     }
 
-    /// Adds the rules of `network`: inbound UDP and TCP to `listen_ports` for
-    /// `program_path`, and a block on inbound traffic to `program_path` that
-    /// arrives on `mesh_adapter`. Rules of the same names left from an
-    /// earlier run are replaced. One guard per network at a time.
+    /// Adds the rules of `network`: a block on inbound traffic to
+    /// `program_path` that arrives on `mesh_adapter`, then inbound UDP and TCP
+    /// to `listen_ports` for `program_path`. Rules of the same names left
+    /// from an earlier run are replaced. One guard per network at a time; a
+    /// network whose rules are still being removed is refused until that
+    /// has finished.
     pub fn add_mesh_firewall_rules(
-        state_dir: &Path,
         network: &str,
         program_path: &Path,
         listen_ports: &[u16],
         mesh_adapter: &str,
     ) -> io::Result<FirewallGuard> {
-        check_state_dir(state_dir)?;
         check_alias(mesh_adapter)?;
         let ports = listen_port_list(listen_ports)?;
         if !program_path.is_absolute() || !program_path.is_file() {
@@ -751,7 +962,7 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
             )
         })?;
         {
-            let mut slot = host(state_dir)?;
+            let mut slot = host()?;
             let host = slot.as_mut().expect("host state was just taken");
             if host.networks.iter().any(|held| held == network) {
                 return Err(io::Error::new(
@@ -764,9 +975,9 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
         let guard = FirewallGuard {
             network: network.to_owned(),
             names: firewall_rule_names(network),
+            removed: false,
         };
-        // A failure part-way drops the guard, which removes what was added.
-        run_firewall_script(
+        let added = run_firewall_script(
             ADD_SCRIPT,
             &[
                 ("ANIX_MESH_NAMES", guard.names.join(",")),
@@ -774,30 +985,42 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
                 ("ANIX_MESH_PROGRAM", program.to_owned()),
                 ("ANIX_MESH_ADAPTER", mesh_adapter.to_owned()),
             ],
-        )?;
+        );
+        if let Err(error) = added {
+            // Remove what was added before returning, not on another thread.
+            let _ = guard.remove();
+            return Err(error);
+        }
         Ok(guard)
     }
 
     /// Puts back what a process that died with guards alive left behind:
-    /// restores forwarding values recorded in `state_dir` (only for
+    /// restores forwarding values recorded in the state directory (only for
     /// interfaces whose GUID still matches) and removes our rules of
     /// [`MESH_FIREWALL_GROUP`]. Call once at start, before any guard is taken,
-    /// and from the uninstaller. A state file that cannot be parsed is set
-    /// aside and the rules are still removed.
-    pub fn recover_mesh_host(state_dir: &Path) -> io::Result<RecoveryReport> {
-        let mut slot = host(state_dir)?;
+    /// and from the uninstaller. A state file that cannot be parsed, or that
+    /// is not owned by SYSTEM or Administrators, is set aside and the rules
+    /// are still removed.
+    pub fn recover_mesh_host() -> io::Result<RecoveryReport> {
+        let mut slot = host()?;
         let host = slot.as_mut().expect("host state was just taken");
-        if !host.holdings.is_empty() || !host.networks.is_empty() {
+        if !host.holdings.is_empty() || !host.networks.is_empty() || !host.nats.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "recovery runs before any guard is taken",
             ));
         }
+        let state_dir = host.dir.clone();
         let mut report = RecoveryReport::default();
-        let state = match read_state(state_dir) {
+        let state = match read_state(&state_dir) {
             Ok(state) => state,
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                let path = state_path(state_dir);
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                let path = state_path(&state_dir);
                 let aside = state_dir.join(format!("{MESH_FORWARDING_STATE_FILE}.corrupt"));
                 let _ = std::fs::remove_file(&aside);
                 std::fs::rename(&path, &aside)?;
@@ -818,10 +1041,137 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
             }
         }
         host.holdings.stuck = kept;
-        write_state(state_dir, &host.holdings.state())?;
+        write_state(&state_dir, &host.holdings.state())?;
         drop(slot);
         report.firewall_cleared = run_firewall_script(CLEAR_SCRIPT, &[]).is_ok();
+        report.nat_cleared = run_script(NAT_CLEAR_SCRIPT, &[], NAT_FAILURE).is_ok();
         Ok(report)
+    }
+
+    const NAT_FAILURE: &str = "the address translation could not be changed";
+
+    const NAT_ADD_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq $env:ANIX_MESH_NAT } | Remove-NetNat -Confirm:$false
+New-NetNat -Name $env:ANIX_MESH_NAT -InternalIPInterfaceAddressPrefix $env:ANIX_MESH_NAT_PREFIX | Out-Null
+"#;
+
+    const NAT_REMOVE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Get-NetNat -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq $env:ANIX_MESH_NAT } | Remove-NetNat -Confirm:$false
+"#;
+
+    const NAT_CLEAR_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Get-NetNat -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name.StartsWith($env:ANIX_MESH_PREFIX + '-', [System.StringComparison]::Ordinal) } |
+  Remove-NetNat -Confirm:$false
+"#;
+
+    /// Holds the WinNAT object of one network. Dropping it removes the object
+    /// on a separate thread; [`NatGuard::remove`] removes it now.
+    #[derive(Debug)]
+    pub struct NatGuard {
+        network: String,
+        name: String,
+        removed: bool,
+    }
+
+    /// Removes the object `name` of `network`, then lets the network be
+    /// added again. A failure is also kept for [`last_firewall_error`].
+    fn remove_nat(network: &str, name: &str) -> io::Result<()> {
+        let result = run_script(
+            NAT_REMOVE_SCRIPT,
+            &[("ANIX_MESH_NAT", name.to_owned())],
+            NAT_FAILURE,
+        );
+        if let Err(error) = &result {
+            *LAST_FIREWALL_ERROR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(format!("{network}: {error}"));
+        }
+        let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(host) = slot.as_mut() {
+            host.nats.retain(|held| held != network);
+        }
+        result
+    }
+
+    impl NatGuard {
+        /// Removes the object now and returns what went wrong, with the start
+        /// of the script's error output.
+        pub fn remove(mut self) -> io::Result<()> {
+            self.removed = true;
+            remove_nat(&self.network, &self.name)
+        }
+    }
+
+    impl Drop for NatGuard {
+        fn drop(&mut self) {
+            if self.removed {
+                return;
+            }
+            let network = std::mem::take(&mut self.network);
+            let name = std::mem::take(&mut self.name);
+            let spawned = std::thread::Builder::new()
+                .name("mesh-nat-remove".into())
+                .spawn({
+                    let network = network.clone();
+                    move || {
+                        let _ = remove_nat(&network, &name);
+                    }
+                });
+            if spawned.is_err() {
+                // No thread: leave the object to the next recovery, but do
+                // not keep the network blocked for the rest of the process.
+                *LAST_FIREWALL_ERROR
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(format!(
+                    "{network}: the address translation is left for the next recovery"
+                ));
+                let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(host) = slot.as_mut() {
+                    host.nats.retain(|held| *held != network);
+                }
+            }
+        }
+    }
+
+    /// Translates the sources of `network`'s IPv4 virtual subnet (the subnet
+    /// holding `address`) to the address of the interface they leave
+    /// through. An object of the same name left from an earlier run is
+    /// replaced. One guard per network at a time. Fails where WinNAT is
+    /// missing or takes no further object (some Windows versions allow one
+    /// per host).
+    pub fn add_mesh_nat(network: &str, address: Ipv4Addr, prefix: u8) -> io::Result<NatGuard> {
+        let internal = nat_prefix(address, prefix)?;
+        {
+            let mut slot = host()?;
+            let host = slot.as_mut().expect("host state was just taken");
+            if host.nats.iter().any(|held| held == network) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the address translation of this network is already held",
+                ));
+            }
+            host.nats.push(network.to_owned());
+        }
+        let guard = NatGuard {
+            network: network.to_owned(),
+            name: nat_name(network),
+            removed: false,
+        };
+        let added = run_script(
+            NAT_ADD_SCRIPT,
+            &[
+                ("ANIX_MESH_NAT", guard.name.clone()),
+                ("ANIX_MESH_NAT_PREFIX", internal),
+            ],
+            NAT_FAILURE,
+        );
+        if let Err(error) = added {
+            // Remove what was added before returning, not on another thread.
+            let _ = guard.remove();
+            return Err(error);
+        }
+        Ok(guard)
     }
 
     #[cfg(test)]
@@ -849,15 +1199,11 @@ Get-NetFirewallRule -PolicyStore PersistentStore -Group $env:ANIX_MESH_GROUP -Er
         }
 
         #[test]
-        fn a_state_directory_outside_the_managed_root_is_refused() {
-            let outside = std::env::temp_dir().join("mesh-host-outside");
-            let error = enable_mesh_forwarding(&outside, "Loopback Pseudo-Interface 1", &[], false)
-                .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-            assert_eq!(
-                recover_mesh_host(&outside).unwrap_err().kind(),
-                io::ErrorKind::PermissionDenied
-            );
+        fn the_interface_table_can_be_read() {
+            // The loopback interface always exists; reading the table and
+            // naming an interface must not fail.
+            forwarding_luids().unwrap();
+            assert!(!luid_alias(u64::MAX).is_empty());
         }
     }
 }
@@ -901,6 +1247,23 @@ mod tests {
     }
 
     #[test]
+    fn translation_objects_are_named_and_cover_the_virtual_subnet() {
+        assert_eq!(nat_name("office-1"), "AnixOpsMesh-office-1");
+        assert!(nat_name("a,b").starts_with("AnixOpsMesh-a_b-"));
+        assert_eq!(
+            nat_prefix(Ipv4Addr::new(10, 144, 3, 7), 24).unwrap(),
+            "10.144.3.0/24"
+        );
+        assert_eq!(
+            nat_prefix(Ipv4Addr::new(100, 100, 255, 1), 10).unwrap(),
+            "100.64.0.0/10"
+        );
+        assert!(nat_prefix(Ipv4Addr::new(10, 0, 0, 1), 0).is_err());
+        assert!(nat_prefix(Ipv4Addr::new(10, 0, 0, 1), 31).is_err());
+        assert!(nat_prefix(Ipv4Addr::new(10, 0, 0, 1), 32).is_err());
+    }
+
+    #[test]
     fn listen_ports_are_sorted_and_deduplicated() {
         assert_eq!(
             listen_port_list(&[11010, 0, 443, 11010]).unwrap(),
@@ -924,16 +1287,21 @@ mod tests {
     }
 
     #[test]
-    fn the_state_directory_must_be_under_the_managed_root() {
-        let root = crate::managed_files::windows_managed_root_directory();
-        assert!(check_state_dir(&root.join("mesh")).is_ok());
-        assert_eq!(
-            check_state_dir(&std::env::temp_dir().join("mesh"))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::PermissionDenied
-        );
-        assert!(check_state_dir(&root.join("..").join("elsewhere")).is_err());
+    fn the_state_directory_is_fixed_under_the_managed_root() {
+        let dir = mesh_host_state_dir();
+        assert!(crate::managed_files::is_within_managed_root(&dir));
+        assert!(dir.ends_with(MESH_HOST_STATE_DIR));
+        assert!(MESH_HOST_MUTEX.starts_with(r"Global\"));
+    }
+
+    #[test]
+    fn script_errors_are_cut_and_kept() {
+        assert_eq!(script_error(b"  denied\r\n"), "denied");
+        assert_eq!(script_error(&[b'x'; 2000]).len(), MAX_SCRIPT_ERROR);
+        // Cutting inside a multi-byte character stays valid text.
+        let mut bytes = vec![b'x'; MAX_SCRIPT_ERROR - 1];
+        bytes.extend_from_slice("办".as_bytes());
+        assert!(script_error(&bytes).starts_with('x'));
     }
 
     #[test]
@@ -971,6 +1339,44 @@ mod tests {
     }
 
     #[test]
+    fn a_new_hold_takes_the_original_from_a_stuck_record() {
+        let mut holdings = Holdings::default();
+        holdings.stuck.push(ForwardingEntry {
+            luid: 7,
+            guid: "{g7}".into(),
+            family: IpFamily::Ipv4,
+            original: false,
+        });
+        // The interface still forwards because its restore failed; the
+        // recorded original wins over the current value.
+        assert!(holdings.hold(7, "{g7}", IpFamily::Ipv4, || panic!("read current")));
+        assert!(holdings.stuck.is_empty());
+        assert_eq!(holdings.state().entries.len(), 1);
+        assert!(!holdings.release(7, IpFamily::Ipv4).unwrap().original);
+    }
+
+    #[test]
+    fn a_stuck_record_of_another_interface_is_dropped_on_hold() {
+        let mut holdings = Holdings::default();
+        holdings.stuck.push(ForwardingEntry {
+            luid: 7,
+            guid: "{old}".into(),
+            family: IpFamily::Ipv4,
+            original: false,
+        });
+        holdings.stuck.push(ForwardingEntry {
+            luid: 7,
+            guid: "{g7}".into(),
+            family: IpFamily::Ipv6,
+            original: false,
+        });
+        assert!(!holdings.hold(7, "{g7}", IpFamily::Ipv4, || true));
+        assert_eq!(holdings.stuck.len(), 1);
+        assert_eq!(holdings.stuck[0].family, IpFamily::Ipv6);
+        assert_eq!(holdings.luids(), vec![7]);
+    }
+
+    #[test]
     fn the_state_format_round_trips() {
         let state = ForwardingState {
             entries: vec![
@@ -1004,22 +1410,28 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn other_systems_refuse_host_changes() {
-        let dir = std::env::temp_dir();
         assert_eq!(
-            enable_mesh_forwarding(&dir, "mesh0", &[], false)
+            enable_mesh_forwarding("mesh0", &[], false)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
         );
         assert_eq!(
-            add_mesh_firewall_rules(&dir, "n", Path::new("/bin/true"), &[1], "mesh0")
+            add_mesh_firewall_rules("n", Path::new("/bin/true"), &[1], "mesh0")
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
         );
         assert_eq!(
-            recover_mesh_host(&dir).unwrap_err().kind(),
+            recover_mesh_host().unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
+        assert_eq!(
+            add_mesh_nat("n", Ipv4Addr::new(10, 0, 0, 1), 24)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(last_firewall_error().is_none());
     }
 }

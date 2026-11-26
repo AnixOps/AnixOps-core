@@ -4,7 +4,7 @@
 //! installers (requirements R12, R13, R15, R31): finding an existing mesh
 //! program on the machine, importing its configuration into ours with a
 //! report, and taking it over with a recorded, reversible procedure. The
-//! node itself (`run`, Linux only) drives the mesh module's socket driver
+//! node itself (`run`, Linux, macOS and Windows) drives the mesh module's socket driver
 //! over a TUN interface ([`serve`], [`tun`]). The kernel's management API
 //! runs the networks a node agent sends through [`managed`] the same way,
 //! one interface each.
@@ -19,7 +19,13 @@ pub mod detect;
 pub mod device;
 #[cfg(target_os = "linux")]
 pub mod device_run;
+#[cfg(target_os = "macos")]
+pub mod forward_macos;
+#[cfg(windows)]
+pub mod forward_windows;
 pub mod host;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod host_routes;
 #[cfg(target_os = "linux")]
 pub mod https;
 pub mod import;
@@ -31,11 +37,19 @@ pub mod managed;
 pub mod net;
 pub mod profile;
 pub mod report;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub mod serve;
+#[cfg(windows)]
+pub mod service_windows;
 pub mod source;
 pub mod takeover;
 #[cfg(target_os = "linux")]
+pub mod tun;
+#[cfg(target_os = "macos")]
+#[path = "tun_macos.rs"]
+pub mod tun;
+#[cfg(windows)]
+#[path = "tun_windows.rs"]
 pub mod tun;
 pub mod winstart;
 pub mod winsvc;
