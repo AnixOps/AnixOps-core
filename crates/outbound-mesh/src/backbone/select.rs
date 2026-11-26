@@ -416,13 +416,13 @@ mod tests {
             "id": 31,
             "region": "cn",
             "members": [
-                { "id": 31, "region": "cn", "link": {} },
-                { "id": 32, "region": "cn", "link": {} },
-                { "id": 21, "region": "ap", "link": {} },
-                { "id": 22, "region": "ap", "link": {} },
-                { "id": 11, "region": "eu", "link": {} },
-                { "id": 12, "region": "eu", "link": {} },
-                { "id": 41, "region": "na", "link": {} }
+                { "id": 31, "region": "cn", "link": { "kind": "k" } },
+                { "id": 32, "region": "cn", "link": { "kind": "k" } },
+                { "id": 21, "region": "ap", "link": { "kind": "k" } },
+                { "id": 22, "region": "ap", "link": { "kind": "k" } },
+                { "id": 11, "region": "eu", "link": { "kind": "k" } },
+                { "id": 12, "region": "eu", "link": { "kind": "k" } },
+                { "id": 41, "region": "na", "link": { "kind": "k" } }
             ],
             "policy": {
                 "deny_link": [["cn", "eu"], ["cn", "na"]],
