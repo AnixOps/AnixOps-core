@@ -1124,6 +1124,11 @@ fn network_status(instance: &Instance) -> ManagedNetworkStatus {
         }
     }
     let mut status = ManagedNetworkStatus::stopped(instance.tag.clone(), "");
+    // Skipped entries are known from the configuration alone, also while
+    // the network waits or was refused.
+    if instance.settings.dns.enabled {
+        status.refused_names = instance.settings.dns.refused.clone();
+    }
     status.forward_secrecy = instance.settings.security.has_forward_secrecy();
     match &instance.state {
         State::Waiting(detail) => {
@@ -1198,6 +1203,11 @@ fn fill_running(
 ) {
     status.running = true;
     status.address = Some(settings.address);
+    // Names only while they are on (spec §15.9.2 item 8).
+    if let Some(names) = snapshot.names.as_ref().filter(|names| names.enabled()) {
+        status.names = names.entries().to_vec();
+        status.refused_names = names.refused().to_vec();
+    }
     let address_of = |peer: u32| -> Option<IpAddr> {
         snapshot
             .members
@@ -1861,6 +1871,54 @@ mod tests {
         assert!(!same_but_hot(&grouped, &renamed));
         assert_eq!(waiting_detail(&base), "empty");
         assert_eq!(waiting_detail(&listed), "self_missing");
+    }
+
+    #[test]
+    fn a_running_status_lists_names_and_skipped_entries_only_while_on() {
+        use outbound_mesh::dns::{DnsConfig, NameSource, Names, NetworkView};
+        let base = settings();
+        let subnets = base.virtual_subnets();
+        let build = |enabled: bool| {
+            let config: DnsConfig = serde_json::from_value(serde_json::json!({
+                "enabled": enabled,
+                "names": [
+                    { "name": "web.cn", "address": "10.150.0.7" },
+                    { "name": "far.cn", "address": "8.8.8.8" },
+                ],
+            }))
+            .unwrap();
+            let dns = config.validate(&subnets).unwrap();
+            let names = Names::build(
+                &dns,
+                &NetworkView {
+                    virtual_subnets: &subnets,
+                    host_groups: &[],
+                    local_addresses: &[],
+                    own_hostname: None,
+                    members: &[],
+                },
+            );
+            Snapshot {
+                names: Some(Arc::new(names)),
+                ..Snapshot::default()
+            }
+        };
+        let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut status, &base, &build(true), Duration::ZERO);
+        assert_eq!(status.names.len(), 1);
+        assert_eq!(status.names[0].name, "web.cn");
+        assert_eq!(status.names[0].source, NameSource::Panel);
+        assert_eq!(status.refused_names.len(), 1);
+        assert_eq!(status.refused_names[0].name, "far.cn");
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["names"][0]["source"], "panel");
+        assert_eq!(json["refusedNames"][0]["reason"], "not_intranet");
+
+        let mut off = ManagedNetworkStatus::stopped("mesh-cn", "");
+        fill_running(&mut off, &base, &build(false), Duration::ZERO);
+        assert!(off.names.is_empty() && off.refused_names.is_empty());
+        let json = serde_json::to_value(&off).unwrap();
+        assert!(json.get("names").is_none() && json.get("refusedNames").is_none());
     }
 
     #[test]
