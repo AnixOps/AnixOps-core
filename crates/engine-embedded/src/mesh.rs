@@ -80,7 +80,9 @@ impl MeshBinding {
     /// Only the runtime of the profile the user runs may call it: a
     /// runtime started for anything else in the same process (a
     /// diagnostic, say) would stop every network that profile did not
-    /// list, and saved networks of another device ID than its own. Today only the iOS bridge creates runtimes, one per profile.
+    /// list, and saved networks that carry another device ID than its
+    /// own (saved networks without an ID keep running). Today only the
+    /// iOS bridge creates runtimes, one per profile.
     pub(crate) fn commit(&self) {
         // The tunnel runs (again): a runtime started after a stop may hold
         // the engine once more.
