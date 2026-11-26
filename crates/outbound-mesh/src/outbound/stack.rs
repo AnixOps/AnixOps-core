@@ -1,0 +1,813 @@
+//! One mesh network inside the engine: the [`driver`](crate::driver) for the
+//! network, and the node's private userspace TCP/IP stack (smoltcp) that
+//! holds this node's virtual addresses in place of a virtual interface.
+//!
+//! The network starts with the first connection ([`Instance::ensure_running`])
+//! or when the engine asks for it ([`Instance::start`]), and runs until the
+//! instance is dropped: a mesh node also carries other members' traffic
+//! (relay) and keeps its routes synchronised, so it does not stop when it
+//! has no connection of its own. The stack outlives a driver that stopped on
+//! an error; the next connection starts a new one.
+//!
+//! The pump task moves packets between the stack and the driver. It holds
+//! the instance only weakly, so dropping the last outbound that uses the
+//! network stops the pump, and dropping the shutdown sender stops the
+//! driver.
+
+use std::collections::{HashSet, VecDeque};
+use std::hash::{BuildHasher, Hasher};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::task::Poll as TaskPoll;
+use std::time::{Duration, Instant};
+
+use ring::rand::SystemRandom;
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::{tcp, udp, AnySocket};
+use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use tokio::sync::{mpsc, watch, Notify};
+
+use crate::driver::{self, Channels, Listeners, Snapshot};
+use crate::secure::noise::KeyPair;
+use crate::{IpNet, MeshSettings};
+
+/// The longest the pump sleeps without a packet or a socket change.
+const MAX_SLEEP: Duration = Duration::from_millis(250);
+/// A closed TCP socket is removed after this long even without a final ACK.
+const LINGER: Duration = Duration::from_secs(30);
+/// Packets from the driver queued for the stack between two polls.
+const STACK_QUEUE: usize = 1024;
+/// Packets between the pump and the driver, each way.
+const CHANNEL_PACKETS: usize = 1024;
+const UDP_PACKETS: usize = 32;
+pub(crate) const UDP_BUFFER: usize = 16 * 1024;
+const TCP_RECEIVE_BUFFER: usize = 256 * 1024;
+const TCP_SEND_BUFFER: usize = 256 * 1024;
+const FIRST_LOCAL_PORT: u16 = 49152;
+
+/// Packet queues between the stack and the driver.
+struct QueueDevice {
+    rx: VecDeque<Vec<u8>>,
+    tx: VecDeque<Vec<u8>>,
+    mtu: usize,
+}
+
+impl Device for QueueDevice {
+    type RxToken<'a> = QueueRx;
+    type TxToken<'a> = QueueTx<'a>;
+
+    fn receive(&mut self, _now: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let packet = self.rx.pop_front()?;
+        Some((QueueRx(packet), QueueTx(&mut self.tx)))
+    }
+
+    fn transmit(&mut self, _now: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(QueueTx(&mut self.tx))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.medium = Medium::Ip;
+        capabilities.max_transmission_unit = self.mtu;
+        capabilities
+    }
+}
+
+struct QueueRx(Vec<u8>);
+
+impl RxToken for QueueRx {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.0)
+    }
+}
+
+struct QueueTx<'a>(&'a mut VecDeque<Vec<u8>>);
+
+impl TxToken for QueueTx<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut packet = vec![0u8; len];
+        let result = f(&mut packet);
+        self.0.push_back(packet);
+        result
+    }
+}
+
+/// The private stack with this node's virtual addresses.
+struct Stack {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    device: QueueDevice,
+    /// TCP sockets whose stream was dropped, waiting for the close to finish.
+    closing: Vec<(SocketHandle, Instant)>,
+}
+
+impl Stack {
+    fn new(settings: &MeshSettings, now: SmolInstant, seed: u64) -> Self {
+        let mut device = QueueDevice {
+            rx: VecDeque::new(),
+            tx: VecDeque::new(),
+            mtu: usize::from(settings.mtu),
+        };
+        let mut config = Config::new(HardwareAddress::Ip);
+        config.random_seed = seed;
+        let mut iface = Interface::new(config, &mut device, now);
+        let addresses = settings.local_addresses();
+        iface.update_ip_addrs(|addrs| {
+            for address in &addresses {
+                let cidr = match address {
+                    IpAddr::V4(v4) => IpCidr::new(IpAddress::Ipv4(*v4), 32),
+                    IpAddr::V6(v6) => IpCidr::new(IpAddress::Ipv6(*v6), 128),
+                };
+                let _ = addrs.push(cidr);
+            }
+        });
+        // Every destination is behind the driver, which checks it against
+        // the mesh routes again; an IP medium needs no neighbour, so the
+        // gateway is only a placeholder.
+        for address in &addresses {
+            match address {
+                IpAddr::V4(v4) => {
+                    let _ = iface.routes_mut().add_default_ipv4_route(*v4);
+                }
+                IpAddr::V6(v6) => {
+                    let _ = iface.routes_mut().add_default_ipv6_route(*v6);
+                }
+            }
+        }
+        Self {
+            iface,
+            sockets: SocketSet::new(Vec::new()),
+            device,
+            closing: Vec::new(),
+        }
+    }
+
+    /// Ends every connection, waking their tasks.
+    fn abort_all(&mut self) {
+        for (_, socket) in self.sockets.iter_mut() {
+            match socket {
+                smoltcp::socket::Socket::Tcp(socket) => socket.abort(),
+                smoltcp::socket::Socket::Udp(socket) => socket.close(),
+                #[allow(unreachable_patterns)]
+                _ => {}
+            }
+        }
+        self.device.rx.clear();
+        self.device.tx.clear();
+    }
+
+    fn sweep(&mut self, now: Instant) {
+        let sockets = &mut self.sockets;
+        self.closing.retain(|(handle, since)| {
+            let socket = sockets.get_mut::<tcp::Socket>(*handle);
+            let done = matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait);
+            if done || now.saturating_duration_since(*since) > LINGER {
+                socket.abort();
+                sockets.remove(*handle);
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+/// Why connections cannot use the network now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// A `managed` network whose `native_keys` do not list this node yet
+    /// (spec §8.3.1): it opens no link until they do.
+    NativeKeysPending,
+    /// A listening port of the network is in use.
+    PortInUse,
+    /// The driver stopped on an error.
+    Stopped,
+}
+
+impl Failure {
+    /// The `network.failure.code` of the status (`mesh-status.md`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NativeKeysPending => "native_keys_pending",
+            Self::PortInUse => "port_in_use",
+            Self::Stopped => "start_refused",
+        }
+    }
+
+    fn error(self) -> io::Error {
+        match self {
+            Self::NativeKeysPending => io::Error::new(
+                io::ErrorKind::NotConnected,
+                "mesh network is waiting for its key list",
+            ),
+            Self::PortInUse => io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "mesh network listening port is in use",
+            ),
+            Self::Stopped => io::Error::new(io::ErrorKind::NotConnected, "mesh network stopped"),
+        }
+    }
+}
+
+struct Core {
+    stack: Stack,
+    /// Identifies the current driver; 0 before the first one.
+    run: u64,
+    running: bool,
+    failure: Option<Failure>,
+    /// Stops the current driver when dropped or set.
+    shutdown: Option<watch::Sender<bool>>,
+    /// The packets out of the stack go here, to the driver.
+    to_driver: Option<mpsc::Sender<Vec<u8>>>,
+    /// Networks of this machine; `None` until the engine reads them, and
+    /// then no advertised subnet is routed (spec §15.4).
+    local_networks: watch::Sender<Option<Vec<IpNet>>>,
+    route_overrides: watch::Sender<Vec<IpNet>>,
+    native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    next_port: u16,
+}
+
+/// One network: its settings, static key, stack and driver.
+pub struct Instance {
+    settings: MeshSettings,
+    static_key: KeyPair,
+    core: Mutex<Core>,
+    /// Shared with the pump, which holds the instance only weakly.
+    wake: Arc<Notify>,
+    snapshot: watch::Sender<Snapshot>,
+    epoch: Instant,
+}
+
+impl Instance {
+    /// A stopped network. Without `node.private_key` a key is made for
+    /// this instance only: a client that must keep its key (a `managed`
+    /// network lists it in `native_keys`) passes it in the configuration.
+    pub fn new(settings: MeshSettings) -> io::Result<Arc<Self>> {
+        let static_key = match &settings.private_key {
+            Some(private) => KeyPair::from_private(**private),
+            None => KeyPair::generate(&SystemRandom::new())
+                .map_err(|_| io::Error::other("mesh static key could not be made"))?,
+        };
+        let epoch = Instant::now();
+        let stack = Stack::new(&settings, SmolInstant::from_micros(0), random());
+        let next_port = FIRST_LOCAL_PORT + (random() % 16384) as u16;
+        let (local_networks, _) = watch::channel(None);
+        let (route_overrides, _) = watch::channel(Vec::new());
+        let (native_keys, _) = watch::channel(settings.native_keys.clone());
+        let (snapshot, _) = watch::channel(Snapshot::default());
+        Ok(Arc::new(Self {
+            settings,
+            static_key,
+            core: Mutex::new(Core {
+                stack,
+                run: 0,
+                running: false,
+                failure: None,
+                shutdown: None,
+                to_driver: None,
+                local_networks,
+                route_overrides,
+                native_keys,
+                next_port,
+            }),
+            wake: Arc::new(Notify::new()),
+            snapshot,
+            epoch,
+        }))
+    }
+
+    pub fn settings(&self) -> &MeshSettings {
+        &self.settings
+    }
+
+    /// This node's static public key in the network (spec §8.1).
+    pub fn static_public_key(&self) -> [u8; 32] {
+        self.static_key.public()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Core> {
+        // The lock is never held across an await; a poisoned lock only means
+        // a panic in smoltcp, and the state is still usable.
+        self.core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn now(&self) -> SmolInstant {
+        let micros = Instant::now()
+            .saturating_duration_since(self.epoch)
+            .as_micros();
+        SmolInstant::from_micros(i64::try_from(micros).unwrap_or(i64::MAX))
+    }
+
+    /// Asks the pump to poll the stack, after a socket changed.
+    pub(crate) fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// The driver's state after its last tick.
+    pub fn snapshot(&self) -> watch::Receiver<Snapshot> {
+        self.snapshot.subscribe()
+    }
+
+    /// Whether a driver runs, and why the last one could not.
+    pub fn state(&self) -> (bool, Option<Failure>) {
+        let core = self.lock();
+        (core.running, core.failure)
+    }
+
+    /// The networks of this machine's interfaces, read by the engine.
+    pub fn set_local_networks(&self, networks: Option<Vec<IpNet>>) {
+        self.lock().local_networks.send_replace(networks);
+    }
+
+    /// Subnets the user routes through the mesh although they overlap a
+    /// network of this machine (spec §15.4).
+    pub fn set_route_overrides(&self, overrides: Vec<IpNet>) {
+        self.lock().route_overrides.send_replace(overrides);
+    }
+
+    /// Starts the network if it does not run; needs a Tokio runtime.
+    pub fn start(self: &Arc<Self>) {
+        let _ = self.ensure_running();
+    }
+
+    /// Starts a driver unless one runs. Fails at once for a network that
+    /// waits for its key list.
+    pub(crate) fn ensure_running(self: &Arc<Self>) -> io::Result<()> {
+        if self
+            .settings
+            .waits_for_native_keys(&self.static_key.public())
+        {
+            self.lock().failure = Some(Failure::NativeKeysPending);
+            return Err(Failure::NativeKeysPending.error());
+        }
+        let run = {
+            let mut core = self.lock();
+            if core.running {
+                return Ok(());
+            }
+            core.running = true;
+            core.run += 1;
+            core.failure = None;
+            core.run
+        };
+        tokio::spawn(start_driver(self.clone(), run));
+        Ok(())
+    }
+
+    /// The error a connection gets while no driver runs.
+    fn not_running(&self) -> io::Error {
+        self.lock().failure.unwrap_or(Failure::Stopped).error()
+    }
+
+    /// Whether connections may go to `address`: a virtual address of the
+    /// network other than this node's own, or an address in a subnet the
+    /// driver routes now. Anything else is refused before a packet is sent.
+    pub fn reaches(&self, address: IpAddr) -> bool {
+        if self.settings.local_addresses().contains(&address) {
+            return false;
+        }
+        self.settings
+            .virtual_subnets()
+            .iter()
+            .any(|subnet| subnet.contains(address))
+            || self
+                .snapshot
+                .borrow()
+                .system_routes
+                .iter()
+                .any(|subnet| subnet.contains(address))
+    }
+
+    /// Runs `f` on a socket of the stack.
+    pub(crate) fn with_socket<T, R>(&self, handle: SocketHandle, f: impl FnOnce(&mut T) -> R) -> R
+    where
+        T: AnySocket<'static>,
+    {
+        let mut core = self.lock();
+        f(core.stack.sockets.get_mut::<T>(handle))
+    }
+
+    /// Starts a TCP connection to `remote`.
+    pub(crate) fn open_tcp(&self, remote: SocketAddr) -> io::Result<SocketHandle> {
+        let mut guard = self.lock();
+        if !guard.running {
+            drop(guard);
+            return Err(self.not_running());
+        }
+        let core = &mut *guard;
+        let port = allocate_port(&mut core.next_port, &core.stack.sockets)?;
+        let mut socket = new_tcp_socket();
+        socket
+            .connect(core.stack.iface.context(), endpoint(remote), port)
+            .map_err(|_| unreachable_address())?;
+        Ok(core.stack.sockets.add(socket))
+    }
+
+    /// Listens for one TCP connection on `port`; for tests that pass
+    /// traffic between two nodes.
+    pub(crate) fn listen_tcp(&self, port: u16) -> io::Result<SocketHandle> {
+        let mut core = self.lock();
+        let mut socket = new_tcp_socket();
+        socket
+            .listen(port)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mesh cannot listen there"))?;
+        Ok(core.stack.sockets.add(socket))
+    }
+
+    /// Binds a UDP socket on `port` or an ephemeral one.
+    pub(crate) fn open_udp(&self, port: Option<u16>) -> io::Result<SocketHandle> {
+        let mut guard = self.lock();
+        let core = &mut *guard;
+        let port = match port {
+            Some(port) if udp_port_bound(&core.stack.sockets, port) => {
+                return Err(udp_port_unavailable())
+            }
+            Some(port) => port,
+            None => allocate_port(&mut core.next_port, &core.stack.sockets)?,
+        };
+        let buffer = || {
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                vec![0u8; UDP_BUFFER],
+            )
+        };
+        let mut socket = udp::Socket::new(buffer(), buffer());
+        socket.bind(port).map_err(|_| udp_port_unavailable())?;
+        Ok(core.stack.sockets.add(socket))
+    }
+
+    /// Closes a TCP socket gracefully; it is removed once the close finishes.
+    pub(crate) fn release_tcp(&self, handle: SocketHandle) {
+        {
+            let mut core = self.lock();
+            core.stack.sockets.get_mut::<tcp::Socket>(handle).close();
+            core.stack.closing.push((handle, Instant::now()));
+        }
+        self.wake();
+    }
+
+    pub(crate) fn release_udp(&self, handle: SocketHandle) {
+        self.lock().stack.sockets.remove(handle);
+    }
+
+    /// Polls the stack and hands its packets to the driver. Returns how
+    /// long the pump may sleep, or `None` when the driver `run` is over.
+    fn poll(&self, run: u64) -> Option<Duration> {
+        let now = Instant::now();
+        let timestamp = self.now();
+        let mut guard = self.lock();
+        let core = &mut *guard;
+        if core.run != run || !core.running {
+            return None;
+        }
+        let stack = &mut core.stack;
+        stack
+            .iface
+            .poll(timestamp, &mut stack.device, &mut stack.sockets);
+        stack.sweep(now);
+        if let Some(to_driver) = &core.to_driver {
+            while let Some(packet) = stack.device.tx.pop_front() {
+                // A full queue drops the packet as a congested link would;
+                // TCP retransmits.
+                let _ = to_driver.try_send(packet);
+            }
+        } else {
+            stack.device.tx.clear();
+        }
+        let delay = stack
+            .iface
+            .poll_delay(timestamp, &stack.sockets)
+            .map(|next| Duration::from_micros(next.total_micros()))
+            .unwrap_or(MAX_SLEEP)
+            .min(MAX_SLEEP);
+        Some(delay)
+    }
+
+    /// Queues packets the driver delivered for this node.
+    fn deliver(&self, packets: impl IntoIterator<Item = Vec<u8>>) {
+        let mut core = self.lock();
+        for packet in packets {
+            if core.stack.device.rx.len() < STACK_QUEUE {
+                core.stack.device.rx.push_back(packet);
+            }
+        }
+    }
+
+    /// Ends the driver `run`, failing every connection.
+    fn stopped(&self, run: u64, failure: Failure) {
+        let mut core = self.lock();
+        if core.run != run {
+            return;
+        }
+        core.running = false;
+        core.failure = Some(failure);
+        core.shutdown = None;
+        core.to_driver = None;
+        core.stack.abort_all();
+    }
+}
+
+/// Binds the listeners, then runs the driver and the pump for `run`.
+async fn start_driver(instance: Arc<Instance>, run: u64) {
+    let settings = instance.settings.clone();
+    let listeners = match Listeners::bind(&settings).await {
+        Ok(listeners) => listeners,
+        Err(_) => {
+            instance.stopped(run, Failure::PortInUse);
+            return;
+        }
+    };
+    let (to_driver, from_interface) = mpsc::channel(CHANNEL_PACKETS);
+    let (to_interface, from_driver) = mpsc::channel(CHANNEL_PACKETS);
+    let (shutdown_tx, shutdown) = watch::channel(false);
+    // The engine does not read other programs' routes: its stack is not the
+    // system's, so they never compete with the mesh routes.
+    let (foreign_routes_tx, foreign_routes) = watch::channel(Vec::new());
+    let channels = {
+        let mut core = instance.lock();
+        if core.run != run || !core.running {
+            return;
+        }
+        core.shutdown = Some(shutdown_tx);
+        core.to_driver = Some(to_driver);
+        Channels {
+            from_interface,
+            to_interface,
+            snapshots: instance.snapshot.clone(),
+            local_networks: core.local_networks.subscribe(),
+            native_keys: core.native_keys.subscribe(),
+            route_overrides: core.route_overrides.subscribe(),
+            foreign_routes,
+            shutdown,
+            border: None,
+        }
+    };
+    let key = KeyPair::from_private(*instance.static_key.private());
+    let weak = Arc::downgrade(&instance);
+    let wake = instance.wake.clone();
+    drop(instance);
+    tokio::spawn(pump(weak.clone(), wake, run, from_driver));
+    let result = driver::run(settings, key, listeners, channels).await;
+    drop(foreign_routes_tx);
+    // The driver only ends on its own after an error: a shutdown comes from
+    // dropping the instance, and then nobody is left to tell.
+    let _ = result;
+    if let Some(instance) = weak.upgrade() {
+        instance.stopped(run, Failure::Stopped);
+    }
+}
+
+/// Moves packets between the stack and the driver until the run ends or
+/// the instance is dropped.
+async fn pump(
+    instance: Weak<Instance>,
+    wake: Arc<Notify>,
+    run: u64,
+    mut from_driver: mpsc::Receiver<Vec<u8>>,
+) {
+    loop {
+        let delay = {
+            let Some(instance) = instance.upgrade() else {
+                return;
+            };
+            match instance.poll(run) {
+                Some(delay) => delay,
+                None => return,
+            }
+        };
+        tokio::select! {
+            packet = from_driver.recv() => {
+                let Some(packet) = packet else {
+                    // The driver ended; `start_driver` records why.
+                    return;
+                };
+                let mut packets = vec![packet];
+                while packets.len() < STACK_QUEUE {
+                    match from_driver.try_recv() {
+                        Ok(packet) => packets.push(packet),
+                        Err(_) => break,
+                    }
+                }
+                let Some(instance) = instance.upgrade() else {
+                    return;
+                };
+                instance.deliver(packets);
+            }
+            _ = wake.notified() => {}
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+fn endpoint(address: SocketAddr) -> IpEndpoint {
+    let ip = match address.ip() {
+        IpAddr::V4(v4) => IpAddress::Ipv4(v4),
+        IpAddr::V6(v6) => IpAddress::Ipv6(v6),
+    };
+    IpEndpoint::new(ip, address.port())
+}
+
+fn new_tcp_socket() -> tcp::Socket<'static> {
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; TCP_RECEIVE_BUFFER]),
+        tcp::SocketBuffer::new(vec![0u8; TCP_SEND_BUFFER]),
+    );
+    socket.set_nagle_enabled(false);
+    socket.set_keep_alive(Some(SmolDuration::from_secs(30)));
+    socket.set_timeout(Some(SmolDuration::from_secs(120)));
+    socket
+}
+
+/// The port after `port` in the local range, wrapping from 65535 to
+/// [`FIRST_LOCAL_PORT`].
+fn following_port(port: u16) -> u16 {
+    if port == u16::MAX {
+        FIRST_LOCAL_PORT
+    } else {
+        port + 1
+    }
+}
+
+fn udp_port_bound(sockets: &SocketSet<'static>, port: u16) -> bool {
+    sockets.iter().any(|(_, socket)| {
+        udp::Socket::downcast(socket).is_some_and(|socket| socket.endpoint().port == port)
+    })
+}
+
+/// The local ports the sockets hold: bound UDP sockets, and TCP sockets
+/// connected or listening.
+fn ports_in_use(sockets: &SocketSet<'static>) -> HashSet<u16> {
+    let mut used = HashSet::new();
+    for (_, socket) in sockets.iter() {
+        if let Some(socket) = udp::Socket::downcast(socket) {
+            let port = socket.endpoint().port;
+            if port != 0 {
+                used.insert(port);
+            }
+        } else if let Some(socket) = tcp::Socket::downcast(socket) {
+            if let Some(local) = socket.local_endpoint() {
+                used.insert(local.port);
+            }
+            let listening = socket.listen_endpoint().port;
+            if listening != 0 {
+                used.insert(listening);
+            }
+        }
+    }
+    used
+}
+
+/// The first free local port from `*next` on, wrapping once through the
+/// range; `*next` moves past it.
+fn allocate_port(next: &mut u16, sockets: &SocketSet<'static>) -> io::Result<u16> {
+    let used = ports_in_use(sockets);
+    let span = u32::from(u16::MAX - FIRST_LOCAL_PORT) + 1;
+    let mut port = (*next).max(FIRST_LOCAL_PORT);
+    for _ in 0..span {
+        if !used.contains(&port) {
+            *next = following_port(port);
+            return Ok(port);
+        }
+        port = following_port(port);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "mesh has no free local port",
+    ))
+}
+
+pub(crate) fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionReset, "mesh connection was closed")
+}
+
+pub(crate) fn unreachable_address() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "mesh cannot reach this address",
+    )
+}
+
+fn udp_port_unavailable() -> io::Error {
+    io::Error::new(io::ErrorKind::AddrInUse, "mesh udp port is unavailable")
+}
+
+/// Process-local randomness for ports and the stack seed; none of it needs
+/// to be unpredictable.
+fn random() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
+}
+
+/// A UDP socket of the private stack; removed when dropped.
+pub(crate) struct UdpHandle {
+    instance: Arc<Instance>,
+    handle: SocketHandle,
+}
+
+impl UdpHandle {
+    pub(crate) fn open(instance: &Arc<Instance>, port: Option<u16>) -> io::Result<Self> {
+        let handle = instance.open_udp(port)?;
+        Ok(Self {
+            instance: instance.clone(),
+            handle,
+        })
+    }
+
+    pub(crate) async fn send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<()> {
+        if payload.len() > UDP_BUFFER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "datagram is too large",
+            ));
+        }
+        let target = endpoint(target);
+        std::future::poll_fn(|cx| {
+            self.instance
+                .with_socket::<udp::Socket, _>(self.handle, |socket| {
+                    if !socket.is_open() {
+                        return TaskPoll::Ready(Err(closed()));
+                    }
+                    match socket.send_slice(payload, target) {
+                        Ok(()) => TaskPoll::Ready(Ok(())),
+                        Err(udp::SendError::BufferFull) => {
+                            socket.register_send_waker(cx.waker());
+                            TaskPoll::Pending
+                        }
+                        Err(_) => TaskPoll::Ready(Err(unreachable_address())),
+                    }
+                })
+        })
+        .await?;
+        self.instance.wake();
+        Ok(())
+    }
+
+    pub(crate) async fn recv(&self) -> io::Result<Vec<u8>> {
+        std::future::poll_fn(|cx| {
+            self.instance
+                .with_socket::<udp::Socket, _>(self.handle, |socket| {
+                    if !socket.is_open() {
+                        return TaskPoll::Ready(Err(closed()));
+                    }
+                    match socket.recv() {
+                        Ok((payload, _)) => TaskPoll::Ready(Ok(payload.to_vec())),
+                        Err(_) => {
+                            socket.register_recv_waker(cx.waker());
+                            TaskPoll::Pending
+                        }
+                    }
+                })
+        })
+        .await
+    }
+}
+
+impl Drop for UdpHandle {
+    fn drop(&mut self) {
+        self.instance.release_udp(self.handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bound_udp(port: u16) -> udp::Socket<'static> {
+        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 1], vec![0u8; 64]);
+        let mut socket = udp::Socket::new(buffer(), buffer());
+        socket.bind(port).unwrap();
+        socket
+    }
+
+    #[test]
+    fn local_ports_skip_sockets_still_open_and_wrap() {
+        let mut sockets: SocketSet<'static> = SocketSet::new(Vec::new());
+        sockets.add(bound_udp(50000));
+        let mut next = 50000;
+        assert_eq!(allocate_port(&mut next, &sockets).unwrap(), 50001);
+        assert_eq!(next, 50002);
+        sockets.add(bound_udp(FIRST_LOCAL_PORT));
+        let mut next = u16::MAX;
+        assert_eq!(allocate_port(&mut next, &sockets).unwrap(), u16::MAX);
+        assert_eq!(
+            allocate_port(&mut next, &sockets).unwrap(),
+            FIRST_LOCAL_PORT + 1
+        );
+        assert!(udp_port_bound(&sockets, 50000));
+        assert!(!udp_port_bound(&sockets, 50001));
+    }
+}
