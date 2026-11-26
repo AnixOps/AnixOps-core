@@ -8,7 +8,7 @@
 
 | 子命令 | 作用 | 退出码 |
 | --- | --- | --- |
-| `run --config F [--interface N]` | 运行节点（Linux）：读取导入或面板写入的组网配置，绑定监听端口，创建 TUN 网卡（默认 `anixmesh0`），直到 SIGTERM/SIGINT。静态私钥取配置的 `node.private_key`，没有时用配置旁的 `<配置>.key`（首次运行生成，0600）。`managed` 网络的 `native_keys` 缺省、为空或不含本机公钥时暂缓（规范 §8.3.1）：不监听、不建网卡，输出一行 `{"state":"not_joined","reason":"native_keys_pending","static_key":…}` 后等待信号，退出码 0；Agent 上报公钥、面板下发含本机公钥的清单后重启服务即入网。状态行带 `static_key`（旧模式为 `null`）与最近一次被拒的非我方节点 `not_native`。与第三方节点的互通测试在 CI 中通过前，`run` 不列入 `capabilities`，安装器因此不会接管现有网络 | 0 收到信号正常停止；1 运行错误；2 用法或配置错误；3 端口或网卡被占用 |
+| `run --config F [--interface N]` | 运行节点（Linux、macOS、Windows；macOS 网卡为系统分配的 `utunN`；Windows 网卡为 Wintun 适配器，`wintun.dll` 须与程序同目录，由服务管理器启动时以服务运行；监听的完整节点自动添加规则组 `AnixOps Mesh` 中的入站规则，通告子网时开接口级转发并以 WinNAT 转换 IPv4 虚拟网段，退出时撤销）：读取导入或面板写入的组网配置，绑定监听端口，创建 TUN 网卡（默认 `anixmesh0`），直到 SIGTERM/SIGINT。静态私钥取配置的 `node.private_key`，没有时用配置旁的 `<配置>.key`（首次运行生成，0600）。`managed` 网络的 `native_keys` 缺省、为空或不含本机公钥时暂缓（规范 §8.3.1）：不监听、不建网卡，输出一行 `{"state":"not_joined","reason":"native_keys_pending","static_key":…}` 后等待信号，退出码 0；Agent 上报公钥、面板下发含本机公钥的清单后重启服务即入网。状态行带 `static_key`（旧模式为 `null`）与最近一次被拒的非我方节点 `not_native`。与第三方节点的互通测试在 CI 中通过前，`run` 不列入 `capabilities`，安装器因此不会接管现有网络 | 0 收到信号正常停止；1 运行错误；2 用法或配置错误；3 端口或网卡被占用 |
 | `capabilities` | 输出版本和本构建支持的子命令（JSON）。安装器只有在列表含 `run` 时才执行接管 | 0 |
 | `detect --profile F` | 列出本机的现有安装（服务、启动脚本、自启行、手动进程、容器）。只输出参数名，不输出任何取值 | 0；2 用法错误 |
 | `import --profile F [--out-dir D] [--report R] [--allow-unencrypted] [--address CIDR] [-- ARGS…]` | 按检测结果（或 `--` 后手动给出的命令行）生成我方配置和导入报告 | 0 全部可用；3 未发现；5 有需确认项；6 有无法自动迁移的实例 |
@@ -85,9 +85,15 @@ macOS 没有 `/proc`，进程从系统进程表读取：程序路径用 `proc_pi
 旧网不拆分，超大旧网不建桥（规范 §11.2「接收」与 §15.11.1）。桥接节点的旧网实例要接收原版节点对整个旧网的全量同步，上限为 4096 个节点、8 MiB。规模在桥接节点上实测，不在导入时估算（`import` 只看到本机一个原版节点的配置，看不到整个旧网）：
 
 1. 桥接节点先以普通成员加入旧网：只加入 `legacy` 网络，不通告任何区域网段，也不加入区域网络。
-2. 同步稳定后（加入后至少 5 分钟，且最近 2 分钟成员数没有变化），读取该网络快照的 `members` 数。成员数（含本机）超过 4096，或该网络出现过同步超限告警（`alerts` 中的 `sync_oversize`：收到的同步重组或解压后超过 8 MiB 被丢弃，或连接图截短后仍送达不了、同步会话被关闭，`detail` 分别以 `received:`、`undelivered:` 开头，见规范 §11.2、§12.2），即判定为超大旧网。
-3. 超大旧网：不启用桥接，桥接节点退出该旧网，向面板报告原因 `legacy_network_too_large`，`detail` 写成员数或超限的大小；不改原版节点的配置，也不尝试拆分。处理方式见 `docs/manual-intervention.md`「超大旧网不能直接建桥」：先挑一部分节点接管、迁入区域网络，旧网缩小到上限以内再建桥。
-4. 未超限：再加入区域网络并通告区域网段，开始桥接。桥接期间旧网成员数超过上限或出现同步超限告警时，同样报告 `legacy_network_too_large`，由管理员决定是否停用桥接。
+2. 同步稳定后（加入后至少 5 分钟，且最近 2 分钟成员数没有变化），读取该网络在 `GET /v1/mesh` 应答中的 `networks[].alerts[]`。出现任意一条 `code` 为 `sync_oversize` 的告警即判定为超大旧网，不比较成员数：节点信息表最多保存 4095 个其他节点（规范 §12.3），超过上限的旧网在快照里也只显示到上限。该告警的 `detail` 前缀区分三种情况：`received:`（收到的同步重组或解压后超过 8 MiB 被丢弃，规范 §11.2）、`undelivered:`（连接图截短后仍送达不了、同步会话被关闭，规范 §12.2）、`capacity:`（节点信息表已满而拒收新节点或连接行、为直连邻居淘汰可达节点，或超过 16 MiB 存储预算，规范 §12.3）。同一网络可同时有多条。
+3. 超大旧网：不启用桥接，桥接节点退出该旧网，向面板报告原因 `legacy_network_too_large`，`detail` 原样带上各条 `sync_oversize` 告警的 `detail`；不改原版节点的配置，也不尝试拆分。处理方式见 `docs/manual-intervention.md`「超大旧网不能直接建桥」：先挑一部分节点接管、迁入区域网络，旧网缩小到上限以内再建桥。
+4. 未超限：再加入区域网络并通告区域网段，开始桥接。桥接期间出现 `sync_oversize` 告警时，同样报告 `legacy_network_too_large`，由管理员决定是否停用桥接。
+
+部署层上报给面板的原因码：
+
+| 码 | 含义 |
+| --- | --- |
+| `legacy_network_too_large` | 旧网超出单网规模（出现 `sync_oversize` 告警），不建桥或建议停用桥接；`detail` 为告警原文 |
 
 这项检查由建桥的一方执行（Agent 按面板下发的桥接配置执行，或管理员手工操作时按上面的步骤）。`anixops-mesh` 的接管与导入不建桥，不做这项检查。
 
@@ -168,6 +174,8 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 | --- | --- |
 | `anixops-mesh-<版本>-x86_64-unknown-linux-musl` | 静态程序，无动态依赖 |
 | `anixops-mesh-<版本>-aarch64-unknown-linux-musl` | 同上 |
+| `anixops-mesh-<版本>-armv7-unknown-linux-musleabihf`、`-armv7-unknown-linux-musleabi`、`-arm-unknown-linux-musleabihf`、`-arm-unknown-linux-musleabi` | 同上，32 位 ARM（ARMv7、ARMv6，各含硬件浮点与软件浮点），供 OpenWrt 软件包使用 |
+| `anixops-mesh_<版本>-r1_<架构>.ipk`、`.apk`，`luci-app-anixops-mesh_<版本>-r1_all.ipk`、`.apk`，`anixops-mesh-<版本>-openwrt-SHA256SUMS` | OpenWrt 软件包与网页插件，见 [`openwrt.md`](openwrt.md) |
 | `anixops-mesh-<版本>-aarch64-apple-darwin` | macOS 程序（Apple 芯片），只链接系统自带的库 |
 | `anixops-mesh-<版本>-x86_64-apple-darwin` | 同上（Intel） |
 | `anixops-mesh-<版本>-x86_64-pc-windows-msvc.exe` | Windows 程序，C 运行库静态链接，不需要 Visual C++ 运行库 |
@@ -179,7 +187,7 @@ Windows 上的顺序：运行中的服务先 `sc.exe stop` 并等待其停止（
 | `anixops-mesh-<版本>-install-windows.ps1` | Windows 安装脚本 |
 | `anixops-mesh-<版本>-<目标>.buildinfo.json` | 构建所用的确切工具链（`rustc -V`、`rustc -Vv`、`cargo -V`）与提交，供复现；随程序一起证明 |
 
-构建脚本是 [`.github/scripts/build-mesh-node.sh`](../../.github/scripts/build-mesh-node.sh)。CI 在每次 Rust 改动时用同一脚本构建全部目标：「Mesh node static build」构建两种 Linux 架构，确认静态链接、x86_64 版本可运行；「Mesh node desktop build」在 macOS 与 Windows 机器上构建，确认 macOS 程序只链接 `/usr/lib` 与 `/System/Library` 下的库、Windows 程序不导入 `vcruntime`、`msvcp`、`ucrtbase` 与 `api-ms-win-crt-*`，与机器同架构的版本可运行。发布签名（Apple 公证、Windows 代码签名）尚未提供，安装命令以面板给出的 SHA-256 与构建证明为准。32 位 ARM 与 MIPS 随 OpenWrt 软件包（内核 0.5）提供。
+构建脚本是 [`.github/scripts/build-mesh-node.sh`](../../.github/scripts/build-mesh-node.sh)。CI 在每次 Rust 改动时用同一脚本构建全部目标：「Mesh node static build」构建全部 Linux 架构（x86_64、aarch64 与 32 位 ARM），确认静态链接、x86_64 版本可运行；「Mesh node desktop build」在 macOS 与 Windows 机器上构建，确认 macOS 程序只链接 `/usr/lib` 与 `/System/Library` 下的库、Windows 程序不导入 `vcruntime`、`msvcp`、`ucrtbase` 与 `api-ms-win-crt-*`，与机器同架构的版本可运行。发布签名（Apple 公证、Windows 代码签名）尚未提供，安装命令以面板给出的 SHA-256 与构建证明为准。32 位 ARM 随 OpenWrt 软件包提供，ARMv5 与 MIPS 随后加入（见 [`openwrt.md`](openwrt.md)）。
 
 ## 接管数据文件格式
 

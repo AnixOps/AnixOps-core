@@ -44,7 +44,7 @@ use crate::rpc::packet::{
     split, Descriptor, RpcError, RpcPacket, RpcRequest, RpcResponse, DEFAULT_TIMEOUT_MS,
     ROUTE_SYNC_TIMEOUT_MS,
 };
-use crate::rpc::reassembly::Reassembler;
+use crate::rpc::reassembly::{Dropped as RpcDropped, Reassembler};
 use crate::secure::handshake::{
     keeps_initiating, relay_respond, HandshakeError, Local, RelayAnswer, RelayInitiator,
 };
@@ -148,6 +148,26 @@ pub struct Counters {
     pub cut_graphs: u64,
     /// Node information off the native key list (spec §8.3.1 rule 4).
     pub refused_not_native: u64,
+    /// RPC calls dropped for a body over 8 MiB (spec §11.2).
+    pub oversize_calls: u64,
+    /// Route sync sessions closed because a connection graph could not be
+    /// delivered in time (spec §12.2).
+    pub graph_timeouts: u64,
+    /// Nodes refused or reachable nodes evicted because the node table is
+    /// full (spec §12.3, §12.4).
+    pub refused_at_capacity: u64,
+}
+
+/// The last oversized synchronisation, for the alert of spec §11.2 and
+/// §12.2: an RPC call received over 8 MiB, or a connection graph that a
+/// neighbour did not take in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncOversize {
+    /// A call from `peer` was dropped at `bytes`, over the 8 MiB limit.
+    Received { peer: u32, bytes: usize },
+    /// The session with the neighbour `peer` was closed: the connection
+    /// graph, even cut by half, was not answered within twice 60 seconds.
+    Undelivered { peer: u32 },
 }
 
 #[derive(Default)]
@@ -227,6 +247,7 @@ pub struct Node {
     actions: VecDeque<Action>,
     counters: Counters,
     duplicate_id: bool,
+    sync_oversize: Option<SyncOversize>,
     /// The last peer refused for a static key off the native key list
     /// (spec §8.3.1 rule 5), and when.
     not_native: Option<(u32, Instant)>,
@@ -359,6 +380,7 @@ impl Node {
             actions: VecDeque::new(),
             counters: Counters::default(),
             duplicate_id: false,
+            sync_oversize: None,
             not_native: None,
             renewed_at: None,
             relays: BTreeMap::new(),
@@ -383,6 +405,8 @@ impl Node {
             refused_rows: refused.rows,
             cut_graphs: refused.cut_graphs,
             refused_not_native: refused.not_native,
+            graph_timeouts: refused.graph_timeouts,
+            refused_at_capacity: refused.at_capacity,
             ..self.counters
         }
     }
@@ -472,6 +496,12 @@ impl Node {
     /// warning. Cleared when the node takes a new ID.
     pub fn duplicate_id(&self) -> bool {
         self.duplicate_id
+    }
+
+    /// The last oversized synchronisation; kept while the node runs, so an
+    /// operator sizing a network sees it (spec §11.2, §12.2).
+    pub fn sync_oversize(&self) -> Option<SyncOversize> {
+        self.sync_oversize
     }
 
     /// The last peer refused because its static key is off the native key
@@ -1032,6 +1062,12 @@ impl Node {
         let call = match self.reassembler.push(from, piece, timeout, now) {
             Ok(Some(call)) => call,
             Ok(None) => return,
+            Err(RpcDropped::CallTooLarge(bytes)) => {
+                self.counters.dropped += 1;
+                self.counters.oversize_calls += 1;
+                self.sync_oversize = Some(SyncOversize::Received { peer: from, bytes });
+                return;
+            }
             Err(_) => {
                 self.counters.dropped += 1;
                 return;
@@ -1192,6 +1228,9 @@ impl Node {
 
         for (peer, request) in self.sync.poll(now, unix_now) {
             self.call(peer, CallKind::SyncRoute, request.encode(), now);
+        }
+        if let Some(peer) = self.sync.take_graph_timeout() {
+            self.sync_oversize = Some(SyncOversize::Undelivered { peer });
         }
         // Rule 1 of spec §12.3, or this node's version ran out.
         if self.sync.take_conflict() {

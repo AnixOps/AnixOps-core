@@ -1,0 +1,359 @@
+name: OpenWrt packages
+
+# OpenWrt packages of the mesh device (R32, R35; docs/deploy/openwrt.md):
+# static checks of the package files and web plugin, the static program
+# build, ipk/apk packaging, and installation tests inside OpenWrt release
+# root file systems (opkg on 23.05 and 24.10, apk on 25.12; x86_64 natively
+# and aarch64 under user-mode emulation). Each check is its own job so they
+# run in parallel.
+
+on:
+  pull_request:
+    paths:
+      - apps/mesh-node/**
+      - crates/outbound-mesh/**
+      - Cargo.lock
+      - .github/scripts/build-mesh-node.sh
+      - .github/scripts/package-openwrt.sh
+      - .github/scripts/openwrt-i18n.py
+      - .github/workflows/openwrt.yml
+  push:
+    branches: [main]
+    paths:
+      - apps/mesh-node/**
+      - crates/outbound-mesh/**
+      - Cargo.lock
+      - .github/scripts/build-mesh-node.sh
+      - .github/scripts/package-openwrt.sh
+      - .github/scripts/openwrt-i18n.py
+      - .github/workflows/openwrt.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # OpenWrt release root file systems, pinned by digest. The ARM images
+  # declare the OpenWrt architecture ("aarch64_generic") as their platform,
+  # which no Docker platform matches, so they are pinned by the image
+  # manifest itself rather than by a multi-platform index.
+  IMAGE_X86_64_2305: openwrt/rootfs@sha256:f53afb386d05651ada9a4a964e0779930f30962a2abc2fadf1b03bfcbcbabb14 # x86-64-23.05.6
+  IMAGE_X86_64_2410: openwrt/rootfs@sha256:9972a4b4747cd136abd597475d7b88c51a49fd849d0d53f069a2f4bf446061b9 # x86-64-24.10.8
+  IMAGE_X86_64_2512: openwrt/rootfs@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af # x86-64-25.12.6
+  IMAGE_AARCH64_2410: openwrt/rootfs@sha256:f6dd33c1d9b7d6f1e0848f2fbb92b8d03fc9b425dc08c3574a44936b93133704 # armsr-armv8-24.10.8 (manifest in index dbe092b7…)
+  IMAGE_AARCH64_2512: openwrt/rootfs@sha256:22f13387da208c0fb4150c41f3ec12e34cc5994a0717a49e50aa9f9ae6cb5e7b # armsr-armv8-25.12.6
+  IMAGE_ARMV7_2410: openwrt/rootfs@sha256:00c6e1dc4d6d4f3e0761fdb8df667b942185d0f4ab0ec361c9e46fa384631ef5 # armsr-armv7-24.10.8 (manifest in index a69380f5…)
+  IMAGE_ARMV7_2512: openwrt/rootfs@sha256:c32d38ebe9811c647a4171b745313cb221b968198be52cedea9a4632b26195f8 # armsr-armv7-25.12.6
+  # QEMU user-mode emulators (10.2.3), registered for the ARM jobs.
+  BINFMT_IMAGE: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 # qemu-v10.2.3
+  # apk-tools 3 (3.0.9) for `apk mkpkg`; OpenWrt's device apk has no mkpkg.
+  APK_MKPKG_IMAGE: alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2 # 3.23.8
+  # luci-base's catalog hash, compared with the Python writer.
+  LUCI_COMMIT: 8d1aecd0216a02ad52c830e9a03c21da734bf630
+  LUCI_LMO_C_SHA256: 1c42aaa581a2a9f6333bce2acd39d3651765b74f6f2513af0a3e295434b06153
+
+jobs:
+  static:
+    name: Package files and web plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=apps/mesh-node/openwrt
+          # The device scripts run under BusyBox ash, which has `local`.
+          for script in \
+            "${root}/anixops-mesh/files/etc/init.d/anixops-mesh" \
+            "${root}/anixops-mesh/files/usr/libexec/anixops-mesh/service" \
+            "${root}/anixops-mesh/files/usr/libexec/anixops-mesh/firewall" \
+            "${root}/anixops-mesh/files/etc/uci-defaults/90-anixops-mesh" \
+            "${root}/tests/container-test.sh"; do
+            sh -n "${script}"
+            shellcheck --shell=sh --exclude=SC3043 "${script}"
+          done
+          shellcheck --shell=bash .github/scripts/package-openwrt.sh
+
+      - name: JSON files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in apps/mesh-node/openwrt/luci-app-anixops-mesh/root/usr/share/luci/menu.d/*.json \
+            apps/mesh-node/openwrt/luci-app-anixops-mesh/root/usr/share/rpcd/acl.d/*.json; do
+            jq empty "${file}"
+          done
+
+      - name: Views parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The web interface runs each view as a function body (it ends in
+          # a top-level `return`), so parse it the same way.
+          for view in apps/mesh-node/openwrt/luci-app-anixops-mesh/htdocs/luci-static/resources/view/anixops-mesh/*.js; do
+            node -e 'new Function(require("fs").readFileSync(process.argv[1], "utf8"))' "${view}"
+            echo "parsed ${view}"
+          done
+
+      - name: Views render outside values as text
+        run: node apps/mesh-node/openwrt/tests/render-test.js apps/mesh-node/openwrt/luci-app-anixops-mesh/htdocs/luci-static/resources/view/anixops-mesh
+
+      - name: Permissions match the backend
+        shell: python
+        run: |
+          import json, re, sys
+          app = "apps/mesh-node/openwrt/luci-app-anixops-mesh/root/usr/share"
+          backend = open(f"{app}/rpcd/ucode/luci.anixops-mesh.uc").read()
+          methods = set(re.findall(r"^\t([a-z_]+): \{$", backend, re.M))
+          acl = json.load(open(f"{app}/rpcd/acl.d/luci-app-anixops-mesh.json"))["luci-app-anixops-mesh"]
+          read = set(acl["read"]["ubus"]["luci.anixops-mesh"])
+          write = set(acl["write"]["ubus"]["luci.anixops-mesh"])
+          # Methods that change state need write permission; the rest only read.
+          expected_read = {"status", "lan_networks"}
+          expected_write = {"enroll", "request_subnets"}
+          errors = []
+          if methods != expected_read | expected_write:
+              errors.append(f"backend methods {sorted(methods)}")
+          if read != expected_read:
+              errors.append(f"read grants {sorted(read)}")
+          if write != expected_write:
+              errors.append(f"write grants {sorted(write)}")
+          if acl["read"].get("uci") != ["anixops-mesh"] or acl["write"].get("uci") != ["anixops-mesh"]:
+              errors.append("uci grants must be exactly anixops-mesh")
+          for error in errors:
+              print(f"::error::{error}")
+          sys.exit(1 if errors else 0)
+
+      - name: Translations complete
+        run: python3 .github/scripts/openwrt-i18n.py check apps/mesh-node/openwrt/luci-app-anixops-mesh
+
+      - name: Catalog hash matches luci-base
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          curl -fsSL --proto =https -o "${work}/lmo.c" \
+            "https://raw.githubusercontent.com/openwrt/luci/${LUCI_COMMIT}/modules/luci-base/src/lib/lmo.c"
+          echo "${LUCI_LMO_C_SHA256}  ${work}/lmo.c" | sha256sum -c -
+          {
+            echo '#include <stdint.h>'
+            echo '#include <stdio.h>'
+            echo '#include <string.h>'
+            echo '#define sfh_get16(d) ((((uint32_t)(((const uint8_t *)(d))[1])) << 8) + (uint32_t)(((const uint8_t *)(d))[0]))'
+            sed -n '/^uint32_t sfh_hash(/,/^}/p' "${work}/lmo.c"
+            echo 'int main(int argc, char **argv) { for (int i = 1; i < argc; i++) { size_t n = strlen(argv[i]); printf("%08x\n", sfh_hash(argv[i], n, n)); } return 0; }'
+          } > "${work}/hash.c"
+          cc -O2 -o "${work}/hash" "${work}/hash.c"
+          # Every key and translation of the catalog, plus each length
+          # remainder and non-ASCII tails.
+          mapfile -t texts < <(sed -n 's/^msg\(id\|str\) "\(.\+\)"$/\2/p' apps/mesh-node/openwrt/luci-app-anixops-mesh/po/zh_Hans/anixops-mesh.po)
+          texts+=(a ab abc abcd é 状 状态 "x状")
+          diff <("${work}/hash" "${texts[@]}") <(python3 .github/scripts/openwrt-i18n.py hash "${texts[@]}")
+          echo "${#texts[@]} hashes match"
+
+  build:
+    name: Static program (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - armv7-unknown-linux-musleabi
+          - arm-unknown-linux-musleabihf
+          - arm-unknown-linux-musleabi
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: openwrt-${{ matrix.target }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # The build script runs the program for other architectures under
+      # user-mode emulation when it is registered.
+      - name: User-mode emulation
+        if: ${{ matrix.target != 'x86_64-unknown-linux-musl' }}
+        run: docker run --rm --privileged "${BINFMT_IMAGE}" --install arm64,arm
+
+      - name: Build
+        shell: bash
+        run: .github/scripts/build-mesh-node.sh "${{ matrix.target }}" ci dist/mesh-node
+
+      - name: Size on flash
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="dist/mesh-node/anixops-mesh-ci-${{ matrix.target }}"
+          size="$(stat -c %s "${binary}")"
+          # OpenWrt's writable overlay compresses with zlib or LZMA; gzip -9
+          # approximates what the program takes on flash.
+          compressed="$(gzip -9c "${binary}" | wc -c)"
+          {
+            echo "### anixops-mesh (${{ matrix.target }})"
+            echo "| Size | Bytes |"
+            echo "| --- | --- |"
+            echo "| Program | ${size} |"
+            echo "| Compressed (gzip -9) | ${compressed} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openwrt-program-${{ matrix.target }}
+          path: dist/mesh-node/anixops-mesh-ci-${{ matrix.target }}
+          retention-days: 3
+          if-no-files-found: error
+
+  package:
+    name: Build packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: openwrt-program-*
+          path: dist/bin
+          merge-multiple: true
+
+      - name: Package
+        shell: bash
+        env:
+          APK_IMAGE: ${{ env.APK_MKPKG_IMAGE }}
+        run: |
+          set -euo pipefail
+          chmod 0755 dist/bin/*
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          .github/scripts/package-openwrt.sh "${version}" dist/bin dist/openwrt
+          ls -l dist/openwrt
+          # Reproducible: a second run gives identical ipk and apk files.
+          .github/scripts/package-openwrt.sh "${version}" dist/bin dist/openwrt-again
+          for package in dist/openwrt/*.ipk dist/openwrt/*.apk; do
+            cmp "${package}" "dist/openwrt-again/$(basename "${package}")"
+          done
+          # A pre-release tag gives versions that sort before the release in
+          # both package managers; apk mkpkg rejects a malformed one.
+          .github/scripts/package-openwrt.sh "v${version}-rc.1" dist/bin dist/openwrt-rc
+          ipk="dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.ipk"
+          tar -xzOf "${ipk}" ./control.tar.gz | tar -xzOf - ./control | grep -Fx "Version: ${version}~rc.1-r1"
+          test -s "dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.apk"
+          # A later version, for the upgrade test of the install jobs.
+          .github/scripts/package-openwrt.sh 99.0.0 dist/bin dist/openwrt/upgrade
+
+      - name: Package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          for ipk in dist/openwrt/*.ipk; do
+            echo "::group::${ipk}"
+            work="$(mktemp -d)"
+            tar -xzf "${ipk}" -C "${work}"
+            test "$(cat "${work}/debian-binary")" = "2.0"
+            tar -xzOf "${work}/control.tar.gz" ./control
+            # Root-owned files only, nothing outside the expected places.
+            tar -tvzf "${work}/data.tar.gz" | tee "${work}/list"
+            if awk '{ print $2 }' "${work}/list" | grep -v '^0/0$'; then
+              echo "::error::${ipk} has files not owned by root"
+              exit 1
+            fi
+            if awk '{ print $6 }' "${work}/list" | grep -Ev '^\./((etc|lib|usr|www)(/.*)?)?$'; then
+              echo "::error::${ipk} installs outside /etc, /lib, /usr and /www"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "### Packages"
+            echo "| File | Bytes |"
+            echo "| --- | --- |"
+            for file in dist/openwrt/*.ipk dist/openwrt/*.apk; do
+              echo "| $(basename "${file}") | $(stat -c %s "${file}") |"
+            done
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Catalog check script
+        run: |
+          python3 .github/scripts/openwrt-i18n.py ucode-check \
+            apps/mesh-node/openwrt/luci-app-anixops-mesh/po/zh_Hans/anixops-mesh.po > dist/openwrt/i18n-check.uc
+
+      - name: Upload packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openwrt-packages
+          path: dist/openwrt/
+          retention-days: 7
+          if-no-files-found: error
+
+  install:
+    name: Install on OpenWrt ${{ matrix.release }} (${{ matrix.arch }}, ${{ matrix.format }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { release: "23.05", arch: x86_64, format: ipk, image: IMAGE_X86_64_2305 }
+          - { release: "24.10", arch: x86_64, format: ipk, image: IMAGE_X86_64_2410 }
+          - { release: "25.12", arch: x86_64, format: apk, image: IMAGE_X86_64_2512 }
+          - { release: "24.10", arch: aarch64_generic, format: ipk, image: IMAGE_AARCH64_2410, emulate: qemu-aarch64 }
+          - { release: "25.12", arch: aarch64_generic, format: apk, image: IMAGE_AARCH64_2512, emulate: qemu-aarch64 }
+          - { release: "24.10", arch: arm_cortex-a15_neon-vfpv4, format: ipk, image: IMAGE_ARMV7_2410, emulate: qemu-arm }
+          - { release: "25.12", arch: arm_cortex-a15_neon-vfpv4, format: apk, image: IMAGE_ARMV7_2512, emulate: qemu-arm }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: openwrt-packages
+          path: dist/openwrt
+
+      - name: User-mode emulation
+        if: ${{ matrix.emulate }}
+        env:
+          EMULATOR: ${{ matrix.emulate }}
+        run: |
+          # Emulators registered with the F (fix binary) flag, so that they
+          # work inside containers. Pinned by digest like the images.
+          docker run --rm --privileged "${BINFMT_IMAGE}" --install arm64,arm
+          cat "/proc/sys/fs/binfmt_misc/${EMULATOR}"
+          grep -q '^flags:.*F' "/proc/sys/fs/binfmt_misc/${EMULATOR}"
+
+      - name: Install and test in the OpenWrt root file system
+        shell: bash
+        env:
+          IMAGE: ${{ env[matrix.image] }}
+          FORMAT: ${{ matrix.format }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${PWD}/dist/openwrt:/pkgs:ro" \
+            -v "${PWD}/apps/mesh-node/openwrt/tests:/tests:ro" \
+            "${IMAGE}" /bin/sh /tests/container-test.sh /pkgs "${FORMAT}" "${ARCH}"
