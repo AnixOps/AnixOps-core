@@ -8,6 +8,7 @@
 //! | `http`        | `http`         | `outbound-http`        |
 //! | `hysteria2`   | `hysteria2`    | `outbound-hysteria2`   |
 //! | `iwan`        | `iwan`         | `outbound-iwan`        |
+//! | `mesh`        | `mesh`         | `outbound-mesh` (feature `outbound`) |
 //! | `mieru`       | `mieru`        | `outbound-mieru`       |
 //! | `shadowsocks` | `shadowsocks`  | `outbound-shadowsocks` |
 //! | `snell`       | `snell`        | `outbound-snell`       |
@@ -60,6 +61,8 @@ pub fn default_registry() -> OutboundRegistry {
     registry.register(Arc::new(outbound_hysteria2::Hysteria2Factory));
     #[cfg(feature = "iwan")]
     registry.register(Arc::new(outbound_iwan::IwanFactory));
+    #[cfg(feature = "mesh")]
+    registry.register(Arc::new(outbound_mesh::outbound::MeshFactory));
     #[cfg(feature = "mieru")]
     registry.register(Arc::new(outbound_mieru::MieruFactory));
     #[cfg(feature = "shadowsocks")]
