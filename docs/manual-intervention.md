@@ -336,6 +336,8 @@ Before describing VLESS + REALITY as usable on iOS, the maintainer records here
 
 ## 当前待处理
 
+- 维护分支 `release/*` 的分支保护（[Release Strategy](release-strategy.md#维护分支)）：仓库管理员在 GitHub 设置中为 `release/*` 新建规则集，禁止强推与删除、合并前要求 PR 且 `CI summary` 通过，与 `main` 一致。发布工作流只接受这些分支上成功的 CI，分支保护缺失时维护分支可被直接推送改写。首个维护分支 `release/0.3` 创建前完成。
+- 内核小版本候选版验收（[Release Strategy](release-strategy.md#候选版rc流程)）：每个 `vX.Y.Z-rc.N` 需要内核维护者用脱敏的上一个小版本配置验证加载、启动、实际连接与回退，客户端维护者把测试构建固定到 RC 提交并在受影响平台验证构建、启动、连接、断开。实际连接与各平台客户端验证无法在本仓库 CI 中完成，结果与负责人记录在该版本发布说明中。
 - `anixcore` 管理接口默认只许回环（第三方审计 2026-11-25 CORE-01）：升级到包含该修改的内核前，部署方需确认各节点 `management.listen` 是 `127.0.0.1` / `::1`；确需跨主机管理的，改为经 SSH 或 VPN 访问本机回环，过渡期才显式设置 `"insecure_public": true`。同时复核已暴露过的管理令牌是否需要轮换。该项属于实际部署检查，CI 无法证明。
 - 首批运维上线环境尚未提供：真实邮件/Telegram 接收渠道、第三方独立 Control 监控、跨地域节点和设备以及维护负责人。当前自动化只能运行测试适配器与代码 CI，不能证明这些真实环境门槛。维护负责人补齐渠道与部署范围后，记录投递/监控/网络/设备及回滚演练证据，再由 CI/CD 推进获准的灰度发布；真实地址与密钥仅放部署系统或密码库。
 - 节点内核的地址段拦截（`PUT /v1/rules` 的 `block_cidrs`、`GET /v1/rules/counters`、feature `block_cidrs`）需要重新发布：内核发布包必须从包含 `block_cidrs` 的 networkcore 版本重新构建。发布前出口节点开启“拒绝中国大陆目标”时，Agent 只记一条警告，不下发、不计数。

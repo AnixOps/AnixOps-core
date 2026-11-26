@@ -2075,6 +2075,7 @@ dependencies = [
  "libc",
  "mesh-bridge",
  "outbound-mesh",
+ "platform-windows",
  "ring",
  "serde",
  "serde_json",
