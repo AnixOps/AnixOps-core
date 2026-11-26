@@ -167,12 +167,19 @@ pub struct Snapshot {
     /// Members announcing another static key than the one bound to their
     /// node ID (spec §12.3).
     pub refused_key_changes: Vec<u32>,
+    /// This node's instance ID in the network, as a UUID text.
+    pub instance: String,
 }
 
 /// One reachable member, as [`Snapshot::members`] lists it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Member {
     pub peer_id: u32,
+    /// Its instance ID, as a UUID text; empty before its route information
+    /// arrived.
+    pub instance: String,
+    /// The host name it advertises, if any.
+    pub hostname: Option<String>,
     /// Its virtual addresses, as accepted.
     pub addresses: Vec<IpAddr>,
     /// The subnets it advertises, as accepted.
@@ -182,6 +189,10 @@ pub struct Member {
     pub via: Vec<u32>,
     /// 1 for a direct connection.
     pub hops: u32,
+    /// The fewest hops to it, whatever the path policy; the driver picks
+    /// among the advertisers of a subnet by this count (spec §15.2), while
+    /// `hops` and `via` follow the policy's path.
+    pub fewest_hops: u32,
     /// Round-trip time to a direct neighbour, in milliseconds; `None`
     /// before the first keep-alive answer and for members reached through
     /// relays.
@@ -649,6 +660,7 @@ fn snapshot(node: &Node, local_read: bool) -> Snapshot {
         standing_in: node.standing_in().to_vec(),
         withdrawing: node.is_withdrawn(),
         border: node.route_table().border().to_vec(),
+        instance: node.own_info().inst_id.to_string(),
     }
 }
 
@@ -676,6 +688,7 @@ fn member_path_state(paths: &[PathStatus], addresses: &[IpAddr]) -> (&'static st
 
 fn members(node: &Node, paths: &[PathStatus]) -> Vec<Member> {
     let table = node.route_table();
+    let fewest = node.fewest_hops();
     node.paths()
         .into_iter()
         .map(|(peer, route)| {
@@ -694,12 +707,18 @@ fn members(node: &Node, paths: &[PathStatus]) -> Vec<Member> {
             };
             let latency_ms = rtt.map(|rtt| u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
             let (path_state, unreachable) = member_path_state(paths, &addresses);
+            let info = node.peer_info(peer);
             Member {
                 peer_id: peer,
+                instance: info
+                    .map(|info| info.inst_id.to_string())
+                    .unwrap_or_default(),
+                hostname: info.and_then(|info| info.hostname.clone()),
                 addresses,
                 subnets,
                 via,
                 hops: route.hops,
+                fewest_hops: fewest.get(&peer).copied().unwrap_or(route.hops),
                 latency_ms,
                 path_state,
                 unreachable,
@@ -1517,6 +1536,7 @@ mod tests {
         let (_local, local_networks) = watch::channel(Some(Vec::new()));
         let (_keys, native_keys) = watch::channel(None);
         let (_groups, host_groups) = watch::channel(Vec::new());
+        let (_paths, paths) = watch::channel(Vec::new());
         let (_overrides, route_overrides) = watch::channel(Vec::new());
         let (_foreign, foreign_routes) = watch::channel(Vec::new());
         let task = tokio::spawn(run(
@@ -1529,6 +1549,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                paths,
                 host_groups,
                 route_overrides,
                 foreign_routes,

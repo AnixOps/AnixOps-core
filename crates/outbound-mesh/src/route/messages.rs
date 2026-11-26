@@ -35,6 +35,19 @@ impl Uuid {
     }
 }
 
+/// The usual text form: 32 lowercase hex digits in groups of 8-4-4-4-12.
+impl std::fmt::Display for Uuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, byte) in self.0.iter().enumerate() {
+            if matches!(i, 4 | 6 | 8 | 10) {
+                f.write_str("-")?;
+            }
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 fn encode_ipv4(address: Ipv4Addr) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.u32(1, u32::from(address));
@@ -979,5 +992,17 @@ mod tests {
         assert!(decoded.graph_dropped);
         assert!(decoded.conn_graph.is_none());
         assert_eq!(decoded.peer_infos.len(), 1);
+    }
+
+    #[test]
+    fn a_uuid_reads_as_grouped_hex() {
+        let mut bytes = [0u8; 16];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i as u8 * 17;
+        }
+        assert_eq!(
+            Uuid(bytes).to_string(),
+            "00112233-4455-6677-8899-aabbccddeeff"
+        );
     }
 }

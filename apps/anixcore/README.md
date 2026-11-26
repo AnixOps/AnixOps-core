@@ -40,6 +40,12 @@ networks' static keys in `"mesh_state_dir"` (default
 `/var/lib/anixcore/mesh`); if that directory cannot be created the mesh is
 left out and `GET /v1/status` does not list `mesh`.
 
+External network bridges of those networks (spec §15.12) stay off unless
+the config sets `"mesh_external_bridge": true`. Off, `anixcore` never runs
+`nft` or touches conntrack, except to remove, under the host lock, the
+bridge tables a node program left on this host (marked by
+`/run/anixops-mesh-bridge-active` while a bridge may be installed).
+
 The inter-region backbone of those networks (a border node's top-level
 `backbone` section) stays off unless the config sets
 `"mesh_backbone": true`. Off, `GET /v1/status` does not list
