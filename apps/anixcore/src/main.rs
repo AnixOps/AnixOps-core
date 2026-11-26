@@ -89,6 +89,7 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
                 config.mesh_external_bridge,
                 config.mesh_backbone,
                 config.mesh_paths,
+                config.mesh_regions,
             )
         });
         if let Some(bundle) = &config.tls_fingerprints {
@@ -161,7 +162,7 @@ const MESH_STATE_DIR: &str = "/var/lib/anixcore/mesh";
 /// its state directory the node runs without them: `GET /v1/status` does
 /// not list `mesh` and `/v1/mesh` answers 404. The inter-region backbone
 /// stays off unless the config sets `mesh_backbone`, custom paths unless
-/// it sets `mesh_paths`.
+/// it sets `mesh_paths`, regions unless it sets `mesh_regions`.
 #[cfg(target_os = "linux")]
 fn with_mesh(
     node: Node,
@@ -169,11 +170,15 @@ fn with_mesh(
     external_bridge: bool,
     backbone: bool,
     paths: bool,
+    regions: bool,
 ) -> Node {
     let dir = dir.unwrap_or(std::path::Path::new(MESH_STATE_DIR));
     match mesh_node::managed::ManagedMesh::open_with_options(dir, external_bridge) {
         Ok(mesh) => {
-            let mesh = mesh.with_backbone(backbone).with_paths(paths);
+            let mesh = mesh
+                .with_backbone(backbone)
+                .with_paths(paths)
+                .with_regions(regions);
             println!("mesh: instance {}", mesh.instance_id());
             node.with_mesh(Arc::new(mesh))
         }
@@ -194,6 +199,7 @@ fn with_mesh(
     _external_bridge: bool,
     _backbone: bool,
     _paths: bool,
+    _regions: bool,
 ) -> Node {
     node
 }
@@ -211,4 +217,41 @@ async fn shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// The mesh features of kernel 0.3, written out. A node whose config
+    /// leaves every mesh switch at its default lists exactly these beside
+    /// [`node_runtime::FEATURES`] in `GET /v1/status`; a feature of a
+    /// later version appears only behind its switch, and adding one here
+    /// is a change reviewers see.
+    const MESH_FEATURES_0_3: &[&str] = &[
+        "mesh",
+        "mesh_dns",
+        "mesh_resolver_address",
+        "mesh_native_keys",
+        "mesh_host_groups",
+    ];
+
+    #[test]
+    fn a_node_with_the_default_switches_lists_the_0_3_features_only() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let dir = std::env::temp_dir().join(format!("anixcore-features-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = with_mesh(
+            Node::new(default_registry(), false),
+            Some(&dir),
+            config.mesh_external_bridge,
+            config.mesh_backbone,
+            config.mesh_paths,
+            config.mesh_regions,
+        );
+        let mut expected = node_runtime::FEATURES.to_vec();
+        expected.extend_from_slice(MESH_FEATURES_0_3);
+        assert_eq!(node.features(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
