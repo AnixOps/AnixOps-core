@@ -1187,9 +1187,20 @@ mod tests {
         }
         let mut a = std::mem::replace(&mut nodes[0], node(1, now));
         a.neighbour_up(9, &rng, now).unwrap();
+        // Node 2 answers, so that only the session with node 9 times out.
+        let mut two = std::mem::replace(&mut nodes[1], node(2, now));
+        let mut poll = |a: &mut RouteSync, t: Instant| {
+            let requests = a.poll(t, (0, 0));
+            for (to, request) in &requests {
+                if *to == 2 {
+                    deliver(a, &mut two, request.clone(), t);
+                }
+            }
+            requests
+        };
 
         // Node 9 never answers.
-        let first = a.poll(now, (0, 0));
+        let first = poll(&mut a, now);
         assert_eq!(graph_rows_to(&first, 9), Some(3));
         let session = first
             .iter()
@@ -1201,12 +1212,12 @@ mod tests {
 
         // Within the deadline the whole graph is retried.
         let t = now + Duration::from_secs(30);
-        assert_eq!(graph_rows_to(&a.poll(t, (0, 0)), 9), Some(3));
+        assert_eq!(graph_rows_to(&poll(&mut a, t), 9), Some(3));
         a.on_response(9, None, &rng, t).unwrap();
 
         // Past it, half the rows go, the farthest first.
         let t = now + GRAPH_DEADLINE;
-        let cut = a.poll(t, (0, 0));
+        let cut = poll(&mut a, t);
         assert_eq!(graph_rows_to(&cut, 9), Some(1));
         let graph = cut
             .iter()
@@ -1221,16 +1232,16 @@ mod tests {
 
         // Past it again, the session is closed and waits 30 seconds.
         let t = now + GRAPH_DEADLINE * 2;
-        assert!(graph_rows_to(&a.poll(t, (0, 0)), 9).is_none());
+        assert!(graph_rows_to(&poll(&mut a, t), 9).is_none());
         assert_eq!(a.take_graph_timeout(), Some(9));
         assert_eq!(a.take_graph_timeout(), None);
         assert_eq!(a.refused().graph_timeouts, 1);
         let early = t + REBUILD_FIRST - Duration::from_secs(1);
-        assert!(graph_rows_to(&a.poll(early, (0, 0)), 9).is_none());
+        assert!(graph_rows_to(&poll(&mut a, early), 9).is_none());
 
         // Then everything goes again under a new session, uncut.
         let t = t + REBUILD_FIRST;
-        let rebuilt = a.poll(t, (0, 0));
+        let rebuilt = poll(&mut a, t);
         assert_eq!(graph_rows_to(&rebuilt, 9), Some(3));
         let request = &rebuilt.iter().find(|(to, _)| *to == 9).unwrap().1;
         assert_ne!(request.my_session_id, session);
@@ -1239,12 +1250,12 @@ mod tests {
         // A second closure waits twice as long.
         a.on_response(9, None, &rng, t).unwrap();
         let closed = t + GRAPH_DEADLINE * 2;
-        a.poll(t + GRAPH_DEADLINE, (0, 0));
-        a.poll(closed, (0, 0));
+        poll(&mut a, t + GRAPH_DEADLINE);
+        poll(&mut a, closed);
         assert_eq!(a.take_graph_timeout(), Some(9));
-        assert!(graph_rows_to(&a.poll(closed + REBUILD_FIRST, (0, 0)), 9).is_none());
+        assert!(graph_rows_to(&poll(&mut a, closed + REBUILD_FIRST), 9).is_none());
         let t = closed + REBUILD_FIRST * 2;
-        let again = a.poll(t, (0, 0));
+        let again = poll(&mut a, t);
         assert_eq!(graph_rows_to(&again, 9), Some(3));
 
         // A graph that gets through resets the wait.
