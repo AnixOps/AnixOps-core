@@ -127,7 +127,9 @@ pub fn valid_instance_id(id: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= MAX_INSTANCE_ID_BYTES
         && bytes[0].is_ascii_alphanumeric()
-        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
 }
 
 /// Refuses a `to_subnet` path inside a host group range with a longer
@@ -141,9 +143,10 @@ pub fn check_paths_against_host_groups(
 ) -> Result<(), &'static str> {
     for path in paths {
         if let PathTarget::Subnet(subnet) = path.target {
-            if groups.iter().any(|group| {
-                group.cidr.covers(&subnet) && subnet.prefix() > group.cidr.prefix()
-            }) {
+            if groups
+                .iter()
+                .any(|group| group.cidr.covers(&subnet) && subnet.prefix() > group.cidr.prefix())
+            {
                 return Err(
                     "mesh path to_subnet is inside a host group range; members of a host group follow the gateway's path",
                 );
@@ -1448,7 +1451,10 @@ mod tests {
         );
         // The standby gateway may be left out.
         let single = json!([{"cidr": "10.127.2.0/24", "gateway": "gw-a"}]);
-        assert_eq!(validate(grouped(single)).unwrap().host_groups[0].backup_gateway, None);
+        assert_eq!(
+            validate(grouped(single)).unwrap().host_groups[0].backup_gateway,
+            None
+        );
         // Absent and empty both mean none.
         assert!(validate(base()).unwrap().host_groups.is_empty());
         assert!(validate(grouped(json!([]))).unwrap().host_groups.is_empty());
@@ -1500,19 +1506,30 @@ mod tests {
             "mesh host_groups backup_gateway is not an instance ID"
         );
         assert_eq!(
-            refused(json!([{"cidr": "10.127.1.0/24", "gateway": "gw-a", "backup_gateway": "gw-a"}])),
+            refused(
+                json!([{"cidr": "10.127.1.0/24", "gateway": "gw-a", "backup_gateway": "gw-a"}])
+            ),
             "mesh host_groups backup_gateway is the gateway"
         );
         let too_many: Vec<Value> = (0..=MAX_HOST_GROUPS)
             .map(|n| group(&format!("10.{}.{}.0/24", 100 + n / 256, n % 256)))
             .collect();
-        assert_eq!(refused(json!(too_many)), "mesh host_groups lists too many groups");
+        assert_eq!(
+            refused(json!(too_many)),
+            "mesh host_groups lists too many groups"
+        );
         let most: Vec<Value> = (0..MAX_HOST_GROUPS)
             .map(|n| group(&format!("10.127.{n}.0/24")))
             .collect();
-        assert_eq!(validate(grouped(json!(most))).unwrap().host_groups.len(), MAX_HOST_GROUPS);
+        assert_eq!(
+            validate(grouped(json!(most))).unwrap().host_groups.len(),
+            MAX_HOST_GROUPS
+        );
         // Unknown fields are refused like everywhere else.
-        assert!(parse(grouped(json!([{"cidr": "10.127.1.0/24", "gateway": "gw-a", "vms": []}]))).is_err());
+        assert!(parse(grouped(
+            json!([{"cidr": "10.127.1.0/24", "gateway": "gw-a", "vms": []}])
+        ))
+        .is_err());
     }
 
     #[test]
@@ -1546,7 +1563,12 @@ mod tests {
         // Audit F-01, requirement R25, spec §15.7 rule 7.
         let path = |to: &str| json!([{"to_subnet": to, "via": ["10.144.144.9"]}]);
         let mut config = grouped(json!([group("10.127.1.0/24")]));
-        for inside in ["10.127.1.20/32", "10.127.1.20", "10.127.1.0/25", "10.127.1.128/26"] {
+        for inside in [
+            "10.127.1.20/32",
+            "10.127.1.20",
+            "10.127.1.0/25",
+            "10.127.1.128/26",
+        ] {
             config["routing"] = json!({"paths": path(inside)});
             assert_eq!(
                 validate(config.clone()).unwrap_err(),
@@ -1555,12 +1577,18 @@ mod tests {
             );
         }
         // The whole range, a wider network and other networks are fine.
-        for allowed in ["10.127.1.0/24", "10.127.0.0/16", "10.0.0.0/8", "192.168.1.0/24"] {
+        for allowed in [
+            "10.127.1.0/24",
+            "10.127.0.0/16",
+            "10.0.0.0/8",
+            "192.168.1.0/24",
+        ] {
             config["routing"] = json!({"paths": path(allowed)});
             assert!(validate(config.clone()).is_ok(), "{allowed}");
         }
         // A path to a member of the network is not affected.
-        config["routing"] = json!({"paths": [{"to_peer": "10.144.144.7", "via": ["10.144.144.9"]}]});
+        config["routing"] =
+            json!({"paths": [{"to_peer": "10.144.144.7", "via": ["10.144.144.9"]}]});
         assert!(validate(config).is_ok());
 
         // The shared check, as every replacement of the path list uses it.

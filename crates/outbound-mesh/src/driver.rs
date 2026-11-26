@@ -1107,7 +1107,10 @@ mod tests {
             port: 0,
             address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         }];
-        hub.advertise_subnets = advertise.iter().map(|text| IpNet::parse(text).unwrap()).collect();
+        hub.advertise_subnets = advertise
+            .iter()
+            .map(|text| IpNet::parse(text).unwrap())
+            .collect();
         let listeners = Listeners::bind(&hub).await.unwrap();
         let rng = SystemRandom::new();
         let (_to_mesh, from_interface) = mpsc::channel(16);

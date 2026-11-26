@@ -1883,7 +1883,10 @@ mod tests {
         assert!(net.nodes[2].standing_in().is_empty());
         assert_eq!(advertised_by(&net, 0, 101), vec![GROUP.to_owned()]);
         assert!(advertised_by(&net, 0, 102).is_empty());
-        assert_eq!(net.nodes[0].route_table().lookup(in_group()), Ok(PeerId(101)));
+        assert_eq!(
+            net.nodes[0].route_table().lookup(in_group()),
+            Ok(PeerId(101))
+        );
         // Both gateways carry the range: packets from it are taken.
         assert!(net.nodes[1].settings().carried_subnets().contains(&group()));
         assert!(net.nodes[2].settings().carried_subnets().contains(&group()));
@@ -1907,7 +1910,10 @@ mod tests {
         // connections (WITHDRAW_WAIT later).
         let mut waited = Duration::ZERO;
         while net.nodes[0].route_table().lookup(in_group()) != Ok(PeerId(102)) {
-            assert!(waited < WITHDRAW_WAIT, "the standby did not take over in time");
+            assert!(
+                waited < WITHDRAW_WAIT,
+                "the standby did not take over in time"
+            );
             net.tick(Duration::from_secs(1));
             waited += Duration::from_secs(1);
         }
@@ -1936,7 +1942,10 @@ mod tests {
         net.tick(Duration::from_secs(1));
         assert!(net.nodes[2].standing_in().is_empty());
         assert!(advertised_by(&net, 0, 102).is_empty());
-        assert_eq!(net.nodes[0].route_table().lookup(in_group()), Ok(PeerId(101)));
+        assert_eq!(
+            net.nodes[0].route_table().lookup(in_group()),
+            Ok(PeerId(101))
+        );
     }
 
     #[test]
@@ -1948,7 +1957,10 @@ mod tests {
             net.tick(Duration::from_secs(1));
         }
         assert_eq!(net.nodes[2].standing_in(), &[group()]);
-        assert_eq!(net.nodes[0].route_table().lookup(in_group()), Ok(PeerId(102)));
+        assert_eq!(
+            net.nodes[0].route_table().lookup(in_group()),
+            Ok(PeerId(102))
+        );
         // Both gone: the range is unreachable.
         unlink(&mut net, 0, 2);
         net.tick(Duration::from_secs(1));
