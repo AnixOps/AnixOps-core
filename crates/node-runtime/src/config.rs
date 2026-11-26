@@ -96,6 +96,13 @@ pub struct NodeConfig {
     /// uses `/var/lib/anixcore/mesh` when it is absent.
     #[serde(default)]
     pub mesh_state_dir: Option<std::path::PathBuf>,
+    /// Turns on the inter-region backbone of managed networks (spec
+    /// §17.3, `docs/protocols/intranet-mesh-appendix.md` B). Off by
+    /// default: the node then does not list `mesh_backbone` and refuses a
+    /// `PUT /v1/mesh` body that carries a `backbone` section
+    /// (`backbone_disabled`), so it never becomes a border node.
+    #[serde(default)]
+    pub mesh_backbone: bool,
 }
 
 /// Has no `Debug`: `token` is a credential.
@@ -333,6 +340,15 @@ mod tests {
                 "{listen}"
             );
         }
+    }
+
+    #[test]
+    fn the_mesh_backbone_is_off_unless_the_config_turns_it_on() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.mesh_backbone);
+        let config: NodeConfig =
+            serde_json::from_value(serde_json::json!({"mesh_backbone": true})).unwrap();
+        assert!(config.mesh_backbone);
     }
 
     #[test]

@@ -40,6 +40,13 @@ networks' static keys in `"mesh_state_dir"` (default
 `/var/lib/anixcore/mesh`); if that directory cannot be created the mesh is
 left out and `GET /v1/status` does not list `mesh`.
 
+The inter-region backbone of those networks (a border node's top-level
+`backbone` section) stays off unless the config sets
+`"mesh_backbone": true`. Off, `GET /v1/status` does not list
+`mesh_backbone` and a `PUT /v1/mesh` body carrying a `backbone` section is
+refused as a whole with 400 (`backbone_disabled`), leaving the running
+networks as they are.
+
 Users may carry `"speed_limit"` (Mbit/s for each direction, shared by all
 of the user's connections) and `"device_limit"` (most client IPs online at
 once); both default to 0, no limit.
