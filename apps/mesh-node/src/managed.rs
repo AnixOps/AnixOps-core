@@ -70,7 +70,13 @@ pub const FEATURES: &[&str] = &[
 
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
 /// lock, nftables took the probe and the start-up cleanup ran.
-pub const FEATURES_WITH_BRIDGE: &[&str] = &["mesh", "mesh_native_keys", mesh_bridge::FEATURE];
+pub const FEATURES_WITH_BRIDGE: &[&str] = &[
+    "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
+    "mesh_native_keys",
+    mesh_bridge::FEATURE,
+];
 
 /// Listed only when the operator turned the backbone on
 /// ([`ManagedMesh::with_backbone`]): `PUT /v1/mesh` then takes the
@@ -79,11 +85,19 @@ pub const FEATURES_WITH_BRIDGE: &[&str] = &["mesh", "mesh_native_keys", mesh_bri
 pub const BACKBONE_FEATURE: &str = "mesh_backbone";
 
 /// [`FEATURES`] with the backbone on.
-pub const FEATURES_WITH_BACKBONE: &[&str] = &["mesh", "mesh_native_keys", BACKBONE_FEATURE];
+pub const FEATURES_WITH_BACKBONE: &[&str] = &[
+    "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
+    "mesh_native_keys",
+    BACKBONE_FEATURE,
+];
 
 /// [`FEATURES_WITH_BRIDGE`] with the backbone on.
 pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
     "mesh",
+    "mesh_dns",
+    "mesh_resolver_address",
     "mesh_native_keys",
     mesh_bridge::FEATURE,
     BACKBONE_FEATURE,
