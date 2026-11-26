@@ -1,0 +1,122 @@
+name: Mesh end-to-end
+
+# Real-topology acceptance of the mesh node (docs/mesh-e2e.md): every
+# machine is a network namespace running the anixops-mesh program built
+# here. Required to be green before a kernel 0.4 / 0.5 release candidate.
+# GitHub-hosted only: this repository is public, and public repositories do
+# not use self-hosted runners. Scenarios that need the closed backbone link
+# run in the private anx repository.
+
+on:
+  pull_request:
+    paths:
+      - apps/mesh-node/**
+      - crates/outbound-mesh/**
+      - crates/engine-outbound/**
+      - Cargo.lock
+      - Cargo.toml
+      - .github/scripts/mesh-e2e/**
+      - .github/workflows/mesh-e2e.yml
+      - docs/mesh-e2e.md
+  push:
+    branches:
+      - main
+      - "release/[0-9]+.[0-9]+"
+    # Path filters are not evaluated for tag pushes, so every v* tag runs.
+    tags:
+      - "v*"
+    paths:
+      - apps/mesh-node/**
+      - crates/outbound-mesh/**
+      - crates/engine-outbound/**
+      - Cargo.lock
+      - Cargo.toml
+      - .github/scripts/mesh-e2e/**
+      - .github/workflows/mesh-e2e.yml
+      - docs/mesh-e2e.md
+  schedule:
+    # Daily, several rounds, to catch intermittent failures.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: Rounds of every enabled scenario
+        default: "1"
+      only:
+        description: Comma-separated scenario IDs (empty = all enabled)
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mesh-e2e-${{ github.event_name == 'pull_request' && github.ref || github.sha }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  e2e:
+    name: Mesh end-to-end (namespaces)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      REPEAT: ${{ github.event_name == 'schedule' && '3' || inputs.repeat || '1' }}
+      ONLY: ${{ inputs.only || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Scenario table matches docs
+        run: python3 .github/scripts/mesh-e2e/scenarios.py --check-docs docs/mesh-e2e.md
+
+      - name: Setup Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mesh-e2e
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Build anixops-mesh
+        run: cargo build --locked --release -p mesh-node --bin anixops-mesh
+
+      - name: Run scenarios
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          sudo python3 .github/scripts/mesh-e2e/scenarios.py \
+            --binary target/release/anixops-mesh \
+            --repeat "${REPEAT}" \
+            --only "${ONLY}" \
+            --results results/mesh-e2e.json
+
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          path = "results/mesh-e2e.json"
+          if not os.path.exists(path):
+              print("No results (the run stopped before the scenarios).")
+              raise SystemExit
+          data = json.load(open(path, encoding="utf-8"))
+          print("| 场景 | 轮 | 结果 | 秒 |\n|---|---|---|---|")
+          for r in data["results"]:
+              print(f"| {r['id']} | {r['round']} | {r['result']} | {r['seconds']} |")
+          print("\n待启用：")
+          for p in data["pending"]:
+              print(f"- {p['id']}：等待 {p['waits_for']}")
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mesh-e2e
+          path: results
+          retention-days: 30
+          if-no-files-found: ignore
