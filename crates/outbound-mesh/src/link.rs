@@ -436,10 +436,14 @@ pub struct Inbound {
     pub was_encrypted: bool,
 }
 
+/// Types that carry user data or control state and so are sealed whenever
+/// the network has a key. Type 40 carries inner packets, probes and path
+/// errors (spec §17.2.5 rule 3); it is never sent on a network without
+/// encryption (spec §17.2.1 rule 6).
 fn needs_encryption(kind: u8) -> bool {
     matches!(
         kind,
-        packet_type::DATA | packet_type::RPC_REQ | packet_type::RPC_RESP
+        packet_type::DATA | packet_type::RPC_REQ | packet_type::RPC_RESP | packet_type::WAYPOINT
     )
 }
 
@@ -474,7 +478,8 @@ pub fn open(
         | packet_type::PING
         | packet_type::PONG
         | packet_type::RELAY_HANDSHAKE
-        | packet_type::RELAY_HANDSHAKE_ACK => {}
+        | packet_type::RELAY_HANDSHAKE_ACK
+        | packet_type::WAYPOINT => {}
         packet_type::HANDSHAKE
         | packet_type::SECURE_MSG1
         | packet_type::SECURE_MSG2
@@ -1043,6 +1048,12 @@ mod tests {
         let sent = seal(&mut crypto, 1, 2, 2, packet_type::RPC_REQ, b"rpc", now).unwrap();
         assert_eq!(open(&mut crypto, 1, &sent, now).unwrap().payload, b"rpc");
         let plain = packet(1, 2, packet_type::RPC_REQ, b"rpc");
+        assert_eq!(open(&mut crypto, 1, &plain, now), Err(Dropped::Unencrypted));
+        // Type 40 is sealed and opened like Data (spec §17.2.5 rule 3).
+        let sent = seal(&mut crypto, 1, 2, 2, packet_type::WAYPOINT, b"probe", now).unwrap();
+        assert!(NodeHeader::decode(&sent).unwrap().has(flags::ENCRYPTED));
+        assert_eq!(open(&mut crypto, 1, &sent, now).unwrap().payload, b"probe");
+        let plain = packet(1, 2, packet_type::WAYPOINT, b"probe");
         assert_eq!(open(&mut crypto, 1, &plain, now), Err(Dropped::Unencrypted));
 
         // Only an explicitly unencrypted network takes plain Data.
