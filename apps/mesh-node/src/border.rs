@@ -627,6 +627,8 @@ mod tests {
             via: Vec::new(),
             hops: 1,
             latency_ms: None,
+            path_state: "auto",
+            unreachable: None,
         }
     }
 
