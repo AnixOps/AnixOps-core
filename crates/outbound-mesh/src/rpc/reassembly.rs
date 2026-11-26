@@ -16,12 +16,13 @@ use super::packet::{Descriptor, RpcPacket};
 
 /// Most calls one peer may have in reassembly at once (spec §19.3).
 pub const MAX_PENDING_PER_PEER: usize = 16;
-/// Most bytes one call may reassemble to.
-pub const MAX_CALL_BYTES: usize = 4 * 1024 * 1024;
+/// Most bytes one call may reassemble to (spec §11.2): the largest full
+/// synchronisation, a 2 MiB graph and 4095 node informations.
+pub const MAX_CALL_BYTES: usize = 8 * 1024 * 1024;
 /// Most calls in progress across all peers.
 pub const MAX_PENDING_TOTAL: usize = 256;
 /// Most bytes held across all calls in progress.
-pub const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Most bytes one peer's calls in progress may hold together.
 pub const MAX_PEER_BYTES: usize = MAX_TOTAL_BYTES / 4;
 

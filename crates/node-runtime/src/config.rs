@@ -91,6 +91,11 @@ pub struct NodeConfig {
     /// `PUT /v1/tls-fingerprints` takes it (see [`crate::apply_tls_fingerprints`]).
     #[serde(default)]
     pub tls_fingerprints: Option<serde_json::Value>,
+    /// Where the managed mesh networks (`PUT /v1/mesh`) keep this device's
+    /// instance ID and each network's static key; `anixcore` on Linux
+    /// uses `/var/lib/anixcore/mesh` when it is absent.
+    #[serde(default)]
+    pub mesh_state_dir: Option<std::path::PathBuf>,
 }
 
 /// Has no `Debug`: `token` is a credential.

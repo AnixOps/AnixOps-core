@@ -21,10 +21,11 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 
-use crate::config::{MeshSettings, PeerEndpoint, Role, Transport};
+use crate::config::{MeshSettings, PeerEndpoint, Role, SecurityMode, Transport};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
 use crate::node::{Action, ConnId, Counters, Node};
+use crate::routes::PeerId;
 use crate::secure::noise::KeyPair;
 use crate::wire::tcp::{encode_frame, FrameDecoder};
 use crate::wire::udp::{self, Datagram};
@@ -103,11 +104,48 @@ pub struct Snapshot {
     /// Node ID, next hop and hop count of every reachable node.
     pub routes: Vec<(u32, u32, u32)>,
     pub counters: Counters,
-    /// A neighbour said this node's ID is taken (spec §12.2).
+    /// This node's ID is taken and it changed ID less than ten minutes
+    /// ago, so it only warns (spec §12.3).
     pub duplicate_id: bool,
     /// Subnets to route into the interface: accepted, not overlapping this
     /// machine's networks, within `routing.system_routes`.
     pub system_routes: Vec<IpNet>,
+    /// This node's static public key in the network; `None` in the
+    /// default mode, which has none.
+    pub static_key: Option<[u8; 32]>,
+    /// A managed network whose native key list lacks this node: no links
+    /// are opened (spec §8.3.1 rule 1).
+    pub waiting_for_native_keys: bool,
+    /// The last peer refused for a key off the native key list.
+    pub not_native: Option<u32>,
+    /// Every reachable member, by node ID (requirement R16).
+    pub members: Vec<Member>,
+    /// Subnets refused from the members' current advertisements (R16, R17).
+    pub rejected_advertisements: u64,
+    /// Accepted subnets that overlap this node's own networks: kept, but
+    /// neither routed nor installed (R17, spec §15.4).
+    pub overlaps: Vec<IpNet>,
+    /// Members that claim one of this node's virtual addresses (R29).
+    pub address_conflicts: Vec<(u32, IpAddr)>,
+}
+
+/// One reachable member, as [`Snapshot::members`] lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub peer_id: u32,
+    /// Its virtual addresses, as accepted.
+    pub addresses: Vec<IpAddr>,
+    /// The subnets it advertises, as accepted.
+    pub subnets: Vec<IpNet>,
+    /// Node IDs of the relays on the path, first hop first; empty for a
+    /// direct connection.
+    pub via: Vec<u32>,
+    /// 1 for a direct connection.
+    pub hops: u32,
+    /// Round-trip time to a direct neighbour, in milliseconds; `None`
+    /// before the first keep-alive answer and for members reached through
+    /// relays.
+    pub latency_ms: Option<u32>,
 }
 
 enum Event {
@@ -184,6 +222,10 @@ pub struct Channels {
     /// The networks of this machine's other interfaces: advertised subnets
     /// that overlap them are neither routed nor installed (spec §15.4).
     pub local_networks: watch::Receiver<Vec<IpNet>>,
+    /// A new `network.native_keys` for a managed network, applied without
+    /// a restart (spec §8.3.1); the value at start is ignored, the
+    /// settings carry it.
+    pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
     /// Stops the node when it turns true.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -200,14 +242,28 @@ pub async fn run(
         to_interface,
         snapshots,
         mut local_networks,
+        mut native_keys,
         mut shutdown,
     } = channels;
+    native_keys.mark_unchanged();
     let rng = SystemRandom::new();
     let started = Instant::now();
     let peers = settings.peers.clone();
     let mut node = Node::new(settings, static_key, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
     node.set_local_networks(&local_networks.borrow_and_update());
+    if node.waits_for_native_keys() {
+        // No listening, dialling or packets until the list holds this
+        // node; the caller should not have bound listeners either.
+        drop(listeners);
+        publish(&snapshots, snapshot(&node));
+        while !*shutdown.borrow_and_update() {
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+        return Ok(());
+    }
     let (events, mut event_rx) = mpsc::channel(EVENT_QUEUE);
     let shared = Shared {
         events,
@@ -249,6 +305,11 @@ pub async fn run(
             }
             Ok(()) = local_networks.changed() => {
                 node.set_local_networks(&local_networks.borrow_and_update());
+            }
+            Ok(()) = native_keys.changed() => {
+                let keys = native_keys.borrow_and_update().clone();
+                node.set_native_keys(keys, Instant::now());
+                publish(&snapshots, snapshot(&node));
             }
             event = event_rx.recv() => {
                 let Some(event) = event else { break };
@@ -348,7 +409,7 @@ pub async fn run(
             }
             _ = ticks.tick() => {
                 node.tick(&rng, Instant::now(), unix_now());
-                let _ = snapshots.send(snapshot(&node));
+                publish(&snapshots, snapshot(&node));
             }
         }
         carry_out(&mut node, &mut conns, &mut budget, &to_interface);
@@ -383,7 +444,75 @@ fn snapshot(node: &Node) -> Snapshot {
         counters: node.counters(),
         duplicate_id: node.duplicate_id(),
         system_routes: node.system_routes(),
+        static_key: (node.settings().security == SecurityMode::ForwardSecrecy)
+            .then(|| node.static_public()),
+        waiting_for_native_keys: node.waits_for_native_keys(),
+        not_native: node.last_not_native(),
+        members: members(node),
+        rejected_advertisements: node.route_table().refused_subnet_count(),
+        overlaps: overlaps(node),
+        address_conflicts: node
+            .route_table()
+            .address_conflicts()
+            .into_iter()
+            .map(|(peer, address)| (peer.0, address))
+            .collect(),
     }
+}
+
+fn members(node: &Node) -> Vec<Member> {
+    let table = node.route_table();
+    node.paths()
+        .into_iter()
+        .map(|(peer, route)| {
+            let (addresses, subnets) = table
+                .peer(PeerId(peer))
+                .map(|view| (view.addresses.to_vec(), view.subnets.to_vec()))
+                .unwrap_or_default();
+            let via = match route.path.split_last() {
+                Some((_, relays)) => relays.to_vec(),
+                None => Vec::new(),
+            };
+            let rtt = if route.hops == 1 {
+                node.latency(peer)
+            } else {
+                None
+            };
+            let latency_ms = rtt.map(|rtt| u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX));
+            Member {
+                peer_id: peer,
+                addresses,
+                subnets,
+                via,
+                hops: route.hops,
+                latency_ms,
+            }
+        })
+        .collect()
+}
+
+fn overlaps(node: &Node) -> Vec<IpNet> {
+    let mut nets: Vec<IpNet> = node
+        .route_table()
+        .local_conflicts()
+        .into_iter()
+        .map(|(_, net)| net)
+        .collect();
+    nets.sort_by_key(ToString::to_string);
+    nets.dedup();
+    nets
+}
+
+/// Publishes `next` only when it differs, so that readers wake on changes.
+fn publish(snapshots: &watch::Sender<Snapshot>, next: Snapshot) {
+    snapshots.send_if_modified(|current| {
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    });
 }
 
 fn close(
@@ -769,6 +898,7 @@ mod tests {
         let (snapshot_tx, snapshots) = watch::channel(Snapshot::default());
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_, local_networks) = watch::channel(Vec::new());
+        let (_, native_keys) = watch::channel(None);
         tokio::spawn(run(
             settings,
             static_key,
@@ -778,6 +908,7 @@ mod tests {
                 to_interface,
                 snapshots: snapshot_tx,
                 local_networks,
+                native_keys,
                 shutdown,
             },
         ));
@@ -864,6 +995,14 @@ mod tests {
             .expect("delivered in time");
         assert_eq!(received, Some(packet));
         assert_eq!(a.snapshots.borrow().neighbours, vec![b_id]);
+        let members = b.snapshots.borrow().members.clone();
+        let member = members
+            .iter()
+            .find(|member| member.peer_id == a_id)
+            .expect("a is listed");
+        assert_eq!(member.addresses, [IpAddr::V4(Ipv4Addr::new(10, 144, 0, 1))]);
+        assert_eq!((member.hops, member.via.is_empty()), (1, true));
+        assert_eq!(b.snapshots.borrow().rejected_advertisements, 0);
     }
 
     #[tokio::test]

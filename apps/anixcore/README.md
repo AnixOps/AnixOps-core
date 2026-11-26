@@ -33,6 +33,13 @@ non-loopback address in plaintext for a deployment that keeps the port on a
 restricted network; `anixcore` then prints a warning at start. An empty
 token is refused.
 
+On Linux `anixcore` also runs the intranet mesh networks a node agent
+sends with `PUT /v1/mesh` (`docs/architecture/mesh-status.md`), one
+virtual interface each. It keeps this device's instance ID and the
+networks' static keys in `"mesh_state_dir"` (default
+`/var/lib/anixcore/mesh`); if that directory cannot be created the mesh is
+left out and `GET /v1/status` does not list `mesh`.
+
 Users may carry `"speed_limit"` (Mbit/s for each direction, shared by all
 of the user's connections) and `"device_limit"` (most client IPs online at
 once); both default to 0, no limit.

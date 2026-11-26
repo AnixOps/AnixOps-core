@@ -31,6 +31,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::net::IpNet;
 use crate::scope::is_intranet_network;
@@ -100,6 +101,13 @@ pub struct NetworkConfig {
     /// encryption off and must be chosen explicitly.
     #[serde(default)]
     pub cipher: Cipher,
+    /// Secure-mode static keys of our nodes in this network, standard
+    /// Base64 of 32 bytes each (spec §8.3.1). A managed network admits only
+    /// these and waits while the list is absent, empty or lacks this
+    /// node's own key. Legacy networks use it only to tell implementations
+    /// apart.
+    #[serde(default)]
+    pub native_keys: Option<Vec<String>>,
 }
 
 /// Who runs a network (spec §15.11).
@@ -141,6 +149,11 @@ pub struct NodeConfig {
     /// that does not relay is still reachable as a destination.
     #[serde(default)]
     pub relay: Option<bool>,
+    /// This node's secure-mode static private key for the network, standard
+    /// Base64 of 32 bytes, injected from the system key store like the
+    /// secret and never written out. Absent: the caller keeps one.
+    #[serde(default)]
+    pub private_key: Option<String>,
 }
 
 /// What a node does for others (spec §1.3, requirement R10).
@@ -346,8 +359,9 @@ impl MeshSettings {
     }
 }
 
-/// Validated settings. Has no `Debug`: it holds the secret.
-#[derive(Clone)]
+/// Validated settings. Has no `Debug`: it holds the secret. Equality
+/// tells the management API whether a network's settings changed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MeshSettings {
     pub network_name: String,
     pub network_secret: String,
@@ -373,9 +387,35 @@ pub struct MeshSettings {
     /// `None`: every accepted route goes into the system routing table.
     pub system_routes: Option<Vec<IpNet>>,
     pub paths: Vec<CustomPath>,
+    /// Decoded `network.native_keys`; `None` when absent.
+    pub native_keys: Option<Vec<[u8; 32]>>,
+    /// Decoded `node.private_key`, wiped when dropped.
+    pub private_key: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl MeshSettings {
+    /// A managed network waits, without links, interface or routes, while
+    /// its native key list is absent, empty or lacks `own_public`, the
+    /// node's static public key (spec §8.3.1 rule 1). Legacy networks never
+    /// wait.
+    pub fn waits_for_native_keys(&self, own_public: &[u8; 32]) -> bool {
+        self.kind == NetworkKind::Managed
+            && !self
+                .native_keys
+                .as_ref()
+                .is_some_and(|keys| keys.contains(own_public))
+    }
+
+    /// Whether a peer with `key` is admitted (spec §8.3.1): in a managed
+    /// network only keys on the list; in a legacy network every key.
+    pub fn admits(&self, key: &[u8; 32]) -> bool {
+        self.kind != NetworkKind::Managed
+            || self
+                .native_keys
+                .as_ref()
+                .is_some_and(|keys| keys.contains(key))
+    }
+
     /// The virtual subnets of the network, IPv4 first.
     pub fn virtual_subnets(&self) -> Vec<IpNet> {
         let mut subnets = vec![self.address.trunc()];
@@ -395,6 +435,29 @@ impl MeshSettings {
             .iter()
             .any(|subnet| subnet.is_host(address))
     }
+}
+
+/// Most keys `network.native_keys` may list: one per node of the largest
+/// network (spec §12.4).
+pub const MAX_NATIVE_KEYS: usize = 4096;
+
+/// Decodes standard Base64 with padding (RFC 4648 §4) of exactly 32 bytes.
+fn decode_key(text: &str) -> Option<Zeroizing<[u8; 32]>> {
+    use base64::Engine as _;
+    let bytes = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .ok()?,
+    );
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(bytes.get(..32).filter(|_| bytes.len() == 32)?);
+    Some(key)
+}
+
+/// Encodes a static public key the way the status and `native_keys` do.
+pub fn encode_key(key: &[u8; 32]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(key)
 }
 
 impl MeshConfig {
@@ -517,6 +580,30 @@ impl MeshConfig {
             Some(texts) => Some(intranet_subnets(texts, "mesh routing.system_routes")?),
         };
 
+        let native_keys = match &network.native_keys {
+            None => None,
+            Some(texts) => {
+                if texts.len() > MAX_NATIVE_KEYS {
+                    return Err("mesh network native_keys lists too many keys");
+                }
+                let mut keys = Vec::with_capacity(texts.len());
+                for text in texts {
+                    let key = decode_key(text)
+                        .ok_or("mesh network native_keys entry is not Base64 of 32 bytes")?;
+                    if !keys.contains(&*key) {
+                        keys.push(*key);
+                    }
+                }
+                Some(keys)
+            }
+        };
+        let private_key = match &node.private_key {
+            None => None,
+            Some(text) => {
+                Some(decode_key(text).ok_or("mesh node private_key is not Base64 of 32 bytes")?)
+            }
+        };
+
         let mut settings = MeshSettings {
             network_name: network.name,
             network_secret: network.secret,
@@ -540,6 +627,8 @@ impl MeshConfig {
             route_policy: self.routing.policy,
             system_routes,
             paths: Vec::new(),
+            native_keys,
+            private_key,
         };
         if advertise_subnets_overlap_virtual(&settings) {
             return Err("mesh subnets.advertise overlaps the virtual subnet");
@@ -1094,5 +1183,50 @@ mod tests {
             ]}),
         );
         assert!(validate(twice).is_err());
+    }
+
+    #[test]
+    fn native_keys_and_the_private_key_are_base64_of_32_bytes() {
+        let key = encode_key(&[7; 32]);
+        assert_eq!(key.len(), 44);
+        let settings = validate(with("network.native_keys", json!([key, key]))).unwrap();
+        assert_eq!(settings.native_keys, Some(vec![[7; 32]]));
+        let settings = validate(with("node.private_key", json!(encode_key(&[9; 32])))).unwrap();
+        assert_eq!(settings.private_key.as_deref(), Some(&[9; 32]));
+        for bad in [
+            json!(["not base64!"]),
+            json!([&encode_key(&[1; 32])[..40]]),
+            json!(["AAAA"]),
+        ] {
+            assert!(validate(with("network.native_keys", bad)).is_err());
+        }
+        assert!(validate(with("node.private_key", json!("AAAA"))).is_err());
+        // Without padding is not the standard form.
+        let unpadded = key.trim_end_matches('=').to_owned();
+        assert!(validate(with("network.native_keys", json!([unpadded]))).is_err());
+    }
+
+    #[test]
+    fn a_managed_network_waits_until_its_list_holds_this_node() {
+        let mut config = with("network.kind", json!("managed"));
+        config["node"]["role"] = json!("full");
+        let own = [5; 32];
+        let settings = validate(config.clone()).unwrap();
+        assert!(settings.waits_for_native_keys(&own));
+        config["network"]["native_keys"] = json!([]);
+        assert!(validate(config.clone())
+            .unwrap()
+            .waits_for_native_keys(&own));
+        config["network"]["native_keys"] = json!([encode_key(&[6; 32])]);
+        let settings = validate(config.clone()).unwrap();
+        assert!(settings.waits_for_native_keys(&own));
+        assert!(settings.admits(&[6; 32]));
+        assert!(!settings.admits(&own));
+        config["network"]["native_keys"] = json!([encode_key(&[6; 32]), encode_key(&own)]);
+        assert!(!validate(config).unwrap().waits_for_native_keys(&own));
+        // A legacy network never waits and admits every key.
+        let legacy = validate(base()).unwrap();
+        assert!(!legacy.waits_for_native_keys(&own));
+        assert!(legacy.admits(&own));
     }
 }

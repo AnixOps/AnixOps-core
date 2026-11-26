@@ -337,6 +337,16 @@ impl Sessions {
         self.map.get(key)
     }
 
+    /// Keys of the established sessions whose peer's static key fails
+    /// `keep`, for example after the native key list changed.
+    pub fn refused_by(&self, keep: impl Fn(&[u8; LEN]) -> bool) -> Vec<SessionKey> {
+        self.map
+            .iter()
+            .filter(|(_, session)| !keep(&session.peer_static()))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     pub fn get_mut(&mut self, key: &SessionKey) -> Option<&mut Session> {
         self.map.get_mut(key)
     }

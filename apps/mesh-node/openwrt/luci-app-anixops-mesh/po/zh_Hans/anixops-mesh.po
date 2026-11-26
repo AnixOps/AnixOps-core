@@ -1,0 +1,266 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: zh_Hans\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+msgid "Address conflict"
+msgstr "地址冲突"
+
+msgid "Address not managed"
+msgstr "地址未受管"
+
+msgid "Advertised LAN subnets"
+msgstr "通告的局域网网段"
+
+msgid "Alert"
+msgstr "告警"
+
+msgid "Approved"
+msgstr "已批准"
+
+msgid "Cancel"
+msgstr "取消"
+
+msgid "Device"
+msgstr "设备"
+
+msgid "Device identity online elsewhere"
+msgstr "设备身份已在其他位置在线"
+
+msgid "Direct"
+msgstr "直连"
+
+msgid "Enable service"
+msgstr "启用服务"
+
+msgid "Enroll"
+msgstr "接入"
+
+msgid "Enroll again"
+msgstr "重新接入"
+
+msgid "Enroll device"
+msgstr "接入设备"
+
+msgid "Enrolled"
+msgstr "已接入"
+
+msgid "Enrollment"
+msgstr "接入"
+
+msgid "Enrollment completed. The service has been started."
+msgstr "接入完成，服务已启动。"
+
+msgid "Enrollment credential"
+msgstr "入网凭据"
+
+msgid "Enrollment failed."
+msgstr "接入失败。"
+
+msgid "Enter at most 16 private IPv4 subnets in network address form, for example 192.168.1.0/24."
+msgstr "请填写不超过 16 个私有 IPv4 网段，使用网络地址形式，例如 192.168.1.0/24。"
+
+msgid "Enter the panel address and the one-time enrollment credential issued by the administrator."
+msgstr "请填写面板地址及管理员签发的一次性入网凭据。"
+
+msgid "Forward secrecy"
+msgstr "前向保密"
+
+msgid "Hops"
+msgstr "跳数"
+
+msgid "Insufficient permission"
+msgstr "权限不足"
+
+msgid "Interface"
+msgstr "接口"
+
+msgid "Intranet mesh"
+msgstr "内网组网"
+
+msgid "Last configuration"
+msgstr "最近读取配置"
+
+msgid "Last report"
+msgstr "最近上报"
+
+msgid "Latency"
+msgstr "延迟"
+
+msgid "Latest configuration rejected"
+msgstr "最近一份配置未通过校验"
+
+msgid "Listening port in use"
+msgstr "监听端口已被占用"
+
+msgid "Members"
+msgstr "成员"
+
+msgid "Network name or key differs from the peer"
+msgstr "网络名或密钥与对端不一致"
+
+msgid "Networks, addresses and peers of this device are assigned by the panel. This page only controls the service, enrollment and subnet requests."
+msgstr "本设备的网络、地址与对端均由面板分配。本页仅用于控制服务、接入设备及申请通告网段。"
+
+msgid "No"
+msgstr "否"
+
+msgid "No members"
+msgstr "暂无成员"
+
+msgid "No network assigned to this device"
+msgstr "面板尚未为本设备分配网络"
+
+msgid "No peer reachable"
+msgstr "所有对端均无法连接"
+
+msgid "No private LAN subnet found"
+msgstr "未发现私有局域网网段"
+
+msgid "Normal"
+msgstr "正常"
+
+msgid "Not enrolled"
+msgstr "未接入"
+
+msgid "Not measured"
+msgstr "未测得"
+
+msgid "Not running"
+msgstr "未运行"
+
+msgid "Not supported by the installed program version"
+msgstr "当前安装的程序版本不支持"
+
+msgid "Not supported by the installed program version."
+msgstr "当前安装的程序版本不支持此功能。"
+
+msgid "Only full nodes can advertise subnets."
+msgstr "仅完整节点可通告网段。"
+
+msgid "Other subnets"
+msgstr "其他网段"
+
+msgid "Overlapping subnets"
+msgstr "重叠网段"
+
+msgid "Panel address"
+msgstr "面板地址"
+
+msgid "Panel connection"
+msgstr "面板连接"
+
+msgid "Path"
+msgstr "路径"
+
+msgid "Peer not admitted to this network refused"
+msgstr "已拒绝未准入本网络的对端"
+
+msgid "Peer without encryption refused"
+msgstr "已拒绝未加密的对端"
+
+msgid "Pending approval"
+msgstr "待管理员批准"
+
+msgid "Rejected subnet advertisements"
+msgstr "被拒绝的网段通告"
+
+msgid "Request failed."
+msgstr "申请失败。"
+
+msgid "Request submitted. The subnets take effect after an administrator approves them."
+msgstr "申请已提交，管理员批准后生效。"
+
+msgid "Requested"
+msgstr "已申请"
+
+msgid "Route conflicts with an existing route"
+msgstr "路由与现有路由冲突"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Security mode differs from the peer"
+msgstr "安全模式与对端不一致"
+
+msgid "Select the LAN subnets that other mesh members may reach through this router. The request is sent to the panel and takes effect after an administrator approves it. Submitting an empty selection withdraws a pending request."
+msgstr "选择允许组网其他成员经本路由器访问的局域网网段。申请提交至面板，经管理员批准后生效。不选择任何网段并提交，即撤回待批准的申请。"
+
+msgid "Service"
+msgstr "服务"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "Start refused"
+msgstr "拒绝启动"
+
+msgid "State"
+msgstr "状态"
+
+msgid "Status"
+msgstr "状态"
+
+msgid "Status of this device in the intranet mesh. Networks are assigned by the panel."
+msgstr "本设备在内网组网中的状态。网络由面板分配。"
+
+msgid "Status unavailable"
+msgstr "无法读取状态"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "Submit request"
+msgstr "提交申请"
+
+msgid "Subnet"
+msgstr "网段"
+
+msgid "Subnets"
+msgstr "网段"
+
+msgid "The device token has been revoked. Enroll the device again."
+msgstr "设备令牌已被吊销，请重新接入。"
+
+msgid "The enrollment credential is invalid."
+msgstr "入网凭据无效。"
+
+msgid "The panel address must be an https address."
+msgstr "面板地址须为 https 地址。"
+
+msgid "The panel is unreachable or returned an invalid response."
+msgstr "无法连接面板，或面板应答无效。"
+
+msgid "The panel refused the request."
+msgstr "面板拒绝了该申请。"
+
+msgid "The panel rejected one or more subnets."
+msgstr "面板拒绝了其中的部分网段。"
+
+msgid "The panel rejected the enrollment credential. Request a new credential from the administrator."
+msgstr "面板拒绝了该入网凭据，请向管理员申请新的凭据。"
+
+msgid "The service starts only after the device has been enrolled."
+msgstr "设备接入后服务方可启动。"
+
+msgid "This device is not enrolled."
+msgstr "本设备尚未接入。"
+
+msgid "Unreachable"
+msgstr "无法连接"
+
+msgid "Virtual address"
+msgstr "虚拟地址"
+
+msgid "Virtual address used by another interface"
+msgstr "虚拟地址已被其他接口使用"
+
+msgid "Virtual interface name in use"
+msgstr "虚拟网卡名称已被占用"
+
+msgid "Waiting for the administrator to admit this device"
+msgstr "等待管理员准入本设备"
+
+msgid "Yes"
+msgstr "是"
