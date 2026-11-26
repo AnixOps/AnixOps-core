@@ -494,6 +494,9 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
+        // Subnet route overrides belong to the managed networks
+        // (`PUT /v1/mesh/subnet_route`); a standalone node has none.
+        let (_keep_overrides, route_overrides) = watch::channel(Vec::new());
         serve_with(
             settings,
             static_key,
@@ -501,6 +504,7 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             device,
             stop,
             native_keys,
+            route_overrides,
             None,
             |snapshot, name| {
                 if let Some(forwarding) = forwarding.as_mut() {
@@ -753,6 +757,7 @@ pub(crate) async fn serve_with(
     device: Tun,
     until: impl std::future::Future<Output = ()>,
     native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    route_overrides: watch::Receiver<Vec<IpNet>>,
     host: Option<(HostRoutes, String)>,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
@@ -820,9 +825,6 @@ pub(crate) async fn serve_with(
             }
         }
     }));
-    // No entry point sets subnet route overrides here yet; the sender is
-    // kept so that the driver sees an open, empty list.
-    let (_route_overrides, route_overrides) = watch::channel(Vec::new());
     let mut installed: Vec<IpNet> = Vec::new();
     let mut wanted: Vec<IpNet> = Vec::new();
     tokio::pin!(until);

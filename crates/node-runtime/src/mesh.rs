@@ -17,9 +17,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use outbound_mesh::status::{
-    valid_tag, ApplyError, ManagedNetwork, ManagedStatus, MeshControl, MAX_MANAGED_NETWORKS,
+    valid_tag, ApplyError, ManagedNetwork, ManagedStatus, MeshControl, OverrideError, SubnetRoute,
+    MAX_MANAGED_NETWORKS,
 };
-use outbound_mesh::MeshConfig;
+use outbound_mesh::{IpNet, MeshConfig};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -47,6 +48,22 @@ impl Mesh {
         self.control.status()
     }
 
+    /// Parses and saves a `PUT /v1/mesh/subnet_route` body; answers the
+    /// status after it. One at a time with `PUT /v1/mesh`.
+    pub(crate) async fn set_subnet_route(&self, body: &[u8]) -> Result<ManagedStatus, NodeError> {
+        let (tag, subnet, route) = parse_subnet_route(body).map_err(NodeError::Mesh)?;
+        let _one_at_a_time = self.apply.lock().await;
+        self.control
+            .set_subnet_route(tag, subnet, route)
+            .await
+            .map_err(|error| match error {
+                OverrideError::UnknownNetwork => NodeError::NotFound,
+                OverrideError::Invalid(message) => NodeError::Mesh(message),
+                OverrideError::Failed(message) => NodeError::MeshFailed(message),
+            })?;
+        Ok(self.control.status())
+    }
+
     /// Parses, validates and applies a `PUT /v1/mesh` body.
     pub(crate) async fn apply(&self, body: &[u8]) -> Result<ManagedStatus, NodeError> {
         let networks = parse(body).map_err(NodeError::Mesh)?;
@@ -59,6 +76,29 @@ impl Mesh {
                 ApplyError::Failed(message) => NodeError::MeshFailed(message),
             })
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubnetRouteBody {
+    tag: String,
+    cidr: String,
+    route: SubnetRoute,
+}
+
+/// Validates a `PUT /v1/mesh/subnet_route` body.
+pub fn parse_subnet_route(body: &[u8]) -> Result<(String, IpNet, SubnetRoute), String> {
+    let body: SubnetRouteBody = serde_json::from_slice(body)
+        .map_err(|error| format!("invalid request body: {}", describe(&error)))?;
+    if !valid_tag(&body.tag) {
+        return Err("tag must be mesh-<region code>".to_owned());
+    }
+    let subnet = Some(&body.cidr)
+        .filter(|cidr| cidr.contains('/'))
+        .and_then(|cidr| IpNet::parse(cidr))
+        .filter(|net| net.prefix() > 0)
+        .ok_or_else(|| "cidr must be a network such as 192.168.10.0/24".to_owned())?;
+    Ok((body.tag, subnet.trunc(), body.route))
 }
 
 #[derive(Deserialize)]
@@ -136,6 +176,32 @@ mod tests {
     use serde_json::json;
 
     const SECRET: &str = "s3cret-value-never-echoed";
+
+    #[test]
+    fn a_subnet_route_body_is_checked() {
+        let parse = |value: Value| parse_subnet_route(value.to_string().as_bytes());
+        let (tag, subnet, route) =
+            parse(json!({"tag": "mesh-cn", "cidr": "192.168.10.7/24", "route": "mesh"})).unwrap();
+        assert_eq!(tag, "mesh-cn");
+        assert_eq!(subnet, IpNet::parse("192.168.10.0/24").unwrap());
+        assert_eq!(route, SubnetRoute::Mesh);
+        assert_eq!(
+            parse(json!({"tag": "mesh-cn", "cidr": "fd00::/64", "route": "local"}))
+                .unwrap()
+                .2,
+            SubnetRoute::Local
+        );
+        for bad in [
+            json!({"tag": "cn", "cidr": "192.168.10.0/24", "route": "mesh"}),
+            json!({"tag": "mesh-cn", "cidr": "192.168.10.0", "route": "mesh"}),
+            json!({"tag": "mesh-cn", "cidr": "0.0.0.0/0", "route": "mesh"}),
+            json!({"tag": "mesh-cn", "cidr": "192.168.10.0/24", "route": "both"}),
+            json!({"tag": "mesh-cn", "cidr": "192.168.10.0/24"}),
+            json!({"tag": "mesh-cn", "cidr": "192.168.10.0/24", "route": "mesh", "x": 1}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
 
     fn network(tag: &str, name: &str) -> Value {
         json!({
