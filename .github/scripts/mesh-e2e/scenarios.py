@@ -157,20 +157,24 @@ def e07_public_subnet(lab):
 
 
 def e08_wrong_secret(lab):
-    a, b = lab.machine("a"), lab.machine("b")
+    a, b, c = lab.machine("a"), lab.machine("b"), lab.machine("c")
     lab.segment("wan1", WAN1)
     _, wa = lab.attach(a, "wan1", 1)
     lab.attach(b, "wan1", 2)
-    members = ["A", "B"]
-    na = lab.node(a, "A", mesh_config(lab, "A", NETWORK, va(VA), members=members)).start()
+    lab.attach(c, "wan1", 3)
+    members = ["A", "B", "C"]
+    lab.node(a, "A", mesh_config(lab, "A", NETWORK, va(VA), members=members)).start()
     nb = lab.node(b, "B", mesh_config(lab, "B", NETWORK, va(VB), members=members,
                                       peers=[(wa, "tcp")], secret="another-secret")).start()
+    # Control: C has the right secret, so A is up and reachable.
+    lab.node(c, "C", mesh_config(lab, "C", NETWORK, va(VC), members=members,
+                                 peers=[(wa, "tcp")])).start()
+    c.reach(VA, REACH)
     b.unreachable(VA, SILENCE)
     a.unreachable(VB, 3)
-    for node in (na, nb):
-        status = node.last_status()
-        if status and status.get("neighbours"):
-            raise LabError(f"{node.name} has neighbours with a wrong network secret: {status}")
+    status = nb.last_status()
+    if status and status.get("neighbours"):
+        raise LabError(f"B has neighbours with a wrong network secret: {status}")
 
 
 def e09_not_native(lab):
