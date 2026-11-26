@@ -230,3 +230,40 @@ fn changed_settings_stop_the_old_network() {
     let found = outbound_mesh::outbound::instance("outbound-replaced").unwrap();
     assert!(std::sync::Arc::ptr_eq(new.instance(), &found));
 }
+
+fn access_node(name: &str, address: &str) -> MeshSettings {
+    let config: MeshConfig = serde_json::from_value(json!({
+        "config_version": 1,
+        "network": {"name": name, "secret": "s3cr3t", "kind": "legacy"},
+        "node": {"address": address, "role": "access"},
+        "peers": [{"server": "127.0.0.1", "port": 1}],
+    }))
+    .unwrap();
+    config.validate().unwrap()
+}
+
+#[test]
+fn a_retired_network_is_not_found_again() {
+    let settings = access_node("outbound-retired", "10.148.0.2/24");
+    let first = MeshOutbound::new(settings.clone()).unwrap();
+    first.instance().retire();
+    assert!(outbound_mesh::outbound::instance("outbound-retired").is_none());
+    let again = MeshOutbound::new(settings).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(first.instance(), again.instance()));
+    assert_eq!(again.instance().state(), (false, None));
+}
+
+#[test]
+fn a_driver_whose_runtime_is_gone_counts_as_stopped() {
+    let outbound =
+        MeshOutbound::unshared(access_node("outbound-runtime", "10.149.0.2/24")).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Started on a runtime that is dropped before the driver task ever ran.
+    runtime.block_on(async { outbound.instance().start() });
+    assert_eq!(outbound.instance().state(), (true, None));
+    drop(runtime);
+    assert_eq!(outbound.instance().state(), (false, Some(Failure::Stopped)));
+}

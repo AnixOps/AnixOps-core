@@ -52,6 +52,7 @@ fn instance_for(settings: MeshSettings) -> io::Result<Arc<Instance>> {
     if let Some(instance) = instances
         .get(&settings.network_name)
         .and_then(Weak::upgrade)
+        .filter(|instance| !instance.is_retired())
     {
         if *instance.settings() == settings {
             return Ok(instance);
@@ -72,6 +73,7 @@ pub fn instance(name: &str) -> Option<Arc<Instance>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(name)
         .and_then(Weak::upgrade)
+        .filter(|instance| !instance.is_retired())
 }
 
 pub struct MeshFactory;

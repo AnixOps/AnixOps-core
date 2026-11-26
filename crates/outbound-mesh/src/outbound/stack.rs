@@ -347,6 +347,11 @@ impl Instance {
         self.snapshot.subscribe()
     }
 
+    /// Whether [`Self::retire`] stopped the network for good.
+    pub fn is_retired(&self) -> bool {
+        self.lock().retired
+    }
+
     /// Whether a driver runs, and why the last one could not.
     pub fn state(&self) -> (bool, Option<Failure>) {
         let core = self.lock();
@@ -394,7 +399,14 @@ impl Instance {
             core.failure = None;
             core.run
         };
-        tokio::spawn(start_driver(self.clone(), run));
+        // The guard is made here and moved into the task, so that it also
+        // records the run as stopped when the runtime drops the task before
+        // it was ever polled.
+        let guard = RunGuard {
+            instance: Arc::downgrade(self),
+            run,
+        };
+        tokio::spawn(start_driver(self.clone(), run, guard));
         Ok(())
     }
 
@@ -573,14 +585,11 @@ impl Instance {
 }
 
 /// Binds the listeners, then runs the driver and the pump for `run`.
-async fn start_driver(instance: Arc<Instance>, run: u64) {
-    // Records the run as stopped if the task ends without doing so, such
-    // as when its runtime shuts down; otherwise `running` would stay set
-    // and every later connection would wait for a driver that is gone.
-    let _guard = RunGuard {
-        instance: Arc::downgrade(&instance),
-        run,
-    };
+///
+/// `_guard` records the run as stopped if the task ends without doing so,
+/// such as when its runtime shuts down; otherwise `running` would stay set
+/// and every later connection would wait for a driver that is gone.
+async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     let settings = instance.settings.clone();
     let listeners = match Listeners::bind(&settings).await {
         Ok(listeners) => listeners,
