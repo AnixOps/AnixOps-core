@@ -18,8 +18,10 @@
 #
 #   package-openwrt.sh VERSION BIN_DIR OUT_DIR
 #
-# VERSION is the program version (x.y.z); the packages are VERSION-r1.
-# BIN_DIR holds anixops-mesh-<any>-<rust target> from build-mesh-node.sh.
+# VERSION is the program version (x.y.z, optionally v-prefixed, optionally
+# -alpha.N, -beta.N or -rc.N); the packages are release 1 of it. BIN_DIR
+# holds anixops-mesh-<version>-<rust target> from build-mesh-node.sh, with
+# or without its .sha256 and .buildinfo.json files.
 
 set -euo pipefail
 
@@ -31,11 +33,23 @@ version="$1"
 bin_dir="$2"
 out_dir="$3"
 
-if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "::error::package version must be x.y.z, got '${version}'"
+# The release tag form (v0.5.0, v0.5.0-rc.1) or the bare version. A
+# pre-release must sort before its release in both package managers: opkg
+# sorts "~" first (0.5.0~rc.1), apk has its own suffixes (0.5.0_rc1).
+version="${version#v}"
+if [[ "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  ipk_version="${version}-r1"
+  apk_version="${version}-r1"
+elif [[ "${version}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(alpha|beta|rc)\.([0-9]+)$ ]]; then
+  ipk_version="${BASH_REMATCH[1]}~${BASH_REMATCH[2]}.${BASH_REMATCH[3]}-r1"
+  apk_version="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}${BASH_REMATCH[3]}-r1"
+else
+  echo "::error::package version must be x.y.z or x.y.z-(alpha|beta|rc).N, got '${version}'"
   exit 1
 fi
-pkg_version="${version}-r1"
+# File names carry the release version as tagged: "~" does not survive as a
+# release asset name, and the package managers read the version inside.
+file_version="${version}-r1"
 
 repo="$(git rev-parse --show-toplevel)"
 src="${repo}/apps/mesh-node/openwrt"
@@ -128,7 +142,7 @@ build_ipk() {
   size="$(du -sb --apparent-size "${data}" | cut -f1)"
   {
     echo "Package: ${name}"
-    echo "Version: ${pkg_version}"
+    echo "Version: ${ipk_version}"
     if [ -n "${depends}" ]; then
       echo "Depends: ${depends//\ /, }"
     fi
@@ -157,8 +171,8 @@ build_ipk() {
   echo "2.0" > "${stage}/debian-binary"
   tar_gz "${data}" "${stage}/data.tar.gz" .
   tar_gz "${stage}/control" "${stage}/control.tar.gz" .
-  tar_gz "${stage}" "${out_dir}/${name}_${pkg_version}_${arch}.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz
-  echo "wrote ${name}_${pkg_version}_${arch}.ipk"
+  tar_gz "${stage}" "${out_dir}/${name}_${file_version}_${arch}.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz
+  echo "wrote ${name}_${file_version}_${arch}.ipk"
 }
 
 # NAME ARCH DATA_DIR DEPENDS DESCRIPTION RUSERS LUCI
@@ -186,7 +200,7 @@ build_apk() {
       luci_refresh >> "${stage}/scripts/${script}"
     done
   fi
-  local output="${name}_${pkg_version}_${arch}.apk"
+  local output="${name}_${file_version}_${arch}.apk"
   # apk names the architecture-independent kind noarch (OpenWrt's
   # package-pack.mk does the same); the file keeps the ipk-style name.
   local apk_arch="${arch}"
@@ -195,7 +209,7 @@ build_apk() {
   fi
   docker run --rm --network none \
     -v "${stage}:/stage:ro" -v "${out_dir}:/out" \
-    -e "NAME=${name}" -e "VERSION=${pkg_version}" -e "ARCH=${apk_arch}" \
+    -e "NAME=${name}" -e "VERSION=${apk_version}" -e "ARCH=${apk_arch}" \
     -e "DESCRIPTION=${description}" -e "DEPENDS=${depends}" -e "LICENSE=${license}" \
     -e "URL=${url}" -e "MAINTAINER=${maintainer}" -e "OUTPUT=${output}" \
     -e "OWNER=$(id -u):$(id -g)" \
@@ -235,7 +249,7 @@ files="${src}/anixops-mesh/files"
 built=0
 while read -r arch target; do
   case "${arch}" in "" | \#*) continue ;; esac
-  mapfile -t binaries < <(find "${bin_dir}" -maxdepth 1 -type f -name "anixops-mesh-*-${target}" ! -name '*.*')
+  mapfile -t binaries < <(find "${bin_dir}" -maxdepth 1 -type f -name "anixops-mesh-*-${target}")
   if [ "${#binaries[@]}" -eq 0 ]; then
     continue
   fi

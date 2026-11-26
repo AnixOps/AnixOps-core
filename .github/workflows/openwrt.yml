@@ -46,6 +46,8 @@ env:
   IMAGE_X86_64_2512: openwrt/rootfs@sha256:14401c04218c2e0da0448f099710ada2460636a92395f353351cc616cf3f67af # x86-64-25.12.6
   IMAGE_AARCH64_2410: openwrt/rootfs@sha256:f6dd33c1d9b7d6f1e0848f2fbb92b8d03fc9b425dc08c3574a44936b93133704 # armsr-armv8-24.10.8 (manifest in index dbe092b7…)
   IMAGE_AARCH64_2512: openwrt/rootfs@sha256:22f13387da208c0fb4150c41f3ec12e34cc5994a0717a49e50aa9f9ae6cb5e7b # armsr-armv8-25.12.6
+  IMAGE_ARMV7_2410: openwrt/rootfs@sha256:00c6e1dc4d6d4f3e0761fdb8df667b942185d0f4ab0ec361c9e46fa384631ef5 # armsr-armv7-24.10.8 (manifest in index a69380f5…)
+  IMAGE_ARMV7_2512: openwrt/rootfs@sha256:c32d38ebe9811c647a4171b745313cb221b968198be52cedea9a4632b26195f8 # armsr-armv7-25.12.6
   # apk-tools 3 (3.0.9) for `apk mkpkg`; OpenWrt's device apk has no mkpkg.
   APK_MKPKG_IMAGE: alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2 # 3.23.8
   # luci-base's catalog hash, compared with the Python writer.
@@ -160,6 +162,10 @@ jobs:
         target:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - armv7-unknown-linux-musleabi
+          - arm-unknown-linux-musleabihf
+          - arm-unknown-linux-musleabi
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -176,6 +182,14 @@ jobs:
         with:
           key: openwrt-${{ matrix.target }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # The build script runs the program for other architectures under
+      # user-mode emulation when it is there.
+      - name: User-mode emulation
+        if: ${{ matrix.target != 'x86_64-unknown-linux-musl' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
 
       - name: Build
         shell: bash
@@ -237,6 +251,12 @@ jobs:
           for ipk in dist/openwrt/*.ipk; do
             cmp "${ipk}" "dist/openwrt-again/$(basename "${ipk}")"
           done
+          # A pre-release tag gives versions that sort before the release in
+          # both package managers; apk mkpkg rejects a malformed one.
+          .github/scripts/package-openwrt.sh "v${version}-rc.1" dist/bin dist/openwrt-rc
+          ipk="dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.ipk"
+          tar -xzOf "${ipk}" ./control.tar.gz | tar -xzOf - ./control | grep -Fx "Version: ${version}~rc.1-r1"
+          test -s "dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.apk"
 
       - name: Package contents
         shell: bash
@@ -294,8 +314,10 @@ jobs:
           - { release: "23.05", arch: x86_64, format: ipk, image: IMAGE_X86_64_2305 }
           - { release: "24.10", arch: x86_64, format: ipk, image: IMAGE_X86_64_2410 }
           - { release: "25.12", arch: x86_64, format: apk, image: IMAGE_X86_64_2512 }
-          - { release: "24.10", arch: aarch64_generic, format: ipk, image: IMAGE_AARCH64_2410, emulate: true }
-          - { release: "25.12", arch: aarch64_generic, format: apk, image: IMAGE_AARCH64_2512, emulate: true }
+          - { release: "24.10", arch: aarch64_generic, format: ipk, image: IMAGE_AARCH64_2410, emulate: qemu-aarch64 }
+          - { release: "25.12", arch: aarch64_generic, format: apk, image: IMAGE_AARCH64_2512, emulate: qemu-aarch64 }
+          - { release: "24.10", arch: arm_cortex-a15_neon-vfpv4, format: ipk, image: IMAGE_ARMV7_2410, emulate: qemu-arm }
+          - { release: "25.12", arch: arm_cortex-a15_neon-vfpv4, format: apk, image: IMAGE_ARMV7_2512, emulate: qemu-arm }
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -308,14 +330,16 @@ jobs:
 
       - name: User-mode emulation
         if: ${{ matrix.emulate }}
+        env:
+          EMULATOR: ${{ matrix.emulate }}
         run: |
           sudo apt-get update
           # Static emulators registered with the F (fix binary) flag, so
           # they work inside containers.
           sudo apt-get install -y --no-install-recommends qemu-user-binfmt
           sudo systemctl restart systemd-binfmt || true
-          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
-          grep -q '^flags:.*F' /proc/sys/fs/binfmt_misc/qemu-aarch64
+          cat "/proc/sys/fs/binfmt_misc/${EMULATOR}"
+          grep -q '^flags:.*F' "/proc/sys/fs/binfmt_misc/${EMULATOR}"
 
       - name: Install and test in the OpenWrt root file system
         shell: bash

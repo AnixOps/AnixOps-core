@@ -11,11 +11,26 @@ OpenWrt 路由器以无 Agent 设备接入组网：软件包只含独立组网�
 
 每个软件包提供 ipk（opkg，OpenWrt 23.05、24.10）与 apk（OpenWrt 25.12 起）两种格式，由 [`.github/scripts/package-openwrt.sh`](../../.github/scripts/package-openwrt.sh) 生成：ipk 由脚本直接写出（归档内容按名称排序、属主 root、时间取提交时间，可重复构建），apk 由 apk-tools 3 的 `apk mkpkg` 写出（与 OpenWrt 构建系统在主机上使用的工具相同；设备上的 apk 不含 mkpkg），架构无关的包按 apk 的约定标记为 `noarch`，并在 25.12 设备上实际安装验证。安装与卸载脚本与 OpenWrt 自身构建系统生成的模板相同，由设备的 `/lib/functions.sh` 处理用户组、开机自启与 `uci-defaults`。
 
-程序是静态构建，同一指令集的所有 OpenWrt 架构共用一份构建，只是包的架构标记不同（OpenWrt 只安装架构在本机列表中的包）。当前提供 `x86_64` 与 `aarch64_*`；32 位 ARM（armv7、armv5/6）与 MIPS（`mips_24kc`、`mipsel_24kc`）随交叉构建加入。
+程序是静态构建，同一指令集的所有 OpenWrt 架构共用一份构建，只是包的架构标记不同（OpenWrt 只安装架构在本机列表中的包）。当前提供：
+
+| OpenWrt 架构 | 程序构建 |
+|---|---|
+| `x86_64` | `x86_64-unknown-linux-musl` |
+| `aarch64_generic`、`aarch64_cortex-a53`、`aarch64_cortex-a72`、`aarch64_cortex-a76` | `aarch64-unknown-linux-musl` |
+| 带浮点单元的 ARMv7：`arm_cortex-a5_vfpv4`、`arm_cortex-a7_neon-vfpv4`、`arm_cortex-a7_vfpv4`、`arm_cortex-a8_vfpv3`、`arm_cortex-a9_neon`、`arm_cortex-a9_vfpv3-d16`、`arm_cortex-a15_neon-vfpv4` | `armv7-unknown-linux-musleabihf`（硬件浮点） |
+| 不带浮点单元的 ARMv7：`arm_cortex-a7`、`arm_cortex-a9` | `armv7-unknown-linux-musleabi`（软件浮点） |
+| `arm_arm1176jzf-s_vfp` | `arm-unknown-linux-musleabihf`（ARMv6，硬件浮点） |
+| `arm_mpcore` | `arm-unknown-linux-musleabi`（ARMv6，软件浮点） |
+
+ARMv5（`arm_arm926ej-s`、`arm_xscale`）与 MIPS（`mips_24kc`、`mipsel_24kc`）随后加入：这两类处理器没有 64 位原子操作，组网模块需先改为不依赖它；MIPS 在 Rust 中为三级目标，需要 nightly 与 `build-std`。ARMv4（`arm_fa526`）没有对应的 Rust 目标，不提供。
+
+### 版本
+
+软件包版本是发布版本的第 1 版（`0.5.0-r1`）。预发布版本须排在正式版本之前，两种格式的写法不同：ipk 为 `0.5.0~rc.1-r1`（opkg 中 `~` 排在最前），apk 为 `0.5.0_rc1-r1`（apk 的预发布后缀）。文件名统一使用发布标签中的写法（`anixops-mesh_0.5.0-rc.1-r1_<架构>.ipk`），因为发布附件的文件名不能含 `~`。
 
 ### 安装
 
-软件包尚未进入签名的软件源，以本地文件安装：
+软件包随发布附带（每个架构的 ipk 与 apk、网页插件，以及列出全部软件包的 `anixops-mesh-<版本>-openwrt-SHA256SUMS`，均有构建证明），尚未进入签名的软件源，以本地文件安装：
 
 ```sh
 # OpenWrt 23.05、24.10
@@ -96,13 +111,13 @@ config device 'main'
 | 任务 | 内容 |
 |---|---|
 | 软件包文件与网页插件 | 脚本 `sh -n` 与 shellcheck；JSON 有效；页面按网页界面的方式（函数体）解析；权限文件与 rpcd 后端方法一一对应（读写分开）；翻译完整；目录文件的散列与 luci-base 的 C 实现逐条一致 |
-| 静态程序 | x86_64、aarch64 musl 静态构建（与发布同一脚本），在任务摘要中报告程序与压缩后大小 |
-| 打包 | 生成全部 ipk 与 apk，第二次打包的 ipk 必须逐字节相同；检查归档内容属主为 root、只安装到 `/etc`、`/lib`、`/usr`、`/www` |
-| 安装测试 | 在 OpenWrt 23.05、24.10（opkg）与 25.12（apk）的官方根文件系统镜像中安装（x86_64；aarch64 在用户态模拟下运行），检查文件与属主、默认配置、用户组、开机自启、procd 服务定义（关闭或未接入时不启动实例）、包装脚本对退出码 8、其他退出码与 SIGTERM 的处理、经真实 ubusd 与 rpcd 调用后端的全部方法（含输入校验、凭据文件的权限与删除、命令行中不出现凭据）、经网页界面自身的目录加载器核对全部翻译、重装保留配置、卸载后不留程序与自启 |
+| 静态程序 | x86_64、aarch64、ARMv7 与 ARMv6（各含硬件浮点与软件浮点）musl 静态构建（与发布同一脚本），其他架构的程序在用户态模拟下运行 `capabilities`，在任务摘要中报告程序与压缩后大小 |
+| 打包 | 生成全部 ipk 与 apk，第二次打包的 ipk 必须逐字节相同；检查归档内容属主为 root、只安装到 `/etc`、`/lib`、`/usr`、`/www`；以预发布版本再打包一次，检查 ipk 版本写法与 apk 接受其版本 |
+| 安装测试 | 在 OpenWrt 23.05、24.10（opkg）与 25.12（apk）的官方根文件系统镜像中安装（x86_64；aarch64 与 ARMv7 `arm_cortex-a15_neon-vfpv4` 在用户态模拟下运行），检查文件与属主、默认配置、用户组、开机自启、procd 服务定义（关闭或未接入时不启动实例）、包装脚本对退出码 8、其他退出码与 SIGTERM 的处理、经真实 ubusd 与 rpcd 调用后端的全部方法（含输入校验、凭据文件的权限与删除、命令行中不出现凭据）、经网页界面自身的目录加载器核对全部翻译、重装保留配置、卸载后不留程序与自启 |
 
 ## 尚未完成
 
-- 32 位 ARM 与 MIPS 交叉构建（MIPS 在 Rust 中为三级目标，需要 nightly 与 `build-std`），以及发布流程附带软件包。
-- 软件包进入签名的软件源（opkg 使用 usign、apk 使用 OpenWrt 的签名密钥），之前以本地文件安装，校验发布附带的 SHA-256 与构建证明。
+- ARMv5 与 MIPS 构建（见上文「软件包」）。
+- 软件包进入签名的软件源（opkg 使用 usign、apk 使用 OpenWrt 的签名密钥）；之前以本地文件安装，校验发布附带的 SHA-256 与构建证明。
 - 体积上限：需求以 16 MB 闪存路由器可安装为准；CI 先报告大小，跨架构的实际数值出来后设定硬性上限。
 - 接管 OpenWrt 上现有组网程序的三种装法（软件包、自写启动脚本、手动运行，R35 第 3 条）由 [`mesh-node.md`](mesh-node.md) 的检测与接管负责，软件包安装方式的检测随后加入。
