@@ -509,12 +509,15 @@ impl Capabilities {
         Some(caps)
     }
 
-    /// What the answer means for paths (spec §17.2.4).
+    /// What the answer means for paths (spec §17.2.4): a node that does
+    /// not relay is "not relaying" whatever its version, so the first-hop
+    /// policy never sends through it; version 0 that relays (a network
+    /// without encryption) is "not supported".
     pub fn capability(&self) -> Capability {
         match (self.version >= 1, self.relay) {
             (true, true) => Capability::Supported,
-            (true, false) => Capability::NotRelay,
-            (false, _) => Capability::Unsupported,
+            (_, false) => Capability::NotRelay,
+            (false, true) => Capability::Unsupported,
         }
     }
 }
@@ -752,7 +755,9 @@ pub fn plan(via: &[WaypointView], destination: DestinationView, held: Option<Hel
         };
     }
     let first = via[0];
-    if first.direct {
+    // A neighbour that does not relay drops everything it would pass on,
+    // so the first-hop policy needs one that relays (spec §17.2.3).
+    if first.direct && first.capability != Capability::NotRelay {
         return Plan::FirstHop {
             neighbour: ids[0],
             reason: first.refusal(),
@@ -870,6 +875,8 @@ pub struct ProbeState {
     clean_rounds: u8,
     warmup: Option<Warmup>,
     held: Option<(usize, Reason)>,
+    /// Echo statuses of the round closed last.
+    latest: Option<Vec<Option<EchoStatus>>>,
 }
 
 /// One probe waiting for its echoes.
@@ -932,6 +939,7 @@ impl ProbeState {
                 deadline,
             }),
             held: None,
+            latest: None,
         }
     }
 
@@ -1017,6 +1025,14 @@ impl ProbeState {
             return self.verdict();
         };
         let answered = self.rounds.remove(at).answered;
+        // A probe answered in full supersedes the ones sent before it that
+        // are still open: they no longer count as misses (spec §17.2.6
+        // rule 3), so an early warm-up probe that went unanswered does not
+        // count once warm-up is over.
+        if answered.iter().all(Option::is_some) {
+            self.rounds.drain(..at);
+        }
+        self.latest = Some(answered.clone());
         // Waypoints after one that echoed status 1 are not missing: that
         // one is still waiting for its query, for at most 3 rounds in a
         // row.
@@ -1078,6 +1094,54 @@ impl ProbeState {
             self.held = Some(self.held_on(lost));
         } else if self.clean_rounds >= PROBE_RECOVERY {
             self.held = None;
+        }
+        self.verdict()
+    }
+
+    /// Whether every waypoint has answered the open round of `token`, so
+    /// that it can be closed before its 3 s are up: warm-up ends as soon as
+    /// one probe has all its echoes (spec §17.2.6 rule 7).
+    pub fn answered_all(&self, token: u64) -> bool {
+        self.rounds
+            .iter()
+            .any(|round| round.token == token && round.answered.iter().all(Option::is_some))
+    }
+
+    /// Whether warm-up is still going on.
+    pub fn warming(&self) -> bool {
+        self.warmup.is_some()
+    }
+
+    /// The waypoint holding the sequence up in the round closed last: the
+    /// one that echoed status 1, else the first without an echo (spec
+    /// §17.2.3, `pending_timeout`). `None` before any round closed or after
+    /// a clean one.
+    pub fn stalled(&self) -> Option<usize> {
+        let latest = self.latest.as_ref()?;
+        latest
+            .iter()
+            .position(|a| *a == Some(EchoStatus::Pending))
+            .or_else(|| latest.iter().position(Option::is_none))
+    }
+
+    /// Ends warm-up at once because the path stayed `pending` for 60 s
+    /// (spec §17.2.3): the sequence goes on under rule 3's recovery, two
+    /// clean rounds in a row, and is not warmed up again. Outside warm-up
+    /// nothing changes. Returns the verdict.
+    pub fn give_up(&mut self) -> Verdict {
+        if self.warmup.take().is_some() {
+            self.clean_rounds = 0;
+            let waiting = |at: usize| {
+                self.latest
+                    .as_ref()
+                    .is_some_and(|latest| latest[at] == Some(EchoStatus::Pending))
+            };
+            let held = match self.stalled() {
+                Some(at) if waiting(at) => (at, Reason::NoEcho),
+                Some(at) => self.held_on(at),
+                None => (0, Reason::NoEcho),
+            };
+            self.held = Some(held);
         }
         self.verdict()
     }
@@ -1659,9 +1723,19 @@ mod tests {
         let access = Capabilities::decode(&Capabilities::local(false).encode()).unwrap();
         assert_eq!(access.capability(), Capability::NotRelay);
         assert!(access.capability().understands_type_40());
-        // Empty message: version 0.
+        // Empty message: version 0 and no relaying.
         let empty = Capabilities::decode(&[]).unwrap();
-        assert_eq!(empty.capability(), Capability::Unsupported);
+        assert_eq!(empty.capability(), Capability::NotRelay);
+        // Version 0 that relays: not supported, the first hop may be kept.
+        let plain = Capabilities {
+            version: 0,
+            max_waypoints: 0,
+            relay: true,
+        };
+        assert_eq!(
+            Capabilities::decode(&plain.encode()).unwrap().capability(),
+            Capability::Unsupported
+        );
         assert!(!Capability::Unsupported.understands_type_40());
         assert!(!Capability::Unknown.understands_type_40());
         // Unknown fields are skipped.
@@ -1753,15 +1827,12 @@ mod tests {
                 culprit: 0
             }
         );
+        // A direct neighbour that does not relay would drop the packets.
         let mut direct = view(3, NotRelay);
         direct.direct = true;
         assert_eq!(
             plan(&[direct, view(4, Supported)], OK, None),
-            Plan::FirstHop {
-                neighbour: 3,
-                reason: Reason::NotRelay,
-                culprit: 0
-            }
+            fallback(Reason::NotRelay, Waypoint(0))
         );
         assert_eq!(
             plan(&[view(3, Unsupported)], OK, None),
@@ -2141,6 +2212,33 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_round_supersedes_older_open_rounds() {
+        use EchoStatus::Forwarded;
+        let mut probe = ProbeState::new(vec![3]);
+        // The first warm-up probe goes unanswered; the second is answered.
+        assert_eq!(probe.start(1), None);
+        assert_eq!(probe.start(2), None);
+        assert!(probe.echo(&echo_from(3, 2, Forwarded), 3));
+        assert_eq!(probe.finish(2), Verdict::Ready);
+        assert_eq!(probe.open_rounds(), 0);
+        // Closing the superseded round later changes nothing.
+        assert_eq!(probe.finish(1), Verdict::Ready);
+        // Two misses, then a clean round: the count starts again.
+        let mut probe = warmed(vec![3]);
+        for token in [10, 11] {
+            assert_eq!(probe.start(token), None);
+            assert_eq!(probe.finish(token), Verdict::Ready);
+        }
+        assert_eq!(round(&mut probe, 12, &[(3, Forwarded)]), Verdict::Ready);
+        for token in [13, 14] {
+            assert_eq!(probe.start(token), None);
+            assert_eq!(probe.finish(token), Verdict::Ready);
+        }
+        assert_eq!(probe.start(15), None);
+        assert!(matches!(probe.finish(15), Verdict::Held { .. }));
+    }
+
+    #[test]
     fn open_rounds_are_bounded() {
         let held = Verdict::Held {
             waypoint: 0,
@@ -2174,6 +2272,53 @@ mod tests {
             assert_eq!(warming.start(token), None);
         }
         assert_eq!(warming.start(99), Some(Verdict::Warming));
+    }
+
+    #[test]
+    fn giving_up_warm_up_needs_two_clean_rounds() {
+        use EchoStatus::{Forwarded, Pending};
+        let mut probe = ProbeState::new(vec![3, 4, 5]);
+        assert_eq!(probe.stalled(), None);
+        // Waypoint 4 keeps waiting for its query; 5 never sees a probe.
+        assert_eq!(
+            round(&mut probe, 1, &[(3, Forwarded), (4, Pending)]),
+            Verdict::Warming
+        );
+        assert_eq!(probe.stalled(), Some(1));
+        assert!(probe.warming());
+        assert_eq!(
+            probe.give_up(),
+            Verdict::Held {
+                waypoint: 1,
+                reason: Reason::NoEcho
+            }
+        );
+        assert!(!probe.warming());
+        // Giving up again changes nothing.
+        assert!(matches!(probe.give_up(), Verdict::Held { .. }));
+        let clean = [(3, Forwarded), (4, Forwarded), (5, Forwarded)];
+        assert!(matches!(round(&mut probe, 2, &clean), Verdict::Held { .. }));
+        assert_eq!(round(&mut probe, 3, &clean), Verdict::Ready);
+        assert_eq!(probe.stalled(), None);
+        // Without an answer, the first silent waypoint is named.
+        let mut silent = ProbeState::new(vec![3, 4]);
+        assert_eq!(round(&mut silent, 1, &[(3, Forwarded)]), Verdict::Warming);
+        assert_eq!(
+            silent.give_up(),
+            Verdict::Held {
+                waypoint: 1,
+                reason: Reason::NoEcho
+            }
+        );
+        // Before any round closed, the first waypoint.
+        let mut fresh = ProbeState::new(vec![3, 4]);
+        assert_eq!(
+            fresh.give_up(),
+            Verdict::Held {
+                waypoint: 0,
+                reason: Reason::NoEcho
+            }
+        );
     }
 
     #[test]

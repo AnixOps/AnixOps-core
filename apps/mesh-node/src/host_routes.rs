@@ -1,33 +1,41 @@
 //! What the host already reaches without the mesh, for the overlap rule of
-//! spec §15.4 (Linux).
+//! spec §15.4.
 //!
 //! An accepted subnet is kept out of the system routes and out of the mesh's
-//! destination lookup when it overlaps one of the networks returned here:
+//! destination lookup when it overlaps one of:
 //!
 //! - the address networks of every interface but loopback and our own mesh
 //!   interfaces (a physical LAN, or an address on another mesh program's
-//!   virtual interface);
-//! - routes carried by another program's virtual interface (point-to-point
-//!   or without a link layer, as TUN devices are), from every routing table,
-//!   so that policy routing tables other programs install are seen too.
-//!   Routes wider than /8 (IPv4) or /7 (IPv6) are left out: they are default
-//!   routes or their splits (0.0.0.0/1 + 128.0.0.0/1 and finer), and would
-//!   otherwise turn every advertisement local while that program carries the
-//!   default route.
+//!   virtual interface), read by the caller;
+//! - the routes of [`foreign_routes`]: routes that leave through another
+//!   program's virtual interface (point-to-point, without a link layer, or a
+//!   TUN/TAP device), and refusing (blackhole, unreachable, prohibit)
+//!   routes, each kept only when the system selects it for its own
+//!   destination. On Linux that is a lookup through the policy rules
+//!   (`RTM_F_FIB_MATCH`, so `throw` routes apply); elsewhere the most
+//!   specific route of the table read. Routes wider than /8 (IPv4) or /7
+//!   (IPv6) are left out: they are default routes or their splits
+//!   (0.0.0.0/1 + 128.0.0.0/1 and finer), and would otherwise turn every
+//!   advertisement local while that program carries the default route.
 //!
 //! Our own mesh interfaces never count, whichever network they belong to:
 //! otherwise a route we install would be found on the next scan, withdrawn as
-//! an overlap, and installed again once gone.
+//! an overlap, and installed again once gone. They are recognised by the
+//! record this process keeps of the interfaces it serves
+//! ([`claim_own_interface`]), not by their name alone.
 
 use std::collections::HashMap;
+#[cfg(not(target_os = "linux"))]
+use std::io;
 use std::net::IpAddr;
+use std::sync::Mutex;
 
 use outbound_mesh::IpNet;
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{host_links, host_routes};
+pub use linux::{foreign_routes, host_links, host_routes};
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -44,57 +52,161 @@ pub const OWN_INTERFACE_PREFIX: &str = "anixmesh";
 /// Narrowest prefix that still counts as a default-route split.
 const WIDEST_V4: u8 = 8;
 const WIDEST_V6: u8 = 7;
+/// Route selections checked per scan at most.
+const MAX_LOOKUPS: usize = 1024;
 
-/// Whether `name` is one of our mesh interfaces: it starts with
-/// [`OWN_INTERFACE_PREFIX`] or is in `extra` (a name given with
-/// `run --interface`).
-pub fn is_own_interface(name: &str, extra: &[&str]) -> bool {
-    name.starts_with(OWN_INTERFACE_PREFIX) || extra.contains(&name)
+/// Names of the mesh interfaces this process serves.
+static OWN_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Records one of our mesh interfaces for as long as it is held.
+#[derive(Debug)]
+pub struct OwnInterface(String);
+
+impl Drop for OwnInterface {
+    fn drop(&mut self) {
+        let mut own = OWN_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = own.iter().position(|name| *name == self.0) {
+            own.swap_remove(at);
+        }
+    }
 }
 
-/// One unicast route: destination and the interfaces it leaves through.
+/// Records `name` as one of our mesh interfaces until the result is
+/// dropped: every network of this process then leaves it out.
+pub fn claim_own_interface(name: &str) -> OwnInterface {
+    OWN_NAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(name.to_owned());
+    OwnInterface(name.to_owned())
+}
+
+/// Whether `name` is one of our mesh interfaces: recorded by
+/// [`claim_own_interface`], or in `extra` (the interface being served).
+pub fn is_own_interface(name: &str, extra: &[&str]) -> bool {
+    extra.contains(&name)
+        || OWN_NAMES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|own| own == name)
+}
+
+/// What a route does with the traffic it matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    /// Sends it out through its interfaces.
+    Unicast,
+    /// Drops or refuses it (blackhole, unreachable, prohibit).
+    Refusing,
+}
+
+/// One route: destination, kind and the interfaces it leaves through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRoute {
     pub destination: IpNet,
+    pub kind: RouteKind,
     pub interfaces: Vec<u32>,
 }
 
-/// One interface: name and whether it is virtual (point-to-point or without
-/// a link layer).
+/// One interface: name and whether it is virtual (point-to-point, without
+/// a link layer, or a TUN/TAP device).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLink {
     pub name: String,
     pub is_virtual: bool,
 }
 
-/// Routes whose prefix is at least /8 (IPv4) or /7 (IPv6) and that leave
-/// through another program's virtual interface.
-pub fn foreign_virtual_routes(
+/// What the route selection for one address found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    /// A route, with the interfaces it leaves through.
+    Route(Vec<u32>),
+    /// A refusing route.
+    Refused,
+    /// No route, or nothing known.
+    Unknown,
+}
+
+fn wide_enough(net: &IpNet) -> bool {
+    let widest = match net.network() {
+        IpAddr::V4(_) => WIDEST_V4,
+        IpAddr::V6(_) => WIDEST_V6,
+    };
+    net.prefix() >= widest
+}
+
+/// The routes, at least /8 (IPv4) or /7 (IPv6), that another program's
+/// virtual interface carries or that refuse traffic, kept only when
+/// `lookup` of their destination shows the system selects them. `own` tells
+/// our mesh interfaces by index.
+pub fn select_foreign(
     routes: &[HostRoute],
     links: &HashMap<u32, HostLink>,
-    own: &[&str],
+    own: &dyn Fn(u32) -> bool,
+    lookup: &mut dyn FnMut(IpAddr) -> Lookup,
 ) -> Vec<IpNet> {
-    let mut found: Vec<IpNet> = routes
+    let foreign =
+        |index: &u32| !own(*index) && links.get(index).is_some_and(|link| link.is_virtual);
+    let mut found: Vec<IpNet> = Vec::new();
+    let mut lookups = 0;
+    for route in routes
         .iter()
-        .filter(|route| {
-            let widest = match route.destination.network() {
-                IpAddr::V4(_) => WIDEST_V4,
-                IpAddr::V6(_) => WIDEST_V6,
-            };
-            route.destination.prefix() >= widest
-        })
-        .filter(|route| {
-            route.interfaces.iter().any(|index| {
-                links
-                    .get(index)
-                    .is_some_and(|link| link.is_virtual && !is_own_interface(&link.name, own))
-            })
-        })
-        .map(|route| route.destination)
-        .collect();
+        .filter(|route| wide_enough(&route.destination))
+    {
+        let candidate = match route.kind {
+            RouteKind::Unicast => route.interfaces.iter().any(foreign),
+            RouteKind::Refusing => true,
+        };
+        if !candidate || found.contains(&route.destination) {
+            continue;
+        }
+        if lookups == MAX_LOOKUPS {
+            break;
+        }
+        lookups += 1;
+        let selected = match (lookup(route.destination.network()), route.kind) {
+            (Lookup::Route(interfaces), RouteKind::Unicast) => interfaces.iter().any(foreign),
+            (Lookup::Refused, RouteKind::Refusing) => true,
+            _ => false,
+        };
+        if selected {
+            found.push(route.destination);
+        }
+    }
     found.sort_by_key(|net| net.to_string());
-    found.dedup();
     found
+}
+
+/// The most specific of `routes` that holds `address`, as a selection:
+/// where no lookup through the system is available, the table read stands
+/// for it.
+pub fn most_specific(routes: &[HostRoute], address: IpAddr) -> Lookup {
+    routes
+        .iter()
+        .filter(|route| route.destination.contains(address))
+        .max_by_key(|route| route.destination.prefix())
+        .map_or(Lookup::Unknown, |route| match route.kind {
+            RouteKind::Unicast => Lookup::Route(route.interfaces.clone()),
+            RouteKind::Refusing => Lookup::Refused,
+        })
+}
+
+/// The routes of other programs' virtual interfaces and the refusing
+/// routes that the system selects (see the module documentation). `own`
+/// names the interface being served, in addition to those recorded.
+#[cfg(not(target_os = "linux"))]
+pub fn foreign_routes(own: &str) -> io::Result<Vec<IpNet>> {
+    let links = host_links()?;
+    let routes = host_routes()?;
+    let is_own = |index: u32| {
+        links
+            .get(&index)
+            .is_some_and(|link| is_own_interface(&link.name, &[own]))
+    };
+    Ok(select_foreign(&routes, &links, &is_own, &mut |address| {
+        most_specific(&routes, address)
+    }))
 }
 
 /// The LAN interfaces that carry each advertised subnet: those with an
@@ -195,8 +307,29 @@ mod tests {
     fn route(text: &str, interfaces: &[u32]) -> HostRoute {
         HostRoute {
             destination: net(text),
+            kind: RouteKind::Unicast,
             interfaces: interfaces.to_vec(),
         }
+    }
+
+    fn refusing(text: &str) -> HostRoute {
+        HostRoute {
+            destination: net(text),
+            kind: RouteKind::Refusing,
+            interfaces: Vec::new(),
+        }
+    }
+
+    /// Ours: the interfaces at 4 and 5, and `extra`.
+    fn ours(extra: &'static [u32]) -> impl Fn(u32) -> bool {
+        move |index| index == 4 || index == 5 || extra.contains(&index)
+    }
+
+    /// Every selection finds the most specific route of the table.
+    fn foreign(routes: &[HostRoute], own: &dyn Fn(u32) -> bool) -> Vec<IpNet> {
+        select_foreign(routes, &links(), own, &mut |address| {
+            most_specific(routes, address)
+        })
     }
 
     #[test]
@@ -211,11 +344,11 @@ mod tests {
             route("fd7a:115c:a1e0::/48", &[3]),
         ];
         assert_eq!(
-            foreign_virtual_routes(&routes, &links(), &["custom9"]),
+            foreign(&routes, &ours(&[6])),
             vec![net("100.64.0.0/10"), net("fd7a:115c:a1e0::/48")]
         );
         // Without `custom9` as ours, its route counts.
-        assert!(foreign_virtual_routes(&routes, &links(), &[]).contains(&net("10.22.0.0/16")));
+        assert!(foreign(&routes, &ours(&[])).contains(&net("10.22.0.0/16")));
     }
 
     #[test]
@@ -233,10 +366,10 @@ mod tests {
             route("fe00::/6", &[3]),
             route("fc00::/7", &[3]),
         ];
-        assert_eq!(
-            foreign_virtual_routes(&routes, &links(), &[]),
-            vec![net("10.0.0.0/8"), net("fc00::/7")]
-        );
+        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |_| {
+            Lookup::Route(vec![3])
+        });
+        assert_eq!(found, vec![net("10.0.0.0/8"), net("fc00::/7")]);
     }
 
     #[test]
@@ -245,17 +378,75 @@ mod tests {
             route("10.30.0.0/16", &[2, 3]),
             route("10.31.0.0/16", &[2, 4]),
         ];
+        assert_eq!(foreign(&routes, &ours(&[])), vec![net("10.30.0.0/16")]);
+    }
+
+    #[test]
+    fn only_routes_the_system_selects_count() {
+        let routes = [
+            route("100.64.0.0/10", &[3]),
+            route("10.40.0.0/16", &[3]),
+            refusing("10.50.0.0/16"),
+            refusing("10.51.0.0/16"),
+            refusing("10.0.0.0/7"),
+        ];
+        // The policy rules send 10.40.0.0/16 out through eth0 (a table of
+        // another program is not consulted), and 10.51.0.0/16 is reached
+        // through another, preferred table.
+        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |address| match address
+            .to_string()
+            .as_str()
+        {
+            "10.40.0.0" | "10.51.0.0" => Lookup::Route(vec![2]),
+            "100.64.0.0" => Lookup::Route(vec![3]),
+            _ => Lookup::Refused,
+        });
+        assert_eq!(found, vec![net("10.50.0.0/16"), net("100.64.0.0/10")]);
+        // A route that leaves through our own interface in the end is ours.
+        let found = select_foreign(&routes[..1], &links(), &ours(&[]), &mut |_| {
+            Lookup::Route(vec![4])
+        });
+        assert!(found.is_empty());
+        // Nothing known: nothing counts.
+        let found = select_foreign(&routes, &links(), &ours(&[]), &mut |_| Lookup::Unknown);
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn the_most_specific_route_stands_for_the_selection() {
+        let routes = [
+            route("10.0.0.0/8", &[3]),
+            route("10.60.0.0/16", &[2]),
+            refusing("10.61.0.0/16"),
+        ];
+        let address = |text: &str| text.parse::<IpAddr>().unwrap();
         assert_eq!(
-            foreign_virtual_routes(&routes, &links(), &[]),
-            vec![net("10.30.0.0/16")]
+            most_specific(&routes, address("10.60.1.1")),
+            Lookup::Route(vec![2])
+        );
+        assert_eq!(
+            most_specific(&routes, address("10.61.0.0")),
+            Lookup::Refused
+        );
+        assert_eq!(
+            most_specific(&routes, address("10.1.0.0")),
+            Lookup::Route(vec![3])
+        );
+        assert_eq!(
+            most_specific(&routes, address("192.168.0.1")),
+            Lookup::Unknown
         );
     }
 
     #[test]
-    fn own_interfaces_are_recognised_by_prefix_or_name() {
-        assert!(is_own_interface("anixmesh0", &[]));
-        assert!(is_own_interface("anixmesh-3", &[]));
+    fn own_interfaces_are_the_recorded_ones() {
         assert!(is_own_interface("custom9", &["custom9"]));
         assert!(!is_own_interface("vpn0", &["custom9"]));
+        // A name like ours is not enough.
+        assert!(!is_own_interface("anixmesh-recorded-test", &[]));
+        let claim = claim_own_interface("anixmesh-recorded-test");
+        assert!(is_own_interface("anixmesh-recorded-test", &[]));
+        drop(claim);
+        assert!(!is_own_interface("anixmesh-recorded-test", &[]));
     }
 }

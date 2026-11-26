@@ -24,7 +24,7 @@ use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use crate::config::{MeshSettings, PeerEndpoint, Role, SecurityMode, Transport};
 use crate::link::{self, Admission, CloseReason, HandshakeBudget, Ticket};
 use crate::net::IpNet;
-use crate::node::{Action, ConnId, Counters, Node};
+use crate::node::{Action, ConnId, Counters, Node, SyncOversize};
 use crate::routes::PeerId;
 use crate::secure::noise::KeyPair;
 use crate::wire::tcp::{encode_frame, FrameDecoder};
@@ -104,6 +104,8 @@ pub struct Snapshot {
     /// Node ID, next hop and hop count of every reachable node.
     pub routes: Vec<(u32, u32, u32)>,
     pub counters: Counters,
+    /// The last oversized synchronisation (spec §11.2, §12.2).
+    pub sync_oversize: Option<SyncOversize>,
     /// This node's ID is taken and it changed ID less than ten minutes
     /// ago, so it only warns (spec §12.3).
     pub duplicate_id: bool,
@@ -125,6 +127,9 @@ pub struct Snapshot {
     /// Accepted subnets that overlap this node's own networks: kept, but
     /// neither routed nor installed (R17, spec §15.4).
     pub overlaps: Vec<IpNet>,
+    /// Those of `overlaps` that overlap another mesh program's route
+    /// rather than a network of this machine (spec §15.4).
+    pub foreign_overlaps: Vec<IpNet>,
     /// Members that claim one of this node's virtual addresses (R29).
     pub address_conflicts: Vec<(u32, IpAddr)>,
 }
@@ -226,6 +231,14 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// Advertised subnets the user routes through the mesh although they
+    /// overlap a network of this machine (`mesh_set_subnet_route`,
+    /// spec §15.4); the value at start applies too.
+    pub route_overrides: watch::Receiver<Vec<IpNet>>,
+    /// Routes other mesh programs' virtual interfaces carry on this
+    /// machine, as the system selects them: handled like `local_networks`
+    /// and reported apart (spec §15.4).
+    pub foreign_routes: watch::Receiver<Vec<IpNet>>,
     /// Stops the node when it turns true.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -243,6 +256,8 @@ pub async fn run(
         snapshots,
         mut local_networks,
         mut native_keys,
+        mut route_overrides,
+        mut foreign_routes,
         mut shutdown,
     } = channels;
     native_keys.mark_unchanged();
@@ -251,6 +266,8 @@ pub async fn run(
     let peers = settings.peers.clone();
     let mut node = Node::new(settings, static_key, &rng, started)
         .map_err(|_| io::Error::other("mesh node keys could not be set up"))?;
+    node.set_route_overrides(&route_overrides.borrow_and_update());
+    node.set_foreign_routes(&foreign_routes.borrow_and_update());
     node.set_local_networks(&local_networks.borrow_and_update());
     if node.waits_for_native_keys() {
         // No listening, dialling or packets until the list holds this
@@ -305,6 +322,12 @@ pub async fn run(
             }
             Ok(()) = local_networks.changed() => {
                 node.set_local_networks(&local_networks.borrow_and_update());
+            }
+            Ok(()) = foreign_routes.changed() => {
+                node.set_foreign_routes(&foreign_routes.borrow_and_update());
+            }
+            Ok(()) = route_overrides.changed() => {
+                node.set_route_overrides(&route_overrides.borrow_and_update());
             }
             Ok(()) = native_keys.changed() => {
                 let keys = native_keys.borrow_and_update().clone();
@@ -442,6 +465,7 @@ fn snapshot(node: &Node) -> Snapshot {
             .map(|(peer, route)| (peer, route.next_hop, route.hops))
             .collect(),
         counters: node.counters(),
+        sync_oversize: node.sync_oversize(),
         duplicate_id: node.duplicate_id(),
         system_routes: node.system_routes(),
         static_key: (node.settings().security == SecurityMode::ForwardSecrecy)
@@ -451,6 +475,7 @@ fn snapshot(node: &Node) -> Snapshot {
         members: members(node),
         rejected_advertisements: node.route_table().refused_subnet_count(),
         overlaps: overlaps(node),
+        foreign_overlaps: node.foreign_overlaps(),
         address_conflicts: node
             .route_table()
             .address_conflicts()
@@ -899,6 +924,8 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let (_, local_networks) = watch::channel(Vec::new());
         let (_, native_keys) = watch::channel(None);
+        let (_, route_overrides) = watch::channel(Vec::new());
+        let (_, foreign_routes) = watch::channel(Vec::new());
         tokio::spawn(run(
             settings,
             static_key,
@@ -909,6 +936,8 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                route_overrides,
+                foreign_routes,
                 shutdown,
             },
         ));
