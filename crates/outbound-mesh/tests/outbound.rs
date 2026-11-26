@@ -6,10 +6,13 @@
 
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use engine_outbound::{TargetAddr, TcpOutbound};
-use outbound_mesh::outbound::{Failure, MeshOutbound};
+use engine_outbound::registry::{OutboundFactory, Settings};
+use engine_outbound::{TargetAddr, TcpDialer, TcpOutbound};
+use outbound_mesh::outbound::engine::{EngineSlot, GRACE};
+use outbound_mesh::outbound::{Failure, MeshFactory, MeshOutbound};
 use outbound_mesh::{MeshConfig, MeshSettings};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -171,7 +174,7 @@ async fn a_managed_network_without_this_node_in_its_key_list_waits() {
         "peers": [{"server": "127.0.0.1", "port": 1}],
     }))
     .unwrap();
-    let outbound = MeshOutbound::new(config.validate().unwrap()).unwrap();
+    let outbound = MeshOutbound::unshared(config.validate().unwrap()).unwrap();
     let error = outbound
         .connect(&target("10.145.0.1:80"))
         .await
@@ -182,53 +185,6 @@ async fn a_managed_network_without_this_node_in_its_key_list_waits() {
         outbound.instance().state(),
         (false, Some(Failure::NativeKeysPending))
     );
-}
-
-#[test]
-fn the_same_settings_share_one_network() {
-    let node = json!({"address": "10.146.0.2/24", "role": "access"});
-    let peers = json!([{"server": "127.0.0.1", "port": 1}]);
-    let config = |name: &str| {
-        let config: MeshConfig = serde_json::from_value(json!({
-            "config_version": 1,
-            "network": {"name": name, "secret": "s3cr3t", "kind": "legacy"},
-            "node": node,
-            "peers": peers,
-        }))
-        .unwrap();
-        config.validate().unwrap()
-    };
-    let first = MeshOutbound::new(config("outbound-shared")).unwrap();
-    let again = MeshOutbound::new(config("outbound-shared")).unwrap();
-    assert!(std::sync::Arc::ptr_eq(first.instance(), again.instance()));
-    let other = MeshOutbound::new(config("outbound-other")).unwrap();
-    assert!(!std::sync::Arc::ptr_eq(first.instance(), other.instance()));
-    let found = outbound_mesh::outbound::instance("outbound-shared").unwrap();
-    assert!(std::sync::Arc::ptr_eq(first.instance(), &found));
-    drop((first, again, found));
-    assert!(outbound_mesh::outbound::instance("outbound-shared").is_none());
-}
-
-#[test]
-fn changed_settings_stop_the_old_network() {
-    let config = |address: &str| {
-        let config: MeshConfig = serde_json::from_value(json!({
-            "config_version": 1,
-            "network": {"name": "outbound-replaced", "secret": "s3cr3t", "kind": "legacy"},
-            "node": {"address": address, "role": "access"},
-            "peers": [{"server": "127.0.0.1", "port": 1}],
-        }))
-        .unwrap();
-        config.validate().unwrap()
-    };
-    let old = MeshOutbound::new(config("10.147.0.2/24")).unwrap();
-    let new = MeshOutbound::new(config("10.147.0.3/24")).unwrap();
-    assert!(!std::sync::Arc::ptr_eq(old.instance(), new.instance()));
-    // The old one stays stopped although an outbound still holds it.
-    assert_eq!(old.instance().state(), (false, Some(Failure::Replaced)));
-    assert_eq!(new.instance().state(), (false, None));
-    let found = outbound_mesh::outbound::instance("outbound-replaced").unwrap();
-    assert!(std::sync::Arc::ptr_eq(new.instance(), &found));
 }
 
 fn access_node(name: &str, address: &str) -> MeshSettings {
@@ -242,15 +198,78 @@ fn access_node(name: &str, address: &str) -> MeshSettings {
     config.validate().unwrap()
 }
 
-#[test]
-fn a_retired_network_is_not_found_again() {
-    let settings = access_node("outbound-retired", "10.148.0.2/24");
-    let first = MeshOutbound::new(settings.clone()).unwrap();
-    first.instance().retire();
-    assert!(outbound_mesh::outbound::instance("outbound-retired").is_none());
-    let again = MeshOutbound::new(settings).unwrap();
-    assert!(!std::sync::Arc::ptr_eq(first.instance(), again.instance()));
-    assert_eq!(again.instance().state(), (false, None));
+static SLOT: EngineSlot = EngineSlot::new(GRACE);
+
+fn outbound_settings(name: &str, address: &str) -> Settings {
+    let value = json!({
+        "config_version": 1,
+        "network": {"name": name, "secret": "s3cr3t", "kind": "legacy"},
+        "node": {"address": address, "role": "access"},
+        "peers": [{"server": "127.0.0.1", "port": 1}],
+    });
+    value.as_object().unwrap().clone()
+}
+
+#[tokio::test]
+async fn building_an_outbound_starts_nothing_until_the_engine_commits() {
+    let built = Arc::new(Mutex::new(Vec::new()));
+    let factory = MeshFactory::bound(&SLOT, built.clone());
+    let outbound = factory
+        .build(
+            &outbound_settings("outbound-commit", "10.146.0.2/24"),
+            Arc::new(TcpDialer),
+        )
+        .unwrap();
+    // Built, not adopted: no engine runs and nothing started.
+    assert!(SLOT.current().is_none());
+    let error = outbound
+        .connect(&target("10.146.0.1:80"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::NotConnected);
+    let engine = SLOT.acquire().unwrap();
+    engine
+        .registry()
+        .commit(std::mem::take(&mut *built.lock().unwrap()));
+    let networks = engine.registry().networks();
+    assert_eq!(networks.len(), 1);
+    let instance = networks[0].instance.clone().unwrap();
+    // A draft profile with other settings builds without touching it.
+    let draft = factory
+        .build(
+            &outbound_settings("outbound-commit", "10.146.0.9/24"),
+            Arc::new(TcpDialer),
+        )
+        .unwrap();
+    let error = draft.connect(&target("10.146.0.1:80")).await.err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::NotConnected);
+    assert!(!instance.is_retired());
+    SLOT.release(true);
+    assert!(engine.is_stopped());
+    assert!(instance.is_retired());
+}
+
+#[tokio::test]
+async fn a_detached_outbound_is_unsupported() {
+    let outbound = MeshFactory::detached()
+        .build(
+            &outbound_settings("outbound-detached", "10.148.0.2/24"),
+            Arc::new(TcpDialer),
+        )
+        .unwrap();
+    let error = outbound
+        .connect(&target("10.148.0.1:80"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    let error = outbound
+        .open_udp(&target("10.148.0.1:53"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
 }
 
 #[test]

@@ -62,7 +62,7 @@ pub fn default_registry() -> OutboundRegistry {
     #[cfg(feature = "iwan")]
     registry.register(Arc::new(outbound_iwan::IwanFactory));
     #[cfg(feature = "mesh")]
-    registry.register(Arc::new(outbound_mesh::outbound::MeshFactory));
+    registry.register(Arc::new(outbound_mesh::outbound::MeshFactory::detached()));
     #[cfg(feature = "mieru")]
     registry.register(Arc::new(outbound_mieru::MieruFactory));
     #[cfg(feature = "shadowsocks")]
