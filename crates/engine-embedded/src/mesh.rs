@@ -119,10 +119,10 @@ impl MeshBinding {
     /// (`stopped` says whether it stopped).
     pub(crate) fn control(&self, request: &[u8]) -> Option<Result<Vec<u8>, RuntimeError>> {
         // Cheap test before parsing: every mesh command names itself.
-        if !contains(request, b"mesh_") {
+        if !crate::control::names(request, b"mesh_") {
             return None;
         }
-        let name = control::command_name(request)?;
+        let name = crate::control::command_name(request)?;
         if name == "mesh_engine_stop" {
             if let Some(hold) = lock(&self.hold).take() {
                 hold.close();
@@ -165,12 +165,6 @@ impl MeshBinding {
         }
         hold.as_ref().map(|hold| hold.engine().clone())
     }
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
 }
 
 fn encode(answer: &Value) -> Result<Vec<u8>, RuntimeError> {

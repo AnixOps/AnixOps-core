@@ -947,6 +947,31 @@ fn decode_key(key_base64: &str) -> Result<Vec<u8>, RuntimeError> {
         .map_err(|_| storage_error(capture::storage::StorageError::InvalidKey))
 }
 
+/// Whether `needle` occurs anywhere in `request`: a cheap test before a
+/// request is parsed for a command that names itself.
+pub(crate) fn names(request: &[u8], needle: &[u8]) -> bool {
+    request.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The `cmd` of a request that is a JSON object of at most
+/// [`MAX_RELOAD_REQUEST_LEN`] bytes; `None` for any other request. Every
+/// other field is skipped unread, nested values included.
+pub(crate) fn command_name(request: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(default)]
+        cmd: Option<String>,
+    }
+    if request.len() > MAX_RELOAD_REQUEST_LEN {
+        return None;
+    }
+    // An object only: the derived reader would also take an array.
+    if request.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    serde_json::from_slice::<Head>(request).ok()?.cmd
+}
+
 /// Answers a request to a whole-device WireGuard tunnel, which has no flows
 /// to control. `reset_network` moves the running tunnel to a new UDP socket
 /// ([`crate::wireguard::PathControl::reset`]): `reset` is 1 when a tunnel

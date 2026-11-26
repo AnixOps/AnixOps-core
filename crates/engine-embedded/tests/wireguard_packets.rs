@@ -274,6 +274,23 @@ fn control(runtime: &EmbeddedRuntime, request: &str) -> serde_json::Value {
 }
 
 #[test]
+fn a_wireguard_tunnel_answers_the_capabilities() {
+    let port = start_peer(None);
+    let mut runtime = EmbeddedRuntime::from_json(&config(port, None)).unwrap();
+    let (sink, _rx) = capture();
+    runtime.start(sink).unwrap();
+    assert_eq!(
+        control(&runtime, r#"{"cmd":"capabilities"}"#),
+        serde_json::json!({"capabilities": {"mesh": cfg!(feature = "mesh")}})
+    );
+    if !cfg!(feature = "mesh") {
+        let refused = control(&runtime, r#"{"cmd":"mesh_status"}"#);
+        assert_eq!(refused["error"]["code"], "unsupported");
+    }
+    runtime.stop();
+}
+
+#[test]
 fn packets_round_trip_through_a_wireguard_peer() {
     let port = start_peer(None);
     let mut runtime = EmbeddedRuntime::from_json(&config(port, None)).unwrap();

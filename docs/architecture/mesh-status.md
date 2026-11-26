@@ -6,7 +6,7 @@
 
 - 组网与代理在同一个引擎实例里运行（需求 R23，手机上共用一个 VPN），命令走现有控制通道：iOS、macOS 为 `networkcore_ios_runtime_control`，Android、Windows、Linux 为 `client-core` / `client-ipc` 的同名命令。
 - 请求是 JSON，命令名放在 `cmd` 字段，用下划线命名，与现有命令一致，例如 `{"cmd":"mesh_status"}`。
-- 引擎编入组网后 `networkcore_ios_feature_set_version` 为 7。控制命令 `{"cmd":"capabilities"}` 返回 `{"capabilities":{"mesh":true|false}}`（任何隧道都可问，WireGuard 隧道也一样）；未编入 `mesh` feature 时 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令返回 `{"ok":false,"error":{"code":"unsupported"}}`。
+- 引擎编入组网后 `networkcore_ios_feature_set_version` 为 7。控制命令 `{"cmd":"capabilities"}` 返回 `{"capabilities":{"mesh":true|false}}`，`mesh` 表示这个运行实例是否回答 `mesh_*` 命令：VPN 运行实例（任何隧道，WireGuard 隧道也一样）在引擎编入 `mesh` feature 时为 `true`，桌面本地代理模式不运行组网，始终为 `false`。它是编译期与运行模式决定的，与节点上 anixcore `/v1/status` 的 features 无关。为 `false` 时所有 `mesh_*` 命令返回 `{"ok":false,"error":{"code":"unsupported"}}`。命令名用 JSON 转义写出（如 `capabilit\u0069es`）的请求不作识别，由其他处理返回 `invalid_argument`。
 - 不新增任何网络监听端口（需求 R11）。独立节点程序 `anixops-mesh` 在本机 Unix 域套接字上回答同样的 `mesh_status`（Windows 上为命名管道），文件权限只允许 root 与指定组访问；不监听任何 TCP 或 UDP 端口，回环地址也不行（OpenWrt LuCI 插件使用，需求 R35）。
 
 ## 快照
