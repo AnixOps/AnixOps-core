@@ -10,6 +10,7 @@
 - 正常停机先撤回通告（规范 §15.7 第 6 条、§15.8 第 6 条）：通告了子网的网络停止时先从字段 5 删除全部子网、version 加 1 并立即同步，继续转发 3 秒再断开；`PUT /v1/mesh` 中要停止的网络并行撤回；`anixcore` 退出前停止全部受管网络。
 - 新增组网端到端实验床（`docs/mesh-e2e.md`、`.github/scripts/mesh-e2e/`、工作流 `mesh-e2e.yml`）：每台机器一个网络命名空间，运行本仓库构建的 `anixops-mesh run`，场景按需求编号登记；12 个场景启用，0.4、0.5 的 11 个场景待对应功能合并后启用。内核 0.4 起 RC 必须该工作流全绿。
 - `anixops-mesh run` 失败时 stderr 最后一行改为符合设计文档的退出约定：启动冲突为 `{"error":"conflict","conflict":"port_in_use"|"tun_in_use","detail"}`（此前为 `{"error":"busy"}`、无冲突代码），其他运行错误为 `"error":"runtime"`（此前为 `"run"`）。退出码不变（2、3、1）。端到端场景 E10 发现。
+- 嵌入式引擎可把组网网络作为 `"type": "mesh"` 出站（`engine-embedded` feature `mesh`，`outbound-mesh` feature `outbound`）：每个网络一个私有 TCP/IP 协议栈，只连本网络成员与当前路由的通告子网，其余目的地址在发包前拒绝；同一 `network.name` 且配置相同的重新构建沿用运行中的网络。暂不进入默认 feature，控制命令与自动分流随后补上。
 
 ### Release process
 

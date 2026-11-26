@@ -27,11 +27,18 @@ ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 # The `runtime` driver: sockets and timers. Already used by the rest of the
 # kernel.
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "macros"], optional = true }
+# The `outbound` feature: the engine's outbound traits, and the private
+# TCP/IP stack that holds the node's virtual addresses (as iWAN and
+# WireGuard already use).
+engine-outbound = { path = "../engine-outbound", optional = true }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"], optional = true }
 
 [features]
 default = ["runtime"]
 # The socket driver (`driver`); without it the crate has no I/O at all.
 runtime = ["dep:tokio"]
+# `"type": "mesh"` as a routable outbound of the embedded engine (`outbound`).
+outbound = ["runtime", "dep:engine-outbound", "dep:smoltcp"]
 
 [dev-dependencies]
 serde_json = "1"
