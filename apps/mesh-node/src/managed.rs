@@ -68,12 +68,21 @@ use crate::tun::{self, Tun};
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-/// `mesh_paths` is listed because `routing.paths` is applied as spec §17.2
-/// asks: waypoint encapsulation, capability queries, fallback and the
-/// `paths` status; a changed path list reaches a running network without a
-/// restart (`mesh_set_paths`).
 /// `mesh_host_groups`: the `host_groups` section (spec §15.7).
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_host_groups", "mesh_paths"];
+/// [`PATHS_FEATURE`] is added only when the operator turned custom paths
+/// on ([`ManagedMesh::with_paths`]).
+pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_host_groups"];
+
+/// Listed only when the operator turned custom paths on (`mesh_paths`, off
+/// by default): `routing.paths` is then applied as spec §17.2 asks
+/// (waypoint encapsulation, capability queries, fallback and the `paths`
+/// status), and a changed path list reaches a running network without a
+/// restart (`mesh_set_paths`). Off, a body with `routing.paths` is refused
+/// ([`PATHS_DISABLED`]).
+pub const PATHS_FEATURE: &str = "mesh_paths";
+
+/// The refusal of `routing.paths` while custom paths are off.
+pub const PATHS_DISABLED: &str = "paths_disabled";
 
 /// [`FEATURES`] once this process can bridge: it holds the host's bridge
 /// lock, nftables took the probe and the start-up cleanup ran.
@@ -81,7 +90,6 @@ pub const FEATURES_WITH_BRIDGE: &[&str] = &[
     "mesh",
     "mesh_native_keys",
     "mesh_host_groups",
-    "mesh_paths",
     mesh_bridge::FEATURE,
 ];
 
@@ -96,7 +104,6 @@ pub const FEATURES_WITH_BACKBONE: &[&str] = &[
     "mesh",
     "mesh_native_keys",
     "mesh_host_groups",
-    "mesh_paths",
     BACKBONE_FEATURE,
 ];
 
@@ -105,7 +112,6 @@ pub const FEATURES_WITH_BRIDGE_AND_BACKBONE: &[&str] = &[
     "mesh",
     "mesh_native_keys",
     "mesh_host_groups",
-    "mesh_paths",
     mesh_bridge::FEATURE,
     BACKBONE_FEATURE,
 ];
@@ -143,6 +149,9 @@ struct Inner {
     /// backbone section is taken and this node never carries other
     /// regions' prefixes.
     backbone_enabled: AtomicBool,
+    /// The operator's switch (`mesh_paths`, off by default): off, no
+    /// network takes `routing.paths`, so the waypoint code stays closed.
+    paths_enabled: AtomicBool,
     bridging: Bridging,
     /// Held by the task that replaces the networks, not by the request:
     /// a request that times out does not let the next one start while
@@ -371,6 +380,7 @@ impl ManagedMesh {
                 hubs: Mutex::new(BTreeMap::new()),
                 backbone: Mutex::new(None),
                 backbone_enabled: AtomicBool::new(false),
+                paths_enabled: AtomicBool::new(false),
                 bridging,
                 applying: tokio::sync::Mutex::new(()),
                 previous: Mutex::new(None),
@@ -396,6 +406,20 @@ impl ManagedMesh {
 
     fn backbone_enabled(&self) -> bool {
         self.inner.backbone_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Turns custom paths on or off (the operator's `mesh_paths`; off when
+    /// not called). Off, `mesh_paths` is not listed and an `apply` whose
+    /// networks carry `routing.paths` is refused as invalid
+    /// ([`PATHS_DISABLED`]); the running networks stay as they are. Set
+    /// before the first `apply`.
+    pub fn with_paths(self, enabled: bool) -> Self {
+        self.inner.paths_enabled.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    fn paths_enabled(&self) -> bool {
+        self.inner.paths_enabled.load(Ordering::SeqCst)
     }
 }
 
@@ -852,13 +876,18 @@ fn bridge_failure(error: &BridgeApplyError) -> String {
 }
 
 impl MeshControl for ManagedMesh {
-    fn features(&self) -> &'static [&'static str] {
-        match (self.inner.bridging.available(), self.backbone_enabled()) {
+    fn features(&self) -> Vec<&'static str> {
+        let mut features = match (self.inner.bridging.available(), self.backbone_enabled()) {
             (true, true) => FEATURES_WITH_BRIDGE_AND_BACKBONE,
             (true, false) => FEATURES_WITH_BRIDGE,
             (false, true) => FEATURES_WITH_BACKBONE,
             (false, false) => FEATURES,
         }
+        .to_vec();
+        if self.paths_enabled() {
+            features.push(PATHS_FEATURE);
+        }
+        features
     }
 
     /// Waits for a replacement in progress, so that the network is found
@@ -891,6 +920,13 @@ impl MeshControl for ManagedMesh {
         if backbone.is_some() && !self.backbone_enabled() {
             return Box::pin(async { Err(backbone_disabled()) });
         }
+        if !self.paths_enabled()
+            && networks
+                .iter()
+                .any(|network| !network.settings.paths.is_empty())
+        {
+            return Box::pin(async { Err(paths_disabled()) });
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             tokio::spawn(async move {
@@ -914,6 +950,14 @@ impl MeshControl for ManagedMesh {
 fn backbone_disabled() -> ApplyError {
     ApplyError::Invalid(format!(
         "{BACKBONE_DISABLED}: backbone: this node does not run a backbone (mesh_backbone is off in the node configuration)"
+    ))
+}
+
+/// Nothing of the request is applied: the running networks stay as they
+/// are.
+fn paths_disabled() -> ApplyError {
+    ApplyError::Invalid(format!(
+        "{PATHS_DISABLED}: routing.paths: this node does not apply custom paths (mesh_paths is off in the node configuration)"
     ))
 }
 
@@ -1779,7 +1823,7 @@ mod tests {
         assert_eq!(mesh.features(), FEATURES);
         assert!(!FEATURES.contains(&mesh_bridge::FEATURE));
         assert!(FEATURES_WITH_BRIDGE.contains(&mesh_bridge::FEATURE));
-        assert!(FEATURES_WITH_BRIDGE.contains(&"mesh_paths"));
+        assert!(!FEATURES_WITH_BRIDGE.contains(&PATHS_FEATURE));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2043,6 +2087,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn custom_paths_are_off_unless_the_operator_turns_them_on() {
+        let dir = temp_dir("paths-off");
+        let mesh = open(&dir).expect("open");
+        assert!(!mesh.features().contains(&PATHS_FEATURE));
+        let plain = || ManagedNetwork {
+            tag: "mesh-cn".into(),
+            settings: settings(),
+        };
+        let routed = || {
+            let mut settings = settings();
+            settings.paths = vec![CustomPath {
+                target: PathTarget::Peer("10.150.0.7".parse().unwrap()),
+                via: vec!["10.150.0.3".parse().unwrap()],
+            }];
+            ManagedNetwork {
+                tag: "mesh-cn".into(),
+                settings,
+            }
+        };
+        let before = mesh.apply(vec![plain()], None).await.unwrap();
+        // Refused as a whole: the running network stays as it was and
+        // takes no path.
+        match mesh.apply(vec![routed()], None).await.unwrap_err() {
+            ApplyError::Invalid(message) => {
+                assert!(message.starts_with(PATHS_DISABLED), "{message}");
+            }
+            ApplyError::Failed(message) => panic!("not invalid: {message}"),
+        }
+        assert_eq!(mesh.status(), before);
+        assert!(lock(&mesh.inner.networks)
+            .iter()
+            .all(|instance| instance.settings.paths.is_empty()));
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Turned on, it is listed and the paths are taken.
+        let dir = temp_dir("paths-on");
+        let mesh = open(&dir).expect("open").with_paths(true);
+        assert_eq!(mesh.features().last(), Some(&PATHS_FEATURE));
+        let status = mesh.apply(vec![routed()], None).await.unwrap();
+        assert_eq!(status.networks.len(), 1);
+        assert!(lock(&mesh.inner.networks)
+            .iter()
+            .all(|instance| instance.settings.paths.len() == 1));
+        let _ = mesh.apply(Vec::new(), None).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_feature_list_holds_the_base_and_the_backbone_only_when_on() {
         for list in [
@@ -2061,7 +2154,14 @@ mod tests {
         assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&BACKBONE_FEATURE));
         assert!(FEATURES_WITH_BRIDGE_AND_BACKBONE.contains(&mesh_bridge::FEATURE));
         assert!(!FEATURES_WITH_BACKBONE.contains(&mesh_bridge::FEATURE));
-        assert!(FEATURES.contains(&"mesh_paths"));
+        for list in [
+            FEATURES,
+            FEATURES_WITH_BRIDGE,
+            FEATURES_WITH_BACKBONE,
+            FEATURES_WITH_BRIDGE_AND_BACKBONE,
+        ] {
+            assert!(!list.contains(&PATHS_FEATURE), "{list:?}");
+        }
     }
 
     #[test]

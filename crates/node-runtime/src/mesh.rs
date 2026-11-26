@@ -38,6 +38,13 @@ pub const BACKBONE_FEATURE: &str = "mesh_backbone";
 /// [`BACKBONE_FEATURE`].
 pub const BACKBONE_DISABLED: &str = "backbone_disabled";
 
+/// Listed only when the operator turned custom paths on (`mesh_paths` in
+/// the node configuration, off by default).
+pub const PATHS_FEATURE: &str = "mesh_paths";
+
+/// The refusal of a body with `routing.paths` while custom paths are off.
+pub const PATHS_DISABLED: &str = "paths_disabled";
+
 /// The installed mesh, with the lock that keeps `PUT`s one at a time.
 pub(crate) struct Mesh {
     control: Arc<dyn MeshControl>,
@@ -53,7 +60,7 @@ impl Mesh {
         }
     }
 
-    pub(crate) fn features(&self) -> &'static [&'static str] {
+    pub(crate) fn features(&self) -> Vec<&'static str> {
         self.control.features()
     }
 
@@ -82,9 +89,23 @@ impl Mesh {
         let request = parse(body).map_err(NodeError::Mesh)?;
         // A node that does not list the backbone never becomes a border
         // node: the whole body is refused and nothing changes.
-        if request.backbone.is_some() && !self.features().contains(&BACKBONE_FEATURE) {
+        let features = self.features();
+        if request.backbone.is_some() && !features.contains(&BACKBONE_FEATURE) {
             return Err(NodeError::Mesh(format!(
                 "{BACKBONE_DISABLED}: backbone: this node does not run a backbone ({BACKBONE_FEATURE} is not listed)"
+            )));
+        }
+        // Likewise for custom paths: a node that does not list them takes
+        // no `routing.paths`, so the waypoint code stays closed to the
+        // network; the running networks stay as they are.
+        if !features.contains(&PATHS_FEATURE)
+            && request
+                .networks
+                .iter()
+                .any(|network| !network.settings.paths.is_empty())
+        {
+            return Err(NodeError::Mesh(format!(
+                "{PATHS_DISABLED}: routing.paths: this node does not apply custom paths ({PATHS_FEATURE} is not listed)"
             )));
         }
         let stopped = self.apply.lock().await;

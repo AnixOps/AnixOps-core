@@ -389,7 +389,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait MeshControl: Send + Sync {
     /// Feature names this implementation adds to `GET /v1/status`:
     /// at least `mesh`; `mesh_dns` once the network config takes `dns`.
-    fn features(&self) -> &'static [&'static str];
+    /// Operator switches (`mesh_paths`, `mesh_backbone`, the external
+    /// bridge) decide some of them, so the list is made at each call.
+    fn features(&self) -> Vec<&'static str>;
 
     /// The current status.
     fn status(&self) -> ManagedStatus;

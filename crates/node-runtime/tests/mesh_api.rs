@@ -36,11 +36,11 @@ struct FakeMesh {
 }
 
 impl MeshControl for FakeMesh {
-    fn features(&self) -> &'static [&'static str] {
+    fn features(&self) -> Vec<&'static str> {
         if self.no_backbone {
-            &["mesh", "mesh_dns"]
+            vec!["mesh", "mesh_dns"]
         } else {
-            &["mesh", "mesh_dns", "mesh_backbone"]
+            vec!["mesh", "mesh_dns", "mesh_backbone"]
         }
     }
 
@@ -374,6 +374,39 @@ async fn a_node_with_the_backbone_off_refuses_the_section_and_keeps_its_networks
     );
     assert!(!raw.contains(SECRET), "{raw}");
     assert_eq!(*mesh.backbones.lock().unwrap(), [None]);
+    assert_eq!(mesh.applied.lock().unwrap().len(), 1);
+    let (status, _, after) = call(api, "GET", "/v1/mesh", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(after, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_with_custom_paths_off_refuses_them_and_keeps_its_networks() {
+    // FakeMesh does not list mesh_paths, as a node with the switch off.
+    let mesh = Arc::new(FakeMesh::default());
+    let api = start_api(Some(mesh.clone())).await;
+    let (_, _, status) = call(api, "GET", "/v1/status", None).await;
+    assert!(!features(&status).contains(&"mesh_paths".to_owned()));
+
+    let body = json!({"networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")]});
+    let (status, _, before) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 200, "{before}");
+
+    // A valid body whose network carries a path: refused as a whole,
+    // nothing reaches the mesh, the running network stays.
+    let mut routed = network("mesh-cn", "mesh-cn", "10.150.0.5/16");
+    routed["routing"]["paths"] = json!([{"to_peer": "10.150.0.7", "via": ["10.150.0.3"]}]);
+    let (status, raw, answer) =
+        call(api, "PUT", "/v1/mesh", Some(json!({"networks": [routed]}))).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("paths_disabled"),
+        "{answer}"
+    );
+    assert!(!raw.contains(SECRET), "{raw}");
     assert_eq!(mesh.applied.lock().unwrap().len(), 1);
     let (status, _, after) = call(api, "GET", "/v1/mesh", None).await;
     assert_eq!(status, 200);

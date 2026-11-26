@@ -111,6 +111,13 @@ pub struct NodeConfig {
     /// (`backbone_disabled`), so it never becomes a border node.
     #[serde(default)]
     pub mesh_backbone: bool,
+    /// Turns on custom paths of managed networks (`routing.paths`, spec
+    /// §17.2). Off by default: the node then does not list `mesh_paths`
+    /// and refuses a `PUT /v1/mesh` body whose networks carry
+    /// `routing.paths` (`paths_disabled`), so no waypoint traffic is taken
+    /// or sent for a path.
+    #[serde(default)]
+    pub mesh_paths: bool,
 }
 
 /// Has no `Debug`: `token` is a credential.
@@ -348,6 +355,15 @@ mod tests {
                 "{listen}"
             );
         }
+    }
+
+    #[test]
+    fn custom_paths_are_off_unless_the_config_turns_them_on() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.mesh_paths);
+        let config: NodeConfig =
+            serde_json::from_value(serde_json::json!({"mesh_paths": true})).unwrap();
+        assert!(config.mesh_paths);
     }
 
     #[test]

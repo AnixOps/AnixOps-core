@@ -53,6 +53,12 @@ The inter-region backbone of those networks (a border node's top-level
 refused as a whole with 400 (`backbone_disabled`), leaving the running
 networks as they are.
 
+Custom paths of those networks (`routing.paths`) likewise stay off unless
+the config sets `"mesh_paths": true`. Off, `GET /v1/status` does not list
+`mesh_paths` and a `PUT /v1/mesh` body whose networks carry
+`routing.paths` is refused as a whole with 400 (`paths_disabled`), leaving
+the running networks as they are.
+
 Users may carry `"speed_limit"` (Mbit/s for each direction, shared by all
 of the user's connections) and `"device_limit"` (most client IPs online at
 once); both default to 0, no limit.
