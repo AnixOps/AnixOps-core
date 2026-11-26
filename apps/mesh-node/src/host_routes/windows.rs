@@ -21,7 +21,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_INET};
 
-use super::{HostLink, HostRoute};
+use super::{HostLink, HostRoute, RouteKind};
 
 /// One interface row, reduced to what the overlap rule needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +139,7 @@ pub fn host_routes() -> io::Result<Vec<HostRoute>> {
             let destination = IpNet::new(address, row.DestinationPrefix.PrefixLength)?.trunc();
             Some(HostRoute {
                 destination,
+                kind: RouteKind::Unicast,
                 interfaces: vec![row.InterfaceIndex],
             })
         })

@@ -628,6 +628,12 @@ fn fill_running(
             peer: String::new(),
             detail: String::new(),
         })
+        .chain(snapshot.foreign_overlaps.iter().map(|subnet| Alert {
+            code: AlertCode::ForeignRouteOverlap,
+            address: None,
+            peer: String::new(),
+            detail: subnet.to_string(),
+        }))
         .collect();
     if let Some(oversize) = snapshot.sync_oversize {
         let counters = &snapshot.counters;
@@ -847,6 +853,7 @@ mod tests {
             not_native: Some(44),
             rejected_advertisements: 2,
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
+            foreign_overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
             sync_oversize: Some(SyncOversize::Received {
                 peer: 9,
@@ -868,24 +875,26 @@ mod tests {
         assert_eq!(status.failure.as_ref().unwrap().detail, "44");
         assert_eq!(status.rejected_advertisements, 2);
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
-        assert_eq!(status.alerts[1].code, AlertCode::SyncOversize);
-        assert!(status.alerts[1].detail.contains("8400000"));
-        assert!(status.alerts[1].detail.starts_with("received:"));
-        assert!(status.alerts[1].detail.contains("node 9"));
+        assert_eq!(status.alerts[1].code, AlertCode::ForeignRouteOverlap);
+        assert_eq!(status.alerts[1].detail, "192.168.1.0/24");
+        assert_eq!(status.alerts[2].code, AlertCode::SyncOversize);
+        assert!(status.alerts[2].detail.contains("8400000"));
+        assert!(status.alerts[2].detail.starts_with("received:"));
+        assert!(status.alerts[2].detail.contains("node 9"));
 
         let undelivered = Snapshot {
             sync_oversize: Some(SyncOversize::Undelivered { peer: 4 }),
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
-        fill_running(&mut status, &base, &undelivered);
+        fill_running(&mut status, &base, &undelivered, Duration::ZERO);
         assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
         assert!(status.alerts[0].detail.starts_with("undelivered:"));
 
         let mut full = Snapshot::default();
         full.counters.refused_at_capacity = 3;
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
-        fill_running(&mut status, &base, &full);
+        fill_running(&mut status, &base, &full, Duration::ZERO);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
         assert!(status.alerts[0].detail.starts_with("capacity:"));

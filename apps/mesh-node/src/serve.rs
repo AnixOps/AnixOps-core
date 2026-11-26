@@ -33,12 +33,14 @@ const QUEUE: usize = 256;
 /// How often the networks of the other interfaces are read again.
 const LOCAL_NETWORKS_EVERY: Duration = Duration::from_secs(30);
 
-/// What the host reaches without the mesh (spec §15.4): the networks of the
-/// other interfaces and the routes of other programs' virtual interfaces.
-/// Every interface named like ours, and `device`, is left out.
+/// How long one scan of the interfaces and routes may take.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The networks of the other interfaces (spec §15.4). Our own mesh
+/// interfaces, and `device`, are left out.
 fn read_local_networks(device: &str) -> Vec<IpNet> {
     let own = |name: &str| host_routes::is_own_interface(name, &[device]);
-    let mut networks: Vec<IpNet> = match tun::local_networks(own) {
+    match tun::local_networks(own) {
         Ok(networks) => networks
             .into_iter()
             .filter_map(|(address, prefix)| IpNet::new(address, prefix))
@@ -47,18 +49,63 @@ fn read_local_networks(device: &str) -> Vec<IpNet> {
             warn("interfaces", &error.to_string());
             Vec::new()
         }
-    };
-    match host_routes::host_links()
-        .and_then(|links| host_routes::host_routes().map(|routes| (links, routes)))
-    {
-        Ok((links, routes)) => networks.extend(host_routes::foreign_virtual_routes(
-            &routes,
-            &links,
-            &[device],
-        )),
-        Err(error) => warn("routes", &error.to_string()),
+    }
+}
+
+/// What the host reaches without the mesh: the networks of the other
+/// interfaces, and the routes of other mesh programs as the system selects
+/// them. `None` when a scan failed or took longer than [`SCAN_TIMEOUT`];
+/// the previous result then stays.
+async fn scan(device: String) -> Option<(Vec<IpNet>, Vec<IpNet>)> {
+    let read = tokio::task::spawn_blocking(move || {
+        let networks = read_local_networks(&device);
+        match host_routes::foreign_routes(&device) {
+            Ok(routes) => Some((networks, routes)),
+            Err(error) => {
+                warn("routes", &error.to_string());
+                None
+            }
+        }
+    });
+    match tokio::time::timeout(SCAN_TIMEOUT, read).await {
+        Ok(Ok(found)) => found,
+        Ok(Err(error)) => {
+            warn("routes", &error.to_string());
+            None
+        }
+        Err(_) => {
+            warn("routes", "the scan of the routing tables timed out");
+            None
+        }
+    }
+}
+
+/// Stores `fresh` when it differs, so that the driver wakes on changes only.
+fn store(sender: &watch::Sender<Vec<IpNet>>, fresh: Vec<IpNet>) {
+    sender.send_if_modified(|current| {
+        let changed = *current != fresh;
+        if changed {
+            *current = fresh;
+        }
+        changed
+    });
+}
+
+/// `networks` with the routes the other networks of this process hold.
+fn with_others(mut networks: Vec<IpNet>, others: Option<&(HostRoutes, String)>) -> Vec<IpNet> {
+    if let Some((routes, owner)) = others {
+        networks.extend(routes.others(owner));
     }
     networks
+}
+
+/// Aborts the task when dropped.
+struct StopTask(tokio::task::JoinHandle<()>);
+
+impl Drop for StopTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Routes to add and to remove to go from `installed` to `wanted`, in
@@ -645,15 +692,49 @@ pub(crate) async fn serve_with(
     let (stop, shutdown) = watch::channel(false);
     let claim = host.map(|(routes, owner)| Claim { routes, owner });
     let mut others_changed = claim.as_ref().map(|claim| claim.routes.subscribe());
-    let local = |device: &Tun| {
-        let mut networks = read_local_networks(device.name());
-        if let Some(claim) = &claim {
-            networks.extend(claim.routes.others(&claim.owner));
+    // Recorded as ours, so that no other network of this process takes
+    // its routes for another program's.
+    let _own = host_routes::claim_own_interface(device.name());
+    // This machine's networks are its other interfaces and the routes the
+    // other networks of this process hold.
+    let others = claim
+        .as_ref()
+        .map(|claim| (claim.routes.clone(), claim.owner.clone()));
+    let (local, foreign) = scan(device.name().to_owned()).await.unwrap_or_default();
+    let (networks, local_networks) = watch::channel(with_others(local.clone(), others.as_ref()));
+    let (foreign_tx, foreign_routes) = watch::channel(foreign);
+    // Scanned again off the packet loop, one scan at a time, and whenever
+    // another network takes or frees routes.
+    let _scanner = StopTask(tokio::spawn({
+        let device = device.name().to_owned();
+        let mut changed = others.as_ref().map(|(routes, _)| routes.subscribe());
+        let mut interfaces = local;
+        async move {
+            let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
+            rescan.tick().await;
+            loop {
+                tokio::select! {
+                    _ = rescan.tick() => {
+                        if let Some((local, foreign)) = scan(device.clone()).await {
+                            interfaces = local;
+                            store(&foreign_tx, foreign);
+                        }
+                    }
+                    Some(Ok(())) = async {
+                        match &mut changed {
+                            Some(changed) => Some(changed.changed().await),
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                }
+                // Only a change wakes the driver (spec §15.4).
+                store(&networks, with_others(interfaces.clone(), others.as_ref()));
+            }
         }
-        networks
-    };
-    let (networks, local_networks) = watch::channel(local(&device));
-    let mut rescan = tokio::time::interval(LOCAL_NETWORKS_EVERY);
+    }));
+    // No entry point sets subnet route overrides here yet; the sender is
+    // kept so that the driver sees an open, empty list.
+    let (_route_overrides, route_overrides) = watch::channel(Vec::new());
     let mut installed: Vec<IpNet> = Vec::new();
     let mut wanted: Vec<IpNet> = Vec::new();
     tokio::pin!(until);
@@ -668,6 +749,8 @@ pub(crate) async fn serve_with(
             snapshots,
             local_networks,
             native_keys,
+            route_overrides,
+            foreign_routes,
             shutdown,
         },
     ));
@@ -725,26 +808,14 @@ pub(crate) async fn serve_with(
                 reconcile(&mut installed, &wanted);
                 observe(&snapshot, device.name());
             }
-            _ = rescan.tick() => {
-                // Only a change wakes the driver (spec §15.4).
-                let fresh = local(&device);
-                networks.send_if_modified(|current| {
-                    let changed = *current != fresh;
-                    if changed {
-                        *current = fresh;
-                    }
-                    changed
-                });
-            }
             Some(Ok(())) = async {
                 match &mut others_changed {
                     Some(changed) => Some(changed.changed().await),
                     None => std::future::pending().await,
                 }
             } => {
-                // Another network took or freed routes: the driver sees
-                // them as this machine's, and freed ones may be ours now.
-                let _ = networks.send(local(&device));
+                // Another network took or freed routes: freed ones may be
+                // ours now (the scanner updates this machine's networks).
                 reconcile(&mut installed, &wanted);
             }
             () = &mut until => break,
