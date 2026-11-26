@@ -1787,6 +1787,16 @@ mod tests {
     #[test]
     fn a_relay_handshake_started_before_the_list_changed_is_dropped() {
         let mut net = three_in_a_row(true);
+        let key = SessionKey {
+            namespace: Namespace::Relay,
+            network: net.nodes[0].local.network_name.clone(),
+            peer_id: 102,
+        };
+        // The latency centre's calls may already have set up a relay
+        // session with node 2; start from none, so that the packet waits
+        // for a new handshake.
+        net.nodes[0].sessions.invalidate(&key);
+        net.nodes[0].relays.remove(&102);
         let packet = ipv4_packet([10, 144, 0, 1], [10, 144, 0, 3]);
         net.nodes[0].send_ip(&packet, net.now).unwrap();
         // msg1 goes out; the answer is not delivered yet.
@@ -1799,11 +1809,6 @@ mod tests {
         unlist(&mut net, 0, 2);
         assert!(!net.nodes[0].relays.contains_key(&102));
         net.settle();
-        let key = SessionKey {
-            namespace: Namespace::Relay,
-            network: net.nodes[0].local.network_name.clone(),
-            peer_id: 102,
-        };
         assert!(net.nodes[0].sessions.get(&key).is_none());
         assert!(net.delivered.is_empty());
     }
