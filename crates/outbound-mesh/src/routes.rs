@@ -154,12 +154,20 @@ impl RouteTable {
             local: settings.local_addresses(),
             virtual_subnets: settings.virtual_subnets(),
             allowed: settings.accept_subnets.clone(),
-            advertised: settings.advertise_subnets.clone(),
+            advertised: settings.carried_subnets(),
             interfaces: Vec::new(),
             mesh_overrides: Vec::new(),
             border: Vec::new(),
             peers: BTreeMap::new(),
         }
+    }
+
+    /// Replaces the subnets this node carries ([`MeshSettings::carried_subnets`]):
+    /// they are never taken from a peer, and packets from them are accepted.
+    /// Peers' subnets that now overlap them stop being routed at the next
+    /// update of the peer.
+    pub fn set_advertised(&mut self, advertised: Vec<IpNet>) {
+        self.advertised = advertised;
     }
 
     /// Sets the other regions' summary prefixes this border node carries

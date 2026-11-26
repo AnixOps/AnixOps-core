@@ -140,6 +140,9 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
         }
         shutdown_signal().await;
         println!("shutting down");
+        // Mesh networks withdraw their advertisements and close a few
+        // seconds later (spec §15.7 rule 6).
+        node.stop_mesh().await;
         Ok(())
     })
 }

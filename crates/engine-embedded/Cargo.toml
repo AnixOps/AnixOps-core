@@ -17,6 +17,10 @@ http = ["dep:outbound-http"]
 hysteria2 = ["dep:outbound-hysteria2"]
 # Panabit iWAN: a layer-3 tunnel used as a routable outbound with its own stack.
 iwan = ["dep:outbound-iwan"]
+# Intranet mesh networks (`"type": "mesh"`), each on a private TCP/IP stack.
+# Not in the default set until the control commands land
+# (`docs/architecture/mesh-status.md`).
+mesh = ["dep:outbound-mesh"]
 # Desktop local proxy (SOCKS5/HTTP listener), URL delay tests and remote rule
 # set downloads (with optional Ed25519 signatures).
 local-proxy = ["dep:inbound-mixed", "dep:transport-tls"]
@@ -67,6 +71,7 @@ node-import = { path = "../node-import" }
 outbound-http = { path = "../outbound-http", optional = true }
 outbound-hysteria2 = { path = "../outbound-hysteria2", optional = true }
 outbound-iwan = { path = "../outbound-iwan", optional = true }
+outbound-mesh = { path = "../outbound-mesh", optional = true, features = ["outbound"] }
 outbound-mieru = { path = "../outbound-mieru", optional = true }
 outbound-shadowsocks = { path = "../outbound-shadowsocks", optional = true }
 outbound-snell = { path = "../outbound-snell", optional = true }

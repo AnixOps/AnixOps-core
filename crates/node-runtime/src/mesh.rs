@@ -45,14 +45,15 @@ pub const BACKBONE_DISABLED: &str = "backbone_disabled";
 /// The installed mesh, with the lock that keeps `PUT`s one at a time.
 pub(crate) struct Mesh {
     control: Arc<dyn MeshControl>,
-    apply: tokio::sync::Mutex<()>,
+    /// `true` once [`Mesh::stop_all`] ran: no `PUT` starts networks again.
+    apply: tokio::sync::Mutex<bool>,
 }
 
 impl Mesh {
     pub(crate) fn new(control: Arc<dyn MeshControl>) -> Self {
         Self {
             control,
-            apply: tokio::sync::Mutex::new(()),
+            apply: tokio::sync::Mutex::new(false),
         }
     }
 
@@ -82,7 +83,10 @@ impl Mesh {
             }
             region => region,
         };
-        let _one_at_a_time = self.apply.lock().await;
+        let stopped = self.apply.lock().await;
+        if *stopped {
+            return Err(NodeError::MeshFailed("the node is shutting down".into()));
+        }
         let status = self
             .control
             .apply(request.networks, request.backbone)
@@ -96,6 +100,19 @@ impl Mesh {
         }
         self.control.set_region(region.flatten()).await;
         Ok(self.control.status())
+    }
+
+    /// Stops every network for good, as the node program shuts down: each
+    /// first withdraws its subnet advertisements and closes a few seconds
+    /// later (spec §15.7 rule 6). Later `PUT`s are refused.
+    pub(crate) async fn stop_all(&self) {
+        let mut stopped = self.apply.lock().await;
+        *stopped = true;
+        let _ = self.control.apply(Vec::new(), None).await;
+        // The measurement task and the border responder end with the node.
+        if self.features().contains(&REGION_FEATURE) {
+            self.control.set_region(None).await;
+        }
     }
 }
 
