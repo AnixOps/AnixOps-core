@@ -55,6 +55,7 @@ impl MeshControl for FakeMesh {
                 instance_id: INSTANCE_ID.into(),
                 networks: networks.iter().map(network_status).collect(),
                 static_keys: Vec::new(),
+                alerts: Vec::new(),
             };
             *self.running.lock().unwrap() = status.clone();
             Ok(status)
@@ -91,6 +92,7 @@ fn network_status(network: &ManagedNetwork) -> ManagedNetworkStatus {
         rejected_advertisements: 0,
         overlaps: Vec::new(),
         alerts: Vec::new(),
+        external_bridge: None,
     }
 }
 

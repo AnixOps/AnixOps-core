@@ -17,6 +17,12 @@
 //!   (`PUT /v1/mesh/subnet_route`, spec §15.4), `{"mesh": ["<cidr>", ...]}`,
 //!   named like the key. A local override: it outlives restarts and leaving
 //!   the list, and never changes the network's configuration.
+//!
+//! External network bridges (spec §15.12, `docs/architecture/mesh-bridge.md`)
+//! run beside the networks that carry an `external_bridge` section. The
+//! node takes the host's bridge lock, probes nftables and clears what an
+//! earlier run left before it lists `mesh_external_bridge`, and clears
+//! again when it goes.
 
 use std::io;
 use std::net::IpAddr;
@@ -24,14 +30,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mesh_bridge::apply::{ALERT_APPLY_FAILED, ALERT_IPV6_FORWARDING_OFF};
+use mesh_bridge::{
+    ApplyError as BridgeApplyError, Bridge, Forwarding, Host as BridgeHost, HostLock, SystemHost,
+};
+use outbound_mesh::bridge::ExternalBridge;
 use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::node::SyncOversize;
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
-    Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedNetwork, ManagedNetworkStatus,
-    ManagedPeer, ManagedStatus, MeshControl, NetworkFailure, NetworkStaticKey, OverrideError,
-    SubnetRoute, MAX_ROUTE_OVERRIDES,
+    Alert, AlertCode, ApplyError, BoxFuture, ExternalBridgeStatus, FailureCode, ManagedNetwork,
+    ManagedNetworkStatus, ManagedPeer, ManagedStatus, MeshControl, NetworkFailure,
+    NetworkStaticKey, OverrideError, SubnetRoute, MAX_ROUTE_OVERRIDES,
 };
 use outbound_mesh::{IpNet, MeshSettings};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -47,6 +58,10 @@ use crate::tun::{self, Tun};
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
 pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
+
+/// [`FEATURES`] once this process can bridge: it holds the host's bridge
+/// lock, nftables took the probe and the start-up cleanup ran.
+pub const FEATURES_WITH_BRIDGE: &[&str] = &["mesh", "mesh_native_keys", mesh_bridge::FEATURE];
 
 /// Interface names: `anixmesh-<n>`, the lowest number free.
 const INTERFACE_PREFIX: &str = "anixmesh-";
@@ -67,6 +82,7 @@ struct Inner {
     dir: PathBuf,
     instance_id: String,
     networks: Mutex<Vec<Instance>>,
+    bridging: Bridging,
     /// Held by the task that replaces the networks, not by the request:
     /// a request that times out does not let the next one start while
     /// the first is still at work.
@@ -76,6 +92,76 @@ struct Inner {
     previous: Mutex<Option<ManagedStatus>>,
     /// The system routes the running networks installed.
     routes: HostRoutes,
+}
+
+/// The host side of external bridges.
+struct Bridging {
+    host: Arc<dyn BridgeHost>,
+    forwarding: Arc<Forwarding>,
+    /// Held while this process may bridge; `None`: it does not.
+    lock: Option<HostLock>,
+    /// Another process holds the host's bridge lock.
+    lock_held: bool,
+}
+
+impl Bridging {
+    /// No bridges (tests, and hosts where the checks below fail).
+    fn off() -> Self {
+        let host: Arc<dyn BridgeHost> = Arc::new(SystemHost);
+        Self {
+            forwarding: Forwarding::new(host.clone()),
+            host,
+            lock: None,
+            lock_held: false,
+        }
+    }
+
+    /// Spec §15.12 item 9 and the recheck of #357 (Y1, Y2): the host lock
+    /// first, so that a second node program neither declares the
+    /// capability nor deletes the first one's tables; then the nftables
+    /// probe; then the start-up cleanup of what an earlier run left.
+    fn system() -> Self {
+        let mut bridging = Self::off();
+        let lock = match HostLock::acquire() {
+            Ok(lock) => lock,
+            Err(error) => {
+                bridging.lock_held = error.kind() == io::ErrorKind::WouldBlock;
+                eprintln!("mesh: external bridge unavailable: {error}");
+                return bridging;
+            }
+        };
+        if let Err(error) = mesh_bridge::probe(bridging.host.as_ref()) {
+            eprintln!("mesh: external bridge unavailable: nftables probe: {error}");
+            return bridging;
+        }
+        match mesh_bridge::cleanup_all(bridging.host.as_ref()) {
+            Ok(0) => {}
+            Ok(count) => eprintln!("mesh: removed {count} bridge table(s) an earlier run left"),
+            Err(error) => {
+                eprintln!("mesh: external bridge unavailable: start-up cleanup: {error}");
+                return bridging;
+            }
+        }
+        bridging.lock = Some(lock);
+        bridging
+    }
+
+    fn available(&self) -> bool {
+        self.lock.is_some()
+    }
+}
+
+impl Drop for Inner {
+    /// At exit the bridges go first (each removes its own table), then the
+    /// cleanup runs once more (spec §15.12 item 9).
+    fn drop(&mut self) {
+        lock(&self.networks).clear();
+        if self.bridging.available() {
+            if let Err(error) = mesh_bridge::cleanup_all(self.bridging.host.as_ref()) {
+                eprintln!("mesh: bridge cleanup at exit: {error}");
+            }
+        }
+    }
 }
 
 struct Instance {
@@ -93,7 +179,7 @@ enum State {
     Waiting(&'static str),
     /// The network could not start.
     Refused(FailureCode, String),
-    Running(Running),
+    Running(Box<Running>),
 }
 
 struct Running {
@@ -107,6 +193,8 @@ struct Running {
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
     task: JoinHandle<()>,
+    /// The network's external bridge, when it has one.
+    bridge: Option<Bridge>,
     started: Instant,
 }
 
@@ -114,6 +202,10 @@ impl ManagedMesh {
     /// Opens the state directory `dir`, creating it and the instance ID
     /// when they are missing.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::open_with(dir, Bridging::system())
+    }
+
+    fn open_with(dir: impl Into<PathBuf>, bridging: Bridging) -> io::Result<Self> {
         let dir = dir.into();
         create_private_dir(&dir)?;
         create_private_dir(&dir.join("keys"))?;
@@ -124,6 +216,7 @@ impl ManagedMesh {
                 dir,
                 instance_id,
                 networks: Mutex::new(Vec::new()),
+                bridging,
                 applying: tokio::sync::Mutex::new(()),
                 previous: Mutex::new(None),
                 routes: HostRoutes::default(),
@@ -387,18 +480,71 @@ impl Inner {
         }
         let overrides = self.route_overrides(&settings.network_name);
         match launch(&settings, key, taken, &self.routes, &tag, overrides).await {
-            Ok(running) => {
+            Ok(mut running) => {
+                if let Some(section) = &settings.external_bridge {
+                    if let Err(detail) = self.bridge_up(&mut running, section, &settings) {
+                        stop_running(running).await;
+                        return instance(
+                            settings,
+                            State::Refused(FailureCode::StartRefused, detail),
+                        );
+                    }
+                }
                 taken.push(running.interface.clone());
-                instance(settings, State::Running(running))
+                instance(settings, State::Running(Box::new(running)))
             }
             Err((code, detail)) => instance(settings, State::Refused(code, detail)),
         }
     }
 
+    /// Installs the bridge of a network that just started; the detail of
+    /// the `start_refused` failure when it cannot.
+    fn bridge_up(
+        &self,
+        running: &mut Running,
+        section: &ExternalBridge,
+        settings: &MeshSettings,
+    ) -> Result<(), String> {
+        if !self.bridging.available() {
+            return Err(if self.bridging.lock_held {
+                "external_bridge_lock_held".to_owned()
+            } else {
+                "external_bridge_unsupported".to_owned()
+            });
+        }
+        let mut bridge = Bridge::new(
+            self.bridging.host.clone(),
+            self.bridging.forwarding.clone(),
+            &running.interface,
+        )
+        .map_err(|error| error.reason().to_owned())?;
+        bridge
+            .apply(
+                section,
+                &settings.virtual_subnets(),
+                &settings.local_addresses(),
+            )
+            .map_err(|error| bridge_failure(&error))?;
+        running.bridge = Some(bridge);
+        Ok(())
+    }
+
     fn describe(&self, networks: &[Instance]) -> ManagedStatus {
+        let lock_held = self.bridging.lock_held;
         ManagedStatus {
             instance_id: self.instance_id.clone(),
-            networks: networks.iter().map(network_status).collect(),
+            networks: networks
+                .iter()
+                .map(|instance| {
+                    let mut status = network_status(instance);
+                    if lock_held {
+                        // Unknown here: another process may bridge for it.
+                        status.external_bridge = None;
+                        status.alerts.push(lock_held_alert());
+                    }
+                    status
+                })
+                .collect(),
             static_keys: networks
                 .iter()
                 .filter(|instance| instance.settings.security.has_forward_secrecy())
@@ -409,13 +555,40 @@ impl Inner {
                     })
                 })
                 .collect(),
+            alerts: if lock_held {
+                vec![lock_held_alert()]
+            } else {
+                Vec::new()
+            },
         }
+    }
+}
+
+fn lock_held_alert() -> Alert {
+    Alert {
+        code: AlertCode::ExternalBridgeLockHeld,
+        address: None,
+        peer: String::new(),
+        detail: mesh_bridge::lock::LOCK_PATH.to_owned(),
+    }
+}
+
+/// The `start_refused` detail of a bridge that could not be installed:
+/// the reason code, then nft's or the kernel's words.
+fn bridge_failure(error: &BridgeApplyError) -> String {
+    match error {
+        BridgeApplyError::Invalid(error) => error.reason().to_owned(),
+        BridgeApplyError::Host(error) => format!("{ALERT_APPLY_FAILED}: {error}"),
     }
 }
 
 impl MeshControl for ManagedMesh {
     fn features(&self) -> &'static [&'static str] {
-        FEATURES
+        if self.inner.bridging.available() {
+            FEATURES_WITH_BRIDGE
+        } else {
+            FEATURES
+        }
     }
 
     /// Waits for a replacement in progress, so that the network is found
@@ -474,7 +647,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// is tried again. `false` means the instance is to be stopped.
 fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
     let same = instance.settings == *settings;
-    let update = match &instance.state {
+    let mut next = settings.clone();
+    let update = match &mut instance.state {
         State::Waiting(_) => same,
         State::Refused(..) => false,
         State::Running(running) if !running_ok(running) => false,
@@ -488,15 +662,52 @@ fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
             {
                 let _ = running.native_keys.send(settings.native_keys.clone());
                 true
+            } else if same_but_bridge_allow(&instance.settings, settings) {
+                // Only the allow list moved: the bridge takes it without a
+                // restart. If it fails, the old rules and status stay with
+                // an alert, and the old list is kept so that the next PUT
+                // tries again.
+                if let (Some(bridge), Some(section)) =
+                    (running.bridge.as_mut(), settings.external_bridge.as_ref())
+                {
+                    if bridge
+                        .apply(
+                            section,
+                            &settings.virtual_subnets(),
+                            &settings.local_addresses(),
+                        )
+                        .is_err()
+                    {
+                        next.external_bridge = instance.settings.external_bridge.clone();
+                    }
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
         }
     };
     if update {
-        instance.settings = settings.clone();
+        instance.settings = next;
     }
     update
+}
+
+/// Whether `new` differs from `old` only in the bridge's allow list: the
+/// same interface and routes, so the advertisement does not move.
+fn same_but_bridge_allow(old: &MeshSettings, new: &MeshSettings) -> bool {
+    match (&old.external_bridge, &new.external_bridge) {
+        (Some(before), Some(after))
+            if before.interface() == after.interface() && before.routes() == after.routes() =>
+        {
+            let mut old = old.clone();
+            old.external_bridge.clone_from(&new.external_bridge);
+            old == *new
+        }
+        _ => false,
+    }
 }
 
 fn running_ok(running: &Running) -> bool {
@@ -541,19 +752,33 @@ fn clash(settings: &MeshSettings, occupied: &[IpNet]) -> Option<(FailureCode, St
 }
 
 async fn stop(instance: Instance) {
-    if let State::Running(mut running) = instance.state {
-        if let Some(stop) = running.stop.take() {
-            let _ = stop.send(());
+    if let State::Running(running) = instance.state {
+        stop_running(*running).await;
+    }
+}
+
+async fn stop_running(mut running: Running) {
+    if let Some(mut bridge) = running.bridge.take() {
+        // On failure the bridge's drop tries once more, and the next
+        // start-up cleanup clears what is left.
+        if let Err(error) = bridge.remove() {
+            eprintln!(
+                "mesh: removing the bridge of {}: {error}",
+                running.interface
+            );
         }
-        if tokio::time::timeout(STOP_TIMEOUT, &mut running.task)
-            .await
-            .is_err()
-        {
-            // Cutting the task off drops the serving, which aborts the
-            // driver and frees its sockets and routes; wait for that.
-            running.task.abort();
-            let _ = (&mut running.task).await;
-        }
+    }
+    if let Some(stop) = running.stop.take() {
+        let _ = stop.send(());
+    }
+    if tokio::time::timeout(STOP_TIMEOUT, &mut running.task)
+        .await
+        .is_err()
+    {
+        // Cutting the task off drops the serving, which aborts the
+        // driver and frees its sockets and routes; wait for that.
+        running.task.abort();
+        let _ = (&mut running.task).await;
     }
 }
 
@@ -640,6 +865,7 @@ async fn launch(
         snapshot,
         exit,
         task,
+        bridge: None,
         started: Instant::now(),
     })
 }
@@ -682,28 +908,58 @@ fn network_status(instance: &Instance) -> ManagedNetworkStatus {
             status.error.clone_from(detail);
             status.failure = failure(*code, detail);
             status.alerts.push(start_refused(detail));
+            // Nothing of a bridge stays for a network that did not start.
+            status.external_bridge = Some(None);
         }
         State::Running(running) => {
             if let Some(exit) = lock(&running.exit).clone() {
                 status.error.clone_from(&exit);
                 status.failure = failure(FailureCode::StartRefused, &exit);
                 status.alerts.push(start_refused(&exit));
-                return status;
-            }
-            if running.task.is_finished() {
+            } else if running.task.is_finished() {
                 status.error = "stopped".to_owned();
-                return status;
+            } else {
+                let snapshot = running.snapshot.borrow();
+                fill_running(
+                    &mut status,
+                    &instance.settings,
+                    &snapshot,
+                    running.started.elapsed(),
+                );
             }
-            let snapshot = running.snapshot.borrow();
-            fill_running(
-                &mut status,
-                &instance.settings,
-                &snapshot,
-                running.started.elapsed(),
-            );
+            // The rules stay until the network is stopped or replaced.
+            bridge_status(&mut status, running.bridge.as_ref());
         }
     }
     status
+}
+
+/// `externalBridge` and the bridge's alerts of a started network: `null`
+/// without a bridge.
+fn bridge_status(status: &mut ManagedNetworkStatus, bridge: Option<&Bridge>) {
+    let Some(bridge) = bridge else {
+        status.external_bridge = Some(None);
+        return;
+    };
+    status.external_bridge = Some(bridge.status().map(|applied| ExternalBridgeStatus {
+        allow_digest: applied.allow_digest.clone(),
+        allow_count: applied.allow_count,
+        routes_digest: applied.routes_digest.clone(),
+        applied_at: applied.applied_at.clone(),
+    }));
+    for alert in bridge.alerts() {
+        let code = match alert.code {
+            ALERT_APPLY_FAILED => AlertCode::ExternalBridgeApplyFailed,
+            ALERT_IPV6_FORWARDING_OFF => AlertCode::ExternalBridgeIpv6ForwardingOff,
+            _ => continue,
+        };
+        status.alerts.push(Alert {
+            code,
+            address: None,
+            peer: String::new(),
+            detail: alert.detail,
+        });
+    }
 }
 
 /// The status of a running network from its driver's snapshot, `up` after
@@ -904,6 +1160,102 @@ mod tests {
             .unwrap()
     }
 
+    /// Without the host's bridge lock, probe or cleanup.
+    fn open(dir: &Path) -> io::Result<ManagedMesh> {
+        ManagedMesh::open_with(dir, Bridging::off())
+    }
+
+    fn bridged(allow: &[&str]) -> MeshSettings {
+        let config = json!({
+            "config_version": 1,
+            "network": {"name": "office", "secret": "s3cret"},
+            "node": {"address": "10.150.0.5/16", "role": "full"},
+            "peers": [{"server": "203.0.113.10", "port": 11010}],
+            "external_bridge": {
+                "interface": "ext0",
+                "routes": ["100.100.0.5"],
+                "allow": allow,
+            },
+        });
+        serde_json::from_value::<MeshConfig>(config)
+            .unwrap()
+            .validate()
+            .unwrap()
+    }
+
+    #[test]
+    fn only_an_allow_list_change_keeps_a_bridge_running() {
+        let before = bridged(&["10.150.0.2/32"]);
+        let after = bridged(&["10.150.0.3/32"]);
+        assert!(same_but_bridge_allow(&before, &after));
+        let mut routes = after.clone();
+        let mut config = json!({
+            "config_version": 1,
+            "network": {"name": "office", "secret": "s3cret"},
+            "node": {"address": "10.150.0.5/16", "role": "full"},
+            "peers": [{"server": "203.0.113.10", "port": 11010}],
+            "external_bridge": {"interface": "ext0", "routes": ["100.100.0.6"]},
+        });
+        routes.external_bridge = serde_json::from_value::<MeshConfig>(config.take())
+            .unwrap()
+            .validate()
+            .unwrap()
+            .external_bridge;
+        assert!(!same_but_bridge_allow(&before, &routes));
+        assert!(!same_but_bridge_allow(&settings(), &after));
+        let mut mtu = after.clone();
+        mtu.mtu -= 10;
+        assert!(!same_but_bridge_allow(&before, &mtu));
+    }
+
+    #[test]
+    fn a_network_without_a_bridge_reports_null() {
+        let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
+        bridge_status(&mut status, None);
+        assert_eq!(status.external_bridge, Some(None));
+        assert!(status.alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_held_bridge_lock_is_a_node_alert_and_hides_the_capability() {
+        let dir = temp_dir("lock");
+        let bridging = Bridging {
+            lock_held: true,
+            ..Bridging::off()
+        };
+        let mesh = ManagedMesh::open_with(&dir, bridging).expect("open");
+        assert_eq!(mesh.features(), FEATURES);
+        // Also with no network at all.
+        let status = mesh.status();
+        assert!(status.networks.is_empty());
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].code, AlertCode::ExternalBridgeLockHeld);
+        let status = mesh
+            .apply(vec![ManagedNetwork {
+                tag: "mesh-cn".into(),
+                settings: settings(),
+            }])
+            .await
+            .unwrap();
+        let network = &status.networks[0];
+        assert_eq!(network.external_bridge, None);
+        assert!(network
+            .alerts
+            .iter()
+            .any(|alert| alert.code == AlertCode::ExternalBridgeLockHeld));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_bridging_the_capability_is_not_listed() {
+        let dir = temp_dir("features");
+        let mesh = open(&dir).expect("open");
+        assert_eq!(mesh.features(), FEATURES);
+        assert!(!FEATURES.contains(&mesh_bridge::FEATURE));
+        assert!(FEATURES_WITH_BRIDGE.contains(&mesh_bridge::FEATURE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mesh-managed-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -913,7 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn a_subnet_route_override_is_saved_and_withdrawn() {
         let dir = temp_dir("overrides");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open");
         let net = |text: &str| IpNet::parse(text).unwrap();
         // No network under the tag.
         assert_eq!(
@@ -933,7 +1285,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let again = ManagedMesh::open(&dir).expect("open again");
+        let again = open(&dir).expect("open again");
         assert_eq!(
             again.inner.route_overrides("office"),
             [net("192.168.10.0/24")]
@@ -961,7 +1313,7 @@ mod tests {
     #[tokio::test]
     async fn a_running_network_gets_its_overrides_at_once() {
         let dir = temp_dir("overrides-running");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open");
         let net = |text: &str| IpNet::parse(text).unwrap();
         let (stop, _stopped) = oneshot::channel();
         let (native_keys, _keys) = watch::channel(None);
@@ -979,6 +1331,7 @@ mod tests {
                 snapshot,
                 exit: Arc::new(Mutex::new(None)),
                 task: tokio::spawn(async {}),
+                bridge: None,
                 started: Instant::now(),
             }),
         });
@@ -993,13 +1346,13 @@ mod tests {
     #[test]
     fn the_instance_id_is_made_once_and_kept() {
         let dir = temp_dir("id");
-        let first = ManagedMesh::open(&dir).expect("open");
+        let first = open(&dir).expect("open");
         assert!(valid_instance_id(first.instance_id()));
         assert_eq!(first.instance_id().len(), 32);
-        let again = ManagedMesh::open(&dir).expect("open again");
+        let again = open(&dir).expect("open again");
         assert_eq!(first.instance_id(), again.instance_id());
         std::fs::write(dir.join("instance_id"), "-bad").unwrap();
-        assert!(ManagedMesh::open(&dir).is_err());
+        assert!(open(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1016,7 +1369,7 @@ mod tests {
     #[test]
     fn keys_are_kept_per_network_name() {
         let dir = temp_dir("keys");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open");
         let office = settings();
         let first = mesh.inner.static_key(&office).unwrap().public();
         assert_eq!(mesh.inner.static_key(&office).unwrap().public(), first);
@@ -1032,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn a_managed_network_off_its_list_waits_and_lists_its_key() {
         let dir = temp_dir("wait");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open");
         let waiting = settings();
         let status = mesh
             .apply(vec![ManagedNetwork {
@@ -1210,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn the_status_keeps_the_old_networks_while_they_are_replaced() {
         let dir = temp_dir("previous");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open");
         let before = mesh
             .apply(vec![waiting("mesh-cn", "office")])
             .await
@@ -1227,7 +1580,7 @@ mod tests {
     #[tokio::test]
     async fn a_replacement_keeps_its_turn_after_the_caller_gives_up() {
         let dir = temp_dir("turn");
-        let mesh = ManagedMesh::open(&dir).expect("open");
+        let mesh = open(&dir).expect("open");
         let held = mesh.inner.applying.lock().await;
         // The caller gives up: its replacement still waits for its turn.
         let gave_up = tokio::time::timeout(
