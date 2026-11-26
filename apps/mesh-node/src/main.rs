@@ -22,6 +22,7 @@ const USAGE: &str = "usage:
   anixops-mesh takeover --profile FILE --state-dir DIR [--dry-run] [--report FILE]
   anixops-mesh rollback --state-dir DIR [--forget-process PID... --confirm] [--report FILE]
   anixops-mesh run      --config FILE [--interface NAME]
+  anixops-mesh restore-host
   anixops-mesh enroll   --control URL --token-file FILE --state-dir DIR
                         [--latency CODE=MS]... [--ca-file FILE]
   anixops-mesh device   --state-dir DIR
@@ -275,6 +276,27 @@ fn run_node(options: &Options) -> Result<ExitCode, ExitCode> {
     ))
 }
 
+/// Puts back the forwarding, rules and translation a node that died left
+/// on the host. The uninstallers run it after stopping the service.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn restore_host() -> Result<ExitCode, ExitCode> {
+    let warnings =
+        mesh_node::serve::restore_host().map_err(|error| fail("restore", &error.to_string()))?;
+    println!(
+        "{}",
+        serde_json::json!({ "restored": true, "warnings": warnings })
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn restore_host() -> Result<ExitCode, ExitCode> {
+    Err(fail(
+        "platform",
+        "the node runs on Linux, macOS and Windows only",
+    ))
+}
+
 fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
     let host = RealHost::default();
     match command {
@@ -294,6 +316,7 @@ fn run(command: &str, options: &Options) -> Result<ExitCode, ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         "run" => run_node(options),
+        "restore-host" => restore_host(),
         "enroll" | "device" | "device-status" | "subnet-request" => run_device(command, options),
         "detect" => {
             if !platform_supported() {

@@ -63,6 +63,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// replace it. `run` exists on Linux but is not listed until the
 /// interoperability tests against third-party nodes pass in CI, so that no
 /// installer replaces a working network with an incomplete node.
+/// `restore-host` puts back host changes a node that died left; the
+/// uninstallers run it.
 ///
 /// `enroll`, `device`, `device-status` and `subnet-request` (the device
 /// without the Agent, `docs/deploy/mesh-device.md`) run the managed mesh,
@@ -72,6 +74,7 @@ pub const COMMANDS: &[&str] = &[
     "capabilities",
     "detect",
     "import",
+    "restore-host",
     "rollback",
     "takeover",
     "version",
@@ -85,6 +88,7 @@ pub const COMMANDS: &[&str] = &[
     "device-status",
     "enroll",
     "import",
+    "restore-host",
     "rollback",
     "subnet-request",
     "takeover",

@@ -71,6 +71,11 @@ stop_ours() {
 if [ "$uninstall" -eq 1 ]; then
   stop_ours
   rm -f "$PLIST"
+  # Put back the forwarding and pf rules a node that died left.
+  if [ -x "$BIN" ]; then
+    "$BIN" restore-host >/dev/null \
+      || log "warning: host changes could not be restored; run '$BIN restore-host' as root"
+  fi
   if [ -x "$BIN" ] && [ -f "$STATE/takeover/takeover.json" ]; then
     log "restoring the programs that were taken over"
     "$BIN" rollback --state-dir "$STATE/takeover" --report "$STATE/rollback-report.json" >/dev/null \

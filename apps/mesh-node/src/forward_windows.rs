@@ -25,6 +25,8 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use outbound_mesh::IpNet;
 use platform_windows::mesh_host::{self, FirewallGuard, ForwardingGuard, NatGuard};
@@ -62,24 +64,22 @@ impl HostChanges {
         Ok(())
     }
 
-    /// Switches forwarding on for `adapter` and the interfaces that carry
-    /// the `advertised` subnets (IPv6 too when `ipv6`), then translates the
-    /// IPv4 virtual subnet (`virtual_v4`, the node's address and prefix).
-    /// `interfaces` are the machine's (alias, address network) pairs.
-    /// Returns warnings: subnets no interface is on, other interfaces that
-    /// forward, and a translation WinNAT refused.
+    /// Switches forwarding on for `adapter` and the interfaces in `lan`
+    /// (alias, advertised subnet it carries; IPv6 too when `ipv6`), then
+    /// translates the IPv4 virtual subnet (`virtual_v4`, the node's address
+    /// and prefix). Returns warnings: other interfaces that forward, and a
+    /// translation WinNAT refused.
     pub fn forward(
         &mut self,
         network: &str,
         adapter: &str,
-        interfaces: &[(String, IpNet)],
-        advertised: &[IpNet],
+        lan: &[(String, IpNet)],
         virtual_v4: Option<(Ipv4Addr, u8)>,
         ipv6: bool,
     ) -> io::Result<Vec<String>> {
-        let lan = crate::host_routes::lan_interfaces(interfaces, advertised, adapter);
-        let mut warnings = missing_interfaces(&lan, advertised);
-        let mut aliases: Vec<String> = lan.into_iter().map(|(alias, _)| alias).collect();
+        let mut warnings = Vec::new();
+        let mut aliases: Vec<String> = lan.iter().map(|(alias, _)| alias.clone()).collect();
+        aliases.sort();
         aliases.dedup();
         let forwarding = mesh_host::enable_mesh_forwarding(adapter, &aliases, ipv6)?;
         match forwarding.other_forwarding_interfaces() {
@@ -102,15 +102,58 @@ impl HostChanges {
         }
         Ok(warnings)
     }
+
+    /// Undoes everything now, in the order the fields drop, waiting for the
+    /// removals so that none is left running when the service reports that
+    /// it stopped (a removal still running could delete the rules of the
+    /// next start), including removals of guards dropped before. Returns
+    /// problems as warnings.
+    pub fn shutdown(mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(nat) = self.nat.take() {
+            if let Err(error) = nat.remove() {
+                warnings.push(error.to_string());
+            }
+        }
+        drop(self.forwarding.take());
+        if let Some(firewall) = self.firewall.take() {
+            if let Err(error) = firewall.remove() {
+                warnings.push(error.to_string());
+            }
+        }
+        // Guards dropped earlier (a start that failed half way) remove on
+        // threads of their own: wait for those too, but not forever.
+        if !finish_removals(REMOVAL_WAIT) {
+            warnings.push(format!(
+                "earlier firewall or translation removals still running after {} s; \
+                 the next start or restore-host puts back what they leave",
+                REMOVAL_WAIT.as_secs()
+            ));
+        }
+        warnings
+    }
 }
 
-/// One warning for each advertised subnet that no interface is on.
-fn missing_interfaces(lan: &[(String, IpNet)], advertised: &[IpNet]) -> Vec<String> {
-    advertised
-        .iter()
-        .filter(|subnet| !lan.iter().any(|(_, net)| net == *subnet))
-        .map(|subnet| format!("{subnet}: no interface of this machine is on it"))
-        .collect()
+/// How long shutdown waits for removals of guards dropped earlier.
+const REMOVAL_WAIT: Duration = Duration::from_secs(10);
+
+/// Waits up to `limit` for the removals of dropped guards. Returns whether
+/// they finished; if not, the waiting thread is left to finish them.
+fn finish_removals(limit: Duration) -> bool {
+    let (done, finished) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("mesh-removals-wait".into())
+        .spawn(move || {
+            mesh_host::finish_mesh_firewall_removals();
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(_) => finished.recv_timeout(limit).is_ok(),
+        Err(_) => {
+            mesh_host::finish_mesh_firewall_removals();
+            true
+        }
+    }
 }
 
 /// The IPv4 address and prefix of `address`, `None` for IPv6.
@@ -130,16 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn subnets_without_an_interface_are_reported() {
-        let lan = vec![("Ethernet".to_string(), net("192.168.1.0/24"))];
-        let warnings = missing_interfaces(&lan, &[net("192.168.1.0/24"), net("172.16.0.0/16")]);
-        assert_eq!(
-            warnings,
-            vec!["172.16.0.0/16: no interface of this machine is on it".to_string()]
-        );
-    }
-
-    #[test]
     fn only_ipv4_virtual_addresses_are_translated() {
         assert_eq!(
             ipv4(&net("10.144.0.5/24")),
@@ -153,5 +186,11 @@ mod tests {
         let host = HostChanges::default();
         assert!(!host.forwarding());
         drop(host);
+    }
+
+    #[test]
+    fn shutdown_with_nothing_pending_returns_at_once() {
+        assert!(finish_removals(Duration::from_secs(10)));
+        assert!(HostChanges::default().shutdown().is_empty());
     }
 }
