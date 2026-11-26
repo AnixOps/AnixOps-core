@@ -684,6 +684,7 @@ pub(crate) struct Updates {
 /// driver.
 /// With `host`, the network installs only routes no other network of the
 /// process holds, under the given owner name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_with(
     settings: MeshSettings,
     static_key: KeyPair,
