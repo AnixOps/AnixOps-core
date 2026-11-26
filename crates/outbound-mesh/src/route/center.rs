@@ -173,6 +173,7 @@ pub fn centre(candidates: impl IntoIterator<Item = u32>) -> Option<u32> {
 #[derive(Default)]
 pub struct CentreServer {
     entries: BTreeMap<u32, (PeerMap, Instant)>,
+    cached_digest: std::sync::Mutex<Option<u64>>,
 }
 
 impl CentreServer {
@@ -189,17 +190,35 @@ impl CentreServer {
         }
         let peers = report.peers.into_iter().take(MAX_REPORTED_PEERS).collect();
         self.entries.insert(report.my_peer_id, (peers, now));
+        *self
+            .cached_digest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         true
     }
 
     /// Drops nodes not heard from for [`ENTRY_TTL`].
     pub fn expire(&mut self, now: Instant) {
+        let before = self.entries.len();
         self.entries
             .retain(|_, (_, at)| now.saturating_duration_since(*at) < ENTRY_TTL);
+        if self.entries.len() != before {
+            *self
+                .cached_digest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     /// Our own digest of the map; callers treat it as opaque.
     pub fn digest(&self) -> u64 {
+        if let Some(d) = *self
+            .cached_digest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return d;
+        }
         let mut bytes = Vec::new();
         for (&peer, (map, _)) in &self.entries {
             bytes.extend_from_slice(&peer.to_le_bytes());
@@ -207,7 +226,12 @@ impl CentreServer {
             bytes.push(0xff);
         }
         // Zero means "nothing yet" to callers, so never hand it out.
-        siphash13(&bytes).max(1)
+        let d = siphash13(&bytes).max(1);
+        *self
+            .cached_digest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(d);
+        d
     }
 
     /// Answers `GetGlobalPeerMap`.

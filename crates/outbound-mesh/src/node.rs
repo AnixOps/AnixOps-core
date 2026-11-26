@@ -330,6 +330,14 @@ pub struct Node {
     withdrawn: bool,
     /// Custom paths and the capability cache (spec §17.2).
     paths: PathRuntime,
+    /// Cached shortest-path routing tables (invalidated on topology/peer_map changes).
+    route_cache: std::sync::Mutex<RouteCache>,
+}
+
+#[derive(Default)]
+struct RouteCache {
+    hops: Option<BTreeMap<u32, Route>>,
+    latency: Option<BTreeMap<u32, Route>>,
 }
 
 /// Routes from any node of the topology, with the latencies the centre
@@ -653,6 +661,7 @@ impl Node {
             neighbours_since: None,
             withdrawn: false,
             paths,
+            route_cache: std::sync::Mutex::new(RouteCache::default()),
             settings,
         })
     }
@@ -1228,8 +1237,36 @@ impl Node {
             .collect()
     }
 
+    fn invalidate_routes(&self) {
+        let mut cache = self.route_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.hops = None;
+        cache.latency = None;
+    }
+
     fn compute_routes(&self, metric: Metric) -> BTreeMap<u32, Route> {
-        routes_from(&self.sync, &self.peer_map, self.local.id, metric)
+        let mut cache = self.route_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match metric {
+            Metric::Hops => &mut cache.hops,
+            Metric::Latency => &mut cache.latency,
+        };
+        if let Some(cached) = slot {
+            return cached.clone();
+        }
+        let computed = routes_from(&self.sync, &self.peer_map, self.local.id, metric);
+        *slot = Some(computed.clone());
+        computed
+    }
+
+    fn cached_next_hop(&self, metric: Metric, to: u32) -> Option<u32> {
+        let mut cache = self.route_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match metric {
+            Metric::Hops => &mut cache.hops,
+            Metric::Latency => &mut cache.latency,
+        };
+        let routes = slot.get_or_insert_with(|| {
+            routes_from(&self.sync, &self.peer_map, self.local.id, metric)
+        });
+        routes.get(&to).map(|r| r.next_hop)
     }
 
     fn with_handshake<T>(
@@ -1383,6 +1420,7 @@ impl Node {
             self.close(conn, CloseReason::Unexpected, now);
             return;
         }
+        self.invalidate_routes();
         self.refresh_routes();
     }
 
@@ -1534,7 +1572,7 @@ impl Node {
             } else {
                 Metric::Hops
             };
-            self.compute_routes(metric).get(&to)?.next_hop
+            self.cached_next_hop(metric, to)?
         };
         self.conns
             .iter()
@@ -2219,6 +2257,7 @@ impl Node {
                 {
                     self.id_conflict(rng, now);
                 }
+                self.invalidate_routes();
             }
             CallKind::ReportPeers => {}
             CallKind::GetPeerMap => {
@@ -2226,6 +2265,7 @@ impl Node {
                     // An empty answer without a digest: nothing changed.
                     if map.digest.is_some() {
                         self.peer_map = map;
+                        self.invalidate_routes();
                     }
                 }
             }
@@ -2253,6 +2293,7 @@ impl Node {
     }
 
     fn refresh_routes_now(&mut self) {
+        self.invalidate_routes();
         let reachable = self.compute_routes(Metric::Hops);
         let mut known = Vec::new();
         for info in self.sync.infos() {
@@ -2619,7 +2660,7 @@ impl Node {
     fn centre_round(&mut self, now: Instant) {
         self.centre.expire(now);
         let reachable = self.compute_routes(Metric::Hops);
-        let candidates = reachable
+        let all_candidates: Vec<u32> = reachable
             .keys()
             .copied()
             .filter(|peer| {
@@ -2627,8 +2668,26 @@ impl Node {
                     .info(*peer)
                     .is_none_or(|info| !info.features.is_public_server)
             })
-            .chain(std::iter::once(self.local.id));
-        let Some(centre) = center::centre(candidates) else {
+            .chain(std::iter::once(self.local.id))
+            .collect();
+        let full_candidates: Vec<u32> = all_candidates
+            .iter()
+            .copied()
+            .filter(|&peer| {
+                if peer == self.local.id {
+                    self.settings.role != Role::Access
+                } else {
+                    self.sync
+                        .info(peer)
+                        .is_some_and(|info| !info.features.avoid_relay_data)
+                }
+            })
+            .collect();
+        let Some(centre) = center::centre(if full_candidates.is_empty() {
+            all_candidates
+        } else {
+            full_candidates
+        }) else {
             return;
         };
         let mut peers = PeerMap::new();
@@ -2652,6 +2711,7 @@ impl Node {
         if self.last_fetch.is_some_and(|(_, from)| from != centre) {
             // Another centre's digest means nothing to this one.
             self.peer_map = GlobalPeerMap::default();
+            self.invalidate_routes();
         }
         if report_due {
             self.last_report = Some((now, centre, report.peers.clone()));
@@ -2666,6 +2726,7 @@ impl Node {
                 let map = self.centre.get(known);
                 if map.digest.is_some() {
                     self.peer_map = map;
+                    self.invalidate_routes();
                 }
             }
             return;
