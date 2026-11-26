@@ -8,22 +8,35 @@
 //! `PUT` takes `{"networks": [MeshConfig + "tag"]}`: each item is the
 //! network's `config_version` 1 config (`docs/architecture/mesh-module.md`)
 //! with a `tag` of `mesh-<region code>` beside it. The list replaces the
-//! running networks as a whole; `{"networks": []}` stops them all. One
-//! invalid item refuses the whole body with 400 and nothing changes. The
-//! network secret never appears in an answer: refusals name the item and
-//! the rule, not the values.
+//! running networks as a whole; `{"networks": []}` stops them all. A border
+//! node's body also carries a top-level `backbone` section
+//! (`docs/protocols/intranet-mesh-appendix.md` B) whose `region` names one
+//! of the networks by its tag `mesh-<region>`; without it the backbone
+//! stops. One invalid item refuses the whole body with 400 and nothing
+//! changes. Neither the network secret nor a backbone link parameter ever
+//! appears in an answer: refusals name the item or field and the rule, not
+//! the values.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use outbound_mesh::backbone::BackboneConfig;
 use outbound_mesh::status::{
-    valid_tag, ApplyError, ManagedNetwork, ManagedStatus, MeshControl, MAX_MANAGED_NETWORKS,
+    valid_tag, ApplyError, ManagedBackbone, ManagedNetwork, ManagedStatus, MeshControl,
+    MAX_MANAGED_NETWORKS, TAG_PREFIX,
 };
 use outbound_mesh::MeshConfig;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::NodeError;
+
+/// The feature a mesh lists when it takes a `backbone` section.
+pub const BACKBONE_FEATURE: &str = "mesh_backbone";
+
+/// The refusal of a `backbone` section on a mesh that does not list
+/// [`BACKBONE_FEATURE`].
+pub const BACKBONE_DISABLED: &str = "backbone_disabled";
 
 /// The installed mesh, with the lock that keeps `PUT`s one at a time.
 pub(crate) struct Mesh {
@@ -49,10 +62,17 @@ impl Mesh {
 
     /// Parses, validates and applies a `PUT /v1/mesh` body.
     pub(crate) async fn apply(&self, body: &[u8]) -> Result<ManagedStatus, NodeError> {
-        let networks = parse(body).map_err(NodeError::Mesh)?;
+        let request = parse(body).map_err(NodeError::Mesh)?;
+        // A node that does not list the backbone never becomes a border
+        // node: the whole body is refused and nothing changes.
+        if request.backbone.is_some() && !self.features().contains(&BACKBONE_FEATURE) {
+            return Err(NodeError::Mesh(format!(
+                "{BACKBONE_DISABLED}: backbone: this node does not run a backbone ({BACKBONE_FEATURE} is not listed)"
+            )));
+        }
         let _one_at_a_time = self.apply.lock().await;
         self.control
-            .apply(networks)
+            .apply(request.networks, request.backbone)
             .await
             .map_err(|error| match error {
                 ApplyError::Invalid(message) => NodeError::Mesh(message),
@@ -65,11 +85,21 @@ impl Mesh {
 #[serde(deny_unknown_fields)]
 struct PutBody {
     networks: Vec<Map<String, Value>>,
+    #[serde(default)]
+    backbone: Option<Value>,
+}
+
+/// A validated `PUT /v1/mesh` body.
+pub struct MeshRequest {
+    pub networks: Vec<ManagedNetwork>,
+    /// The border node's backbone; `None` when the body has none.
+    pub backbone: Option<ManagedBackbone>,
 }
 
 /// Validates a `PUT /v1/mesh` body: every item, unique tags and unique
-/// network names. Error messages carry no values from the body.
-pub fn parse(body: &[u8]) -> Result<Vec<ManagedNetwork>, String> {
+/// network names, and the `backbone` section with its region network.
+/// Error messages carry no values from the body.
+pub fn parse(body: &[u8]) -> Result<MeshRequest, String> {
     let body: PutBody = serde_json::from_slice(body)
         .map_err(|error| format!("invalid request body: {}", describe(&error)))?;
     if body.networks.len() > MAX_MANAGED_NETWORKS {
@@ -104,7 +134,28 @@ pub fn parse(body: &[u8]) -> Result<Vec<ManagedNetwork>, String> {
         }
         networks.push(ManagedNetwork { tag, settings });
     }
-    Ok(networks)
+    let backbone = match body.backbone {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_backbone(value, &tags)?),
+    };
+    Ok(MeshRequest { networks, backbone })
+}
+
+/// The `backbone` section: its own rules (appendix B) and a network tagged
+/// `mesh-<region>` in the same body.
+fn parse_backbone(value: Value, tags: &BTreeSet<String>) -> Result<ManagedBackbone, String> {
+    let config: BackboneConfig =
+        serde_json::from_value(value).map_err(|error| format!("backbone: {}", describe(&error)))?;
+    let settings = config.validate().map_err(|error| error.to_string())?;
+    if !tags.contains(&format!("{TAG_PREFIX}{}", settings.region)) {
+        return Err(
+            "backbone.region: networks must hold the region network, tagged mesh-<region>".into(),
+        );
+    }
+    Ok(ManagedBackbone {
+        links: config.links(),
+        settings,
+    })
 }
 
 /// A JSON error without the offending value: a mistyped secret must not be
@@ -149,6 +200,22 @@ mod tests {
 
     fn put(networks: Vec<Value>) -> Result<Vec<ManagedNetwork>, String> {
         parse(&serde_json::to_vec(&json!({ "networks": networks })).unwrap())
+            .map(|request| request.networks)
+    }
+
+    fn backbone() -> Value {
+        json!({
+            "id": 11,
+            "region": "eu",
+            "members": [
+                { "id": 11, "region": "eu", "link": { "kind": "k" } },
+                { "id": 21, "region": "ap", "link": { "kind": "k", "params": { "key": SECRET } } }
+            ]
+        })
+    }
+
+    fn put_with(networks: Vec<Value>, backbone: Value) -> Result<MeshRequest, String> {
+        parse(&serde_json::to_vec(&json!({ "networks": networks, "backbone": backbone })).unwrap())
     }
 
     /// The refusal of a body that must be refused. (`ManagedNetwork` has
@@ -263,5 +330,47 @@ mod tests {
         let mut tag_as_secret = network("mesh-cn", "a");
         tag_as_secret["tag"] = json!(SECRET);
         assert!(!refused(vec![tag_as_secret]).contains(SECRET));
+    }
+
+    #[test]
+    fn takes_a_backbone_with_its_region_network() {
+        let request = put_with(vec![network("mesh-eu", "eu")], backbone()).unwrap();
+        let backbone = request.backbone.expect("backbone");
+        assert_eq!(backbone.settings.id, 11);
+        assert_eq!(backbone.links[1].0, 21);
+        assert_eq!(backbone.links[1].1.params["key"], SECRET);
+        assert!(put_with(vec![network("mesh-eu", "eu")], Value::Null)
+            .unwrap()
+            .backbone
+            .is_none());
+        assert!(put(vec![network("mesh-eu", "eu")]).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_backbone_without_its_region_network_or_with_bad_fields() {
+        let error = match put_with(vec![network("mesh-ap", "ap")], backbone()) {
+            Ok(_) => panic!("accepted"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("backbone.region"), "{error}");
+
+        let mut extra = backbone();
+        extra["members"][1]["link"]["secret"] = json!(SECRET);
+        let mut wrong_type = backbone();
+        wrong_type["members"][1]["link"]["kind"] = json!([SECRET]);
+        let mut bad_region = backbone();
+        bad_region["region"] = json!("EU");
+        for (body, path) in [
+            (extra, "backbone"),
+            (wrong_type, "backbone"),
+            (bad_region, "backbone.region"),
+        ] {
+            let error = match put_with(vec![network("mesh-eu", "eu")], body) {
+                Ok(_) => panic!("accepted"),
+                Err(error) => error,
+            };
+            assert!(error.starts_with(path), "{error}");
+            assert!(!error.contains(SECRET), "{error}");
+        }
     }
 }

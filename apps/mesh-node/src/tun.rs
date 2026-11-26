@@ -304,6 +304,14 @@ fn prefix_of(mask: &[u8]) -> u8 {
 /// The networks of every interface but loopback and those `skip` names (our
 /// own mesh interfaces), for the overlap rule of spec §15.4.
 pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8)>> {
+    Ok(local_interfaces(skip)?
+        .into_iter()
+        .map(|(_, address, prefix)| (address, prefix))
+        .collect())
+}
+
+/// Like [`local_networks`], with the name of each interface.
+pub fn local_interfaces(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(String, IpAddr, u8)>> {
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` fills `head` with a list freed below.
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
@@ -349,7 +357,9 @@ pub fn local_networks(skip: impl Fn(&str) -> bool) -> io::Result<Vec<(IpAddr, u8
                 _ => None,
             }
         };
-        networks.extend(network);
+        networks.extend(
+            network.map(|(address, prefix)| (name.to_string_lossy().into_owned(), address, prefix)),
+        );
     }
     // SAFETY: `head` came from `getifaddrs` and is freed once.
     unsafe { libc::freeifaddrs(head) };

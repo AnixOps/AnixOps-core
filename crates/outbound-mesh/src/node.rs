@@ -133,6 +133,9 @@ pub enum Action {
     Send { conn: ConnId, packet: Vec<u8> },
     /// Write an IP packet to the virtual interface.
     Deliver(Vec<u8>),
+    /// Hand an IP packet for another region to the backbone (border nodes,
+    /// [`Node::set_border`]).
+    ToBackbone(Vec<u8>),
     /// Close a connection.
     Close { conn: ConnId, reason: CloseReason },
 }
@@ -451,7 +454,12 @@ macro_rules! facts {
     };
 }
 
-fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) -> RoutePeerInfo {
+fn own_info(
+    settings: &MeshSettings,
+    identity: &Identity,
+    static_key: &KeyPair,
+    border: &[IpNet],
+) -> RoutePeerInfo {
     let ipv4 = match settings.address.address() {
         IpAddr::V4(v4) => Some(v4),
         IpAddr::V6(_) => None,
@@ -461,15 +469,7 @@ fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) 
         IpAddr::V4(_) => None,
     });
     let relays = settings.role == Role::Full && settings.relay;
-    let advertise = if settings.role == Role::Full {
-        settings
-            .advertise_subnets
-            .iter()
-            .map(|net| net.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let advertise = advertised(settings, border);
     RoutePeerInfo {
         peer_id: identity.peer_id,
         inst_id: identity.inst_id,
@@ -491,6 +491,21 @@ fn own_info(settings: &MeshSettings, identity: &Identity, static_key: &KeyPair) 
         },
         ..RoutePeerInfo::default()
     }
+}
+
+/// The subnets a node advertises in its route information: a full node's
+/// `subnets.advertise` and, on a border node, the other regions' summary
+/// prefixes it carries; nothing for an access node.
+fn advertised(settings: &MeshSettings, border: &[IpNet]) -> Vec<String> {
+    if settings.role != Role::Full {
+        return Vec::new();
+    }
+    settings
+        .advertise_subnets
+        .iter()
+        .chain(border)
+        .map(|net| net.to_string())
+        .collect()
 }
 
 /// The static keys a managed network admits (spec §8.3.1); `None` for a
@@ -537,7 +552,7 @@ impl Node {
             }
             SecurityMode::ForwardSecrecy => None,
         };
-        let info = own_info(&settings, &identity, &static_key);
+        let info = own_info(&settings, &identity, &static_key, &[]);
         let local = Local {
             id: identity.peer_id,
             static_key,
@@ -727,6 +742,42 @@ impl Node {
         self.refresh_routes();
     }
 
+    /// The other regions' summary prefixes this border node carries (spec
+    /// §15.6 item 3; empty withdraws them): advertised to the members in
+    /// this node's route information, packets to them come out as
+    /// [`Action::ToBackbone`]. A full node only; on an access node nothing
+    /// is carried. Returns how many prefixes did not fit
+    /// ([`RouteTable::set_border`]).
+    pub fn set_border(&mut self, prefixes: &[IpNet], now: Instant) -> usize {
+        let prefixes: &[IpNet] = if self.settings.role == Role::Full {
+            prefixes
+        } else {
+            &[]
+        };
+        let left_out = self.routes.set_border(prefixes);
+        let mut info = self.sync.own().clone();
+        info.proxy_cidrs = advertised(&self.settings, self.routes.border());
+        self.sync.set_own(info, now);
+        left_out
+    }
+
+    /// An IP packet the backbone delivered for this network
+    /// ([`RouteTable::classify_from_backbone`]).
+    pub fn send_from_backbone(&mut self, packet: &[u8], now: Instant) -> Result<(), Denied> {
+        let peer = match self.routes.classify_from_backbone(packet) {
+            Ok(peer) => peer,
+            Err(denied) => {
+                self.counters.refused_outgoing += 1;
+                return Err(denied);
+            }
+        };
+        if self.send_data(peer.0, packet, now) {
+            Ok(())
+        } else {
+            Err(Denied::NoRoute)
+        }
+    }
+
     /// The networks of this machine's other interfaces (spec §15.4).
     pub fn set_local_networks(&mut self, interfaces: &[IpNet]) {
         self.local_networks = interfaces.to_vec();
@@ -907,7 +958,12 @@ impl Node {
             self.local.node_name = format!("node-{}", identity.peer_id);
         }
         self.sync = RouteSync::new(
-            own_info(&self.settings, &identity, &self.local.static_key),
+            own_info(
+                &self.settings,
+                &identity,
+                &self.local.static_key,
+                self.routes.border(),
+            ),
             now,
         );
         self.sync.set_admitted(admitted_keys(&self.settings));
@@ -1186,7 +1242,11 @@ impl Node {
             packet_type::DATA => match self.routes.check_incoming(PeerId(from), &inbound.payload) {
                 Ok(()) => {
                     let delivered = self.clamp_inbound(from, inbound.payload);
-                    self.actions.push_back(Action::Deliver(delivered));
+                    if self.routes.for_backbone(&delivered) {
+                        self.actions.push_back(Action::ToBackbone(delivered));
+                    } else {
+                        self.actions.push_back(Action::Deliver(delivered));
+                    }
                 }
                 Err(_) => self.counters.refused_incoming += 1,
             },
@@ -2459,6 +2519,7 @@ mod tests {
         /// (node index, conn) -> (node index, conn)
         wires: BTreeMap<(usize, ConnId), (usize, ConnId)>,
         delivered: Vec<(usize, Vec<u8>)>,
+        to_backbone: Vec<(usize, Vec<u8>)>,
         now: Instant,
         /// A node that silently drops type-40 packets addressed to it, as
         /// an implementation without custom paths does.
@@ -2501,6 +2562,7 @@ mod tests {
                 nodes,
                 wires: BTreeMap::new(),
                 delivered: Vec::new(),
+                to_backbone: Vec::new(),
                 now,
                 drops_type_40: None,
             }
@@ -2537,6 +2599,7 @@ mod tests {
                                 }
                             }
                             Action::Deliver(packet) => self.delivered.push((i, packet)),
+                            Action::ToBackbone(packet) => self.to_backbone.push((i, packet)),
                             Action::Close { .. } => {}
                         }
                     }
@@ -2848,6 +2911,52 @@ mod tests {
         assert_eq!(status[0].state, "fallback");
         assert_eq!(status[0].reason, Some(crate::waypoint::Reason::NotRelay));
         assert_eq!(status[0].unreachable, Some(IpAddr::from([10, 144, 0, 4])));
+    }
+
+    #[test]
+    fn a_border_node_carries_other_regions_both_ways() {
+        let mut net = three_in_a_row(false);
+        let version = net.nodes[2].sync.own().version;
+        let left_out = net.nodes[2].set_border(&[IpNet::parse("10.20.0.0/16").unwrap()], net.now);
+        assert_eq!(left_out, 0);
+        assert!(net.nodes[2].sync.own().version > version);
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        // The members learn the summary and route it to the border node.
+        assert_eq!(
+            net.nodes[0]
+                .route_table()
+                .lookup("10.20.1.1".parse().unwrap()),
+            Ok(PeerId(102))
+        );
+        let out = ipv4_packet([10, 144, 0, 1], [10, 20, 1, 1]);
+        net.nodes[0].send_ip(&out, net.now).unwrap();
+        net.settle();
+        assert_eq!(net.to_backbone, vec![(2, out)]);
+        assert!(net.delivered.is_empty());
+
+        // The reply from the backbone reaches the member.
+        let back = ipv4_packet([10, 20, 1, 1], [10, 144, 0, 1]);
+        net.nodes[2].send_from_backbone(&back, net.now).unwrap();
+        net.settle();
+        assert_eq!(net.delivered, vec![(0, back)]);
+        // Only sources the border node carries.
+        let spoofed = ipv4_packet([10, 30, 1, 1], [10, 144, 0, 1]);
+        assert_eq!(
+            net.nodes[2].send_from_backbone(&spoofed, net.now),
+            Err(Denied::ForeignSource)
+        );
+
+        // Withdrawn: the members forget the route.
+        net.nodes[2].set_border(&[], net.now);
+        for _ in 0..6 {
+            net.tick(Duration::from_secs(1));
+        }
+        assert!(net.nodes[0]
+            .route_table()
+            .lookup("10.20.1.1".parse().unwrap())
+            .is_err());
     }
 
     #[test]

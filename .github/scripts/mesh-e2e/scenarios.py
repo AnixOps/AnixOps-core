@@ -134,8 +134,9 @@ def e06_subnet(lab):
     _, wg = lab.attach(g, "wan1", 1)
     lab.attach(b, "wan1", 2)
     host = lab.lan(g, h, LAN)
-    # Linux host forwarding is not done by the node yet (mesh-module.md:
-    # Linux prints "off"); the testbed switches it on in the gateway's
+    # Linux host forwarding is not switched on by the node yet: the node
+    # advertises a subnet only when the host forwards its family
+    # (mesh-module.md), so the testbed switches it on in the gateway's
     # namespace. Everything else is the mesh's own doing.
     g.sysctl("net.ipv4.ip_forward", 1)
     members = ["G", "B"]

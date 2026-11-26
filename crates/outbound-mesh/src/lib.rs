@@ -6,6 +6,8 @@
 //! `docs/architecture/mesh-module.md` for the design and its boundaries.
 //!
 //! - [`config`]: the `"type": "mesh"` settings and their validation.
+//! - [`backbone`]: the inter-region backbone of border nodes (spec §17.3),
+//!   without I/O.
 //! - [`net`]: IPv4/IPv6 networks.
 //! - [`scope`]: what counts as intranet. The module never carries traffic to
 //!   the public Internet and never acts as an exit.
@@ -37,6 +39,7 @@
 //!   management API (`/v1/mesh`), and the trait that API drives the mesh
 //!   through.
 
+pub mod backbone;
 pub mod bridge;
 pub mod config;
 pub mod dns;
