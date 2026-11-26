@@ -13,9 +13,13 @@
 //!   carries `node.private_key`. Keys stay when a network leaves the list,
 //!   so that taking it back keeps the key the panel already lists.
 //!
+//! - `region-probe.json` and `keys/region-probe`: the region measurement
+//!   history and the probe responder's key ([`crate::region_probe`]).
+//!
 //! A border node's request also carries a `backbone` section; its backbone
 //! runs beside the networks and meets its region network through that
-//! network's hub ([`crate::border`]).
+//! network's hub ([`crate::border`]). The top-level `region` object starts
+//! the region measurement and, on border nodes, the probe responder.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -40,8 +44,10 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::border::{BorderInstance, Hub, RegionView};
+use crate::region_probe::RegionRuntime;
 use crate::serve::{self, Failure};
 use crate::tun::{self, Tun};
+use outbound_mesh::region::directory::RegionSection;
 
 /// Features this implementation adds to `GET /v1/status`. `mesh_native_keys`
 /// is listed because `network.kind` and `native_keys` are handled as spec
@@ -49,7 +55,14 @@ use crate::tun::{self, Tun};
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
 /// `mesh_backbone`: `PUT /v1/mesh` takes the top-level `backbone` section
 /// and `GET /v1/mesh` gives its status (spec §17.3, appendix B and C).
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_backbone"];
+/// `mesh_region_probe`: `PUT /v1/mesh` takes the top-level `region` object
+/// and `GET /v1/mesh` gives `region_probe` (appendix D.9).
+pub const FEATURES: &[&str] = &[
+    "mesh",
+    "mesh_native_keys",
+    "mesh_backbone",
+    "mesh_region_probe",
+];
 
 /// Interface names: `anixmesh-<n>`, the lowest number free.
 const INTERFACE_PREFIX: &str = "anixmesh-";
@@ -69,6 +82,7 @@ struct Inner {
     /// One per network of the last request, by tag.
     hubs: Mutex<BTreeMap<String, Arc<Hub>>>,
     backbone: Mutex<Option<BorderInstance>>,
+    region: Mutex<RegionRuntime>,
 }
 
 struct Instance {
@@ -110,6 +124,7 @@ impl ManagedMesh {
         let instance_id = instance_id(&dir.join("instance_id"))?;
         Ok(Self {
             inner: Arc::new(Inner {
+                region: Mutex::new(RegionRuntime::new(&dir)),
                 dir,
                 instance_id,
                 networks: Mutex::new(Vec::new()),
@@ -301,6 +316,7 @@ impl Inner {
                 })
                 .collect(),
             backbone: lock(&self.backbone).as_ref().map(BorderInstance::status),
+            region_probe: lock(&self.region).status(),
         }
     }
 }
@@ -327,6 +343,11 @@ impl MeshControl for ManagedMesh {
                 .await
                 .map_err(|error| ApplyError::Failed(format!("mesh apply: {error}")))
         })
+    }
+
+    fn set_region(&self, region: Option<RegionSection>) -> BoxFuture<'_, ()> {
+        lock(&self.inner.region).set(region);
+        Box::pin(async {})
     }
 }
 

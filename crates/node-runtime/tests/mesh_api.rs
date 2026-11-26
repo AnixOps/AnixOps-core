@@ -63,6 +63,7 @@ impl MeshControl for FakeMesh {
                 networks: networks.iter().map(network_status).collect(),
                 static_keys: Vec::new(),
                 backbone: None,
+                region_probe: None,
             };
             *self.running.lock().unwrap() = status.clone();
             Ok(status)
@@ -328,4 +329,19 @@ async fn a_border_node_takes_its_backbone_with_the_region_network() {
     let (status, _, _) = call(api, "PUT", "/v1/mesh", Some(body)).await;
     assert_eq!(status, 200);
     assert_eq!(*mesh.backbones.lock().unwrap(), [Some(11), None]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_object_needs_the_region_probe_feature() {
+    let mesh = Arc::new(FakeMesh::default());
+    let api = start_api(Some(mesh.clone())).await;
+    let body = json!({
+        "networks": [network("mesh-cn", "mesh-cn", "10.150.0.5/16")],
+        "region": { "current": "cn", "basis": "admin", "directory": null }
+    });
+    let (status, raw, answer) = call(api, "PUT", "/v1/mesh", Some(body)).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer["error"].as_str().unwrap().starts_with("region"));
+    assert!(!raw.contains(SECRET), "{raw}");
+    assert!(mesh.applied.lock().unwrap().is_empty());
 }
