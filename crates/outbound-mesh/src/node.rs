@@ -1482,7 +1482,18 @@ impl Node {
     /// A broadcast or multicast goes to every direct neighbour, addressed
     /// to each of them, and is not relayed further (spec §15.3).
     pub fn send_ip(&mut self, packet: &[u8], now: Instant) -> Result<(), Denied> {
-        let outgoing = match self.routes.classify_outgoing(packet) {
+        // Among several advertisers of a subnet the nearest is used, by the
+        // network's path policy (spec §15.2, requirement R7); unreachable
+        // ones are skipped. The paths are only worked out when a subnet
+        // destination needs them.
+        let paths = std::cell::OnceCell::new();
+        let hops = |peer: PeerId| {
+            paths
+                .get_or_init(|| self.compute_routes(self.policy_metric()))
+                .get(&peer.0)
+                .map(|route: &Route| route.hops)
+        };
+        let outgoing = match self.routes.classify_outgoing_by(packet, hops) {
             Ok(outgoing) => outgoing,
             Err(denied) => {
                 self.counters.refused_outgoing += 1;
