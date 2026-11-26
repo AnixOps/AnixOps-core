@@ -742,12 +742,12 @@ impl Node {
             return;
         };
         state.peer = Some(up.peer_id);
-        self.admitted_peer(up.peer_id);
         state.ping = Ping {
             interval: PING_START,
             next_at: Some(now + PING_START),
             ..Ping::default()
         };
+        self.admitted_peer(up.peer_id);
         if self.sync.neighbour_up(up.peer_id, rng, now).is_err() {
             self.close(conn, CloseReason::Unexpected, now);
             return;
