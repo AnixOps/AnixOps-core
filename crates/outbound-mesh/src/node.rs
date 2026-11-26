@@ -633,6 +633,16 @@ impl Node {
         self.local.id
     }
 
+    /// This node's own route information, as it advertises it.
+    pub fn own_info(&self) -> &RoutePeerInfo {
+        self.sync.own()
+    }
+
+    /// The route information a reachable member last advertised.
+    pub fn peer_info(&self, id: u32) -> Option<&RoutePeerInfo> {
+        self.sync.info(id)
+    }
+
     pub fn settings(&self) -> &MeshSettings {
         &self.settings
     }
