@@ -162,8 +162,8 @@ impl Registry {
         // the client changed it) stops, not run under a second identity,
         // and reports `instance_id_changed` until `mesh_save_network` gives
         // it the current ID or a profile names its ID again. A profile
-        // without an ID (only `legacy` networks) leaves every saved
-        // network as it is.
+        // without an ID leaves every saved network as it is, and a saved
+        // network without an ID is left as it is by every profile.
         if let Some(id) = profile_id {
             let Inner {
                 networks,
@@ -175,7 +175,12 @@ impl Registry {
                 if !network.saved || listed.contains(name) || !network.joined {
                     continue;
                 }
-                if network.settings.instance_id.as_deref() != Some(id.as_str()) {
+                // A network without an ID runs under none of the device's:
+                // it conflicts with no profile, as with `mesh_join`.
+                let Some(own) = network.settings.instance_id.as_deref() else {
+                    continue;
+                };
+                if own != id {
                     network.failure = Some(Failure::InstanceIdChanged);
                     if let Some(instance) = network.instance.take() {
                         instance.retire();
@@ -660,6 +665,19 @@ mod tests {
             registry.save(with_id("shed", "10.147.3.2/24", "device-2")),
             Err(RegistryError::InstanceIdMismatch)
         );
+    }
+
+    #[test]
+    fn a_saved_network_without_a_device_id_keeps_running_under_any_profile() {
+        let (_runtime, registry) = registry();
+        let home = settings("home", "10.147.1.2/24", "legacy");
+        registry.save(home.clone()).unwrap();
+        let running = found(&registry, &home);
+        registry.commit(vec![with_id("office", "10.146.0.2/24", "device-2")]);
+        assert!(!running.is_retired());
+        assert_eq!(state(&registry, "home").failure, None);
+        registry.commit(vec![with_id("office", "10.146.0.2/24", "device-3")]);
+        assert!(Arc::ptr_eq(&running, &found(&registry, &home)));
     }
 
     #[test]

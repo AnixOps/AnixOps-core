@@ -31,6 +31,7 @@
 
 ### Mesh
 
+- 嵌入式组网控制命令审计修复（第二步 2c-5，#417 审计）：提交带 `node.instance_id` 的 profile 不再停下没有 ID 的已保存网络（Q1）；mesh-status.md 与代码注释写明 `mesh_status` 默认网络的三档选择顺序，客户端以 `networks[]` 与显式 `network` 为准（Q2）；写明「无 ID 不冲突」只用于保存、加入与提交（Q3）。补测：失败网络排在运行中网络之前时仍选运行中的网络、无 ID 的已保存网络在任何 profile 下继续运行。
 - 嵌入式组网控制命令审计修复（第二步 2c-4，#416 审计）：不带 `network` 的 `mesh_status` 优先选运行中的网络，其次不是因 `instance_id_changed` 停下的已加入网络（P1）；没有 `node.instance_id` 的网络与任何网络都不冲突（P2）。mesh-status.md 补充密钥含 `"`、`\`、控制字符时的残留副本（P3）、辅助运行时可能以 `instance_id_changed` 停网（P4）、`failure` 优先级列入 `instance_id_changed`（P5），并注明 ID 比较按有无实例判断。
 - 嵌入式组网控制命令审计修复（第二步 2c-3，#414 审计）：`node.instance_id` 只与运行中的网络比较，已退出的不算（N1）；`mesh_join` 同样检查（N2）；profile 没有 `node.instance_id` 时不停已保存的网络（N3）；同一运行时再次启动隧道后可重新持有组网引擎（N4）；命令参数先校验再查找组网引擎，不合规的 `mesh_save_network` 不启动引擎、已停止的运行时同样返回 `invalid_argument`，命令名读取只保留一份（N5）。被 profile 停下的已保存网络不再标为用户退出，改为 `failure.code` `instance_id_changed`，以当前值重新保存或 profile 恢复原值后自动恢复。mesh-status.md 写明宿主 JSON 不得转义 `/`、辅助运行时不得在同一进程中启动（#410 L2）。补测：两个网络被停下、停下后直接加入、超限配置、先起新再停旧、空 profile 提交、停止后再启动（#410 L3）。
 - 嵌入式组网控制命令审计修复（第二步 2c-2，#413 审计）：profile 构建只检查自身各网络 `node.instance_id` 一致，提交后以 profile 为准，`node.instance_id` 不同的已保存网络退出（M1）；已停止的运行时不再因 `mesh_save_network`、`mesh_join` 重新持有组网引擎（M2）；新增错误码 `engine_unavailable`，持有的引擎已停止时重新启动一次，其余命令遇引擎已停止返回 `not_found`（L1）；请求直接解析到命令参数，`mesh_save_network` 的密钥与私钥不经中间 JSON 值、释放时清零，只接受 JSON 对象（L2）；mesh-status.md 写明扩展应拒绝 App 转来的带私钥配置（D1）。
