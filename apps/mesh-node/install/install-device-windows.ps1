@@ -229,7 +229,7 @@ try {
     }
     if (-not $answered) {
         Stop-Ours
-        Fail "the device did not start; see $State\device.log (the enrolment is kept; run again to retry)"
+        Fail "the device did not start or its status pipe is held by another program; see $State\device.log (the enrolment is kept; run again to retry)"
     }
     Say "installed and running"
 }

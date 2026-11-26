@@ -235,6 +235,6 @@ done
 if [ "$answered" -ne 1 ]; then
   stop_ours
   rm -f "$PLIST"
-  die "the device did not start; see $LOG (the enrolment is kept; run again to retry)"
+  die "the device did not start or its status socket could not be made; see $LOG (the enrolment is kept; run again to retry)"
 fi
 log "installed and running"
