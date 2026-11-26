@@ -96,7 +96,9 @@
 | `node.mtu` | 虚拟网卡 MTU，1280–9000，默认 1380 |
 | `node.relay` | 是否替其他节点中转；完整节点默认 `true`，接入节点固定 `false`（写 `true` 报错）。`false` 时仍可作为目的节点 |
 | `node.waypoint_relay` | 是否作为他人自定义路径的途经点（规范 §17.2.4）；默认 `false`，需要 `node.relay` 为 `true`（接入节点或 `relay: false` 时写 `true` 报错）。为 `false` 且本网络没有 `routing.paths` 时，本节点对 `MeshPathRpc` 回 Error 3、丢弃全部类型 40 包并计数，自定义路径的代码对远端不可达。自定义路径在内核 0.5 审计通过前保持此默认。旧版内核不认识该字段、会拒收配置，面板只对用作途经点的节点下发它 |
-| `node.private_key` | 可省略。本机在该网络的安全模式静态私钥，32 字节的标准 base64，由钥匙串注入，内核不输出、不写盘；`MeshSettings` 不实现 `Debug`，解码后的私钥在释放时清零。省略时由调用方保管（`anixops-mesh run` 用配置旁的 `<配置>.key`，首次运行生成，权限 0600） |
+| `node.private_key` | 可省略。本机在该网络的安全模式静态私钥，32 字节的标准 base64，由钥匙串注入，内核不输出、不写盘；`MeshSettings` 不实现 `Debug`，解码后的私钥在释放时清零。省略时由调用方保管（`anixops-mesh run` 用配置旁的 `<配置>.key`，首次运行生成，权限 0600）。有状态目录的内核（`anixcore`）省略时自行生成并保存在状态目录。**没有状态目录的嵌入式引擎**（iOS、Android、桌面客户端内置引擎）不保存任何密钥：客户端在第一次保存该网络时自己用系统安全随机数生成 32 字节私钥，存入系统钥匙串（iOS/macOS Keychain、Android Keystore 包装、Windows DPAPI），以后每次 `mesh_save_network` 与构建配置时注入；引擎由私钥推出公钥，在 `self.staticKey` 中给出，从不返回私钥。删除该网络时客户端删除这把私钥。嵌入式引擎收到 `network.kind = managed` 且没有 `node.private_key` 的配置时拒绝保存（`invalid_argument`，`detail` 为 `private_key_required`），不临时生成：临时密钥每次启动都变，面板登记的 `native_keys` 会失效；`legacy` 网络省略时临时生成 |
+| `node.instance_id` | 只用于没有状态目录的嵌入式引擎：本设备的设备实例 ID（规范 §1 的格式），由客户端第一次使用组网时生成（例如 UUID 文本）并与私钥一起保存，每个网络配置都带同一个值；同一引擎内各网络的值不同时拒绝（`invalid_argument`）。快照 `self.id` 取此值。有状态目录的内核忽略该字段，使用自己保存的 ID |
+| `network.member_ids`（内核 0.4，能力 `mesh_member_ids`） | 可省略。`[{ "static_key", "instance_id" }]`，最多 4096 项：面板汇总的我方节点静态公钥（编码同 `native_keys`）与其设备实例 ID 的对应，经 Agent 下发，用于快照 `members[].id`、`host_groups` 的网关与 `external_routes` 的 `bridge` 匹配成员。只按经握手认证的静态公钥匹配，路由信息中的自报公钥不算。`static_key` 重复时整份配置被拒 |
 | `peers` | 初始对端（最多 64 个），`transport` 为 `tcp`（默认）或 `udp`；只有监听的完整节点（中心节点）可以为空 |
 | `subnets.accept` | 进一步限制接受的通告子网，不能扩大内网范围 |
 | `subnets.advertise` | 本机通告的局域网子网，只有完整节点可以配置，必须在内网范围内且不与虚拟网段重叠 |
