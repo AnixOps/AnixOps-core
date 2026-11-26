@@ -1423,6 +1423,7 @@ mod tests {
         let (_shutdown_tx, shutdown) = watch::channel(false);
         let (_local, local_networks) = watch::channel(Some(Vec::new()));
         let (_keys, native_keys) = watch::channel(None);
+        let (_groups, host_groups) = watch::channel(Vec::new());
         let (_overrides, route_overrides) = watch::channel(Vec::new());
         let (_foreign, foreign_routes) = watch::channel(Vec::new());
         let task = tokio::spawn(run(
@@ -1435,6 +1436,7 @@ mod tests {
                 snapshots: snapshot_tx,
                 local_networks,
                 native_keys,
+                host_groups,
                 route_overrides,
                 foreign_routes,
                 shutdown,
