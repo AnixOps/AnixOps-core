@@ -14,8 +14,9 @@ use std::time::Duration;
 use outbound_mesh::config::encode_key;
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
-use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
+use outbound_mesh::{IpNet, MeshConfig, MeshSettings, Role};
 use ring::rand::SystemRandom;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
@@ -228,6 +229,7 @@ fn busy(what: &str, error: &io::Error) -> Failure {
             Failure::Busy(format!("{what}: {error}"))
         }
         // The kernel answers EBUSY for an interface another program holds.
+        #[cfg(unix)]
         _ if error.raw_os_error() == Some(libc::EBUSY) => Failure::Busy(format!("{what}: {error}")),
         _ => Failure::Other(format!("{what}: {error}")),
     }
@@ -271,6 +273,7 @@ pub fn key_path(config: &Path) -> std::path::PathBuf {
 /// missing file gets a new key, written readable by the owner only.
 pub fn static_key(path: &Path) -> Result<KeyPair, Failure> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
     match std::fs::read(path).map(Zeroizing::new) {
@@ -294,10 +297,14 @@ pub fn static_key(path: &Path) -> Result<KeyPair, Failure> {
     let temporary = path.with_file_name(name);
     let _ = std::fs::remove_file(&temporary);
     let failed = |error: io::Error| Failure::Other(format!("{}: {error}", path.display()));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Readable by the owner only. On Windows the file takes the access
+    // list of its directory, which the installer limits to SYSTEM and
+    // Administrators.
+    #[cfg(unix)]
+    options.mode(0o600);
+    let written = options
         .open(&temporary)
         .and_then(|mut file| {
             file.write_all(&key.private()[..])?;
@@ -355,6 +362,17 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             .map_err(|error| busy(&format!("interface {interface}"), &error))?;
         let stop = signals()?;
         let mut last = String::new();
+        let mut listen_ports: Vec<u16> = listeners
+            .local_addrs()
+            .map_err(|error| Failure::Other(format!("listen: {error}")))?
+            .iter()
+            .map(|(_, address)| address.port())
+            .collect();
+        listen_ports.sort_unstable();
+        listen_ports.dedup();
+        // Kept until the node stops; dropping it puts the host back.
+        let mut forwarding = start_forwarding(&settings, device.name(), &listen_ports, path);
+        let virtual_subnets = settings.virtual_subnets();
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
         let (_keep, native_keys) = watch::channel(None);
@@ -367,6 +385,13 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
             native_keys,
             None,
             |snapshot, name| {
+                if let Some(forwarding) = forwarding.as_mut() {
+                    let mut sources = virtual_subnets.clone();
+                    sources.extend(snapshot.system_routes.iter().copied());
+                    if let Err(error) = forwarding.set_sources(&sources) {
+                        warn("forwarding", &error.to_string());
+                    }
+                }
                 let line = status_line(snapshot, name);
                 if line != last {
                     println!("{line}");
@@ -378,7 +403,183 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
     })
 }
 
+/// The host side of carrying advertised subnets, held while the node runs.
+trait HostForwarder {
+    /// Replaces the mesh sources translated towards the advertised subnets.
+    fn set_sources(&mut self, sources: &[IpNet]) -> io::Result<()>;
+}
+
+#[cfg(target_os = "macos")]
+impl HostForwarder for crate::forward_macos::HostForwarding {
+    fn set_sources(&mut self, sources: &[IpNet]) -> io::Result<()> {
+        crate::forward_macos::HostForwarding::set_sources(self, sources)
+    }
+}
+
+/// Whether this node carries traffic to its advertised subnets: a full
+/// node with subnets to advertise (requirement R10).
+fn forwards(settings: &MeshSettings) -> bool {
+    settings.role == Role::Full && !settings.advertise_subnets.is_empty()
+}
+
+/// One line saying whether the host forwards for the advertised subnets
+/// (`ipForwarding` in the status: `on`, `off` or `not_needed`).
+fn forwarding_line(state: &str, detail: Option<&str>) {
+    println!(
+        "{}",
+        serde_json::json!({ "ip_forwarding": state, "detail": detail })
+    );
+}
+
+/// macOS: switches forwarding on and translates mesh traffic to the
+/// advertised subnets (`forward_macos`). A failure is reported and the node
+/// runs on without carrying them.
+#[cfg(target_os = "macos")]
+fn start_forwarding(
+    settings: &MeshSettings,
+    interface: &str,
+    _listen_ports: &[u16],
+    _config: &Path,
+) -> Option<Box<dyn HostForwarder>> {
+    if !forwards(settings) {
+        forwarding_line("not_needed", None);
+        return None;
+    }
+    let interfaces = match host_interfaces(interface) {
+        Ok(found) => found,
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            return None;
+        }
+    };
+    match crate::forward_macos::HostForwarding::start(
+        Path::new(crate::forward_macos::STATE_DIR),
+        &settings.network_name,
+        interface,
+        &interfaces,
+        &settings.advertise_subnets,
+        &settings.virtual_subnets(),
+        settings.address_v6.is_some(),
+    ) {
+        Ok((forwarding, warnings)) => {
+            for warning in warnings {
+                warn("forwarding", &warning);
+            }
+            forwarding_line("on", None);
+            Some(Box::new(forwarding))
+        }
+        Err(error) => {
+            forwarding_line("off", Some(&error.to_string()));
+            None
+        }
+    }
+}
+
+/// The machine's (interface name, address network) pairs, leaving out the
+/// mesh interface itself.
+#[cfg(any(target_os = "macos", windows))]
+fn host_interfaces(interface: &str) -> io::Result<Vec<(String, IpNet)>> {
+    Ok(tun::local_interfaces(|name| name == interface)?
+        .into_iter()
+        .filter_map(|(name, address, prefix)| Some((name, IpNet::new(address, prefix)?)))
+        .collect())
+}
+
+#[cfg(windows)]
+impl HostForwarder for crate::forward_windows::HostChanges {
+    /// WinNAT translates the IPv4 virtual subnet only; subnets routed in
+    /// from other nodes are not translated (see `forward_windows`).
+    fn set_sources(&mut self, _sources: &[IpNet]) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Windows: puts back what an earlier run left, allows inbound traffic to a
+/// listening full node, and for a full node with subnets to advertise
+/// switches forwarding on and translates the virtual subnet
+/// (`forward_windows`). One process per host makes these changes: when the
+/// client (or another node) holds them, this node says so and runs without
+/// them. Any other failure is reported and the node runs on.
+#[cfg(windows)]
+fn start_forwarding(
+    settings: &MeshSettings,
+    interface: &str,
+    listen_ports: &[u16],
+    _config: &Path,
+) -> Option<Box<dyn HostForwarder>> {
+    use platform_windows::mesh_host;
+
+    if let Err(error) = mesh_host::recover_mesh_host() {
+        let busy = error.kind() == io::ErrorKind::ResourceBusy;
+        let detail = if busy {
+            "another process holds the host changes".to_owned()
+        } else {
+            error.to_string()
+        };
+        warn("host_changes", &detail);
+        if forwards(settings) {
+            // Without recovery, originals recorded now could be values an
+            // earlier run set.
+            forwarding_line("off", Some(&detail));
+        } else {
+            forwarding_line("not_needed", None);
+        }
+        return None;
+    }
+    let mut host = crate::forward_windows::HostChanges::default();
+    if settings.role == Role::Full && !listen_ports.is_empty() {
+        if let Err(error) = host.allow_inbound(&settings.network_name, listen_ports, interface) {
+            warn("firewall", &error.to_string());
+        }
+    }
+    if !forwards(settings) {
+        forwarding_line("not_needed", None);
+    } else {
+        let started = host_interfaces(interface).and_then(|interfaces| {
+            host.forward(
+                &settings.network_name,
+                interface,
+                &interfaces,
+                &settings.advertise_subnets,
+                crate::forward_windows::ipv4(&settings.address),
+                settings.address_v6.is_some(),
+            )
+        });
+        match started {
+            Ok(warnings) => {
+                for warning in warnings {
+                    warn("forwarding", &warning);
+                }
+                forwarding_line("on", None);
+            }
+            Err(error) => forwarding_line("off", Some(&error.to_string())),
+        }
+    }
+    Some(Box::new(host))
+}
+
+/// Linux: the host side is not in place yet; the node says so instead of
+/// advertising subnets it cannot carry silently.
+#[cfg(target_os = "linux")]
+fn start_forwarding(
+    settings: &MeshSettings,
+    _interface: &str,
+    _listen_ports: &[u16],
+    _config: &Path,
+) -> Option<Box<dyn HostForwarder>> {
+    if forwards(settings) {
+        forwarding_line(
+            "off",
+            Some("host forwarding is not implemented on this system yet"),
+        );
+    } else {
+        forwarding_line("not_needed", None);
+    }
+    None
+}
+
 /// Resolves on SIGTERM or SIGINT.
+#[cfg(unix)]
 fn signals() -> Result<impl std::future::Future<Output = ()>, Failure> {
     let mut terminate =
         signal(SignalKind::terminate()).map_err(|error| Failure::Other(error.to_string()))?;
@@ -388,6 +589,17 @@ fn signals() -> Result<impl std::future::Future<Output = ()>, Failure> {
         tokio::select! {
             _ = terminate.recv() => {}
             _ = interrupt.recv() => {}
+        }
+    })
+}
+
+/// Resolves on Ctrl+C, or when the service manager stops the service.
+#[cfg(windows)]
+fn signals() -> Result<impl std::future::Future<Output = ()>, Failure> {
+    Ok(async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = crate::service_windows::stop_requested() => {}
         }
     })
 }
@@ -582,8 +794,11 @@ mod tests {
     fn a_port_in_use_is_busy() {
         let error = io::Error::from(io::ErrorKind::AddrInUse);
         assert_eq!(busy("listen", &error).exit_code(), 3);
-        let error = io::Error::from_raw_os_error(libc::EBUSY);
-        assert_eq!(busy("interface", &error).exit_code(), 3);
+        #[cfg(unix)]
+        {
+            let error = io::Error::from_raw_os_error(libc::EBUSY);
+            assert_eq!(busy("interface", &error).exit_code(), 3);
+        }
         let error = io::Error::from(io::ErrorKind::PermissionDenied);
         assert_eq!(busy("interface", &error).exit_code(), 1);
     }
@@ -625,12 +840,15 @@ mod tests {
         let first = static_key(&path).expect("new key");
         let second = static_key(&path).expect("same key");
         assert_eq!(first.public(), second.public());
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path)
-            .expect("key file")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("key file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::write(&path, b"short").expect("overwrite");
         assert_eq!(static_key(&path).err().map(|f| f.exit_code()), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
