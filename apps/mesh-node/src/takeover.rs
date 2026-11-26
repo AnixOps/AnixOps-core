@@ -497,6 +497,30 @@ fn plan(host: &dyn Host, found: &[Found]) -> (Vec<Planned>, Vec<String>) {
                     });
                 }
             }
+            Origin::Procd {
+                name,
+                script,
+                enabled,
+                running,
+                ..
+            } => {
+                backup(script, &mut backups);
+                // Turned off only if it was on, so rollback never enables
+                // a script that was off.
+                if *enabled {
+                    disables.push(Planned::ScriptDisable {
+                        name: name.clone(),
+                        script: script.clone(),
+                    });
+                }
+                if *running || !entry.processes.is_empty() {
+                    stops.push(Planned::ScriptStop {
+                        name: name.clone(),
+                        script: script.clone(),
+                        openrc: false,
+                    });
+                }
+            }
             Origin::Autostart { file, line } => {
                 backup(file, &mut backups);
                 disables.push(Planned::CommentLine {
@@ -1298,6 +1322,7 @@ pub fn takeover(
                 Origin::Systemd { .. }
                     | Origin::Openrc { .. }
                     | Origin::Sysv { .. }
+                    | Origin::Procd { .. }
                     | Origin::Launchd { .. }
                     | Origin::WinService { .. }
                     | Origin::WinTask { .. }
@@ -2945,6 +2970,113 @@ mod tests {
         assert!(rollback(&host, Path::new(STATE)).unwrap().ok);
         let ran = host.ran.borrow().clone();
         assert_eq!(ran, vec!["rc-update add demo-meshd default".to_string()]);
+    }
+
+    fn procd_host(enabled: bool, running: bool) -> FakeHost {
+        let host = FakeHost::default();
+        host.file(
+            "/etc/init.d/demo",
+            "#!/bin/sh /etc/rc.common\nUSE_PROCD=1\nPROG=/usr/bin/demo-meshd\nstart_service() {\n\tprocd_set_param command \"$PROG\" -c /etc/demo.conf\n}\n",
+        );
+        if enabled {
+            host.link("/etc/rc.d/S99demo", "../init.d/demo");
+        }
+        if running {
+            host.process(
+                321,
+                "/usr/bin/demo-meshd",
+                &["/usr/bin/demo-meshd", "-c", "/etc/demo.conf"],
+                &[],
+                "0::/\n",
+            );
+            host.answer(
+                "ubus call service list {\"name\":\"demo\"}",
+                0,
+                r#"{"demo":{"instances":{"instance1":{"running":true,"pid":321,"command":["/usr/bin/demo-meshd","-c","/etc/demo.conf"]}}}}"#,
+            );
+            // procd ends the instance when the script stops the service.
+            host.exits_on
+                .borrow_mut()
+                .insert("/etc/init.d/demo stop".into(), vec![321]);
+        } else {
+            host.answer("ubus call service list {\"name\":\"demo\"}", 0, "{}");
+        }
+        host
+    }
+
+    #[test]
+    fn procd_services_are_turned_off_only_if_on() {
+        // Enabled and running: turned off, stopped through procd, and the
+        // process is not killed separately.
+        let host = procd_host(true, true);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest.steps.iter().any(
+            |step| matches!(&step.action, Action::ScriptDisable { tool, .. } if tool == "procd")
+        ));
+        assert!(manifest
+            .steps
+            .iter()
+            .any(|step| matches!(step.action, Action::ScriptStop { .. })));
+        assert!(manifest
+            .steps
+            .iter()
+            .all(|step| !matches!(step.action, Action::Terminate { .. })));
+        let ran = host.ran.borrow().clone();
+        assert!(
+            ran.contains(&"/etc/init.d/demo disable".to_string()),
+            "{ran:?}"
+        );
+        assert!(
+            ran.contains(&"/etc/init.d/demo stop".to_string()),
+            "{ran:?}"
+        );
+        host.ran.borrow_mut().clear();
+        assert!(rollback(&host, Path::new(STATE)).unwrap().ok);
+        let ran = host.ran.borrow().clone();
+        assert!(
+            ran.contains(&"/etc/init.d/demo enable".to_string()),
+            "{ran:?}"
+        );
+        assert!(
+            ran.contains(&"/etc/init.d/demo start".to_string()),
+            "{ran:?}"
+        );
+
+        // Not enabled but running: stopped, and rollback never enables it.
+        let host = procd_host(false, true);
+        let report = takeover(&host, &demo(), Path::new(STATE), false).unwrap();
+        assert_eq!(report.outcome, Outcome::Done, "{report:?}");
+        let manifest = load_manifest(&host, Path::new(STATE)).unwrap().unwrap();
+        assert!(manifest
+            .steps
+            .iter()
+            .all(|step| !matches!(step.action, Action::ScriptDisable { .. })));
+        assert!(manifest
+            .steps
+            .iter()
+            .any(|step| matches!(step.action, Action::ScriptStop { .. })));
+        host.ran.borrow_mut().clear();
+        assert!(rollback(&host, Path::new(STATE)).unwrap().ok);
+        let ran = host.ran.borrow().clone();
+        assert!(
+            ran.contains(&"/etc/init.d/demo start".to_string()),
+            "{ran:?}"
+        );
+        assert!(
+            !ran.iter().any(|command| command.ends_with(" enable")),
+            "{ran:?}"
+        );
+
+        // Not enabled and not running: only the backup.
+        let host = procd_host(false, false);
+        let found = detect(&host, &demo());
+        let (planned, _) = plan(&host, &found);
+        assert_eq!(
+            planned,
+            vec![Planned::Backup("/etc/init.d/demo".to_string())]
+        );
     }
 
     #[test]
