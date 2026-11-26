@@ -509,12 +509,15 @@ impl Capabilities {
         Some(caps)
     }
 
-    /// What the answer means for paths (spec §17.2.4).
+    /// What the answer means for paths (spec §17.2.4): a node that does
+    /// not relay is "not relaying" whatever its version, so the first-hop
+    /// policy never sends through it; version 0 that relays (a network
+    /// without encryption) is "not supported".
     pub fn capability(&self) -> Capability {
         match (self.version >= 1, self.relay) {
             (true, true) => Capability::Supported,
-            (true, false) => Capability::NotRelay,
-            (false, _) => Capability::Unsupported,
+            (_, false) => Capability::NotRelay,
+            (false, true) => Capability::Unsupported,
         }
     }
 }
@@ -1713,9 +1716,19 @@ mod tests {
         let access = Capabilities::decode(&Capabilities::local(false).encode()).unwrap();
         assert_eq!(access.capability(), Capability::NotRelay);
         assert!(access.capability().understands_type_40());
-        // Empty message: version 0.
+        // Empty message: version 0 and no relaying.
         let empty = Capabilities::decode(&[]).unwrap();
-        assert_eq!(empty.capability(), Capability::Unsupported);
+        assert_eq!(empty.capability(), Capability::NotRelay);
+        // Version 0 that relays: not supported, the first hop may be kept.
+        let plain = Capabilities {
+            version: 0,
+            max_waypoints: 0,
+            relay: true,
+        };
+        assert_eq!(
+            Capabilities::decode(&plain.encode()).unwrap().capability(),
+            Capability::Unsupported
+        );
         assert!(!Capability::Unsupported.understands_type_40());
         assert!(!Capability::Unknown.understands_type_40());
         // Unknown fields are skipped.

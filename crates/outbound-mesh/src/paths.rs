@@ -808,11 +808,9 @@ impl PathRuntime {
                 .map(|address| single(facts.owners(*address)))
                 .collect();
         }
-        if self.encrypted {
-            let kept = self.kept();
-            for id in &kept {
-                self.caps.want(*id, &kept, now);
-            }
+        let kept = self.kept();
+        for id in &kept {
+            self.caps.want(*id, &kept, now);
         }
         let Self {
             entries,
@@ -843,13 +841,8 @@ impl PathRuntime {
         }
     }
 
-    /// The capability queries to send now (spec §17.2.4). A network
-    /// without encryption asks nobody: every waypoint counts as not
-    /// supported there (spec §17.2.1 rule 6).
+    /// The capability queries to send now (spec §17.2.4).
     pub fn take_queries(&mut self, facts: &dyn Facts, now: Instant) -> Vec<u32> {
-        if !self.encrypted {
-            return Vec::new();
-        }
         let kept = self.kept();
         self.caps.retain(|id| facts.in_topology(id), now);
         self.caps.take_due(
@@ -1325,10 +1318,12 @@ fn judge(
                     id,
                     reachable: id.is_some_and(|id| facts.reachable(id)),
                     direct: id.is_some_and(|id| facts.direct(id)),
-                    capability: match id {
-                        // A network without encryption cannot carry type 40.
-                        Some(_) if !encrypted => Capability::Unsupported,
-                        Some(id) => caps.capability(id),
+                    capability: match id.map(|id| caps.capability(id)) {
+                        // A network without encryption never encapsulates;
+                        // the answer still tells who relays (spec §17.2.1
+                        // rule 6).
+                        Some(Capability::Supported) if !encrypted => Capability::Unsupported,
+                        Some(capability) => capability,
                         None => Capability::Pending,
                     },
                     // A managed network admits native members only (spec
@@ -1800,11 +1795,16 @@ mod tests {
             .unwrap();
         assert_eq!(out.route, Route::Encapsulate(vec![W]));
         assert_eq!(out.mss, Some(waypoint::max_mss(0, false)));
-        // Without encryption nothing is asked and nothing encapsulable:
-        // the first hop is kept by the connection to the direct neighbour.
+        // Without encryption nothing is encapsulable: the first hop is
+        // kept by the connection to the direct neighbour that relays.
         let mut plain = PathRuntime::new(vec![path(&[W, X])], false, t0);
         plain.evaluate(&world, t0);
-        assert!(plain.take_queries(&world, t0).is_empty());
+        let plain_answer = Answer::Capabilities(Capabilities {
+            version: 0,
+            max_waypoints: 0,
+            relay: true,
+        });
+        answer_all(&mut plain, &world, |_| plain_answer, t0);
         let status = plain.status(&world, t0);
         assert_eq!(status[0].state, "first_hop_only");
         assert_eq!(status[0].reason, Some(Reason::Unsupported));
