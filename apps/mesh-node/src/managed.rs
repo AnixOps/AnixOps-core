@@ -491,40 +491,51 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
             detail: String::new(),
         })
         .collect();
-    if let Some(oversize) = snapshot.sync_oversize {
-        let counters = &snapshot.counters;
-        let detail = match oversize {
-            SyncOversize::Received { peer, bytes } => format!(
-                "received: rpc body of at least {bytes} bytes from node {peer} over the 8 MiB limit"
-            ),
-            SyncOversize::Undelivered { peer } => format!(
-                "undelivered: connection graph not taken by node {peer} within 120 s, sync session closed"
-            ),
-        };
-        status.alerts.push(Alert {
-            code: AlertCode::SyncOversize,
-            address: None,
-            peer: String::new(),
-            detail: format!(
-                "{detail} ({} received over the limit, {} sessions closed)",
-                counters.oversize_calls, counters.graph_timeouts
-            ),
-        });
-    }
     let counters = &snapshot.counters;
+    let oversize = |detail: String| Alert {
+        code: AlertCode::SyncOversize,
+        address: None,
+        peer: String::new(),
+        detail,
+    };
+    if let Some((peer, bytes)) = snapshot.sync_oversize.received {
+        status.alerts.push(oversize(format!(
+            "received: route sync of at least {bytes} bytes from neighbour {peer} over the \
+             8 MiB limit ({} received over the limit)",
+            counters.oversize_calls
+        )));
+    }
+    if !snapshot.sync_oversize.undelivered.is_empty() {
+        let peers: Vec<String> = snapshot
+            .sync_oversize
+            .undelivered
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        status.alerts.push(oversize(format!(
+            "undelivered: connection graph not taken by node {} within 120 s, sync session \
+             closed; may also come from the link or the neighbour ({} sessions closed, {} \
+             error answers)",
+            peers.join(", "),
+            counters.graph_timeouts,
+            counters.sync_errors
+        )));
+    }
     if counters.refused_at_capacity > 0 || counters.refused_over_budget > 0 {
-        status.alerts.push(Alert {
-            code: AlertCode::SyncOversize,
-            address: None,
-            peer: String::new(),
-            detail: format!(
-                "capacity: node table full ({} entries) or information budget (16 MiB) reached; \
-                 {} refused or evicted at the table limit, {} refused over the budget",
-                outbound_mesh::route::sync::MAX_NODES,
-                counters.refused_at_capacity,
-                counters.refused_over_budget
-            ),
-        });
+        status.alerts.push(oversize(format!(
+            "capacity: node table full ({} entries) or information budget (16 MiB) reached; \
+             {} refused or evicted at the table limit, {} refused over the budget",
+            outbound_mesh::route::sync::MAX_NODES,
+            counters.refused_at_capacity,
+            counters.refused_over_budget
+        )));
+    }
+    if counters.cut_graphs > 0 {
+        status.alerts.push(oversize(format!(
+            "cut: connection graph sent without its farthest rows {} times, past the graph \
+             limits or halved for delivery; the rows left out are sent again",
+            counters.cut_graphs
+        )));
     }
 }
 
@@ -710,10 +721,10 @@ mod tests {
             rejected_advertisements: 2,
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
-            sync_oversize: Some(SyncOversize::Received {
-                peer: 9,
-                bytes: 8_400_000,
-            }),
+            sync_oversize: SyncOversize {
+                received: Some((9, 8_400_000)),
+                undelivered: Vec::new(),
+            },
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
@@ -733,16 +744,28 @@ mod tests {
         assert_eq!(status.alerts[1].code, AlertCode::SyncOversize);
         assert!(status.alerts[1].detail.contains("8400000"));
         assert!(status.alerts[1].detail.starts_with("received:"));
-        assert!(status.alerts[1].detail.contains("node 9"));
+        assert!(status.alerts[1].detail.contains("neighbour 9"));
 
-        let undelivered = Snapshot {
-            sync_oversize: Some(SyncOversize::Undelivered { peer: 4 }),
+        // Each kind keeps its own alert; every neighbour closed is named.
+        let mut both = Snapshot {
+            sync_oversize: SyncOversize {
+                received: Some((9, 8_400_000)),
+                undelivered: vec![4, 6],
+            },
             ..Snapshot::default()
         };
+        both.counters.cut_graphs = 2;
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
-        fill_running(&mut status, &base, &undelivered);
-        assert_eq!(status.alerts[0].code, AlertCode::SyncOversize);
-        assert!(status.alerts[0].detail.starts_with("undelivered:"));
+        fill_running(&mut status, &base, &both);
+        assert_eq!(status.alerts.len(), 3);
+        assert!(status
+            .alerts
+            .iter()
+            .all(|alert| alert.code == AlertCode::SyncOversize));
+        assert!(status.alerts[0].detail.starts_with("received:"));
+        assert!(status.alerts[1].detail.starts_with("undelivered:"));
+        assert!(status.alerts[1].detail.contains("node 4, 6"));
+        assert!(status.alerts[2].detail.starts_with("cut:"));
 
         let mut full = Snapshot::default();
         full.counters.refused_at_capacity = 3;
