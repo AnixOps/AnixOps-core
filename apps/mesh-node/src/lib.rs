@@ -18,6 +18,8 @@ pub mod convert;
 pub mod detect;
 pub mod device;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub mod host_routes;
 pub mod import;
 pub mod launchd;
 #[cfg(target_os = "linux")]
