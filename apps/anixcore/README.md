@@ -40,6 +40,12 @@ networks' static keys in `"mesh_state_dir"` (default
 `/var/lib/anixcore/mesh`); if that directory cannot be created the mesh is
 left out and `GET /v1/status` does not list `mesh`.
 
+External network bridges of those networks (spec §15.12) stay off unless
+the config sets `"mesh_external_bridge": true`. Off, `anixcore` never runs
+`nft` or touches conntrack, except to remove once the bridge tables of an
+earlier run that had them on (the state directory keeps a `bridge_active`
+mark while a bridge may be installed).
+
 Users may carry `"speed_limit"` (Mbit/s for each direction, shared by all
 of the user's connections) and `"device_limit"` (most client IPs online at
 once); both default to 0, no limit.

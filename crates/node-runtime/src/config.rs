@@ -96,6 +96,13 @@ pub struct NodeConfig {
     /// uses `/var/lib/anixcore/mesh` when it is absent.
     #[serde(default)]
     pub mesh_state_dir: Option<std::path::PathBuf>,
+    /// Turns on the external network bridges of managed networks (spec
+    /// §15.12, `docs/architecture/mesh-bridge.md`). Off by default: the
+    /// node then neither lists `mesh_external_bridge` nor touches
+    /// nftables or conntrack, unless its state directory says an earlier
+    /// run installed a bridge, whose tables it then removes once.
+    #[serde(default)]
+    pub mesh_external_bridge: bool,
 }
 
 /// Has no `Debug`: `token` is a credential.

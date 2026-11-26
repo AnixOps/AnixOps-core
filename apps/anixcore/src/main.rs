@@ -83,7 +83,11 @@ fn start(config: NodeConfig, check_only: bool) -> Result<(), String> {
         let node = Arc::new(if check_only {
             node
         } else {
-            with_mesh(node, config.mesh_state_dir.as_deref())
+            with_mesh(
+                node,
+                config.mesh_state_dir.as_deref(),
+                config.mesh_external_bridge,
+            )
         });
         if let Some(bundle) = &config.tls_fingerprints {
             let status = node_runtime::apply_tls_fingerprints(bundle)
@@ -152,9 +156,9 @@ const MESH_STATE_DIR: &str = "/var/lib/anixcore/mesh";
 /// its state directory the node runs without them: `GET /v1/status` does
 /// not list `mesh` and `/v1/mesh` answers 404.
 #[cfg(target_os = "linux")]
-fn with_mesh(node: Node, dir: Option<&std::path::Path>) -> Node {
+fn with_mesh(node: Node, dir: Option<&std::path::Path>, external_bridge: bool) -> Node {
     let dir = dir.unwrap_or(std::path::Path::new(MESH_STATE_DIR));
-    match mesh_node::managed::ManagedMesh::open(dir) {
+    match mesh_node::managed::ManagedMesh::open_with_options(dir, external_bridge) {
         Ok(mesh) => {
             println!("mesh: instance {}", mesh.instance_id());
             node.with_mesh(Arc::new(mesh))
@@ -170,7 +174,7 @@ fn with_mesh(node: Node, dir: Option<&std::path::Path>) -> Node {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn with_mesh(node: Node, _dir: Option<&std::path::Path>) -> Node {
+fn with_mesh(node: Node, _dir: Option<&std::path::Path>, _external_bridge: bool) -> Node {
     node
 }
 

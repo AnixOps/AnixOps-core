@@ -14,10 +14,13 @@
 //!   so that taking it back keeps the key the panel already lists.
 //!
 //! External network bridges (spec §15.12, `docs/architecture/mesh-bridge.md`)
-//! run beside the networks that carry an `external_bridge` section. The
-//! node takes the host's bridge lock, probes nftables and clears what an
-//! earlier run left before it lists `mesh_external_bridge`, and clears
-//! again when it goes.
+//! run beside the networks that carry an `external_bridge` section, only
+//! when the operator turned them on (`mesh_external_bridge`). Then the node
+//! takes the host's bridge lock and probes nftables before it lists
+//! `mesh_external_bridge`. `bridge_active` in the state directory says a
+//! bridge was installed: only then does the node clear what an earlier run
+//! left, at start-up and when it goes. Off and without that file, the node
+//! never calls `nft` or touches conntrack.
 
 use std::io;
 use std::net::IpAddr;
@@ -89,6 +92,12 @@ struct Inner {
     routes: HostRoutes,
 }
 
+/// The file in the state directory that says this program may have left
+/// bridge tables on the host: written before a bridge is first installed,
+/// removed once a cleanup has run. Without it the node runs no cleanup, so
+/// a node that never bridged never calls `nft` or touches conntrack.
+const BRIDGE_MARK: &str = "bridge_active";
+
 /// The host side of external bridges.
 struct Bridging {
     host: Arc<dyn BridgeHost>,
@@ -97,112 +106,159 @@ struct Bridging {
     lock: Option<HostLock>,
     /// Another process holds the host's bridge lock.
     lock_held: bool,
+    /// [`BRIDGE_MARK`] in the state directory; `None` in tests.
+    mark: Option<PathBuf>,
 }
 
 impl Bridging {
-    /// No bridges (tests, and hosts where the checks below fail).
+    /// No bridges, and nothing touched on the host.
     fn off() -> Self {
-        let host: Arc<dyn BridgeHost> = Arc::new(SystemHost);
+        Self::with_host(Arc::new(SystemHost))
+    }
+
+    fn with_host(host: Arc<dyn BridgeHost>) -> Self {
         Self {
             forwarding: Forwarding::new(host.clone()),
             host,
             lock: None,
             lock_held: false,
+            mark: None,
         }
     }
 
-    /// Spec §15.12 item 9 and the recheck of #357 (Y1, Y2): the host lock
-    /// first, so that a second node program neither declares the
+    /// The bridges of the node whose state directory is `dir`.
+    ///
+    /// Off unless the operator turned them on (`enabled`): then nothing on
+    /// the host is touched, unless the mark says an earlier run may have
+    /// left tables, which are then removed under the lock.
+    ///
+    /// On: spec §15.12 item 9 and the recheck of #357 (Y1, Y2). The host
+    /// lock first, so that a second node program neither declares the
     /// capability nor deletes the first one's tables; then the nftables
-    /// probe; then the start-up cleanup of what an earlier run left.
-    fn system() -> Self {
-        let mut bridging = Self::off();
-        let lock = match HostLock::acquire() {
+    /// probe; then the cleanup of what an earlier run left, when the mark
+    /// says there may be some.
+    fn start(dir: &Path, enabled: bool, host: Arc<dyn BridgeHost>, lock_path: &str) -> Self {
+        let mut bridging = Self::with_host(host);
+        let mark = dir.join(BRIDGE_MARK);
+        let left = std::fs::symlink_metadata(&mark).is_ok();
+        bridging.mark = Some(mark);
+        if !enabled && !left {
+            return bridging;
+        }
+        let lock = match HostLock::acquire_at(lock_path) {
             Ok(lock) => lock,
             Err(error) => {
-                bridging.lock_held = error.kind() == io::ErrorKind::WouldBlock;
-                eprintln!("mesh: external bridge unavailable: {error}");
+                if enabled {
+                    bridging.lock_held = error.kind() == io::ErrorKind::WouldBlock;
+                    eprintln!("mesh: external bridge unavailable: {error}");
+                } else {
+                    eprintln!("mesh: bridge tables an earlier run may have left stay: {error}");
+                }
                 return bridging;
             }
         };
-        if let Err(error) = mesh_bridge::probe(bridging.host.as_ref()) {
-            eprintln!("mesh: external bridge unavailable: nftables probe: {error}");
-            return bridging;
+        if enabled {
+            if let Err(error) = mesh_bridge::probe(bridging.host.as_ref()) {
+                eprintln!("mesh: external bridge unavailable: nftables probe: {error}");
+                return bridging;
+            }
         }
-        match mesh_bridge::cleanup_all(bridging.host.as_ref()) {
-            Ok(0) => {}
-            Ok(count) => eprintln!("mesh: removed {count} bridge table(s) an earlier run left"),
-            Err(error) => {
+        if left {
+            if let Err(error) = bridging.cleanup() {
                 eprintln!("mesh: external bridge unavailable: start-up cleanup: {error}");
                 return bridging;
             }
         }
-        bridging.lock = Some(lock);
+        if enabled {
+            bridging.lock = Some(lock);
+        }
         bridging
     }
 
     fn available(&self) -> bool {
         self.lock.is_some()
     }
+
+    /// Writes the mark before a bridge is installed.
+    fn mark_active(&self) -> io::Result<()> {
+        let Some(mark) = &self.mark else {
+            return Ok(());
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(mark).and_then(|file| file.sync_all())
+    }
+
+    /// Removes every bridge table of this program, then the mark.
+    fn cleanup(&self) -> io::Result<()> {
+        let count = mesh_bridge::cleanup_all(self.host.as_ref())?;
+        if count > 0 {
+            eprintln!("mesh: removed {count} bridge table(s)");
+        }
+        if let Some(mark) = &self.mark {
+            match std::fs::remove_file(mark) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Inner {
     /// At exit the bridges go first (each removes its own table), then the
-    /// cleanup runs once more (spec §15.12 item 9).
+    /// cleanup runs once more (spec §15.12 item 9), when a bridge was
+    /// installed.
     fn drop(&mut self) {
         lock(&self.networks).clear();
-        if self.bridging.available() {
-            if let Err(error) = mesh_bridge::cleanup_all(self.bridging.host.as_ref()) {
+        let marked = self
+            .bridging
+            .mark
+            .as_ref()
+            .is_some_and(|mark| std::fs::symlink_metadata(mark).is_ok());
+        if self.bridging.available() && marked {
+            if let Err(error) = self.bridging.cleanup() {
                 eprintln!("mesh: bridge cleanup at exit: {error}");
             }
         }
     }
 }
 
-struct Instance {
-    tag: String,
-    settings: MeshSettings,
-    /// The network's static public key; `None` when it could not be read.
-    /// Listed in `static_keys` in the secure mode only.
-    public: Option<[u8; 32]>,
-    state: State,
-}
-
-enum State {
-    /// A managed network whose native key list lacks this node; the
-    /// detail is `empty` or `self_missing`.
-    Waiting(&'static str),
-    /// The network could not start.
-    Refused(FailureCode, String),
-    Running(Box<Running>),
-}
-
-struct Running {
-    interface: String,
-    /// Dropping or sending stops the network.
-    stop: Option<oneshot::Sender<()>>,
-    native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
-    snapshot: watch::Receiver<Snapshot>,
-    /// Why the network stopped on its own, once it has.
-    exit: Arc<Mutex<Option<String>>>,
-    task: JoinHandle<()>,
-    /// The network's external bridge, when it has one.
-    bridge: Option<Bridge>,
-    started: Instant,
-}
-
 impl ManagedMesh {
     /// Opens the state directory `dir`, creating it and the instance ID
-    /// when they are missing.
+    /// when they are missing. External bridges stay off.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::open_with(dir, Bridging::system())
+        Self::open_with_options(dir, false)
     }
 
-    fn open_with(dir: impl Into<PathBuf>, bridging: Bridging) -> io::Result<Self> {
+    /// [`ManagedMesh::open`], with external bridges (spec §15.12) when
+    /// `external_bridge` is set: the operator's `mesh_external_bridge`.
+    pub fn open_with_options(dir: impl Into<PathBuf>, external_bridge: bool) -> io::Result<Self> {
+        Self::open_with(dir, |dir| {
+            Bridging::start(
+                dir,
+                external_bridge,
+                Arc::new(SystemHost),
+                mesh_bridge::lock::LOCK_PATH,
+            )
+        })
+    }
+
+    fn open_with(
+        dir: impl Into<PathBuf>,
+        bridging: impl FnOnce(&Path) -> Bridging,
+    ) -> io::Result<Self> {
         let dir = dir.into();
         create_private_dir(&dir)?;
         create_private_dir(&dir.join("keys"))?;
         let instance_id = instance_id(&dir.join("instance_id"))?;
+        let bridging = bridging(&dir);
         Ok(Self {
             inner: Arc::new(Inner {
                 dir,
@@ -392,6 +448,9 @@ impl Inner {
                 "external_bridge_unsupported".to_owned()
             });
         }
+        self.bridging
+            .mark_active()
+            .map_err(|error| format!("{ALERT_APPLY_FAILED}: {BRIDGE_MARK}: {error}"))?;
         let mut bridge = Bridge::new(
             self.bridging.host.clone(),
             self.bridging.forwarding.clone(),
@@ -1024,7 +1083,7 @@ mod tests {
 
     /// Without the host's bridge lock, probe or cleanup.
     fn open(dir: &Path) -> io::Result<ManagedMesh> {
-        ManagedMesh::open_with(dir, Bridging::off())
+        ManagedMesh::open_with(dir, |_| Bridging::off())
     }
 
     fn bridged(allow: &[&str]) -> MeshSettings {
@@ -1078,6 +1137,110 @@ mod tests {
         assert!(status.alerts.is_empty());
     }
 
+    /// Counts every call that would reach nftables, sysctl or conntrack.
+    #[derive(Default)]
+    struct CountingHost {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingHost {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn count(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl BridgeHost for CountingHost {
+        fn nft(&self, _args: &[&str], _stdin: Option<&str>) -> io::Result<String> {
+            self.count();
+            Ok(r#"{"nftables": []}"#.to_owned())
+        }
+        fn read_sysctl(&self, _path: &str) -> io::Result<String> {
+            self.count();
+            Ok("0".to_owned())
+        }
+        fn write_sysctl(&self, _path: &str, _value: &str) -> io::Result<()> {
+            self.count();
+            Ok(())
+        }
+        fn conntrack_flows(&self) -> io::Result<Vec<mesh_bridge::conntrack::Flow>> {
+            self.count();
+            Ok(Vec::new())
+        }
+        fn conntrack_delete(&self, _flows: &[&mesh_bridge::conntrack::Flow]) -> io::Result<()> {
+            self.count();
+            Ok(())
+        }
+    }
+
+    /// Opens `dir` with the bridges `enabled` on `host`, the host lock in
+    /// `dir` too.
+    fn open_on(dir: &Path, enabled: bool, host: &Arc<CountingHost>) -> ManagedMesh {
+        let host: Arc<dyn BridgeHost> = host.clone();
+        let lock_path = dir.with_extension("lock");
+        ManagedMesh::open_with(dir, move |dir| {
+            Bridging::start(dir, enabled, host, lock_path.to_str().unwrap())
+        })
+        .expect("open")
+    }
+
+    #[tokio::test]
+    async fn bridges_off_and_unmarked_never_reach_the_host() {
+        let dir = temp_dir("bridge-off");
+        let host = Arc::new(CountingHost::default());
+        let mesh = open_on(&dir, false, &host);
+        assert_eq!(mesh.features(), FEATURES);
+        let status = mesh
+            .apply(vec![waiting("mesh-cn", "office")])
+            .await
+            .unwrap();
+        assert!(status.alerts.is_empty());
+        mesh.apply(Vec::new()).await.unwrap();
+        drop(mesh);
+        assert_eq!(host.calls(), 0);
+        // Not even the host lock is taken.
+        assert!(!dir.with_extension("lock").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mark_left_behind_is_cleared_once_even_with_bridges_off() {
+        let dir = temp_dir("bridge-mark");
+        create_private_dir(&dir).unwrap();
+        std::fs::write(dir.join(BRIDGE_MARK), "").unwrap();
+        let host = Arc::new(CountingHost::default());
+        let mesh = open_on(&dir, false, &host);
+        // `nft -j list tables`, which lists none of ours.
+        assert_eq!(host.calls(), 1);
+        assert!(!dir.join(BRIDGE_MARK).exists());
+        assert_eq!(mesh.features(), FEATURES);
+        drop(mesh);
+        let again = open_on(&dir, false, &host);
+        drop(again);
+        assert_eq!(host.calls(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("lock"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bridges_on_probe_but_clear_only_after_a_mark() {
+        let dir = temp_dir("bridge-on");
+        let host = Arc::new(CountingHost::default());
+        let mesh = open_on(&dir, true, &host);
+        // The probe only: no mark, no cleanup.
+        assert_eq!(host.calls(), 1);
+        assert_eq!(mesh.features(), FEATURES_WITH_BRIDGE);
+        drop(mesh);
+        assert_eq!(host.calls(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("lock"));
+    }
+
     #[tokio::test]
     async fn a_held_bridge_lock_is_a_node_alert_and_hides_the_capability() {
         let dir = temp_dir("lock");
@@ -1085,7 +1248,7 @@ mod tests {
             lock_held: true,
             ..Bridging::off()
         };
-        let mesh = ManagedMesh::open_with(&dir, bridging).expect("open");
+        let mesh = ManagedMesh::open_with(&dir, |_| bridging).expect("open");
         assert_eq!(mesh.features(), FEATURES);
         // Also with no network at all.
         let status = mesh.status();
