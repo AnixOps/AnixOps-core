@@ -634,57 +634,73 @@ impl MeshConfig {
             return Err("mesh subnets.advertise overlaps the virtual subnet");
         }
 
-        if self.routing.paths.len() > MAX_PATHS {
-            return Err("mesh routing lists too many paths");
-        }
-        let mut targets = HashSet::new();
-        for path in self.routing.paths {
-            let target = match (path.to_peer, path.to_subnet.as_deref()) {
-                (Some(peer), None) => {
-                    if !settings.in_virtual_subnet(peer)
-                        || settings.local_addresses().contains(&peer)
-                    {
-                        return Err("mesh path to_peer is not another node's virtual address");
-                    }
-                    PathTarget::Peer(peer)
-                }
-                (None, Some(text)) => {
-                    let subnet =
-                        IpNet::parse(text).ok_or("mesh path to_subnet is not a network")?;
-                    if !is_intranet_network(&subnet) || subnet.prefix() == 0 {
-                        return Err("mesh path to_subnet is outside the intranet ranges");
-                    }
-                    PathTarget::Subnet(subnet.trunc())
-                }
-                _ => return Err("mesh path needs exactly one of to_peer and to_subnet"),
-            };
-            if !targets.insert(target) {
-                return Err("mesh routing has two paths to the same target");
-            }
-            if path.via.is_empty() {
-                return Err("mesh path via is empty");
-            }
-            if path.via.len() > MAX_WAYPOINTS {
-                return Err("mesh path via has too many waypoints");
-            }
-            let mut waypoints = HashSet::new();
-            for waypoint in &path.via {
-                if !settings.in_virtual_subnet(*waypoint)
-                    || settings.local_addresses().contains(waypoint)
-                {
-                    return Err("mesh path waypoint is not another node's virtual address");
-                }
-                if !waypoints.insert(*waypoint) || target == PathTarget::Peer(*waypoint) {
-                    return Err("mesh path repeats a node");
-                }
-            }
-            settings.paths.push(CustomPath {
-                target,
-                via: path.via,
-            });
-        }
+        settings.paths = validate_paths(self.routing.paths, &settings)?;
         Ok(settings)
     }
+}
+
+/// Validates a `routing.paths` list against `settings` (spec §17.2.2):
+/// the rules of the configuration and of `mesh_set_paths`, with the same
+/// error strings. The list is used as given on success.
+pub fn validate_paths(
+    paths: Vec<PathConfig>,
+    settings: &MeshSettings,
+) -> Result<Vec<CustomPath>, &'static str> {
+    if paths.len() > MAX_PATHS {
+        return Err("mesh routing lists too many paths");
+    }
+    let mut targets = HashSet::new();
+    let mut custom = Vec::new();
+    for path in paths {
+        let target = match (path.to_peer, path.to_subnet.as_deref()) {
+            (Some(peer), None) => {
+                if !settings.in_virtual_subnet(peer) || settings.local_addresses().contains(&peer) {
+                    return Err("mesh path to_peer is not another node's virtual address");
+                }
+                PathTarget::Peer(peer)
+            }
+            (None, Some(text)) => {
+                let subnet = IpNet::parse(text).ok_or("mesh path to_subnet is not a network")?;
+                if !is_intranet_network(&subnet) || subnet.prefix() == 0 {
+                    return Err("mesh path to_subnet is outside the intranet ranges");
+                }
+                if settings
+                    .virtual_subnets()
+                    .iter()
+                    .any(|virtual_subnet| virtual_subnet.overlaps(&subnet))
+                {
+                    return Err("mesh path to_subnet overlaps the virtual subnet");
+                }
+                PathTarget::Subnet(subnet.trunc())
+            }
+            _ => return Err("mesh path needs exactly one of to_peer and to_subnet"),
+        };
+        if !targets.insert(target) {
+            return Err("mesh routing has two paths to the same target");
+        }
+        if path.via.is_empty() {
+            return Err("mesh path via is empty");
+        }
+        if path.via.len() > MAX_WAYPOINTS {
+            return Err("mesh path via has too many waypoints");
+        }
+        let mut waypoints = HashSet::new();
+        for waypoint in &path.via {
+            if !settings.in_virtual_subnet(*waypoint)
+                || settings.local_addresses().contains(waypoint)
+            {
+                return Err("mesh path waypoint is not another node's virtual address");
+            }
+            if !waypoints.insert(*waypoint) || target == PathTarget::Peer(*waypoint) {
+                return Err("mesh path repeats a node");
+            }
+        }
+        custom.push(CustomPath {
+            target,
+            via: path.via,
+        });
+    }
+    Ok(custom)
 }
 
 impl std::hash::Hash for PathTarget {
@@ -1183,6 +1199,64 @@ mod tests {
             ]}),
         );
         assert!(validate(twice).is_err());
+    }
+
+    #[test]
+    fn custom_path_subnets_must_not_overlap_the_virtual_subnet() {
+        for subnet in ["10.144.144.0/25", "10.144.0.0/16", "10.0.0.0/8"] {
+            let config = with(
+                "routing",
+                json!({"paths": [{"to_subnet": subnet, "via": ["10.144.144.3"]}]}),
+            );
+            assert_eq!(
+                validate(config).err(),
+                Some("mesh path to_subnet overlaps the virtual subnet"),
+                "{subnet}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_paths_serves_mesh_set_paths_with_the_same_rules() {
+        let settings = validate(with("routing", json!({}))).unwrap();
+        let parse = |value: Value| serde_json::from_value::<Vec<PathConfig>>(value).unwrap();
+        let ok = validate_paths(
+            parse(json!([{"to_peer": "10.144.144.7", "via": ["10.144.144.3"]}])),
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(validate_paths(Vec::new(), &settings).unwrap(), Vec::new());
+        for (bad, error) in [
+            (
+                json!([{"to_peer": "10.144.144.7", "via": []}]),
+                "mesh path via is empty",
+            ),
+            (
+                json!([{"to_peer": "10.144.144.5", "via": ["10.144.144.3"]}]),
+                "mesh path to_peer is not another node's virtual address",
+            ),
+            (
+                json!([{"to_subnet": "10.144.144.0/24", "via": ["10.144.144.3"]}]),
+                "mesh path to_subnet overlaps the virtual subnet",
+            ),
+            (
+                json!([
+                    {"to_peer": "10.144.144.7", "via": ["10.144.144.3"]},
+                    {"to_peer": "10.144.144.7", "via": ["10.144.144.4"]},
+                ]),
+                "mesh routing has two paths to the same target",
+            ),
+        ] {
+            assert_eq!(validate_paths(parse(bad), &settings).err(), Some(error));
+        }
+        let many: Vec<Value> = (0..=MAX_PATHS)
+            .map(|i| json!({"to_subnet": format!("192.168.{}.0/24", i % 250), "via": ["10.144.144.3"]}))
+            .collect();
+        assert_eq!(
+            validate_paths(parse(Value::Array(many)), &settings).err(),
+            Some("mesh routing lists too many paths")
+        );
     }
 
     #[test]

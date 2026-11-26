@@ -11,7 +11,7 @@ use std::path::Path;
 
 use std::time::Duration;
 
-use outbound_mesh::config::encode_key;
+use outbound_mesh::config::{encode_key, CustomPath};
 use outbound_mesh::driver::{self, Channels, Listeners, Snapshot};
 use outbound_mesh::secure::noise::{KeyPair, LEN};
 use outbound_mesh::{IpNet, MeshConfig, MeshSettings};
@@ -222,14 +222,15 @@ pub fn run(path: &Path, interface: Option<&str>) -> Result<(), Failure> {
         let mut last = String::new();
         // Nothing updates the native key list of a standalone node: the
         // Agent writes a new configuration and starts it again.
-        let (_keep, native_keys) = watch::channel(None);
+        let (_keep_keys, native_keys) = watch::channel(None);
+        let (_keep_paths, paths) = watch::channel(Vec::new());
         serve_with(
             settings,
             static_key,
             listeners,
             device,
             stop,
-            native_keys,
+            Updates { native_keys, paths },
             |snapshot, name| {
                 let line = status_line(snapshot, name);
                 if line != last {
@@ -273,17 +274,26 @@ async fn wait_for_native_keys(static_key: &KeyPair) -> Result<(), Failure> {
     Ok(())
 }
 
+/// What can change in a running network without a restart.
+pub(crate) struct Updates {
+    /// A new native key list (spec §8.3.1).
+    pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    /// A new list of custom paths (spec §17.2.8).
+    pub paths: watch::Receiver<Vec<CustomPath>>,
+}
+
 /// Runs one network over `device` until `until` resolves: moves packets
 /// between the interface and the driver, keeps the system routes in step
 /// with the driver's snapshot and hands each new snapshot to `observe`.
-/// `native_keys` carries a new native key list into the running driver.
+/// `updates` carries a new native key list or path list into the running
+/// driver.
 pub(crate) async fn serve_with(
     settings: MeshSettings,
     static_key: KeyPair,
     listeners: Listeners,
     device: Tun,
     until: impl std::future::Future<Output = ()>,
-    native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
+    updates: Updates,
     mut observe: impl FnMut(&Snapshot, &str),
 ) -> Result<(), Failure> {
     let mtu = usize::from(settings.mtu);
@@ -305,7 +315,8 @@ pub(crate) async fn serve_with(
             to_interface,
             snapshots,
             local_networks,
-            native_keys,
+            native_keys: updates.native_keys,
+            paths: updates.paths,
             shutdown,
         },
     ));

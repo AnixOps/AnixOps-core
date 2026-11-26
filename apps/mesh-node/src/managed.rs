@@ -19,27 +19,33 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use outbound_mesh::config::encode_key;
+use outbound_mesh::config::{encode_key, CustomPath, PathTarget};
 use outbound_mesh::driver::{Listeners, Snapshot};
 use outbound_mesh::secure::noise::KeyPair;
 use outbound_mesh::status::{
     Alert, AlertCode, ApplyError, BoxFuture, FailureCode, ManagedNetwork, ManagedNetworkStatus,
-    ManagedPeer, ManagedStatus, MeshControl, NetworkFailure, NetworkStaticKey,
+    ManagedPath, ManagedPathTarget, ManagedPeer, ManagedStatus, MeshControl, NetworkFailure,
+    NetworkStaticKey,
 };
+use outbound_mesh::waypoint::Reason;
 use outbound_mesh::MeshSettings;
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::serve::{self, Failure};
+use crate::serve::{self, Failure, Updates};
 use crate::tun::{self, Tun};
 
 /// Features this implementation adds to `GET /v1/status`. `mesh_native_keys`
 /// is listed because `network.kind` and `native_keys` are handled as spec
 /// §8.3.1 asks: admission, waiting for the list (`native_keys_pending`),
 /// refusing members off the list (`peer_not_native`) and `static_keys`.
-pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys"];
+/// `mesh_paths` is listed because `routing.paths` is applied as spec §17.2
+/// asks: waypoint encapsulation, capability queries, fallback and the
+/// `paths` status; a changed path list reaches a running network without a
+/// restart (`mesh_set_paths`).
+pub const FEATURES: &[&str] = &["mesh", "mesh_native_keys", "mesh_paths"];
 
 /// Interface names: `anixmesh-<n>`, the lowest number free.
 const INTERFACE_PREFIX: &str = "anixmesh-";
@@ -81,6 +87,7 @@ struct Running {
     /// Dropping or sending stops the network.
     stop: Option<oneshot::Sender<()>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    paths: watch::Sender<Vec<CustomPath>>,
     snapshot: watch::Receiver<Snapshot>,
     /// Why the network stopped on its own, once it has.
     exit: Arc<Mutex<Option<String>>>,
@@ -257,9 +264,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Whether `instance` can go on under `settings` without a restart: the
-/// same settings, or, while it runs, the same but for the native key list,
-/// which is handed to the running driver. A network that failed to start
-/// is tried again. `false` means the instance is to be stopped.
+/// same settings, or, while it runs, the same but for the native key list
+/// and the custom paths, which are handed to the running driver. A network
+/// that failed to start is tried again. `false` means the instance is to be stopped.
 fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
     let same = instance.settings == *settings;
     let update = match &instance.state {
@@ -269,12 +276,17 @@ fn keep(instance: &mut Instance, settings: &MeshSettings) -> bool {
         State::Running(running) => {
             if same {
                 true
-            } else if same_but_native_keys(&instance.settings, settings)
+            } else if same_but_hot_updates(&instance.settings, settings)
                 && instance
                     .public
                     .is_some_and(|public| !settings.waits_for_native_keys(&public))
             {
-                let _ = running.native_keys.send(settings.native_keys.clone());
+                if instance.settings.native_keys != settings.native_keys {
+                    let _ = running.native_keys.send(settings.native_keys.clone());
+                }
+                if instance.settings.paths != settings.paths {
+                    let _ = running.paths.send(settings.paths.clone());
+                }
                 true
             } else {
                 false
@@ -291,9 +303,12 @@ fn running_ok(running: &Running) -> bool {
     !running.task.is_finished()
 }
 
-fn same_but_native_keys(old: &MeshSettings, new: &MeshSettings) -> bool {
+/// Whether the settings differ at most in what a running driver takes
+/// without a restart: the native key list and the custom paths.
+fn same_but_hot_updates(old: &MeshSettings, new: &MeshSettings) -> bool {
     let mut old = old.clone();
     old.native_keys.clone_from(&new.native_keys);
+    old.paths.clone_from(&new.paths);
     old == *new
 }
 
@@ -354,6 +369,7 @@ async fn launch(
 
     let (stop, stopped) = oneshot::channel::<()>();
     let (native_keys, keys) = watch::channel(settings.native_keys.clone());
+    let (paths, path_list) = watch::channel(settings.paths.clone());
     let (snapshots, snapshot) = watch::channel(Snapshot::default());
     let exit = Arc::new(Mutex::new(None));
     let exit_of_task = Arc::clone(&exit);
@@ -368,7 +384,10 @@ async fn launch(
             listeners,
             device,
             until,
-            keys,
+            Updates {
+                native_keys: keys,
+                paths: path_list,
+            },
             move |next, _| {
                 snapshots.send_replace(next.clone());
             },
@@ -382,6 +401,7 @@ async fn launch(
         interface,
         stop: Some(stop),
         native_keys,
+        paths,
         snapshot,
         exit,
         task,
@@ -471,7 +491,24 @@ fn fill_running(status: &mut ManagedNetworkStatus, settings: &MeshSettings, snap
                 hops: member.hops,
                 latency_ms: member.latency_ms,
                 forward_secrecy: status.forward_secrecy,
+                path_state: member.path_state,
+                unreachable: member.unreachable,
             })
+        })
+        .collect();
+    status.paths = snapshot
+        .paths
+        .iter()
+        .map(|path| ManagedPath {
+            id: path.id.clone(),
+            target: match path.target {
+                PathTarget::Peer(address) => ManagedPathTarget::Peer(address),
+                PathTarget::Subnet(net) => ManagedPathTarget::Subnet(net.to_string()),
+            },
+            via: path.via.clone(),
+            state: path.state,
+            unreachable: path.unreachable,
+            reason: path.reason.map(Reason::as_str),
         })
         .collect();
     status.failure = snapshot.not_native.map(|peer| NetworkFailure {
@@ -544,6 +581,7 @@ fn instance_id(path: &Path) -> io::Result<String> {
 mod tests {
     use super::*;
     use outbound_mesh::driver::Member;
+    use outbound_mesh::paths::PathStatus;
     use outbound_mesh::{IpNet, MeshConfig};
     use serde_json::json;
 
@@ -638,14 +676,26 @@ mod tests {
     }
 
     #[test]
-    fn only_a_native_key_change_keeps_a_network_running() {
+    fn the_features_name_the_paths() {
+        assert!(FEATURES.contains(&"mesh_paths"));
+        assert!(FEATURES.contains(&"mesh_native_keys"));
+    }
+
+    #[test]
+    fn only_native_key_and_path_changes_keep_a_network_running() {
         let base = settings();
         let mut listed = base.clone();
         listed.native_keys = Some(vec![[1; 32], [2; 32]]);
-        assert!(same_but_native_keys(&base, &listed));
-        let mut moved = listed.clone();
+        assert!(same_but_hot_updates(&base, &listed));
+        let mut routed = listed.clone();
+        routed.paths = vec![CustomPath {
+            target: PathTarget::Peer("10.150.0.7".parse().unwrap()),
+            via: vec!["10.150.0.3".parse().unwrap()],
+        }];
+        assert!(same_but_hot_updates(&base, &routed));
+        let mut moved = routed.clone();
         moved.mtu -= 10;
-        assert!(!same_but_native_keys(&base, &moved));
+        assert!(!same_but_hot_updates(&base, &moved));
         assert_eq!(waiting_detail(&base), "empty");
         assert_eq!(waiting_detail(&listed), "self_missing");
     }
@@ -660,11 +710,17 @@ mod tests {
             via,
             hops,
             latency_ms: (hops == 1).then_some(7),
+            path_state: "auto",
+            unreachable: None,
         };
         let snapshot = Snapshot {
             members: vec![
                 member(3, "10.150.0.3", Vec::new(), 1),
-                member(9, "10.150.0.9", vec![3], 2),
+                Member {
+                    path_state: "fallback",
+                    unreachable: Some("10.150.0.3".parse().unwrap()),
+                    ..member(9, "10.150.0.9", vec![3], 2)
+                },
                 Member {
                     addresses: Vec::new(),
                     ..member(12, "10.150.0.12", Vec::new(), 1)
@@ -674,6 +730,24 @@ mod tests {
             rejected_advertisements: 2,
             overlaps: vec![IpNet::parse("192.168.1.0/24").unwrap()],
             address_conflicts: vec![(9, "10.150.0.5".parse().unwrap())],
+            paths: vec![
+                PathStatus {
+                    id: "peer:10.150.0.9".into(),
+                    target: PathTarget::Peer("10.150.0.9".parse().unwrap()),
+                    via: vec!["10.150.0.3".parse().unwrap()],
+                    state: "fallback",
+                    reason: Some(Reason::NoEcho),
+                    unreachable: Some("10.150.0.3".parse().unwrap()),
+                },
+                PathStatus {
+                    id: "subnet:192.168.20.0/24".into(),
+                    target: PathTarget::Subnet(IpNet::parse("192.168.20.0/24").unwrap()),
+                    via: vec!["10.150.0.3".parse().unwrap()],
+                    state: "active",
+                    reason: None,
+                    unreachable: None,
+                },
+            ],
             ..Snapshot::default()
         };
         let mut status = ManagedNetworkStatus::stopped("mesh-cn", "");
@@ -690,5 +764,24 @@ mod tests {
         assert_eq!(status.failure.as_ref().unwrap().detail, "44");
         assert_eq!(status.rejected_advertisements, 2);
         assert_eq!(status.alerts[0].code, AlertCode::AddressConflict);
+        assert_eq!(status.peers[0].path_state, "auto");
+        assert_eq!(status.peers[1].path_state, "fallback");
+        assert_eq!(
+            status.peers[1].unreachable,
+            Some("10.150.0.3".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(status.paths.len(), 2);
+        assert_eq!(status.paths[0].id, "peer:10.150.0.9");
+        assert_eq!(
+            status.paths[0].target,
+            ManagedPathTarget::Peer("10.150.0.9".parse().unwrap())
+        );
+        assert_eq!(status.paths[0].reason, Some("no_echo"));
+        assert_eq!(
+            status.paths[1].target,
+            ManagedPathTarget::Subnet("192.168.20.0/24".into())
+        );
+        assert_eq!(status.paths[1].state, "active");
+        assert_eq!(status.paths[1].reason, None);
     }
 }

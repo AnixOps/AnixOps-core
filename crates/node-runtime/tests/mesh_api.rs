@@ -87,10 +87,13 @@ fn network_status(network: &ManagedNetwork) -> ManagedNetworkStatus {
             hops: 1,
             latency_ms: Some(12),
             forward_secrecy: true,
+            path_state: "auto",
+            unreachable: None,
         }],
         rejected_advertisements: 0,
         overlaps: Vec::new(),
         alerts: Vec::new(),
+        paths: Vec::new(),
     }
 }
 
