@@ -1632,6 +1632,41 @@ impl RoutedOutbound {
     /// Names devices by the address their connections come from, for
     /// `DEVICE-NAME` rules, replacing the names given before. Returns whether
     /// they changed. Connections already open keep their route.
+    /// Sends every flow to an address that a joined mesh network routes
+    /// to that network's node, ahead of the rules and of every mode
+    /// (`mesh-status.md`, `tunnel.routes`).
+    pub fn set_mesh_routes(&self, routes: MeshRoutes) {
+        *self
+            .mesh_routes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(routes);
+    }
+
+    /// The mesh node for `target`, when it is an address a joined mesh
+    /// network routes and the profile has that network's node. A name is
+    /// left to the rules: intranet names come with the mesh DNS.
+    pub fn mesh_flow(&self, target: &TargetAddr) -> Option<(RouteInfo, Arc<dyn TcpOutbound>)> {
+        let TargetAddr::Ip(address) = target else {
+            return None;
+        };
+        let routes = self
+            .mesh_routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let id = routes(address.ip())?;
+        let node = self.nodes.get(&id)?.clone();
+        Some((
+            RouteInfo {
+                rule: MESH_RULE.to_string(),
+                chain: vec![id.clone()],
+                outbound: id,
+                reject: None,
+            },
+            node,
+        ))
+    }
+
     pub fn set_devices(&self, devices: BTreeMap<IpAddr, String>) -> bool {
         let mut current = self
             .devices
