@@ -24,8 +24,9 @@ pub const NETWORKCORE_IOS_SCHEMA_VERSION: u32 = crate::config::CONFIG_SCHEMA_VER
 /// `networkcore_ios_runtime_input_packets`, 5 added `networkcore_ios_checkup`,
 /// 6 added `networkcore_ios_capture_viewer`, 7 added the `capabilities`
 /// control command and, in builds with the `mesh` feature, mesh networks
-/// (`docs/architecture/mesh-status.md`). The version does not change with
-/// the `mesh` feature: clients read `capabilities.mesh` for that.
+/// (`docs/architecture/mesh-status.md`), and the config's `allow_mesh`
+/// (from 0.3.0-rc.2). The version does not change with the `mesh` feature
+/// or `allow_mesh`: clients read `capabilities.mesh` for that.
 pub const NETWORKCORE_IOS_FEATURE_SET_VERSION: u32 = 7;
 
 pub const NETWORKCORE_IOS_OK: i32 = 0;

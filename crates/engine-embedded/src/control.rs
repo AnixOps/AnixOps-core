@@ -33,7 +33,7 @@
 //! | `run_script` | `tag` | `{"scheduled": bool}` |
 //! | `outbound_health` | | `{"outbounds": [{"node", "protocol", "health"}]}`, only outbounds that report health |
 //! | `resume_outbound` | `node` | `{"resumed": bool}` |
-//! | `capabilities` | | `{"capabilities": {"mesh": bool}}`: whether this runtime answers `mesh_*` commands (`docs/architecture/mesh-status.md`): the VPN runtime ([`crate::EmbeddedRuntime::control_json`], every tunnel, WireGuard included) when built with the `mesh` feature, the desktop local proxy never; when not, every `mesh_*` command answers `{"ok": false, "error": {"code": "unsupported"}}` |
+//! | `capabilities` | | `{"capabilities": {"mesh": bool}}`: whether this runtime answers `mesh_*` commands (`docs/architecture/mesh-status.md`): the VPN runtime ([`crate::EmbeddedRuntime::control_json`], every tunnel, WireGuard included) when built with the `mesh` feature and its config sets `allow_mesh`, the desktop local proxy never; when not, every `mesh_*` command answers `{"ok": false, "error": {"code": "unsupported"}}` |
 //! | `metrics` | `anonymous` (optional bool) | `{"content_type", "text"}`: [`crate::metrics`] in the Prometheus text format |
 //! | `reload_rules` | `rules`, optional `dry_run` | `{"reloaded": bool, "rules", "generation"}` or `{"reloaded": false, "error": {"line", "code"}}` |
 //! | `outbound_reuse` | | `{"outbounds": [{"node", "protocol", "reuse"}]}`: connection pool (`mux`) and TLS resumption counters, only outbounds that keep them |

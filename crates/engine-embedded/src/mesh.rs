@@ -92,6 +92,9 @@ impl MeshBinding {
         // the engine once more.
         self.stopped.store(false, Ordering::SeqCst);
         let networks = lock(&self.built).clone();
+        // A profile without mesh outbounds, `allow_mesh: false` among them,
+        // commits the empty list: unsaved networks of an earlier profile
+        // stop.
         if networks.is_empty() {
             if let Some(engine) = SLOT.current() {
                 engine.registry().commit(Vec::new());
