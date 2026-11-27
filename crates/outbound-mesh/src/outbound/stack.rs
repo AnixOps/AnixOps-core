@@ -290,6 +290,8 @@ pub struct Instance {
     /// Shared with the pump, which holds the instance only weakly.
     wake: Arc<Notify>,
     snapshot: watch::Sender<Snapshot>,
+    /// Ticks when a driver starts or stops, or the network retires.
+    changes: watch::Sender<()>,
     epoch: Instant,
     /// The runtime drivers run on; `None` runs them on the caller's.
     runtime: Option<tokio::runtime::Handle>,
@@ -340,6 +342,7 @@ impl Instance {
             }),
             wake: Arc::new(Notify::new()),
             snapshot,
+            changes: watch::channel(()).0,
             epoch,
             runtime,
         })
@@ -379,6 +382,27 @@ impl Instance {
         self.snapshot.subscribe()
     }
 
+    /// Ticks when a driver starts or stops, or the network retires: the
+    /// moments [`Self::state`] and [`Self::is_retired`] change.
+    pub(crate) fn changes(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    /// Test hook: marks the network running with `snapshot` as its
+    /// driver's, without starting one.
+    #[cfg(test)]
+    pub(crate) fn pretend(&self, snapshot: Snapshot) {
+        self.lock().running = true;
+        self.snapshot.send_replace(snapshot);
+        self.changes.send_replace(());
+    }
+
+    /// Test hook: the networks this machine's driver would see as local.
+    #[cfg(test)]
+    pub(crate) fn local_networks(&self) -> Option<Vec<IpNet>> {
+        self.lock().local_networks.borrow().clone()
+    }
+
     /// Whether [`Self::retire`] stopped the network for good.
     pub fn is_retired(&self) -> bool {
         self.lock().retired
@@ -391,8 +415,15 @@ impl Instance {
     }
 
     /// The networks of this machine's interfaces, read by the engine.
+    /// The driver is told only when they changed.
     pub fn set_local_networks(&self, networks: Option<Vec<IpNet>>) {
-        self.lock().local_networks.send_replace(networks);
+        self.lock().local_networks.send_if_modified(|current| {
+            let changed = *current != networks;
+            if changed {
+                *current = networks;
+            }
+            changed
+        });
     }
 
     /// Subnets the user routes through the mesh although they overlap a
@@ -432,6 +463,7 @@ impl Instance {
             core.failure = None;
             core.run
         };
+        self.changes.send_replace(());
         // The guard is made here and moved into the task, so that it also
         // records the run as stopped when the runtime drops the task before
         // it was ever polled.
@@ -495,6 +527,8 @@ impl Instance {
         core.shutdown = None;
         core.to_driver = None;
         core.stack.abort_all();
+        drop(core);
+        self.changes.send_replace(());
     }
 
     /// Starts a TCP connection to `remote`.
@@ -618,6 +652,8 @@ impl Instance {
         core.shutdown = None;
         core.to_driver = None;
         core.stack.abort_all();
+        drop(core);
+        self.changes.send_replace(());
     }
 }
 

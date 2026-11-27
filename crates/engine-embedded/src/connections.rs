@@ -63,10 +63,13 @@ pub enum Mode {
     #[default]
     Rule,
     /// Every flow to the global target of a routing config (its outbound for
-    /// a config with one outbound).
+    /// a config with one outbound), but a flow to an address a joined mesh
+    /// network routes, which goes to that network (`mesh-status.md`).
     Global,
     /// Every flow direct, and every DNS server asked directly (the tunnel's
-    /// queries and the names of Fake-IP flows alike), `proxy` ones included.
+    /// queries and the names of Fake-IP flows alike), `proxy` ones included;
+    /// only a flow to an address a joined mesh network routes goes to that
+    /// network.
     Direct,
 }
 
@@ -998,15 +1001,31 @@ impl Dispatcher {
         http: Option<&HttpRequestHead>,
         guard: &ConnectionGuard,
     ) -> io::Result<(Arc<dyn TcpOutbound>, RouteInfo)> {
-        let (route, outbound) = match (mode, &self.routed) {
-            (Mode::Direct, _) => (direct_route(), Some(self.direct.clone())),
-            (Mode::Global, Some(routed)) => routed.route_global_flow().await,
-            (Mode::Rule, Some(routed)) => {
-                routed
-                    .route_network_flow(target, host, origin.process, network, http, origin.source)
-                    .await
+        // Mesh networks come ahead of every mode, not only of the rules.
+        let mesh = match (mode, &self.routed) {
+            (Mode::Direct | Mode::Global, Some(routed)) => routed.mesh_flow(target),
+            _ => None,
+        };
+        let (route, outbound) = if let Some((route, node)) = mesh {
+            (route, Some(node))
+        } else {
+            match (mode, &self.routed) {
+                (Mode::Direct, _) => (direct_route(), Some(self.direct.clone())),
+                (Mode::Global, Some(routed)) => routed.route_global_flow().await,
+                (Mode::Rule, Some(routed)) => {
+                    routed
+                        .route_network_flow(
+                            target,
+                            host,
+                            origin.process,
+                            network,
+                            http,
+                            origin.source,
+                        )
+                        .await
+                }
+                (_, None) => (single_route(&*self.outbound), Some(self.outbound.clone())),
             }
-            (_, None) => (single_route(&*self.outbound), Some(self.outbound.clone())),
         };
         let reject = route.reject.unwrap_or_default();
         guard.set_route(route.clone());

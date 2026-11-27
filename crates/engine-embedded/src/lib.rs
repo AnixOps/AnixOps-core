@@ -250,6 +250,10 @@ impl EmbeddedRuntime {
             .unwrap_or_default();
         let routed =
             config.build_routed_with_plugin_rules(registry, dialer.clone(), &plugin_rules)?;
+        #[cfg(feature = "mesh")]
+        if let (Some(routed), Some(routing)) = (&routed, &config.routing) {
+            mesh.route(routed, &routing.outbounds);
+        }
         let engine = match &routed {
             Some(routed) => Engine::Stack(Arc::new(config.build_dispatcher(
                 Some(routed.clone()),
@@ -428,6 +432,9 @@ impl EmbeddedRuntime {
     /// (moving to a new UDP socket) and `set_network`, and rejects every
     /// other request.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        if let Some(answer) = feature_control(request, cfg!(feature = "mesh")) {
+            return answer;
+        }
         #[cfg(feature = "mesh")]
         if let Some(answer) = self.mesh.control(request) {
             return answer;
@@ -595,5 +602,124 @@ pub(crate) fn build_interceptor(
 impl Drop for EmbeddedRuntime {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// `{"cmd": "capabilities"}`: what this runtime runs,
+/// `{"capabilities": {"mesh": bool}}` (`mesh-status.md`). `mesh` says
+/// whether this runtime answers `mesh_*` commands: the VPN runtime does when
+/// the engine is built with the `mesh` feature, the desktop local proxy
+/// never does. When it does not, every `mesh_*` command answers
+/// `unsupported` here. `None` for any other request.
+///
+/// `capabilities` is answered up to [`control::MAX_REQUEST_LEN`] bytes, like
+/// the other short commands; a `mesh_*` command up to
+/// [`control::MAX_RELOAD_REQUEST_LEN`], like the mesh commands it stands for.
+/// Longer requests go on to the other handlers, which refuse their length.
+/// A command name written with JSON escapes (`"capabilit\u0069es"`) is not
+/// guaranteed to be recognised: the byte test only finds it when the plain
+/// name also appears elsewhere in the request.
+pub(crate) fn feature_control(request: &[u8], mesh: bool) -> Option<Result<Vec<u8>, RuntimeError>> {
+    if !control::names(request, b"capabilities") && (mesh || !control::names(request, b"mesh_")) {
+        return None;
+    }
+    let name = control::command_name(request)?;
+    let answer = if name == "capabilities" {
+        if request.len() > control::MAX_REQUEST_LEN {
+            return None;
+        }
+        serde_json::json!({"capabilities": {"mesh": mesh}})
+    } else if !mesh && name.starts_with("mesh_") {
+        serde_json::json!({
+            "ok": false,
+            "error": {"code": "unsupported", "detail": "this runtime does not run mesh networks"},
+        })
+    } else {
+        return None;
+    };
+    Some(serde_json::to_vec(&answer).map_err(|_| {
+        RuntimeError::new(
+            RuntimeErrorCode::InternalError,
+            "capabilities answer could not be encoded",
+        )
+    }))
+}
+
+#[cfg(test)]
+mod feature_control_tests {
+    use super::feature_control;
+    use serde_json::{json, Value};
+
+    fn ask(request: &str, mesh: bool) -> Option<Value> {
+        feature_control(request.as_bytes(), mesh)
+            .map(|answer| serde_json::from_slice(&answer.unwrap()).unwrap())
+    }
+
+    #[test]
+    fn the_capabilities_say_whether_mesh_networks_are_answered() {
+        for mesh in [true, false] {
+            assert_eq!(
+                ask(r#"{"cmd":"capabilities"}"#, mesh),
+                Some(json!({"capabilities": {"mesh": mesh}}))
+            );
+            assert_eq!(
+                ask(r#"{"cmd":"traffic","note":"capabilities"}"#, mesh),
+                None
+            );
+            assert_eq!(ask(r#"["capabilities"]"#, mesh), None);
+            assert_eq!(ask(r#"{"cmd":"traffic"}"#, mesh), None);
+        }
+        // The mesh binding answers it.
+        assert_eq!(ask(r#"{"cmd":"mesh_status"}"#, true), None);
+        let refused = ask(r#"{"cmd":"mesh_status"}"#, false).unwrap();
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["error"]["code"], "unsupported");
+    }
+
+    #[test]
+    fn a_mesh_word_inside_another_command_is_not_a_mesh_command() {
+        assert_eq!(
+            ask(r#"{"cmd":"traffic","note":"mesh_status"}"#, false),
+            None
+        );
+        assert_eq!(ask(r#"{"note":"mesh_status"}"#, false), None);
+    }
+
+    #[test]
+    fn nested_values_and_oversized_requests_are_left_to_the_other_handlers() {
+        // Every field but `cmd` is skipped unread, however deep it nests.
+        let deep = format!(
+            r#"{{"cmd":"capabilities","x":{}1{}}}"#,
+            "[".repeat(1000),
+            "]".repeat(1000)
+        );
+        assert_eq!(
+            ask(&deep, false),
+            Some(json!({"capabilities": {"mesh": false}}))
+        );
+        let shallow = r#"{"x":[[{"cmd":"mesh_status"}]],"cmd":"capabilities"}"#;
+        assert_eq!(
+            ask(shallow, false),
+            Some(json!({"capabilities": {"mesh": false}}))
+        );
+        // `capabilities` is a short command.
+        let padded = |cmd: &str, length: usize| {
+            let head = format!(r#"{{"cmd":"{cmd}","pad":""#);
+            format!("{head}{}\"}}", "x".repeat(length - head.len() - 2))
+        };
+        let short = padded("capabilities", crate::control::MAX_REQUEST_LEN);
+        assert_eq!(short.len(), crate::control::MAX_REQUEST_LEN);
+        assert!(ask(&short, false).is_some());
+        let long = padded("capabilities", crate::control::MAX_REQUEST_LEN + 1);
+        assert_eq!(ask(&long, false), None);
+        // A `mesh_*` command is refused up to the mesh commands' limit.
+        let mesh = padded("mesh_status", crate::control::MAX_RELOAD_REQUEST_LEN);
+        assert_eq!(ask(&mesh, false).unwrap()["error"]["code"], "unsupported");
+        let mesh = padded("mesh_status", crate::control::MAX_RELOAD_REQUEST_LEN + 1);
+        assert_eq!(ask(&mesh, false), None);
+        // An escaped command name is not guaranteed to be recognised: alone,
+        // it misses the byte test; next to the plain name, it is read.
+        assert_eq!(ask(r#"{"cmd":"capabilit\u0069es"}"#, false), None);
+        assert!(ask(r#"{"cmd":"capabilit\u0069es","n":"capabilities"}"#, false).is_some());
     }
 }

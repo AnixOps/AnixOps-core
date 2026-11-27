@@ -33,6 +33,7 @@
 //! | `run_script` | `tag` | `{"scheduled": bool}` |
 //! | `outbound_health` | | `{"outbounds": [{"node", "protocol", "health"}]}`, only outbounds that report health |
 //! | `resume_outbound` | `node` | `{"resumed": bool}` |
+//! | `capabilities` | | `{"capabilities": {"mesh": bool}}`: whether this runtime answers `mesh_*` commands (`docs/architecture/mesh-status.md`): the VPN runtime ([`crate::EmbeddedRuntime::control_json`], every tunnel, WireGuard included) when built with the `mesh` feature, the desktop local proxy never; when not, every `mesh_*` command answers `{"ok": false, "error": {"code": "unsupported"}}` |
 //! | `metrics` | `anonymous` (optional bool) | `{"content_type", "text"}`: [`crate::metrics`] in the Prometheus text format |
 //! | `reload_rules` | `rules`, optional `dry_run` | `{"reloaded": bool, "rules", "generation"}` or `{"reloaded": false, "error": {"line", "code"}}` |
 //! | `outbound_reuse` | | `{"outbounds": [{"node", "protocol", "reuse"}]}`: connection pool (`mux`) and TLS resumption counters, only outbounds that keep them |
@@ -944,6 +945,31 @@ fn decode_key(key_base64: &str) -> Result<Vec<u8>, RuntimeError> {
     base64::engine::general_purpose::STANDARD
         .decode(key_base64.trim())
         .map_err(|_| storage_error(capture::storage::StorageError::InvalidKey))
+}
+
+/// Whether `needle` occurs anywhere in `request`: a cheap test before a
+/// request is parsed for a command that names itself.
+pub(crate) fn names(request: &[u8], needle: &[u8]) -> bool {
+    request.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The `cmd` of a request that is a JSON object of at most
+/// [`MAX_RELOAD_REQUEST_LEN`] bytes; `None` for any other request. Every
+/// other field is skipped unread, nested values included.
+pub(crate) fn command_name(request: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(default)]
+        cmd: Option<String>,
+    }
+    if request.len() > MAX_RELOAD_REQUEST_LEN {
+        return None;
+    }
+    // An object only: the derived reader would also take an array.
+    if request.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    serde_json::from_slice::<Head>(request).ok()?.cmd
 }
 
 /// Answers a request to a whole-device WireGuard tunnel, which has no flows

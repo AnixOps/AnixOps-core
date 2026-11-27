@@ -16,6 +16,8 @@
 //! runtime that answered them then holds it until it stops, so that a
 //! network saved while only the proxy runs keeps running.
 
+use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -23,9 +25,11 @@ use engine_outbound::registry::OutboundRegistry;
 use outbound_mesh::outbound::control;
 use outbound_mesh::outbound::engine::{EngineHold, EngineSlot, MeshEngine, GRACE};
 use outbound_mesh::outbound::MeshFactory;
-use outbound_mesh::{MeshSettings, TYPE_NAME};
+use outbound_mesh::{IpNet, MeshSettings, TYPE_NAME};
 use serde_json::{json, Value};
 
+use crate::config::OutboundConfig;
+use crate::routing::RoutedOutbound;
 use crate::{RuntimeError, RuntimeErrorCode};
 
 /// The mesh engine of this process.
@@ -101,7 +105,12 @@ impl MeshBinding {
             *hold = SLOT.acquire().ok();
         }
         if let Some(hold) = &*hold {
-            hold.engine().registry().commit(networks);
+            let engine = hold.engine();
+            engine.registry().commit(networks);
+            // The tunnel started: this machine's networks are read again.
+            if !engine.read_local_networks(Arc::new(local_networks)) {
+                engine.reread_local_networks();
+            }
         }
     }
 
@@ -112,17 +121,62 @@ impl MeshBinding {
         lock(&self.hold).take();
     }
 
+    /// Sends the flows to every address a joined mesh network routes
+    /// (its `tunnel.routes`) to that network's node of `outbounds`, ahead
+    /// of the rules and of every mode. A network the profile has no node
+    /// for is left to the rules.
+    pub(crate) fn route(
+        &self,
+        routed: &RoutedOutbound,
+        outbounds: &BTreeMap<String, OutboundConfig>,
+    ) {
+        let tags = mesh_tags(outbounds);
+        if tags.is_empty() {
+            return;
+        }
+        routed.set_mesh_routes(Arc::new(move |address: IpAddr| {
+            let engine = SLOT.current()?;
+            let network = engine.registry().network_for(address)?;
+            tags.get(&network).cloned()
+        }));
+    }
+
+    /// Reads this machine's interface networks again for the mesh
+    /// networks (spec §15.4), on the mesh engine's thread: an advertised
+    /// subnet that overlaps one is not routed into the mesh. The engine
+    /// also reads them every 30 seconds (every 5 until a read succeeds);
+    /// the client's network change asks for a read at once.
+    fn refresh_local_networks(&self) {
+        if let Some(engine) = SLOT.current() {
+            engine.reread_local_networks();
+        }
+    }
+
     /// Answers a `mesh_*` request; `None` for any other request.
     ///
     /// `{"cmd": "mesh_engine_stop"}`: the user closed the VPN; lets go of
     /// the engine and stops it at once unless another runtime holds it
     /// (`stopped` says whether it stopped).
     pub(crate) fn control(&self, request: &[u8]) -> Option<Result<Vec<u8>, RuntimeError>> {
-        // Cheap test before parsing: every mesh command names itself.
-        if !contains(request, b"mesh_") {
+        // The client reports a network change: the interface networks are
+        // read again, and the request goes on to the engine's own handler.
+        // Cheap test before parsing: both commands end in `_network`; a
+        // name written with JSON escapes is not recognised, and the
+        // periodic read catches up with the change.
+        if crate::control::names(request, b"_network")
+            && matches!(
+                crate::control::command_name(request).as_deref(),
+                Some("set_network" | "reset_network")
+            )
+        {
+            self.refresh_local_networks();
             return None;
         }
-        let name = control::command_name(request)?;
+        // Cheap test before parsing: every mesh command names itself.
+        if !crate::control::names(request, b"mesh_") {
+            return None;
+        }
+        let name = crate::control::command_name(request)?;
         if name == "mesh_engine_stop" {
             if let Some(hold) = lock(&self.hold).take() {
                 hold.close();
@@ -163,14 +217,175 @@ impl MeshBinding {
         if hold.is_none() {
             *hold = SLOT.acquire().ok();
         }
-        hold.as_ref().map(|hold| hold.engine().clone())
+        let engine = hold.as_ref().map(|hold| hold.engine().clone())?;
+        // A network saved while only the proxy runs needs them too.
+        engine.read_local_networks(Arc::new(local_networks));
+        Some(engine)
     }
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+/// The node id of each mesh network in `outbounds`, by `network.name`;
+/// the first id wins when two nodes name one network.
+fn mesh_tags(outbounds: &BTreeMap<String, OutboundConfig>) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    for (id, outbound) in outbounds {
+        if outbound.kind != TYPE_NAME || outbound.via.is_some() {
+            continue;
+        }
+        let name = outbound
+            .settings
+            .get("network")
+            .and_then(|network| network.get("name"))
+            .and_then(Value::as_str);
+        if let Some(name) = name {
+            tags.entry(name.to_string()).or_insert_with(|| id.clone());
+        }
+    }
+    tags
+}
+
+/// The networks of this machine's interfaces but loopback and the tunnel's
+/// own, with their prefix lengths; `None` when they cannot be read, so that
+/// no advertised subnet is routed into the mesh until a read succeeds (spec
+/// §15.4). The tunnel's interface is the one that carries any of `own`, the
+/// mesh networks' virtual addresses: until the client has given it those
+/// addresses, its other address ranges count as this machine's (an
+/// advertised subnet overlapping them stays local; `mesh-status.md`). A
+/// network wider than /8 or /7 (such as a missing or empty mask) is left
+/// out.
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android"
+))]
+fn local_networks(own: &[IpAddr]) -> Option<Vec<IpNet>> {
+    use std::ffi::CStr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn prefix_of(mask: &[u8]) -> u8 {
+        let ones: u32 = mask.iter().map(|byte| byte.count_ones()).sum();
+        u8::try_from(ones).unwrap_or(u8::MAX)
+    }
+
+    /// `N` bytes of a socket address from getifaddrs, from byte `offset`
+    /// on. Apple systems may hand out a mask shorter than its family's
+    /// address: the bytes past its `sa_len` read as zero.
+    fn bytes<const N: usize>(address: *const libc::sockaddr, offset: usize) -> [u8; N] {
+        let mut out = [0u8; N];
+        // SAFETY: a socket address from getifaddrs is valid for its length
+        // (`sa_len` on Apple systems, its family's size elsewhere), which
+        // the caller picked `offset + N` within.
+        unsafe {
+            #[cfg(any(target_os = "ios", target_os = "macos"))]
+            let length = usize::from((*address).sa_len);
+            #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+            let length = offset + N;
+            if length > offset {
+                std::ptr::copy_nonoverlapping(
+                    address.cast::<u8>().add(offset),
+                    out.as_mut_ptr(),
+                    (length - offset).min(N),
+                );
+            }
+        }
+        out
+    }
+
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list freed below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+    // Every address of an interface that is up, but loopback, with the
+    // interface's name.
+    let mut found: Vec<(String, IpAddr, u8)> = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` points into the list getifaddrs returned.
+        let entry = unsafe { &*cursor };
+        cursor = entry.ifa_next;
+        if entry.ifa_addr.is_null() || entry.ifa_netmask.is_null() || entry.ifa_name.is_null() {
+            continue;
+        }
+        if entry.ifa_flags & (libc::IFF_LOOPBACK as libc::c_uint) != 0
+            || entry.ifa_flags & (libc::IFF_UP as libc::c_uint) == 0
+        {
+            continue;
+        }
+        // SAFETY: a non-null name from getifaddrs is a C string.
+        let name = unsafe { CStr::from_ptr(entry.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: a non-null address from getifaddrs.
+        let family = libc::c_int::from(unsafe { (*entry.ifa_addr).sa_family });
+        // The IPv4 address sits at byte 4 of `sockaddr_in`, the IPv6 one at
+        // byte 8 of `sockaddr_in6`.
+        let address = match family {
+            libc::AF_INET => Some((
+                IpAddr::V4(Ipv4Addr::from(bytes::<4>(entry.ifa_addr, 4))),
+                prefix_of(&bytes::<4>(entry.ifa_netmask, 4)),
+            )),
+            libc::AF_INET6 => {
+                let mut address = bytes::<16>(entry.ifa_addr, 8);
+                // Apple kernels keep the scope of a link-local address in
+                // bytes 2 and 3.
+                if address[0] == 0xfe && address[1] & 0xc0 == 0x80 {
+                    address[2] = 0;
+                    address[3] = 0;
+                }
+                Some((
+                    IpAddr::V6(Ipv6Addr::from(address)),
+                    prefix_of(&bytes::<16>(entry.ifa_netmask, 8)),
+                ))
+            }
+            _ => None,
+        };
+        found.extend(address.map(|(address, prefix)| (name, address, prefix)));
+    }
+    // SAFETY: `head` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    Some(interface_networks(found, own))
+}
+
+/// The networks of `found` (interface name, address, prefix length) but
+/// those of an interface that carries any of `own`, and those wider than
+/// /8 (IPv4) or /7 (IPv6). A physical interface that carries one of the
+/// mesh addresses (an address conflict) is left out whole, like the
+/// tunnel's.
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android"
+))]
+fn interface_networks(found: Vec<(String, IpAddr, u8)>, own: &[IpAddr]) -> Vec<IpNet> {
+    let tunnel: std::collections::BTreeSet<&str> = found
+        .iter()
+        .filter(|(_, address, _)| own.contains(address))
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    found
+        .iter()
+        .filter(|(name, address, prefix)| {
+            // Wider than /8 or /7 (a default route split in halves or
+            // quarters, an empty mask): not a network of this machine
+            // (spec §15.4 leaves out prefixes shorter than /8 and /7).
+            let widest = if address.is_ipv4() { 8 } else { 7 };
+            *prefix >= widest && !tunnel.contains(name.as_str())
+        })
+        .filter_map(|(_, address, prefix)| IpNet::new(*address, *prefix))
+        .collect()
+}
+
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android"
+)))]
+fn local_networks(_own: &[IpAddr]) -> Option<Vec<IpNet>> {
+    None
 }
 
 fn encode(answer: &Value) -> Result<Vec<u8>, RuntimeError> {
@@ -197,6 +412,76 @@ mod tests {
         .as_object()
         .unwrap()
         .clone()
+    }
+
+    #[test]
+    fn a_mesh_command_longer_than_the_limit_goes_on_to_the_other_handlers() {
+        // Refused for its length there; the engine is never looked up.
+        let head = r#"{"cmd":"mesh_status","pad":""#;
+        let length = crate::control::MAX_RELOAD_REQUEST_LEN + 1;
+        let request = format!("{head}{}\"}}", "x".repeat(length - head.len() - 2));
+        assert_eq!(request.len(), length);
+        assert!(MeshBinding::default().control(request.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn mesh_nodes_are_found_by_network_name() {
+        let outbounds: BTreeMap<String, OutboundConfig> = serde_json::from_value(json!({
+            "mesh-b": {"type": "mesh", "network": {"name": "office"}},
+            "mesh-a": {"type": "mesh", "network": {"name": "office"}},
+            "mesh-c": {"type": "mesh", "network": {"name": "lab"}},
+            "chained": {"type": "mesh", "network": {"name": "home"}, "via": "proxy"},
+            "proxy": {"type": "socks", "network": {"name": "home"}},
+        }))
+        .unwrap();
+        let tags = mesh_tags(&outbounds);
+        assert_eq!(
+            tags,
+            BTreeMap::from([
+                ("lab".to_string(), "mesh-c".to_string()),
+                ("office".to_string(), "mesh-a".to_string()),
+            ])
+        );
+    }
+
+    #[cfg(any(
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android"
+    ))]
+    #[test]
+    fn the_tunnels_interface_and_empty_masks_are_left_out() {
+        let found = |name: &str, address: &str, prefix: u8| {
+            (name.to_owned(), address.parse::<IpAddr>().unwrap(), prefix)
+        };
+        let networks = super::interface_networks(
+            vec![
+                found("en0", "192.168.1.20", 24),
+                found("en0", "fe80::1", 64),
+                // The tunnel: it carries a mesh address, so its other
+                // ranges go too.
+                found("utun4", "10.157.0.2", 24),
+                found("utun4", "fd00:4e43::1", 64),
+                found("utun4", "172.19.0.1", 30),
+                // An empty mask (an Apple `sa_len` of 0).
+                found("en1", "10.0.0.5", 0),
+                found("en1", "10.0.0.5", 7),
+                found("en1", "fd00::5", 6),
+                found("en2", "10.0.0.6", 8),
+            ],
+            &["10.157.0.2".parse().unwrap()],
+        );
+        assert_eq!(
+            networks,
+            [
+                IpNet::new("192.168.1.20".parse().unwrap(), 24).unwrap(),
+                IpNet::new("fe80::1".parse().unwrap(), 64).unwrap(),
+                IpNet::new("10.0.0.6".parse().unwrap(), 8).unwrap(),
+            ]
+        );
+        // Real interfaces can be read here.
+        assert!(super::local_networks(&[]).is_some());
     }
 
     /// One test for the process's engine slot, so that no other test
@@ -228,6 +513,24 @@ mod tests {
         assert!(SLOT.current().is_none());
         first.commit();
         let engine = SLOT.current().expect("the engine runs");
+        // A network change asks the engine for a read of this machine's
+        // networks and goes on to the engine's own handler.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.local_reads() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = engine.local_reads();
+        assert!(before > 0, "the tunnel's start reads them");
+        assert!(first
+            .control(br#"{"cmd":"set_network","type":"wifi"}"#)
+            .is_none());
+        while engine.local_reads() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            engine.local_reads() > before,
+            "set_network reads them again"
+        );
         let instance = engine.registry().networks()[0]
             .instance
             .clone()
