@@ -254,18 +254,25 @@ impl EmbeddedRuntime {
         if let (Some(routed), Some(routing)) = (&routed, &config.routing) {
             mesh.route(routed, &routing.outbounds);
         }
+        // The intranet names of the mesh networks, answered in the tunnel
+        // of a stack engine (a WireGuard tunnel takes no such answers).
+        #[cfg(feature = "mesh")]
+        let mesh_dns = || mesh.dns(config.allow_mesh);
+        #[cfg(not(feature = "mesh"))]
+        let mesh_dns = || None;
         let engine = match &routed {
-            Some(routed) => Engine::Stack(Arc::new(config.build_dispatcher(
-                Some(routed.clone()),
-                registry,
-                dialer,
-            )?)),
+            Some(routed) => Engine::Stack(Arc::new(
+                config
+                    .build_dispatcher(Some(routed.clone()), registry, dialer)?
+                    .with_mesh_dns(mesh_dns()),
+            )),
             None => match config.build_mode(registry, dialer.clone())? {
                 TunnelMode::Stack(outbound) => {
                     let dispatcher = Dispatcher::single(outbound)
                         .with_direct(Arc::new(direct::DirectOutbound::new(dialer)))
                         .with_redirects(config.redirect_table()?)
-                        .with_fake_ip(config.runtime_fake_ip_pool()?);
+                        .with_fake_ip(config.runtime_fake_ip_pool()?)
+                        .with_mesh_dns(mesh_dns());
                     dispatcher.set_mode(config.mode);
                     dispatcher.set_block_quic(config.block_quic);
                     Engine::Stack(Arc::new(dispatcher))

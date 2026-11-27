@@ -190,6 +190,37 @@ pub fn header_of(message: &[u8]) -> Option<(u16, bool, u8)> {
     ))
 }
 
+/// The question name of a query [`Query::parse`] refused, lower-cased,
+/// when the name itself can be read; `None` for a response or a message
+/// without a readable question.
+pub fn question_labels(message: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if message.len() < HEADER_LEN || message[2] & 0x80 != 0 {
+        return None;
+    }
+    if u16::from_be_bytes([message[4], message[5]]) == 0 {
+        return None;
+    }
+    let mut at = HEADER_LEN;
+    let mut labels = Vec::new();
+    let mut wire = 1;
+    loop {
+        let len = usize::from(*message.get(at)?);
+        at += 1;
+        if len == 0 {
+            return Some(labels);
+        }
+        if len > 63 {
+            return None;
+        }
+        wire += len + 1;
+        if wire > MAX_NAME_WIRE {
+            return None;
+        }
+        labels.push(message.get(at..at + len)?.to_ascii_lowercase());
+        at += len;
+    }
+}
+
 /// An answer with no question section, for a query that could not be read.
 pub fn bare_answer(id: u16, rd: bool, opcode: u8, rcode: Rcode) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN);

@@ -671,7 +671,14 @@ pub struct Dispatcher {
     /// The DNS answers and upstream connections of the tunnels running on
     /// this dispatcher, for [`Dispatcher::reset_dns`].
     tunnel_dns: Mutex<Vec<TunnelDns>>,
+    /// Answers the queries for the mesh networks' intranet names; see
+    /// [`Dispatcher::with_mesh_dns`].
+    mesh_dns: Option<MeshDns>,
 }
+
+/// Answers a DNS query (UDP message) for an intranet name of a mesh
+/// network; `None` for any other query (`mesh-status.md`, `tunnel.dns`).
+pub type MeshDns = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
 /// A running tunnel's DNS cache and upstream connection pools.
 type TunnelDns = (Weak<Mutex<DnsCache>>, Weak<DnsPools>);
@@ -702,6 +709,7 @@ impl Dispatcher {
             block_quic: AtomicBool::new(false),
             server_first: Arc::default(),
             tunnel_dns: Mutex::default(),
+            mesh_dns: None,
         }
     }
 
@@ -720,7 +728,24 @@ impl Dispatcher {
             block_quic: AtomicBool::new(false),
             server_first: Arc::default(),
             tunnel_dns: Mutex::default(),
+            mesh_dns: None,
         }
+    }
+
+    /// Answers the tunnel's queries for the mesh networks' intranet names
+    /// with `dns`, ahead of the hosts, the DNS rules, Fake-IP and every
+    /// upstream (spec §15.9.2 item 8): such a query never leaves the
+    /// device.
+    pub fn with_mesh_dns(mut self, dns: Option<MeshDns>) -> Self {
+        self.mesh_dns = dns;
+        self
+    }
+
+    /// The answer to `message` when it asks for an intranet name of a mesh
+    /// network; `None` for any other query, and always without
+    /// [`Self::with_mesh_dns`].
+    pub fn mesh_dns(&self, message: &[u8]) -> Option<Vec<u8>> {
+        (self.mesh_dns.as_ref()?)(message)
     }
 
     /// Sends flows to the addresses of `pool` out by the name each address

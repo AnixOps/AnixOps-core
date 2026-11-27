@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine_outbound::registry::OutboundRegistry;
+use outbound_mesh::dns::message::Transport;
 use outbound_mesh::outbound::control;
 use outbound_mesh::outbound::engine::{EngineHold, EngineSlot, MeshEngine, GRACE};
 use outbound_mesh::outbound::MeshFactory;
@@ -29,6 +30,7 @@ use outbound_mesh::{IpNet, MeshSettings, TYPE_NAME};
 use serde_json::{json, Value};
 
 use crate::config::OutboundConfig;
+use crate::connections::MeshDns;
 use crate::routing::RoutedOutbound;
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -52,6 +54,8 @@ pub(crate) struct MeshBinding {
     /// again, so that a host that stopped the tunnel but keeps the runtime
     /// cannot keep the mesh running with the VPN closed.
     stopped: AtomicBool,
+    /// The runtime's tunnel answers the intranet names ([`Self::dns`]).
+    answers_dns: AtomicBool,
 }
 
 /// The registry of an engine a runtime looked up for a command.
@@ -144,6 +148,26 @@ impl MeshBinding {
         }));
     }
 
+    /// The tunnel's answers to queries for the intranet names of every
+    /// running network of the engine (`tunnel.dns`, spec §15.9.2 item 8),
+    /// when `allowed` (the config's `allow_mesh`): every domain the
+    /// snapshot lists in `tunnel.dns.matchDomains` is answered there, whether
+    /// or not the profile has a node for its network, so that no such query
+    /// leaves the device. Connections to the addresses still go by
+    /// `tunnel.routes` and the rules. A runtime whose tunnel takes no such
+    /// answers (a WireGuard tunnel) reports `tunnel.dns` as `null`.
+    pub(crate) fn dns(&self, allowed: bool) -> Option<MeshDns> {
+        if !allowed {
+            return None;
+        }
+        self.answers_dns.store(true, Ordering::SeqCst);
+        Some(Arc::new(|message: &[u8]| {
+            SLOT.current()?
+                .registry()
+                .answer_dns(message, Transport::Udp)
+        }))
+    }
+
     /// Reads this machine's interface networks again for the mesh
     /// networks (spec §15.4), on the mesh engine's thread: an advertised
     /// subnet that overlaps one is not routed into the mesh. The engine
@@ -206,7 +230,19 @@ impl MeshBinding {
             };
             engine.map(Engine)
         });
-        Some(encode(&answer))
+        Some(encode(&self.without_unanswered_dns(answer)))
+    }
+
+    /// `answer` with `tunnel.dns` set to `null` when the runtime's tunnel
+    /// does not answer the intranet names: a client must not send their
+    /// queries to a tunnel that would pass them on.
+    fn without_unanswered_dns(&self, mut answer: Value) -> Value {
+        if !self.answers_dns.load(Ordering::SeqCst) {
+            if let Some(tunnel) = answer.get_mut("tunnel").and_then(Value::as_object_mut) {
+                tunnel.insert("dns".to_owned(), Value::Null);
+            }
+        }
+        answer
     }
 
     /// The running engine, started and held by this runtime when none runs
@@ -425,6 +461,43 @@ mod tests {
         let request = format!("{head}{}\"}}", "x".repeat(length - head.len() - 2));
         assert_eq!(request.len(), length);
         assert!(MeshBinding::default().control(request.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn only_a_runtime_whose_tunnel_answers_the_names_reports_them() {
+        let status = || {
+            json!({
+                "statusVersion": 1,
+                "tunnel": {
+                    "routes": [],
+                    "routesVersion": 2,
+                    "dns": {"servers": ["198.18.0.2", "fd00::53"], "matchDomains": ["mesh.internal"]},
+                },
+            })
+        };
+        // Without `allow_mesh` no answers, and none reported.
+        let binding = MeshBinding::default();
+        assert!(binding.dns(false).is_none());
+        let reported = binding.without_unanswered_dns(status());
+        assert_eq!(reported["tunnel"]["dns"], Value::Null);
+        assert_eq!(reported["tunnel"]["routesVersion"], 2);
+        // A tunnel that takes the answers reports them as they are.
+        let binding = MeshBinding::default();
+        let dns = binding.dns(true).expect("answers with allow_mesh");
+        assert_eq!(binding.without_unanswered_dns(status()), status());
+        // Other answers are left alone.
+        let other = json!({"ok": true});
+        assert_eq!(
+            MeshBinding::default().without_unanswered_dns(other.clone()),
+            other
+        );
+        // Without a running engine nothing is answered.
+        if SLOT.current().is_none() {
+            assert_eq!(
+                dns(&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]),
+                None
+            );
+        }
     }
 
     #[test]

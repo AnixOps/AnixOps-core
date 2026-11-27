@@ -40,6 +40,22 @@ pub struct Joined<'a> {
 pub struct Tunnel<'a> {
     pub routes: &'a [IpNet],
     pub routes_version: u64,
+    /// `tunnel.dns.matchDomains`; `tunnel.dns` is `null` when empty.
+    pub dns_domains: &'a [String],
+}
+
+/// `tunnel.dns.servers`: the DNS addresses inside the tunnel that the
+/// embedded engine answers itself (the client's tunnel DNS, IPv4 first):
+/// never a member's address or a public resolver, so that a query for an
+/// intranet name never leaves the tunnel.
+pub const TUNNEL_DNS_SERVERS: [&str; 2] = ["198.18.0.2", "fd00::53"];
+
+/// `tunnel.dns`: `null` while no network answers names.
+fn tunnel_dns(domains: &[String]) -> Value {
+    if domains.is_empty() {
+        return Value::Null;
+    }
+    json!({"servers": TUNNEL_DNS_SERVERS, "matchDomains": domains})
 }
 
 /// `network.state` (snapshot «取值»).
@@ -90,8 +106,7 @@ pub fn snapshot(
         "tunnel": {
             "routes": tunnel.routes.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "routesVersion": tunnel.routes_version,
-            // Intranet names are answered once the engine serves them.
-            "dns": Value::Null,
+            "dns": tunnel_dns(tunnel.dns_domains),
         },
     })
 }
@@ -129,8 +144,10 @@ fn network(view: &NetworkView<'_>) -> Value {
             crate::config::RoutePolicy::Hops => "hops",
             crate::config::RoutePolicy::Latency => "latency",
         },
-        "dnsSuffix": Value::Null,
-        "dnsEnabled": false,
+        // The names this device uses: the network's `dns` section, with
+        // the local `mesh_set_dns` override applied.
+        "dnsSuffix": settings.dns.suffix,
+        "dnsEnabled": settings.dns.enabled,
     })
 }
 
@@ -369,6 +386,7 @@ mod tests {
         let tunnel = Tunnel {
             routes: &[],
             routes_version: 1,
+            dns_domains: &[],
         };
         let value = snapshot(&view, std::slice::from_ref(&view), &tunnel);
         assert_eq!(value["statusVersion"], 1);
@@ -416,6 +434,7 @@ mod tests {
         let tunnel = Tunnel {
             routes: &[],
             routes_version: 1,
+            dns_domains: &[],
         };
         let value = snapshot(&view, std::slice::from_ref(&view), &tunnel);
         let advertisers = &value["subnets"][0]["advertisers"];
@@ -471,11 +490,20 @@ mod tests {
         };
         // `Registry::tunnel_routes` gives them.
         let routes = [net("10.144.0.0/24"), net("192.168.10.0/24")];
+        let domains = ["mesh.internal".to_owned(), "144.10.in-addr.arpa".to_owned()];
         let tunnel = Tunnel {
             routes: &routes,
             routes_version: 4,
+            dns_domains: &domains,
         };
         let value = snapshot(&view, std::slice::from_ref(&view), &tunnel);
+        assert_eq!(
+            value["tunnel"]["dns"],
+            json!({
+                "servers": ["198.18.0.2", "fd00::53"],
+                "matchDomains": ["mesh.internal", "144.10.in-addr.arpa"],
+            })
+        );
         assert_eq!(value["network"]["state"], "joined");
         assert_eq!(value["network"]["security"], "forward_secrecy");
         assert_eq!(value["network"]["limitations"], json!(["reference_peers"]));
@@ -581,6 +609,7 @@ mod tests {
         let tunnel = Tunnel {
             routes: &[],
             routes_version: 1,
+            dns_domains: &[],
         };
         let text = snapshot(&view, std::slice::from_ref(&view), &tunnel).to_string();
         assert!(!text.contains("s3cr3t"));
