@@ -14,6 +14,17 @@
 - `engine-embedded` 默认 feature 加入 `mesh`，`networkcore_ios_feature_set_version` 升到 7。rc.1「未启用与未审计功能」中「嵌入式引擎的 `"type": "mesh"` 出站不在默认 feature 中」一条不再适用。
 - 判断某个运行实例能否使用组网，以控制命令 `capabilities` 返回的 `capabilities.mesh` 为准；为 `false` 时所有 `mesh_*` 命令返回 `unsupported`（rc.1 中为 `invalid_argument`）。
 - `mesh_set_dns` 在内网域名接入嵌入式引擎之前返回 `unsupported`。
+- `feature_set_version` 7 只说明接口集，不代表组网可用；`allow_mesh` 从本版起才被接受，rc.1 不认识这个字段。
+- `anixcore` 与独立节点 `anixops-mesh` 的行为不变，默认组网能力集仍正好是 `mesh`、`mesh_dns`、`mesh_resolver_address`、`mesh_native_keys`。
+
+### 已知未完成
+
+以下各项不影响本候选版；客户端打开组网发布门槛之前，必须先处理前两项。审计报告见 `mesh/audits/` 下 2026-11-26-embedded-413、2026-11-26-split-421、2026-11-27-split-423、2026-11-27-enable-424、2026-11-27-allow-mesh-425。
+
+- 嵌入式引擎的组网内网域名（第二步 2e）。
+- 隧道网卡地址段始终算作本机网段（审计 N2，处理方案待客户端确认）。
+- 分流跟随任务超时中止时的竞态（审计 N14）与 L10。
+- 独立节点从 `legacy` 网络收回子网，留到 rc.2 之后。
 
 ### Mesh
 
