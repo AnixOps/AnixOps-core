@@ -138,7 +138,7 @@ impl HostRoutes {
                 ));
             }
         }
-        entries.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+        entries.sort_by_key(|a| (a.0, a.1, a.2, a.3));
         let mut owners: BTreeMap<&str, Arc<str>> = BTreeMap::new();
         let table: Vec<Entry> = entries
             .into_iter()
