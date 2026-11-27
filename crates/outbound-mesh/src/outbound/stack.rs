@@ -31,6 +31,7 @@ use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use tokio::sync::{mpsc, watch, Notify};
 
+use crate::dns::DnsSettings;
 use crate::driver::{self, Channels, Listeners, Snapshot};
 use crate::secure::noise::KeyPair;
 use crate::{IpNet, MeshSettings};
@@ -277,6 +278,9 @@ struct Core {
     local_networks: watch::Sender<Option<Vec<IpNet>>>,
     route_overrides: watch::Sender<Vec<IpNet>>,
     native_keys: watch::Sender<Option<Vec<[u8; 32]>>>,
+    /// The `dns` settings in force: the settings' section with the local
+    /// override (`mesh_set_dns`) applied, changed without a restart.
+    dns: watch::Sender<DnsSettings>,
     next_port: u16,
     /// Stopped for good: newer settings replaced the network.
     retired: bool,
@@ -323,6 +327,7 @@ impl Instance {
         let (local_networks, _) = watch::channel(None);
         let (route_overrides, _) = watch::channel(Vec::new());
         let (native_keys, _) = watch::channel(settings.native_keys.clone());
+        let (dns, _) = watch::channel(settings.dns.clone());
         let (snapshot, _) = watch::channel(Snapshot::default());
         Arc::new(Self {
             settings,
@@ -337,6 +342,7 @@ impl Instance {
                 local_networks,
                 route_overrides,
                 native_keys,
+                dns,
                 next_port,
                 retired: false,
             }),
@@ -430,6 +436,24 @@ impl Instance {
     /// network of this machine (spec §15.4).
     pub fn set_route_overrides(&self, overrides: Vec<IpNet>) {
         self.lock().route_overrides.send_replace(overrides);
+    }
+
+    /// The `dns` settings in force, `mesh_set_dns` applied: a running
+    /// driver takes them without a restart, a later one starts with them.
+    pub fn set_dns(&self, dns: DnsSettings) {
+        self.lock().dns.send_if_modified(|current| {
+            let changed = *current != dns;
+            if changed {
+                *current = dns;
+            }
+            changed
+        });
+    }
+
+    /// The `dns` settings in force.
+    #[cfg(test)]
+    pub(crate) fn dns(&self) -> DnsSettings {
+        self.lock().dns.borrow().clone()
     }
 
     /// Starts the network if it does not run; needs a Tokio runtime unless
@@ -663,7 +687,7 @@ impl Instance {
 /// such as when its runtime shuts down; otherwise `running` would stay set
 /// and every later connection would wait for a driver that is gone.
 async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
-    let settings = instance.settings.clone();
+    let mut settings = instance.settings.clone();
     let listeners = match Listeners::bind(&settings).await {
         Ok(listeners) => listeners,
         Err(_) => {
@@ -678,9 +702,9 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     // system's, so they never compete with the mesh routes.
     let (foreign_routes_tx, foreign_routes) = watch::channel(Vec::new());
     // The engine restarts the instance for a new configuration, so the
-    // `dns` section and the host groups the settings carry never change
-    // while it runs; the senders only keep the receivers open.
-    let (dns_tx, dns) = watch::channel(settings.dns.clone());
+    // host groups the settings carry never change while it runs; the
+    // sender only keeps the receiver open. The `dns` settings change with
+    // `mesh_set_dns` ([`Instance::set_dns`]).
     let (host_groups_tx, host_groups) = watch::channel(settings.host_groups.clone());
     // Custom paths likewise come with the settings.
     let (paths_tx, paths) = watch::channel(Vec::new());
@@ -691,6 +715,11 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
         }
         core.shutdown = Some(shutdown_tx);
         core.to_driver = Some(to_driver);
+        // The driver starts with the settings in force, read under the
+        // lock `set_dns` takes: the receiver has seen that value, and any
+        // later `set_dns` is a change the driver applies once it runs.
+        let dns = core.dns.subscribe();
+        settings.dns = dns.borrow().clone();
         Channels {
             from_interface,
             to_interface,
@@ -712,7 +741,7 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
     drop(instance);
     tokio::spawn(pump(weak.clone(), wake, run, from_driver));
     let result = driver::run(settings, key, listeners, channels).await;
-    drop((foreign_routes_tx, dns_tx, host_groups_tx, paths_tx));
+    drop((foreign_routes_tx, host_groups_tx, paths_tx));
     // The driver only ends on its own after an error: a shutdown comes from
     // dropping the instance, and then nobody is left to tell.
     let _ = result;

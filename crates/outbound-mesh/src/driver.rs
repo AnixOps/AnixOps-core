@@ -293,8 +293,9 @@ pub struct Channels {
     /// a restart (spec §8.3.1); the value at start is ignored, the
     /// settings carry it.
     pub native_keys: watch::Receiver<Option<Vec<[u8; 32]>>>,
-    /// A new `dns` section, applied without a restart (R28); the value at
-    /// start is ignored, the settings carry it.
+    /// A new `dns` section, applied without a restart (R28). The settings
+    /// carry the value at start; a value the receiver has not seen yet when
+    /// the driver starts is applied at once.
     pub dns: watch::Receiver<DnsSettings>,
     /// A new list of custom paths, already validated, which replaces the
     /// current one at once (spec §17.2.8); the value at start is ignored,
@@ -371,7 +372,9 @@ pub async fn run(
     };
     let mut from_backbone = from_backbone.lock_owned().await;
     native_keys.mark_unchanged();
-    dns.mark_unchanged();
+    // Not `dns`: a value sent after the receiver was made (or subscribed)
+    // and before this point is newer than the settings, and is applied as
+    // soon as the loop runs (a receiver starts with its value seen).
     paths.mark_unchanged();
     host_groups.mark_unchanged();
     let rng = SystemRandom::new();
@@ -1594,6 +1597,73 @@ mod tests {
         })
         .await
         .expect("the port is free again");
+    }
+
+    #[tokio::test]
+    async fn a_dns_change_sent_before_the_driver_runs_is_applied() {
+        let mut node = settings("10.144.0.1/24", "full");
+        node.peers.clear();
+        node.listen = vec![ListenConfig {
+            transport: Transport::Tcp,
+            port: 0,
+            address: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        }];
+        let listeners = Listeners::bind(&node).await.unwrap();
+        let rng = SystemRandom::new();
+        let (_to_mesh, from_interface) = mpsc::channel(16);
+        let (to_interface, _from_mesh) = mpsc::channel(16);
+        let (snapshot_tx, mut snapshots) = watch::channel(Snapshot::default());
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (_local, local_networks) = watch::channel(Some(Vec::new()));
+        let (_keys, native_keys) = watch::channel(None);
+        let (dns_tx, dns) = watch::channel(node.dns.clone());
+        let (_groups, host_groups) = watch::channel(Vec::new());
+        let (_paths, paths) = watch::channel(Vec::new());
+        let (_overrides, route_overrides) = watch::channel(Vec::new());
+        let (_foreign, foreign_routes) = watch::channel(Vec::new());
+        // `mesh_set_dns` right after the network was saved: sent after the
+        // receiver was handed over, before the driver looked at it.
+        dns_tx.send_replace(DnsSettings {
+            enabled: true,
+            suffix: "home.internal".into(),
+            ..node.dns.clone()
+        });
+        let task = tokio::spawn(run(
+            node,
+            KeyPair::generate(&rng).unwrap(),
+            listeners,
+            Channels {
+                from_interface,
+                to_interface,
+                snapshots: snapshot_tx,
+                local_networks,
+                native_keys,
+                dns,
+                paths,
+                host_groups,
+                route_overrides,
+                foreign_routes,
+                shutdown,
+                border: None,
+            },
+        ));
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let applied = snapshots
+                    .borrow_and_update()
+                    .names
+                    .as_ref()
+                    .is_some_and(|names| names.enabled() && names.suffix() == "home.internal");
+                if applied {
+                    break;
+                }
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the change is applied");
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
