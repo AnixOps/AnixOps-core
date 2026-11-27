@@ -37,7 +37,7 @@ extern "C" fn count_packets(context: *mut c_void, _packet: *const u8, _len: usiz
 fn versions_match_the_swift_handshake() {
     assert_eq!(networkcore_ios_abi_version(), 1);
     assert_eq!(networkcore_ios_schema_version(), 1);
-    assert_eq!(networkcore_ios_feature_set_version(), 6);
+    assert_eq!(networkcore_ios_feature_set_version(), 7);
 }
 
 #[test]
