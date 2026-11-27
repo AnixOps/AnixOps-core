@@ -148,7 +148,7 @@ impl Registry {
         Self {
             runtime,
             inner: Mutex::new(Inner::default()),
-            claims: HostRoutes::default(),
+            claims: HostRoutes::reclaiming(),
             machine: watch::channel(None).0,
             owners: AtomicU64::new(0),
         }
@@ -491,7 +491,11 @@ impl Registry {
                 {
                     return;
                 }
-                network.stop(&self.claims);
+                // The old instance gives way once the new one has joined
+                // the claims, so that its addresses never fall to the
+                // rules in between.
+                let old = network.instance.take();
+                let old_owner = std::mem::take(&mut network.owner);
                 // A new key in the settings replaces the one made before.
                 if settings.private_key.is_some() {
                     keys.remove(&name);
@@ -500,6 +504,10 @@ impl Registry {
                 network.failure = None;
                 if network.joined {
                     self.start(keys, network);
+                }
+                if let Some(old) = old {
+                    old.retire();
+                    self.claims.release(&old_owner);
                 }
             }
             None => {
@@ -607,9 +615,13 @@ async fn follow_claims(
         None => return,
     };
     let mut others = claims.subscribe();
+    // What the last round claimed with, so that a snapshot that changed
+    // something else (most do: counters, latencies) claims nothing anew.
+    let mut last_wanted: Option<Vec<IpNet>> = None;
+    // The shared claims or this machine's networks changed since the
+    // instance was last told its local networks.
+    let mut look = true;
     loop {
-        others.mark_unchanged();
-        changes.mark_unchanged();
         {
             let Some(instance) = instance.upgrade() else {
                 return;
@@ -617,29 +629,38 @@ async fn follow_claims(
             if instance.is_retired() {
                 return;
             }
-            let (routes, read) = {
-                let snapshot = snapshots.borrow_and_update();
-                (snapshot.system_routes.clone(), snapshot.local_networks_read)
-            };
             // Nothing is claimed before this machine's networks were read,
             // nor while no driver runs.
-            let wanted = if instance.state().0 && read {
-                routes
-            } else {
-                Vec::new()
+            let running = instance.state().0;
+            let wanted = {
+                let snapshot = snapshots.borrow_and_update();
+                let routes: &[IpNet] = if running && snapshot.local_networks_read {
+                    &snapshot.system_routes
+                } else {
+                    &[]
+                };
+                (last_wanted.as_deref() != Some(routes)).then(|| routes.to_vec())
             };
-            claims.claim(&owner, &wanted);
-            let local = machine.borrow_and_update().clone().map(|mut networks| {
-                networks.extend(claims.others(&owner));
-                networks
-            });
-            instance.set_local_networks(local);
+            if look || wanted.is_some() {
+                others.mark_unchanged();
+                let wanted = wanted.unwrap_or_else(|| last_wanted.clone().unwrap_or_default());
+                claims.claim(&owner, &wanted);
+                last_wanted = Some(wanted);
+            }
+            if look {
+                let local = machine.borrow_and_update().clone().map(|mut networks| {
+                    networks.extend(claims.others(&owner));
+                    networks
+                });
+                instance.set_local_networks(local);
+                look = false;
+            }
         }
         tokio::select! {
             changed = snapshots.changed() => if changed.is_err() { return },
             changed = changes.changed() => if changed.is_err() { return },
-            _ = others.changed() => {}
-            _ = machine.changed() => {}
+            _ = others.changed() => look = true,
+            _ = machine.changed() => look = true,
         }
     }
 }
@@ -894,7 +915,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let claims = HostRoutes::default();
+        let claims = HostRoutes::reclaiming();
         let (machine, _) = watch::channel(None);
         let net = |text: &str| IpNet::parse(text).unwrap();
         let address = |text: &str| text.parse::<IpAddr>().unwrap();
@@ -957,7 +978,14 @@ mod tests {
         // A network that is dropped frees its range; a managed one takes a
         // subnet from a legacy one.
         let gone = make("gone", "10.170.0.2/24", "legacy");
+        settle();
+        assert_eq!(
+            claims.lookup(address("10.170.0.9")).as_deref(),
+            Some("gone")
+        );
         drop(gone);
+        settle();
+        assert_eq!(claims.lookup(address("10.170.0.9")), None);
         let hq = {
             let settings = settings("hq", "10.170.0.2/24", "legacy");
             let key = KeyPair::generate(&SystemRandom::new()).unwrap();
@@ -972,7 +1000,6 @@ mod tests {
             instance
         };
         settle();
-        // The dropped instance's claims went with it.
         assert_eq!(claims.lookup(address("10.170.0.9")).as_deref(), Some("hq"));
         hq.pretend(routes(&["192.168.10.0/24"]));
         settle();

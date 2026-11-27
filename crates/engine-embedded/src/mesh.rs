@@ -250,8 +250,9 @@ fn mesh_tags(outbounds: &BTreeMap<String, OutboundConfig>) -> BTreeMap<String, S
 /// §15.4). The tunnel's interface is the one that carries any of `own`, the
 /// mesh networks' virtual addresses: until the client has given it those
 /// addresses, its other address ranges count as this machine's (an
-/// advertised subnet overlapping them stays local). A network of prefix
-/// length 0 (a missing or empty mask) is left out.
+/// advertised subnet overlapping them stays local; `mesh-status.md`). A
+/// network wider than /8 or /7 (such as a missing or empty mask) is left
+/// out.
 #[cfg(any(
     target_os = "ios",
     target_os = "macos",
@@ -348,8 +349,10 @@ fn local_networks(own: &[IpAddr]) -> Option<Vec<IpNet>> {
 }
 
 /// The networks of `found` (interface name, address, prefix length) but
-/// those of an interface that carries any of `own`, and those of prefix
-/// length 0.
+/// those of an interface that carries any of `own`, and those wider than
+/// /8 (IPv4) or /7 (IPv6). A physical interface that carries one of the
+/// mesh addresses (an address conflict) is left out whole, like the
+/// tunnel's.
 #[cfg(any(
     target_os = "ios",
     target_os = "macos",
@@ -364,7 +367,13 @@ fn interface_networks(found: Vec<(String, IpAddr, u8)>, own: &[IpAddr]) -> Vec<I
         .collect();
     found
         .iter()
-        .filter(|(name, _, prefix)| *prefix > 0 && !tunnel.contains(name.as_str()))
+        .filter(|(name, address, prefix)| {
+            // As wide as a default route split in halves or quarters: not
+            // a network of this machine (spec §15.4 compares only prefixes
+            // more specific than /8 and /7).
+            let widest = if address.is_ipv4() { 8 } else { 7 };
+            *prefix >= widest && !tunnel.contains(name.as_str())
+        })
         .filter_map(|(_, address, prefix)| IpNet::new(*address, *prefix))
         .collect()
 }
@@ -453,6 +462,9 @@ mod tests {
                 found("utun4", "172.19.0.1", 30),
                 // An empty mask (an Apple `sa_len` of 0).
                 found("en1", "10.0.0.5", 0),
+                found("en1", "10.0.0.5", 7),
+                found("en1", "fd00::5", 6),
+                found("en2", "10.0.0.6", 8),
             ],
             &["10.157.0.2".parse().unwrap()],
         );
@@ -461,6 +473,7 @@ mod tests {
             [
                 IpNet::new("192.168.1.20".parse().unwrap(), 24).unwrap(),
                 IpNet::new("fe80::1".parse().unwrap(), 64).unwrap(),
+                IpNet::new("10.0.0.6".parse().unwrap(), 8).unwrap(),
             ]
         );
         // Real interfaces can be read here.
@@ -496,6 +509,11 @@ mod tests {
         assert!(SLOT.current().is_none());
         first.commit();
         let engine = SLOT.current().expect("the engine runs");
+        // A network change asks the engine for a read of this machine's
+        // networks and goes on to the engine's own handler.
+        assert!(first
+            .control(br#"{"cmd":"set_network","type":"wifi"}"#)
+            .is_none());
         let instance = engine.registry().networks()[0]
             .instance
             .clone()

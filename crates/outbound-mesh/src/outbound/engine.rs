@@ -123,8 +123,10 @@ impl MeshEngine {
         true
     }
 
-    /// Reads this machine's networks again at once (the tunnel started,
-    /// the client reported a network change), unless a read is under way.
+    /// Reads this machine's networks again (the tunnel started, the client
+    /// reported a network change): at once, or right after the read under
+    /// way; a read cut off by its time limit and still running is not
+    /// stacked on, and the next scheduled round tries again.
     pub fn reread_local_networks(&self) {
         if let Some(now) = &*lock(&self.reader) {
             now.notify_one();

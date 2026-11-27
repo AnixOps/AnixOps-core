@@ -8,6 +8,14 @@
 //! networks, which refuses it as an overlap. A subnet goes to the first
 //! network to claim it, except that a `managed` network takes it from a
 //! `legacy` one; a virtual address range is never taken.
+//!
+//! Two modes. [`HostRoutes::reclaiming`] (the embedded engine) follows
+//! spec §15.4 in full: a `managed` network does not count the subnets a
+//! `legacy` one holds as this machine's, so that its driver wants them and
+//! takes them back, and a network that joins takes back at once the
+//! subnets others held in its virtual ranges. [`HostRoutes::default`] (the
+//! standalone node) keeps both out: its routes are system routes, and
+//! handing one over between two networks' tasks is not done yet.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -55,6 +63,8 @@ pub struct HostRoutes {
 }
 
 struct HostRoutesInner {
+    /// See the module documentation.
+    reclaim: bool,
     state: Mutex<State>,
     /// Counts changes, so that the other networks look again.
     changed: watch::Sender<u64>,
@@ -66,8 +76,22 @@ struct HostRoutesInner {
 
 impl Default for HostRoutes {
     fn default() -> Self {
+        Self::with_reclaim(false)
+    }
+}
+
+impl HostRoutes {
+    /// Shared claims in which a `managed` network takes subnets back from
+    /// `legacy` ones and a joining network takes back its virtual ranges
+    /// (see the module documentation).
+    pub fn reclaiming() -> Self {
+        Self::with_reclaim(true)
+    }
+
+    fn with_reclaim(reclaim: bool) -> Self {
         Self {
             inner: Arc::new(HostRoutesInner {
+                reclaim,
                 state: Mutex::new(State::default()),
                 changed: watch::channel(0).0,
                 table: RwLock::new(Arc::from(Vec::new())),
@@ -133,17 +157,20 @@ impl HostRoutes {
 
     /// Records `owner`, of the given kind and with its virtual address
     /// ranges, before it claims anything: the other networks see the
-    /// ranges at once, and give up any subnet they held in them.
+    /// ranges at once; when [`Self::reclaiming`], they also give up at once
+    /// any subnet they held in them.
     pub fn join(&self, owner: &str, managed: bool, interface: &[IpNet]) {
         let mut state = self.state();
         state.joins += 1;
         let joined = state.joins;
         let interface = sorted(interface.iter().map(IpNet::trunc).collect());
-        for (other, holder) in state.holders.iter_mut() {
-            if other != owner {
-                holder
-                    .routes
-                    .retain(|route| !interface.iter().any(|range| range.overlaps(route)));
+        if self.inner.reclaim {
+            for (other, holder) in state.holders.iter_mut() {
+                if other != owner {
+                    holder
+                        .routes
+                        .retain(|route| !interface.iter().any(|range| range.overlaps(route)));
+                }
             }
         }
         let holder = state.holders.entry(owner.to_owned()).or_default();
@@ -158,13 +185,14 @@ impl HostRoutes {
     /// with the same or a higher precedence; a `managed` owner takes
     /// overlapping subnets from `legacy` networks. Gives up the rest of
     /// what it held and returns what it now holds, sorted. Others are told
-    /// only when something changed.
+    /// only when something changed. An owner that did not [`Self::join`],
+    /// or was released, claims nothing: a retired network's last claim
+    /// cannot outlive it.
     pub fn claim(&self, owner: &str, wanted: &[IpNet]) -> Vec<IpNet> {
         let mut state = self.state();
-        let managed = state
-            .holders
-            .get(owner)
-            .is_some_and(|holder| holder.managed);
+        let Some(managed) = state.holders.get(owner).map(|holder| holder.managed) else {
+            return Vec::new();
+        };
         let held = sorted(
             wanted
                 .iter()
@@ -195,7 +223,9 @@ impl HostRoutes {
                 changed |= holder.routes.len() != before;
             }
         }
-        let holder = state.holders.entry(owner.to_owned()).or_default();
+        let Some(holder) = state.holders.get_mut(owner) else {
+            return Vec::new();
+        };
         if holder.routes != held {
             holder.routes = held.clone();
             changed = true;
@@ -220,14 +250,16 @@ impl HostRoutes {
     }
 
     /// What `owner` treats as this machine's networks of the others:
-    /// every virtual range, and the subnets held with the same or a higher
-    /// precedence (a `managed` owner may take a `legacy` network's), sorted.
+    /// every virtual range and held subnet, sorted. When
+    /// [`Self::reclaiming`], a `managed` owner leaves out the subnets
+    /// `legacy` networks hold: it may take them (spec §15.4).
     pub fn others(&self, owner: &str) -> Vec<IpNet> {
         let state = self.state();
-        let managed = state
-            .holders
-            .get(owner)
-            .is_some_and(|holder| holder.managed);
+        let managed = self.inner.reclaim
+            && state
+                .holders
+                .get(owner)
+                .is_some_and(|holder| holder.managed);
         sorted(
             state
                 .holders
@@ -383,6 +415,8 @@ mod tests {
     #[test]
     fn the_first_network_to_claim_a_subnet_keeps_it() {
         let routes = HostRoutes::default();
+        routes.join("mesh-a", false, &[]);
+        routes.join("mesh-b", false, &[]);
         let mut changes = routes.subscribe();
         let a = routes.claim("mesh-a", &[net("192.168.50.0/24"), net("172.16.0.0/16")]);
         assert_eq!(a.len(), 2);
@@ -405,10 +439,7 @@ mod tests {
         routes.claim("mesh-a", &a);
         assert!(!changes.has_changed().unwrap());
         // Once the first network stops, the subnet is free.
-        drop(Claim {
-            routes: routes.clone(),
-            owner: "mesh-a".into(),
-        });
+        routes.release("mesh-a");
         assert!(changes.has_changed().unwrap());
         let b = routes.claim("mesh-b", &[net("192.168.50.128/25")]);
         assert_eq!(b, [net("192.168.50.128/25")]);
@@ -416,7 +447,7 @@ mod tests {
 
     #[test]
     fn a_managed_network_sees_a_legacy_networks_subnets_as_its_to_take() {
-        let routes = HostRoutes::default();
+        let routes = HostRoutes::reclaiming();
         routes.join("legacy", false, &[net("10.144.0.0/24")]);
         routes.join("managed", true, &[net("10.150.0.0/16")]);
         routes.claim("legacy", &[net("192.168.50.0/24")]);
@@ -427,11 +458,37 @@ mod tests {
         routes.claim("managed", &[net("192.168.50.0/24")]);
         assert!(routes.others("legacy").contains(&net("192.168.50.0/24")));
         assert!(routes.held("legacy").is_empty());
+        // The standalone node's claims keep a legacy network's subnets out
+        // of what a managed one wants.
+        let standalone = HostRoutes::default();
+        standalone.join("legacy", false, &[]);
+        standalone.join("managed", true, &[]);
+        standalone.claim("legacy", &[net("192.168.50.0/24")]);
+        assert_eq!(standalone.others("managed"), [net("192.168.50.0/24")]);
+    }
+
+    #[test]
+    fn a_network_that_never_joined_claims_nothing() {
+        let routes = HostRoutes::reclaiming();
+        assert!(routes.claim("stray", &[net("192.168.1.0/24")]).is_empty());
+        routes.join("a", false, &[]);
+        routes.claim("a", &[net("192.168.1.0/24")]);
+        routes.release("a");
+        // A late claim of a released owner is not recorded either.
+        assert!(routes.claim("a", &[net("192.168.1.0/24")]).is_empty());
+        assert_eq!(routes.lookup(address("192.168.1.9")), None);
     }
 
     #[test]
     fn a_joining_network_takes_its_virtual_range_back_at_once() {
-        let routes = HostRoutes::default();
+        let standalone = HostRoutes::default();
+        standalone.join("legacy", false, &[]);
+        standalone.claim("legacy", &[net("10.150.1.0/24")]);
+        standalone.join("managed", true, &[net("10.150.0.5/16")]);
+        // The standalone node's driver gives it up on its next look.
+        assert_eq!(standalone.held("legacy"), [net("10.150.1.0/24")]);
+
+        let routes = HostRoutes::reclaiming();
         routes.join("legacy", false, &[]);
         routes.claim("legacy", &[net("10.150.1.0/24"), net("192.168.1.0/24")]);
         routes.join("managed", true, &[net("10.150.0.5/16")]);

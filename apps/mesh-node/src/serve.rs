@@ -194,7 +194,6 @@ fn route_changes(installed: &[IpNet], wanted: &[IpNet]) -> (Vec<IpNet>, Vec<IpNe
     (add, remove)
 }
 
-
 /// Releases a network's routes in [`HostRoutes`] however its serving ends,
 /// including when the task is cut off.
 struct Claim {
