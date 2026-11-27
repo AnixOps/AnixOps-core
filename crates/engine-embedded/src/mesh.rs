@@ -163,9 +163,9 @@ impl MeshBinding {
         // Cheap test before parsing: both commands end in `_network`; a
         // name written with JSON escapes is not recognised, and the
         // periodic read catches up with the change.
-        if contains(request, b"_network")
+        if crate::control::names(request, b"_network")
             && matches!(
-                control::command_name(request).as_deref(),
+                crate::control::command_name(request).as_deref(),
                 Some("set_network" | "reset_network")
             )
         {
@@ -173,10 +173,10 @@ impl MeshBinding {
             return None;
         }
         // Cheap test before parsing: every mesh command names itself.
-        if !contains(request, b"mesh_") {
+        if !crate::control::names(request, b"mesh_") {
             return None;
         }
-        let name = control::command_name(request)?;
+        let name = crate::control::command_name(request)?;
         if name == "mesh_engine_stop" {
             if let Some(hold) = lock(&self.hold).take() {
                 hold.close();
@@ -388,12 +388,6 @@ fn local_networks(_own: &[IpAddr]) -> Option<Vec<IpNet>> {
     None
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
 fn encode(answer: &Value) -> Result<Vec<u8>, RuntimeError> {
     serde_json::to_vec(answer).map_err(|_| {
         RuntimeError::new(
@@ -418,6 +412,16 @@ mod tests {
         .as_object()
         .unwrap()
         .clone()
+    }
+
+    #[test]
+    fn a_mesh_command_longer_than_the_limit_goes_on_to_the_other_handlers() {
+        // Refused for its length there; the engine is never looked up.
+        let head = r#"{"cmd":"mesh_status","pad":""#;
+        let length = crate::control::MAX_RELOAD_REQUEST_LEN + 1;
+        let request = format!("{head}{}\"}}", "x".repeat(length - head.len() - 2));
+        assert_eq!(request.len(), length);
+        assert!(MeshBinding::default().control(request.as_bytes()).is_none());
     }
 
     #[test]
