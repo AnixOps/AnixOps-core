@@ -407,3 +407,19 @@ fn script_rules_run_the_script_the_routing_section_names() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn the_local_proxy_says_it_runs_no_mesh_networks() {
+    let config = br#"{"schema_version":1,"profile_id":"direct","routing":{"outbounds":{"node":{"type":"direct"}},"rules":["FINAL,node"]}}"#;
+    let proxy = LocalProxy::start(config, loopback(), MixedSettings::default()).unwrap();
+    let ask = |request: &str| -> serde_json::Value {
+        serde_json::from_slice(&proxy.control_json(request.as_bytes()).unwrap()).unwrap()
+    };
+    assert_eq!(
+        ask(r#"{"cmd":"capabilities"}"#),
+        serde_json::json!({"capabilities": {"mesh": false}})
+    );
+    let refused = ask(r#"{"cmd":"mesh_status"}"#);
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "unsupported");
+}

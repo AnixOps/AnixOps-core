@@ -274,6 +274,34 @@ fn control(runtime: &EmbeddedRuntime, request: &str) -> serde_json::Value {
 }
 
 #[test]
+fn a_wireguard_tunnel_answers_the_capabilities() {
+    let port = start_peer(None);
+    // `allow_mesh` is off unless the config turns it on.
+    let runtime = EmbeddedRuntime::from_json(&config(port, None)).unwrap();
+    assert_eq!(
+        control(&runtime, r#"{"cmd":"capabilities"}"#),
+        serde_json::json!({"capabilities": {"mesh": false}})
+    );
+    let refused = control(&runtime, r#"{"cmd":"mesh_status"}"#);
+    assert_eq!(refused["error"]["code"], "unsupported");
+    drop(runtime);
+    let mut allowed: serde_json::Value = serde_json::from_slice(&config(port, None)).unwrap();
+    allowed["allow_mesh"] = true.into();
+    let mut runtime = EmbeddedRuntime::from_json(&serde_json::to_vec(&allowed).unwrap()).unwrap();
+    let (sink, _rx) = capture();
+    runtime.start(sink).unwrap();
+    assert_eq!(
+        control(&runtime, r#"{"cmd":"capabilities"}"#),
+        serde_json::json!({"capabilities": {"mesh": cfg!(feature = "mesh")}})
+    );
+    if !cfg!(feature = "mesh") {
+        let refused = control(&runtime, r#"{"cmd":"mesh_status"}"#);
+        assert_eq!(refused["error"]["code"], "unsupported");
+    }
+    runtime.stop();
+}
+
+#[test]
 fn packets_round_trip_through_a_wireguard_peer() {
     let port = start_peer(None);
     let mut runtime = EmbeddedRuntime::from_json(&config(port, None)).unwrap();

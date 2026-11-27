@@ -20,7 +20,8 @@ pub const PROXY_OUTBOUND: &str = "proxy";
 pub enum RoutingMode {
     /// Everything direct: the engine starts in its direct mode
     /// ([`Mode::Direct`]), where every flow and every DNS query goes
-    /// direct, whatever the rules say.
+    /// direct, whatever the rules say; only a flow to an address a joined
+    /// mesh network routes still goes to that network (`mesh-status.md`).
     Direct,
     /// The subscription's own rules and policy groups; a single-node profile
     /// sends everything through its node.

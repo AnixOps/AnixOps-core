@@ -1366,3 +1366,44 @@ fn reset_network_flushes_the_tunnel_dns_cache_and_pools() {
         assert_eq!(answer_json["dns_connections_dropped"], 0);
     });
 }
+
+#[test]
+fn mesh_addresses_go_to_their_node_in_every_mode() {
+    runtime().block_on(async {
+        let dispatcher = routed();
+        let inside: std::net::IpAddr = "10.144.0.9".parse().unwrap();
+        dispatcher
+            .routed_outbound()
+            .unwrap()
+            .set_mesh_routes(Arc::new(move |address: std::net::IpAddr| {
+                (address == inside).then(|| "hk-1".to_string())
+            }));
+        for mode in [Mode::Rule, Mode::Global, Mode::Direct] {
+            dispatcher.set_mode(mode);
+            let mesh = dispatcher
+                .connect_flow(&ip("10.144.0.9:22"), None)
+                .await
+                .unwrap();
+            let other = dispatcher
+                .connect_flow(&ip("192.0.2.9:22"), None)
+                .await
+                .unwrap();
+            let list = dispatcher.tracker().connections();
+            let route = |destination: &str| {
+                let found = list
+                    .active
+                    .iter()
+                    .find(|c| c.destination == destination)
+                    .unwrap();
+                (found.rule.clone(), found.outbound.clone())
+            };
+            assert_eq!(
+                route("10.144.0.9:22"),
+                ("MESH".to_string(), "hk-1".to_string()),
+                "{mode:?}"
+            );
+            assert_ne!(route("192.0.2.9:22").0, "MESH", "{mode:?}");
+            drop((mesh, other));
+        }
+    });
+}

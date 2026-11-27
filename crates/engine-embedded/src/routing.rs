@@ -147,7 +147,17 @@ pub struct RoutedOutbound {
     reject_storm: RejectStorm,
     /// Scripts that `SCRIPT` rules name (see [`crate::rule_scripts`]).
     scripts: Arc<RuleScripts>,
+    /// The node of the mesh network that routes an address, if any
+    /// ([`RoutedOutbound::set_mesh_routes`]).
+    mesh_routes: RwLock<Option<MeshRoutes>>,
 }
+
+/// Gives the node id (a key of `routing.outbounds`) of the mesh network
+/// whose `tunnel.routes` hold an address (`mesh-status.md`).
+pub type MeshRoutes = Arc<dyn Fn(IpAddr) -> Option<String> + Send + Sync>;
+
+/// The `rule` of a flow that went to a mesh network ahead of the rules.
+pub const MESH_RULE: &str = "MESH";
 
 /// Probing one member gives up after this long.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -596,6 +606,7 @@ impl RoutedOutbound {
             checks_running: AtomicBool::new(false),
             reject_storm: RejectStorm::default(),
             scripts: Arc::default(),
+            mesh_routes: RwLock::default(),
         })
     }
 
@@ -1347,6 +1358,9 @@ impl RoutedOutbound {
         http: Option<&HttpRequestHead>,
         source: FlowSource,
     ) -> (RouteInfo, Option<Arc<dyn TcpOutbound>>) {
+        if let Some((route, node)) = self.mesh_flow(target) {
+            return (route, Some(node));
+        }
         let mut query = query(target)
             .with_network(network)
             .with_source(source.address, source.in_port)
@@ -1577,6 +1591,42 @@ impl RoutedOutbound {
                 Ok((address, name.to_lowercase()))
             })
             .collect()
+    }
+
+    /// Sends every flow to an address that a joined mesh network routes
+    /// to that network's node, ahead of the rules and of every mode
+    /// (`mesh-status.md`, `tunnel.routes`): the user's rules cannot keep
+    /// an intranet address off the mesh.
+    pub fn set_mesh_routes(&self, routes: MeshRoutes) {
+        *self
+            .mesh_routes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(routes);
+    }
+
+    /// The mesh node for `target`, when it is an address a joined mesh
+    /// network routes and the profile has that network's node. A name is
+    /// left to the rules: intranet names come with the mesh DNS.
+    pub fn mesh_flow(&self, target: &TargetAddr) -> Option<(RouteInfo, Arc<dyn TcpOutbound>)> {
+        let TargetAddr::Ip(address) = target else {
+            return None;
+        };
+        let routes = self
+            .mesh_routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        let id = routes(address.ip())?;
+        let node = self.nodes.get(&id)?.clone();
+        Some((
+            RouteInfo {
+                rule: MESH_RULE.to_string(),
+                chain: vec![id.clone()],
+                outbound: id,
+                reject: None,
+            },
+            node,
+        ))
     }
 
     /// Names devices by the address their connections come from, for
@@ -2330,6 +2380,43 @@ mod lazy_health_tests {
             .into_iter()
             .map(|(group, _)| group.id.clone())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn an_address_a_mesh_network_routes_goes_to_its_node_ahead_of_the_rules() {
+        let routed = routed();
+        let inside = TargetAddr::Ip("10.144.0.9:22".parse().unwrap());
+        let outside = TargetAddr::Ip("192.0.2.1:22".parse().unwrap());
+        let (route, _) = routed.route_flow(&inside, None, None).await;
+        assert_ne!(route.rule, MESH_RULE);
+        routed.set_mesh_routes(Arc::new(|address: IpAddr| {
+            let IpAddr::V4(v4) = address else {
+                return None;
+            };
+            match v4.octets() {
+                [10, 144, 0, _] => Some("jp-1".to_string()),
+                // A network the profile has no node for.
+                [10, 145, 0, _] => Some("missing".to_string()),
+                _ => None,
+            }
+        }));
+        let (route, node) = routed
+            .route_flow(&inside, Some("www.example.jp"), None)
+            .await;
+        assert_eq!(route.rule, MESH_RULE);
+        assert_eq!(route.chain, vec!["jp-1".to_string()]);
+        assert_eq!(route.outbound, "jp-1");
+        assert!(node.is_some());
+        // Elsewhere the rules decide: FINAL through the Proxy group.
+        let (route, _) = routed.route_flow(&outside, None, None).await;
+        assert_eq!(route.rule, "FINAL");
+        let unknown = TargetAddr::Ip("10.145.0.9:22".parse().unwrap());
+        let (route, _) = routed.route_flow(&unknown, None, None).await;
+        assert_eq!(route.rule, "FINAL");
+        // A name is left to the rules.
+        let named = TargetAddr::Domain("www.example.jp".to_string(), 443);
+        let (route, _) = routed.route_flow(&named, None, None).await;
+        assert_ne!(route.rule, MESH_RULE);
     }
 
     #[tokio::test]

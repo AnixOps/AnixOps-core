@@ -8,7 +8,7 @@ description = "In-process engine for the iOS Network Extension: userspace TCP/IP
 
 # One feature per protocol; see src/protocols.rs. `direct` is always built in.
 [features]
-default = ["dns-quic", "dns-tls", "http", "hysteria2", "iwan", "local-proxy", "mieru", "mitm", "scripts", "shadowsocks", "snell", "socks", "trojan", "tuic", "vless", "vmess", "wireguard"]
+default = ["dns-quic", "dns-tls", "http", "hysteria2", "iwan", "local-proxy", "mesh", "mieru", "mitm", "scripts", "shadowsocks", "snell", "socks", "trojan", "tuic", "vless", "vmess", "wireguard"]
 # DNS over TLS and DNS over HTTPS upstreams (`tls://`, `https://`).
 dns-tls = ["dep:transport-tls"]
 # DNS over QUIC upstreams (`quic://`, RFC 9250), through the outbound's UDP relay.
@@ -17,9 +17,9 @@ http = ["dep:outbound-http"]
 hysteria2 = ["dep:outbound-hysteria2"]
 # Panabit iWAN: a layer-3 tunnel used as a routable outbound with its own stack.
 iwan = ["dep:outbound-iwan"]
-# Intranet mesh networks (`"type": "mesh"`), each on a private TCP/IP stack.
-# Not in the default set until the control commands land
-# (`docs/architecture/mesh-status.md`).
+# Intranet mesh networks (`"type": "mesh"`), each on a private TCP/IP stack,
+# with the `mesh_*` control commands and `tunnel.routes` routing
+# (`docs/architecture/mesh-status.md`); feature set 7.
 mesh = ["dep:outbound-mesh"]
 # Desktop local proxy (SOCKS5/HTTP listener), URL delay tests and remote rule
 # set downloads (with optional Ed25519 signatures).

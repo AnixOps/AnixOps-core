@@ -247,6 +247,12 @@ pub struct NodeConfig {
     /// secret and never written out. Absent: the caller keeps one.
     #[serde(default, deserialize_with = "optional_secret_text")]
     pub private_key: Option<Zeroizing<String>>,
+    /// This device's instance ID (spec §1), for the embedded engine, which
+    /// has no state directory: the client makes it once and gives the same
+    /// value in every network's config (`mesh-module.md`). Node programs
+    /// with a state directory replace it with their own.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 /// Secret text, wiped from memory when dropped.
@@ -499,8 +505,10 @@ pub struct MeshSettings {
     pub paths: Vec<CustomPath>,
     /// Decoded `network.native_keys`; `None` when absent.
     pub native_keys: Option<Vec<[u8; 32]>>,
-    /// Decoded `node.private_key`, wiped when dropped.
-    pub private_key: Option<Zeroizing<[u8; 32]>>,
+    /// Decoded `node.private_key`, wiped when dropped. On the heap, so
+    /// that moving the settings (into a box, a registry entry, a clone's
+    /// slot) moves a pointer and leaves no copy of the key behind.
+    pub private_key: Option<Box<Zeroizing<[u8; 32]>>>,
     /// The `dns` section; names are off without one.
     pub dns: DnsSettings,
     /// Host groups of the network (spec §15.7).
@@ -686,6 +694,20 @@ fn decode_key(text: &str) -> Option<Zeroizing<[u8; 32]>> {
     Some(key)
 }
 
+/// Decodes a private key straight into its heap slot: no copy of it is
+/// made on the way.
+fn decode_private_key(text: &str) -> Option<Box<Zeroizing<[u8; 32]>>> {
+    use base64::Engine as _;
+    let bytes = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .ok()?,
+    );
+    let mut key = Box::new(Zeroizing::new([0u8; 32]));
+    key.copy_from_slice(bytes.get(..32).filter(|_| bytes.len() == 32)?);
+    Some(key)
+}
+
 /// Encodes a static public key the way the status and `native_keys` do.
 pub fn encode_key(key: &[u8; 32]) -> String {
     use base64::Engine as _;
@@ -854,11 +876,17 @@ impl MeshConfig {
                 Some(keys)
             }
         };
+        if let Some(id) = &node.instance_id {
+            if !valid_instance_id(id) {
+                return Err("mesh node instance_id is not an instance ID");
+            }
+        }
         let private_key = match &node.private_key {
             None => None,
-            Some(text) => {
-                Some(decode_key(text).ok_or("mesh node private_key is not Base64 of 32 bytes")?)
-            }
+            Some(text) => Some(
+                decode_private_key(text)
+                    .ok_or("mesh node private_key is not Base64 of 32 bytes")?,
+            ),
         };
 
         let mut virtual_subnets = vec![address.trunc()];
@@ -896,7 +924,7 @@ impl MeshConfig {
             private_key,
             dns,
             host_groups: Vec::new(),
-            instance_id: None,
+            instance_id: node.instance_id,
             external_bridge,
         };
         if let Some(bridge) = &settings.external_bridge {
@@ -1681,13 +1709,31 @@ mod tests {
     }
 
     #[test]
+    fn the_device_instance_id_follows_the_contract() {
+        assert_eq!(validate(base()).unwrap().instance_id, None);
+        let settings = validate(with("node.instance_id", json!("device-1"))).unwrap();
+        assert_eq!(settings.instance_id.as_deref(), Some("device-1"));
+        let long = "a".repeat(65);
+        for bad in ["", "-device", "device 1", long.as_str()] {
+            assert_eq!(
+                validate(with("node.instance_id", json!(bad))).err(),
+                Some("mesh node instance_id is not an instance ID"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn native_keys_and_the_private_key_are_base64_of_32_bytes() {
         let key = encode_key(&[7; 32]);
         assert_eq!(key.len(), 44);
         let settings = validate(with("network.native_keys", json!([key, key]))).unwrap();
         assert_eq!(settings.native_keys, Some(vec![[7; 32]]));
         let settings = validate(with("node.private_key", json!(encode_key(&[9; 32])))).unwrap();
-        assert_eq!(settings.private_key.as_deref(), Some(&[9; 32]));
+        assert_eq!(
+            settings.private_key.as_deref().map(|key| &**key),
+            Some(&[9; 32])
+        );
         for bad in [
             json!(["not base64!"]),
             json!([&encode_key(&[1; 32])[..40]]),

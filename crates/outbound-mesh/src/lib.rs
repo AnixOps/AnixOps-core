@@ -47,6 +47,8 @@
 
 pub mod backbone;
 pub mod bridge;
+#[cfg(feature = "runtime")]
+pub mod claims;
 pub mod config;
 pub mod dns;
 #[cfg(feature = "runtime")]

@@ -6,12 +6,14 @@
 
 - 组网与代理在同一个引擎实例里运行（需求 R23，手机上共用一个 VPN），命令走现有控制通道：iOS、macOS 为 `networkcore_ios_runtime_control`，Android、Windows、Linux 为 `client-core` / `client-ipc` 的同名命令。
 - 请求是 JSON，命令名放在 `cmd` 字段，用下划线命名，与现有命令一致，例如 `{"cmd":"mesh_status"}`。
-- 引擎编入组网后 `networkcore_ios_feature_set_version` 为 7。未编入 `mesh` feature 时 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令返回 `unsupported`。
+- 是否支持组网只以 `capabilities.mesh` 判断。`networkcore_ios_feature_set_version` 自 7 起不论是否编入 `mesh` feature 都为 7，只表示 FFI 接口集（含 `capabilities` 命令），不表示组网可用。控制命令 `{"cmd":"capabilities"}` 返回 `{"capabilities":{"mesh":true|false}}`，`mesh` 表示这个运行实例是否回答 `mesh_*` 命令：VPN 运行实例（任何隧道，WireGuard 隧道也一样）在引擎编入 `mesh` feature 且配置 `allow_mesh` 为 `true` 时为 `true`，桌面本地代理模式不运行组网，始终为 `false`。它由编译期 feature、运行模式与配置的 `allow_mesh` 决定，与节点上 anixcore `/v1/status` 的 features 无关。为 `false` 时所有 `mesh_*` 命令返回 `{"ok":false,"error":{"code":"unsupported"}}`。`capabilities` 与其他短命令一样，请求长度上限 4096 字节；未编入时的 `mesh_*` 与组网命令一样，上限 1 MiB；超出时按长度错误拒绝。命令名用 JSON 转义写出（如 `capabilit\u0069es`）的请求不保证识别。
+- 默认构建编入组网，运行时由配置的 `allow_mesh` 控制（见下一条）。允许时，profile 里没有 `"type": "mesh"` 出站则组网引擎不启动、不读网卡、不分流，完全惰性；profile 含组网出站时，隧道启动后提交并启动组网引擎。未编入 `mesh` 的旧默认构建（0.3.0-rc.1 及以前）会把这类出站当作未知类型拒绝。
+- 运行配置 `allow_mesh`（布尔，缺省 `false`，0.3.0-rc.2 起接受）是内核侧的闸门，缺省即关闭：客户端漏发时组网配置直接报错，而不是静默放行。为 `false` 或缺省时，任何组网出站（顶层 `outbound`、`routing.outbounds`、内联 `via` 链的任一层）都使整个配置被拒绝，错误码 `config_rejected`，消息固定为 `mesh outbounds are not allowed by this config`；该实例的 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令返回 `unsupported`。这样的 profile 没有组网出站，隧道启动时与不含组网出站的 profile 相同：不持有组网引擎，同进程里上一个 profile 未经 `mesh_save_network` 保存的网络随之停止，已保存的网络继续运行到持有引擎的运行时放手；流量不会进入组网。这样的实例上 `mesh_engine_stop` 同样返回 `unsupported`，不能提前停止其他实例持有的或宽限期中的组网引擎。C ABI 初始化（`networkcore_ios_runtime_*`）被拒绝时只返回 `NETWORKCORE_IOS_ERR_CONFIG_REJECTED`，看不到具体消息。客户端在组网发布门槛打开时才发送 `allow_mesh: true`，且只向 0.3.0-rc.2 及以后的内核发送（能力集 7 的过渡提交 cbb3c844 不认识该字段，未发布）。
 - 不新增任何网络监听端口（需求 R11）。独立节点程序 `anixops-mesh` 在本机 Unix 域套接字上回答同样的 `mesh_status`（Windows 上为命名管道），文件权限只允许 root 与指定组访问；不监听任何 TCP 或 UDP 端口，回环地址也不行（OpenWrt LuCI 插件使用，需求 R35）。
 
 ## 快照
 
-`mesh_status` 一次返回完整快照。快照按网络给出：`network`、`self`、`members`、`subnets`、`refusedAdvertisements` 都属于请求的那个网络（命令参数 `network`；省略时为第一个已加入的网络，没有已加入的网络时为第一个已保存的网络）。`tunnel` 属于整个引擎：一台设备只有一个隧道，它汇总所有已加入的网络，在每个网络的快照里取值相同。顶层 `networks` 列出所有已保存的网络 `{ "id", "name", "state" }`，供多网络时逐个读取。字段名用 lowerCamelCase。读取方忽略未知字段，枚举遇到未知取值按 `other` 处理；某个内核版本尚未提供的字段直接缺省。
+`mesh_status` 一次返回完整快照。快照按网络给出：`network`、`self`、`members`、`subnets`、`refusedAdvertisements` 都属于请求的那个网络（命令参数 `network`；省略时依次取第一个正在运行的网络、第一个已加入且不是因 `instance_id_changed` 停下的网络、第一个已保存的网络。省略时选中哪个网络会随网络启停变化，客户端以 `networks[]` 列出全部网络，展示某个网络时应显式传 `network`；`self` 同样属于所选网络，选中的网络没有 `node.instance_id` 时 `self.id` 为 `null`）。`tunnel` 属于整个引擎：一台设备只有一个隧道，它汇总所有已加入的网络，在每个网络的快照里取值相同。顶层 `networks` 列出所有已保存的网络 `{ "id", "name", "state" }`，供多网络时逐个读取。字段名用 lowerCamelCase。读取方忽略未知字段，枚举遇到未知取值按 `other` 处理；某个内核版本尚未提供的字段直接缺省。
 
 | 对象 | 字段 | 自哪个内核版本 |
 |---|---|---|
@@ -47,11 +49,11 @@
 | `self.staticKey` | 本机在该网络的安全模式静态公钥：32 字节 X25519 公钥的标准 base64（RFC 4648 §4，带填充，44 个字符）。按网络各一份（规范 §8.1），保存网络配置时即生成，网络未加入时也给出；旧模式网络为 `null`。没有 Agent 的设备在登记时或首次上报时提交这个值，供面板列入 `network.native_keys`（规范 §8.3.1 第 7 条） |
 | `network.limitations` | 字符串列表，空列表表示没有限制；只在安全模式网络上给出，旧模式网络为空列表（旧模式另由 `security` 标出）。`reference_peers`：`network.kind` 为 `legacy` 且为安全模式（旧网本来就由原版节点组成）；与原版节点之间的会话保密性以参考实现为上限（规范 §19.2 第 5 条），界面显示「含原版节点，保密性受限」。`managed` 网络按规范 §8.3.1 只接纳 `native_keys` 中的我方节点，不会出现该值。`unverified_peers`：保留值，当前不再产生（原用于 `managed` 网络中实现无法判定的成员）；客户端仍应能显示它，提示「无法确认对端实现」 |
 | `members[].implementation` | `native`（我方节点程序）、`reference`（原版实现）、`unknown`（尚不能判断）。判定用的是**经握手认证**的对端静态公钥：直连邻居取 Noise XX 握手中认证的静态公钥，经中继的成员取已建立的中继会话（Noise IK）中认证的静态公钥；还没有会话的成员只有路由信息字段 18 中的自报公钥，一律为 `unknown`。认证后的公钥与配置 `network.native_keys`（面板经 Agent 下发的我方节点静态公钥清单，见 `mesh-module.md`）比较：在清单中为 `native`；清单存在但不在其中为 `reference`；配置没有该清单时为 `unknown`。`managed` 网络必须有清单，且不在清单中的对端握手被拒（规范 §8.3.1），所以已有会话的成员一律为 `native`，`reference` 只出现在带清单的 `legacy` 网络中。旧模式网络没有静态公钥认证，一律为 `unknown` |
-| `network.failure` | `null` 或 `{ "code", "detail" }`，`code` 见下表；`detail` 只给人看。只有一个值，按优先级取：使网络无法运行的原因（`native_keys_pending`、`port_in_use`、`tun_in_use`、`route_overlap`、`address_in_use`、`identity_online`、`permission_denied` 等）优先，其次 `unreachable_peers`，最后 `peer_not_native`。`peer_not_native` 在以下情况清除：被拒对端此后握手成功（中继握手以会话实际生效为准，应答方的待定会话要等第一个数据包）；10 分钟内没有新的被拒；`native_keys` 更新（新清单使被拒退避复位并立即重拨，对端仍不在清单中时几秒内重新报告，告警会短暂消失一次） |
+| `network.failure` | `null` 或 `{ "code", "detail" }`，`code` 见下表；`detail` 只给人看。只有一个值，按优先级取：使网络无法运行的原因（`native_keys_pending`、`instance_id_changed`、`port_in_use`、`tun_in_use`、`route_overlap`、`address_in_use`、`identity_online`、`permission_denied` 等）优先，其次 `unreachable_peers`，最后 `peer_not_native`。`peer_not_native` 在以下情况清除：被拒对端此后握手成功（中继握手以会话实际生效为准，应答方的待定会话要等第一个数据包）；10 分钟内没有新的被拒；`native_keys` 更新（新清单使被拒退避复位并立即重拨，对端仍不在清单中时几秒内重新报告，告警会短暂消失一次） |
 | `network.joining` | `null` 或 `{ "stage": "connecting" \| "assigning_address" \| "measuring_regions", "peersConnected" }` |
 | `routingPolicy` | `hops`、`latency` |
 | `role` | 0.3：`server`（完整节点）、`client`（接入节点）；0.4 起另有 `border`、`gateway`、`host` |
-| `id`（成员与本机） | 不透明字符串，客户端不解析其格式。`self.id` 为本设备的设备实例 ID（规范 §1，持久保存，等于 `GET /v1/mesh` 的 `instance_id`）。`members[].id`：设备实例 ID 不上线，内核从线上只能得到对端的线上实例 UUID（规范 §12.3 字段 2，对端每次启动重新生成），所以取该 UUID 的小写连字符文本，只保证在该成员进程的一次运行内不变，**对端重启后改变**；不用静态公钥派生（旧模式网络没有公钥，且会引入跨会话可关联的标识）。同一次运行内成员第一次出现在快照时就给出最终 `id`，此后不变。客户端不得用成员 `id` 作为需要跨重启保存的设置键（本机设置按网段、虚拟地址保存）。不用每次启动都会变的数字节点号 |
+| `id`（成员与本机） | 不透明字符串，客户端不解析其格式。`self.id` 为本设备的设备实例 ID（规范 §1，持久保存，等于 `GET /v1/mesh` 的 `instance_id`）；嵌入式引擎取所选网络的 `node.instance_id`，该网络没有配置时为 `null`。`members[].id`：设备实例 ID 不上线，内核从线上只能得到对端的线上实例 UUID（规范 §12.3 字段 2，对端每次启动重新生成），所以取该 UUID 的小写连字符文本，只保证在该成员进程的一次运行内不变，**对端重启后改变**；不用静态公钥派生（旧模式网络没有公钥，且会引入跨会话可关联的标识）。同一次运行内成员第一次出现在快照时就给出最终 `id`，此后不变。客户端不得用成员 `id` 作为需要跨重启保存的设置键（本机设置按网段、虚拟地址保存）。不用每次启动都会变的数字节点号 |
 | `member.state` | `online`、`unreachable` |
 | `connection` | `self`、`direct`、`relay`（`hops` 为中转次数）、`unreachable`；0.4 起另有 `cross_region`、`via_host`、`via_gateway`。`cross_region` 为保留值：区域之间不传递节点信息（规范 §15.6 第 8 条），`members[]` 只列本区域成员，0.4 内核不产生该值；其他地区只以 `subnets[]` 中 `kind = summary` 的汇总网段出现（`path` 止于出口边界节点），其他地区的主机名只经 `names[]` 出现，不进入 `members[]`。客户端遇到该值时按「经边界节点」显示 |
 | `transport` | `tcp`、`udp` |
@@ -106,6 +108,7 @@
 | `port_in_use` | 监听端口被占用，`detail` 为传输与端口 |
 | `tun_in_use` | 虚拟网卡名称已被占用 |
 | `native_keys_pending` | `managed` 网络暂缓：`network.native_keys` 缺省、为空或不含本机在该网络的静态公钥（规范 §8.3.1 第 1 条）。`detail` 为 `empty`（缺省或为空）或 `self_missing`（不含本机公钥）。此时 `network.state` 为 `not_joined`，不建链路、不启动虚拟网卡；`self.staticKey` 与 `static_keys` 照常给出，供 Agent 上报。只影响该网络，不使 `anixops-mesh run` 退出；面板下发含本机公钥的清单后自动启动 |
+| `instance_id_changed` | 嵌入式引擎：已保存网络的 `node.instance_id` 与之后提交的 profile 不同，停下不运行（`state` 为 `not_joined`），以当前值重新保存或 profile 恢复原值后自动恢复 |
 | `peer_not_native` | `managed` 网络中，对端经握手认证的静态公钥不在 `network.native_keys` 中，握手被拒（规范 §8.3.1）。只记录最近一次，`detail` 为对端节点 ID；不改变 `network.state`，不使 `anixops-mesh run` 退出。通常是原版节点或尚未列入清单的新节点，后者在清单下发后自动恢复 |
 | `route_overlap` | 虚拟网段或要装的路由与本机已有路由冲突，`detail` 为网段 |
 | `address_in_use` | 虚拟地址已被本机其他接口使用 |
@@ -128,7 +131,7 @@
 - **代理开关不打断组网**：代理连上或断开时，客户端重新下发 profile（增加或去掉代理出站）。只要网络配置没变，组网实例按 `network.id` 保留，会话与成员连接不断；配置变了才重建该网络。
 - **路由由引擎给出**：客户端不自己算网段，通告子网是动态的。客户端在组网加入期间读取 `mesh_status`（前台每 2 秒、后台每 10 秒，或在现有状态变化通知到来时），`tunnel.routesVersion` 变化时重新应用一次隧道网络设置（手机上的 `includedRoutes`、DNS 匹配域），重新应用之间至少间隔 1 秒。
 - 组网与代理都关闭时，客户端关闭 VPN。
-- **嵌入式引擎的组网引擎**：组网网络由进程内的组网引擎持有（自有线程与运行时），不属于某一份 profile。每份 profile 的引擎运行时在隧道启动后提交其中的组网网络，停止隧道时放手；最后一份放手后组网引擎再保留 5 秒，供下一份 profile 接手（先停旧再起新、先起新再停旧都不打断组网）。用户关闭 VPN 时，客户端在停止隧道前发 `mesh_engine_stop`，组网引擎立即停止；不发时组网会多运行最多 5 秒，期间仍用本机网络与成员通信。组网引擎停止后，`mesh_save_network`、`mesh_leave`、`mesh_set_subnet_route` 的本机状态随之清除，客户端须自己保存，在下次启动后重新下发。延迟测试、体检中的组网出站返回 `unsupported`，不启动、不替换任何网络。
+- **嵌入式引擎的组网引擎**：组网网络由进程内的组网引擎持有（自有线程与运行时），不属于某一份 profile。每份 profile 的引擎运行时在隧道启动后提交其中的组网网络，停止隧道时放手；最后一份放手后组网引擎再保留 5 秒，供下一份 profile 接手（先停旧再起新、先起新再停旧都不打断组网）。用户关闭 VPN 时，客户端在停止隧道前发 `mesh_engine_stop`，组网引擎立即停止（`allow_mesh` 为 `false` 的实例上返回 `unsupported`，见「通道」）；不发时组网会多运行最多 5 秒，期间仍用本机网络与成员通信。组网引擎停止后，`mesh_save_network`、`mesh_leave`、`mesh_set_subnet_route` 的本机状态随之清除，客户端须自己保存，在下次启动后重新下发。引擎按 `tunnel.routes` 自动分流：目的地址落在某个已加入网络的虚拟网段内（网络暂未运行也算，连接在该网络失败，不回落到规则），或落在某个运行中网络当前持有的通告子网内（多网重叠取最长前缀），流量直接交给 profile 中该网络的组网出站，先于 profile 规则，全局与直连模式下同样如此，用户规则也不能把这些地址改走别处，连接列表的 `rule` 为 `MESH`；profile 中没有该网络的组网出站时按规则走。同名网络有多个组网出站时取标识符排序最前的一个；该出站的配置与组网引擎采用的配置不一致（例如草稿 profile）时连接以 `NotConnected` 失败，不回落到规则。只按 IP 目的地址分流：域名目标交给规则（内网域名随组网 DNS 解析为内网地址后再分流；Fake-IP 模式下未经组网 DNS 的域名按规则走，可能经代理发出）。IPv4 映射的 IPv6 地址按其 IPv4 地址查找。以下情况流量按规则走：网络因 `instance_id_changed` 停下（它不以任何身份运行，虚拟网段一并让出，客户端以当前 ID 重新保存后恢复）、网络离开或删除、网络未能启动（例如 `managed` 网络缺少私钥）。网络因配置变化重建时新实例先登记再撤下旧实例，中间不回落。同一进程的多个网络按规范 §15.4 共用一张认领表：各网络启动时登记自己的虚拟网段，其他网络立即看到且不能认领；通告子网同类网络先认领者保留，`managed` 网络优先于 `legacy` 网络并立即收回 `legacy` 网络已认领的重叠子网；每个网络把其他网络登记与认领的内容当作本机网段（状态里该网段为 `route = local`）。本机网卡网段在组网引擎线程上读取：隧道启动和客户端发 `set_network`、`reset_network` 时立即读一次，此后每 30 秒重读，成功读取之前每 5 秒重试；单次最长 10 秒，上一次未结束时跳过本轮；读取失败时保留上一次的结果。读取时排除隧道自身的网卡和回环网卡，并忽略比 /8（IPv4）、/7（IPv6）更宽的地址段（含掩码为空的地址）。隧道自身的网卡按「带有任一组网虚拟地址」识别；物理网卡上若有与组网虚拟地址冲突的地址，整张网卡同样被排除。这是对 §15.4 的有意偏离：快照不提供隧道地址，客户端也不把组网虚拟地址设到隧道网卡上，所以按现有客户端，隧道网卡始终识别不出，它自己的地址段一直算本机网段，与之重叠的通告子网一直为 `route = local`、不分流。受影响的地址段：iOS 与 macOS 隧道的 `198.18.0.1/24`（不在内网白名单内，无实际影响）与 `fd00:4e43::1/64`（与 `fd00:4e43::/64` 重叠的通告子网，含其超网，不分流）；Windows 隧道的 `172.19.0.1/30` 与 `fdfe:dcba:9876::1/126` 目前不受影响（Windows 不读取网卡），以后读取时同样适用。Windows 等不读取网卡的平台上本机网段一直未读取，通告子网不进入隧道也不分流，只有虚拟网段分流。延迟测试、体检中的组网出站返回 `unsupported`，不启动、不替换任何网络，组网出站因此不宜放进按公网 URL 测速的分组。只开代理的 profile 提交空列表、不持有组网引擎：未经 `mesh_save_network` 保存的网络随之停止，已保存的网络只在某个运行时持有组网引擎时继续运行（经该运行时发出的 `mesh_save_network` 或 `mesh_join` 即持有）。
 
 ## 节点程序管理 API
 
@@ -186,7 +189,7 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 |---|---|---|
 | `mesh_status` | `network`（可省略，见「快照」） | 0.3 |
 | `mesh_join` / `mesh_leave` | `network` | 0.3 |
-| `mesh_engine_stop` | 无；用户关闭 VPN 时在停止隧道前发送，立即停止组网引擎（仅嵌入式引擎，见「隧道生命周期」） | 0.3 |
+| `mesh_engine_stop` | 无；用户关闭 VPN 时在停止隧道前发送，立即停止组网引擎（仅嵌入式引擎，见「隧道生命周期」）；应答 `{"ok":true,"stopped":布尔}`，`stopped` 为 `false` 表示另一份运行中的 profile 仍持有组网引擎 | 0.3 |
 | `mesh_save_network` | `config`：`config_version: 1` 网络配置（见 `mesh-module.md`；密钥由钥匙串注入） | 0.3 |
 | `mesh_remove_network` | `network` | 0.3 |
 | `mesh_set_dns` | 可省的 `network`、`enabled`、可省的 `suffix`；`network` 省略时作用于本设备全部网络（已有的按网络覆盖一并清除），给出时只作用于该网络，按网络的覆盖优先于全部网络的覆盖。本机覆盖，优先于网络配置的 `dns`，`suffix` 须位于 `internal` 之下且至少两个标签（规范 §15.9.2 第 1 条，见 `mesh-module.md`），不合规时拒绝该次设置 | 0.3 |
@@ -199,4 +202,13 @@ Agent 自己产生、上报面板的告警（不经内核），与内核给出�
 | `mesh_set_paths` | `network`、`paths`（与 `routing.paths` 同结构） | 0.5 |
 | `mesh_join_credential` | `credential`：一次性入网凭据 | 0.5 |
 
-成功返回 `{"ok":true}`，`mesh_status` 返回快照。失败返回 `{"ok":false,"error":{"code","detail"}}`。`code` 为 `unsupported`、`invalid_argument`、`not_found`、`not_allowed`（例如接入节点通告子网），或上面的失败原因之一。
+成功返回 `{"ok":true}`，`mesh_status` 返回快照。失败返回 `{"ok":false,"error":{"code","detail"}}`。`code` 为 `unsupported`、`invalid_argument`、`not_found`、`not_allowed`（例如接入节点通告子网）、`engine_unavailable`（嵌入式引擎：组网引擎未运行且无法由该运行时启动，见下），或上面的失败原因之一。
+
+嵌入式引擎的补充约定：
+- 任一运行时的控制通道都可发 `mesh_*` 命令。没有组网引擎在运行时，`mesh_save_network` 与 `mesh_join` 启动组网引擎，并由收到命令的运行时持有到它停止（只开代理时保存的网络因此继续运行）；已停止的运行时在隧道再次启动前不再持有组网引擎，这两条命令返回 `engine_unavailable`（组网引擎线程无法启动时同样），宿主停止隧道后不应再经它发 `mesh_*` 命令，同一运行时再次启动隧道后恢复；其余命令返回 `not_found`，`mesh_status` 返回空快照 `{"statusVersion":1,"networks":[],"network":null,"self":null,"members":[],"subnets":[],"refusedAdvertisements":0,"tunnel":{"routes":[],"routesVersion":0,"dns":null}}`（带 `network` 参数时返回 `not_found`）。
+- `mesh_save_network` 的 `config` 不合规、`kind = managed` 缺 `node.private_key`（`detail` 以 `private_key_required` 开头）、`node.instance_id` 与其他网络不同，都返回 `invalid_argument`，不保存。profile 中组网出站的 `node.instance_id` 彼此不同时该 profile 构建失败（构建只看 profile 本身）；设备的 `node.instance_id` 只与有运行实例的网络比较（启动后报 `port_in_use` 等失败、实例仍在的网络也算）：用户已退出、或因下述原因停下的网络不算，没有 `node.instance_id` 的网络与任何网络都不冲突（只用于 `mesh_save_network`、`mesh_join` 与下面的提交；profile 构建时同一 profile 内有 ID 与无 ID 的组网出站仍视为不同，构建失败），`mesh_join` 一个 `node.instance_id` 与运行中网络不同的网络同样返回 `invalid_argument`。profile 提交后以它的 `node.instance_id` 为准，未列在其中、带有不同 `node.instance_id`、用户未退出的已保存网络停下（保留配置，`state` 为 `not_joined`，`failure.code` 为 `instance_id_changed`，与用户退出区分），以当前值重新 `mesh_save_network`、或之后的 profile 再次使用它的 `node.instance_id` 时自动恢复；profile 中的组网出站都没有 `node.instance_id` 时不停任何已保存网络，没有 `node.instance_id` 的已保存网络也不会因任何 profile 停下。参数不合规（配置校验不过、超出上限、`cidr` 主机位不为零）的命令先返回 `invalid_argument`，不启动组网引擎；已停止的运行时同样如此。
+- 宿主把配置编码成 JSON 时不得把 `/` 转义为 `\/`（iOS 用 `JSONSerialization` 的 `.withoutEscapingSlashes`）：带转义的字符串要先解到临时缓冲区，那份私钥、密钥的明文副本不会被清零。同理，`network.secret` 含 `"`、`\` 或控制字符时 JSON 必须转义，也会留下不清零的副本；客户端生成密钥时只用可打印 ASCII 且不含这两个字符，导入的外部网络密钥无法保证。
+- 只有承载用户 profile 的运行时会在隧道启动后提交其组网网络；同一进程中为其他用途（如诊断）启动的运行时也会提交，会停掉未保存的网络，其组网出站带 `node.instance_id` 时还会以 `instance_id_changed` 停掉带有其他 ID 的已保存网络，因此不得在同一进程中这样启动。
+- 私钥只由运行引擎的进程注入（#408）：引擎无法分辨 `mesh_save_network` 的配置来自哪个进程，网络扩展、VPN 服务收到 App 经进程间通道转来的、带 `node.private_key` 的配置时应拒绝，只用自己专用安全存储中的私钥填入。
+- `mesh_set_subnet_route` 的 `cidr` 须为主机位为零的网段。
+- `mesh_set_dns` 在内网域名接入嵌入式引擎之前返回 `unsupported`；上表 0.4、0.5 的命令与未知的 `mesh_*` 命令返回 `unsupported`。

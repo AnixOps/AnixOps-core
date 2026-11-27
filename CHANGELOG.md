@@ -4,6 +4,42 @@
 
 ## Unreleased
 
+## v0.3.0-rc.2 - 2026-11-27
+
+内核 0.3 的第二个候选版，仍从 `release/0.3` 发布。在 rc.1 基础上补齐 iOS、macOS 客户端 1.1 使用组网所需的嵌入式引擎部分（控制命令、自动分流、能力查询、默认编入、`allow_mesh` 闸门），全部经过审计并已合入 `main`，再挑入维护分支。
+
+### 从 rc.1 升级
+
+- 运行配置新增 `allow_mesh`，缺省 `false`（失败时关闭）。组网发布门槛打开的客户端必须发送 `allow_mesh: true`，否则带 `"type": "mesh"` 出站的配置整份返回 `config_rejected`。
+- `engine-embedded` 默认 feature 加入 `mesh`，`networkcore_ios_feature_set_version` 升到 7。rc.1「未启用与未审计功能」中「嵌入式引擎的 `"type": "mesh"` 出站不在默认 feature 中」一条不再适用。
+- 判断某个运行实例能否使用组网，以控制命令 `capabilities` 返回的 `capabilities.mesh` 为准；为 `false` 时所有 `mesh_*` 命令返回 `unsupported`（rc.1 中为 `invalid_argument`）。
+- `mesh_set_dns` 在内网域名接入嵌入式引擎之前返回 `unsupported`。
+- `feature_set_version` 7 只说明接口集，不代表组网可用；`allow_mesh` 从本版起才被接受，rc.1 不认识这个字段。
+- `anixcore` 与独立节点 `anixops-mesh` 的行为不变，默认组网能力集仍正好是 `mesh`、`mesh_dns`、`mesh_resolver_address`、`mesh_native_keys`。
+
+### 已知未完成
+
+以下各项不影响本候选版；客户端打开组网发布门槛之前，必须先处理前两项。
+
+- 嵌入式引擎的组网内网域名（第二步 2e）。
+- 隧道网卡地址段始终算作本机网段（审计 N2，处理方案待客户端确认）。
+- 分流跟随任务超时中止时的竞态（审计 N14）与 L10。
+- 独立节点从 `legacy` 网络收回子网，留到 rc.2 之后。
+
+### Mesh
+
+- 运行配置新增 `allow_mesh`（布尔，缺省 `false`，0.3.0-rc.2 起接受）：为 `false` 或缺省时任何 `"type": "mesh"` 出站（顶层 `outbound`、`routing.outbounds`、内联 `via` 链任一层）都使整个配置被拒绝，错误码 `config_rejected`、消息固定为 `mesh outbounds are not allowed by this config`；该运行实例 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令返回 `unsupported`。缺省关闭，客户端只在组网发布门槛打开时发送 `true`，闸门落在内核一处。
+- 嵌入式组网进入默认构建（第二步 2f）：`engine-embedded` 默认 feature 加入 `mesh`，`networkcore_ios_feature_set_version` 升为 7（FFI 接口集含 `capabilities` 控制命令；不随 `mesh` feature 变化）。客户端以 `capabilities.mesh` 判断组网可用；profile 不含组网出站时组网完全惰性；组网界面仍按客户端发布门槛控制。
+- 嵌入式组网分流审计修复（#421 审计 M1–M6、L1–L9；#423 审计 H1、H2、N1–N4、N6–N13、N15–N17）：同一进程的多个网络按规范 §15.4 共用认领表（`outbound_mesh::claims::HostRoutes`，由独立节点的 `serve` 移入共用；虚拟网段登记后立即生效且不能被认领，加入时收回其他网络已认领的重叠子网，`managed` 网络看待 `legacy` 网络的子网时不当作本机网段，以便收回）（M1）；独立节点仍用原口径（`HostRoutes::default`，managed 不从 legacy 收回、加入时不收回，系统路由交接另行处理），嵌入式用 `HostRoutes::reclaiming`（H2）；未加入或已释放的 owner 认领不到任何子网（N1）；跟随任务只在驱动给出的子网、运行状态、他网认领或本机网段变化时重算（N3）；配置重建时新实例先登记再撤旧实例（N4）；分流查找改为认领变化时重建的查找表，查找不再取登记表锁、不复制快照（M2）；本机网卡网段改在组网引擎线程读取，每 30 秒重读、成功前每 5 秒重试、单次最长 10 秒、失败保留上次结果（M3）；读取时排除带有组网虚拟地址的隧道网卡并忽略前缀长度 0 的地址（M4）；已加入但未运行的网络的虚拟网段仍交给该网络，不回落到规则，`tunnel.routes` 列出所有已加入网络的虚拟网段（M5）；补测直连、全局模式分流、认领与本机网段联动、读取周期与排除隧道网卡（M6）；IPv4 映射的 IPv6 地址按 IPv4 查找（L7）；文档写明域名目标、同名出站、Windows 不读网卡、用户规则不能改走等行为（L1–L9）。
+- 嵌入式引擎新增控制命令 `capabilities`，返回 `{"capabilities": {"mesh": bool}}`，任何隧道（含 WireGuard）与桌面本地代理都可问；`mesh` 表示该运行实例是否回答 `mesh_*` 命令（本地代理始终为 `false`），为 `false` 时所有 `mesh_*` 命令返回 `unsupported`（此前为 `invalid_argument`）。
+- 嵌入式组网自动分流（第二步 2d）：目的地址落在已加入且运行中的组网网络 `tunnel.routes` 内时（重叠取最长前缀），流量直接交给 profile 中该网络的组网出站，先于规则与全局、直连模式，连接列表规则名为 `MESH`；域名目标仍按规则。隧道启动及客户端发 `set_network`、`reset_network` 时读取本机网卡网段交给组网网络，读不到时通告子网不进入隧道（规范 §15.4）。`mesh` feature 仍不在默认集合中。
+- 组网私钥放到堆上（#417 审计 Q5）：`MeshSettings.private_key` 改为 `Box<Zeroizing<[u8; 32]>>`，解码直接写入堆上，设置在装箱、拆箱、登记表赋值时只移动指针，不再在栈上留下未清零的私钥副本；新增 `KeyPair::from_private_ref` 按引用取私钥（按值传参的临时副本与运算库内部副本仍不保证清零，见 mesh-module.md），`mesh_status` 等状态查询复制设置时先移开私钥，不再复制私钥；修复 `apps/mesh-node` 随之的编译。文档收尾（#418 审计 R1–R3）：去掉把「无 ID」等同于 `legacy` 的说法，写明 `self.id` 属于所选网络，`mesh-module.md` 的 `node.instance_id` 一行同步比较口径。
+- 嵌入式组网控制命令审计修复（第二步 2c-5，#417 审计）：提交带 `node.instance_id` 的 profile 不再停下没有 ID 的已保存网络（Q1）；mesh-status.md 与代码注释写明 `mesh_status` 默认网络的三档选择顺序，客户端以 `networks[]` 与显式 `network` 为准（Q2）；写明「无 ID 不冲突」只用于保存、加入与提交（Q3）。补测：失败网络排在运行中网络之前时仍选运行中的网络、无 ID 的已保存网络在任何 profile 下继续运行。
+- 嵌入式组网控制命令审计修复（第二步 2c-4，#416 审计）：不带 `network` 的 `mesh_status` 优先选运行中的网络，其次不是因 `instance_id_changed` 停下的已加入网络（P1）；没有 `node.instance_id` 的网络与任何网络都不冲突（P2）。mesh-status.md 补充密钥含 `"`、`\`、控制字符时的残留副本（P3）、辅助运行时可能以 `instance_id_changed` 停网（P4）、`failure` 优先级列入 `instance_id_changed`（P5），并注明 ID 比较按有无实例判断。
+- 嵌入式组网控制命令审计修复（第二步 2c-3，#414 审计）：`node.instance_id` 只与运行中的网络比较，已退出的不算（N1）；`mesh_join` 同样检查（N2）；profile 没有 `node.instance_id` 时不停已保存的网络（N3）；同一运行时再次启动隧道后可重新持有组网引擎（N4）；命令参数先校验再查找组网引擎，不合规的 `mesh_save_network` 不启动引擎、已停止的运行时同样返回 `invalid_argument`，命令名读取只保留一份（N5）。被 profile 停下的已保存网络不再标为用户退出，改为 `failure.code` `instance_id_changed`，以当前值重新保存或 profile 恢复原值后自动恢复。mesh-status.md 写明宿主 JSON 不得转义 `/`、辅助运行时不得在同一进程中启动（#410 L2）。补测：两个网络被停下、停下后直接加入、超限配置、先起新再停旧、空 profile 提交、停止后再启动（#410 L3）。
+- 嵌入式组网控制命令审计修复（第二步 2c-2，#413 审计）：profile 构建只检查自身各网络 `node.instance_id` 一致，提交后以 profile 为准，`node.instance_id` 不同的已保存网络退出（M1）；已停止的运行时不再因 `mesh_save_network`、`mesh_join` 重新持有组网引擎（M2）；新增错误码 `engine_unavailable`，持有的引擎已停止时重新启动一次，其余命令遇引擎已停止返回 `not_found`（L1）；请求直接解析到命令参数，`mesh_save_network` 的密钥与私钥不经中间 JSON 值、释放时清零，只接受 JSON 对象（L2）；mesh-status.md 写明扩展应拒绝 App 转来的带私钥配置（D1）。
+- 嵌入式组网引擎控制命令（第二步 2c-1）：任一运行时的控制通道可发 `mesh_status`、`mesh_join`、`mesh_leave`、`mesh_save_network`、`mesh_remove_network`、`mesh_set_subnet_route`（`outbound_mesh::outbound::control`）。没有组网引擎时 `mesh_save_network`、`mesh_join` 启动它并由该运行时持有，`mesh_status` 返回空快照；`mesh_set_dns`、0.4/0.5 命令与未知 `mesh_*` 命令返回 `unsupported`。网络配置新增 `node.instance_id`（规范 §1 格式，快照 `self.id`）：同一引擎内各网络不同值时 `mesh_save_network` 返回 `invalid_argument`、profile 构建失败；`managed` 缺私钥返回 `invalid_argument`（`private_key_required`）。快照在登记表锁外取各网络驱动状态的副本，`tunnel.routesVersion` 在路由变化时加 1。`mesh_engine_stop` 应答增加 `stopped`。
+
 ## v0.3.0-rc.1 - 2026-11-26
 
 内核 0.3 的第一个候选版，从维护分支 `release/0.3` 发布（分支切自 `main` 的 `9197d59`），随客户端 1.1 验收。0.3 的组网范围：互通、TCP/UDP、前向保密、只走内网、成员与子网视图、内网域名。兼容性承诺见 [docs/compatibility-surface.md](docs/compatibility-surface.md)，候选版流程见 [docs/release-strategy.md](docs/release-strategy.md#版本节奏与候选版)。以下为自 `v0.2.0` 以来的全部变更。

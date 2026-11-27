@@ -216,6 +216,11 @@ pub enum Failure {
     /// the one `native_keys` lists, so the engine does not make one
     /// (spec §8.1, §8.3.1).
     PrivateKeyRequired,
+    /// A saved network whose `node.instance_id` differs from that of the
+    /// profile adopted later: it does not run under a second identity
+    /// until saved again with the current ID, or until a profile names
+    /// its ID again (`mesh-status.md`).
+    InstanceIdChanged,
 }
 
 impl Failure {
@@ -225,6 +230,7 @@ impl Failure {
             Self::NativeKeysPending => "native_keys_pending",
             Self::PortInUse => "port_in_use",
             Self::PrivateKeyRequired => "private_key_required",
+            Self::InstanceIdChanged => "instance_id_changed",
             Self::Stopped | Self::Replaced => "start_refused",
         }
     }
@@ -247,6 +253,10 @@ impl Failure {
             Self::PrivateKeyRequired => io::Error::new(
                 io::ErrorKind::NotConnected,
                 "mesh network needs its private key",
+            ),
+            Self::InstanceIdChanged => io::Error::new(
+                io::ErrorKind::NotConnected,
+                "mesh network carries another device instance ID",
             ),
         }
     }
@@ -280,6 +290,8 @@ pub struct Instance {
     /// Shared with the pump, which holds the instance only weakly.
     wake: Arc<Notify>,
     snapshot: watch::Sender<Snapshot>,
+    /// Ticks when a driver starts or stops, or the network retires.
+    changes: watch::Sender<()>,
     epoch: Instant,
     /// The runtime drivers run on; `None` runs them on the caller's.
     runtime: Option<tokio::runtime::Handle>,
@@ -291,7 +303,7 @@ impl Instance {
     /// network lists it in `native_keys`) passes it in the configuration.
     pub fn new(settings: MeshSettings) -> io::Result<Arc<Self>> {
         let static_key = match &settings.private_key {
-            Some(private) => KeyPair::from_private(**private),
+            Some(private) => KeyPair::from_private_ref(private),
             None => KeyPair::generate(&SystemRandom::new())
                 .map_err(|_| io::Error::other("mesh static key could not be made"))?,
         };
@@ -330,6 +342,7 @@ impl Instance {
             }),
             wake: Arc::new(Notify::new()),
             snapshot,
+            changes: watch::channel(()).0,
             epoch,
             runtime,
         })
@@ -369,6 +382,27 @@ impl Instance {
         self.snapshot.subscribe()
     }
 
+    /// Ticks when a driver starts or stops, or the network retires: the
+    /// moments [`Self::state`] and [`Self::is_retired`] change.
+    pub(crate) fn changes(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    /// Test hook: marks the network running with `snapshot` as its
+    /// driver's, without starting one.
+    #[cfg(test)]
+    pub(crate) fn pretend(&self, snapshot: Snapshot) {
+        self.lock().running = true;
+        self.snapshot.send_replace(snapshot);
+        self.changes.send_replace(());
+    }
+
+    /// Test hook: the networks this machine's driver would see as local.
+    #[cfg(test)]
+    pub(crate) fn local_networks(&self) -> Option<Vec<IpNet>> {
+        self.lock().local_networks.borrow().clone()
+    }
+
     /// Whether [`Self::retire`] stopped the network for good.
     pub fn is_retired(&self) -> bool {
         self.lock().retired
@@ -381,8 +415,15 @@ impl Instance {
     }
 
     /// The networks of this machine's interfaces, read by the engine.
+    /// The driver is told only when they changed.
     pub fn set_local_networks(&self, networks: Option<Vec<IpNet>>) {
-        self.lock().local_networks.send_replace(networks);
+        self.lock().local_networks.send_if_modified(|current| {
+            let changed = *current != networks;
+            if changed {
+                *current = networks;
+            }
+            changed
+        });
     }
 
     /// Subnets the user routes through the mesh although they overlap a
@@ -422,6 +463,7 @@ impl Instance {
             core.failure = None;
             core.run
         };
+        self.changes.send_replace(());
         // The guard is made here and moved into the task, so that it also
         // records the run as stopped when the runtime drops the task before
         // it was ever polled.
@@ -485,6 +527,8 @@ impl Instance {
         core.shutdown = None;
         core.to_driver = None;
         core.stack.abort_all();
+        drop(core);
+        self.changes.send_replace(());
     }
 
     /// Starts a TCP connection to `remote`.
@@ -608,6 +652,8 @@ impl Instance {
         core.shutdown = None;
         core.to_driver = None;
         core.stack.abort_all();
+        drop(core);
+        self.changes.send_replace(());
     }
 }
 

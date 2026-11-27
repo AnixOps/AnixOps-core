@@ -15,6 +15,7 @@
 //! included, and start a new one: the old one would keep the previous
 //! `native_keys` (spec §8.3.1) and dial with the same identity.
 
+pub mod control;
 pub mod engine;
 pub mod registry;
 pub mod snapshot;
@@ -102,11 +103,23 @@ impl OutboundFactory for MeshFactory {
         let Some(binding) = &self.binding else {
             return Ok(Arc::new(DetachedOutbound));
         };
-        binding
+        let mut built = binding
             .built
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(settings.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // One device has one instance ID (`mesh-module.md`,
+        // `node.instance_id`): a profile whose networks name different ones
+        // is refused. Only the profile is checked, not the engine, so that
+        // building never depends on the networks running now; the engine
+        // takes the profile's ID at commit.
+        let conflicting = built.iter().any(|other| {
+            other.network_name != settings.network_name && other.instance_id != settings.instance_id
+        });
+        if conflicting {
+            return Err("mesh node instance_id differs from that of another mesh network");
+        }
+        built.push(settings.clone());
+        drop(built);
         Ok(Arc::new(RegistryOutbound {
             slot: binding.slot,
             settings,

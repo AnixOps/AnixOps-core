@@ -48,8 +48,9 @@ pub fn state(view: &NetworkView<'_>) -> &'static str {
         return "not_joined";
     };
     match joined.failure {
-        // A managed network waiting for its key list is not joined yet.
-        Some(Failure::NativeKeysPending) => "not_joined",
+        // A managed network waiting for its key list is not joined yet;
+        // nor is a saved network of another device ID than the profile's.
+        Some(Failure::NativeKeysPending | Failure::InstanceIdChanged) => "not_joined",
         Some(_) => "failed",
         None if !joined.running => "joining",
         None if joined.snapshot.neighbours.is_empty() => "joining",
@@ -182,8 +183,10 @@ fn joining(view: &NetworkView<'_>) -> Value {
 fn own(view: &NetworkView<'_>) -> Value {
     let settings = view.settings;
     let mut own = Map::new();
-    // The device's instance ID (`node.instance_id`), the same in every
-    // network; the instance ID on the wire changes at every start.
+    // The device's instance ID (`node.instance_id`) of the chosen
+    // network, the same in every network that has one; `null` for a
+    // network configured without it. The instance ID on the wire changes
+    // at every start.
     own.insert("id".into(), json!(settings.instance_id));
     own.insert("name".into(), json!(settings.hostname));
     own.insert(
@@ -317,30 +320,6 @@ fn subnets(current: &Snapshot) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-/// `tunnel.routes` (snapshot «取值»): the virtual subnets of every joined
-/// network and the subnets its driver routes into the mesh, once this
-/// machine's networks were read; deduplicated, in a stable order.
-pub fn tunnel_routes<'a>(
-    joined: impl IntoIterator<Item = (&'a MeshSettings, &'a Snapshot)>,
-) -> Vec<IpNet> {
-    let mut routes = Vec::new();
-    for (settings, snapshot) in joined {
-        for net in settings.virtual_subnets() {
-            if !routes.contains(&net) {
-                routes.push(net);
-            }
-        }
-        if snapshot.local_networks_read {
-            for net in &snapshot.system_routes {
-                if !routes.contains(net) {
-                    routes.push(*net);
-                }
-            }
-        }
-    }
-    routes
 }
 
 #[cfg(test)]
@@ -490,8 +469,8 @@ mod tests {
             }),
             static_key: Some([1; 32]),
         };
-        let routes = tunnel_routes([(&settings, &current)]);
-        assert_eq!(routes, [net("10.144.0.0/24"), net("192.168.10.0/24")]);
+        // `Registry::tunnel_routes` gives them.
+        let routes = [net("10.144.0.0/24"), net("192.168.10.0/24")];
         let tunnel = Tunnel {
             routes: &routes,
             routes_version: 4,
@@ -558,20 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn no_subnet_enters_the_tunnel_before_local_networks_are_read() {
-        let settings = settings("legacy", false);
-        let current = Snapshot {
-            system_routes: vec![net("192.168.10.0/24")],
-            local_networks_read: false,
-            ..Snapshot::default()
-        };
-        assert_eq!(
-            tunnel_routes([(&settings, &current)]),
-            [net("10.144.0.0/24")]
-        );
-    }
-
-    #[test]
     fn failures_follow_the_snapshot_contract() {
         let settings = settings("managed", true);
         let current = Snapshot {
@@ -607,7 +572,7 @@ mod tests {
     #[test]
     fn no_secret_is_in_the_snapshot() {
         let mut settings = settings("managed", true);
-        settings.private_key = Some(zeroize::Zeroizing::new([7; 32]));
+        settings.private_key = Some(Box::new(zeroize::Zeroizing::new([7; 32])));
         let view = NetworkView {
             settings: &settings,
             joined: None,
