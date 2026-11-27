@@ -6,7 +6,7 @@
 
 ### Mesh
 
-- 嵌入式组网进入默认构建（第二步 2f）：`engine-embedded` 默认 feature 加入 `mesh`，`networkcore_ios_feature_set_version` 升为 7（组网出站、`mesh_*` 与 `capabilities` 控制命令、`tunnel.routes` 自动分流）。客户端以 `feature_set_version() >= 7` 判断可用；组网界面仍按客户端发布门槛控制。
+- 嵌入式组网进入默认构建（第二步 2f）：`engine-embedded` 默认 feature 加入 `mesh`，`networkcore_ios_feature_set_version` 升为 7（FFI 接口集含 `capabilities` 控制命令；不随 `mesh` feature 变化）。客户端以 `capabilities.mesh` 判断组网可用；profile 不含组网出站时组网完全惰性；组网界面仍按客户端发布门槛控制。
 - 嵌入式组网分流审计修复（#421 审计 M1–M6、L1–L9；#423 审计 H1、H2、N1–N4、N6–N13、N15–N17）：同一进程的多个网络按规范 §15.4 共用认领表（`outbound_mesh::claims::HostRoutes`，由独立节点的 `serve` 移入共用；虚拟网段登记后立即生效且不能被认领，加入时收回其他网络已认领的重叠子网，`managed` 网络看待 `legacy` 网络的子网时不当作本机网段，以便收回）（M1）；独立节点仍用原口径（`HostRoutes::default`，managed 不从 legacy 收回、加入时不收回，系统路由交接另行处理），嵌入式用 `HostRoutes::reclaiming`（H2）；未加入或已释放的 owner 认领不到任何子网（N1）；跟随任务只在驱动给出的子网、运行状态、他网认领或本机网段变化时重算（N3）；配置重建时新实例先登记再撤旧实例（N4）；分流查找改为认领变化时重建的查找表，查找不再取登记表锁、不复制快照（M2）；本机网卡网段改在组网引擎线程读取，每 30 秒重读、成功前每 5 秒重试、单次最长 10 秒、失败保留上次结果（M3）；读取时排除带有组网虚拟地址的隧道网卡并忽略前缀长度 0 的地址（M4）；已加入但未运行的网络的虚拟网段仍交给该网络，不回落到规则，`tunnel.routes` 列出所有已加入网络的虚拟网段（M5）；补测直连、全局模式分流、认领与本机网段联动、读取周期与排除隧道网卡（M6）；IPv4 映射的 IPv6 地址按 IPv4 查找（L7）；文档写明域名目标、同名出站、Windows 不读网卡、用户规则不能改走等行为（L1–L9）。
 - 嵌入式引擎新增控制命令 `capabilities`，返回 `{"capabilities": {"mesh": bool}}`，任何隧道（含 WireGuard）与桌面本地代理都可问；`mesh` 表示该运行实例是否回答 `mesh_*` 命令（本地代理始终为 `false`），为 `false` 时所有 `mesh_*` 命令返回 `unsupported`（此前为 `invalid_argument`）。
 - 嵌入式组网自动分流（第二步 2d）：目的地址落在已加入且运行中的组网网络 `tunnel.routes` 内时（重叠取最长前缀），流量直接交给 profile 中该网络的组网出站，先于规则与全局、直连模式，连接列表规则名为 `MESH`；域名目标仍按规则。隧道启动及客户端发 `set_network`、`reset_network` 时读取本机网卡网段交给组网网络，读不到时通告子网不进入隧道（规范 §15.4）。`mesh` feature 仍不在默认集合中。
