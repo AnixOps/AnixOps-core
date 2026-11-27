@@ -4,6 +4,63 @@
 
 ## Unreleased
 
+## v0.3.0 - 2026-11-27
+
+内核 0.3 正式版，从维护分支 `release/0.3` 发布，随客户端 1.1 发布。代码与 `v0.3.0-rc.2` 相同，只改了版本号与发布说明。0.3 的组网范围：互通、TCP/UDP、前向保密、只走内网、成员与子网视图、内网域名。兼容性承诺见 [docs/compatibility-surface.md](docs/compatibility-surface.md)，补丁版 0.3.x 只含修复。以下为自 `v0.2.0` 以来的全部变更，由 `v0.3.0-rc.1`、`v0.3.0-rc.2` 两个候选版小节合并而成。
+
+### 验收结果
+
+- 内核（Linux，2026-11-27，`v0.3.0-rc.2` 发布产物，先核对 `.sha256`）：用脱敏的 0.2.0 订阅 profile 实际验证。0.3 读取同一 profile 并以内置引擎连接（SOCKS 与 HTTP 两种方式均成功），收到 SIGTERM 干净退出、无残留进程；不改写 0.2.0 的 profile（sha256、文件列表、修改时间、大小均与升级前一致，无新文件）；profile 不含组网出站时组网完全惰性（无新网卡、无 UDP 监听）；回退到 0.2.0 后再次连接成功。`v0.3.0-rc.1` 已按同样步骤验收通过。
+- 客户端（iOS，2026-11-27）：固定到 `v0.3.0-rc.2` 的 TestFlight 构建真机启动、连接、断开正常；组网发布门槛关闭时行为与 rc.1 一致。
+
+### 回退到 0.2.0
+
+1. 停止 0.3 的进程。用 `anixops-mesh takeover` 接管过的设备，先运行 `anixops-mesh rollback`。
+2. 用 0.2.0 的二进制直接运行原 profile 目录。0.3 不改写 0.2.0 的 profile，无需恢复备份；仍建议升级前备份一份。
+3. 0.2.0 收到 SIGTERM 时，它拉起的外部子进程不退出、继续占用端口。回退后停止 0.2.0 时，需要一并停掉该子进程（0.2.0 自身的行为；0.3 只用内置引擎，没有外部子进程）。
+4. 0.3 只用内置引擎，内置引擎不支持的节点类型直接报错；遇到这类节点时，可回退到 0.2.0 继续使用。
+
+### 从 0.2.0 升级
+
+- 仓库拆分：客户端迁到 AnixOps/anixops-net，本仓库只发布 Linux CLI（`networkcore-linux`）、`anixops-mesh` 与 `anixcore` 相关产物；客户端以 git 提交固定引用内核 crate，升级时把固定提交改到本版的提交。
+- 不再内置第三方内核与预设规则：`networkcore-linux` 删除 `install-sing-box`/`sing-box install`、`core install|start|stop|status mieru`、`node switch`、`node health`，`run-url`/`run-catalog` 去掉 `--engine`、`--install-dir`、`--force`、`--binary`、`--sha256`；内置引擎不支持的节点直接报错。`engine-embedded::profile::RoutingMode` 只剩 `rule`/`direct`；MITM 不带内置插件，需要时用 `--mitm-plugin <path>` 加载用户插件。依赖这些命令或参数的脚本需要改写。
+- Windows 托管配置与状态里旧的 `tunnel` 字段被忽略；旧版本拉起的隧道进程需先用旧版本停止。
+- `/v1/mesh` 只新增字段，唯一收紧的是 `dns.suffix`：必须在 `internal` 之下且至少两个标签（`home.arpa`、单独的 `internal` 会使整份配置返回 400）。管理接口请求体上限为 32 MiB。
+- `anixops-mesh run` 失败时 stderr 最后一行：启动冲突为 `{"error":"conflict","conflict":"port_in_use"|"tun_in_use","detail"}`，其他运行错误为 `"error":"runtime"`；退出码不变。`run` 启动时输出 `ip_forwarding` 对象（[docs/deploy/mesh-node.md](docs/deploy/mesh-node.md)「`run` 的输出」）。
+- 指纹包：带 `hybrid_x25519` 的指纹包会被 0.2.0 整包拒绝，含 Firefox 指纹的包需按接收方版本分别下发（见下文 Fixed 中 `tls-mimic` 一条）。
+- 回退：见上文「回退到 0.2.0」。
+- 组网出站需要运行配置 `allow_mesh: true`（缺省 `false`，失败时关闭），能否使用组网以控制命令 `capabilities` 返回的 `capabilities.mesh` 为准，详见下文「从 0.3.0-rc.1 升级」。
+
+### 从 0.3.0-rc.1 升级
+
+- 运行配置新增 `allow_mesh`，缺省 `false`（失败时关闭）。组网发布门槛打开的客户端必须发送 `allow_mesh: true`，否则带 `"type": "mesh"` 出站的配置整份返回 `config_rejected`。
+- `engine-embedded` 默认 feature 加入 `mesh`，`networkcore_ios_feature_set_version` 升到 7。（rc.1 中不在默认 feature。）
+- 判断某个运行实例能否使用组网，以控制命令 `capabilities` 返回的 `capabilities.mesh` 为准；为 `false` 时所有 `mesh_*` 命令返回 `unsupported`（rc.1 中为 `invalid_argument`）。
+- `mesh_set_dns` 在内网域名接入嵌入式引擎之前返回 `unsupported`。
+- `feature_set_version` 7 只说明接口集，不代表组网可用；`allow_mesh` 从 rc.2 起才被接受，rc.1 不认识这个字段。
+- `anixcore` 与独立节点 `anixops-mesh` 的行为不变，默认组网能力集仍正好是 `mesh`、`mesh_dns`、`mesh_resolver_address`、`mesh_native_keys`。
+
+从 `v0.3.0-rc.2` 升级：无代码变化。
+
+### 已知未完成
+
+以下各项不影响本版；客户端打开组网发布门槛之前，必须先处理前两项。
+
+- 嵌入式引擎的组网内网域名（第二步 2e）。
+- 隧道网卡地址段始终算作本机网段（审计 N2，处理方案待客户端确认）。
+- 分流跟随任务超时中止时的竞态（审计 N14）与 L10。
+- 独立节点从 `legacy` 网络收回子网，留到后续版本。
+
+### 未启用与未审计功能
+
+以下功能已在代码中，但默认关闭、未纳入本轮审计，不属于 0.3 的承诺范围（[docs/compatibility-surface.md](docs/compatibility-surface.md) 第 7 节）。默认配置下组网能力正好是 `mesh`、`mesh_dns`、`mesh_resolver_address`、`mesh_native_keys`，有防回归测试固定。
+
+- 组网区域间骨干（`mesh_backbone`）、外部网络桥接（`mesh_external_bridge`）、自定义路径与途经点中继（`mesh_paths`、`node.waypoint_relay`）、区域测量（`mesh_regions`）、宿主组（`mesh_host_groups`）：`anixcore` 运维开关默认 `false`，关闭时不声明能力，带对应配置的 `PUT /v1/mesh` 整份返回 400。
+- 上述开关只约束 `anixcore` 受管组网。独立运行的 `anixops-mesh run` 按本地配置原样应用，不受这些开关约束；只有在本地配置里写了对应字段才会启用。
+- macOS 与 Windows 版 `anixops-mesh` 为实验性，未审计。
+- 内网域名的解析地址依赖面板为它保留（审计 L-5），需要与支持保留的面板版本一起使用。
+- 本轮审计的低危遗留项在 0.3.x 补丁中处理，不阻断本版。
+
 ### Mesh
 
 - 运行配置新增 `allow_mesh`（布尔，缺省 `false`，0.3.0-rc.2 起接受）：为 `false` 或缺省时任何 `"type": "mesh"` 出站（顶层 `outbound`、`routing.outbounds`、内联 `via` 链任一层）都使整个配置被拒绝，错误码 `config_rejected`、消息固定为 `mesh outbounds are not allowed by this config`；该运行实例 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令返回 `unsupported`。缺省关闭，客户端只在组网发布门槛打开时发送 `true`，闸门落在内核一处。
