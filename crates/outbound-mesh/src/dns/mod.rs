@@ -2,9 +2,9 @@
 //! `dns` section, the name list built from it and from the members' own
 //! host names, and the answers to queries for it.
 //!
-//! Both entrances use [`Names::answer`]: the engine's split DNS hands it the
-//! queries for the suffix, and a full node answers queries sent to the
-//! network's resolver address on its virtual interface ([`intercept`]).
+//! The engine's split DNS answers from the lists of every network at once
+//! ([`answer_from`]); a full node answers with [`Names::answer`] the
+//! queries sent to the network's resolver address on its virtual interface ([`intercept`]).
 //! Nothing here sends a query to the network.
 //!
 //! - [`normalize`]: the name rule and its Unicode 15.1.0 table.
@@ -330,6 +330,8 @@ pub struct Names {
     /// The only reverse names answered (spec §15.9.2 items 1 and 7).
     reverse: ReverseZones,
     entries: Vec<NameStatus>,
+    /// The name and region of each of `entries`, in the same order.
+    keys: Vec<Key>,
     refused: Vec<RefusedName>,
     resolver_address: Option<IpAddr>,
     resolver_conflict: bool,
@@ -410,6 +412,7 @@ impl Names {
         }
 
         let mut entries = Vec::new();
+        let mut entry_keys = Vec::new();
         let mut by_name: BTreeMap<Key, Vec<IpAddr>> = BTreeMap::new();
         let mut by_address: BTreeMap<IpAddr, Vec<String>> = BTreeMap::new();
         let mut regions = BTreeSet::new();
@@ -432,6 +435,7 @@ impl Names {
                     duplicate: from_members.is_some() || families(true) > 1 || families(false) > 1,
                     answerable: addresses.iter().all(|a| in_scope(*a)),
                 });
+                entry_keys.push(key.clone());
                 for address in addresses.iter().filter(|a| in_scope(**a)) {
                     push_unique(&mut answered, *address);
                 }
@@ -445,6 +449,7 @@ impl Names {
                     duplicate: from_panel.is_some() || groups.len() > 1,
                     answerable: addresses.iter().all(|a| in_scope(*a)),
                 });
+                entry_keys.push(key.clone());
                 for address in addresses.into_iter().filter(|a| in_scope(*a)) {
                     push_unique(&mut answered, address);
                 }
@@ -479,6 +484,7 @@ impl Names {
             // follow once the backbone hands them to the network.
             reverse: ReverseZones::of(view.virtual_subnets.iter().chain(view.host_groups).copied()),
             entries,
+            keys: entry_keys,
             refused: settings.refused.clone(),
             resolver_address: configured.filter(|_| !resolver_conflict),
             resolver_conflict,
@@ -643,6 +649,59 @@ impl Names {
         &self.refused
     }
 
+    /// The query names (lower case, without the final dot) whose answers
+    /// carry addresses of `entries()[index]`; none when none of its
+    /// addresses is answered. A query any other list also answers with
+    /// addresses merges both in the tunnel ([`answer_from`]), so the name
+    /// is a duplicate there (requirement R28).
+    ///
+    /// The forms follow [`Names::answer`]: `<name>.<region>.<suffix>`
+    /// always; `<name>.<suffix>` when the name is in this node's region or
+    /// that region has no such name (a short name looks in every region
+    /// then); the bare `<name>` when it is in this node's region.
+    pub fn queries_of(&self, index: usize) -> Vec<String> {
+        let (Some(entry), Some((label, region))) = (self.entries.get(index), self.keys.get(index))
+        else {
+            return Vec::new();
+        };
+        let answered = self
+            .by_name
+            .get(&(label.clone(), region.clone()))
+            .is_some_and(|found| entry.addresses.iter().any(|a| found.contains(a)));
+        if !answered {
+            return Vec::new();
+        }
+        self.queries_of_key(label, region.as_deref())
+    }
+
+    /// Every query name this list answers with addresses, in the forms of
+    /// [`Names::queries_of`].
+    pub fn queries(&self) -> BTreeSet<String> {
+        self.by_name
+            .keys()
+            .flat_map(|(label, region)| self.queries_of_key(label, region.as_deref()))
+            .collect()
+    }
+
+    fn queries_of_key(&self, label: &str, region: Option<&str>) -> Vec<String> {
+        let mut queries = Vec::new();
+        if let Some(region) = region {
+            queries.push(format!("{label}.{region}.{}", self.suffix));
+        }
+        let here = region == self.region.as_deref();
+        if here
+            || !self
+                .by_name
+                .contains_key(&(label.to_owned(), self.region.clone()))
+        {
+            queries.push(format!("{label}.{}", self.suffix));
+        }
+        if here {
+            queries.push(label.to_owned());
+        }
+        queries
+    }
+
     /// The address whose port 53 the virtual interface answers; `None`
     /// when names are off, none is configured, or it is this node's own.
     pub fn resolver_address(&self) -> Option<IpAddr> {
@@ -715,6 +774,14 @@ impl Names {
                 Some(resolution.write(&query, transport))
             }
         }
+    }
+
+    /// Whether `labels` lie under the suffix or in a reverse zone: names
+    /// this list answers for, found or not.
+    fn claims(&self, labels: &[Vec<u8>]) -> bool {
+        let n = self.suffix_labels.len();
+        (labels.len() >= n && labels[labels.len() - n..] == self.suffix_labels[..])
+            || self.reverse.zone_of(labels).is_some()
     }
 
     fn resolve(&self, query: &Query) -> Option<Resolution> {
@@ -823,6 +890,149 @@ impl Names {
             truncated: names.len() > MAX_ANSWER_ADDRESSES,
         }
     }
+}
+
+/// Answers `message` from the lists of several networks at once, in the
+/// order given (the embedded engine's split DNS, spec §15.9.2 item 8).
+/// Lists whose names are off take no part. A name with records in several
+/// lists answers the records of all of them, the first list's first and
+/// without repeats, at most [`MAX_ANSWER_ADDRESSES`] per record type (R28:
+/// a duplicate name answers every address); a name that exists without
+/// records of the type asked in one list answers NOERROR without records,
+/// before the NXDOMAIN of another. A query for a name under a suffix or
+/// in a reverse zone that cannot be read past its question answers
+/// FORMERR (or NOTIMP), never passed on. Anything else is
+/// [`Outcome::NotOurs`].
+pub fn answer_from(lists: &[&Names], message: &[u8], transport: Transport) -> Outcome {
+    let lists: Vec<&Names> = lists
+        .iter()
+        .copied()
+        .filter(|names| names.enabled)
+        .collect();
+    if lists.is_empty() {
+        return Outcome::NotOurs;
+    }
+    let query = match Query::parse(message) {
+        Ok(query) => query,
+        Err(message::ParseError::Bad(rcode)) => {
+            let ours = message::question_labels(message)
+                .is_some_and(|labels| lists.iter().any(|names| names.claims(&labels)));
+            return match message::header_of(message).filter(|_| ours) {
+                Some((id, rd, opcode)) => {
+                    Outcome::Answer(message::bare_answer(id, rd, opcode, rcode))
+                }
+                None => Outcome::NotOurs,
+            };
+        }
+        Err(message::ParseError::Ignore) => return Outcome::NotOurs,
+    };
+    match merge(&lists, &query) {
+        Some(resolution) => Outcome::Answer(resolution.write(&query, transport)),
+        None => Outcome::NotOurs,
+    }
+}
+
+/// The addresses of `host` in the lists of several networks, merged as
+/// [`answer_from`] merges records: `Some` (possibly empty, when the name
+/// is under a suffix but has no address) when a list answers for the
+/// name, so that it is never handed to another resolver; `None` for any
+/// other name.
+pub fn lookup(lists: &[&Names], host: &str) -> Option<Vec<IpAddr>> {
+    let lists: Vec<&Names> = lists
+        .iter()
+        .copied()
+        .filter(|names| names.enabled)
+        .collect();
+    if lists.is_empty() {
+        return None;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let labels: Vec<Vec<u8>> = host
+        .split('.')
+        .map(|label| label.as_bytes().to_ascii_lowercase())
+        .collect();
+    if labels
+        .iter()
+        .any(|label| label.is_empty() || label.len() > 63)
+    {
+        // A malformed name under a suffix or in a reverse zone fails here
+        // rather than going to another resolver.
+        return lists
+            .iter()
+            .any(|names| names.claims(&labels))
+            .then(Vec::new);
+    }
+    let query = Query {
+        id: 0,
+        rd: false,
+        opcode: 0,
+        labels,
+        qtype: message::TYPE_ANY,
+        qclass: message::CLASS_IN,
+        question: Vec::new(),
+        edns: None,
+    };
+    let resolution = merge(&lists, &query)?;
+    Some(
+        resolution
+            .records
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Address(address) => Some(address),
+                Record::Pointer(_) => None,
+            })
+            .collect(),
+    )
+}
+
+/// The resolutions of `query` in `lists`, merged (see [`answer_from`]);
+/// `None` when no list answers for the name.
+fn merge(lists: &[&Names], query: &Query) -> Option<Resolution> {
+    let resolutions: Vec<Resolution> = lists
+        .iter()
+        .filter_map(|names| names.resolve(query))
+        .collect();
+    let first = resolutions.first()?;
+    let found: Vec<&Resolution> = resolutions
+        .iter()
+        .filter(|resolution| resolution.rcode == Rcode::NoError && !resolution.records.is_empty())
+        .collect();
+    if found.is_empty() {
+        let exists = resolutions
+            .iter()
+            .any(|resolution| resolution.rcode == Rcode::NoError);
+        return Some(Resolution::empty(if exists {
+            Rcode::NoError
+        } else {
+            first.rcode
+        }));
+    }
+    let (mut v4, mut v6, mut pointers) = (Vec::new(), Vec::new(), Vec::new());
+    let mut truncated = false;
+    for resolution in found {
+        truncated |= resolution.truncated;
+        for record in &resolution.records {
+            let list = match record {
+                Record::Address(IpAddr::V4(_)) => &mut v4,
+                Record::Address(IpAddr::V6(_)) => &mut v6,
+                Record::Pointer(_) => &mut pointers,
+            };
+            push_unique(list, record.clone());
+        }
+    }
+    for list in [&mut v4, &mut v6, &mut pointers] {
+        if list.len() > MAX_ANSWER_ADDRESSES {
+            truncated = true;
+            list.truncate(MAX_ANSWER_ADDRESSES);
+        }
+    }
+    v4.append(&mut v6);
+    v4.append(&mut pointers);
+    Some(Resolution {
+        rcode: Rcode::NoError,
+        records: v4,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -1120,6 +1330,95 @@ mod tests {
     }
 
     #[test]
+    fn several_networks_answer_together() {
+        let first = names(
+            json!({"enabled": true}),
+            &[
+                member("printer", &["10.150.0.9"], &[]),
+                member("nas", &["10.150.0.20"], &[]),
+            ],
+        );
+        let second = names(
+            json!({"enabled": true}),
+            &[member("printer", &["10.150.0.10"], &[])],
+        );
+        let off = names(
+            json!({"enabled": false}),
+            &[member("printer", &["10.150.0.11"], &[])],
+        );
+        let lists = [&off, &first, &second];
+        let reply = |message: Vec<u8>| match answer_from(&lists, &message, Transport::Udp) {
+            Outcome::Answer(reply) => Some(reply),
+            Outcome::NotOurs => None,
+        };
+        let ask =
+            |name: &str, qtype: u16| reply(query(1, name, qtype, None)).map(|r| parse_answer(&r));
+        // A name in two networks answers both, the first list's first; the
+        // list whose names are off takes no part.
+        let printer = ask("printer.mesh.internal", TYPE_A).unwrap();
+        assert_eq!(printer.rcode, 0);
+        assert_eq!(addresses(&printer), [ip("10.150.0.9"), ip("10.150.0.10")]);
+        // The same address twice is answered once.
+        let own = ask("self-box.mesh.internal", TYPE_A).unwrap();
+        assert_eq!(addresses(&own), [ip("10.150.0.5")]);
+        // A name of one network only.
+        let nas = ask("nas.mesh.internal", TYPE_A).unwrap();
+        assert_eq!(addresses(&nas), [ip("10.150.0.20")]);
+        // A name without records of the type: NOERROR, before the NXDOMAIN
+        // of the network that does not have it.
+        let none = ask("nas.mesh.internal", TYPE_AAAA).unwrap();
+        assert_eq!(none.rcode, 0);
+        assert!(none.records.is_empty());
+        assert_eq!(
+            ask("scanner.mesh.internal", TYPE_A).unwrap().rcode,
+            Rcode::NxDomain as u8
+        );
+        // A version of EDNS other than 0 gets BADVERS, as from one list.
+        let mut badvers = query(1, "printer.mesh.internal", TYPE_A, Some(1232));
+        let version = badvers.len() - 5;
+        badvers[version] = 1;
+        let badvers = parse_answer(&reply(badvers).unwrap());
+        assert!(badvers.records.is_empty());
+        assert_eq!(badvers.opt.map(|(_, extended)| extended), Some(1));
+        // Other names are left to the other resolvers.
+        assert!(ask("www.example.com", TYPE_A).is_none());
+        // A malformed query under the suffix answers FORMERR; elsewhere it
+        // is left alone.
+        let malformed = |name: &str| {
+            let mut message = query(1, name, TYPE_A, None);
+            message[7] = 1;
+            reply(message)
+        };
+        let formerr = malformed("printer.mesh.internal").unwrap();
+        assert_eq!(formerr[3] & 0x0f, Rcode::FormErr as u8);
+        assert_eq!(formerr[..2], [0, 1]);
+        assert!(malformed("www.example.com").is_none());
+        // Nothing answers when every list is off.
+        assert!(
+            answer_from(
+                &[&off],
+                &query(1, "printer.mesh.internal", TYPE_A, None),
+                Transport::Udp
+            ) == Outcome::NotOurs
+        );
+        // Looked up by name for a connection: the same merge, and a name
+        // under the suffix never goes elsewhere, found or not.
+        assert_eq!(
+            lookup(&lists, "Printer.Mesh.Internal."),
+            Some(vec![ip("10.150.0.9"), ip("10.150.0.10")])
+        );
+        assert_eq!(lookup(&lists, "scanner.mesh.internal"), Some(Vec::new()));
+        // A malformed name under the suffix fails too; elsewhere it is left
+        // to the system resolver.
+        assert_eq!(lookup(&lists, "a..mesh.internal"), Some(Vec::new()));
+        let long = format!("{}.mesh.internal", "x".repeat(64));
+        assert_eq!(lookup(&lists, &long), Some(Vec::new()));
+        assert_eq!(lookup(&lists, "a..example.com"), None);
+        assert_eq!(lookup(&lists, "www.example.com"), None);
+        assert_eq!(lookup(&[&off], "printer.mesh.internal"), None);
+    }
+
+    #[test]
     fn duplicates_answer_every_address_panel_first() {
         let members = [
             // Claims the panel's name for another member: both answered,
@@ -1340,6 +1639,68 @@ mod tests {
         let names = super::tests::names(json!({ "enabled": true, "region": "hk" }), &members);
         let gw = ask(&names, "gw.hk.mesh.internal", TYPE_A).unwrap();
         assert_eq!(addresses(&gw), [ip("10.150.0.1")]);
+    }
+
+    #[test]
+    fn queries_follow_how_names_are_answered() {
+        let members = [
+            member("gw", &["10.150.0.1"], &["192.168.10.0/24"]),
+            member("eu-border", &["10.150.0.2"], &["10.151.0.0/16"]),
+        ];
+        let names = names(region_dns(), &members);
+        let queries = |names: &Names, name: &str| {
+            let index = names
+                .entries()
+                .iter()
+                .position(|entry| entry.name == name)
+                .unwrap();
+            names.queries_of(index)
+        };
+        // In this region: full, short and bare.
+        assert_eq!(
+            queries(&names, "web.cn"),
+            ["web.cn.mesh.internal", "web.mesh.internal", "web"]
+        );
+        // Another region whose name this region has too: the short name
+        // stays here, so only the full name reaches it.
+        assert_eq!(queries(&names, "web.eu"), ["web.eu.mesh.internal"]);
+        // Another region whose name this region lacks: full and short.
+        assert_eq!(
+            queries(&names, "db.eu"),
+            ["db.eu.mesh.internal", "db.mesh.internal"]
+        );
+        // No address answered: no query reaches it.
+        assert!(queries(&names, "far.cn").is_empty());
+        // Every listed query is answered with the entry's addresses.
+        for entry in ["web.cn", "web.eu", "db.eu", "nas.cn"] {
+            let index = names
+                .entries()
+                .iter()
+                .position(|e| e.name == entry)
+                .unwrap();
+            let expected = &names.entries()[index].addresses;
+            for query in names.queries_of(index) {
+                let answer = ask(&names, &query, TYPE_ANY).unwrap();
+                let found = addresses(&answer);
+                assert!(
+                    expected.iter().any(|a| found.contains(a)),
+                    "{query} for {entry}"
+                );
+            }
+        }
+        let all = names.queries();
+        assert!(all.contains("db.mesh.internal"));
+        assert!(!all.contains("far"));
+        assert!(!all.contains("db"));
+        // Region unknown: names have no region label, so the short and the
+        // bare name reach them.
+        let alone = super::tests::names(
+            json!({ "enabled": true }),
+            &[member("gw", &["10.150.0.1"], &[])],
+        );
+        assert_eq!(alone.region(), None);
+        assert_eq!(queries(&alone, "gw"), ["gw.mesh.internal", "gw"]);
+        assert!(alone.queries().contains("self-box"));
     }
 
     #[test]

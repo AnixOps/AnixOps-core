@@ -11,7 +11,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::registry::{NetworkState, Registry, RegistryError};
+use super::registry::{DnsOverride, NetworkState, Registry, RegistryError};
 use super::snapshot::{self, Joined, NetworkView, Tunnel};
 use crate::driver::Snapshot;
 use crate::{IpNet, MeshConfig, MeshSettings};
@@ -41,6 +41,12 @@ pub enum Command {
         network: String,
         cidr: String,
         route: Route,
+    },
+    /// `mesh_set_dns`: `network` `None` for every network.
+    SetDns {
+        network: Option<String>,
+        enabled: bool,
+        suffix: Option<String>,
     },
 }
 
@@ -86,6 +92,18 @@ struct SubnetRouteArgs {
     route: Route,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsArgs {
+    #[allow(dead_code)]
+    cmd: IgnoredAny,
+    #[serde(default)]
+    network: Option<String>,
+    enabled: bool,
+    #[serde(default)]
+    suffix: Option<String>,
+}
+
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Route {
@@ -98,8 +116,7 @@ pub enum Request {
     /// One of [`Command`].
     Command(Command),
     /// A command of this table this engine does not run (a later kernel
-    /// version, or `mesh_set_dns` before intranet names reach the embedded
-    /// engine).
+    /// version).
     Unsupported(String),
     /// A known command with missing or malformed arguments.
     Invalid(String),
@@ -107,7 +124,6 @@ pub enum Request {
 
 /// The commands [`parse`] knows but leaves to [`Request::Unsupported`].
 const UNSUPPORTED: &[&str] = &[
-    "mesh_set_dns",
     "mesh_set_relay",
     "mesh_set_host_mode",
     "mesh_advertise",
@@ -169,6 +185,11 @@ pub fn parse(request: &[u8]) -> Option<Request> {
                 route: args.route,
             })
         }
+        "mesh_set_dns" => serde_json::from_slice::<DnsArgs>(request).map(|args| Command::SetDns {
+            network: args.network,
+            enabled: args.enabled,
+            suffix: args.suffix,
+        }),
         _ => return Some(Request::Unsupported(name)),
     };
     Some(match command {
@@ -237,6 +258,7 @@ enum Checked {
     Remove(String),
     Save(Box<MeshSettings>),
     SetSubnetRoute(String, IpNet, Route),
+    SetDns(Option<String>, DnsOverride),
 }
 
 fn check(command: Command) -> Result<Checked, Value> {
@@ -266,6 +288,24 @@ fn check(command: Command) -> Result<Checked, Value> {
             };
             Checked::SetSubnetRoute(network, cidr, route)
         }
+        Command::SetDns {
+            network,
+            enabled,
+            suffix,
+        } => {
+            // The rule of the config's `dns.suffix` (spec §15.9.2 item 1).
+            let suffix = suffix
+                .map(|suffix| {
+                    crate::dns::normalize_suffix(&suffix).ok_or_else(|| {
+                        error(
+                            "invalid_argument",
+                            "suffix must lie under internal with at least two labels",
+                        )
+                    })
+                })
+                .transpose()?;
+            Checked::SetDns(network, DnsOverride { enabled, suffix })
+        }
     })
 }
 
@@ -286,6 +326,7 @@ fn execute(command: Checked, starts: bool, registry: Option<&Registry>) -> Value
         Checked::SetSubnetRoute(network, cidr, route) => {
             registry.set_route_override(&network, cidr, route == Route::Mesh)
         }
+        Checked::SetDns(network, dns) => registry.set_dns(network.as_deref(), dns),
     };
     match result {
         Ok(()) => json!({"ok": true}),
@@ -314,6 +355,8 @@ fn empty_status() -> Value {
         "members": [],
         "subnets": [],
         "refusedAdvertisements": 0,
+        "names": [],
+        "refusedNames": [],
         "tunnel": {"routes": [], "routesVersion": 0, "dns": Value::Null},
     })
 }
@@ -402,13 +445,15 @@ fn status(registry: &Registry, network: Option<&str>) -> Value {
         return refused(RegistryError::NotFound);
     };
     let routes = registry.tunnel_routes();
-    let routes_version = registry.routes_version(&routes);
+    let domains = registry.dns_domains();
+    let routes_version = registry.routes_version(&routes, &domains);
     snapshot::snapshot(
         &views[chosen],
         &views,
         &Tunnel {
             routes: &routes,
             routes_version,
+            dns_domains: &domains,
         },
     )
 }
@@ -481,7 +526,7 @@ mod tests {
             "mesh_".repeat(100_000)
         );
         assert!(parse(large.as_bytes()).is_none());
-        for name in ["mesh_set_dns", "mesh_set_paths", "mesh_something_later"] {
+        for name in ["mesh_set_relay", "mesh_set_paths", "mesh_something_later"] {
             let answer = run(None, json!({"cmd": name}));
             assert_eq!(code(&answer), "unsupported", "{name}");
         }
@@ -490,6 +535,10 @@ mod tests {
             json!({"cmd": "mesh_join", "network": 1}),
             json!({"cmd": "mesh_leave", "network": "a", "extra": true}),
             json!({"cmd": "mesh_set_subnet_route", "network": "a", "cidr": "10.0.0.0/8", "route": "elsewhere"}),
+            json!({"cmd": "mesh_set_dns"}),
+            json!({"cmd": "mesh_set_dns", "enabled": "yes"}),
+            json!({"cmd": "mesh_set_dns", "enabled": true, "suffix": 1}),
+            json!({"cmd": "mesh_set_dns", "enabled": true, "region": "eu"}),
         ] {
             assert_eq!(
                 code(&run(None, request.clone())),
@@ -505,6 +554,8 @@ mod tests {
         assert_eq!(status["statusVersion"], 1);
         assert_eq!(status["networks"], json!([]));
         assert_eq!(status["network"], Value::Null);
+        assert_eq!(status["names"], json!([]));
+        assert_eq!(status["refusedNames"], json!([]));
         let named = run(None, json!({"cmd": "mesh_status", "network": "office"}));
         assert_eq!(code(&named), "not_found");
         let left = run(None, json!({"cmd": "mesh_leave", "network": "office"}));
@@ -623,6 +674,8 @@ mod tests {
             json!({"cmd": "mesh_save_network", "config": bad}),
             json!({"cmd": "mesh_save_network", "config": oversized}),
             json!({"cmd": "mesh_set_subnet_route", "network": "office", "cidr": "10.0.0.1/8", "route": "mesh"}),
+            json!({"cmd": "mesh_set_dns", "enabled": true, "suffix": "example.com"}),
+            json!({"cmd": "mesh_set_dns", "network": "office", "enabled": true, "suffix": "internal"}),
         ] {
             assert_eq!(code(&ask(request.clone())), "invalid_argument", "{request}");
             assert!(!looked.get(), "{request}");
@@ -736,5 +789,102 @@ mod tests {
         assert_eq!(set("local", "10.200.0.0/24"), json!({"ok": true}));
         assert_eq!(set("mesh", "10.201.0.0/24"), json!({"ok": true}));
         assert_eq!(overrides(&registry).len(), 256);
+    }
+
+    #[test]
+    fn a_dns_override_applies_to_one_network_or_to_all() {
+        let (_runtime, registry) = registry();
+        for (name, address) in [("lab", "10.145.0.2/24"), ("office", "10.144.0.2/24")] {
+            let saved = run(
+                Some(&registry),
+                json!({"cmd": "mesh_save_network", "config": config(name, address, "legacy")}),
+            );
+            assert_eq!(saved, json!({"ok": true}));
+        }
+        let default_suffix = crate::dns::DnsSettings::default().suffix;
+        // The `dns` in force of `name`: as reported, and as its instance
+        // has it.
+        let dns = |name: &str| {
+            let state = registry
+                .networks()
+                .into_iter()
+                .find(|state| state.settings.network_name == name)
+                .expect("a network of that name");
+            let instance = state.instance.as_ref().expect("running").dns();
+            assert_eq!(instance, state.settings.dns, "{name}");
+            (state.settings.dns.enabled, state.settings.dns.suffix)
+        };
+        let set = |request: Value| run(Some(&registry), request);
+        assert_eq!(dns("office"), (false, default_suffix.clone()));
+        let status = run(
+            Some(&registry),
+            json!({"cmd": "mesh_status", "network": "office"}),
+        );
+        assert_eq!(status["network"]["dnsEnabled"], false);
+        // Every network.
+        assert_eq!(
+            set(json!({"cmd": "mesh_set_dns", "enabled": true})),
+            json!({"ok": true})
+        );
+        assert_eq!(dns("lab"), (true, default_suffix.clone()));
+        assert_eq!(dns("office"), (true, default_suffix.clone()));
+        // One network, ahead of the override of every network; the suffix
+        // is read as the config's is.
+        assert_eq!(
+            set(
+                json!({"cmd": "mesh_set_dns", "network": "office", "enabled": false, "suffix": "Home.Internal."})
+            ),
+            json!({"ok": true})
+        );
+        assert_eq!(dns("office"), (false, "home.internal".to_owned()));
+        assert_eq!(dns("lab"), (true, default_suffix.clone()));
+        let status = run(
+            Some(&registry),
+            json!({"cmd": "mesh_status", "network": "office"}),
+        );
+        assert_eq!(status["network"]["dnsSuffix"], "home.internal");
+        assert_eq!(status["network"]["dnsEnabled"], false);
+        // A bad suffix or an unknown network changes nothing.
+        assert_eq!(
+            code(&set(
+                json!({"cmd": "mesh_set_dns", "network": "office", "enabled": true, "suffix": "home.arpa"})
+            )),
+            "invalid_argument"
+        );
+        assert_eq!(
+            code(&set(
+                json!({"cmd": "mesh_set_dns", "network": "branch", "enabled": true})
+            )),
+            "not_found"
+        );
+        assert_eq!(dns("office"), (false, "home.internal".to_owned()));
+        // Every network again: the override of one network goes.
+        assert_eq!(
+            set(json!({"cmd": "mesh_set_dns", "enabled": true, "suffix": "corp.internal"})),
+            json!({"ok": true})
+        );
+        assert_eq!(dns("office"), (true, "corp.internal".to_owned()));
+        assert_eq!(dns("lab"), (true, "corp.internal".to_owned()));
+        // A network added later starts with it, and so does one whose
+        // settings change.
+        let saved = run(
+            Some(&registry),
+            json!({"cmd": "mesh_save_network", "config": config("branch", "10.146.0.2/24", "legacy")}),
+        );
+        assert_eq!(saved, json!({"ok": true}));
+        assert_eq!(dns("branch"), (true, "corp.internal".to_owned()));
+        let mut changed = config("office", "10.144.0.3/24", "legacy");
+        changed["dns"] = json!({"enabled": false, "suffix": "office.internal"});
+        let saved = run(
+            Some(&registry),
+            json!({"cmd": "mesh_save_network", "config": changed}),
+        );
+        assert_eq!(saved, json!({"ok": true}));
+        assert_eq!(dns("office"), (true, "corp.internal".to_owned()));
+        // Without an engine there is nothing to set.
+        assert_eq!(
+            code(&run(None, json!({"cmd": "mesh_set_dns", "enabled": true}))),
+            "not_found"
+        );
     }
 }
