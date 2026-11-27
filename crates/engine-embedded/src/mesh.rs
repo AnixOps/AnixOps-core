@@ -193,6 +193,16 @@ mod tests {
         .clone()
     }
 
+    #[test]
+    fn a_mesh_command_longer_than_the_limit_goes_on_to_the_other_handlers() {
+        // Refused for its length there; the engine is never looked up.
+        let head = r#"{"cmd":"mesh_status","pad":""#;
+        let length = crate::control::MAX_RELOAD_REQUEST_LEN + 1;
+        let request = format!("{head}{}\"}}", "x".repeat(length - head.len() - 2));
+        assert_eq!(request.len(), length);
+        assert!(MeshBinding::default().control(request.as_bytes()).is_none());
+    }
+
     /// One test for the process's engine slot, so that no other test
     /// shares it.
     #[test]

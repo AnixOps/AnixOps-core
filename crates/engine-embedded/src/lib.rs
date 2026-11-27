@@ -608,15 +608,22 @@ impl Drop for EmbeddedRuntime {
 /// never does. When it does not, every `mesh_*` command answers
 /// `unsupported` here. `None` for any other request.
 ///
-/// A command name written with JSON escapes (`"capabilit\u0069es"`) misses
-/// the byte test and reaches the other handlers, which answer
-/// `invalid_argument`.
+/// `capabilities` is answered up to [`control::MAX_REQUEST_LEN`] bytes, like
+/// the other short commands; a `mesh_*` command up to
+/// [`control::MAX_RELOAD_REQUEST_LEN`], like the mesh commands it stands for.
+/// Longer requests go on to the other handlers, which refuse their length.
+/// A command name written with JSON escapes (`"capabilit\u0069es"`) is not
+/// guaranteed to be recognised: the byte test only finds it when the plain
+/// name also appears elsewhere in the request.
 pub(crate) fn feature_control(request: &[u8], mesh: bool) -> Option<Result<Vec<u8>, RuntimeError>> {
     if !control::names(request, b"capabilities") && (mesh || !control::names(request, b"mesh_")) {
         return None;
     }
     let name = control::command_name(request)?;
     let answer = if name == "capabilities" {
+        if request.len() > control::MAX_REQUEST_LEN {
+            return None;
+        }
         serde_json::json!({"capabilities": {"mesh": mesh}})
     } else if !mesh && name.starts_with("mesh_") {
         serde_json::json!({
@@ -676,25 +683,39 @@ mod feature_control_tests {
 
     #[test]
     fn nested_values_and_oversized_requests_are_left_to_the_other_handlers() {
-        // Deeper than the JSON reader's nesting limit: unread here.
+        // Every field but `cmd` is skipped unread, however deep it nests.
         let deep = format!(
             r#"{{"cmd":"capabilities","x":{}1{}}}"#,
-            "[".repeat(4096),
-            "]".repeat(4096)
+            "[".repeat(1000),
+            "]".repeat(1000)
         );
-        assert_eq!(ask(&deep, false), None);
+        assert_eq!(
+            ask(&deep, false),
+            Some(json!({"capabilities": {"mesh": false}}))
+        );
         let shallow = r#"{"x":[[{"cmd":"mesh_status"}]],"cmd":"capabilities"}"#;
         assert_eq!(
             ask(shallow, false),
             Some(json!({"capabilities": {"mesh": false}}))
         );
-        let long = format!(
-            r#"{{"cmd":"capabilities","pad":"{}"}}"#,
-            "x".repeat(crate::control::MAX_RELOAD_REQUEST_LEN)
-        );
+        // `capabilities` is a short command.
+        let padded = |cmd: &str, length: usize| {
+            let head = format!(r#"{{"cmd":"{cmd}","pad":""#);
+            format!("{head}{}\"}}", "x".repeat(length - head.len() - 2))
+        };
+        let short = padded("capabilities", crate::control::MAX_REQUEST_LEN);
+        assert_eq!(short.len(), crate::control::MAX_REQUEST_LEN);
+        assert!(ask(&short, false).is_some());
+        let long = padded("capabilities", crate::control::MAX_REQUEST_LEN + 1);
         assert_eq!(ask(&long, false), None);
-        // Escaped command names miss the byte test (`invalid_argument`
-        // from the other handlers).
+        // A `mesh_*` command is refused up to the mesh commands' limit.
+        let mesh = padded("mesh_status", crate::control::MAX_RELOAD_REQUEST_LEN);
+        assert_eq!(ask(&mesh, false).unwrap()["error"]["code"], "unsupported");
+        let mesh = padded("mesh_status", crate::control::MAX_RELOAD_REQUEST_LEN + 1);
+        assert_eq!(ask(&mesh, false), None);
+        // An escaped command name is not guaranteed to be recognised: alone,
+        // it misses the byte test; next to the plain name, it is read.
         assert_eq!(ask(r#"{"cmd":"capabilit\u0069es"}"#, false), None);
+        assert!(ask(r#"{"cmd":"capabilit\u0069es","n":"capabilities"}"#, false).is_some());
     }
 }
