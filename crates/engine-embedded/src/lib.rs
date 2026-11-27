@@ -250,6 +250,10 @@ impl EmbeddedRuntime {
             .unwrap_or_default();
         let routed =
             config.build_routed_with_plugin_rules(registry, dialer.clone(), &plugin_rules)?;
+        #[cfg(feature = "mesh")]
+        if let (Some(routed), Some(routing)) = (&routed, &config.routing) {
+            mesh.route(routed, &routing.outbounds);
+        }
         let engine = match &routed {
             Some(routed) => Engine::Stack(Arc::new(config.build_dispatcher(
                 Some(routed.clone()),
