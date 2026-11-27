@@ -412,7 +412,7 @@ impl Names {
         }
 
         let mut entries = Vec::new();
-        let mut keys = Vec::new();
+        let mut entry_keys = Vec::new();
         let mut by_name: BTreeMap<Key, Vec<IpAddr>> = BTreeMap::new();
         let mut by_address: BTreeMap<IpAddr, Vec<String>> = BTreeMap::new();
         let mut regions = BTreeSet::new();
@@ -435,7 +435,7 @@ impl Names {
                     duplicate: from_members.is_some() || families(true) > 1 || families(false) > 1,
                     answerable: addresses.iter().all(|a| in_scope(*a)),
                 });
-                keys.push(key.clone());
+                entry_keys.push(key.clone());
                 for address in addresses.iter().filter(|a| in_scope(**a)) {
                     push_unique(&mut answered, *address);
                 }
@@ -449,7 +449,7 @@ impl Names {
                     duplicate: from_panel.is_some() || groups.len() > 1,
                     answerable: addresses.iter().all(|a| in_scope(*a)),
                 });
-                keys.push(key.clone());
+                entry_keys.push(key.clone());
                 for address in addresses.into_iter().filter(|a| in_scope(*a)) {
                     push_unique(&mut answered, address);
                 }
@@ -484,7 +484,7 @@ impl Names {
             // follow once the backbone hands them to the network.
             reverse: ReverseZones::of(view.virtual_subnets.iter().chain(view.host_groups).copied()),
             entries,
-            keys,
+            keys: entry_keys,
             refused: settings.refused.clone(),
             resolver_address: configured.filter(|_| !resolver_conflict),
             resolver_conflict,
@@ -1639,6 +1639,68 @@ mod tests {
         let names = super::tests::names(json!({ "enabled": true, "region": "hk" }), &members);
         let gw = ask(&names, "gw.hk.mesh.internal", TYPE_A).unwrap();
         assert_eq!(addresses(&gw), [ip("10.150.0.1")]);
+    }
+
+    #[test]
+    fn queries_follow_how_names_are_answered() {
+        let members = [
+            member("gw", &["10.150.0.1"], &["192.168.10.0/24"]),
+            member("eu-border", &["10.150.0.2"], &["10.151.0.0/16"]),
+        ];
+        let names = names(region_dns(), &members);
+        let queries = |names: &Names, name: &str| {
+            let index = names
+                .entries()
+                .iter()
+                .position(|entry| entry.name == name)
+                .unwrap();
+            names.queries_of(index)
+        };
+        // In this region: full, short and bare.
+        assert_eq!(
+            queries(&names, "web.cn"),
+            ["web.cn.mesh.internal", "web.mesh.internal", "web"]
+        );
+        // Another region whose name this region has too: the short name
+        // stays here, so only the full name reaches it.
+        assert_eq!(queries(&names, "web.eu"), ["web.eu.mesh.internal"]);
+        // Another region whose name this region lacks: full and short.
+        assert_eq!(
+            queries(&names, "db.eu"),
+            ["db.eu.mesh.internal", "db.mesh.internal"]
+        );
+        // No address answered: no query reaches it.
+        assert!(queries(&names, "far.cn").is_empty());
+        // Every listed query is answered with the entry's addresses.
+        for entry in ["web.cn", "web.eu", "db.eu", "nas.cn"] {
+            let index = names
+                .entries()
+                .iter()
+                .position(|e| e.name == entry)
+                .unwrap();
+            let expected = &names.entries()[index].addresses;
+            for query in names.queries_of(index) {
+                let answer = ask(&names, &query, TYPE_ANY).unwrap();
+                let found = addresses(&answer);
+                assert!(
+                    expected.iter().any(|a| found.contains(a)),
+                    "{query} for {entry}"
+                );
+            }
+        }
+        let all = names.queries();
+        assert!(all.contains("db.mesh.internal"));
+        assert!(!all.contains("far"));
+        assert!(!all.contains("db"));
+        // Region unknown: names have no region label, so the short and the
+        // bare name reach them.
+        let alone = super::tests::names(
+            json!({ "enabled": true }),
+            &[member("gw", &["10.150.0.1"], &[])],
+        );
+        assert_eq!(alone.region(), None);
+        assert_eq!(queries(&alone, "gw"), ["gw.mesh.internal", "gw"]);
+        assert!(alone.queries().contains("self-box"));
     }
 
     #[test]
