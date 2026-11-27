@@ -631,7 +631,9 @@ mod tests {
         ];
         let value = snapshot(&views[0], &views, &tunnel);
         assert_eq!(entry(&value, "printer.lon")["duplicate"], false);
-        assert_eq!(entry(&value, "cam.lon")["duplicate"], false);
+        // `cam.lon` stays a duplicate within office (two panel addresses),
+        // but no other network shares it.
+        assert!(entry(&value, "cam.lon").get("duplicateNetworks").is_none());
         // Not running itself: no names, only what its config skipped.
         let views = [
             view(&office, &office_now, false),
