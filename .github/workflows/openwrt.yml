@@ -256,11 +256,15 @@ jobs:
             cmp "${package}" "dist/openwrt-again/$(basename "${package}")"
           done
           # A pre-release tag gives versions that sort before the release in
-          # both package managers; apk mkpkg rejects a malformed one.
-          .github/scripts/package-openwrt.sh "v${version}-rc.1" dist/bin dist/openwrt-rc
-          ipk="dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.ipk"
-          tar -xzOf "${ipk}" ./control.tar.gz | tar -xzOf - ./control | grep -Fx "Version: ${version}~rc.1-r1"
-          test -s "dist/openwrt-rc/anixops-mesh_${version}-rc.1-r1_x86_64.apk"
+          # both package managers; apk mkpkg rejects a malformed one. The
+          # workspace version is itself a pre-release on release/X.Y during a
+          # release candidate (0.3.0-rc.2), so build the test tag from the
+          # release part only.
+          base="${version%%-*}"
+          .github/scripts/package-openwrt.sh "v${base}-rc.1" dist/bin dist/openwrt-rc
+          ipk="dist/openwrt-rc/anixops-mesh_${base}-rc.1-r1_x86_64.ipk"
+          tar -xzOf "${ipk}" ./control.tar.gz | tar -xzOf - ./control | grep -Fx "Version: ${base}~rc.1-r1"
+          test -s "dist/openwrt-rc/anixops-mesh_${base}-rc.1-r1_x86_64.apk"
           # A later version, for the upgrade test of the install jobs.
           .github/scripts/package-openwrt.sh 99.0.0 dist/bin dist/openwrt/upgrade
 
