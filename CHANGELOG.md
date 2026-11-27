@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+## v0.3.1-rc.1 - 2026-11-27
+
+内核 0.3.1 的候选版，从 `release/0.3` 发布。补丁版通常只收修复；本版经负责人批准例外加入嵌入式引擎的组网内网域名（`mesh_set_dns` 在兼容性承诺清单中本就列为 0.3 接口），以便客户端 1.1 使用组网。因为改动面较大，先出候选版验收。
+
+### 从 0.3.0 升级
+
+- `mesh_set_dns` 在嵌入式引擎中不再返回 `unsupported`；运行配置带 `allow_mesh: true` 的隧道开始应答组网内网域名。未发送 `allow_mesh: true` 的客户端行为不变。
+- `mesh_status` 快照新增名字视图 `names[]`、`refusedNames[]`，只新增字段。
+- 修复：组网驱动启动窗口内发出的 `dns`、`native_keys`、`paths`、`host_groups` 热更新不再丢失（安全相关，详见下文 Mesh 一节）。
+
 ### Mesh
 
 - 嵌入式引擎接入内网域名（0.3.1，用户批准的补丁版例外）：运行配置带 `allow_mesh: true` 的隧道（WireGuard 隧道除外）中，发往 53 端口的 UDP 查询里组网网络的内网域名（后缀、推算的反向区、本地区单标签主机名）由组网模块直接应答，先于 hosts、DNS 规则、Fake-IP 与上游；查不到返回 NXDOMAIN，读不懂的这类查询返回 FORMERR，都不外发。参与应答的是所有运行中且内网域名开启的网络，与 `tunnel.dns.matchDomains` 范围相同。快照 `tunnel.dns` 给出 `{"servers": ["198.18.0.2", "fd00::53"], "matchDomains": [...]}`（客户端须把这两个地址路由进隧道），`network.dnsSuffix`、`network.dnsEnabled` 给出实际取值；`tunnel.routesVersion` 也随 `matchDomains` 变化。多个网络有同一名字时合并全部地址（managed 网络在前，其余按网络加入引擎的顺序，重建后不变）。组网出站的内网域名目标改从同一名单取地址，不再交给系统解析器。只应答 UDP：经 TCP 的 DNS 查询（含 TC 后的重试）仍按规则转发；上游 DNS 服务器的出站选择不经组网分流（已知限制）。
