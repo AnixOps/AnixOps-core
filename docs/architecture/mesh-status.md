@@ -8,6 +8,7 @@
 - 请求是 JSON，命令名放在 `cmd` 字段，用下划线命名，与现有命令一致，例如 `{"cmd":"mesh_status"}`。
 - 是否支持组网只以 `capabilities.mesh` 判断。`networkcore_ios_feature_set_version` 自 7 起不论是否编入 `mesh` feature 都为 7，只表示 FFI 接口集（含 `capabilities` 命令），不表示组网可用。控制命令 `{"cmd":"capabilities"}` 返回 `{"capabilities":{"mesh":true|false}}`，`mesh` 表示这个运行实例是否回答 `mesh_*` 命令：VPN 运行实例（任何隧道，WireGuard 隧道也一样）在引擎编入 `mesh` feature 时为 `true`，桌面本地代理模式不运行组网，始终为 `false`。它是编译期与运行模式决定的，与节点上 anixcore `/v1/status` 的 features 无关。为 `false` 时所有 `mesh_*` 命令返回 `{"ok":false,"error":{"code":"unsupported"}}`。`capabilities` 与其他短命令一样，请求长度上限 4096 字节；未编入时的 `mesh_*` 与组网命令一样，上限 1 MiB；超出时按长度错误拒绝。命令名用 JSON 转义写出（如 `capabilit\u0069es`）的请求不保证识别。
 - 默认构建编入组网，但内核没有运行时开关：profile 里没有 `"type": "mesh"` 出站时组网引擎不启动、不读网卡、不分流，完全惰性；只要 profile 含组网出站（包括用户手写或导入的配置），隧道启动后就提交并启动组网引擎。未编入 `mesh` 的旧默认构建会把这类出站当作未知类型拒绝。是否向用户开放组网由客户端发布门槛与配置生成控制。
+- 运行配置 `allow_mesh`（缺省 `true`，能力集 7 起接受）是内核侧的闸门：为 `false` 时，任何组网出站（顶层 `outbound`、`routing.outbounds`、内联 `via` 链的任一层）都使整个配置被拒绝，错误码 `config_rejected`，消息固定为 `mesh outbounds are not allowed by this config`；该实例的 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令返回 `unsupported`。这样的 profile 没有组网出站，隧道启动时与不含组网出站的 profile 相同：不持有组网引擎，同进程里上一个 profile 未经 `mesh_save_network` 保存的网络随之停止。客户端在组网发布门槛关闭时应对所有平台入口发送 `allow_mesh: false`。
 - 不新增任何网络监听端口（需求 R11）。独立节点程序 `anixops-mesh` 在本机 Unix 域套接字上回答同样的 `mesh_status`（Windows 上为命名管道），文件权限只允许 root 与指定组访问；不监听任何 TCP 或 UDP 端口，回环地址也不行（OpenWrt LuCI 插件使用，需求 R35）。
 
 ## 快照

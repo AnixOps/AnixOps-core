@@ -432,12 +432,15 @@ impl EmbeddedRuntime {
     /// (moving to a new UDP socket) and `set_network`, and rejects every
     /// other request.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
-        if let Some(answer) = feature_control(request, cfg!(feature = "mesh")) {
+        let mesh = cfg!(feature = "mesh") && self.config.allow_mesh;
+        if let Some(answer) = feature_control(request, mesh) {
             return answer;
         }
         #[cfg(feature = "mesh")]
-        if let Some(answer) = self.mesh.control(request) {
-            return answer;
+        if mesh {
+            if let Some(answer) = self.mesh.control(request) {
+                return answer;
+            }
         }
         match &self.engine {
             Engine::Stack(dispatcher) => {

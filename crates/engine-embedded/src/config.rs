@@ -101,6 +101,38 @@ pub struct RuntimeConfig {
     /// Needs the `tls-fingerprints` feature (on with `vless`).
     #[serde(default)]
     pub tls_fingerprints: Option<serde_json::Value>,
+    /// Whether the profile may run mesh networks. `false` refuses the whole
+    /// config when any outbound is a `"type": "mesh"` one (the top-level
+    /// `outbound`, `routing.outbounds` or an inline `via`), with
+    /// [`MESH_NOT_ALLOWED`], and the runtime answers every `mesh_*` command
+    /// `unsupported` and `capabilities.mesh` `false`. On by default; a build
+    /// without the `mesh` feature takes the field too
+    /// (`docs/architecture/mesh-status.md`).
+    #[serde(default = "default_true")]
+    pub allow_mesh: bool,
+}
+
+/// The `type` of mesh outbounds.
+const MESH_TYPE: &str = "mesh";
+
+/// The message of a config refused for a mesh outbound under
+/// `allow_mesh: false`; the code is `config_rejected`.
+pub const MESH_NOT_ALLOWED: &str = "mesh outbounds are not allowed by this config";
+
+/// Whether `outbound`, or an outbound its inline `via` chain builds, is a
+/// mesh outbound.
+fn builds_mesh(outbound: &OutboundConfig) -> bool {
+    let mut next = Some(outbound);
+    while let Some(outbound) = next {
+        if outbound.kind == MESH_TYPE {
+            return true;
+        }
+        next = match &outbound.via {
+            Some(Via::Inline(via)) => Some(via.as_ref()),
+            _ => None,
+        };
+    }
+    false
 }
 
 /// The `mitm` section: plugins and the device root (see `crate::mitm`).
@@ -841,6 +873,16 @@ impl RuntimeConfig {
     }
 
     fn validate(&self) -> Result<(), RuntimeError> {
+        if !self.allow_mesh {
+            let mut outbounds = self.outbound.iter().chain(
+                self.routing
+                    .iter()
+                    .flat_map(|routing| routing.outbounds.values()),
+            );
+            if outbounds.any(builds_mesh) {
+                return Err(rejected(MESH_NOT_ALLOWED));
+            }
+        }
         self.redirect_table()?;
         let profile_id_ok = is_identifier(&self.profile_id);
         if !profile_id_ok {
