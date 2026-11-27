@@ -531,6 +531,31 @@ mod tests {
             engine.local_reads() > before,
             "set_network reads them again"
         );
+        // The profile's mesh node takes the network's addresses ahead of
+        // the rules; other addresses stay with the rules.
+        let spec = config_core::routing::RoutingSpec {
+            rules: vec!["FINAL,DIRECT".to_string()],
+            groups: Vec::new(),
+        };
+        let direct: Arc<dyn engine_outbound::TcpOutbound> =
+            Arc::new(crate::direct::DirectOutbound::new(Arc::new(TcpDialer)));
+        let routed = RoutedOutbound::new(
+            &spec,
+            direct.clone(),
+            BTreeMap::from([("mesh-office".to_string(), direct)]),
+        )
+        .unwrap();
+        let outbounds: BTreeMap<String, OutboundConfig> = serde_json::from_value(json!({
+            "mesh-office": {"type": "mesh", "network": {"name": "embedded-office"}},
+        }))
+        .unwrap();
+        first.route(&routed, &outbounds);
+        let inside = engine_outbound::TargetAddr::Ip("10.160.0.9:22".parse().unwrap());
+        let (route, _) = routed.mesh_flow(&inside).expect("routed to the mesh");
+        assert_eq!(route.rule, crate::routing::MESH_RULE);
+        assert_eq!(route.outbound, "mesh-office");
+        let outside = engine_outbound::TargetAddr::Ip("192.0.2.1:22".parse().unwrap());
+        assert!(routed.mesh_flow(&outside).is_none());
         let instance = engine.registry().networks()[0]
             .instance
             .clone()
