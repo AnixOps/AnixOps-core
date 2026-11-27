@@ -13,14 +13,38 @@
 //! thread.
 
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 use super::registry::Registry;
+use crate::IpNet;
+
+/// Reads the networks of this machine's interfaces, leaving out the
+/// interface that carries any of the given addresses (the tunnel's own);
+/// `None` when they cannot be read. A blocking call.
+pub type LocalReader = Arc<dyn Fn(&[IpAddr]) -> Option<Vec<IpNet>> + Send + Sync>;
+
+/// When this machine's networks are read (spec §15.4): again every
+/// `every` once read, every `retry` until then, each read cut off after
+/// `limit` (it may go on in the background; the next one waits for it).
+#[derive(Clone, Copy, Debug)]
+pub struct LocalTiming {
+    pub retry: Duration,
+    pub every: Duration,
+    pub limit: Duration,
+}
+
+/// The timing of spec §15.4.
+pub const LOCAL_TIMING: LocalTiming = LocalTiming {
+    retry: Duration::from_secs(5),
+    every: Duration::from_secs(30),
+    limit: Duration::from_secs(10),
+};
 
 /// How long the engine waits for a new holder after the last one let go.
 pub const GRACE: Duration = Duration::from_secs(5);
@@ -36,6 +60,8 @@ pub struct MeshEngine {
     runtime: Handle,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Wakes the reader of this machine's networks, once it runs.
+    reader: Mutex<Option<Arc<Notify>>>,
 }
 
 impl MeshEngine {
@@ -63,11 +89,46 @@ impl MeshEngine {
             runtime: handle,
             stop: Mutex::new(Some(stop)),
             thread: Mutex::new(Some(thread)),
+            reader: Mutex::new(None),
         }))
     }
 
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Starts reading this machine's networks with `read` on the engine's
+    /// own runtime, off every caller's thread, on [`LOCAL_TIMING`]; the
+    /// registry gets each read that succeeds. A failed read keeps the
+    /// networks read last. Once started, later calls change nothing.
+    /// Whether this call started it.
+    pub fn read_local_networks(self: &Arc<Self>, read: LocalReader) -> bool {
+        self.read_local_networks_with(read, LOCAL_TIMING)
+    }
+
+    /// [`Self::read_local_networks`] on `timing`.
+    pub fn read_local_networks_with(
+        self: &Arc<Self>,
+        read: LocalReader,
+        timing: LocalTiming,
+    ) -> bool {
+        let mut reader = lock(&self.reader);
+        if reader.is_some() {
+            return false;
+        }
+        let now = Arc::new(Notify::new());
+        *reader = Some(now.clone());
+        self.runtime
+            .spawn(read_local(Arc::downgrade(self), read, now, timing));
+        true
+    }
+
+    /// Reads this machine's networks again at once (the tunnel started,
+    /// the client reported a network change), unless a read is under way.
+    pub fn reread_local_networks(&self) {
+        if let Some(now) = &*lock(&self.reader) {
+            now.notify_one();
+        }
     }
 
     /// Retires every network, then ends the runtime and its thread.
@@ -89,6 +150,49 @@ impl MeshEngine {
     /// Whether [`Self::stop`] ran.
     pub fn is_stopped(&self) -> bool {
         lock(&self.stop).is_none()
+    }
+}
+
+/// Reads this machine's networks until the engine is gone (spec §15.4):
+/// one read at a time, so that a slow one is not stacked on.
+async fn read_local(
+    engine: Weak<MeshEngine>,
+    read: LocalReader,
+    now: Arc<Notify>,
+    timing: LocalTiming,
+) {
+    let mut pending: Option<tokio::task::JoinHandle<Option<Vec<IpNet>>>> = None;
+    let mut known = false;
+    loop {
+        if pending.as_ref().is_none_or(|read| read.is_finished()) {
+            let Some(own) = engine
+                .upgrade()
+                .map(|engine| engine.registry.own_addresses())
+            else {
+                return;
+            };
+            let read = read.clone();
+            let mut handle = tokio::task::spawn_blocking(move || read(&own));
+            pending = match tokio::time::timeout(timing.limit, &mut handle).await {
+                Ok(Ok(Some(found))) => {
+                    let Some(engine) = engine.upgrade() else {
+                        return;
+                    };
+                    engine.registry.set_local_networks(found);
+                    known = true;
+                    None
+                }
+                // Failed: the networks read last stay.
+                Ok(_) => None,
+                // Too slow: not waited for, not read again before it ends.
+                Err(_) => Some(handle),
+            };
+        }
+        let wait = if known { timing.every } else { timing.retry };
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = now.notified() => {}
+        }
     }
 }
 
@@ -249,6 +353,113 @@ impl Drop for EngineHold {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    /// Waits up to five seconds for `done`.
+    fn wait_for(done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done(), "timed out");
+    }
+
+    #[test]
+    fn this_machines_networks_are_read_again_and_a_failed_read_keeps_the_last() {
+        let engine = MeshEngine::start().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lan = IpNet::parse("192.168.1.0/24").unwrap();
+        let read: LocalReader = {
+            let calls = calls.clone();
+            Arc::new(move |_own: &[IpAddr]| {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    // Retried until it succeeds once, then failures keep it.
+                    0 => None,
+                    1 => Some(vec![lan]),
+                    _ => None,
+                }
+            })
+        };
+        let timing = LocalTiming {
+            retry: Duration::from_millis(10),
+            every: Duration::from_millis(10),
+            limit: Duration::from_secs(5),
+        };
+        assert_eq!(engine.registry().local_networks(), None);
+        assert!(engine.read_local_networks_with(read, timing));
+        wait_for(|| calls.load(Ordering::SeqCst) >= 4);
+        assert_eq!(engine.registry().local_networks(), Some(vec![lan]));
+        engine.stop();
+    }
+
+    #[test]
+    fn a_slow_read_is_not_stacked_on() {
+        let engine = MeshEngine::start().unwrap();
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read: LocalReader = {
+            let (running, most, calls) = (running.clone(), most.clone(), calls.clone());
+            Arc::new(move |_own: &[IpAddr]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                running.fetch_sub(1, Ordering::SeqCst);
+                None
+            })
+        };
+        let timing = LocalTiming {
+            retry: Duration::from_millis(5),
+            every: Duration::from_millis(5),
+            limit: Duration::from_millis(20),
+        };
+        assert!(engine.read_local_networks_with(read, timing));
+        wait_for(|| calls.load(Ordering::SeqCst) >= 3);
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+        engine.stop();
+    }
+
+    #[test]
+    fn a_read_is_asked_for_at_once_and_the_tunnel_is_left_out() {
+        let engine = MeshEngine::start().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let read: LocalReader = {
+            let (calls, seen) = (calls.clone(), seen.clone());
+            Arc::new(move |own: &[IpAddr]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                *lock(&seen) = own.to_vec();
+                Some(Vec::new())
+            })
+        };
+        let timing = LocalTiming {
+            retry: Duration::from_secs(3600),
+            every: Duration::from_secs(3600),
+            limit: Duration::from_secs(5),
+        };
+        let config: crate::MeshConfig = serde_json::from_value(serde_json::json!({
+            "config_version": 1,
+            "network": {"name": "office", "secret": "s3cr3t", "kind": "legacy"},
+            "node": {"address": "10.157.0.2/24", "role": "access"},
+            "peers": [{"server": "127.0.0.1", "port": 1}],
+        }))
+        .unwrap();
+        engine.registry().commit(vec![config.validate().unwrap()]);
+        assert!(engine.read_local_networks_with(read.clone(), timing));
+        wait_for(|| calls.load(Ordering::SeqCst) == 1);
+        // The reader is told the virtual addresses, so that it leaves out
+        // the interface that carries them.
+        assert!(lock(&seen).contains(&"10.157.0.2".parse::<IpAddr>().unwrap()));
+        // Started once only.
+        assert!(!engine.read_local_networks_with(read, timing));
+        engine.reread_local_networks();
+        wait_for(|| calls.load(Ordering::SeqCst) == 2);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        engine.stop();
+    }
 
     fn slot(grace: Duration) -> &'static EngineSlot {
         Box::leak(Box::new(EngineSlot::new(grace)))

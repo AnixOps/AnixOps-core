@@ -401,12 +401,7 @@ fn status(registry: &Registry, network: Option<&str>) -> Value {
     let Some(chosen) = chosen else {
         return refused(RegistryError::NotFound);
     };
-    let routes = snapshot::tunnel_routes(views.iter().filter_map(|view| {
-        view.joined
-            .as_ref()
-            .filter(|joined| joined.running)
-            .map(|joined| (view.settings, joined.snapshot))
-    }));
+    let routes = registry.tunnel_routes();
     let routes_version = registry.routes_version(&routes);
     snapshot::snapshot(
         &views[chosen],

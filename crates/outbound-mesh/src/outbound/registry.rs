@@ -9,16 +9,19 @@
 //! `mesh_*` commands change it. Every instance runs its driver on the
 //! engine's own runtime, never on the caller's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use ring::rand::SystemRandom;
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 
 use super::same_settings;
 use super::stack::{Failure, Instance};
+use crate::claims::HostRoutes;
 use crate::config::NetworkKind;
 use crate::secure::noise::KeyPair;
 use crate::{IpNet, MeshSettings};
@@ -41,6 +44,20 @@ struct Network {
     /// Subnets the user routes through the mesh although they overlap a
     /// network of this machine (`mesh_set_subnet_route`).
     route_overrides: Vec<IpNet>,
+    /// The instance's name in the shared [`HostRoutes`]: one per instance,
+    /// so that a replaced instance cannot release its successor's claim.
+    owner: String,
+}
+
+impl Network {
+    /// Retires the instance, if any, and frees what it held in `claims` at
+    /// once: its addresses go back to the rules.
+    fn stop(&mut self, claims: &HostRoutes) {
+        if let Some(instance) = self.instance.take() {
+            instance.retire();
+            claims.release(&self.owner);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -53,7 +70,6 @@ struct Inner {
     keys: BTreeMap<String, KeyPair>,
     /// The engine stopped; nothing starts any more.
     closed: bool,
-    local_networks: Option<Vec<IpNet>>,
     /// The `tunnel.routes` last reported and their `routesVersion`.
     routes: (Vec<IpNet>, u64),
 }
@@ -117,6 +133,13 @@ impl RegistryError {
 pub struct Registry {
     runtime: Handle,
     inner: Mutex<Inner>,
+    /// What each running network routes, shared by all (spec §15.4, 同一
+    /// 进程中的多个网络): flows are routed by it ([`Self::network_for`]).
+    claims: HostRoutes,
+    /// The networks of this machine's interfaces; `None` until read once.
+    machine: watch::Sender<Option<Vec<IpNet>>>,
+    /// Numbers the instances' owners in [`Self::claims`].
+    owners: AtomicU64,
 }
 
 impl Registry {
@@ -125,6 +148,9 @@ impl Registry {
         Self {
             runtime,
             inner: Mutex::new(Inner::default()),
+            claims: HostRoutes::default(),
+            machine: watch::channel(None).0,
+            owners: AtomicU64::new(0),
         }
     }
 
@@ -166,12 +192,7 @@ impl Registry {
         // without an ID leaves every saved network as it is, and a saved
         // network without an ID is left as it is by every profile.
         if let Some(id) = profile_id {
-            let Inner {
-                networks,
-                keys,
-                local_networks,
-                ..
-            } = &mut *inner;
+            let Inner { networks, keys, .. } = &mut *inner;
             for (name, network) in networks.iter_mut() {
                 if !network.saved || listed.contains(name) || !network.joined {
                     continue;
@@ -183,11 +204,9 @@ impl Registry {
                 };
                 if own != id {
                     network.failure = Some(Failure::InstanceIdChanged);
-                    if let Some(instance) = network.instance.take() {
-                        instance.retire();
-                    }
+                    network.stop(&self.claims);
                 } else if network.failure == Some(Failure::InstanceIdChanged) {
-                    self.start(keys, local_networks, network);
+                    self.start(keys, network);
                 }
             }
         }
@@ -200,10 +219,8 @@ impl Registry {
         for name in gone {
             // Its key stays: the network may come back in a later profile
             // and should keep its identity (spec §8.1).
-            if let Some(network) = inner.networks.remove(&name) {
-                if let Some(instance) = network.instance {
-                    instance.retire();
-                }
+            if let Some(mut network) = inner.networks.remove(&name) {
+                network.stop(&self.claims);
             }
         }
     }
@@ -263,7 +280,7 @@ impl Registry {
             .as_ref()
             .is_some_and(|instance| !instance.is_retired());
         if !running {
-            self.start(&mut inner.keys, &inner.local_networks, network);
+            self.start(&mut inner.keys, network);
         }
         Ok(())
     }
@@ -281,9 +298,7 @@ impl Registry {
             .ok_or(RegistryError::NotFound)?;
         network.joined = false;
         network.failure = None;
-        if let Some(instance) = network.instance.take() {
-            instance.retire();
-        }
+        network.stop(&self.claims);
         Ok(())
     }
 
@@ -297,7 +312,7 @@ impl Registry {
         if !inner.networks.contains_key(name) {
             return Err(RegistryError::NotFound);
         }
-        remove(&mut inner, name);
+        remove(&mut inner, &self.claims, name);
         Ok(())
     }
 
@@ -335,46 +350,70 @@ impl Registry {
         Ok(())
     }
 
-    /// The joined, running network whose `tunnel.routes` (its virtual
-    /// subnets and the advertised subnets routed into the mesh) hold
-    /// `address`; the most specific route wins when networks overlap. The
-    /// embedded engine sends such flows to that network ahead of the
-    /// profile's rules (`mesh-status.md`).
+    /// The joined network that routes `address`: the most specific of
+    /// every joined network's virtual subnets, running or not, and the
+    /// advertised subnets each running network holds (spec §15.4: a
+    /// subnet goes to one network only). An address of a network whose
+    /// driver does not run thus still goes to that network, and fails
+    /// there, rather than on to the rules. The embedded engine sends such
+    /// flows to that network ahead of the profile's rules
+    /// (`mesh-status.md`). Takes no registry lock.
     pub fn network_for(&self, address: IpAddr) -> Option<String> {
+        let owner = self.claims.lookup(address)?;
+        Some(network_of(&owner).to_owned())
+    }
+
+    /// `tunnel.routes`: every joined network's virtual subnets, then the
+    /// advertised subnets it holds, in network order and without repeats.
+    pub fn tunnel_routes(&self) -> Vec<IpNet> {
         let inner = self.lock();
-        let mut best: Option<(u8, &String)> = None;
-        for (name, network) in &inner.networks {
-            if !network.joined {
+        let mut seen = HashSet::new();
+        let mut routes = Vec::new();
+        for network in inner.networks.values() {
+            let live = network.joined
+                && network
+                    .instance
+                    .as_ref()
+                    .is_some_and(|instance| !instance.is_retired());
+            if !live {
                 continue;
             }
-            let Some(instance) = network
-                .instance
-                .as_ref()
-                .filter(|instance| !instance.is_retired() && instance.state().0)
-            else {
-                continue;
-            };
-            let snapshot = instance.snapshot();
-            let current = snapshot.borrow();
-            for route in super::snapshot::tunnel_routes([(&network.settings, &*current)]) {
-                if route.contains(address) && best.is_none_or(|(prefix, _)| route.prefix() > prefix)
-                {
-                    best = Some((route.prefix(), name));
+            let subnets = network.settings.virtual_subnets();
+            for net in subnets.into_iter().chain(self.claims.held(&network.owner)) {
+                if seen.insert(net) {
+                    routes.push(net);
                 }
             }
         }
-        best.map(|(_, name)| name.clone())
+        routes
     }
 
-    /// The networks of this machine's interfaces, for every network.
-    pub fn set_local_networks(&self, networks: Option<Vec<IpNet>>) {
-        let mut inner = self.lock();
-        for network in inner.networks.values() {
-            if let Some(instance) = &network.instance {
-                instance.set_local_networks(networks.clone());
+    /// The virtual addresses of every network: the tunnel interface that
+    /// carries one is this engine's own (spec §15.4).
+    pub fn own_addresses(&self) -> Vec<IpAddr> {
+        self.lock()
+            .networks
+            .values()
+            .flat_map(|network| network.settings.local_addresses())
+            .collect()
+    }
+
+    /// The networks of this machine's interfaces read last; `None` before
+    /// the first read.
+    pub fn local_networks(&self) -> Option<Vec<IpNet>> {
+        self.machine.borrow().clone()
+    }
+
+    /// The networks of this machine's interfaces, read again. A read that
+    /// failed is not reported: the last networks stay (spec §15.4).
+    pub fn set_local_networks(&self, networks: Vec<IpNet>) {
+        self.machine.send_if_modified(|current| {
+            let changed = current.as_ref() != Some(&networks);
+            if changed {
+                *current = Some(networks);
             }
-        }
-        inner.local_networks = networks;
+            changed
+        });
     }
 
     /// The running instance of `name` for an outbound built with
@@ -431,10 +470,8 @@ impl Registry {
     pub fn shutdown(&self) {
         let mut inner = self.lock();
         inner.closed = true;
-        for (_, network) in std::mem::take(&mut inner.networks) {
-            if let Some(instance) = network.instance {
-                instance.retire();
-            }
+        for (_, mut network) in std::mem::take(&mut inner.networks) {
+            network.stop(&self.claims);
         }
         inner.keys.clear();
     }
@@ -443,12 +480,7 @@ impl Registry {
     /// it if it is joined and changed.
     fn put(&self, inner: &mut Inner, settings: MeshSettings, saved: bool) {
         let name = settings.network_name.clone();
-        let Inner {
-            networks,
-            keys,
-            local_networks,
-            ..
-        } = inner;
+        let Inner { networks, keys, .. } = inner;
         match networks.get_mut(&name) {
             Some(network) => {
                 network.saved |= saved;
@@ -459,9 +491,7 @@ impl Registry {
                 {
                     return;
                 }
-                if let Some(instance) = network.instance.take() {
-                    instance.retire();
-                }
+                network.stop(&self.claims);
                 // A new key in the settings replaces the one made before.
                 if settings.private_key.is_some() {
                     keys.remove(&name);
@@ -469,7 +499,7 @@ impl Registry {
                 network.settings = settings;
                 network.failure = None;
                 if network.joined {
-                    self.start(keys, local_networks, network);
+                    self.start(keys, network);
                 }
             }
             None => {
@@ -480,20 +510,16 @@ impl Registry {
                     joined: true,
                     saved,
                     route_overrides: Vec::new(),
+                    owner: String::new(),
                 };
-                self.start(keys, local_networks, &mut network);
+                self.start(keys, &mut network);
                 networks.insert(name, network);
             }
         }
     }
 
     /// Starts `network` on the engine's runtime with its static key.
-    fn start(
-        &self,
-        keys: &mut BTreeMap<String, KeyPair>,
-        local_networks: &Option<Vec<IpNet>>,
-        network: &mut Network,
-    ) {
+    fn start(&self, keys: &mut BTreeMap<String, KeyPair>, network: &mut Network) {
         let settings = &network.settings;
         let key = match &settings.private_key {
             Some(private) => KeyPair::from_private_ref(private),
@@ -516,11 +542,105 @@ impl Registry {
             },
         };
         let instance = Instance::with_key(settings.clone(), key, Some(self.runtime.clone()));
-        instance.set_local_networks(local_networks.clone());
+        // Its virtual subnets are routed to it at once, and no other
+        // network may claim them.
+        let owner = format!(
+            "{}/{}",
+            self.owners.fetch_add(1, Ordering::Relaxed),
+            settings.network_name
+        );
+        self.claims.join(
+            &owner,
+            settings.kind == NetworkKind::Managed,
+            &settings.virtual_subnets(),
+        );
         instance.set_route_overrides(network.route_overrides.clone());
         instance.start();
+        self.runtime.spawn(follow_claims(
+            Arc::downgrade(&instance),
+            owner.clone(),
+            self.claims.clone(),
+            self.machine.subscribe(),
+        ));
         network.failure = None;
         network.instance = Some(instance);
+        network.owner = owner;
+    }
+}
+
+/// The network name of an owner in [`HostRoutes`] (`<number>/<name>`).
+fn network_of(owner: &str) -> &str {
+    owner.split_once('/').map_or(owner, |(_, name)| name)
+}
+
+/// Releases an owner's claims however its task ends.
+struct Release {
+    claims: HostRoutes,
+    owner: String,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.claims.release(&self.owner);
+    }
+}
+
+/// Keeps one instance's part of the shared claims current until it
+/// retires: it claims the advertised subnets its driver routes while it
+/// runs, and it sees as this machine's networks the interfaces' networks
+/// and whatever the other networks hold, so that its driver refuses those
+/// as local (spec §15.4). Runs again whenever its driver's snapshot, its
+/// state, the others' claims or the interfaces' networks change; a change
+/// it caused itself settles at once.
+async fn follow_claims(
+    instance: Weak<Instance>,
+    owner: String,
+    claims: HostRoutes,
+    mut machine: watch::Receiver<Option<Vec<IpNet>>>,
+) {
+    let _release = Release {
+        claims: claims.clone(),
+        owner: owner.clone(),
+    };
+    let (mut snapshots, mut changes) = match instance.upgrade() {
+        Some(instance) => (instance.snapshot(), instance.changes()),
+        None => return,
+    };
+    let mut others = claims.subscribe();
+    loop {
+        others.mark_unchanged();
+        changes.mark_unchanged();
+        {
+            let Some(instance) = instance.upgrade() else {
+                return;
+            };
+            if instance.is_retired() {
+                return;
+            }
+            let (routes, read) = {
+                let snapshot = snapshots.borrow_and_update();
+                (snapshot.system_routes.clone(), snapshot.local_networks_read)
+            };
+            // Nothing is claimed before this machine's networks were read,
+            // nor while no driver runs.
+            let wanted = if instance.state().0 && read {
+                routes
+            } else {
+                Vec::new()
+            };
+            claims.claim(&owner, &wanted);
+            let local = machine.borrow_and_update().clone().map(|mut networks| {
+                networks.extend(claims.others(&owner));
+                networks
+            });
+            instance.set_local_networks(local);
+        }
+        tokio::select! {
+            changed = snapshots.changed() => if changed.is_err() { return },
+            changed = changes.changed() => if changed.is_err() { return },
+            _ = others.changed() => {}
+            _ = machine.changed() => {}
+        }
     }
 }
 
@@ -556,11 +676,9 @@ fn without_private_key(settings: &mut MeshSettings) -> MeshSettings {
     copy
 }
 
-fn remove(inner: &mut Inner, name: &str) {
-    if let Some(network) = inner.networks.remove(name) {
-        if let Some(instance) = network.instance {
-            instance.retire();
-        }
+fn remove(inner: &mut Inner, claims: &HostRoutes, name: &str) {
+    if let Some(mut network) = inner.networks.remove(name) {
+        network.stop(claims);
     }
     inner.keys.remove(name);
 }
@@ -755,7 +873,9 @@ mod tests {
         );
         assert_eq!(registry.network_for(address("10.158.0.1")), None);
         assert_eq!(registry.network_for(address("fd00::1")), None);
-        // A left network routes nothing.
+        // The drivers never run here: a joined network's virtual subnet is
+        // routed to it all the same, and fails there rather than going on
+        // to the rules. A left network routes nothing.
         registry.leave("lab").unwrap();
         assert_eq!(
             registry.network_for(address("10.157.0.200")).as_deref(),
@@ -763,6 +883,114 @@ mod tests {
         );
         registry.leave("office").unwrap();
         assert_eq!(registry.network_for(address("10.157.0.9")), None);
+    }
+
+    #[test]
+    fn networks_split_advertised_subnets_and_see_the_others_as_local() {
+        use crate::driver::Snapshot;
+        use crate::secure::noise::KeyPair;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let claims = HostRoutes::default();
+        let (machine, _) = watch::channel(None);
+        let net = |text: &str| IpNet::parse(text).unwrap();
+        let address = |text: &str| text.parse::<IpAddr>().unwrap();
+        let make = |name: &str, address: &str, kind: &str| {
+            let settings = settings(name, address, kind);
+            let key = KeyPair::generate(&SystemRandom::new()).unwrap();
+            let instance = Instance::with_key(settings.clone(), key, None);
+            claims.join(
+                name,
+                settings.kind == NetworkKind::Managed,
+                &settings.virtual_subnets(),
+            );
+            runtime.spawn(follow_claims(
+                Arc::downgrade(&instance),
+                name.to_owned(),
+                claims.clone(),
+                machine.subscribe(),
+            ));
+            instance
+        };
+        let settle = || {
+            runtime.block_on(async {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let routes = |subnets: &[&str]| Snapshot {
+            system_routes: subnets.iter().map(|text| net(text)).collect(),
+            local_networks_read: true,
+            ..Snapshot::default()
+        };
+        let office = make("office", "10.157.0.2/24", "legacy");
+        let lab = make("lab", "10.160.0.2/24", "legacy");
+        settle();
+        // Not running: nothing is claimed; this machine's networks are
+        // not read yet.
+        assert_eq!(office.local_networks(), None);
+        assert_eq!(
+            claims.lookup(address("10.157.0.9")).as_deref(),
+            Some("office")
+        );
+        machine.send_replace(Some(vec![net("192.168.1.0/24")]));
+        office.pretend(routes(&["192.168.10.0/24"]));
+        settle();
+        assert_eq!(claims.held("office"), [net("192.168.10.0/24")]);
+        // The first to claim keeps it; the other sees it as local.
+        lab.pretend(routes(&["192.168.10.0/24", "172.16.8.0/24"]));
+        settle();
+        assert_eq!(claims.held("lab"), [net("172.16.8.0/24")]);
+        let local = lab.local_networks().unwrap();
+        assert!(local.contains(&net("192.168.1.0/24")));
+        assert!(local.contains(&net("192.168.10.0/24")));
+        assert!(local.contains(&net("10.157.0.0/24")));
+        assert_eq!(
+            claims.lookup(address("192.168.10.5")).as_deref(),
+            Some("office")
+        );
+        assert_eq!(claims.lookup(address("172.16.8.5")).as_deref(), Some("lab"));
+        // A network that is dropped frees its range; a managed one takes a
+        // subnet from a legacy one.
+        let gone = make("gone", "10.170.0.2/24", "legacy");
+        drop(gone);
+        let hq = {
+            let settings = settings("hq", "10.170.0.2/24", "legacy");
+            let key = KeyPair::generate(&SystemRandom::new()).unwrap();
+            let instance = Instance::with_key(settings.clone(), key, None);
+            claims.join("hq", true, &settings.virtual_subnets());
+            runtime.spawn(follow_claims(
+                Arc::downgrade(&instance),
+                "hq".to_owned(),
+                claims.clone(),
+                machine.subscribe(),
+            ));
+            instance
+        };
+        settle();
+        // The dropped instance's claims went with it.
+        assert_eq!(claims.lookup(address("10.170.0.9")).as_deref(), Some("hq"));
+        hq.pretend(routes(&["192.168.10.0/24"]));
+        settle();
+        assert_eq!(claims.held("hq"), [net("192.168.10.0/24")]);
+        assert!(claims.held("office").is_empty());
+        assert!(office
+            .local_networks()
+            .unwrap()
+            .contains(&net("192.168.10.0/24")));
+        assert_eq!(
+            claims.lookup(address("192.168.10.5")).as_deref(),
+            Some("hq")
+        );
+        // A retired network frees its addresses.
+        lab.retire();
+        settle();
+        assert_eq!(claims.lookup(address("172.16.8.5")), None);
+        assert_eq!(claims.lookup(address("10.160.0.9")), None);
     }
 
     #[test]
