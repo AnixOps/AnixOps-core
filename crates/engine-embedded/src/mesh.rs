@@ -464,6 +464,43 @@ mod tests {
     }
 
     #[test]
+    fn only_a_runtime_whose_tunnel_answers_the_names_reports_them() {
+        let status = || {
+            json!({
+                "statusVersion": 1,
+                "tunnel": {
+                    "routes": [],
+                    "routesVersion": 2,
+                    "dns": {"servers": ["198.18.0.2", "fd00::53"], "matchDomains": ["mesh.internal"]},
+                },
+            })
+        };
+        // Without `allow_mesh` no answers, and none reported.
+        let binding = MeshBinding::default();
+        assert!(binding.dns(false).is_none());
+        let reported = binding.without_unanswered_dns(status());
+        assert_eq!(reported["tunnel"]["dns"], Value::Null);
+        assert_eq!(reported["tunnel"]["routesVersion"], 2);
+        // A tunnel that takes the answers reports them as they are.
+        let binding = MeshBinding::default();
+        let dns = binding.dns(true).expect("answers with allow_mesh");
+        assert_eq!(binding.without_unanswered_dns(status()), status());
+        // Other answers are left alone.
+        let other = json!({"ok": true});
+        assert_eq!(
+            MeshBinding::default().without_unanswered_dns(other.clone()),
+            other
+        );
+        // Without a running engine nothing is answered.
+        if SLOT.current().is_none() {
+            assert_eq!(
+                dns(&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn mesh_nodes_are_found_by_network_name() {
         let outbounds: BTreeMap<String, OutboundConfig> = serde_json::from_value(json!({
             "mesh-b": {"type": "mesh", "network": {"name": "office"}},

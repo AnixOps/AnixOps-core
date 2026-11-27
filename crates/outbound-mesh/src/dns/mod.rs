@@ -896,7 +896,12 @@ pub fn lookup(lists: &[&Names], host: &str) -> Option<Vec<IpAddr>> {
         .iter()
         .any(|label| label.is_empty() || label.len() > 63)
     {
-        return None;
+        // A malformed name under a suffix or in a reverse zone fails here
+        // rather than going to another resolver.
+        return lists
+            .iter()
+            .any(|names| names.claims(&labels))
+            .then(Vec::new);
     }
     let query = Query {
         id: 0,
@@ -1344,6 +1349,12 @@ mod tests {
             Some(vec![ip("10.150.0.9"), ip("10.150.0.10")])
         );
         assert_eq!(lookup(&lists, "scanner.mesh.internal"), Some(Vec::new()));
+        // A malformed name under the suffix fails too; elsewhere it is left
+        // to the system resolver.
+        assert_eq!(lookup(&lists, "a..mesh.internal"), Some(Vec::new()));
+        let long = format!("{}.mesh.internal", "x".repeat(64));
+        assert_eq!(lookup(&lists, &long), Some(Vec::new()));
+        assert_eq!(lookup(&lists, "a..example.com"), None);
         assert_eq!(lookup(&lists, "www.example.com"), None);
         assert_eq!(lookup(&[&off], "printer.mesh.internal"), None);
     }

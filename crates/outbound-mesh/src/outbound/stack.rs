@@ -715,9 +715,9 @@ async fn start_driver(instance: Arc<Instance>, run: u64, _guard: RunGuard) {
         }
         core.shutdown = Some(shutdown_tx);
         core.to_driver = Some(to_driver);
-        // The driver starts with the settings in force and ignores the
-        // value it subscribed with: read under the lock `set_dns` takes,
-        // so that no change falls in between.
+        // The driver starts with the settings in force, read under the
+        // lock `set_dns` takes: the receiver has seen that value, and any
+        // later `set_dns` is a change the driver applies once it runs.
         let dns = core.dns.subscribe();
         settings.dns = dns.borrow().clone();
         Channels {
