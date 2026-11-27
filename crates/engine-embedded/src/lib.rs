@@ -611,8 +611,8 @@ impl Drop for EmbeddedRuntime {
 /// `{"cmd": "capabilities"}`: what this runtime runs,
 /// `{"capabilities": {"mesh": bool}}` (`mesh-status.md`). `mesh` says
 /// whether this runtime answers `mesh_*` commands: the VPN runtime does when
-/// the engine is built with the `mesh` feature, the desktop local proxy
-/// never does. When it does not, every `mesh_*` command answers
+/// the engine is built with the `mesh` feature and its config sets
+/// `allow_mesh`, the desktop local proxy never does. When it does not, every `mesh_*` command answers
 /// `unsupported` here. `None` for any other request.
 ///
 /// `capabilities` is answered up to [`control::MAX_REQUEST_LEN`] bytes, like

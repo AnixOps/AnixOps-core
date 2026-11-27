@@ -101,19 +101,21 @@ pub struct RuntimeConfig {
     /// Needs the `tls-fingerprints` feature (on with `vless`).
     #[serde(default)]
     pub tls_fingerprints: Option<serde_json::Value>,
-    /// Whether the profile may run mesh networks. `false` refuses the whole
-    /// config when any outbound is a `"type": "mesh"` one (the top-level
-    /// `outbound`, `routing.outbounds` or an inline `via`), with
+    /// Whether the profile may run mesh networks. Off by default (closed
+    /// when the client leaves it out): the whole config is refused when any
+    /// outbound is a `"type": "mesh"` one (the top-level `outbound`,
+    /// `routing.outbounds` or a layer of an inline `via`), with
     /// [`MESH_NOT_ALLOWED`], and the runtime answers every `mesh_*` command
-    /// `unsupported` and `capabilities.mesh` `false`. On by default; a build
-    /// without the `mesh` feature takes the field too
-    /// (`docs/architecture/mesh-status.md`).
-    #[serde(default = "default_true")]
+    /// `unsupported` and `capabilities.mesh` `false`. A build without the
+    /// `mesh` feature takes the field too (`docs/architecture/mesh-status.md`).
+    /// Only [`RuntimeConfig::from_json`] checks it: a config changed after
+    /// parsing is not checked again.
+    #[serde(default)]
     pub allow_mesh: bool,
 }
 
-/// The `type` of mesh outbounds.
-const MESH_TYPE: &str = "mesh";
+/// The `type` of mesh outbounds (`outbound_mesh::TYPE_NAME`).
+pub(crate) const MESH_TYPE: &str = "mesh";
 
 /// The message of a config refused for a mesh outbound under
 /// `allow_mesh: false`; the code is `config_rejected`.
@@ -1344,4 +1346,12 @@ pub(crate) fn is_identifier(value: &str) -> bool {
 
 fn rejected(message: &'static str) -> RuntimeError {
     RuntimeError::new(RuntimeErrorCode::ConfigRejected, message)
+}
+
+#[cfg(all(test, feature = "mesh"))]
+mod mesh_type_tests {
+    #[test]
+    fn the_mesh_type_is_the_mesh_factorys() {
+        assert_eq!(super::MESH_TYPE, outbound_mesh::TYPE_NAME);
+    }
 }
