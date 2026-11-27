@@ -213,8 +213,13 @@ impl LocalProxy {
             .unwrap_or_default()
     }
 
-    /// Answers one [`control`] request, such as the connection list.
+    /// Answers one [`control`] request, such as the connection list. The
+    /// local proxy runs no mesh networks: `capabilities` answers
+    /// `"mesh": false` and every `mesh_*` command `unsupported`.
     pub fn control_json(&self, request: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        if let Some(answer) = crate::feature_control(request, false) {
+            return answer;
+        }
         let replay = self.replay_proxy.control(request, |decrypt| {
             // Decrypted connections carry the listener's process name too.
             let interceptor = if decrypt {
