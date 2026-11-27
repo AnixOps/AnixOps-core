@@ -10,6 +10,7 @@
 - 嵌入式引擎支持 `mesh_set_dns`（0.3.0 返回 `unsupported`）：可省的 `network`、`enabled`、可省的 `suffix`，本机覆盖网络配置的 `dns.enabled` 与 `suffix`；`network` 省略时作用于全部网络（含之后加入的）并清除按网络的覆盖；`suffix` 按配置同一规则校验，不合规返回 `invalid_argument`；运行中的网络不重启。覆盖在引擎停止后清除，没有引擎运行时返回 `not_found`。
 - 组网驱动启动前发出的 `dns` 变化不再被丢弃（独立节点与嵌入式引擎相同）。
 - 组网驱动启动前发出的 `native_keys`、`paths`、`host_groups` 热更新不再被丢弃：此前独立节点在启动窗口内（扫描网卡期间，最长约 10 秒）收到的这些更新会被丢掉，面板在节点启动后几秒内从 `native_keys` 撤下的密钥会一直被接纳，直到网络重启。
+- 嵌入式引擎的 `mesh_status` 快照给出名字视图 `names[]`、`refusedNames[]`（需求 R28，字段同节点管理 API）；隧道会把某个名字与其他运行中网络的地址合并应答时（全名、短名或单标签查询，不论后缀与地区），`duplicate` 为 `true`，新增可省字段 `duplicateNetworks` 按 id 字节序列出这些网络。
 
 ## v0.3.0 - 2026-11-27
 

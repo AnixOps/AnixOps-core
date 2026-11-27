@@ -56,6 +56,7 @@
 - **内存所有权**：内核分配的缓冲区一律由对应的 `*_free_buffer` 释放，句柄由 `networkcore_ios_runtime_free_handle` 释放，这一规则不变。
 - **经 C ABI 传递的 JSON**（运行配置、`networkcore_ios_runtime_control` 的请求与应答、状态、节点导入结果）：应答中只新增字段，不删除、不改名；调用方须忽略不认识的字段。请求与配置按 `deny_unknown_fields` 严格校验，所以调用方不得向旧内核发送新版本才有的字段，应先用能力集版本判断。
 - **运行配置 `allow_mesh`**（0.3.0-rc.2 起接受，0.3 承诺面）：布尔，缺省 `false`（失败时关闭：调用方漏发时组网配置直接报错）。为 `false` 或缺省时，配置中任何 `"type": "mesh"` 出站（顶层 `outbound`、`routing.outbounds`、内联 `via` 链的任一层）都使整个配置被拒绝，错误码 `config_rejected`，消息固定为 `mesh outbounds are not allowed by this config`（`engine_embedded::config::MESH_NOT_ALLOWED`）；该运行实例的 `capabilities.mesh` 为 `false`，所有 `mesh_*` 命令（含 `mesh_save_network`、`mesh_join`）返回 `unsupported`。未编入 `mesh` feature 的构建同样接受该字段并按同样规则拒绝。C ABI 初始化只返回 `NETWORKCORE_IOS_ERR_CONFIG_REJECTED`，不带消息。能力集 7 的过渡提交（main 上 cbb3c844，未发布）不认识该字段，调用方以 0.3.0-rc.2 为下限。缺省值与语义在 0.3.x 内不变。
+- **`mesh_status` 快照的内网域名字段**（嵌入式引擎 0.3.1 起，字段与取值见 `docs/architecture/mesh-status.md`）：`tunnel.dns`、顶层 `names[]` 与 `refusedNames[]`（0.3.0 不给出，客户端须把缺失当作空列表）。`names[]` 的可省字段 `duplicateNetworks`（0.3.1 新增登记）：隧道会把该条目与其他运行中网络的地址合并应答时（全名、短名或单标签查询），按 `id` 字节序给出这些网络的 `id`，此时 `duplicate` 为 `true`；不出现时省略该字段。
 
 0.x 期间仍可能变化：组网相关的控制命令与状态字段（0.4、0.5 的地区、骨干、自定义路径）；`networkcore_import_set_anx_license` 的入参格式随 ANX 规格定稿可能调整。
 
