@@ -574,7 +574,7 @@ jobs:
             cargo test --locked -p engine-embedded --no-default-features --features "${features}" --tests
             echo "::endgroup::"
           done
-          # The mesh outbound itself; the workspace build leaves the feature off.
+          # The mesh outbound itself, as engine-embedded's default `mesh` feature uses it.
           echo "::group::outbound-mesh features=[outbound]"
           cargo clippy --locked -p outbound-mesh --features outbound --all-targets -- -D warnings
           cargo test --locked -p outbound-mesh --features outbound --lib --test outbound
