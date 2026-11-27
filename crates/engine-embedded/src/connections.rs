@@ -63,10 +63,13 @@ pub enum Mode {
     #[default]
     Rule,
     /// Every flow to the global target of a routing config (its outbound for
-    /// a config with one outbound).
+    /// a config with one outbound), but a flow to an address a joined mesh
+    /// network routes, which goes to that network (`mesh-status.md`).
     Global,
     /// Every flow direct, and every DNS server asked directly (the tunnel's
-    /// queries and the names of Fake-IP flows alike), `proxy` ones included.
+    /// queries and the names of Fake-IP flows alike), `proxy` ones included;
+    /// only a flow to an address a joined mesh network routes goes to that
+    /// network.
     Direct,
 }
 
