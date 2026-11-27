@@ -1593,12 +1593,10 @@ impl RoutedOutbound {
             .collect()
     }
 
-    /// Names devices by the address their connections come from, for
-    /// `DEVICE-NAME` rules, replacing the names given before. Returns whether
-    /// they changed. Connections already open keep their route.
     /// Sends every flow to an address that a joined mesh network routes
     /// to that network's node, ahead of the rules and of every mode
-    /// (`mesh-status.md`, `tunnel.routes`).
+    /// (`mesh-status.md`, `tunnel.routes`): the user's rules cannot keep
+    /// an intranet address off the mesh.
     pub fn set_mesh_routes(&self, routes: MeshRoutes) {
         *self
             .mesh_routes
@@ -1631,6 +1629,9 @@ impl RoutedOutbound {
         ))
     }
 
+    /// Names devices by the address their connections come from, for
+    /// `DEVICE-NAME` rules, replacing the names given before. Returns whether
+    /// they changed. Connections already open keep their route.
     pub fn set_devices(&self, devices: BTreeMap<IpAddr, String>) -> bool {
         let mut current = self
             .devices

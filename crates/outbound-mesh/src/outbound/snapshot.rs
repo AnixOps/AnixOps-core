@@ -322,30 +322,6 @@ fn subnets(current: &Snapshot) -> Vec<Value> {
         .collect()
 }
 
-/// `tunnel.routes` (snapshot «取值»): the virtual subnets of every joined
-/// network and the subnets its driver routes into the mesh, once this
-/// machine's networks were read; deduplicated, in a stable order.
-pub fn tunnel_routes<'a>(
-    joined: impl IntoIterator<Item = (&'a MeshSettings, &'a Snapshot)>,
-) -> Vec<IpNet> {
-    let mut routes = Vec::new();
-    for (settings, snapshot) in joined {
-        for net in settings.virtual_subnets() {
-            if !routes.contains(&net) {
-                routes.push(net);
-            }
-        }
-        if snapshot.local_networks_read {
-            for net in &snapshot.system_routes {
-                if !routes.contains(net) {
-                    routes.push(*net);
-                }
-            }
-        }
-    }
-    routes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,8 +469,8 @@ mod tests {
             }),
             static_key: Some([1; 32]),
         };
-        let routes = tunnel_routes([(&settings, &current)]);
-        assert_eq!(routes, [net("10.144.0.0/24"), net("192.168.10.0/24")]);
+        // `Registry::tunnel_routes` gives them.
+        let routes = [net("10.144.0.0/24"), net("192.168.10.0/24")];
         let tunnel = Tunnel {
             routes: &routes,
             routes_version: 4,
@@ -558,20 +534,6 @@ mod tests {
             json!(["10.144.0.0/24", "192.168.10.0/24"])
         );
         assert_eq!(value["tunnel"]["routesVersion"], 4);
-    }
-
-    #[test]
-    fn no_subnet_enters_the_tunnel_before_local_networks_are_read() {
-        let settings = settings("legacy", false);
-        let current = Snapshot {
-            system_routes: vec![net("192.168.10.0/24")],
-            local_networks_read: false,
-            ..Snapshot::default()
-        };
-        assert_eq!(
-            tunnel_routes([(&settings, &current)]),
-            [net("10.144.0.0/24")]
-        );
     }
 
     #[test]
