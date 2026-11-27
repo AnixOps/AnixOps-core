@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use serde_json::{json, Map, Value};
 
 use crate::config::{encode_key, Cipher, MeshSettings, NetworkKind, Role, SecurityMode};
+use crate::dns::Names;
 use crate::driver::{Member, Snapshot};
 use crate::net::IpNet;
 
@@ -58,6 +59,60 @@ fn tunnel_dns(domains: &[String]) -> Value {
     json!({"servers": TUNNEL_DNS_SERVERS, "matchDomains": domains})
 }
 
+/// The name list `view` answers from: its driver runs and its names are
+/// on.
+fn running_names<'a>(view: &NetworkView<'a>) -> Option<&'a Names> {
+    let joined = view.joined.as_ref().filter(|joined| joined.running)?;
+    let snapshot: &'a Snapshot = joined.snapshot;
+    snapshot.names.as_deref().filter(|names| names.enabled())
+}
+
+/// `names[]` and `refusedNames[]` of `view` (requirement R28): empty while
+/// its names are off. A network that does not run lists only the entries
+/// its config skipped. A name that another running network with the same
+/// suffix also answers is a duplicate too (the tunnel answers the
+/// addresses of all of them, `mesh-status.md`), and `duplicateNetworks`
+/// names those networks.
+fn names(view: &NetworkView<'_>, networks: &[NetworkView<'_>]) -> (Value, Value) {
+    if !view.settings.dns.enabled {
+        return (json!([]), json!([]));
+    }
+    let Some(own) = running_names(view) else {
+        return (json!([]), json!(view.settings.dns.refused));
+    };
+    let others: Vec<(&str, &Names)> = networks
+        .iter()
+        .filter(|other| other.settings.network_name != view.settings.network_name)
+        .filter_map(|other| {
+            running_names(other).map(|names| (other.settings.network_name.as_str(), names))
+        })
+        .filter(|(_, names)| names.suffix() == own.suffix())
+        .collect();
+    let entries = own
+        .entries()
+        .iter()
+        .map(|entry| {
+            let elsewhere: Vec<&str> = others
+                .iter()
+                .filter(|(_, names)| {
+                    names
+                        .entries()
+                        .iter()
+                        .any(|other| other.answerable && other.name == entry.name)
+                })
+                .map(|(network, _)| *network)
+                .collect();
+            let mut value = json!(entry);
+            if entry.answerable && !elsewhere.is_empty() {
+                value["duplicate"] = Value::Bool(true);
+                value["duplicateNetworks"] = json!(elsewhere);
+            }
+            value
+        })
+        .collect();
+    (Value::Array(entries), json!(own.refused()))
+}
+
 /// `network.state` (snapshot «取值»).
 pub fn state(view: &NetworkView<'_>) -> &'static str {
     let Some(joined) = &view.joined else {
@@ -86,6 +141,7 @@ pub fn snapshot(
         .joined
         .as_ref()
         .map_or(&empty, |joined| joined.snapshot);
+    let (names, refused_names) = names(view, networks);
     json!({
         "statusVersion": STATUS_VERSION,
         "networks": networks
@@ -103,6 +159,8 @@ pub fn snapshot(
             .collect::<Vec<_>>(),
         "subnets": subnets(current),
         "refusedAdvertisements": current.rejected_advertisements,
+        "names": names,
+        "refusedNames": refused_names,
         "tunnel": {
             "routes": tunnel.routes.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "routesVersion": tunnel.routes_version,
@@ -373,6 +431,137 @@ mod tests {
             path_state: "auto",
             unreachable: None,
         }
+    }
+
+    #[test]
+    fn names_are_listed_with_their_duplicates_in_other_networks() {
+        use std::sync::Arc;
+
+        fn names(suffix: &str, subnet: &str, members: &[(&str, &str)]) -> Arc<Names> {
+            let settings = crate::dns::DnsSettings {
+                enabled: true,
+                suffix: suffix.to_owned(),
+                ..crate::dns::DnsSettings::default()
+            };
+            let subnets = [net(subnet)];
+            let members: Vec<crate::dns::MemberNames> = members
+                .iter()
+                .map(|(hostname, address)| crate::dns::MemberNames {
+                    hostname: Some((*hostname).to_owned()),
+                    addresses: vec![address.parse().unwrap()],
+                    subnets: Vec::new(),
+                })
+                .collect();
+            Arc::new(Names::build(
+                &settings,
+                &crate::dns::NetworkView {
+                    virtual_subnets: &subnets,
+                    host_groups: &[],
+                    local_addresses: &[],
+                    own_hostname: None,
+                    members: &members,
+                },
+            ))
+        }
+        fn view<'a>(
+            settings: &'a MeshSettings,
+            snapshot: &'a Snapshot,
+            running: bool,
+        ) -> NetworkView<'a> {
+            NetworkView {
+                settings,
+                joined: Some(Joined {
+                    running,
+                    failure: None,
+                    snapshot,
+                }),
+                static_key: None,
+            }
+        }
+        let mut office = settings("legacy", false);
+        office.dns.enabled = true;
+        let mut lab = office.clone();
+        lab.network_name = "lab".to_owned();
+        let mut home = office.clone();
+        home.network_name = "home".to_owned();
+        let office_now = Snapshot {
+            names: Some(names(
+                "mesh.internal",
+                "10.144.0.0/24",
+                &[("printer", "10.144.0.9"), ("nas", "10.144.0.20")],
+            )),
+            ..Snapshot::default()
+        };
+        let lab_now = Snapshot {
+            names: Some(names(
+                "mesh.internal",
+                "10.145.0.0/24",
+                &[("printer", "10.145.0.9")],
+            )),
+            ..Snapshot::default()
+        };
+        // Another suffix: its names are other names.
+        let home_now = Snapshot {
+            names: Some(names(
+                "home.internal",
+                "10.146.0.0/24",
+                &[("nas", "10.146.0.20")],
+            )),
+            ..Snapshot::default()
+        };
+        let tunnel = Tunnel {
+            routes: &[],
+            routes_version: 1,
+            dns_domains: &[],
+        };
+        let entry = |value: &Value, name: &str| {
+            value["names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        let views = [
+            view(&office, &office_now, true),
+            view(&lab, &lab_now, true),
+            view(&home, &home_now, true),
+        ];
+        let value = snapshot(&views[0], &views, &tunnel);
+        let printer = entry(&value, "printer");
+        assert_eq!(printer["source"], "member");
+        assert_eq!(printer["addresses"], json!(["10.144.0.9"]));
+        assert_eq!(printer["duplicate"], true);
+        assert_eq!(printer["duplicateNetworks"], json!(["lab"]));
+        let nas = entry(&value, "nas");
+        assert_eq!(nas["duplicate"], false);
+        assert!(nas.get("duplicateNetworks").is_none());
+        assert_eq!(value["refusedNames"], json!([]));
+        // From the other side alike.
+        let value = snapshot(&views[1], &views, &tunnel);
+        assert_eq!(
+            entry(&value, "printer")["duplicateNetworks"],
+            json!(["office"])
+        );
+        // A network that does not run answers nothing: no duplicate.
+        let views = [
+            view(&office, &office_now, true),
+            view(&lab, &lab_now, false),
+        ];
+        let value = snapshot(&views[0], &views, &tunnel);
+        assert_eq!(entry(&value, "printer")["duplicate"], false);
+        // Not running itself: no names, only what its config skipped.
+        let value = snapshot(&views[1], &views, &tunnel);
+        assert_eq!(value["names"], json!([]));
+        assert_eq!(value["refusedNames"], json!([]));
+        // Names off: both lists empty.
+        let mut quiet = office.clone();
+        quiet.dns.enabled = false;
+        let views = [view(&quiet, &office_now, true)];
+        let value = snapshot(&views[0], &views, &tunnel);
+        assert_eq!(value["names"], json!([]));
+        assert_eq!(value["refusedNames"], json!([]));
     }
 
     #[test]

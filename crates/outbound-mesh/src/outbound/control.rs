@@ -355,6 +355,8 @@ fn empty_status() -> Value {
         "members": [],
         "subnets": [],
         "refusedAdvertisements": 0,
+        "names": [],
+        "refusedNames": [],
         "tunnel": {"routes": [], "routesVersion": 0, "dns": Value::Null},
     })
 }
