@@ -330,6 +330,8 @@ pub struct Names {
     /// The only reverse names answered (spec §15.9.2 items 1 and 7).
     reverse: ReverseZones,
     entries: Vec<NameStatus>,
+    /// The name and region of each of `entries`, in the same order.
+    keys: Vec<Key>,
     refused: Vec<RefusedName>,
     resolver_address: Option<IpAddr>,
     resolver_conflict: bool,
@@ -410,6 +412,7 @@ impl Names {
         }
 
         let mut entries = Vec::new();
+        let mut keys = Vec::new();
         let mut by_name: BTreeMap<Key, Vec<IpAddr>> = BTreeMap::new();
         let mut by_address: BTreeMap<IpAddr, Vec<String>> = BTreeMap::new();
         let mut regions = BTreeSet::new();
@@ -432,6 +435,7 @@ impl Names {
                     duplicate: from_members.is_some() || families(true) > 1 || families(false) > 1,
                     answerable: addresses.iter().all(|a| in_scope(*a)),
                 });
+                keys.push(key.clone());
                 for address in addresses.iter().filter(|a| in_scope(**a)) {
                     push_unique(&mut answered, *address);
                 }
@@ -445,6 +449,7 @@ impl Names {
                     duplicate: from_panel.is_some() || groups.len() > 1,
                     answerable: addresses.iter().all(|a| in_scope(*a)),
                 });
+                keys.push(key.clone());
                 for address in addresses.into_iter().filter(|a| in_scope(*a)) {
                     push_unique(&mut answered, address);
                 }
@@ -479,6 +484,7 @@ impl Names {
             // follow once the backbone hands them to the network.
             reverse: ReverseZones::of(view.virtual_subnets.iter().chain(view.host_groups).copied()),
             entries,
+            keys,
             refused: settings.refused.clone(),
             resolver_address: configured.filter(|_| !resolver_conflict),
             resolver_conflict,
@@ -641,6 +647,59 @@ impl Names {
     /// Entries of `dns.names` that were skipped.
     pub fn refused(&self) -> &[RefusedName] {
         &self.refused
+    }
+
+    /// The query names (lower case, without the final dot) whose answers
+    /// carry addresses of `entries()[index]`; none when none of its
+    /// addresses is answered. A query any other list also answers with
+    /// addresses merges both in the tunnel ([`answer_from`]), so the name
+    /// is a duplicate there (requirement R28).
+    ///
+    /// The forms follow [`Names::answer`]: `<name>.<region>.<suffix>`
+    /// always; `<name>.<suffix>` when the name is in this node's region or
+    /// that region has no such name (a short name looks in every region
+    /// then); the bare `<name>` when it is in this node's region.
+    pub fn queries_of(&self, index: usize) -> Vec<String> {
+        let (Some(entry), Some((label, region))) = (self.entries.get(index), self.keys.get(index))
+        else {
+            return Vec::new();
+        };
+        let answered = self
+            .by_name
+            .get(&(label.clone(), region.clone()))
+            .is_some_and(|found| entry.addresses.iter().any(|a| found.contains(a)));
+        if !answered {
+            return Vec::new();
+        }
+        self.queries_of_key(label, region.as_deref())
+    }
+
+    /// Every query name this list answers with addresses, in the forms of
+    /// [`Names::queries_of`].
+    pub fn queries(&self) -> BTreeSet<String> {
+        self.by_name
+            .keys()
+            .flat_map(|(label, region)| self.queries_of_key(label, region.as_deref()))
+            .collect()
+    }
+
+    fn queries_of_key(&self, label: &str, region: Option<&str>) -> Vec<String> {
+        let mut queries = Vec::new();
+        if let Some(region) = region {
+            queries.push(format!("{label}.{region}.{}", self.suffix));
+        }
+        let here = region == self.region.as_deref();
+        if here
+            || !self
+                .by_name
+                .contains_key(&(label.to_owned(), self.region.clone()))
+        {
+            queries.push(format!("{label}.{}", self.suffix));
+        }
+        if here {
+            queries.push(label.to_owned());
+        }
+        queries
     }
 
     /// The address whose port 53 the virtual interface answers; `None`

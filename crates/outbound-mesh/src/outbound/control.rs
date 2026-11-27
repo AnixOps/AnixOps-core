@@ -554,6 +554,8 @@ mod tests {
         assert_eq!(status["statusVersion"], 1);
         assert_eq!(status["networks"], json!([]));
         assert_eq!(status["network"], Value::Null);
+        assert_eq!(status["names"], json!([]));
+        assert_eq!(status["refusedNames"], json!([]));
         let named = run(None, json!({"cmd": "mesh_status", "network": "office"}));
         assert_eq!(code(&named), "not_found");
         let left = run(None, json!({"cmd": "mesh_leave", "network": "office"}));
