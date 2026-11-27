@@ -62,6 +62,8 @@ pub struct MeshEngine {
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Wakes the reader of this machine's networks, once it runs.
     reader: Mutex<Option<Arc<Notify>>>,
+    /// Reads of this machine's networks started so far.
+    reads: std::sync::atomic::AtomicU64,
 }
 
 impl MeshEngine {
@@ -90,6 +92,7 @@ impl MeshEngine {
             stop: Mutex::new(Some(stop)),
             thread: Mutex::new(Some(thread)),
             reader: Mutex::new(None),
+            reads: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -121,6 +124,11 @@ impl MeshEngine {
         self.runtime
             .spawn(read_local(Arc::downgrade(self), read, now, timing));
         true
+    }
+
+    /// How many reads of this machine's networks started so far.
+    pub fn local_reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reads this machine's networks again (the tunnel started, the client
@@ -167,10 +175,12 @@ async fn read_local(
     let mut known = false;
     loop {
         if pending.as_ref().is_none_or(|read| read.is_finished()) {
-            let Some(own) = engine
-                .upgrade()
-                .map(|engine| engine.registry.own_addresses())
-            else {
+            let Some(own) = engine.upgrade().map(|engine| {
+                engine
+                    .reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                engine.registry.own_addresses()
+            }) else {
                 return;
             };
             let read = read.clone();

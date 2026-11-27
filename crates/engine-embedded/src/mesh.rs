@@ -368,9 +368,9 @@ fn interface_networks(found: Vec<(String, IpAddr, u8)>, own: &[IpAddr]) -> Vec<I
     found
         .iter()
         .filter(|(name, address, prefix)| {
-            // As wide as a default route split in halves or quarters: not
-            // a network of this machine (spec §15.4 compares only prefixes
-            // more specific than /8 and /7).
+            // Wider than /8 or /7 (a default route split in halves or
+            // quarters, an empty mask): not a network of this machine
+            // (spec §15.4 leaves out prefixes shorter than /8 and /7).
             let widest = if address.is_ipv4() { 8 } else { 7 };
             *prefix >= widest && !tunnel.contains(name.as_str())
         })
@@ -511,9 +511,22 @@ mod tests {
         let engine = SLOT.current().expect("the engine runs");
         // A network change asks the engine for a read of this machine's
         // networks and goes on to the engine's own handler.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.local_reads() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = engine.local_reads();
+        assert!(before > 0, "the tunnel's start reads them");
         assert!(first
             .control(br#"{"cmd":"set_network","type":"wifi"}"#)
             .is_none());
+        while engine.local_reads() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            engine.local_reads() > before,
+            "set_network reads them again"
+        );
         let instance = engine.registry().networks()[0]
             .instance
             .clone()

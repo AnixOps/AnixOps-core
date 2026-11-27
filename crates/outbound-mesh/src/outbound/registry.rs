@@ -642,6 +642,9 @@ async fn follow_claims(
                 (last_wanted.as_deref() != Some(routes)).then(|| routes.to_vec())
             };
             if look || wanted.is_some() {
+                // A change of the others' claims not handled yet still
+                // calls for a new look at them, after this claim.
+                look |= others.has_changed().unwrap_or(false);
                 others.mark_unchanged();
                 let wanted = wanted.unwrap_or_else(|| last_wanted.clone().unwrap_or_default());
                 claims.claim(&owner, &wanted);
@@ -1018,6 +1021,29 @@ mod tests {
         settle();
         assert_eq!(claims.lookup(address("172.16.8.5")), None);
         assert_eq!(claims.lookup(address("10.160.0.9")), None);
+        // A subnet freed in the same round as a new snapshot that claims
+        // nothing new: the network still looks again at the others, and
+        // no longer sees the freed subnet as local.
+        office.retire();
+        let keeper = make("keeper", "10.190.0.2/24", "legacy");
+        keeper.pretend(routes(&["172.16.9.0/24"]));
+        let branch = make("branch", "10.180.0.2/24", "legacy");
+        settle();
+        assert!(branch
+            .local_networks()
+            .unwrap()
+            .contains(&net("192.168.10.0/24")));
+        branch.pretend(routes(&["172.16.9.0/24"]));
+        // Released at once, as `Network::stop` does, before branch's task
+        // runs again.
+        hq.retire();
+        claims.release("hq");
+        settle();
+        assert!(claims.held("branch").is_empty());
+        assert!(!branch
+            .local_networks()
+            .unwrap()
+            .contains(&net("192.168.10.0/24")));
     }
 
     #[test]
