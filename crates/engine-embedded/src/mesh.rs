@@ -16,12 +16,13 @@
 //! runtime that answered them then holds it until it stops, so that a
 //! network saved while only the proxy runs keeps running.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine_outbound::registry::OutboundRegistry;
+use outbound_mesh::dns::message::Transport;
 use outbound_mesh::outbound::control;
 use outbound_mesh::outbound::engine::{EngineHold, EngineSlot, MeshEngine, GRACE};
 use outbound_mesh::outbound::MeshFactory;
@@ -137,10 +138,21 @@ impl MeshBinding {
         if tags.is_empty() {
             return;
         }
+        let networks: BTreeSet<String> = tags.keys().cloned().collect();
         routed.set_mesh_routes(Arc::new(move |address: IpAddr| {
             let engine = SLOT.current()?;
             let network = engine.registry().network_for(address)?;
             tags.get(&network).cloned()
+        }));
+        // The intranet names of the same networks: their addresses then
+        // go to those nodes too.
+        routed.set_mesh_dns(Arc::new(move |message: &[u8]| {
+            let engine = SLOT.current()?;
+            engine
+                .registry()
+                .answer_dns(message, Transport::Udp, |network| {
+                    networks.contains(network)
+                })
         }));
     }
 

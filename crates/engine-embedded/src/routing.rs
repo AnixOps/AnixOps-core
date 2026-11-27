@@ -150,11 +150,19 @@ pub struct RoutedOutbound {
     /// The node of the mesh network that routes an address, if any
     /// ([`RoutedOutbound::set_mesh_routes`]).
     mesh_routes: RwLock<Option<MeshRoutes>>,
+    /// The answers of the mesh networks to queries for their intranet
+    /// names ([`RoutedOutbound::set_mesh_dns`]).
+    mesh_dns: RwLock<Option<MeshDns>>,
 }
 
 /// Gives the node id (a key of `routing.outbounds`) of the mesh network
 /// whose `tunnel.routes` hold an address (`mesh-status.md`).
 pub type MeshRoutes = Arc<dyn Fn(IpAddr) -> Option<String> + Send + Sync>;
+
+/// Answers a DNS query (UDP message) for an intranet name of a mesh
+/// network the profile has a node for; `None` for any other query
+/// (`mesh-status.md`, `tunnel.dns`).
+pub type MeshDns = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
 /// The `rule` of a flow that went to a mesh network ahead of the rules.
 pub const MESH_RULE: &str = "MESH";
@@ -607,6 +615,7 @@ impl RoutedOutbound {
             reject_storm: RejectStorm::default(),
             scripts: Arc::default(),
             mesh_routes: RwLock::default(),
+            mesh_dns: RwLock::default(),
         })
     }
 
@@ -1602,6 +1611,28 @@ impl RoutedOutbound {
             .mesh_routes
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(routes);
+    }
+
+    /// Answers the queries for the mesh networks' intranet names in the
+    /// tunnel's DNS, ahead of the hosts, the DNS rules, Fake-IP and every
+    /// upstream (spec §15.9.2 item 8): such a query never leaves the
+    /// device.
+    pub fn set_mesh_dns(&self, dns: MeshDns) {
+        *self
+            .mesh_dns
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dns);
+    }
+
+    /// The answer to `message` when it asks for an intranet name of a
+    /// mesh network the profile has a node for.
+    pub fn mesh_dns(&self, message: &[u8]) -> Option<Vec<u8>> {
+        let dns = self
+            .mesh_dns
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        dns(message)
     }
 
     /// The mesh node for `target`, when it is an address a joined mesh

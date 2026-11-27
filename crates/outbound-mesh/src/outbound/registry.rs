@@ -1,7 +1,7 @@
 //! The networks of one [`MeshEngine`](super::engine::MeshEngine): which
 //! settings the engine adopted for each network, its running instance, and
 //! what the user did to it (`mesh_leave`, `mesh_save_network`, a subnet
-//! route override).
+//! route override, a local `dns` override).
 //!
 //! Building an outbound never changes the registry: a delay test, a checkup
 //! or a draft profile builds outbounds without stopping a running network.
@@ -19,10 +19,13 @@ use ring::rand::SystemRandom;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
+use super::name_book::NameBook;
 use super::same_settings;
 use super::stack::{Failure, Instance};
 use crate::claims::HostRoutes;
 use crate::config::NetworkKind;
+use crate::dns::message::Transport;
+use crate::dns::DnsSettings;
 use crate::secure::noise::KeyPair;
 use crate::{IpNet, MeshSettings};
 
@@ -44,12 +47,24 @@ struct Network {
     /// Subnets the user routes through the mesh although they overlap a
     /// network of this machine (`mesh_set_subnet_route`).
     route_overrides: Vec<IpNet>,
+    /// The local `dns` override in force for this network
+    /// (`mesh_set_dns`), whether set for it or for every network.
+    dns_override: Option<DnsOverride>,
     /// The instance's name in the shared [`HostRoutes`]: one per instance,
     /// so that a replaced instance cannot release its successor's claim.
     owner: String,
 }
 
 impl Network {
+    /// The `dns` settings in force: the configured section with the local
+    /// override applied.
+    fn dns(&self) -> DnsSettings {
+        match &self.dns_override {
+            Some(dns) => dns.apply(&self.settings.dns),
+            None => self.settings.dns.clone(),
+        }
+    }
+
     /// Retires the instance, if any, and frees what it held in `claims` at
     /// once: its addresses go back to the rules.
     fn stop(&mut self, claims: &HostRoutes) {
@@ -70,13 +85,41 @@ struct Inner {
     keys: BTreeMap<String, KeyPair>,
     /// The engine stopped; nothing starts any more.
     closed: bool,
-    /// The `tunnel.routes` last reported and their `routesVersion`.
-    routes: (Vec<IpNet>, u64),
+    /// The last `mesh_set_dns` without a network: every network added
+    /// later starts with it too.
+    dns_all: Option<DnsOverride>,
+    /// The `tunnel.routes` and `tunnel.dns.matchDomains` last reported,
+    /// and their `routesVersion`.
+    routes: (Vec<IpNet>, Vec<String>, u64),
+}
+
+/// A local override of a network's `dns` section (`mesh_set_dns`): kept
+/// on this device only, ahead of the network config, and forgotten when
+/// the engine stops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsOverride {
+    pub enabled: bool,
+    /// Already checked with [`crate::dns::normalize_suffix`]; `None`
+    /// keeps the configured suffix.
+    pub suffix: Option<String>,
+}
+
+impl DnsOverride {
+    /// `dns` with this override applied.
+    pub fn apply(&self, dns: &DnsSettings) -> DnsSettings {
+        let mut dns = dns.clone();
+        dns.enabled = self.enabled;
+        if let Some(suffix) = &self.suffix {
+            dns.suffix = suffix.clone();
+        }
+        dns
+    }
 }
 
 /// What [`Registry::network`] reports about one network.
 #[derive(Clone)]
 pub struct NetworkState {
+    /// The `dns` section is the one in force, `mesh_set_dns` applied.
     pub settings: MeshSettings,
     pub joined: bool,
     /// Kept by `mesh_save_network`.
@@ -140,6 +183,9 @@ pub struct Registry {
     machine: watch::Sender<Option<Vec<IpNet>>>,
     /// Numbers the instances' owners in [`Self::claims`].
     owners: AtomicU64,
+    /// The intranet names of the running networks, for the engine's split
+    /// DNS (spec §15.9.2 item 8).
+    names: NameBook,
 }
 
 impl Registry {
@@ -151,6 +197,7 @@ impl Registry {
             claims: HostRoutes::reclaiming(),
             machine: watch::channel(None).0,
             owners: AtomicU64::new(0),
+            names: NameBook::default(),
         }
     }
 
@@ -242,13 +289,16 @@ impl Registry {
         Ok(())
     }
 
-    /// The `routesVersion` of `routes` (snapshot `tunnel`): 1 for the
-    /// first routes reported, one more at each change.
-    pub fn routes_version(&self, routes: &[IpNet]) -> u64 {
+    /// The `routesVersion` of `routes` and the split DNS `domains`
+    /// (snapshot `tunnel`): 1 for the first reported, one more whenever
+    /// either changes, so that the client applies its tunnel settings
+    /// (routes and DNS match domains) again.
+    pub fn routes_version(&self, routes: &[IpNet], domains: &[String]) -> u64 {
         let mut inner = self.lock();
-        let (last, version) = &mut inner.routes;
-        if *version == 0 || last.as_slice() != routes {
+        let (last, last_domains, version) = &mut inner.routes;
+        if *version == 0 || last.as_slice() != routes || last_domains.as_slice() != domains {
             *last = routes.to_vec();
+            *last_domains = domains.to_vec();
             *version += 1;
         }
         *version
@@ -350,6 +400,34 @@ impl Registry {
         Ok(())
     }
 
+    /// `mesh_set_dns`: the local `dns` override of `name`, or of every
+    /// network for `None` (which replaces the overrides set for single
+    /// networks, and applies to networks added later). A running network
+    /// takes it without a restart.
+    pub fn set_dns(&self, name: Option<&str>, dns: DnsOverride) -> Result<(), RegistryError> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(RegistryError::Closed);
+        }
+        let networks: Vec<&mut Network> = match name {
+            Some(name) => vec![inner
+                .networks
+                .get_mut(name)
+                .ok_or(RegistryError::NotFound)?],
+            None => inner.networks.values_mut().collect(),
+        };
+        for network in networks {
+            network.dns_override = Some(dns.clone());
+            if let Some(instance) = &network.instance {
+                instance.set_dns(network.dns());
+            }
+        }
+        if name.is_none() {
+            inner.dns_all = Some(dns);
+        }
+        Ok(())
+    }
+
     /// The joined network that routes `address`: the most specific of
     /// every joined network's virtual subnets, running or not, and the
     /// advertised subnets each running network holds (spec §15.4: a
@@ -361,6 +439,27 @@ impl Registry {
     pub fn network_for(&self, address: IpAddr) -> Option<String> {
         let owner = self.claims.lookup(address)?;
         Some(network_of(&owner).to_owned())
+    }
+
+    /// Answers `message` when it asks for an intranet name of a running
+    /// network that `wanted` accepts by name (spec §15.9.2 item 8, the
+    /// engine's split DNS); `None` leaves it to the other resolvers. A
+    /// network whose names are off answers nothing. Takes no registry
+    /// lock.
+    pub fn answer_dns(
+        &self,
+        message: &[u8],
+        transport: Transport,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Option<Vec<u8>> {
+        self.names.answer(message, transport, wanted)
+    }
+
+    /// `tunnel.dns.matchDomains`: the suffixes and reverse zones of the
+    /// running networks whose names are on, without repeats; empty when
+    /// there are none.
+    pub fn dns_domains(&self) -> Vec<String> {
+        self.names.match_domains()
     }
 
     /// `tunnel.routes`: every joined network's virtual subnets, then the
@@ -454,13 +553,17 @@ impl Registry {
         self.lock()
             .networks
             .values_mut()
-            .map(|network| NetworkState {
-                settings: without_private_key(&mut network.settings),
-                joined: network.joined,
-                saved: network.saved,
-                instance: network.instance.clone(),
-                failure: network.failure,
-                route_overrides: network.route_overrides.clone(),
+            .map(|network| {
+                let mut settings = without_private_key(&mut network.settings);
+                settings.dns = network.dns();
+                NetworkState {
+                    settings,
+                    joined: network.joined,
+                    saved: network.saved,
+                    instance: network.instance.clone(),
+                    failure: network.failure,
+                    route_overrides: network.route_overrides.clone(),
+                }
             })
             .collect()
     }
@@ -474,13 +577,19 @@ impl Registry {
             network.stop(&self.claims);
         }
         inner.keys.clear();
+        inner.dns_all = None;
     }
 
     /// Adopts `settings` for its network (the later writer wins) and starts
     /// it if it is joined and changed.
     fn put(&self, inner: &mut Inner, settings: MeshSettings, saved: bool) {
         let name = settings.network_name.clone();
-        let Inner { networks, keys, .. } = inner;
+        let Inner {
+            networks,
+            keys,
+            dns_all,
+            ..
+        } = inner;
         match networks.get_mut(&name) {
             Some(network) => {
                 network.saved |= saved;
@@ -518,6 +627,7 @@ impl Registry {
                     joined: true,
                     saved,
                     route_overrides: Vec::new(),
+                    dns_override: dns_all.clone(),
                     owner: String::new(),
                 };
                 self.start(keys, &mut network);
@@ -552,23 +662,25 @@ impl Registry {
         let instance = Instance::with_key(settings.clone(), key, Some(self.runtime.clone()));
         // Its virtual subnets are routed to it at once, and no other
         // network may claim them.
-        let owner = format!(
-            "{}/{}",
-            self.owners.fetch_add(1, Ordering::Relaxed),
-            settings.network_name
-        );
+        let order = self.owners.fetch_add(1, Ordering::Relaxed);
+        let owner = format!("{order}/{}", settings.network_name);
         self.claims.join(
             &owner,
             settings.kind == NetworkKind::Managed,
             &settings.virtual_subnets(),
         );
         instance.set_route_overrides(network.route_overrides.clone());
+        instance.set_dns(network.dns());
         instance.start();
         self.runtime.spawn(follow_claims(
             Arc::downgrade(&instance),
             owner.clone(),
             self.claims.clone(),
             self.machine.subscribe(),
+            Published {
+                book: self.names.clone(),
+                order,
+            },
         ));
         network.failure = None;
         network.instance = Some(instance);
@@ -581,16 +693,28 @@ fn network_of(owner: &str) -> &str {
     owner.split_once('/').map_or(owner, |(_, name)| name)
 }
 
-/// Releases an owner's claims however its task ends.
+/// Releases an owner's claims, and takes its names out of the book,
+/// however its task ends.
 struct Release {
     claims: HostRoutes,
     owner: String,
+    names: Published,
 }
 
 impl Drop for Release {
     fn drop(&mut self) {
         self.claims.release(&self.owner);
+        self.names
+            .book
+            .set(self.names.order, network_of(&self.owner), None);
     }
+}
+
+/// Where an instance publishes its names: its place in the book.
+#[derive(Clone)]
+struct Published {
+    book: NameBook,
+    order: u64,
 }
 
 /// Keeps one instance's part of the shared claims current until it
@@ -605,10 +729,12 @@ async fn follow_claims(
     owner: String,
     claims: HostRoutes,
     mut machine: watch::Receiver<Option<Vec<IpNet>>>,
+    names: Published,
 ) {
     let _release = Release {
         claims: claims.clone(),
         owner: owner.clone(),
+        names: names.clone(),
     };
     let (mut snapshots, mut changes) = match instance.upgrade() {
         Some(instance) => (instance.snapshot(), instance.changes()),
@@ -634,6 +760,10 @@ async fn follow_claims(
             let running = instance.state().0;
             let wanted = {
                 let snapshot = snapshots.borrow_and_update();
+                // Its names answer while its driver runs (the book keeps
+                // the same list once).
+                let published = snapshot.names.clone().filter(|_| running);
+                names.book.set(names.order, network_of(&owner), published);
                 let routes: &[IpNet] = if running && snapshot.local_networks_read {
                     &snapshot.system_routes
                 } else {
@@ -910,6 +1040,68 @@ mod tests {
     }
 
     #[test]
+    fn a_running_network_publishes_its_names_until_it_retires() {
+        use crate::dns::{DnsSettings, Names, NetworkView};
+        use crate::driver::Snapshot;
+        use crate::secure::noise::KeyPair;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let claims = HostRoutes::reclaiming();
+        let (machine, _) = watch::channel(None);
+        let book = NameBook::default();
+        let settings = settings("office", "10.157.0.2/24", "legacy");
+        let key = KeyPair::generate(&SystemRandom::new()).unwrap();
+        let instance = Instance::with_key(settings.clone(), key, None);
+        claims.join("3/office", false, &settings.virtual_subnets());
+        runtime.spawn(follow_claims(
+            Arc::downgrade(&instance),
+            "3/office".to_owned(),
+            claims.clone(),
+            machine.subscribe(),
+            Published {
+                book: book.clone(),
+                order: 3,
+            },
+        ));
+        let settle = || {
+            runtime.block_on(async {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let names = Arc::new(Names::build(
+            &DnsSettings {
+                enabled: true,
+                suffix: "office.internal".to_owned(),
+                ..DnsSettings::default()
+            },
+            &NetworkView {
+                virtual_subnets: &settings.virtual_subnets(),
+                host_groups: &[],
+                local_addresses: &settings.local_addresses(),
+                own_hostname: None,
+                members: &[],
+            },
+        ));
+        settle();
+        // Not running: no names.
+        assert!(book.match_domains().is_empty());
+        instance.pretend(Snapshot {
+            names: Some(names),
+            ..Snapshot::default()
+        });
+        settle();
+        assert_eq!(book.match_domains()[0], "office.internal");
+        instance.retire();
+        settle();
+        assert!(book.match_domains().is_empty());
+    }
+
+    #[test]
     fn networks_split_advertised_subnets_and_see_the_others_as_local() {
         use crate::driver::Snapshot;
         use crate::secure::noise::KeyPair;
@@ -936,6 +1128,10 @@ mod tests {
                 name.to_owned(),
                 claims.clone(),
                 machine.subscribe(),
+                Published {
+                    book: NameBook::default(),
+                    order: 0,
+                },
             ));
             instance
         };
@@ -999,6 +1195,10 @@ mod tests {
                 "hq".to_owned(),
                 claims.clone(),
                 machine.subscribe(),
+                Published {
+                    book: NameBook::default(),
+                    order: 0,
+                },
             ));
             instance
         };
@@ -1047,19 +1247,23 @@ mod tests {
     }
 
     #[test]
-    fn the_routes_version_changes_only_with_the_routes() {
+    fn the_routes_version_changes_only_with_the_routes_and_domains() {
         let (_runtime, registry) = registry();
         let a = [IpNet::parse("10.146.0.0/24").unwrap()];
         let b = [
             IpNet::parse("10.146.0.0/24").unwrap(),
             IpNet::parse("192.168.10.0/24").unwrap(),
         ];
-        assert_eq!(registry.routes_version(&[]), 1);
-        assert_eq!(registry.routes_version(&[]), 1);
-        assert_eq!(registry.routes_version(&a), 2);
-        assert_eq!(registry.routes_version(&a), 2);
-        assert_eq!(registry.routes_version(&b), 3);
-        assert_eq!(registry.routes_version(&a), 4);
+        let domains = ["office.internal".to_string()];
+        assert_eq!(registry.routes_version(&[], &[]), 1);
+        assert_eq!(registry.routes_version(&[], &[]), 1);
+        assert_eq!(registry.routes_version(&a, &[]), 2);
+        assert_eq!(registry.routes_version(&a, &[]), 2);
+        assert_eq!(registry.routes_version(&b, &[]), 3);
+        assert_eq!(registry.routes_version(&a, &[]), 4);
+        assert_eq!(registry.routes_version(&a, &domains), 5);
+        assert_eq!(registry.routes_version(&a, &domains), 5);
+        assert_eq!(registry.routes_version(&a, &[]), 6);
     }
 
     #[test]

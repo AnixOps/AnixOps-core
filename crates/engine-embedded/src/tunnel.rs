@@ -803,6 +803,18 @@ fn spawn_tasks(
                 );
                 continue;
             }
+            // Intranet names of the mesh networks: answered here, never
+            // sent anywhere (spec §15.9.2 item 8).
+            if let Some(answer) = dispatcher
+                .routed_outbound()
+                .and_then(|routed| routed.mesh_dns(&payload))
+            {
+                bump(&stats.dns_queries);
+                if reply_tx.try_send((answer, dst, src)).is_err() {
+                    bump(&stats.dns_failed);
+                }
+                continue;
+            }
             let rule_sets = dispatcher
                 .routed_outbound()
                 .map(|routed| routed.rule_sets().as_ref());

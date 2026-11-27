@@ -17,6 +17,7 @@
 
 pub mod control;
 pub mod engine;
+pub mod name_book;
 pub mod registry;
 pub mod snapshot;
 mod stack;

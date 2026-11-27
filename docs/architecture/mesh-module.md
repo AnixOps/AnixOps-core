@@ -119,18 +119,17 @@
 
 **名单来源**：第一版的跨区域名字与网关后面设备的名字都由面板经 `dns.names` 下发，代替规范 §15.9.2 第 3、4 条的骨干名字交换与网关名字发布；状态的 `source` 为 `panel` 或 `member`，并预留 `backbone`、`gateway` 两个取值给以后的协议来源。
 
-**`dns` 与 `mesh_set_dns` 的优先级**：`mesh_set_dns` 是本机覆盖：带 `network` 时只对该网络生效，省略时对本设备所有网络生效（并清除已有的按网络覆盖），按网络的覆盖优先；优先于网络配置里的 `dns.enabled` 与 `suffix`，与 `mesh_set_subnet_route` 一样保存在本机、不改网络配置；`suffix` 按上面同样的规则校验，不合规返回 `invalid_argument`。`mesh_set_dns` 省略 `suffix` 时各网络用自己配置的后缀。
+**`dns` 与 `mesh_set_dns` 的优先级**：`mesh_set_dns` 是本机覆盖：带 `network` 时只对该网络生效，省略时对本设备所有网络生效（并清除已有的按网络覆盖），按网络的覆盖优先；优先于网络配置里的 `dns.enabled` 与 `suffix`，与 `mesh_set_subnet_route` 一样保存在本机、不改网络配置；`suffix` 按上面同样的规则校验，不合规返回 `invalid_argument`。`mesh_set_dns` 省略 `suffix` 时各网络用自己配置的后缀。省略 `network` 的覆盖也作用于之后加入的网络；覆盖只保存在运行中的嵌入式引擎里，引擎停止后清除；运行中的网络按新的取值重建名单，不重启。
+
 **实现**（`crates/outbound-mesh` 的 `dns` 模块）：
 
 - 名字规范化内嵌面板生成的 `nametable-unicode-15.1.0.txt`（面板 `internal/meshregion/` 同名文件，逐字节相同，SHA-256 `f1f486fd79d9fd8b15183a5d4d1a6efa801af64c6744973d0c65ba958010cd7c`，测试校验摘要与 §22.5 全部向量）。面板与内核换表时两边同时更新。
 - 名单每秒随路由信息重建一次：下发条目在前，成员自报的主机名（路由信息字段 6，按同一规则规范化）记在本网络的地区下；本机也按 `node.hostname` 列入。下发条目的地址与某个成员（含本机）的虚拟地址相同时，该成员的自报名不用。可应答的网段依次为本网络虚拟网段、`host_groups` 各组地址段（变化时立即重建）与可达成员已接受的通告子网（边界节点通告的汇总网段在其中）。
 - 应答：A、AAAA、ANY 与 PTR，TTL 5 秒，置 AA；`<后缀>` 本身与已知地区 `<地区>.<后缀>` 无此类记录时为空应答，其余查不到的名字为 NXDOMAIN；三个以上标签加后缀为 NXDOMAIN。查询带 EDNS 时按其 UDP 大小应答（512–1232 字节），版本非 0 应答 BADVERS。超过 32 个地址时只给前 32 个，UDP 置 TC；放不下时也置 TC。
 - 反向区（`dns::reverse`）：由本网络虚拟网段推算（宿主组地址段与汇总网段随 0.4 接入后依次排在其后），与 §15.4 白名单取交集，按标签边界展开，至多 256 个；超出的个数由 `GET /v1/mesh` 的 `alerts` 以 `reverse_zones_truncated` 给出（`detail` 为个数）。`in-addr.arpa` / `ip6.arpa` 下只应答落在这些区内的查询：完整地址名按名单给 PTR（无名字为 NXDOMAIN），区顶点与通往地址的较短名字为空应答，标签不可能是地址的一部分时为 NXDOMAIN；区外的反向查询交还原有解析链。成员通告子网内的地址仍可正向应答，但不在反向区内。`Names::match_domains` 给出后缀与反向区，供 `tunnel.dns.matchDomains`；内网域名关闭时为空。
-- 入口一：引擎的分流 DNS 调用 `Names::answer`（取驱动快照的 `names`），返回 `NotOurs` 时交还原有解析链。客户端与嵌入式引擎接入组网出站时接上，届时 `tunnel.dns` 与 `mesh_set_dns` 一起实现。
+- 入口一：引擎的分流 DNS 调用 `Names::answer`（取驱动快照的 `names`），返回 `NotOurs` 时交还原有解析链。嵌入式引擎自 0.3.1 起接上（`outbound::name_book`，见 `mesh-status.md`「嵌入式引擎的内网域名」），`tunnel.dns` 与 `mesh_set_dns` 同时实现。
 - 入口二：配置了 `resolver_address` 且 `enabled` 时，完整节点在虚拟网卡上应答发往该地址 53 端口的 UDP 与 TCP（`dns::intercept`），这些包不进入路由，也不外发。该地址上不属于内网域名的查询应答 REFUSED，让系统换下一个解析服务器；其他端口的 UDP 丢弃，TCP 回 RST。TCP 为每连接一个查询的最小应答：收齐带长度前缀的查询后按对方 MSS 分段发出应答并 FIN，对方关闭或 30 秒无活动后遗忘，同时最多 64 个连接。`resolver_address` 等于本机虚拟地址时不拦截，`GET /v1/mesh` 的 `alerts` 给出 `resolver_address_conflict`（`address` 为该地址）。
 - 热更新：只有 `native_keys` 与 `dns` 变化的运行中网络不重启，新的 `dns` 交给驱动重建名单。
-
-**`dns` 与 `mesh_set_dns` 的优先级**：`mesh_set_dns` 是本机覆盖，对本设备所有网络生效，优先于网络配置里的 `dns.enabled` 与 `suffix`，与 `mesh_set_subnet_route` 一样保存在本机、不改网络配置；`suffix` 按上面同样的规则校验，不合规返回 `invalid_argument`。`mesh_set_dns` 省略 `suffix` 时各网络用自己配置的后缀。
 
 ## 分层与集成点
 

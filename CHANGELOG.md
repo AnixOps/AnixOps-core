@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+### Mesh
+
+- 嵌入式引擎接入内网域名（0.3.1，用户批准的补丁版例外）：隧道内发往 53 端口的 UDP 查询中，组网网络的内网域名（后缀、推算的反向区、本地区单标签主机名）由组网模块直接应答，先于 hosts、DNS 规则、Fake-IP 与上游，从不外发；只应答 profile 中有组网出站、运行中且内网域名开启的网络。快照 `tunnel.dns` 给出 `{"servers": ["198.18.0.2", "fd00::53"], "matchDomains": [...]}`，`network.dnsSuffix`、`network.dnsEnabled` 给出实际取值；`tunnel.routesVersion` 也随 `matchDomains` 变化。多个网络同一后缀时按「有记录 > 名字存在 > 不存在」取应答。
+- 嵌入式引擎支持 `mesh_set_dns`（0.3.0 返回 `unsupported`）：可省的 `network`、`enabled`、可省的 `suffix`，本机覆盖网络配置的 `dns.enabled` 与 `suffix`；`network` 省略时作用于全部网络（含之后加入的）并清除按网络的覆盖；`suffix` 按配置同一规则校验，不合规返回 `invalid_argument`；运行中的网络不重启。覆盖在引擎停止后清除，没有引擎运行时返回 `not_found`。
+
 ## v0.3.0 - 2026-11-27
 
 内核 0.3 正式版，从维护分支 `release/0.3` 发布，随客户端 1.1 发布。代码与 `v0.3.0-rc.2` 相同，只改了版本号与发布说明。0.3 的组网范围：互通、TCP/UDP、前向保密、只走内网、成员与子网视图、内网域名。兼容性承诺见 [docs/compatibility-surface.md](docs/compatibility-surface.md)，补丁版 0.3.x 只含修复。以下为自 `v0.2.0` 以来的全部变更，由 `v0.3.0-rc.1`、`v0.3.0-rc.2` 两个候选版小节合并而成。
