@@ -6,8 +6,9 @@
 
 ### Mesh
 
-- 嵌入式引擎接入内网域名（0.3.1，用户批准的补丁版例外）：隧道内发往 53 端口的 UDP 查询中，组网网络的内网域名（后缀、推算的反向区、本地区单标签主机名）由组网模块直接应答，先于 hosts、DNS 规则、Fake-IP 与上游，从不外发；只应答 profile 中有组网出站、运行中且内网域名开启的网络。快照 `tunnel.dns` 给出 `{"servers": ["198.18.0.2", "fd00::53"], "matchDomains": [...]}`，`network.dnsSuffix`、`network.dnsEnabled` 给出实际取值；`tunnel.routesVersion` 也随 `matchDomains` 变化。多个网络同一后缀时按「有记录 > 名字存在 > 不存在」取应答。
+- 嵌入式引擎接入内网域名（0.3.1，用户批准的补丁版例外）：运行配置带 `allow_mesh: true` 的隧道（WireGuard 隧道除外）中，发往 53 端口的 UDP 查询里组网网络的内网域名（后缀、推算的反向区、本地区单标签主机名）由组网模块直接应答，先于 hosts、DNS 规则、Fake-IP 与上游；查不到返回 NXDOMAIN，读不懂的这类查询返回 FORMERR，都不外发。参与应答的是所有运行中且内网域名开启的网络，与 `tunnel.dns.matchDomains` 范围相同。快照 `tunnel.dns` 给出 `{"servers": ["198.18.0.2", "fd00::53"], "matchDomains": [...]}`（客户端须把这两个地址路由进隧道），`network.dnsSuffix`、`network.dnsEnabled` 给出实际取值；`tunnel.routesVersion` 也随 `matchDomains` 变化。多个网络有同一名字时合并全部地址（managed 网络在前，其余按网络加入引擎的顺序，重建后不变）。组网出站的内网域名目标改从同一名单取地址，不再交给系统解析器。只应答 UDP：经 TCP 的 DNS 查询（含 TC 后的重试）仍按规则转发；上游 DNS 服务器的出站选择不经组网分流（已知限制）。
 - 嵌入式引擎支持 `mesh_set_dns`（0.3.0 返回 `unsupported`）：可省的 `network`、`enabled`、可省的 `suffix`，本机覆盖网络配置的 `dns.enabled` 与 `suffix`；`network` 省略时作用于全部网络（含之后加入的）并清除按网络的覆盖；`suffix` 按配置同一规则校验，不合规返回 `invalid_argument`；运行中的网络不重启。覆盖在引擎停止后清除，没有引擎运行时返回 `not_found`。
+- 组网驱动启动前发出的 `dns` 变化不再被丢弃（独立节点与嵌入式引擎相同）。
 
 ## v0.3.0 - 2026-11-27
 

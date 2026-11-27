@@ -490,12 +490,20 @@ mod tests {
         };
         // `Registry::tunnel_routes` gives them.
         let routes = [net("10.144.0.0/24"), net("192.168.10.0/24")];
+        let domains = ["mesh.internal".to_owned(), "144.10.in-addr.arpa".to_owned()];
         let tunnel = Tunnel {
             routes: &routes,
             routes_version: 4,
-            dns_domains: &[],
+            dns_domains: &domains,
         };
         let value = snapshot(&view, std::slice::from_ref(&view), &tunnel);
+        assert_eq!(
+            value["tunnel"]["dns"],
+            json!({
+                "servers": ["198.18.0.2", "fd00::53"],
+                "matchDomains": ["mesh.internal", "144.10.in-addr.arpa"],
+            })
+        );
         assert_eq!(value["network"]["state"], "joined");
         assert_eq!(value["network"]["security"], "forward_secrecy");
         assert_eq!(value["network"]["limitations"], json!(["reference_peers"]));

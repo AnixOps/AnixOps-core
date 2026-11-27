@@ -16,7 +16,7 @@
 //! runtime that answered them then holds it until it stops, so that a
 //! network saved while only the proxy runs keeps running.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -30,6 +30,7 @@ use outbound_mesh::{IpNet, MeshSettings, TYPE_NAME};
 use serde_json::{json, Value};
 
 use crate::config::OutboundConfig;
+use crate::connections::MeshDns;
 use crate::routing::RoutedOutbound;
 use crate::{RuntimeError, RuntimeErrorCode};
 
@@ -53,6 +54,8 @@ pub(crate) struct MeshBinding {
     /// again, so that a host that stopped the tunnel but keeps the runtime
     /// cannot keep the mesh running with the VPN closed.
     stopped: AtomicBool,
+    /// The runtime's tunnel answers the intranet names ([`Self::dns`]).
+    answers_dns: AtomicBool,
 }
 
 /// The registry of an engine a runtime looked up for a command.
@@ -138,22 +141,31 @@ impl MeshBinding {
         if tags.is_empty() {
             return;
         }
-        let networks: BTreeSet<String> = tags.keys().cloned().collect();
         routed.set_mesh_routes(Arc::new(move |address: IpAddr| {
             let engine = SLOT.current()?;
             let network = engine.registry().network_for(address)?;
             tags.get(&network).cloned()
         }));
-        // The intranet names of the same networks: their addresses then
-        // go to those nodes too.
-        routed.set_mesh_dns(Arc::new(move |message: &[u8]| {
-            let engine = SLOT.current()?;
-            engine
+    }
+
+    /// The tunnel's answers to queries for the intranet names of every
+    /// running network of the engine (`tunnel.dns`, spec §15.9.2 item 8),
+    /// when `allowed` (the config's `allow_mesh`): every domain the
+    /// snapshot lists in `tunnel.dns.matchDomains` is answered there, whether
+    /// or not the profile has a node for its network, so that no such query
+    /// leaves the device. Connections to the addresses still go by
+    /// `tunnel.routes` and the rules. A runtime whose tunnel takes no such
+    /// answers (a WireGuard tunnel) reports `tunnel.dns` as `null`.
+    pub(crate) fn dns(&self, allowed: bool) -> Option<MeshDns> {
+        if !allowed {
+            return None;
+        }
+        self.answers_dns.store(true, Ordering::SeqCst);
+        Some(Arc::new(|message: &[u8]| {
+            SLOT.current()?
                 .registry()
-                .answer_dns(message, Transport::Udp, |network| {
-                    networks.contains(network)
-                })
-        }));
+                .answer_dns(message, Transport::Udp)
+        }))
     }
 
     /// Reads this machine's interface networks again for the mesh
@@ -218,7 +230,19 @@ impl MeshBinding {
             };
             engine.map(Engine)
         });
-        Some(encode(&answer))
+        Some(encode(&self.without_unanswered_dns(answer)))
+    }
+
+    /// `answer` with `tunnel.dns` set to `null` when the runtime's tunnel
+    /// does not answer the intranet names: a client must not send their
+    /// queries to a tunnel that would pass them on.
+    fn without_unanswered_dns(&self, mut answer: Value) -> Value {
+        if !self.answers_dns.load(Ordering::SeqCst) {
+            if let Some(tunnel) = answer.get_mut("tunnel").and_then(Value::as_object_mut) {
+                tunnel.insert("dns".to_owned(), Value::Null);
+            }
+        }
+        answer
     }
 
     /// The running engine, started and held by this runtime when none runs

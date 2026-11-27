@@ -167,7 +167,10 @@ impl RegistryOutbound {
         let instance = engine
             .registry()
             .instance(&self.settings.network_name, &self.settings)?;
-        Ok(MeshOutbound { instance })
+        Ok(MeshOutbound {
+            instance,
+            names: Some(engine.registry().names().clone()),
+        })
     }
 }
 
@@ -196,6 +199,10 @@ impl TcpOutbound for RegistryOutbound {
 #[derive(Clone)]
 pub struct MeshOutbound {
     instance: Arc<Instance>,
+    /// The intranet names of every network of the engine, for domain
+    /// targets; `None` for a network of its own ([`Self::unshared`]),
+    /// which uses its own names.
+    names: Option<name_book::NameBook>,
 }
 
 impl MeshOutbound {
@@ -210,6 +217,7 @@ impl MeshOutbound {
     pub fn unshared(settings: MeshSettings) -> io::Result<Self> {
         Ok(Self {
             instance: Instance::new(settings)?,
+            names: None,
         })
     }
 
@@ -235,7 +243,22 @@ impl MeshOutbound {
         self.udp_flow(Some(port), target).await
     }
 
-    /// The address to reach `target` at: an IP target as it is, a domain
+    /// The addresses of `host` when it is an intranet name (spec §15.9.2):
+    /// `Some`, possibly empty, for a name under a suffix or in a reverse
+    /// zone of a network whose names are on, which never goes to another
+    /// resolver; `None` for any other name.
+    fn intranet_addresses(&self, host: &str) -> Option<Vec<IpAddr>> {
+        match &self.names {
+            Some(book) => book.lookup(host),
+            None => {
+                let names = self.instance.snapshot().borrow().names.clone()?;
+                crate::dns::lookup(&[names.as_ref()], host)
+            }
+        }
+    }
+
+    /// The address to reach `target` at: an IP target as it is, an
+    /// intranet name from the networks' name lists, any other domain
     /// through the system resolver; either way only an address the network
     /// reaches (spec §15.4: nothing outside the mesh routes is sent).
     async fn remote(&self, target: &TargetAddr) -> io::Result<SocketAddr> {
@@ -251,6 +274,21 @@ impl MeshOutbound {
             TargetAddr::Domain(host, port) => {
                 if let Ok(address) = host.parse::<IpAddr>() {
                     return checked(SocketAddr::new(address, *port));
+                }
+                // An intranet name is never handed to the system resolver
+                // (spec §15.9.2 item 8): found in the lists or not at all.
+                if let Some(mut addresses) = self.intranet_addresses(host) {
+                    addresses.sort_by_key(IpAddr::is_ipv6);
+                    return addresses
+                        .into_iter()
+                        .map(|address| SocketAddr::new(address, *port))
+                        .find(|address| self.instance.reaches(address.ip()))
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "intranet name has no address in the mesh network",
+                            )
+                        });
                 }
                 let lookup = tokio::net::lookup_host((host.as_str(), *port));
                 let addresses = tokio::time::timeout(RESOLVE_TIMEOUT, lookup)

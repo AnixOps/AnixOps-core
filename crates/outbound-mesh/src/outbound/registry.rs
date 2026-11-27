@@ -19,7 +19,7 @@ use ring::rand::SystemRandom;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
-use super::name_book::NameBook;
+use super::name_book::{NameBook, Place};
 use super::same_settings;
 use super::stack::{Failure, Instance};
 use crate::claims::HostRoutes;
@@ -47,6 +47,9 @@ struct Network {
     /// Subnets the user routes through the mesh although they overlap a
     /// network of this machine (`mesh_set_subnet_route`).
     route_overrides: Vec<IpNet>,
+    /// The order the network was added to the engine in: its place among
+    /// the name lists ([`NameBook`]), kept by every instance of it.
+    order: u64,
     /// The local `dns` override in force for this network
     /// (`mesh_set_dns`), whether set for it or for every network.
     dns_override: Option<DnsOverride>,
@@ -88,6 +91,8 @@ struct Inner {
     /// The last `mesh_set_dns` without a network: every network added
     /// later starts with it too.
     dns_all: Option<DnsOverride>,
+    /// The order the next network added gets.
+    next_order: u64,
     /// The `tunnel.routes` and `tunnel.dns.matchDomains` last reported,
     /// and their `routesVersion`.
     routes: (Vec<IpNet>, Vec<String>, u64),
@@ -442,17 +447,17 @@ impl Registry {
     }
 
     /// Answers `message` when it asks for an intranet name of a running
-    /// network that `wanted` accepts by name (spec §15.9.2 item 8, the
-    /// engine's split DNS); `None` leaves it to the other resolvers. A
-    /// network whose names are off answers nothing. Takes no registry
-    /// lock.
-    pub fn answer_dns(
-        &self,
-        message: &[u8],
-        transport: Transport,
-        wanted: impl Fn(&str) -> bool,
-    ) -> Option<Vec<u8>> {
-        self.names.answer(message, transport, wanted)
+    /// network (spec §15.9.2 item 8, the engine's split DNS): every domain
+    /// of [`Self::dns_domains`] is answered here. `None` leaves it to the
+    /// other resolvers. A network whose names are off answers nothing.
+    /// Takes no registry lock.
+    pub fn answer_dns(&self, message: &[u8], transport: Transport) -> Option<Vec<u8>> {
+        self.names.answer(message, transport)
+    }
+
+    /// The intranet names of the running networks.
+    pub fn names(&self) -> &NameBook {
+        &self.names
     }
 
     /// `tunnel.dns.matchDomains`: the suffixes and reverse zones of the
@@ -588,6 +593,7 @@ impl Registry {
             networks,
             keys,
             dns_all,
+            next_order,
             ..
         } = inner;
         match networks.get_mut(&name) {
@@ -627,9 +633,11 @@ impl Registry {
                     joined: true,
                     saved,
                     route_overrides: Vec::new(),
+                    order: *next_order,
                     dns_override: dns_all.clone(),
                     owner: String::new(),
                 };
+                *next_order += 1;
                 self.start(keys, &mut network);
                 networks.insert(name, network);
             }
@@ -679,7 +687,8 @@ impl Registry {
             self.machine.subscribe(),
             Published {
                 book: self.names.clone(),
-                order,
+                place: Place::new(settings.kind == NetworkKind::Managed, network.order),
+                instance: order,
             },
         ));
         network.failure = None;
@@ -706,15 +715,17 @@ impl Drop for Release {
         self.claims.release(&self.owner);
         self.names
             .book
-            .set(self.names.order, network_of(&self.owner), None);
+            .set(self.names.place, self.names.instance, None);
     }
 }
 
-/// Where an instance publishes its names: its place in the book.
+/// Where an instance publishes its names: its network's place in the
+/// book, and its own number there.
 #[derive(Clone)]
 struct Published {
     book: NameBook,
-    order: u64,
+    place: Place,
+    instance: u64,
 }
 
 /// Keeps one instance's part of the shared claims current until it
@@ -763,7 +774,7 @@ async fn follow_claims(
                 // Its names answer while its driver runs (the book keeps
                 // the same list once).
                 let published = snapshot.names.clone().filter(|_| running);
-                names.book.set(names.order, network_of(&owner), published);
+                names.book.set(names.place, names.instance, published);
                 let routes: &[IpNet] = if running && snapshot.local_networks_read {
                     &snapshot.system_routes
                 } else {
@@ -1040,6 +1051,30 @@ mod tests {
     }
 
     #[test]
+    fn a_network_keeps_its_place_among_the_names_when_it_starts_again() {
+        let (_runtime, registry) = registry();
+        registry.commit(vec![
+            settings("office", "10.157.0.2/24", "legacy"),
+            settings("lab", "10.158.0.2/24", "legacy"),
+        ]);
+        let order = |name: &str| registry.lock().networks[name].order;
+        assert_eq!((order("office"), order("lab")), (0, 1));
+        // Changed settings start a new instance; so do a leave and a join.
+        registry.commit(vec![
+            settings("office", "10.157.0.3/24", "legacy"),
+            settings("lab", "10.158.0.2/24", "legacy"),
+        ]);
+        registry.leave("lab").unwrap();
+        registry.join("lab").unwrap();
+        assert_eq!((order("office"), order("lab")), (0, 1));
+        // A network added later comes after them.
+        registry
+            .save(settings("branch", "10.159.0.2/24", "legacy"))
+            .unwrap();
+        assert_eq!(order("branch"), 2);
+    }
+
+    #[test]
     fn a_running_network_publishes_its_names_until_it_retires() {
         use crate::dns::{DnsSettings, Names, NetworkView};
         use crate::driver::Snapshot;
@@ -1063,7 +1098,8 @@ mod tests {
             machine.subscribe(),
             Published {
                 book: book.clone(),
-                order: 3,
+                place: Place::new(false, 0),
+                instance: 3,
             },
         ));
         let settle = || {
@@ -1130,7 +1166,8 @@ mod tests {
                 machine.subscribe(),
                 Published {
                     book: NameBook::default(),
-                    order: 0,
+                    place: Place::new(false, 0),
+                    instance: 0,
                 },
             ));
             instance
@@ -1197,7 +1234,8 @@ mod tests {
                 machine.subscribe(),
                 Published {
                     book: NameBook::default(),
-                    order: 0,
+                    place: Place::new(false, 0),
+                    instance: 0,
                 },
             ));
             instance
