@@ -2,6 +2,12 @@
 
 本文件记录当前无法由本地自动化完成、需要人工处理的事项。
 
+## 0.4 路径与宿主组独立审计
+
+路线 #438 的 R8、R21、R25 在默认启用前仍须通过独立审计。
+#435 L-1 的启动前热更新回归须合入并通过 GitHub Actions 的 `CI summary`，
+覆盖路径状态与宿主组网段通告。`mesh_paths` 与 `mesh_host_groups` 的默认启用须同时满足这两项条件。
+
 ## v0.2.0 Release Acceptance Gate
 
 This is the historical record of the last joint kernel + client release. The client moved to
