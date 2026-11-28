@@ -8,6 +8,7 @@
 
 - [CI/CD Policy](ci-cd-policy.md)：本地与 GitHub Actions 的职责、按改动范围选择验证任务、客户端互通矩阵与新增兼容用例的方法
 - [性能与长稳 CI](performance-ci.md)：规则决策、5000 并发（含 9 种出站的全出站压测结果）、10 万 UDP 会话、24 h 长稳与 IPC 模糊测试的门槛和所在 workflow
+- [发展路线：内核 0.3 → 0.5](roadmap-0.5.md)：内核 0.3.x / 0.4 / 0.5、客户端 1.1 / 1.2 / 1.3 与 ANX 交付边界的全部功能需求和打开条件
 - [Release Strategy](release-strategy.md)：tag 发布门禁、产物矩阵与回滚，版本节奏、候选版（RC）流程、维护分支与补丁维护
 - [兼容性承诺清单](compatibility-surface.md)：Rust 公共 API、C ABI、Linux CLI、`anixops-mesh`、`anixcore` 管理接口与配置升级行为的承诺，以及 0.x 期间仍可能变化的部分
 - [Alpha Release Feature Matrix](alpha-release-feature-matrix.md)：每个 alpha/beta/rc/stable 版本的能力边界
