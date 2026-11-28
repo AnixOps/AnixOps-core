@@ -15,11 +15,11 @@ jobs:
   cleanup:
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Delete artifacts older than one day
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          cut=$(date -u -d '-1 day' +%FT%TZ)
-          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.expired | not) | select(.created_at < \"$cut\") | .id" |
-            xargs -r -I{} gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/{}"
+        run: bash .github/scripts/artifact-cleanup.sh

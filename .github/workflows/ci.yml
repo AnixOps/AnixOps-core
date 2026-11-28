@@ -96,6 +96,9 @@ jobs:
       - name: Release version check self-test
         run: bash .github/scripts/release-version-check.sh --self-test
 
+      - name: Artifact cleanup contract
+        run: bash .github/scripts/test-artifact-cleanup.sh
+
       # Neutral terminology (AnixOps-design guidelines/terminology.md); the script and word list are
       # byte-identical copies of the AnixOps-design baseline.
       - name: Neutral terminology
