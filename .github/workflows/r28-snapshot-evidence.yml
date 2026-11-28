@@ -1,0 +1,62 @@
+name: R28 snapshot evidence
+
+on:
+  push:
+    branches: [kalijerry/r28-snapshot-evidence]
+    paths: [.github/workflows/r28-snapshot-evidence.yml, .github/scripts/r28-snapshot-evidence.py]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    name: R28 snapshots (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: core-0.3.0
+            core: 6790d8675309d5d2cb719a5fcee4acca69735663
+          - label: core-0.3.1-rc.1
+            core: ef52978586ce43e8c5a7376f987eb435650d9019
+          - label: core-pr-439
+            core: 1d9b4907918355a27ab3bb65698b28ca3e0ed0fa
+    steps:
+      - name: Check out evidence harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out fixed Core source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.core }}
+          path: core
+          persist-credentials: false
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Serialize the existing synthetic snapshots
+        env:
+          CORE_SHA: ${{ matrix.core }}
+          CORE_LABEL: ${{ matrix.label }}
+          R28_SNAPSHOT_OUTPUT: ${{ runner.temp }}/r28-snapshots
+        run: |
+          test "$(git -C core rev-parse HEAD)" = "$CORE_SHA"
+          python3 .github/scripts/r28-snapshot-evidence.py core
+          cd core
+          cargo test --locked -p outbound-mesh --features outbound --lib outbound::snapshot::tests
+          test -s "$R28_SNAPSHOT_OUTPUT/joined.json"
+          if [[ "$CORE_LABEL" != core-0.3.0 ]]; then
+            test -s "$R28_SNAPSHOT_OUTPUT/office-all-running.json"
+            test -s "$R28_SNAPSHOT_OUTPUT/office-lab-stopped.json"
+          fi
+      - name: Upload raw JSON and provenance
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: r28-snapshots-${{ matrix.label }}
+          path: ${{ runner.temp }}/r28-snapshots
+          if-no-files-found: error
+          retention-days: 30
