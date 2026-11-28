@@ -1305,6 +1305,18 @@ mod tests {
         listeners: Listeners,
         local: Option<Vec<IpNet>>,
     ) -> Running {
+        let (_, paths) = watch::channel(Vec::new());
+        let (_, host_groups) = watch::channel(Vec::new());
+        start_with_routing(settings, listeners, local, paths, host_groups).await
+    }
+
+    async fn start_with_routing(
+        settings: MeshSettings,
+        listeners: Listeners,
+        local: Option<Vec<IpNet>>,
+        paths: watch::Receiver<Vec<CustomPath>>,
+        host_groups: watch::Receiver<Vec<HostGroup>>,
+    ) -> Running {
         let rng = SystemRandom::new();
         let static_key = KeyPair::generate(&rng).unwrap();
         let (to_mesh, from_interface) = mpsc::channel(16);
@@ -1314,8 +1326,6 @@ mod tests {
         let (local_tx, local_networks) = watch::channel(local);
         let (_, native_keys) = watch::channel(None);
         let (_, dns) = watch::channel(DnsSettings::default());
-        let (_, paths) = watch::channel(Vec::new());
-        let (_, host_groups) = watch::channel(Vec::new());
         let (_, route_overrides) = watch::channel(Vec::new());
         let (_, foreign_routes) = watch::channel(Vec::new());
         tokio::spawn(run(
@@ -1727,6 +1737,41 @@ mod tests {
         .expect("the narrowed list is applied");
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn routing_changes_sent_before_the_driver_runs_are_applied() {
+        let mut node = settings("10.144.0.1/24", "full");
+        node.peers.clear();
+        node.listen.clear();
+        node.instance_id = Some("test-gateway".into());
+        let listeners = Listeners::bind(&node).await.unwrap();
+        let path = CustomPath {
+            target: PathTarget::Peer("10.144.0.7".parse().unwrap()),
+            via: vec!["10.144.0.3".parse().unwrap()],
+        };
+        let cidr = IpNet::parse("192.168.10.0/24").unwrap();
+        let (paths_tx, paths) = watch::channel(node.paths.clone());
+        let (groups_tx, host_groups) = watch::channel(node.host_groups.clone());
+        // Both receivers exist, but the driver has yet to start.
+        paths_tx.send(vec![path.clone()]).unwrap();
+        groups_tx
+            .send(vec![HostGroup {
+                cidr,
+                gateway: "test-gateway".into(),
+                backup_gateway: None,
+            }])
+            .unwrap();
+
+        let running = start_with_routing(node, listeners, Some(Vec::new()), paths, host_groups).await;
+        wait_for(&running, |snapshot| {
+            snapshot
+                .paths
+                .iter()
+                .any(|current| current.target == path.target && current.via == path.via)
+        })
+        .await;
+        wait_for(&running, |snapshot| snapshot.advertising.contains(&cidr)).await;
     }
 
     #[tokio::test]
