@@ -511,7 +511,12 @@ mod tests {
         let mut office_dns = dns(
             "mesh.internal",
             "lon",
-            &[("cam", "lon", "10.144.0.41"), ("cam", "lon", "10.147.0.5")],
+            &[
+                ("cam", "lon", "10.144.0.41"),
+                ("cam", "lon", "10.147.0.5"),
+                ("backup", "ber", "10.144.0.50"),
+                ("backup", "par", "10.144.0.51"),
+            ],
         );
         let refused = RefusedName {
             name: "bad.lon".to_owned(),
@@ -597,6 +602,11 @@ mod tests {
         assert_eq!(cam["answerable"], false);
         assert_eq!(cam["duplicate"], true);
         assert_eq!(cam["duplicateNetworks"], json!(["lab"]));
+        for name in ["backup.ber", "backup.par"] {
+            let backup = entry(&value, name);
+            assert_eq!(backup["duplicate"], true);
+            assert!(backup.get("duplicateNetworks").is_none());
+        }
         assert_eq!(
             entry(&value, "nas.lon")["duplicateNetworks"],
             json!(["home"])
@@ -633,7 +643,9 @@ mod tests {
         assert_eq!(entry(&value, "printer.lon")["duplicate"], false);
         // `cam.lon` stays a duplicate within office (two panel addresses),
         // but no other network shares it.
-        assert!(entry(&value, "cam.lon").get("duplicateNetworks").is_none());
+        let cam = entry(&value, "cam.lon");
+        assert_eq!(cam["duplicate"], true);
+        assert!(cam.get("duplicateNetworks").is_none());
         // Not running itself: no names, only what its config skipped.
         let views = [
             view(&office, &office_now, false),
