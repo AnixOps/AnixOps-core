@@ -265,8 +265,9 @@ pub struct NameStatus {
     pub name: String,
     pub addresses: Vec<IpAddr>,
     pub source: NameSource,
-    /// The name stands for more than one member or entry; queries get all
-    /// their addresses, the panel's first.
+    /// The name stands for more than one member or entry, or its short name
+    /// merges answers from multiple regions. Queries return the matching
+    /// addresses, with the panel's first within each region.
     pub duplicate: bool,
     /// `false` when an address lies outside the ranges answers may point to
     /// and is not answered (spec §15.9.2 item 9).
@@ -461,6 +462,22 @@ impl Names {
                 push_unique(by_address.entry(*address).or_default(), name.clone());
             }
             by_name.insert(key.clone(), answered);
+        }
+
+        // Answerable keys are ordered by label and region. Two adjacent
+        // keys with the same label share a short-name answer if the local
+        // region has no answerable key for it.
+        let mut merged_short_names = BTreeSet::new();
+        for ((label, _), (next_label, _)) in by_name.keys().zip(by_name.keys().skip(1)) {
+            if label == next_label && !by_name.contains_key(&(label.clone(), region.clone())) {
+                merged_short_names.insert(label.as_str());
+            }
+        }
+        for (entry, (label, _)) in entries.iter_mut().zip(&entry_keys) {
+            let label = label.as_str();
+            if merged_short_names.contains(label) && entry.addresses.iter().any(|a| in_scope(*a)) {
+                entry.duplicate = true;
+            }
         }
 
         let configured = settings.resolver_address;
@@ -1639,6 +1656,45 @@ mod tests {
         let names = super::tests::names(json!({ "enabled": true, "region": "hk" }), &members);
         let gw = ask(&names, "gw.hk.mesh.internal", TYPE_A).unwrap();
         assert_eq!(addresses(&gw), [ip("10.150.0.1")]);
+    }
+
+    #[test]
+    fn short_name_duplicates_follow_answerable_regions() {
+        let names = names(
+            json!({
+                "enabled": true,
+                "region": "lon",
+                "names": [
+                    { "name": "cam.lon", "address": "10.151.0.1" },
+                    { "name": "cam.ber", "address": "10.150.0.7" },
+                    { "name": "cam.par", "address": "10.150.0.8" },
+                    { "name": "solo.ber", "address": "10.150.0.9" },
+                    { "name": "solo.par", "address": "10.151.0.2" },
+                    { "name": "web.lon", "address": "10.150.0.10" },
+                    { "name": "web.ber", "address": "10.150.0.11" },
+                    { "name": "web.par", "address": "10.150.0.12" }
+                ]
+            }),
+            &[],
+        );
+        let entry = |name: &str| names.entries().iter().find(|e| e.name == name).unwrap();
+        assert!(entry("cam.ber").duplicate);
+        assert!(entry("cam.par").duplicate);
+        assert!(!entry("cam.lon").duplicate);
+        assert!(!entry("cam.lon").answerable);
+        for unique in ["solo.ber", "solo.par", "web.lon", "web.ber", "web.par"] {
+            assert!(!entry(unique).duplicate, "{unique}");
+        }
+
+        let lookup = |name| addresses(&ask(&names, name, TYPE_A).unwrap());
+        assert_eq!(
+            lookup("cam.mesh.internal"),
+            [ip("10.150.0.7"), ip("10.150.0.8")]
+        );
+        assert_eq!(lookup("cam.ber.mesh.internal"), [ip("10.150.0.7")]);
+        assert_eq!(lookup("solo.mesh.internal"), [ip("10.150.0.9")]);
+        assert_eq!(lookup("web.mesh.internal"), [ip("10.150.0.10")]);
+        assert!(ask(&names, "cam", TYPE_A).is_none());
     }
 
     #[test]

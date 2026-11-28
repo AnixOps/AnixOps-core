@@ -511,7 +511,12 @@ mod tests {
         let mut office_dns = dns(
             "mesh.internal",
             "lon",
-            &[("cam", "lon", "10.144.0.41"), ("cam", "lon", "10.147.0.5")],
+            &[
+                ("cam", "lon", "10.144.0.41"),
+                ("cam", "lon", "10.147.0.5"),
+                ("backup", "ber", "10.144.0.50"),
+                ("backup", "par", "10.144.0.51"),
+            ],
         );
         let refused = RefusedName {
             name: "bad.lon".to_owned(),
@@ -520,7 +525,7 @@ mod tests {
         };
         office_dns.refused.push(refused.clone());
         let office = named("office", &office_dns);
-        let office_now = snapshot_of(names(
+        let mut office_now = snapshot_of(names(
             &office_dns,
             "10.144.0.0/24",
             &[
@@ -530,15 +535,23 @@ mod tests {
                 ("router", "10.144.0.1"),
             ],
         ));
-        // lab: same suffix and region, so `printer.lon` and `cam.lon` are
-        // the same full names.
+        office_now.members.push(Member {
+            hostname: Some("printer".into()),
+            ..member(9, "10.144.0.9", &[], Vec::new())
+        });
+        // lab: the same suffix and region give both networks the same
+        // full names. The printers also share an address across snapshots.
         let lab_dns = dns("mesh.internal", "lon", &[]);
         let lab = named("lab", &lab_dns);
-        let lab_now = snapshot_of(names(
+        let mut lab_now = snapshot_of(names(
             &lab_dns,
-            "10.145.0.0/24",
-            &[("printer", "10.145.0.9"), ("cam", "10.145.0.41")],
+            "10.144.0.0/15",
+            &[("printer", "10.144.0.9"), ("cam", "10.145.0.41")],
         ));
+        lab_now.members.push(Member {
+            hostname: Some("printer".into()),
+            ..member(19, "10.144.0.9", &[], Vec::new())
+        });
         // paris: same suffix, region par. Its `printer.par` shares the
         // short name and the bare name with office's `printer.lon`; its
         // `solo.ber` (no `solo` in par) only the short name `solo.<suffix>`.
@@ -592,11 +605,25 @@ mod tests {
         assert_eq!(printer["addresses"], json!(["10.144.0.9"]));
         assert_eq!(printer["duplicate"], true);
         assert_eq!(printer["duplicateNetworks"], json!(["lab", "paris"]));
+        assert!(printer.get("memberId").is_none());
+        let office_member = &value["members"][0];
+        let lab_value = snapshot(&views[2], &views, &tunnel);
+        let lab_member = &lab_value["members"][0];
+        assert_eq!(value["network"]["id"], "office");
+        assert_eq!(lab_value["network"]["id"], "lab");
+        assert_eq!(office_member["address"], printer["addresses"][0]);
+        assert_eq!(lab_member["address"], office_member["address"]);
+        assert_ne!(lab_member["id"], office_member["id"]);
         let cam = entry(&value, "cam.lon");
         assert_eq!(cam["source"], "panel");
         assert_eq!(cam["answerable"], false);
         assert_eq!(cam["duplicate"], true);
         assert_eq!(cam["duplicateNetworks"], json!(["lab"]));
+        for name in ["backup.ber", "backup.par"] {
+            let backup = entry(&value, name);
+            assert_eq!(backup["duplicate"], true);
+            assert!(backup.get("duplicateNetworks").is_none());
+        }
         assert_eq!(
             entry(&value, "nas.lon")["duplicateNetworks"],
             json!(["home"])
@@ -633,7 +660,9 @@ mod tests {
         assert_eq!(entry(&value, "printer.lon")["duplicate"], false);
         // `cam.lon` stays a duplicate within office (two panel addresses),
         // but no other network shares it.
-        assert!(entry(&value, "cam.lon").get("duplicateNetworks").is_none());
+        let cam = entry(&value, "cam.lon");
+        assert_eq!(cam["duplicate"], true);
+        assert!(cam.get("duplicateNetworks").is_none());
         // Not running itself: no names, only what its config skipped.
         let views = [
             view(&office, &office_now, false),
@@ -793,6 +822,9 @@ mod tests {
             "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
         );
         let far = &value["members"][1];
+        assert!(far.get("domain").is_none());
+        assert!(far.get("duplicateOf").is_none());
+        assert_eq!(far["address"], "10.144.0.9");
         assert_eq!(far["connection"], "relay");
         assert_eq!(far["hops"], 1);
         assert_eq!(far["latencyMs"], Value::Null);
