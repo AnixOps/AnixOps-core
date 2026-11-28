@@ -1763,7 +1763,8 @@ mod tests {
             }])
             .unwrap();
 
-        let running = start_with_routing(node, listeners, Some(Vec::new()), paths, host_groups).await;
+        let running =
+            start_with_routing(node, listeners, Some(Vec::new()), paths, host_groups).await;
         wait_for(&running, |snapshot| {
             snapshot
                 .paths
